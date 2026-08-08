@@ -299,6 +299,7 @@ export interface BenchmarkResult {
     read: number;
     decode: number;
     verify: number;
+    aggregate: number;
     total: number;
   };
   kernel: {

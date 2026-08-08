@@ -868,6 +868,7 @@ function timingLabel(name: keyof BenchmarkResult["timingsMs"]): string {
     read: "Load blocks",
     decode: "Open + check blocks",
     verify: "Check every value",
+    aggregate: "Numeric aggregate",
     total: "Total",
   };
   return labels[name];

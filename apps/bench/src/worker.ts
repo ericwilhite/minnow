@@ -154,6 +154,7 @@ async function benchmark(requestId: string, config: BenchmarkConfig): Promise<Be
     read: 0,
     decode: 0,
     verify: 0,
+    aggregate: 0,
     total: 0,
   };
   const started = performance.now();
@@ -266,15 +267,18 @@ async function benchmark(requestId: string, config: BenchmarkConfig): Promise<Be
 
       const verifyStarted = performance.now();
       verifyBlock(decoded.column, block);
+      timings.verify += performance.now() - verifyStarted;
+
       if (decoded.column.type === "number") {
+        const aggregateStarted = performance.now();
         for (const value of decoded.column.values) {
           if (value !== null) {
             numericValues += 1;
             numericSum += value;
           }
         }
+        timings.aggregate += performance.now() - aggregateStarted;
       }
-      timings.verify += performance.now() - verifyStarted;
       block.measurement.verified = true;
       completed += 1;
       progress(requestId, {
