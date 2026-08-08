@@ -210,12 +210,14 @@ form.addEventListener("submit", (event) => {
 
 compareButton.addEventListener("click", () => {
   const base = readConfig();
+  const repetitions = Number(repetitionsSelect.value);
   const blockSizes = [262_144, 524_288, 1_048_576, 2_097_152, 4_194_304];
   const compressions: Array<BenchmarkConfig["compression"]> = ["raw", "rle", "gzip"];
+  const settings = compressions.flatMap((compression) =>
+    blockSizes.map((targetBlockBytes) => ({ ...base, compression, targetBlockBytes })),
+  );
   beginBatch(
-    compressions.flatMap((compression) =>
-      blockSizes.map((targetBlockBytes) => ({ ...base, compression, targetBlockBytes })),
-    ),
+    settings.flatMap((config) => Array.from({ length: repetitions }, () => ({ ...config }))),
   );
 });
 

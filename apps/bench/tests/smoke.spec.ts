@@ -135,14 +135,25 @@ test("runs the 27-table suite and executes a measured ad-hoc query", async ({ pa
   await expect(page.locator("#ad-hoc-history-rows tr")).toHaveCount(1);
 });
 
-test("compares every compression and block-size setting", async ({ page }) => {
-  test.setTimeout(120_000);
+test("compares every compression and block-size setting", async ({ page, browserName }) => {
+  const matrixScale = process.env.BROWSERDATABASE_MATRIX_SCALE ?? "0.1";
+  const matrixRepetitions = process.env.BROWSERDATABASE_MATRIX_REPETITIONS ?? "1";
+  const outputDirectory = process.env.BROWSERDATABASE_MATRIX_OUTPUT_DIRECTORY;
+  const timeoutMs = Number(process.env.BROWSERDATABASE_MATRIX_TIMEOUT_MS ?? "120000");
+  const expectedRuns = 15 * Number(matrixRepetitions);
+  test.setTimeout(timeoutMs);
   await page.goto("/");
-  await page.locator("#scale").selectOption("0.1");
+  await page.locator("#scale").selectOption(matrixScale);
+  await page.locator("#repetitions").selectOption(matrixRepetitions);
   await page.getByRole("button", { name: "Compare all 15 settings" }).click();
 
-  await expect(page.locator("#history-rows tr")).toHaveCount(15, { timeout: 90_000 });
-  await expect(page.locator("#progress-label")).toContainText("15 tests complete");
+  await expect(page.locator("#history-rows tr")).toHaveCount(expectedRuns, {
+    timeout: Math.max(90_000, timeoutMs - 30_000),
+  });
+  await expect(page.locator("#history-rows .check.pass")).toHaveCount(expectedRuns);
+  await expect(page.locator("#progress-label")).toContainText(
+    `${String(expectedRuns)} tests complete`,
+  );
   await expect(page.locator("#history-rows")).toContainText("Relational commerce");
   await expect(page.locator("#history-rows")).toContainText("4.00 MB");
   await expect(page.locator("#comparison-summary")).toContainText("Fastest");
@@ -150,4 +161,13 @@ test("compares every compression and block-size setting", async ({ page }) => {
   await expect(page.locator("#comparison-summary")).toContainText("Fastest insertBatch");
   await expect(page.locator("#comparison-summary")).toContainText("Fastest bounded upsert");
   await expect(page.locator("#comparison-summary")).toContainText("Fastest reference suite");
+
+  if (outputDirectory !== undefined) {
+    const downloadPromise = page.waitForEvent("download");
+    await page.locator("#export").click();
+    const download = await downloadPromise;
+    await download.saveAs(
+      `${outputDirectory}/browserdatabase-matrix-${matrixScale.replace(".", "_")}x-${browserName}.json`,
+    );
+  }
 });

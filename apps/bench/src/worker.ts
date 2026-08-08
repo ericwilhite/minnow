@@ -2533,7 +2533,7 @@ function estimateBlockCount(config: BenchmarkConfig): number {
 }
 
 function blockRows(definition: ColumnDefinition, targetBytes: number): number {
-  return Math.max(1, Math.min(100_000, Math.floor(targetBytes / definition.estimatedBytesPerRow)));
+  return Math.max(1, Math.floor(targetBytes / definition.estimatedBytesPerRow));
 }
 
 function progress(requestId: string, value: BenchmarkProgress): void {
