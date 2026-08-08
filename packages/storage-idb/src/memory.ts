@@ -204,6 +204,7 @@ export class MemoryBlockStore implements BlockStore {
     if (current?.revision !== expectedRevision) {
       throw new TransactionRecordConflictError(id, expectedRevision, current?.revision ?? null);
     }
+    assertGenericTransactionUpdateAllowed(current, update);
     const updated = updateTransactionRecord(current, update);
     this.#transactions.set(id, updated);
     return structuredClone(updated);
@@ -374,6 +375,9 @@ export class MemoryBlockStore implements BlockStore {
     expectedRevision: number,
     update: CompactionJobRecordUpdate,
   ): Promise<CompactionJobRecord> {
+    if (update.state === "cancelled") {
+      throw new TypeError("Use cancelCompactionJob to cancel a compaction job");
+    }
     const current = this.#compactionJobs.get(id);
     if (current?.revision !== expectedRevision) {
       throw new CompactionJobConflictError(id, expectedRevision, current?.revision ?? null);
@@ -381,6 +385,72 @@ export class MemoryBlockStore implements BlockStore {
     const updated = updateCompactionJobRecord(current, update);
     this.#compactionJobs.set(id, updated);
     return structuredClone(updated);
+  }
+
+  async cancelCompactionJob(
+    id: string,
+    expectedRevision: number,
+    cancelledAt: string,
+  ): Promise<CompactionJobRecord> {
+    let resolveResult: (record: CompactionJobRecord) => void;
+    let rejectResult: (reason: unknown) => void;
+    const result = new Promise<CompactionJobRecord>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    this.#commitQueue = this.#commitQueue.then(() => {
+      try {
+        const current = this.#compactionJobs.get(id);
+        if (current?.revision !== expectedRevision) {
+          throw new CompactionJobConflictError(id, expectedRevision, current?.revision ?? null);
+        }
+        if (isTerminalCompactionJob(current)) {
+          resolveResult(structuredClone(current));
+          return;
+        }
+
+        const transaction =
+          current.transactionId === null
+            ? undefined
+            : this.#transactions.get(current.transactionId);
+        if (transaction?.status === "committed") {
+          if (transaction.committedVersion === null) {
+            throw new Error(`Committed transaction has no manifest version: ${transaction.id}`);
+          }
+          const published = updateCompactionJobRecord(current, {
+            state: "published",
+            publishedVersion: transaction.committedVersion,
+            updatedAt: cancelledAt,
+            error: null,
+          });
+          this.#compactionJobs.set(id, published);
+          resolveResult(structuredClone(published));
+          return;
+        }
+
+        const cancelled = updateCompactionJobRecord(current, {
+          state: "cancelled",
+          updatedAt: cancelledAt,
+          error: null,
+        });
+        const abortedTransaction =
+          transaction?.status === "active"
+            ? updateTransactionRecord(transaction, {
+                status: "aborted",
+                updatedAt: cancelledAt,
+                committedVersion: null,
+              })
+            : undefined;
+        if (abortedTransaction !== undefined) {
+          this.#transactions.set(abortedTransaction.id, abortedTransaction);
+        }
+        this.#compactionJobs.set(id, cancelled);
+        resolveResult(structuredClone(cancelled));
+      } catch (error) {
+        rejectResult(error);
+      }
+    });
+    return result;
   }
 
   async removeCompactionJob(id: string): Promise<void> {
@@ -410,5 +480,24 @@ function assertBlockSet(actual: readonly string[], expected: readonly string[]):
     [...expectedSet].some((blockId) => !actualSet.has(blockId))
   ) {
     throw new Error("Transaction manifest does not match its snapshot and pending blocks");
+  }
+}
+
+function isTerminalCompactionJob(record: CompactionJobRecord): boolean {
+  return record.state === "published" || record.state === "cancelled" || record.state === "aborted";
+}
+
+function assertGenericTransactionUpdateAllowed(
+  record: TransactionRecord,
+  update: TransactionRecordUpdate,
+): void {
+  if (record.status !== "active") {
+    throw new TypeError(`Only active transactions can be updated; found ${record.status}`);
+  }
+  if (update.status === "committed") {
+    throw new TypeError("Use commitTransaction to commit a transaction");
+  }
+  if (Reflect.has(update, "committedVersion")) {
+    throw new TypeError("Only commitTransaction can set a committed transaction version");
   }
 }

@@ -147,7 +147,7 @@ encode/compress new blocks
         -> commit metadata transaction
 ```
 
-The manifest never references a partial block. A crash before publication can leave unreachable blocks, which later garbage collection may safely reclaim. A compare-and-swap failure is a normal write conflict; the caller rebases or retries according to transaction semantics. Compaction uses the same atomic publication path: a new manifest replaces its planned source blocks with newly staged blocks. If a concurrent commit only appends data and all planned sources remain visible, compaction rebases and publishes without dropping or reordering that append. If a source changed, the job aborts rather than publishing a stale rewrite. Historical manifests and their source blocks remain unchanged, so replacement is not physical deletion.
+The manifest never references a partial block. A crash before publication can leave unreachable blocks, which later garbage collection may safely reclaim. A compare-and-swap failure is a normal write conflict; the caller rebases or retries according to transaction semantics. Compaction uses the same atomic publication path: a new manifest replaces its planned source blocks with newly staged blocks. If a concurrent commit only appends data and all planned sources remain visible, compaction rebases and publishes without dropping or reordering that append. If a source changed, the job aborts rather than publishing a stale rewrite. Cancellation and publication serialize through storage transactions: cancellation wins by atomically marking the job `cancelled` and aborting its active transaction, or commit wins and cancellation observes `published` with the committed manifest version. Historical manifests and their source blocks remain unchanged, so replacement or cancellation is not physical deletion.
 
 The library now implements block writes, saved manifest history, stable snapshots, transaction records, competing-writer checks, and reader/backup leases. Garbage collection remains part of the MVCC milestone.
 
@@ -179,7 +179,9 @@ deterministic output IDs, the next output-window/column cursor, transaction ID, 
 processed rows and bytes, and the modeled working-memory high-water. `compactTableStep()` processes
 at most the requested number of output blocks; `resumeCompactionJob()` continues the persisted plan
 after a yield or reopen; `listCompactionJobs()` exposes it; and `compactTable()` repeatedly drives
-the same workflow to publication.
+the same workflow to publication. `cancelCompactionJob(jobId)` settles an unpublished job in a
+distinct terminal `cancelled` state and returns the terminal state plus any published version.
+Repeated calls are idempotent; terminal `published` and `aborted` jobs keep their existing outcome.
 
 Each output is built directly from validated physical column ranges. The implementation
 decompresses source blocks, slices and concatenates their validity/value buffers, recalculates
@@ -209,11 +211,21 @@ every planned source remains visible and unchanged; otherwise it aborts. Manifes
 affects only the new version, so historical snapshots continue reading their original segments and
 blocks.
 
+Cancellation is cooperative rather than preemptive. Physical transforms and an active native codec
+operation run to their next durable boundary; an in-flight step that then observes cancellation, or
+any attempt to resume the terminal job, throws `CompactionJobCancelledError`. The atomic
+cancellation operation also aborts the linked transaction, so a cancelled job cannot publish. If
+the commit transaction wins the race first, the job is reconciled as `published` instead. The
+cancelled record preserves its immutable plan, cursor, completed-output IDs, byte counts, and
+high-water metrics for diagnosis and recovery accounting. Already-written immutable blocks and
+segment artifacts are left unreachable. Their physical deletion is deliberately deferred to
+lease-aware reachability and garbage collection rather than performed by cancellation.
+
 This is still a deliberately narrow Phase 6 policy: it selects every eligible contiguous
 append-only segment in a table and publishes one L1 replacement. It does not compact
 upsert/update/delete deltas, select subsets or levels beyond whole-table L0 -> L1, produce L2
-segments, cancel jobs, or physically reclaim source/output garbage. Lease-aware reachability and
-reclamation remain separate future steps.
+segments, or physically reclaim source/output garbage. Lease-aware reachability and reclamation
+remain separate future steps.
 
 ## Multi-tab correctness
 

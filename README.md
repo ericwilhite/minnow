@@ -2,8 +2,9 @@
 
 BrowserDatabase is an experimental browser-only relational database built around immutable compressed
 columnar blocks and IndexedDB. The current slice includes the block format, atomic storage
-publication, persistent writes and snapshots, a bounded read-only SQL API, resumable physical
-compaction of append segments, deterministic fault injection, and a browser benchmark laboratory.
+publication, persistent writes and snapshots, a bounded read-only SQL API, resumable and cancellable
+physical compaction of append segments, deterministic fault injection, and a browser benchmark
+laboratory.
 
 The public logical types are intentionally small:
 
@@ -96,6 +97,9 @@ await database.insert("events", { value: 2 });
 let progress = await database.compactTableStep("events", { maxBlocks: 1 });
 while (progress.result === null) {
   if (progress.jobId === null) throw new Error("Expected a compaction job");
+  // To stop instead, cancellation is durable and idempotent:
+  // await database.cancelCompactionJob(progress.jobId);
+  // break;
   progress = await database.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
 }
 const jobs = await database.listCompactionJobs("events");
@@ -133,6 +137,9 @@ order. It also checkpoints its output IDs, active transaction, state, and next o
 `resumeCompactionJob()` continues a known job after a yield or database reopen; and
 `listCompactionJobs()` exposes persisted progress. `compactTable()` is a convenience wrapper that
 drives the same checkpointed workflow to completion in steps controlled by `maxBlocksPerStep`.
+`cancelCompactionJob(jobId)` durably settles an unpublished job as `cancelled` and atomically aborts
+its linked transaction. It is idempotent and returns the job's terminal state plus any published
+version, so a caller also sees when publication or an earlier abort had already won.
 
 Execution decodes verified physical column payloads, slices and concatenates row ranges, and
 re-encodes output windows without materializing JavaScript row objects. The defaults are gzip, a
@@ -156,10 +163,19 @@ L0 segments. The completed whole-table append rewrite publishes one L1 segment w
 rebases. A changed or missing planned source aborts the job. Older manifests still reference the
 source blocks, so historical snapshots remain valid.
 
+Cancellation is cooperative: it does not preempt synchronous physical transforms or browser-native
+codec work already in progress. An in-flight step observes cancellation at its next durable boundary
+and throws `CompactionJobCancelledError`; resuming a cancelled job throws the same typed error. The
+cancellation record update and transaction abort are one atomic storage operation. If cancellation
+wins, publication cannot commit; if commit wins, cancellation reports `published` and its manifest
+version. The terminal job retains its plan, cursor, metrics, and output IDs for inspection. Any
+immutable output blocks or segment artifacts already written remain unreachable rather than being
+deleted immediately; lease-aware garbage collection will reclaim them in a later Phase 6 slice.
+
 Phase 6 remains open. The implemented policy only rewrites every eligible, contiguous append-only
 segment in a table from L0 to one L1 segment. It does not compact upsert/update/delete deltas, choose
-source subsets, implement L2 policy, cancel jobs, or reclaim physical blocks. Mutation-bearing and
-non-contiguous inputs are skipped explicitly; superseded blocks remain stored and
+source subsets, implement L2 policy, or reclaim physical blocks. Mutation-bearing and non-contiguous
+inputs are skipped explicitly; superseded and cancelled-job artifacts remain stored and
 `physicallyReclaimedBytes` is zero until lease-aware garbage collection exists.
 
 ## Storage laboratory

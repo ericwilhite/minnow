@@ -188,6 +188,12 @@ export interface CompactionJobProgress {
   result: CompactTableResult | null;
 }
 
+export interface CancelCompactionJobResult {
+  jobId: string;
+  state: "cancelled" | "published" | "aborted";
+  publishedVersion: number | null;
+}
+
 export interface TableDefinition {
   name: string;
   columns: ColumnDefinition[];
@@ -230,6 +236,14 @@ export class CompactionMemoryBudgetError extends Error {
     super(
       `Compaction needs at least ${String(minimumBytes)} bytes of working memory; budget is ${String(budgetBytes)} bytes`,
     );
+  }
+}
+
+export class CompactionJobCancelledError extends Error {
+  override readonly name = "CompactionJobCancelledError";
+
+  constructor(readonly jobId: string) {
+    super(`Compaction job cancelled: ${jobId}`);
   }
 }
 
@@ -973,6 +987,25 @@ export class BrowserDatabase {
     return this.store.listCompactionJobs(table.id);
   }
 
+  /** Atomically prevents an unpublished compaction job from committing its transaction. */
+  async cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult> {
+    for (;;) {
+      const job = await this.store.getCompactionJob(jobId);
+      if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
+      if (job.state === "cancelled" || job.state === "published" || job.state === "aborted") {
+        return compactionCancellationResult(job);
+      }
+      try {
+        return compactionCancellationResult(
+          await this.store.cancelCompactionJob(job.id, job.revision, this.#now().toISOString()),
+        );
+      } catch (error) {
+        if (error instanceof CompactionJobConflictError) continue;
+        throw error;
+      }
+    }
+  }
+
   async #planCompaction(
     table: TableRecord,
     options: CompactTableOptions,
@@ -1054,7 +1087,9 @@ export class BrowserDatabase {
 
     let id = ["compaction", table.id, "manifest", String(version)].join("/");
     const existing = await this.store.getCompactionJob(id);
-    if (existing !== undefined && existing.state !== "aborted") return existing;
+    if (existing !== undefined && existing.state !== "aborted" && existing.state !== "cancelled") {
+      return existing;
+    }
     if (existing !== undefined) id = `${id}/retry/${this.#createId()}`;
     const timestamp = this.#now().toISOString();
     const job: CompactionJobRecord = {
@@ -1323,6 +1358,7 @@ export class BrowserDatabase {
     maxBlocks: number,
   ): Promise<CompactionJobProgress> {
     let job = (await this.store.getCompactionJob(initialJob.id)) ?? initialJob;
+    if (job.state === "cancelled") throw new CompactionJobCancelledError(job.id);
     if (job.state === "aborted") throw new Error(job.error ?? `Compaction job aborted: ${job.id}`);
     if (job.state === "published") {
       return this.#publishedCompactionProgress(table, job);
@@ -1339,29 +1375,36 @@ export class BrowserDatabase {
       rewritePlan.kind === "copy-v1" ? await this.#loadCompactionSources(job) : [];
 
     let transaction: DatabaseTransaction;
-    if (job.transactionId === null) {
-      const linked = await this.#beginCompactionTransaction(job);
-      if (linked.transaction === null) {
-        return this.#runCompactionJob(table, linked.job, maxBlocks);
-      }
-      ({ job, transaction } = linked);
-    } else {
-      if (linkedTransaction?.status !== "active") {
+    try {
+      if (job.transactionId === null) {
         const linked = await this.#beginCompactionTransaction(job);
         if (linked.transaction === null) {
-          return this.#runCompactionJob(table, linked.job, maxBlocks);
+          return await this.#runCompactionJob(table, linked.job, maxBlocks);
         }
         ({ job, transaction } = linked);
       } else {
-        transaction = await this.#transactions.resume(job.transactionId);
-        if (job.state !== "running") {
-          job = await this.store.updateCompactionJob(job.id, job.revision, {
-            state: "running",
-            updatedAt: this.#now().toISOString(),
-            error: null,
-          });
+        if (linkedTransaction?.status !== "active") {
+          const linked = await this.#beginCompactionTransaction(job);
+          if (linked.transaction === null) {
+            return await this.#runCompactionJob(table, linked.job, maxBlocks);
+          }
+          ({ job, transaction } = linked);
+        } else {
+          transaction = await this.#transactions.resume(job.transactionId);
+          if (job.state !== "running") {
+            job = await this.store.updateCompactionJob(job.id, job.revision, {
+              state: "running",
+              updatedAt: this.#now().toISOString(),
+              error: null,
+            });
+          }
         }
       }
+    } catch (error) {
+      if ((await this.store.getCompactionJob(job.id))?.state === "cancelled") {
+        throw new CompactionJobCancelledError(job.id);
+      }
+      throw error;
     }
 
     try {
@@ -1554,6 +1597,9 @@ export class BrowserDatabase {
       );
     } catch (error) {
       const latest = await this.store.getCompactionJob(job.id);
+      if (latest?.state === "cancelled") {
+        throw new CompactionJobCancelledError(job.id);
+      }
       if (
         !(error instanceof CompactionJobConflictError) &&
         !(error instanceof TransactionRecordConflictError) &&
@@ -1740,7 +1786,12 @@ export class BrowserDatabase {
         return { job: latest, transaction: null };
       }
       const reason = `Compaction source is no longer visible: ${missingSourceId}`;
-      if (latest !== undefined && latest.state !== "published" && latest.state !== "aborted") {
+      if (
+        latest !== undefined &&
+        latest.state !== "published" &&
+        latest.state !== "aborted" &&
+        latest.state !== "cancelled"
+      ) {
         await this.#abortCompactionJob(latest, reason);
       }
       throw new Error(reason);
@@ -2658,6 +2709,17 @@ function compactionSkippedProgress(result: CompactTableResult): CompactionJobPro
     sourceBlockCount: result.sourceBlockCount,
     outputBlockCount: 0,
     result,
+  };
+}
+
+function compactionCancellationResult(job: CompactionJobRecord): CancelCompactionJobResult {
+  if (job.state !== "cancelled" && job.state !== "published" && job.state !== "aborted") {
+    throw new Error(`Compaction cancellation did not reach a terminal state: ${job.id}`);
+  }
+  return {
+    jobId: job.id,
+    state: job.state,
+    publishedVersion: job.publishedVersion,
   };
 }
 

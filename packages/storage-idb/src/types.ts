@@ -78,7 +78,14 @@ export interface LeaseRecord {
   revision: number;
 }
 
-export const compactionJobStates = ["planned", "running", "ready", "published", "aborted"] as const;
+export const compactionJobStates = [
+  "planned",
+  "running",
+  "ready",
+  "published",
+  "cancelled",
+  "aborted",
+] as const;
 export type CompactionJobState = (typeof compactionJobStates)[number];
 
 export interface CompactionJobCursor {
@@ -347,6 +354,11 @@ export interface BlockStore {
     expectedRevision: number,
     update: CompactionJobRecordUpdate,
   ): Promise<CompactionJobRecord>;
+  cancelCompactionJob(
+    id: string,
+    expectedRevision: number,
+    cancelledAt: string,
+  ): Promise<CompactionJobRecord>;
   removeCompactionJob(id: string): Promise<void>;
   close(): void;
 }
@@ -521,6 +533,9 @@ export function updateCompactionJobRecord(
 }
 
 function validateCompactionJobState(record: CompactionJobRecord): void {
+  if (record.state === "cancelled" && record.error !== undefined) {
+    throw new TypeError("A cancelled compaction cannot contain an error");
+  }
   if (record.state === "planned") {
     const isCopy = record.rewritePlan?.kind === "copy-v1";
     const hasProgress =
@@ -746,10 +761,11 @@ function validateCompactionJobTransition(
   next: CompactionJobState,
 ): void {
   const allowed: Record<CompactionJobState, readonly CompactionJobState[]> = {
-    planned: ["planned", "running", "aborted"],
-    running: ["running", "ready", "published", "aborted"],
-    ready: ["ready", "running", "published", "aborted"],
+    planned: ["planned", "running", "cancelled", "aborted"],
+    running: ["running", "ready", "published", "cancelled", "aborted"],
+    ready: ["ready", "running", "published", "cancelled", "aborted"],
     published: ["published"],
+    cancelled: ["cancelled"],
     aborted: ["aborted"],
   };
   if (!allowed[previous].includes(next)) {

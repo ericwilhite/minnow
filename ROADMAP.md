@@ -147,11 +147,14 @@ Phase 6A and the first Phase 6B physical-rewrite slice are implemented:
 
 - atomic manifest publication can supersede snapshot blocks without deleting historical data;
 - revisioned compaction job records persist in the IndexedDB `gc` store with planned, running,
-  ready, published, and aborted states;
+  ready, published, cancelled, and aborted states;
 - `compactTableStep()` plans or advances a job by a bounded output-block count,
   `resumeCompactionJob()` continues it after a yield or restart, and `listCompactionJobs()` exposes
   durable progress; `compactTable()` remains the convenience wrapper that drives those steps to
   publication;
+- `cancelCompactionJob(jobId)` atomically settles an unpublished job as `cancelled` and aborts its
+  active transaction; repeated requests return the same terminal outcome, while a commit that won
+  the race is reported as `published` with its manifest version;
 - the immutable `rechunk-v1` plan fingerprints the ordered columns and source blocks with row
   ranges, stored/encoded lengths, and checksums, and persists output windows, row-ID bounds, logical
   order, target encoding, and execution settings;
@@ -186,7 +189,11 @@ job/transaction metadata are excluded.
 
 Phase 6 remains open. The current policy rewrites all eligible contiguous append-only inputs into
 one whole-table L1 segment. It does not compact upsert/update/delete deltas, choose subsets or level
-policies beyond L0 -> L1, build L2 segments, cancel a job, or reclaim physical blocks.
+policies beyond L0 -> L1, build L2 segments, or reclaim physical blocks. Cancellation is
+cooperative: it cannot preempt physical transforms or native codec work already in progress, but an
+in-flight step observes it at the next durable boundary and `resumeCompactionJob()` throws
+`CompactionJobCancelledError`. Cancelled records retain their plan, cursor, progress, metrics, and
+completed artifact IDs; physical cleanup remains deferred to lease-aware garbage collection.
 
 Deliver:
 
@@ -290,8 +297,9 @@ Exit gate: representative changing workloads improve without manual indexes and 
 The current repository slice has completed the Phase 5 storage/write foundation and its planned
 four-way durability matrix. Phase 6A plus the first Phase 6B slice now provide durable,
 restart-safe, output-block-stepped physical rechunking and re-encoding under a modeled
-JavaScript-owned memory budget. Phase 6 remains open until compaction handles mutation deltas and
-level/subset selection, supports cancellation, and safely reclaims unreachable data. The broader
+JavaScript-owned memory budget, including safe cooperative job cancellation. Phase 6 remains open
+until compaction handles mutation deltas and level/subset selection and safely reclaims unreachable
+data. The broader
 Phase 5 performance curves and larger/repeated benchmark tiers remain outstanding.
 
 - [x] Record architecture and roadmap.
@@ -322,7 +330,7 @@ Phase 5 performance curves and larger/repeated benchmark tiers remain outstandin
 - [x] Preserve L0/L1 logical order while rebasing publication across concurrent appends.
 - [x] Rechunk and re-encode append-only inputs under an explicit JavaScript-owned byte memory budget.
 - [ ] Add subset/level selection beyond whole-table L0 -> L1 and compact mutation deltas.
-- [ ] Add safe compaction-job cancellation.
+- [x] Add safe compaction-job cancellation.
 - [ ] Add lease-aware garbage collection and physical reclamation for superseded blocks.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 

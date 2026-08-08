@@ -194,6 +194,14 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.updateCompactionJob(id, expectedRevision, update);
   }
 
+  cancelCompactionJob(
+    id: string,
+    expectedRevision: number,
+    cancelledAt: string,
+  ): Promise<CompactionJobRecord> {
+    return this.inner.cancelCompactionJob(id, expectedRevision, cancelledAt);
+  }
+
   removeCompactionJob(id: string): Promise<void> {
     return this.inner.removeCompactionJob(id);
   }

@@ -8,6 +8,9 @@ import {
   type BlockStore,
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
+  type CommitTransactionInput,
+  type TransactionRecord,
+  type TransactionRecordUpdate,
 } from "./index.js";
 
 function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
@@ -19,6 +22,21 @@ function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
         IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
     },
   ];
+}
+
+function activeTransaction(id: string): TransactionRecord {
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  return {
+    id,
+    snapshotVersion: null,
+    pendingBlockIds: [],
+    pendingSegmentIds: [],
+    status: "active",
+    revision: 0,
+    startedAt: createdAt,
+    updatedAt: createdAt,
+    committedVersion: null,
+  };
 }
 
 function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
@@ -97,6 +115,89 @@ function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
     revision: 0,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+async function createReadyCompaction(
+  store: BlockStore,
+  prefix = "cancellation",
+  transactionState: Pick<TransactionRecord, "status" | "committedVersion"> = {
+    status: "active",
+    committedVersion: null,
+  },
+): Promise<{ job: CompactionJobRecord; commit: CommitTransactionInput }> {
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const sourceBlockId = `${prefix}/source-block`;
+  const outputBlockId = `${prefix}/output-block`;
+  const transactionId = `${prefix}/transaction`;
+  const outputSegmentId = `${prefix}/output-segment`;
+  await store.addBlock(sourceBlockId, Uint8Array.of(1));
+  const previous = await store.getCurrentManifest();
+  const sourceManifest = await store.publishManifest({
+    expectedVersion: previous?.version ?? null,
+    blockIds: [...(previous?.blockIds ?? []), sourceBlockId],
+    createdAt,
+  });
+  await store.addBlock(outputBlockId, Uint8Array.of(2));
+  await store.addSegment({
+    id: outputSegmentId,
+    tableId: "events",
+    transactionId,
+    rowCount: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    columnBlockIds: { value: [outputBlockId] },
+    level: 1,
+    logicalOrder: sourceManifest.version,
+    createdAt,
+  });
+  await store.createTransaction({
+    id: transactionId,
+    snapshotVersion: sourceManifest.version,
+    pendingBlockIds: [outputBlockId],
+    pendingSegmentIds: [outputSegmentId],
+    status: transactionState.status,
+    revision: 0,
+    startedAt: createdAt,
+    updatedAt: createdAt,
+    committedVersion: transactionState.committedVersion,
+  });
+  const job: CompactionJobRecord = {
+    id: `${prefix}/job`,
+    tableId: "events",
+    sourceManifestVersion: sourceManifest.version,
+    sourceSegmentIds: [`${prefix}/source-segment`],
+    sourceBlockIds: [sourceBlockId],
+    outputBlockIds: [outputBlockId],
+    cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
+    processedRows: 1,
+    sourceStoredBytes: 1,
+    outputStoredBytes: 1,
+    logicalBytes: 1,
+    targetLevel: 1,
+    state: "ready",
+    transactionId,
+    outputSegmentId,
+    publishedVersion: null,
+    revision: 0,
+    createdAt,
+    updatedAt: createdAt,
+    error: "prior transient failure",
+  };
+  await store.createCompactionJob(job);
+  return {
+    job,
+    commit: {
+      transactionId,
+      expectedTransactionRevision: 0,
+      expectedManifestVersion: sourceManifest.version,
+      blockIds: [
+        ...sourceManifest.blockIds.filter((blockId) => blockId !== sourceBlockId),
+        outputBlockId,
+      ],
+      removedBlockIds: [sourceBlockId],
+      committedAt: "2026-01-01T00:00:01.000Z",
+    },
   };
 }
 
@@ -238,6 +339,61 @@ for (const implementation of stores()) {
         level: 0,
         logicalOrder: 0,
       });
+      store.close();
+    });
+
+    it("prevents generic transaction updates from forging a commit", async () => {
+      const store = await implementation.create();
+      const created = activeTransaction("forged-commit");
+      await store.createTransaction(created);
+      const before = await store.getTransaction(created.id);
+      const forgedUpdates: TransactionRecordUpdate[] = [
+        {
+          status: "committed",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        {
+          committedVersion: 99,
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        },
+        {
+          committedVersion: null,
+          updatedAt: "2026-01-01T00:00:03.000Z",
+        },
+      ];
+
+      for (const update of forgedUpdates) {
+        await expect(store.updateTransaction(created.id, created.revision, update)).rejects.toThrow(
+          "commitTransaction",
+        );
+        expect(await store.getTransaction(created.id)).toEqual(before);
+      }
+      expect(await store.getCurrentManifest()).toBeUndefined();
+      store.close();
+    });
+
+    it("prevents an aborted transaction from being reactivated or mutated", async () => {
+      const store = await implementation.create();
+      const created = activeTransaction("terminal-abort");
+      await store.createTransaction(created);
+      const aborted = await store.updateTransaction(created.id, created.revision, {
+        status: "aborted",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+
+      await expect(
+        store.updateTransaction(created.id, aborted.revision, {
+          status: "active",
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      ).rejects.toThrow("Only active transactions can be updated; found aborted");
+      await expect(
+        store.updateTransaction(created.id, aborted.revision, {
+          pendingBlockIds: ["late-block"],
+          updatedAt: "2026-01-01T00:00:03.000Z",
+        }),
+      ).rejects.toThrow("Only active transactions can be updated; found aborted");
+      expect(await store.getTransaction(created.id)).toEqual(aborted);
       store.close();
     });
 
@@ -398,6 +554,200 @@ for (const implementation of stores()) {
 
       await store.removeCompactionJob("job-b");
       expect(await store.getCompactionJob("job-b")).toBeUndefined();
+      store.close();
+    });
+
+    it("atomically cancels a compaction and aborts its active transaction", async () => {
+      const store = await implementation.create();
+      const { job, commit } = await createReadyCompaction(store);
+      const cancelledAt = "2026-01-01T00:00:02.000Z";
+
+      const cancelled = await store.cancelCompactionJob(job.id, job.revision, cancelledAt);
+
+      expect(cancelled).toMatchObject({
+        state: "cancelled",
+        revision: 1,
+        updatedAt: cancelledAt,
+        outputBlockIds: job.outputBlockIds,
+        outputSegmentId: job.outputSegmentId,
+      });
+      expect(cancelled).not.toHaveProperty("error");
+      expect(await store.getTransaction(commit.transactionId)).toMatchObject({
+        status: "aborted",
+        revision: 1,
+        updatedAt: cancelledAt,
+        pendingBlockIds: job.outputBlockIds,
+        pendingSegmentIds: [job.outputSegmentId],
+      });
+      expect(await store.getBlock(job.outputBlockIds[0] ?? "")).toEqual(Uint8Array.of(2));
+      expect(await store.getSegment(job.outputSegmentId ?? "")).toBeDefined();
+      await expect(store.commitTransaction(commit)).rejects.toThrow("changed");
+      expect((await store.getCurrentManifest())?.version).toBe(job.sourceManifestVersion);
+      store.close();
+    });
+
+    it("reconciles cancellation to publication when the linked commit wins", async () => {
+      const store = await implementation.create();
+      const { job, commit } = await createReadyCompaction(store, "commit-wins");
+
+      const [manifest, reconciled] = await Promise.all([
+        store.commitTransaction(commit),
+        store.cancelCompactionJob(job.id, job.revision, "2026-01-01T00:00:02.000Z"),
+      ]);
+
+      expect(reconciled).toMatchObject({
+        state: "published",
+        publishedVersion: manifest.version,
+        revision: 1,
+      });
+      expect(reconciled).not.toHaveProperty("error");
+      expect(await store.getTransaction(commit.transactionId)).toMatchObject({
+        status: "committed",
+        committedVersion: manifest.version,
+        revision: 1,
+      });
+      expect((await store.getCurrentManifest())?.version).toBe(manifest.version);
+      store.close();
+    });
+
+    it("treats terminal compaction cancellation as an exact no-op", async () => {
+      const store = await implementation.create();
+      const { job } = await createReadyCompaction(store, "terminal");
+      const cancelled = await store.cancelCompactionJob(
+        job.id,
+        job.revision,
+        "2026-01-01T00:00:02.000Z",
+      );
+      const transactionBefore = await store.getTransaction(job.transactionId ?? "");
+      expect(
+        await store.cancelCompactionJob(job.id, cancelled.revision, "2026-01-01T00:00:03.000Z"),
+      ).toEqual(cancelled);
+      expect(await store.getTransaction(job.transactionId ?? "")).toEqual(transactionBefore);
+
+      for (const state of ["published", "aborted"] as const) {
+        const terminalJob: CompactionJobRecord = {
+          ...job,
+          id: `${state}-terminal-job`,
+          transactionId: `${state}-terminal-transaction`,
+          state,
+          publishedVersion: state === "published" ? 9 : null,
+          revision: 4,
+          updatedAt: "2026-01-01T00:00:04.000Z",
+        };
+        await store.createCompactionJob(terminalJob);
+        const before = await store.getCompactionJob(terminalJob.id);
+        const after = await store.cancelCompactionJob(
+          terminalJob.id,
+          terminalJob.revision,
+          "2026-01-01T00:00:05.000Z",
+        );
+        expect(after).toEqual(before);
+      }
+      store.close();
+    });
+
+    it("rejects stale cancellation without changing either record", async () => {
+      const store = await implementation.create();
+      const { job } = await createReadyCompaction(store, "stale-cancel");
+      const transactionBefore = await store.getTransaction(job.transactionId ?? "");
+
+      await expect(
+        store.cancelCompactionJob(job.id, job.revision + 1, "2026-01-01T00:00:02.000Z"),
+      ).rejects.toBeInstanceOf(CompactionJobConflictError);
+
+      expect(await store.getCompactionJob(job.id)).toMatchObject({
+        state: "ready",
+        revision: job.revision,
+        error: "prior transient failure",
+      });
+      expect(await store.getTransaction(job.transactionId ?? "")).toEqual(transactionBefore);
+      store.close();
+    });
+
+    it("prevents generic checkpoint updates from bypassing atomic cancellation", async () => {
+      const store = await implementation.create();
+      const { job } = await createReadyCompaction(store, "generic-cancel");
+      const transactionBefore = await store.getTransaction(job.transactionId ?? "");
+
+      await expect(
+        store.updateCompactionJob(job.id, job.revision, {
+          state: "cancelled",
+          error: null,
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      ).rejects.toThrow("Use cancelCompactionJob");
+
+      expect(await store.getCompactionJob(job.id)).toMatchObject({
+        state: "ready",
+        revision: job.revision,
+        error: "prior transient failure",
+      });
+      expect(await store.getTransaction(job.transactionId ?? "")).toEqual(transactionBefore);
+      store.close();
+    });
+
+    it("cancels safely when the linked transaction is missing or already aborted", async () => {
+      const store = await implementation.create();
+      const { job } = await createReadyCompaction(store, "inactive-transaction");
+      const abortedTransaction = await store.updateTransaction(job.transactionId ?? "", 0, {
+        status: "aborted",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+
+      const cancelled = await store.cancelCompactionJob(
+        job.id,
+        job.revision,
+        "2026-01-01T00:00:02.000Z",
+      );
+      expect(cancelled.state).toBe("cancelled");
+      expect(await store.getTransaction(job.transactionId ?? "")).toEqual(abortedTransaction);
+
+      const missingTransactionJob: CompactionJobRecord = {
+        ...job,
+        id: "missing-transaction-job",
+        transactionId: "missing-transaction",
+      };
+      await store.createCompactionJob(missingTransactionJob);
+      expect(
+        await store.cancelCompactionJob(
+          missingTransactionJob.id,
+          missingTransactionJob.revision,
+          "2026-01-01T00:00:03.000Z",
+        ),
+      ).toMatchObject({ state: "cancelled", revision: 1 });
+      expect(await store.getTransaction("missing-transaction")).toBeUndefined();
+      store.close();
+    });
+
+    it("fails closed when a committed transaction has no manifest version", async () => {
+      const store = await implementation.create();
+      const { job } = await createReadyCompaction(store, "invalid-commit", {
+        status: "committed",
+        committedVersion: null,
+      });
+      const invalidTransaction = await store.getTransaction(job.transactionId ?? "");
+
+      await expect(
+        store.cancelCompactionJob(job.id, job.revision, "2026-01-01T00:00:02.000Z"),
+      ).rejects.toThrow("has no manifest version");
+      expect(await store.getCompactionJob(job.id)).toMatchObject({
+        state: "ready",
+        revision: job.revision,
+      });
+      expect(await store.getTransaction(job.transactionId ?? "")).toEqual(invalidTransaction);
+      store.close();
+    });
+
+    it("rejects cancelled compaction records that retain an error", async () => {
+      const store = await implementation.create();
+      await expect(
+        store.createCompactionJob({
+          ...rechunkCompactionJob("invalid-cancelled-error"),
+          state: "cancelled",
+          error: "should have been cleared",
+        }),
+      ).rejects.toThrow("cannot contain an error");
+      expect(await store.getCompactionJob("invalid-cancelled-error")).toBeUndefined();
       store.close();
     });
 
@@ -826,6 +1176,32 @@ it("persists compaction checkpoints across IndexedDB connections", async () => {
     outputLogicalBytes: 4096,
     revision: 3,
   });
+  store.close();
+});
+
+it("persists compaction cancellation and transaction abort atomically across reopen", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const { job } = await createReadyCompaction(store, "persistent-cancellation");
+  await store.cancelCompactionJob(job.id, job.revision, "2026-01-01T00:00:02.000Z");
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  expect(await store.getCompactionJob(job.id)).toMatchObject({
+    state: "cancelled",
+    revision: 1,
+    outputBlockIds: job.outputBlockIds,
+    outputSegmentId: job.outputSegmentId,
+  });
+  expect(await store.getTransaction(job.transactionId ?? "")).toMatchObject({
+    status: "aborted",
+    revision: 1,
+    pendingBlockIds: job.outputBlockIds,
+    pendingSegmentIds: [job.outputSegmentId],
+  });
+  expect(await store.getBlock(job.outputBlockIds[0] ?? "")).toEqual(Uint8Array.of(2));
+  expect(await store.getSegment(job.outputSegmentId ?? "")).toBeDefined();
   store.close();
 });
 

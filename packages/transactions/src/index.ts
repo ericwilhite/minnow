@@ -431,7 +431,7 @@ export class TransactionManager {
       if (record.status === "active") record.pendingBlockIds.forEach((id) => roots.add(id));
     }
     const activeCompactionJobs = (await this.store.listCompactionJobs()).filter(
-      (job) => job.state !== "published" && job.state !== "aborted",
+      (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
     );
     for (const job of activeCompactionJobs) {
       job.sourceBlockIds.forEach((id) => roots.add(id));

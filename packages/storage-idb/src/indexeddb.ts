@@ -337,6 +337,13 @@ export class IndexedDbBlockStore implements BlockStore {
       await ignoreAbort(transaction);
       throw new TransactionRecordConflictError(id, expectedRevision, current?.revision ?? null);
     }
+    try {
+      assertGenericTransactionUpdateAllowed(current, update);
+    } catch (error) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw error;
+    }
     const updated = updateTransactionRecord(current, update);
     store.put(updated, id);
     await transactionDone(transaction);
@@ -622,6 +629,9 @@ export class IndexedDbBlockStore implements BlockStore {
     expectedRevision: number,
     update: CompactionJobRecordUpdate,
   ): Promise<CompactionJobRecord> {
+    if (update.state === "cancelled") {
+      throw new TypeError("Use cancelCompactionJob to cancel a compaction job");
+    }
     const transaction = this.#transaction("gc", "readwrite");
     const store = transaction.objectStore("gc");
     const key = compactionJobKey(id);
@@ -634,6 +644,72 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     const updated = updateCompactionJobRecord(current, update);
     store.put(compactionJobEnvelope(updated), key);
+    await transactionDone(transaction);
+    return structuredClone(updated);
+  }
+
+  async cancelCompactionJob(
+    id: string,
+    expectedRevision: number,
+    cancelledAt: string,
+  ): Promise<CompactionJobRecord> {
+    const transaction = this.#transaction(["gc", "transactions"], "readwrite");
+    const jobStore = transaction.objectStore("gc");
+    const transactionStore = transaction.objectStore("transactions");
+    const key = compactionJobKey(id);
+    const value: unknown = await requestResult(jobStore.get(key));
+    const current = value === undefined ? undefined : asCompactionJobEnvelope(value);
+    if (current?.revision !== expectedRevision) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new CompactionJobConflictError(id, expectedRevision, current?.revision ?? null);
+    }
+    if (isTerminalCompactionJob(current)) {
+      await transactionDone(transaction);
+      return structuredClone(current);
+    }
+
+    const transactionValue: unknown =
+      current.transactionId === null
+        ? undefined
+        : await requestResult(transactionStore.get(current.transactionId));
+    const linkedTransaction =
+      transactionValue === undefined ? undefined : asTransactionRecord(transactionValue);
+    let updated: CompactionJobRecord;
+    try {
+      if (linkedTransaction?.status === "committed") {
+        if (linkedTransaction.committedVersion === null) {
+          throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
+        }
+        updated = updateCompactionJobRecord(current, {
+          state: "published",
+          publishedVersion: linkedTransaction.committedVersion,
+          updatedAt: cancelledAt,
+          error: null,
+        });
+      } else {
+        updated = updateCompactionJobRecord(current, {
+          state: "cancelled",
+          updatedAt: cancelledAt,
+          error: null,
+        });
+        if (linkedTransaction?.status === "active") {
+          transactionStore.put(
+            updateTransactionRecord(linkedTransaction, {
+              status: "aborted",
+              updatedAt: cancelledAt,
+              committedVersion: null,
+            }),
+            linkedTransaction.id,
+          );
+        }
+      }
+    } catch (error) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw error;
+    }
+    jobStore.put(compactionJobEnvelope(updated), key);
     await transactionDone(transaction);
     return structuredClone(updated);
   }
@@ -761,6 +837,25 @@ function isCompactionJobEnvelope(value: unknown): value is CompactionJobEnvelope
 function asCompactionJobEnvelope(value: unknown): CompactionJobRecord {
   if (!isCompactionJobEnvelope(value)) throw new Error("Stored compaction job is invalid");
   return normalizeCompactionJobRecord(structuredClone(value.record));
+}
+
+function isTerminalCompactionJob(record: CompactionJobRecord): boolean {
+  return record.state === "published" || record.state === "cancelled" || record.state === "aborted";
+}
+
+function assertGenericTransactionUpdateAllowed(
+  record: TransactionRecord,
+  update: TransactionRecordUpdate,
+): void {
+  if (record.status !== "active") {
+    throw new TypeError(`Only active transactions can be updated; found ${record.status}`);
+  }
+  if (update.status === "committed") {
+    throw new TypeError("Use commitTransaction to commit a transaction");
+  }
+  if (Reflect.has(update, "committedVersion")) {
+    throw new TypeError("Only commitTransaction can set a committed transaction version");
+  }
 }
 
 function validateCount(count: number): void {

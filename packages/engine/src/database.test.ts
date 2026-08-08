@@ -13,6 +13,7 @@ import { TransactionManager } from "@browserdatabase/transactions";
 import {
   attachLifecycleFlush,
   BrowserDatabase,
+  CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   MissingKeyError,
   UniqueConstraintError,
@@ -1442,6 +1443,343 @@ it("resumes a ready compaction interrupted before manifest publication", async (
   store.close();
 });
 
+for (const implementation of recoveryImplementations()) {
+  it(`${implementation.name} durably cancels partial compaction without deleting artifacts`, async () => {
+    const harness = await implementation.create();
+    let store = harness.store;
+    const database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 1; value <= 4; value += 1) {
+      await database.insert("events", { value });
+    }
+
+    const sourceManifest = await store.getCurrentManifest();
+    const progress = await database.compactTableStep("events", {
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+    const jobId = progress.jobId;
+    const interrupted = await store.getCompactionJob(jobId);
+    if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
+      throw new Error("Expected a linked compaction transaction");
+    }
+    const transactionId = interrupted.transactionId;
+    const interruptedTransaction = await store.getTransaction(transactionId);
+    const outputBlockId = interrupted.outputBlockIds[0];
+    if (outputBlockId === undefined) throw new Error("Expected a checkpointed output block");
+    const outputBytes = await store.getBlock(outputBlockId);
+    if (outputBytes === undefined) throw new Error("Expected persisted compaction output");
+    expect(interrupted).toMatchObject({
+      state: "running",
+      outputBlockIds: [outputBlockId],
+      outputCursor: { outputIndex: 1, columnIndex: 0, rowStart: 1 },
+    });
+
+    expect(await database.cancelCompactionJob(jobId)).toEqual({
+      jobId,
+      state: "cancelled",
+      publishedVersion: null,
+    });
+    const cancelled = await store.getCompactionJob(jobId);
+    const cancelledTransaction = await store.getTransaction(transactionId);
+    expect(cancelled).toMatchObject({
+      state: "cancelled",
+      revision: interrupted.revision + 1,
+      outputBlockIds: interrupted.outputBlockIds,
+      outputCursor: interrupted.outputCursor,
+      processedRows: interrupted.processedRows,
+    });
+    expect(cancelledTransaction).toMatchObject({
+      status: "aborted",
+      revision: (interruptedTransaction?.revision ?? 0) + 1,
+      pendingBlockIds: interrupted.outputBlockIds,
+    });
+    expect(await store.getCurrentManifest()).toEqual(sourceManifest);
+    expect(await store.getBlock(outputBlockId)).toEqual(outputBytes);
+    expect(await database.readTable("events")).toEqual([
+      { value: 1 },
+      { value: 2 },
+      { value: 3 },
+      { value: 4 },
+    ]);
+
+    store = await harness.reopen();
+    const reopened = new BrowserDatabase(store);
+    const persisted = await store.getCompactionJob(jobId);
+    const persistedTransaction = await store.getTransaction(transactionId);
+    expect(persisted).toMatchObject({ state: "cancelled", revision: cancelled?.revision });
+    expect(persistedTransaction).toMatchObject({
+      status: "aborted",
+      revision: cancelledTransaction?.revision,
+    });
+    expect(await store.getBlock(outputBlockId)).toEqual(outputBytes);
+
+    const repeated = await reopened.cancelCompactionJob(jobId);
+    expect(repeated).toEqual({ jobId, state: "cancelled", publishedVersion: null });
+    expect((await store.getCompactionJob(jobId))?.revision).toBe(persisted?.revision);
+    expect((await store.getTransaction(transactionId))?.revision).toBe(
+      persistedTransaction?.revision,
+    );
+
+    const resumeError = await reopened
+      .resumeCompactionJob(jobId)
+      .then<unknown>(() => undefined)
+      .catch((error: unknown) => error);
+    expect(resumeError).toBeInstanceOf(CompactionJobCancelledError);
+    expect(resumeError).toMatchObject({ jobId });
+
+    const retry = await reopened.compactTable("events", {
+      maxBlocksPerStep: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    expect(retry).toMatchObject({ compacted: true, rowCount: 4 });
+    expect(retry.jobId).not.toBe(jobId);
+    expect(await store.getBlock(outputBlockId)).toEqual(outputBytes);
+    expect(await reopened.readTable("events")).toEqual([
+      { value: 1 },
+      { value: 2 },
+      { value: 3 },
+      { value: 4 },
+    ]);
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} cancels ready compaction before commit and retains prepared output`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await database.insert("events", { value: 1 });
+    await database.insert("events", { value: 2 });
+    const sourceManifest = await store.getCurrentManifest();
+
+    let failBeforeCommit = true;
+    const faultStore = new FaultInjectingBlockStore(store, (point) => {
+      if (point === "beforeTransactionCommit" && failBeforeCommit) {
+        failBeforeCommit = false;
+        throw new Error("injected before cancellable compaction commit");
+      }
+    });
+    await expect(new BrowserDatabase(faultStore).compactTable("events")).rejects.toThrow(
+      "injected before cancellable compaction commit",
+    );
+    const ready = (await store.listCompactionJobs())[0];
+    if (ready?.transactionId === null || ready?.transactionId === undefined) {
+      throw new Error("Expected a linked compaction transaction");
+    }
+    if (ready.outputSegmentId === null) throw new Error("Expected a prepared output segment");
+    const outputBytes = await Promise.all(
+      ready.outputBlockIds.map(async (id) => {
+        const bytes = await store.getBlock(id);
+        if (bytes === undefined) throw new Error(`Expected compaction output ${id}`);
+        return bytes;
+      }),
+    );
+    expect(ready.state).toBe("ready");
+    expect(await store.getSegment(ready.outputSegmentId)).toBeDefined();
+
+    expect(await database.cancelCompactionJob(ready.id)).toEqual({
+      jobId: ready.id,
+      state: "cancelled",
+      publishedVersion: null,
+    });
+    expect(await store.getCompactionJob(ready.id)).toMatchObject({ state: "cancelled" });
+    expect(await store.getTransaction(ready.transactionId)).toMatchObject({ status: "aborted" });
+    expect(await store.getCurrentManifest()).toEqual(sourceManifest);
+    expect(await store.getSegment(ready.outputSegmentId)).toBeDefined();
+    await Promise.all(
+      ready.outputBlockIds.map(async (id, index) => {
+        expect(await store.getBlock(id)).toEqual(outputBytes[index]);
+      }),
+    );
+    expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
+    store.close();
+  });
+
+  it(`${implementation.name} makes concurrent cancellation idempotent`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 1; value <= 3; value += 1) {
+      await database.insert("events", { value });
+    }
+    const progress = await database.compactTableStep("events", {
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+    const interrupted = await store.getCompactionJob(progress.jobId);
+    if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
+      throw new Error("Expected a linked compaction transaction");
+    }
+    const interruptedTransaction = await store.getTransaction(interrupted.transactionId);
+
+    const results = await Promise.all([
+      new BrowserDatabase(store).cancelCompactionJob(progress.jobId),
+      new BrowserDatabase(store).cancelCompactionJob(progress.jobId),
+    ]);
+    expect(results).toEqual([
+      { jobId: progress.jobId, state: "cancelled", publishedVersion: null },
+      { jobId: progress.jobId, state: "cancelled", publishedVersion: null },
+    ]);
+    expect(await store.getCompactionJob(progress.jobId)).toMatchObject({
+      state: "cancelled",
+      revision: interrupted.revision + 1,
+    });
+    expect(await store.getTransaction(interrupted.transactionId)).toMatchObject({
+      status: "aborted",
+      revision: (interruptedTransaction?.revision ?? 0) + 1,
+    });
+    store.close();
+  });
+
+  it(`${implementation.name} rejects cancellation of a missing compaction job`, async () => {
+    const store = await implementation.create();
+    await expect(new BrowserDatabase(store).cancelCompactionJob("missing-job")).rejects.toThrow(
+      "Compaction job not found: missing-job",
+    );
+    expect(await store.listCompactionJobs()).toEqual([]);
+    store.close();
+  });
+}
+
+it("reconciles cancellation with a compaction transaction that already committed", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("events", { value: 1 });
+  await database.insert("events", { value: 2 });
+  const manifestCount = (await store.listManifests()).length;
+
+  let signalCommitted: (() => void) | undefined;
+  const committed = new Promise<void>((resolve) => {
+    signalCommitted = resolve;
+  });
+  let releaseCommit: (() => void) | undefined;
+  const commitRelease = new Promise<void>((resolve) => {
+    releaseCommit = resolve;
+  });
+  const faultStore = new FaultInjectingBlockStore(store, async (point) => {
+    if (point !== "afterTransactionCommit") return;
+    signalCommitted?.();
+    await commitRelease;
+  });
+  const completionPromise = new BrowserDatabase(faultStore).compactTable("events");
+  await committed;
+
+  const ready = (await store.listCompactionJobs())[0];
+  if (ready?.transactionId === null || ready?.transactionId === undefined) {
+    releaseCommit?.();
+    throw new Error("Expected a committed compaction transaction");
+  }
+  const committedTransaction = await store.getTransaction(ready.transactionId);
+  expect(ready.state).toBe("ready");
+  expect(committedTransaction?.status).toBe("committed");
+  if (committedTransaction?.committedVersion === null || committedTransaction === undefined) {
+    releaseCommit?.();
+    throw new Error("Expected the compaction transaction's committed manifest version");
+  }
+  const committedVersion = committedTransaction.committedVersion;
+
+  let cancellation: Awaited<ReturnType<BrowserDatabase["cancelCompactionJob"]>>;
+  try {
+    cancellation = await database.cancelCompactionJob(ready.id);
+  } finally {
+    releaseCommit?.();
+  }
+  const completion = await completionPromise;
+  expect(cancellation).toEqual({
+    jobId: ready.id,
+    state: "published",
+    publishedVersion: committedVersion,
+  });
+  expect(completion).toMatchObject({ jobId: ready.id, compacted: true });
+  expect(await store.getCompactionJob(ready.id)).toMatchObject({
+    state: "published",
+    publishedVersion: committedVersion,
+  });
+  expect(await store.listManifests()).toHaveLength(manifestCount + 1);
+  expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
+  store.close();
+});
+
+it("translates cancellation during an in-flight output checkpoint", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  for (let value = 1; value <= 3; value += 1) {
+    await database.insert("events", { value });
+  }
+  const progress = await database.compactTableStep("events", {
+    maxBlocks: 1,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+  const manifestBeforeResume = await store.getCurrentManifest();
+
+  let signalBlockWritten: (() => void) | undefined;
+  const blockWritten = new Promise<void>((resolve) => {
+    signalBlockWritten = resolve;
+  });
+  let releaseCheckpoint: (() => void) | undefined;
+  const checkpointRelease = new Promise<void>((resolve) => {
+    releaseCheckpoint = resolve;
+  });
+  let pauseNextBlockWrite = true;
+  const faultStore = new FaultInjectingBlockStore(store, async (point) => {
+    if (point !== "afterBlockWrite" || !pauseNextBlockWrite) return;
+    pauseNextBlockWrite = false;
+    signalBlockWritten?.();
+    await checkpointRelease;
+  });
+  const resumePromise = new BrowserDatabase(faultStore).resumeCompactionJob(progress.jobId, {
+    maxBlocks: 1,
+  });
+  await blockWritten;
+
+  let cancellation: Awaited<ReturnType<BrowserDatabase["cancelCompactionJob"]>>;
+  try {
+    cancellation = await database.cancelCompactionJob(progress.jobId);
+  } finally {
+    releaseCheckpoint?.();
+  }
+  const resumeError = await resumePromise
+    .then<unknown>(() => undefined)
+    .catch((error: unknown) => error);
+
+  expect(cancellation).toEqual({
+    jobId: progress.jobId,
+    state: "cancelled",
+    publishedVersion: null,
+  });
+  expect(resumeError).toBeInstanceOf(CompactionJobCancelledError);
+  expect(resumeError).toMatchObject({ jobId: progress.jobId });
+  expect(await store.getCompactionJob(progress.jobId)).toMatchObject({ state: "cancelled" });
+  expect(await store.getCurrentManifest()).toEqual(manifestBeforeResume);
+  store.close();
+});
+
 it("restages checkpointed outputs with bounded reads after stale-transaction recovery", async () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
   const store = new CountingMemoryBlockStore();
@@ -1732,6 +2070,21 @@ it("aborts a replacement compaction transaction when its sources were superseded
   const aborted = await store.getCompactionJob(progress.jobId);
   expect(aborted?.state).toBe("aborted");
   expect(aborted?.error).toContain("Compaction source is no longer visible");
+  if (aborted === undefined) throw new Error("Expected a failed compaction job");
+  const abortedTransaction =
+    aborted.transactionId === null ? undefined : await store.getTransaction(aborted.transactionId);
+  const manifestBeforeCancellation = await store.getCurrentManifest();
+
+  expect(await reopened.cancelCompactionJob(progress.jobId)).toEqual({
+    jobId: progress.jobId,
+    state: "aborted",
+    publishedVersion: null,
+  });
+  expect(await store.getCompactionJob(progress.jobId)).toEqual(aborted);
+  expect(
+    aborted.transactionId === null ? undefined : await store.getTransaction(aborted.transactionId),
+  ).toEqual(abortedTransaction);
+  expect(await store.getCurrentManifest()).toEqual(manifestBeforeCancellation);
   store.close();
 });
 
@@ -1749,18 +2102,29 @@ it("returns a published compaction job repeatedly without publishing another man
   if (result.jobId === undefined) throw new Error("Expected a persisted compaction job");
   const published = await store.getCompactionJob(result.jobId);
   if (published === undefined) throw new Error("Expected the published compaction job");
+  if (published.transactionId === null) throw new Error("Expected a published transaction");
+  const publishedTransaction = await store.getTransaction(published.transactionId);
   const manifestCount = (await store.listManifests()).length;
   const transactionCount = (await store.listTransactions()).length;
 
   const first = await new BrowserDatabase(store).resumeCompactionJob(result.jobId);
   const second = await new BrowserDatabase(store).resumeCompactionJob(result.jobId);
+  const firstCancellation = await database.cancelCompactionJob(result.jobId);
+  const secondCancellation = await database.cancelCompactionJob(result.jobId);
 
   expect(first).toEqual(second);
   expect(first).toMatchObject({
     state: "published",
     result: { jobId: result.jobId, version: result.version },
   });
-  expect((await store.getCompactionJob(result.jobId))?.revision).toBe(published.revision);
+  expect(firstCancellation).toEqual(secondCancellation);
+  expect(firstCancellation).toEqual({
+    jobId: result.jobId,
+    state: "published",
+    publishedVersion: result.version,
+  });
+  expect(await store.getCompactionJob(result.jobId)).toEqual(published);
+  expect(await store.getTransaction(published.transactionId)).toEqual(publishedTransaction);
   expect(await store.listManifests()).toHaveLength(manifestCount);
   expect(await store.listTransactions()).toHaveLength(transactionCount);
   store.close();
