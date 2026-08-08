@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>BrowserDatabase Storage Lab</title>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="BrowserDatabase Storage Lab home">
+        <span class="brand-mark" aria-hidden="true">B</span>
+        <span>BrowserDatabase</span>
+      </a>
+      <div class="engine-state"><span class="status-dot"></span> Local · worker · IndexedDB</div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <div>
+          <p class="eyebrow">BrowserDatabase benchmark</p>
+          <h1>Relational workload lab</h1>
+          <p class="intro-copy">
+            Generate one connected commerce dataset, persist it through the public API, verify its
+            relationships, and measure storage, mutations, joins, aggregates, and your own queries.
+            Everything runs locally in this browser.
+          </p>
+        </div>
+      </section>
+
+      <section class="workbench" aria-labelledby="configuration-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Parameters</p>
+            <h2 id="configuration-title">Configure the run</h2>
+          </div>
+          <p class="section-note">Every value below is passed directly to the benchmark worker.</p>
+        </div>
+
+        <form id="controls" class="configuration-card">
+          <div class="control-grid">
+            <label class="field">
+              <span class="field-label">Dataset scale <code>scale</code></span>
+              <select id="scale" name="scale">
+                <option value="0.1">0.1× — quick check</option>
+                <option value="0.25">0.25× — small</option>
+                <option value="1" selected>1× — standard</option>
+                <option value="5">5× — substantial</option>
+                <option value="10">10× — stress</option>
+                <option value="100">100× — millions</option>
+              </select>
+              <small id="scale-description"></small>
+            </label>
+            <label class="field">
+              <span class="field-label">Primary timing <code>focus</code></span>
+              <select id="focus" name="focus">
+                <option value="roundtrip">roundtrip — total elapsed time</option>
+                <option value="write">write — encode and save</option>
+                <option value="read">read — load and decode</option>
+              </select>
+              <small>Changes the highlighted result, not the work performed.</small>
+            </label>
+            <label class="field">
+              <span class="field-label">Compression <code>compression</code></span>
+              <select id="compression" name="compression">
+                <option value="raw">raw — no compression</option>
+                <option value="rle">rle — run-length encoding</option>
+                <option value="gzip" selected>gzip — CompressionStream</option>
+              </select>
+              <small>The codec applied before blocks are stored.</small>
+            </label>
+            <label class="field">
+              <span class="field-label">Target block size <code>targetBlockBytes</code></span>
+              <select id="block-size" name="blockSize">
+                <option value="262144">256 KiB — 262,144 bytes</option>
+                <option value="524288" selected>512 KiB — 524,288 bytes</option>
+                <option value="1048576">1 MiB — 1,048,576 bytes</option>
+                <option value="2097152">2 MiB — 2,097,152 bytes</option>
+                <option value="4194304">4 MiB — 4,194,304 bytes</option>
+              </select>
+              <small>Maximum target size before compression.</small>
+            </label>
+            <label class="field">
+              <span class="field-label">IndexedDB durability <code>durability</code></span>
+              <select id="durability" name="durability">
+                <option value="relaxed" selected>relaxed — browser may defer flush</option>
+                <option value="strict">strict — request durable flush</option>
+              </select>
+              <small>Passed to the IndexedDB transaction.</small>
+            </label>
+            <label class="field">
+              <span class="field-label">Repetitions <code>repetitions</code></span>
+              <select id="repetitions" name="repetitions">
+                <option value="1" selected>1 run</option>
+                <option value="3">3 runs</option>
+                <option value="5">5 runs</option>
+              </select>
+              <small>Runs sequentially; each result is kept below.</small>
+            </label>
+          </div>
+
+          <section class="dataset-plan" aria-labelledby="dataset-plan-title">
+            <div>
+              <p class="eyebrow">Generated dataset</p>
+              <h3 id="dataset-plan-title">27 related tables</h3>
+              <p id="dataset-plan-summary"></p>
+            </div>
+            <div id="dataset-plan-tables" class="dataset-plan-tables"></div>
+          </section>
+
+          <aside class="run-summary" aria-labelledby="run-summary-title">
+            <div>
+              <p class="eyebrow">Execution summary</p>
+              <h3 id="run-summary-title">What will happen</h3>
+              <p id="run-summary-copy"></p>
+            </div>
+            <dl>
+              <div>
+                <dt>Thread</dt>
+                <dd>Web Worker</dd>
+              </div>
+              <div>
+                <dt>Storage</dt>
+                <dd>IndexedDB</dd>
+              </div>
+              <div>
+                <dt>Commit</dt>
+                <dd>Transaction journal + manifest</dd>
+              </div>
+              <div>
+                <dt>Validation</dt>
+                <dd>Values + transactions + query results</dd>
+              </div>
+              <div>
+                <dt>Network</dt>
+                <dd>None</dd>
+              </div>
+            </dl>
+          </aside>
+
+          <div class="actions">
+            <button id="run" class="primary-button" type="submit">
+              <span>Run one test</span><span aria-hidden="true">→</span>
+            </button>
+            <button id="compare" class="compare-button" type="button">
+              Compare all 15 settings
+            </button>
+            <button id="compare-engines" class="compare-button" type="button">
+              Compare database engines
+            </button>
+            <button id="cancel" class="secondary-button" type="button" hidden>Cancel</button>
+            <p class="compare-note">
+              Settings comparison runs 3 codecs × 5 block sizes. Engine comparison loads the same
+              27-table dataset through each product's public API using the selected scale.
+            </p>
+          </div>
+        </form>
+
+        <div id="progress-panel" class="progress-panel" aria-live="polite">
+          <div class="progress-copy">
+            <span id="progress-label">Ready</span>
+            <span id="progress-value">0%</span>
+          </div>
+          <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+        </div>
+
+        <article class="panel engine-comparison-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Public API comparison</p>
+              <h3>BrowserDatabase · SQLite Wasm · DuckDB-Wasm · PGlite</h3>
+            </div>
+            <strong id="engine-comparison-state">Not run</strong>
+          </div>
+          <p id="engine-comparison-note" class="transaction-summary">
+            One deterministic relational dataset, bounded generated batches, documented public APIs,
+            explicit persistence modes, and separately reported SQL timings.
+          </p>
+          <div id="engine-comparison-results" hidden></div>
+        </article>
+      </section>
+
+      <section id="results" class="results" aria-labelledby="results-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Output</p>
+            <h2 id="results-title">Latest result</h2>
+          </div>
+          <div id="verification-badge" class="verification-badge muted">No test yet</div>
+        </div>
+
+        <div id="empty-state" class="empty-state">
+          <span>↳</span>
+          <p>Run a test to see speed, space used, and saved blocks.</p>
+        </div>
+
+        <div id="result-content" hidden>
+          <div id="metric-cards" class="metric-grid"></div>
+
+          <div class="detail-grid">
+            <article class="panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">Steps</p>
+                  <h3>Time spent on each step</h3>
+                </div>
+                <strong id="primary-timing"></strong>
+              </div>
+              <div id="timing-chart" class="timing-chart"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">Browser storage</p>
+                  <h3>Space used</h3>
+                </div>
+              </div>
+              <div id="storage-metrics" class="storage-metrics"></div>
+              <p class="fine-print">
+                The browser gives an estimate for total site storage. The sizes listed for each
+                block are exact.
+              </p>
+            </article>
+          </div>
+
+          <article class="panel transaction-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Transactions</p>
+                <h3>Commit, contention, and recovery checks</h3>
+              </div>
+              <strong id="transaction-total"></strong>
+            </div>
+            <p id="transaction-summary" class="transaction-summary"></p>
+            <div id="transaction-checks" class="transaction-checks"></div>
+            <p class="fine-print">
+              The fixed probe uses a separate throwaway IndexedDB database. Its time is reported
+              here and excluded from main time, throughput, and comparison rankings.
+            </p>
+          </article>
+
+          <article class="panel library-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Public write API</p>
+                <h3>Insert, upsert, partial update, projection, and delete</h3>
+              </div>
+              <strong id="library-total"></strong>
+            </div>
+            <p id="library-summary" class="transaction-summary"></p>
+            <div id="library-metrics" class="metric-grid library-metric-grid"></div>
+            <div class="library-detail-grid">
+              <div>
+                <h4>Measured API time</h4>
+                <div id="library-timings" class="timing-chart"></div>
+              </div>
+              <div>
+                <h4>Correctness probes</h4>
+                <div id="library-checks" class="transaction-checks library-checks"></div>
+              </div>
+            </div>
+            <div class="table-scroll library-table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Table</th>
+                    <th>Rows</th>
+                    <th>Segments</th>
+                    <th>Blocks</th>
+                    <th>Saved size</th>
+                  </tr>
+                </thead>
+                <tbody id="library-table-rows"></tbody>
+              </table>
+            </div>
+            <p class="fine-print">
+              insertBatch uses chunks of at most 100,000 rows. Keyed mutation probes are capped at
+              1,000 saved keys; they use the persistent lookup and report encoding, staging, commit,
+              retry, rows/s, and write-amplification metrics. Concurrent probes are excluded from
+              API throughput.
+            </p>
+          </article>
+
+          <article class="panel query-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Relational reference workload</p>
+                <h3>Simple filters through multi-table analysis</h3>
+              </div>
+              <strong id="query-total"></strong>
+            </div>
+            <aside class="query-disclosure" aria-label="Query benchmark disclosure">
+              <strong>What these numbers mean</strong>
+              <p id="query-note"></p>
+            </aside>
+            <p id="query-summary" class="transaction-summary"></p>
+            <h4 class="subsection-title">Dataset and relationships</h4>
+            <div id="query-dataset" class="query-dataset"></div>
+            <h4 class="subsection-title">Dataset integrity</h4>
+            <div id="query-checks" class="transaction-checks query-checks"></div>
+            <h4 class="subsection-title">Query catalog</h4>
+            <div id="query-results" class="query-results"></div>
+          </article>
+
+          <article id="query-console" class="panel query-console">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Ad-hoc verification</p>
+                <h3>Run a query against this generated dataset</h3>
+              </div>
+              <span id="ad-hoc-dataset-state" class="table-meta">Available after a run</span>
+            </div>
+            <aside class="query-disclosure" aria-label="Ad-hoc query disclosure">
+              <strong>Measured reference runner</strong>
+              <p>
+                This console executes a documented read-only SQL subset over rows loaded from the
+                latest BrowserDatabase snapshot. It reports parse time and median/p95 execution time
+                separately. This is not the future native SQL engine.
+              </p>
+            </aside>
+            <div class="query-example-row" aria-label="Query examples">
+              <button type="button" class="query-example" data-query-example="revenue">
+                Revenue by segment
+              </button>
+              <button type="button" class="query-example" data-query-example="tax">
+                Tax by jurisdiction
+              </button>
+              <button type="button" class="query-example" data-query-example="inventory">
+                Supplier inventory
+              </button>
+            </div>
+            <label class="query-editor-label" for="ad-hoc-sql">
+              SQL
+              <textarea id="ad-hoc-sql" spellcheck="false">
+SELECT c.segment, COUNT(*) AS orders, SUM(o.total) AS revenue
+FROM customers c
+JOIN orders o ON o.customer_id = c.customer_id
+WHERE o.status = 'paid'
+GROUP BY c.segment
+ORDER BY revenue DESC
+LIMIT 20</textarea>
+            </label>
+            <div class="query-console-actions">
+              <button id="run-ad-hoc" class="primary-button" type="button" disabled>
+                <span>Run query</span><span aria-hidden="true">→</span>
+              </button>
+              <p id="ad-hoc-status" role="status">Generate the dataset first.</p>
+            </div>
+            <div id="ad-hoc-result" hidden>
+              <div id="ad-hoc-metrics" class="metric-grid ad-hoc-metrics"></div>
+              <div class="table-scroll ad-hoc-table-scroll">
+                <table>
+                  <thead id="ad-hoc-result-head"></thead>
+                  <tbody id="ad-hoc-result-rows"></tbody>
+                </table>
+              </div>
+              <p id="ad-hoc-result-note" class="fine-print"></p>
+            </div>
+            <h4 class="subsection-title">Query history</h4>
+            <div id="ad-hoc-history-empty" class="history-empty">No ad-hoc queries yet.</div>
+            <div id="ad-hoc-history" class="table-scroll" hidden>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Query</th>
+                    <th>Tables</th>
+                    <th>Rows</th>
+                    <th>Median</th>
+                    <th>p95</th>
+                    <th>Parsed</th>
+                  </tr>
+                </thead>
+                <tbody id="ad-hoc-history-rows"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel table-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Sample data</p>
+                <h3>Data groups</h3>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Group</th>
+                    <th>Rows</th>
+                    <th>Columns</th>
+                    <th>Blocks</th>
+                    <th>Before compression</th>
+                    <th>Saved size</th>
+                    <th>Size change</th>
+                  </tr>
+                </thead>
+                <tbody id="entity-rows"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel table-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Saved data</p>
+                <h3>Blocks</h3>
+              </div>
+              <span id="block-count" class="table-meta"></span>
+            </div>
+            <div class="table-scroll block-table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Block</th>
+                    <th>Type</th>
+                    <th>Rows</th>
+                    <th>Before compression</th>
+                    <th>Saved size</th>
+                    <th>Size change</th>
+                    <th>Check</th>
+                  </tr>
+                </thead>
+                <tbody id="block-rows"></tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="history-section" aria-labelledby="history-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Session history</p>
+            <h2 id="history-title">Past runs</h2>
+          </div>
+          <button id="export" class="text-button" type="button" disabled>Download results ↓</button>
+        </div>
+        <div id="comparison-summary" class="comparison-summary" hidden></div>
+        <div class="panel table-panel">
+          <div id="history-empty" class="history-empty">
+            Results stay here until you close this page.
+          </div>
+          <div id="history-table" class="table-scroll" hidden>
+            <table>
+              <thead>
+                <tr>
+                  <th>Run</th>
+                  <th>Dataset</th>
+                  <th>Scale</th>
+                  <th>Compression</th>
+                  <th>Block size</th>
+                  <th>Blocks</th>
+                  <th>Saved size</th>
+                  <th>Size change</th>
+                  <th>Main time</th>
+                  <th>insertBatch</th>
+                  <th>upsertBatch</th>
+                  <th>updateBatch</th>
+                  <th>deleteBatch</th>
+                  <th>Reference queries</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="history-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>BrowserDatabase storage &amp; relational workload benchmark</span>
+      <span>Local execution · no benchmark data is sent over the network</span>
+    </footer>
+  </body>
+</html>

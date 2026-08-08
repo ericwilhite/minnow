@@ -1,0 +1,35 @@
+{
+  "recordedAt": "2026-08-07T21:00:26.955Z",
+  "browser": "Firefox 153.0",
+  "operatingSystem": "macOS 26.5.2 arm64",
+  "environment": {
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0",
+    "platform": "MacIntel",
+    "hardwareConcurrency": 12
+  },
+  "dataset": {
+    "shape": "100,000 number values; value = row index modulo 1000",
+    "logicalBytes": 800000
+  },
+  "codec": "gzip",
+  "blockSizeBytes": 16426,
+  "blockCount": 1,
+  "storedBytes": 16426,
+  "compressionRatio": 48.70327529526361,
+  "durability": "relaxed",
+  "timingsMs": {
+    "generateAndEncode": 12,
+    "writeAndCommit": 4,
+    "read": 1,
+    "decodeAndVerify": 11,
+    "aggregate": 1,
+    "total": 29
+  },
+  "aggregate": { "operation": "sum", "result": 49950000 },
+  "verified": true,
+  "caveats": [
+    "Quick smoke measurement, not a throughput claim.",
+    "Headless Playwright browser with a single small block.",
+    "No competing workload was controlled or measured."
+  ]
+}
