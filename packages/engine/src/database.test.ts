@@ -2310,3 +2310,208 @@ it("stages a bounded batch in one write and uses bulk reads", async () => {
   );
   store.close();
 });
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} reclaims cancelled compaction output without changing current rows`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "gc_cancelled_events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 1; value <= 4; value += 1) {
+      await database.insert("gc_cancelled_events", { value });
+    }
+
+    const progress = await database.compactTableStep("gc_cancelled_events", {
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (progress.jobId === null) throw new Error("Expected a cancellable compaction job");
+    const partial = await store.getCompactionJob(progress.jobId);
+    const outputBlockId = partial?.outputBlockIds[0];
+    if (outputBlockId === undefined) throw new Error("Expected a partial compaction output");
+    const outputBytes = await store.getBlock(outputBlockId);
+    if (outputBytes === undefined) throw new Error("Expected persisted compaction output bytes");
+    await database.cancelCompactionJob(progress.jobId);
+
+    const result = await database.collectGarbage({ maxItemsPerStep: 1 });
+
+    expect(result).toMatchObject({
+      reclaimedBlockCount: 1,
+      physicallyReclaimedBytes: outputBytes.byteLength,
+    });
+    expect(await store.getBlock(outputBlockId)).toBeUndefined();
+    expect(await database.readTable("gc_cancelled_events")).toEqual([
+      { value: 1 },
+      { value: 2 },
+      { value: 3 },
+      { value: 4 },
+    ]);
+    store.close();
+  });
+
+  it(`${implementation.name} keeps compacted history while leased and reclaims exact bytes after release`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "gc_leased_events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await database.insert("gc_leased_events", { value: 1 });
+    const source = await database.insert("gc_leased_events", { value: 2 });
+    const sourceManifest = await store.getManifest(source.version);
+    if (sourceManifest === undefined) throw new Error("Expected a source manifest");
+    const sourceBytes = await Promise.all(
+      sourceManifest.blockIds.map(async (id) => {
+        const bytes = await store.getBlock(id);
+        if (bytes === undefined) throw new Error(`Expected source block ${id}`);
+        return bytes;
+      }),
+    );
+    const expectedReclaimedBytes = sourceBytes.reduce(
+      (total, bytes) => total + bytes.byteLength,
+      0,
+    );
+    const lease = await new TransactionManager(store, {
+      createId: () => "gc-history-lease",
+    }).openLeasedSnapshot({
+      ownerId: "tab-1",
+      ttlMs: 60_000,
+      version: source.version,
+    });
+    await database.compactTable("gc_leased_events", {
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+
+    const retained = await database.collectGarbage({ maxItemsPerStep: 2 });
+    expect(retained.retainedManifestCount).toBeGreaterThan(0);
+    expect(retained.retainedBlockCount).toBeGreaterThanOrEqual(sourceManifest.blockIds.length);
+    for (const [index, id] of sourceManifest.blockIds.entries()) {
+      expect(await lease.getBlock(id)).toEqual(sourceBytes[index]);
+    }
+
+    await lease.release();
+    const reclaimed = await database.collectGarbage({ maxItemsPerStep: 2 });
+    expect(reclaimed).toMatchObject({
+      reclaimedBlockCount: sourceManifest.blockIds.length,
+      physicallyReclaimedBytes: expectedReclaimedBytes,
+    });
+    for (const id of sourceManifest.blockIds) {
+      expect(await store.getBlock(id)).toBeUndefined();
+    }
+    expect(await database.readTable("gc_leased_events")).toEqual([{ value: 1 }, { value: 2 }]);
+    store.close();
+  });
+
+  it(`${implementation.name} holds an internal read lease across concurrent compaction and collection`, async () => {
+    const store = await implementation.create();
+    const writer = new BrowserDatabase(store);
+    await writer.createTable({
+      name: "gc_read_race_events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await writer.insert("gc_read_race_events", { value: 1 });
+    await writer.insert("gc_read_race_events", { value: 2 });
+    const sourceManifest = await store.getCurrentManifest();
+    if (sourceManifest === undefined) throw new Error("Expected a source manifest");
+
+    let signalReadStarted: (() => void) | undefined;
+    const readStarted = new Promise<void>((resolve) => {
+      signalReadStarted = resolve;
+    });
+    let releaseRead: (() => void) | undefined;
+    const readRelease = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let pauseFirstRead = true;
+    const readerStore = new FaultInjectingBlockStore(store, async (point) => {
+      if (point !== "beforeBlockRead" || !pauseFirstRead) return;
+      pauseFirstRead = false;
+      signalReadStarted?.();
+      await readRelease;
+    });
+    const readPromise = new BrowserDatabase(readerStore).readTable("gc_read_race_events");
+    await readStarted;
+
+    try {
+      expect(await store.listLeases()).toHaveLength(1);
+      await writer.compactTable("gc_read_race_events", {
+        targetBlockBytes: 9,
+        outputCompression: "raw",
+      });
+      await writer.collectGarbage({ maxItemsPerStep: 1 });
+      for (const id of sourceManifest.blockIds) {
+        expect(await store.getBlock(id)).toBeDefined();
+      }
+    } finally {
+      releaseRead?.();
+    }
+
+    expect(await readPromise).toEqual([{ value: 1 }, { value: 2 }]);
+    expect(await store.listLeases()).toEqual([]);
+    await writer.collectGarbage({ maxItemsPerStep: 1 });
+    for (const id of sourceManifest.blockIds) {
+      expect(await store.getBlock(id)).toBeUndefined();
+    }
+    store.close();
+  });
+}
+
+for (const implementation of recoveryImplementations()) {
+  it(`${implementation.name} resumes a bounded garbage-collection job after reopen`, async () => {
+    const harness = await implementation.create();
+    let store = harness.store;
+    let database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "gc_resume_events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 1; value <= 3; value += 1) {
+      await database.insert("gc_resume_events", { value });
+    }
+    const compaction = await database.compactTableStep("gc_resume_events", {
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (compaction.jobId === null) throw new Error("Expected a cancellable compaction job");
+    const partial = await store.getCompactionJob(compaction.jobId);
+    const outputBlockId = partial?.outputBlockIds[0];
+    if (outputBlockId === undefined) throw new Error("Expected a partial compaction output");
+    const outputBytes = await store.getBlock(outputBlockId);
+    if (outputBytes === undefined) throw new Error("Expected partial output bytes");
+    await database.cancelCompactionJob(compaction.jobId);
+
+    let progress = await database.collectGarbageStep({ maxItems: 1 });
+    expect(progress).toMatchObject({
+      state: "running",
+      examinedManifestCount: 1,
+      examinedSegmentCount: 0,
+      examinedBlockCount: 0,
+      result: null,
+    });
+    const jobId = progress.jobId;
+
+    store = await harness.reopen();
+    database = new BrowserDatabase(store);
+    expect((await database.listGarbageCollectionJobs()).map((job) => job.id)).toContain(jobId);
+    while (progress.result === null) {
+      progress = await database.resumeGarbageCollectionJob(jobId, { maxItems: 1 });
+    }
+    expect(progress.result).toMatchObject({
+      jobId,
+      reclaimedBlockCount: 1,
+      physicallyReclaimedBytes: outputBytes.byteLength,
+    });
+    expect(await store.getBlock(outputBlockId)).toBeUndefined();
+    expect(await database.readTable("gc_resume_events")).toEqual([
+      { value: 1 },
+      { value: 2 },
+      { value: 3 },
+    ]);
+    store.close();
+  });
+}

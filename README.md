@@ -3,8 +3,8 @@
 BrowserDatabase is an experimental browser-only relational database built around immutable compressed
 columnar blocks and IndexedDB. The current slice includes the block format, atomic storage
 publication, persistent writes and snapshots, a bounded read-only SQL API, resumable and cancellable
-physical compaction of append segments, deterministic fault injection, and a browser benchmark
-laboratory.
+physical compaction of append segments, lease-aware physical garbage collection, deterministic fault
+injection, and a browser benchmark laboratory.
 
 The public logical types are intentionally small:
 
@@ -103,6 +103,16 @@ while (progress.result === null) {
   progress = await database.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
 }
 const jobs = await database.listCompactionJobs("events");
+
+// Reclaim unreachable history and terminal-job artifacts to completion.
+const collection = await database.collectGarbage({ maxItemsPerStep: 64 });
+
+// Or drive the same durable pass explicitly across yields or database reopens.
+let gcProgress = await database.collectGarbageStep({ maxItems: 8 });
+while (gcProgress.result === null) {
+  gcProgress = await database.resumeGarbageCollectionJob(gcProgress.jobId, { maxItems: 8 });
+}
+const collectionJobs = await database.listGarbageCollectionJobs();
 ```
 
 `result` reports the row count, block count, saved bytes, database version, encoding/staging/commit
@@ -170,13 +180,59 @@ cancellation record update and transaction abort are one atomic storage operatio
 wins, publication cannot commit; if commit wins, cancellation reports `published` and its manifest
 version. The terminal job retains its plan, cursor, metrics, and output IDs for inspection. Any
 immutable output blocks or segment artifacts already written remain unreachable rather than being
-deleted immediately; lease-aware garbage collection will reclaim them in a later Phase 6 slice.
+deleted by cancellation itself; a later garbage-collection pass can reclaim them after revalidating
+that they are still unreachable.
+
+Garbage collection is restart-safe and lease-aware. `collectGarbage()` drives one persisted pass to
+completion, using `maxItemsPerStep` to control each checkpoint. `collectGarbageStep()` plans or
+advances one pass, `resumeGarbageCollectionJob()` continues its durable cursor by ID, and
+`listGarbageCollectionJobs()` exposes the revisioned `planned`, `running`, and `completed` records
+stored in `gc`. Progress reports cumulative examined manifest, segment, and block counts. The
+completed result reports the job ID; pruned, already-pruned, retained, and missing manifest counts;
+reclaimed, retained, and missing segment counts; reclaimed, retained, and missing block counts; and
+`physicallyReclaimedBytes`. That byte value is the sum of the deleted immutable block byte lengths.
+It does not include deleted metadata and does not claim that a browser has returned the same number
+of bytes to its storage quota.
+
+Each Memory or IndexedDB step atomically checks the expected job revision, re-reads reachability,
+applies any manifest tombstones or physical deletions, and checkpoints the new cursor and cumulative
+counters. Roots include the current manifest; reader and backup leases unexpired at the pass's fixed
+cutoff; active transaction snapshots and pending blocks/segments; and the source manifest,
+segments, and source/output blocks of active compactions. Every remaining unpruned manifest roots
+its blocks. Terminal cancelled and aborted compaction artifacts, superseded inputs from published
+compactions, and aborted-transaction artifacts are candidates rather than permanent roots; the
+atomic recheck still retains anything another live root reaches.
+
+Historical manifest descriptors are tombstoned with `prunedAt`, not deleted, so a transaction can
+reconcile a commit whose response was lost. A tombstoned version can no longer be opened for a data
+read, newly pinned, or used to root its former blocks. `BrowserDatabase` creates transient internal
+reader leases while materializing table reads and queries, then releases them after materialization.
+Transaction begin/rebase, lease creation/renewal, and compare-and-swap lease expiry are serialized
+with collection, so a race either establishes a valid root or receives
+`SnapshotManifestMissingError`; it cannot silently pin already-pruned data. Stale-transaction
+recovery also routes deletion through the durable collector instead of deleting pending artifacts
+directly.
+
+`maxItems` bounds the number of manifest, segment, and block candidates examined—and therefore the
+maximum candidate mutations—within one durable step. It does not bound initial candidate planning
+or the full metadata/root scans currently repeated for atomic revalidation. Collection intentionally
+accepts only candidates with persisted provenance in historical manifests, aborted transaction
+journals, or terminal compaction jobs. An otherwise unknown immutable block left by a crash after
+`addBlock()` but before journal attachment is omitted until provenance or conservative age tracking
+exists.
 
 Phase 6 remains open. The implemented policy only rewrites every eligible, contiguous append-only
 segment in a table from L0 to one L1 segment. It does not compact upsert/update/delete deltas, choose
-source subsets, implement L2 policy, or reclaim physical blocks. Mutation-bearing and non-contiguous
-inputs are skipped explicitly; superseded and cancelled-job artifacts remain stored and
-`physicallyReclaimedBytes` is zero until lease-aware garbage collection exists.
+source subsets, or implement L2 policy. Mutation-bearing and non-contiguous inputs are skipped
+explicitly. Garbage collection now reclaims known unreachable physical artifacts, but its planner
+and root discovery are not yet chunked/indexed, and unknown pre-journal orphans plus broader
+catalog, terminal-job, and metadata cleanup remain future work. A compaction result's
+`physicallyReclaimedBytes` remains zero because compaction never deletes in the publication path;
+the separate garbage-collection result reports bytes deleted later.
+
+An unleased `TransactionManager.openSnapshot()` handle is not a durable collection root. Code that
+keeps a snapshot across asynchronous work or an explicit collection pass must use
+`openLeasedSnapshot()` and renew or release that lease explicitly.
 
 ## Storage laboratory
 

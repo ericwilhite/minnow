@@ -3,8 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   IndexedDbBlockStore,
   MemoryBlockStore,
+  SnapshotManifestMissingError,
   WriteConflictError,
   type BlockStore,
+  type GarbageCollectionStepResult,
+  type LeaseRecord,
+  type TransactionRecord,
+  type TransactionRecordUpdate,
 } from "@browserdatabase/storage-idb";
 import { FaultInjectingBlockStore } from "@browserdatabase/testing";
 import { TransactionClosedError, TransactionManager } from "./index.js";
@@ -18,6 +23,105 @@ function implementations(): Array<{ name: string; create: () => Promise<BlockSto
         IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
     },
   ];
+}
+
+async function collectStorageGarbage(
+  store: BlockStore,
+  input: {
+    prefix: string;
+    candidateManifestVersions: readonly number[];
+    candidateSegmentIds?: readonly string[];
+    candidateBlockIds: readonly string[];
+    leaseCutoff: string;
+    maxItems?: number;
+  },
+): Promise<GarbageCollectionStepResult> {
+  let job = await store.createGarbageCollectionJob({
+    id: `${input.prefix}-${crypto.randomUUID()}`,
+    candidateManifestVersions: input.candidateManifestVersions,
+    candidateSegmentIds: input.candidateSegmentIds ?? [],
+    candidateBlockIds: input.candidateBlockIds,
+    leaseCutoff: input.leaseCutoff,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  let result: GarbageCollectionStepResult | undefined;
+  while (job.state !== "completed") {
+    result = await store.runGarbageCollectionStep({
+      jobId: job.id,
+      expectedRevision: job.revision,
+      maxItems: input.maxItems ?? 32,
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    });
+    job = result.job;
+  }
+  if (result === undefined) throw new Error("Garbage collection completed without a step");
+  return result;
+}
+
+class SnapshotPinFaultStore extends FaultInjectingBlockStore {
+  transactionPinAttempts = 0;
+  leasePinAttempts = 0;
+  rebasePinAttempts = 0;
+  failNextTransactionPin = false;
+  failNextLeasePin = false;
+  failNextRebasePin = false;
+
+  constructor(inner: BlockStore) {
+    super(inner, () => undefined);
+  }
+
+  override async createTransaction(record: TransactionRecord): Promise<void> {
+    this.transactionPinAttempts += 1;
+    if (this.failNextTransactionPin && record.snapshotVersion !== null) {
+      this.failNextTransactionPin = false;
+      throw new SnapshotManifestMissingError(record.snapshotVersion);
+    }
+    return super.createTransaction(record);
+  }
+
+  override async createLease(record: LeaseRecord): Promise<void> {
+    this.leasePinAttempts += 1;
+    if (this.failNextLeasePin && record.manifestVersion !== null) {
+      this.failNextLeasePin = false;
+      throw new SnapshotManifestMissingError(record.manifestVersion);
+    }
+    return super.createLease(record);
+  }
+
+  override async updateTransaction(
+    id: string,
+    expectedRevision: number,
+    update: TransactionRecordUpdate,
+  ): Promise<TransactionRecord> {
+    if (update.snapshotVersion !== undefined) {
+      this.rebasePinAttempts += 1;
+      if (this.failNextRebasePin && update.snapshotVersion !== null) {
+        this.failNextRebasePin = false;
+        throw new SnapshotManifestMissingError(update.snapshotVersion);
+      }
+    }
+    return super.updateTransaction(id, expectedRevision, update);
+  }
+}
+
+class LeaseRenewalRaceStore extends FaultInjectingBlockStore {
+  raced = false;
+
+  constructor(inner: BlockStore) {
+    super(inner, () => undefined);
+  }
+
+  override async removeLeaseIfExpired(
+    id: string,
+    expectedRevision: number,
+    expiresAtCutoff: string,
+  ): Promise<boolean> {
+    if (!this.raced) {
+      this.raced = true;
+      await super.renewLease(id, expectedRevision, "2026-01-01T00:10:00.000Z");
+    }
+    return super.removeLeaseIfExpired(id, expectedRevision, expiresAtCutoff);
+  }
 }
 
 for (const implementation of implementations()) {
@@ -170,6 +274,235 @@ for (const implementation of implementations()) {
       expect((await store.getTransaction(compaction.id))?.status).toBe("aborted");
       expect(await store.getBlock("compaction-output-block")).toEqual(Uint8Array.of(1));
       expect(await store.getSegment("compaction-output-segment")).toBeDefined();
+      expect(await store.listGarbageCollectionJobs()).toEqual([
+        expect.objectContaining({
+          state: "completed",
+          retainedBlockCount: 1,
+          retainedSegmentCount: 1,
+          reclaimedBlockCount: 0,
+        }),
+      ]);
+      store.close();
+    });
+
+    it("pins historical blocks with a lease and reclaims their exact bytes after release", async () => {
+      const store = await implementation.create();
+      const now = new Date("2026-01-01T00:00:00.000Z");
+      const manager = new TransactionManager(store, {
+        now: () => now,
+        createId: () => "historical-reader",
+      });
+      const oldBytes = Uint8Array.of(1, 2, 3, 4, 5);
+      await store.addBlock("historical-block", oldBytes);
+      const historical = await store.publishManifest({
+        expectedVersion: null,
+        blockIds: ["historical-block"],
+        createdAt: now.toISOString(),
+      });
+      const leased = await manager.openLeasedSnapshot({
+        ownerId: "tab-1",
+        ttlMs: 60_000,
+        version: historical.version,
+      });
+      await store.addBlock("current-block", Uint8Array.of(9));
+      await store.publishManifest({
+        expectedVersion: historical.version,
+        blockIds: ["current-block"],
+        createdAt: "2026-01-01T00:00:01.000Z",
+      });
+
+      const retained = await collectStorageGarbage(store, {
+        prefix: "lease-retains-history",
+        candidateManifestVersions: [historical.version],
+        candidateBlockIds: ["historical-block"],
+        leaseCutoff: "2026-01-01T00:00:30.000Z",
+      });
+      expect(retained.job).toMatchObject({
+        retainedManifestCount: 1,
+        retainedBlockCount: 1,
+        reclaimedBlockBytes: 0,
+      });
+      expect(await leased.getBlock("historical-block")).toEqual(oldBytes);
+
+      await leased.release();
+      const reclaimed = await collectStorageGarbage(store, {
+        prefix: "released-history",
+        candidateManifestVersions: [historical.version],
+        candidateBlockIds: ["historical-block"],
+        leaseCutoff: "2026-01-01T00:00:30.000Z",
+      });
+      expect(reclaimed.job).toMatchObject({
+        prunedManifestCount: 1,
+        reclaimedBlockCount: 1,
+        reclaimedBlockBytes: oldBytes.byteLength,
+      });
+      const prunedManifest = await store.getManifest(historical.version);
+      expect(prunedManifest?.version).toBe(historical.version);
+      expect(typeof prunedManifest?.prunedAt).toBe("string");
+      expect(await store.getBlock("historical-block")).toBeUndefined();
+      await expect(manager.openSnapshot(historical.version)).rejects.toBeInstanceOf(
+        SnapshotManifestMissingError,
+      );
+      await expect(
+        manager.openLeasedSnapshot({
+          ownerId: "tab-1",
+          ttlMs: 60_000,
+          version: historical.version,
+        }),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+      expect((await store.getCurrentManifest())?.blockIds).toEqual(["current-block"]);
+      store.close();
+    });
+
+    it("treats a lease expiring exactly at the collection cutoff as expired", async () => {
+      const store = await implementation.create();
+      const now = new Date("2026-01-01T00:00:00.000Z");
+      const manager = new TransactionManager(store, {
+        now: () => now,
+        createId: () => "expiring-reader",
+      });
+      const oldBytes = Uint8Array.of(1, 2, 3);
+      await store.addBlock("expired-history", oldBytes);
+      const historical = await store.publishManifest({
+        expectedVersion: null,
+        blockIds: ["expired-history"],
+        createdAt: now.toISOString(),
+      });
+      await manager.openLeasedSnapshot({
+        ownerId: "tab-1",
+        ttlMs: 1_000,
+        version: historical.version,
+      });
+      await store.addBlock("new-history", Uint8Array.of(8));
+      await store.publishManifest({
+        expectedVersion: historical.version,
+        blockIds: ["new-history"],
+        createdAt: "2026-01-01T00:00:00.500Z",
+      });
+
+      const result = await collectStorageGarbage(store, {
+        prefix: "expired-history",
+        candidateManifestVersions: [historical.version],
+        candidateBlockIds: ["expired-history"],
+        leaseCutoff: "2026-01-01T00:00:01.000Z",
+      });
+      expect(result.job).toMatchObject({
+        prunedManifestCount: 1,
+        reclaimedBlockCount: 1,
+        reclaimedBlockBytes: oldBytes.byteLength,
+      });
+      expect(await store.getBlock("expired-history")).toBeUndefined();
+      store.close();
+    });
+
+    it("retains an active transaction snapshot until the transaction closes", async () => {
+      const store = await implementation.create();
+      const manager = new TransactionManager(store, { createId: () => "snapshot-owner" });
+      const oldBytes = Uint8Array.of(1, 2, 3, 4);
+      await store.addBlock("transaction-history", oldBytes);
+      const historical = await store.publishManifest({
+        expectedVersion: null,
+        blockIds: ["transaction-history"],
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const transaction = await manager.begin();
+      await store.addBlock("transaction-current", Uint8Array.of(9));
+      await store.publishManifest({
+        expectedVersion: historical.version,
+        blockIds: ["transaction-current"],
+        createdAt: "2026-01-01T00:00:01.000Z",
+      });
+
+      const retained = await collectStorageGarbage(store, {
+        prefix: "active-transaction",
+        candidateManifestVersions: [historical.version],
+        candidateBlockIds: ["transaction-history"],
+        leaseCutoff: "2026-01-01T00:01:00.000Z",
+      });
+      expect(retained.job).toMatchObject({
+        retainedManifestCount: 1,
+        retainedBlockCount: 1,
+        reclaimedBlockBytes: 0,
+      });
+      expect(await transaction.getBlock("transaction-history")).toEqual(oldBytes);
+
+      await transaction.abort();
+      const reclaimed = await collectStorageGarbage(store, {
+        prefix: "closed-transaction",
+        candidateManifestVersions: [historical.version],
+        candidateBlockIds: ["transaction-history"],
+        leaseCutoff: "2026-01-01T00:01:00.000Z",
+      });
+      expect(reclaimed.job).toMatchObject({
+        prunedManifestCount: 1,
+        reclaimedBlockCount: 1,
+        reclaimedBlockBytes: oldBytes.byteLength,
+      });
+      store.close();
+    });
+
+    it("retries latest transaction, lease, and rebase pins after a pruned-manifest race", async () => {
+      const inner = await implementation.create();
+      await inner.addBlock("pin-source", Uint8Array.of(1));
+      await inner.publishManifest({ expectedVersion: null, blockIds: ["pin-source"] });
+      const store = new SnapshotPinFaultStore(inner);
+      const ids = ["pin-transaction", "pin-lease"];
+      const manager = new TransactionManager(store, {
+        createId: () => ids.shift() ?? crypto.randomUUID(),
+      });
+
+      store.failNextTransactionPin = true;
+      const transaction = await manager.begin();
+      expect(transaction.snapshotVersion).toBe(0);
+      expect(store.transactionPinAttempts).toBe(2);
+
+      store.failNextLeasePin = true;
+      const lease = await manager.openLeasedSnapshot({ ownerId: "tab-1", ttlMs: 60_000 });
+      expect(lease.version).toBe(0);
+      expect(store.leasePinAttempts).toBe(2);
+
+      store.failNextRebasePin = true;
+      expect((await transaction.rebase()).version).toBe(0);
+      expect(store.rebasePinAttempts).toBe(2);
+
+      await lease.release();
+      await transaction.abort();
+      store.close();
+    });
+
+    it("does not retry an explicitly requested historical lease after it is pruned", async () => {
+      const inner = await implementation.create();
+      await inner.addBlock("explicit-pin-source", Uint8Array.of(1));
+      await inner.publishManifest({ expectedVersion: null, blockIds: ["explicit-pin-source"] });
+      const store = new SnapshotPinFaultStore(inner);
+      const manager = new TransactionManager(store, { createId: () => "explicit-pin-lease" });
+      store.failNextLeasePin = true;
+
+      await expect(
+        manager.openLeasedSnapshot({ ownerId: "tab-1", ttlMs: 60_000, version: 0 }),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+      expect(store.leasePinAttempts).toBe(1);
+      expect(await inner.listLeases()).toEqual([]);
+      store.close();
+    });
+
+    it("does not remove a lease that renews during expired-lease cleanup", async () => {
+      let now = new Date("2026-01-01T00:00:00.000Z");
+      const inner = await implementation.create();
+      const store = new LeaseRenewalRaceStore(inner);
+      const manager = new TransactionManager(store, {
+        now: () => now,
+        createId: () => "renewed-during-cleanup",
+      });
+      await manager.openLeasedSnapshot({ ownerId: "tab-1", ttlMs: 1_000 });
+      now = new Date("2026-01-01T00:01:00.000Z");
+
+      expect(await manager.removeExpiredLeases()).toEqual([]);
+      expect(store.raced).toBe(true);
+      expect(await inner.getLease("renewed-during-cleanup")).toMatchObject({
+        revision: 1,
+        expiresAt: "2026-01-01T00:10:00.000Z",
+      });
       store.close();
     });
   });
@@ -206,6 +539,62 @@ it("reconciles a successful commit when the response is lost", async () => {
   expect(manifest.blockIds).toEqual(["saved"]);
   expect(transaction.status).toBe("committed");
   expect((await inner.getTransaction(transaction.id))?.status).toBe("committed");
+});
+
+it("reconciles a lost commit response from a tombstoned manifest descriptor", async () => {
+  const inner = new MemoryBlockStore();
+  let signalCommitted: (() => void) | undefined;
+  const committed = new Promise<void>((resolve) => {
+    signalCommitted = resolve;
+  });
+  let releaseResponse: (() => void) | undefined;
+  const responseRelease = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
+  });
+  const faultStore = new FaultInjectingBlockStore(inner, async (point) => {
+    if (point !== "afterTransactionCommit") return;
+    signalCommitted?.();
+    await responseRelease;
+    throw new Error("commit response lost after reclamation");
+  });
+  const first = await new TransactionManager(faultStore, {
+    createId: () => "lost-response-transaction",
+  }).begin();
+  await first.stageBlock("lost-response-block", Uint8Array.of(1, 2, 3));
+  const firstCommit = first.commit();
+  await committed;
+
+  try {
+    const successor = await new TransactionManager(inner, {
+      createId: () => "successor-transaction",
+    }).begin();
+    await successor.stageBlock("successor-block", Uint8Array.of(4));
+    successor.supersedeBlocks(["lost-response-block"]);
+    await successor.commit();
+    const collection = await collectStorageGarbage(inner, {
+      prefix: "lost-response-history",
+      candidateManifestVersions: [0],
+      candidateBlockIds: ["lost-response-block"],
+      leaseCutoff: "2026-01-01T00:01:00.000Z",
+    });
+    expect(collection.job).toMatchObject({
+      prunedManifestCount: 1,
+      reclaimedBlockCount: 1,
+      reclaimedBlockBytes: 3,
+    });
+    expect(typeof (await inner.getManifest(0))?.prunedAt).toBe("string");
+    expect(await inner.getBlock("lost-response-block")).toBeUndefined();
+  } finally {
+    releaseResponse?.();
+  }
+
+  const reconciled = await firstCommit;
+  expect(reconciled).toMatchObject({
+    version: 0,
+    blockIds: ["lost-response-block"],
+  });
+  expect(typeof reconciled.prunedAt).toBe("string");
+  expect(first.status).toBe("committed");
 });
 
 it("keeps a transaction active when failure happens before commit", async () => {
@@ -253,6 +642,13 @@ it("aborts stale transactions and removes only their unreachable blocks", async 
   expect(await store.getBlock("still-in-use")).toEqual(Uint8Array.of(2));
   expect((await store.getTransaction("stale"))?.status).toBe("aborted");
   expect((await store.getTransaction("live"))?.status).toBe("active");
+  expect(await store.listGarbageCollectionJobs()).toEqual([
+    expect.objectContaining({
+      state: "completed",
+      reclaimedBlockCount: 1,
+      reclaimedBlockBytes: 1,
+    }),
+  ]);
 });
 
 it("resumes an active transaction and reconciles an existing immutable block", async () => {

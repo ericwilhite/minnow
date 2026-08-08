@@ -1,10 +1,13 @@
 import {
   type BlockStore,
   type BlockWrite,
+  GarbageCollectionJobConflictError,
+  LeaseConflictError,
   type LeaseKind,
   type LeaseRecord,
   type Manifest,
   type SegmentRecord,
+  SnapshotManifestMissingError,
   type TransactionRecord,
   TransactionRecordConflictError,
   type UniqueKeyChanges,
@@ -30,10 +33,12 @@ export interface RecoveryReport {
 }
 
 export interface OpenLeasedSnapshotOptions {
+  /** Optional caller-owned ID used by internal short-lived leases. */
+  id?: string;
   ownerId: string;
   ttlMs: number;
   kind?: LeaseKind;
-  version?: number;
+  version?: number | null;
 }
 
 export class TransactionClosedError extends Error {
@@ -93,6 +98,11 @@ export class LeasedSnapshot extends Snapshot {
 
   get expiresAt(): Date {
     return new Date(this.#record.expiresAt);
+  }
+
+  override async getBlock(id: string): Promise<Uint8Array | undefined> {
+    this.#assertOpen();
+    return super.getBlock(id);
   }
 
   async renew(ttlMs: number): Promise<Date> {
@@ -296,12 +306,21 @@ export class DatabaseTransaction {
 
   async rebase(): Promise<Snapshot> {
     this.#assertActive();
-    const current = await this.store.getCurrentManifest();
-    this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
-      snapshotVersion: current?.version ?? null,
-      updatedAt: this.now().toISOString(),
-    });
-    return new Snapshot(this.store, current?.version ?? null, current?.blockIds ?? []);
+    for (;;) {
+      const current = await this.store.getCurrentManifest();
+      try {
+        this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
+          snapshotVersion: current?.version ?? null,
+          updatedAt: this.now().toISOString(),
+        });
+        return new Snapshot(this.store, current?.version ?? null, current?.blockIds ?? []);
+      } catch (error) {
+        if (error instanceof SnapshotManifestMissingError) {
+          continue;
+        }
+        throw error;
+      }
+    }
   }
 
   async abort(): Promise<void> {
@@ -330,21 +349,31 @@ export class TransactionManager {
   }
 
   async begin(): Promise<DatabaseTransaction> {
-    const current = await this.store.getCurrentManifest();
-    const timestamp = this.#now().toISOString();
-    const record: TransactionRecord = {
-      id: this.#createId(),
-      snapshotVersion: current?.version ?? null,
-      pendingBlockIds: [],
-      pendingSegmentIds: [],
-      status: "active",
-      revision: 0,
-      startedAt: timestamp,
-      updatedAt: timestamp,
-      committedVersion: null,
-    };
-    await this.store.createTransaction(record);
-    return new DatabaseTransaction(this.store, record, this.#now);
+    const id = this.#createId();
+    for (;;) {
+      const current = await this.store.getCurrentManifest();
+      const timestamp = this.#now().toISOString();
+      const record: TransactionRecord = {
+        id,
+        snapshotVersion: current?.version ?? null,
+        pendingBlockIds: [],
+        pendingSegmentIds: [],
+        status: "active",
+        revision: 0,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        committedVersion: null,
+      };
+      try {
+        await this.store.createTransaction(record);
+        return new DatabaseTransaction(this.store, record, this.#now);
+      } catch (error) {
+        if (error instanceof SnapshotManifestMissingError) {
+          continue;
+        }
+        throw error;
+      }
+    }
   }
 
   async resume(transactionId: string): Promise<DatabaseTransaction> {
@@ -364,23 +393,36 @@ export class TransactionManager {
   async openLeasedSnapshot(options: OpenLeasedSnapshotOptions): Promise<LeasedSnapshot> {
     validateTtl(options.ttlMs);
     if (options.ownerId.trim().length === 0) throw new TypeError("Lease owner cannot be empty");
-    const snapshot = await this.openSnapshot(options.version);
-    const record: LeaseRecord = {
-      id: this.#createId(),
-      kind: options.kind ?? "reader",
-      manifestVersion: snapshot.version,
-      ownerId: options.ownerId,
-      expiresAt: new Date(this.#now().getTime() + options.ttlMs).toISOString(),
-      revision: 0,
-    };
-    await this.store.createLease(record);
-    return new LeasedSnapshot(
-      this.store,
-      snapshot.version,
-      snapshot.listBlockIds(),
-      record,
-      this.#now,
-    );
+    if (options.id?.trim().length === 0) {
+      throw new TypeError("Lease ID cannot be empty");
+    }
+    const id = options.id ?? this.#createId();
+    for (;;) {
+      const snapshot = await this.openSnapshot(options.version);
+      const record: LeaseRecord = {
+        id,
+        kind: options.kind ?? "reader",
+        manifestVersion: snapshot.version,
+        ownerId: options.ownerId,
+        expiresAt: new Date(this.#now().getTime() + options.ttlMs).toISOString(),
+        revision: 0,
+      };
+      try {
+        await this.store.createLease(record);
+        return new LeasedSnapshot(
+          this.store,
+          snapshot.version,
+          snapshot.listBlockIds(),
+          record,
+          this.#now,
+        );
+      } catch (error) {
+        if (options.version === undefined && error instanceof SnapshotManifestMissingError) {
+          continue;
+        }
+        throw error;
+      }
+    }
   }
 
   async removeExpiredLeases(at: Date = this.#now()): Promise<string[]> {
@@ -389,8 +431,14 @@ export class TransactionManager {
     const removed: string[] = [];
     for (const lease of await this.store.listLeases()) {
       if (Date.parse(lease.expiresAt) > timestamp) continue;
-      await this.store.removeLease(lease.id);
-      removed.push(lease.id);
+      try {
+        if (await this.store.removeLeaseIfExpired(lease.id, lease.revision, at.toISOString())) {
+          removed.push(lease.id);
+        }
+      } catch (error) {
+        if (error instanceof LeaseConflictError) continue;
+        throw error;
+      }
     }
     return removed.sort();
   }
@@ -423,55 +471,58 @@ export class TransactionManager {
       }
     }
 
-    const roots = new Set<string>();
-    for (const manifest of await this.store.listManifests()) {
-      manifest.blockIds.forEach((id) => roots.add(id));
-    }
-    for (const record of await this.store.listTransactions()) {
-      if (record.status === "active") record.pendingBlockIds.forEach((id) => roots.add(id));
-    }
-    const activeCompactionJobs = (await this.store.listCompactionJobs()).filter(
-      (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
-    );
-    for (const job of activeCompactionJobs) {
-      job.sourceBlockIds.forEach((id) => roots.add(id));
-      job.outputBlockIds.forEach((id) => roots.add(id));
-    }
-
-    const activeSegmentIds = new Set<string>();
-    for (const record of await this.store.listTransactions()) {
-      if (record.status === "active") {
-        record.pendingSegmentIds.forEach((id) => activeSegmentIds.add(id));
-      }
-    }
-    for (const job of activeCompactionJobs) {
-      if (job.outputSegmentId !== null) activeSegmentIds.add(job.outputSegmentId);
-    }
-
     const removedBlockIds: string[] = [];
     const retainedBlockIds: string[] = [];
-    for (const id of [...candidates].sort()) {
-      if (roots.has(id) || options.removePendingBlocks === false) {
-        retainedBlockIds.push(id);
-      } else {
-        await this.store.removeBlock(id);
-        removedBlockIds.push(id);
-      }
-    }
     const removedSegmentIds: string[] = [];
     const retainedSegmentIds: string[] = [];
-    for (const id of [...segmentCandidates].sort()) {
-      const segment = await this.store.getSegment(id);
-      const published =
-        segment !== undefined &&
-        Object.values(segment.columnBlockIds)
-          .flat()
-          .every((blockId) => roots.has(blockId));
-      if (published || activeSegmentIds.has(id) || options.removePendingBlocks === false) {
-        retainedSegmentIds.push(id);
-      } else {
-        await this.store.removeSegment(id);
-        removedSegmentIds.push(id);
+    if (options.removePendingBlocks === false) {
+      retainedBlockIds.push(...[...candidates].sort());
+      retainedSegmentIds.push(...[...segmentCandidates].sort());
+    } else if (candidates.size > 0 || segmentCandidates.size > 0) {
+      const timestamp = this.#now().toISOString();
+      const baseId = `recovery/${timestamp}/${this.#createId()}`;
+      let suffix = 0;
+      let job;
+      for (;;) {
+        const id = suffix === 0 ? baseId : `${baseId}/${String(suffix)}`;
+        if ((await this.store.getGarbageCollectionJob(id)) !== undefined) {
+          suffix += 1;
+          continue;
+        }
+        try {
+          job = await this.store.createGarbageCollectionJob({
+            id,
+            candidateManifestVersions: [],
+            candidateSegmentIds: [...segmentCandidates],
+            candidateBlockIds: [...candidates],
+            leaseCutoff: timestamp,
+            createdAt: timestamp,
+          });
+          break;
+        } catch (error) {
+          if ((await this.store.getGarbageCollectionJob(id)) === undefined) throw error;
+          suffix += 1;
+        }
+      }
+      while (job.state !== "completed") {
+        try {
+          const step = await this.store.runGarbageCollectionStep({
+            jobId: job.id,
+            expectedRevision: job.revision,
+            maxItems: 128,
+            updatedAt: this.#now().toISOString(),
+          });
+          removedBlockIds.push(...step.reclaimedBlockIds);
+          retainedBlockIds.push(...step.retainedBlockIds);
+          removedSegmentIds.push(...step.reclaimedSegmentIds);
+          retainedSegmentIds.push(...step.retainedSegmentIds);
+          job = step.job;
+        } catch (error) {
+          if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+          const latest = await this.store.getGarbageCollectionJob(job.id);
+          if (latest === undefined) throw new Error(`Garbage collection job not found: ${job.id}`);
+          job = latest;
+        }
       }
     }
     return {
@@ -494,6 +545,8 @@ function validateTtl(ttlMs: number): void {
 async function loadSnapshot(store: BlockStore, version: number | null): Promise<Snapshot> {
   if (version === null) return new Snapshot(store, null, []);
   const manifest = await store.getManifest(version);
-  if (manifest === undefined) throw new Error(`Snapshot manifest is missing: ${String(version)}`);
+  if (manifest === undefined || manifest.prunedAt !== undefined) {
+    throw new SnapshotManifestMissingError(version);
+  }
   return new Snapshot(store, manifest.version, manifest.blockIds);
 }

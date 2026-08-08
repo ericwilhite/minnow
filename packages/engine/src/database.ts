@@ -21,6 +21,9 @@ import {
   CompactionJobConflictError,
   type CompactionJobRecord,
   type CompactionJobState,
+  GarbageCollectionJobConflictError,
+  type GarbageCollectionJobRecord,
+  type GarbageCollectionJobState,
   type RechunkCompactionOutputWindow,
   type RechunkCompactionRewritePlan,
   type RechunkCompactionSourceBlock,
@@ -29,11 +32,17 @@ import {
   type SimpleDataType,
   type TableColumnRecord,
   type TableRecord,
+  SnapshotManifestMissingError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
   WriteConflictError,
 } from "@browserdatabase/storage-idb";
-import { TransactionManager, type DatabaseTransaction } from "@browserdatabase/transactions";
+import {
+  TransactionManager,
+  type DatabaseTransaction,
+  type LeasedSnapshot,
+  type Snapshot,
+} from "@browserdatabase/transactions";
 import {
   compileQuery,
   createPreparedQuery,
@@ -47,6 +56,7 @@ const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
+const INTERNAL_READ_LEASE_TTL_MS = 60_000;
 
 export interface ColumnDefinition {
   name: string;
@@ -194,6 +204,40 @@ export interface CancelCompactionJobResult {
   publishedVersion: number | null;
 }
 
+export interface CollectGarbageOptions {
+  /** Maximum candidates examined and checkpointed by each durable reclamation step. */
+  maxItemsPerStep?: number;
+}
+
+export interface CollectGarbageStepOptions {
+  /** Maximum candidates examined and checkpointed by this durable reclamation step. */
+  maxItems?: number;
+}
+
+export interface GarbageCollectionResult {
+  jobId: string;
+  prunedManifestCount: number;
+  alreadyPrunedManifestCount: number;
+  retainedManifestCount: number;
+  missingManifestCount: number;
+  reclaimedSegmentCount: number;
+  retainedSegmentCount: number;
+  missingSegmentCount: number;
+  reclaimedBlockCount: number;
+  retainedBlockCount: number;
+  missingBlockCount: number;
+  physicallyReclaimedBytes: number;
+}
+
+export interface GarbageCollectionProgress {
+  jobId: string;
+  state: GarbageCollectionJobState;
+  examinedManifestCount: number;
+  examinedSegmentCount: number;
+  examinedBlockCount: number;
+  result: GarbageCollectionResult | null;
+}
+
 export interface TableDefinition {
   name: string;
   columns: ColumnDefinition[];
@@ -298,6 +342,8 @@ export class BrowserDatabase {
   readonly #maxCommitRetries: number;
   readonly #now: () => Date;
   readonly #createId: () => string;
+  readonly #internalLeaseOwnerId = `browserdatabase/${crypto.randomUUID()}`;
+  #internalLeaseSequence = 0;
 
   constructor(
     private readonly store: BlockStore,
@@ -885,23 +931,23 @@ export class BrowserDatabase {
       tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
     );
     const columns = referencedColumns(plan, schemas);
-    const snapshotVersion =
-      options.version ?? (await this.store.getCurrentManifest())?.version ?? null;
     const rows = new Map<string, DatabaseRow[]>();
-    for (const table of tables) {
-      const requestedColumns = columns.get(table.name);
-      rows.set(
-        table.name,
-        await this.#materializeTable(
-          table,
-          snapshotVersion,
-          resolveReadColumns(
+    await this.#withLeasedSnapshot(options.version, async (snapshot) => {
+      for (const table of tables) {
+        const requestedColumns = columns.get(table.name);
+        rows.set(
+          table.name,
+          await this.#materializeTableAtSnapshot(
             table,
-            requestedColumns?.length === 0 ? [table.columns[0]?.name ?? ""] : requestedColumns,
+            snapshot,
+            resolveReadColumns(
+              table,
+              requestedColumns?.length === 0 ? [table.columns[0]?.name ?? ""] : requestedColumns,
+            ),
           ),
-        ),
-      );
-    }
+        );
+      }
+    });
     return createPreparedQuery(plan, rows);
   }
 
@@ -917,11 +963,13 @@ export class BrowserDatabase {
 
   async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {
     const table = await this.#findTable(tableName);
-    return (await this.#visibleSegmentRecords(table, version)).map((segment) => ({
-      id: segment.id,
-      rowCount: segment.rowCount,
-      columnBlockIds: structuredClone(segment.columnBlockIds),
-    }));
+    return this.#withLeasedSnapshot(version, async (snapshot) =>
+      (await this.#visibleSegmentRecords(table, snapshot)).map((segment) => ({
+        id: segment.id,
+        rowCount: segment.rowCount,
+        columnBlockIds: structuredClone(segment.columnBlockIds),
+      })),
+    );
   }
 
   async compactTable(
@@ -1006,18 +1054,141 @@ export class BrowserDatabase {
     }
   }
 
+  /** Runs restart-safe lease-aware reclamation to completion in bounded durable steps. */
+  async collectGarbage(options: CollectGarbageOptions = {}): Promise<GarbageCollectionResult> {
+    const maxItems = positiveWholeNumber(
+      options.maxItemsPerStep ?? 64,
+      "Garbage collection items per step",
+    );
+    let progress = await this.collectGarbageStep({ maxItems });
+    while (progress.result === null) {
+      progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
+    }
+    return progress.result;
+  }
+
+  /** Plans or advances one durable garbage-collection pass. */
+  async collectGarbageStep(
+    options: CollectGarbageStepOptions = {},
+  ): Promise<GarbageCollectionProgress> {
+    const active = (await this.store.listGarbageCollectionJobs()).find(
+      (job) => job.state === "planned" || job.state === "running",
+    );
+    const job = active ?? (await this.#planGarbageCollection());
+    return this.#runGarbageCollectionJob(
+      job,
+      positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
+    );
+  }
+
+  /** Continues a persisted reclamation pass after a cooperative yield or restart. */
+  async resumeGarbageCollectionJob(
+    jobId: string,
+    options: CollectGarbageStepOptions = {},
+  ): Promise<GarbageCollectionProgress> {
+    const job = await this.store.getGarbageCollectionJob(jobId);
+    if (job === undefined) throw new Error(`Garbage collection job not found: ${jobId}`);
+    return this.#runGarbageCollectionJob(
+      job,
+      positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
+    );
+  }
+
+  async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
+    return this.store.listGarbageCollectionJobs();
+  }
+
+  async #planGarbageCollection(): Promise<GarbageCollectionJobRecord> {
+    const [current, manifests, transactions, compactionJobs] = await Promise.all([
+      this.store.getCurrentManifest(),
+      this.store.listManifests(),
+      this.store.listTransactions(),
+      this.store.listCompactionJobs(),
+    ]);
+    const historicalManifests = manifests.filter(
+      (manifest) => manifest.version !== current?.version && manifest.prunedAt === undefined,
+    );
+    const terminalTransactions = transactions.filter((record) => record.status === "aborted");
+    const terminalCompactionJobs = compactionJobs.filter(
+      (job) => job.state === "published" || job.state === "cancelled" || job.state === "aborted",
+    );
+    const candidateBlockIds = new Set(historicalManifests.flatMap((manifest) => manifest.blockIds));
+    const candidateSegmentIds = new Set<string>();
+    for (const transaction of terminalTransactions) {
+      transaction.pendingBlockIds.forEach((id) => candidateBlockIds.add(id));
+      transaction.pendingSegmentIds.forEach((id) => candidateSegmentIds.add(id));
+    }
+    for (const job of terminalCompactionJobs) {
+      job.sourceBlockIds.forEach((id) => candidateBlockIds.add(id));
+      job.outputBlockIds.forEach((id) => candidateBlockIds.add(id));
+      job.sourceSegmentIds.forEach((id) => candidateSegmentIds.add(id));
+      if (job.outputSegmentId !== null) candidateSegmentIds.add(job.outputSegmentId);
+    }
+    const timestamp = this.#now().toISOString();
+    return this.store.createGarbageCollectionJob({
+      id: `garbage-collection/${this.#createId()}`,
+      candidateManifestVersions: historicalManifests.map((manifest) => manifest.version),
+      candidateSegmentIds: [...candidateSegmentIds],
+      candidateBlockIds: [...candidateBlockIds],
+      leaseCutoff: timestamp,
+      createdAt: timestamp,
+    });
+  }
+
+  async #runGarbageCollectionJob(
+    initialJob: GarbageCollectionJobRecord,
+    maxItems: number,
+  ): Promise<GarbageCollectionProgress> {
+    let job = initialJob;
+    for (;;) {
+      if (job.state === "completed") return garbageCollectionProgress(job);
+      try {
+        const step = await this.store.runGarbageCollectionStep({
+          jobId: job.id,
+          expectedRevision: job.revision,
+          maxItems,
+          updatedAt: this.#now().toISOString(),
+        });
+        return garbageCollectionProgress(step.job);
+      } catch (error) {
+        if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
+        const latest = await this.store.getGarbageCollectionJob(job.id);
+        if (latest === undefined) throw new Error(`Garbage collection job not found: ${job.id}`);
+        job = latest;
+      }
+    }
+  }
+
   async #planCompaction(
     table: TableRecord,
     options: CompactTableOptions,
+  ): Promise<CompactionJobRecord | CompactTableResult> {
+    for (;;) {
+      const manifest = await this.store.getCurrentManifest();
+      const version = manifest?.version ?? null;
+      try {
+        return await this.#withLeasedSnapshot(version, (snapshot) =>
+          this.#planCompactionAtSnapshot(table, options, version, snapshot),
+        );
+      } catch (error) {
+        if (error instanceof SnapshotManifestMissingError) continue;
+        throw error;
+      }
+    }
+  }
+
+  async #planCompactionAtSnapshot(
+    table: TableRecord,
+    options: CompactTableOptions,
+    version: number | null,
+    snapshot: LeasedSnapshot,
   ): Promise<CompactionJobRecord | CompactTableResult> {
     const minimumSegments = positiveWholeNumber(
       options.minimumSegments ?? 2,
       "Compaction segment threshold",
     );
     const targetLevel = positiveWholeNumber(options.targetLevel ?? 1, "Compaction target level");
-    const manifest = await this.store.getCurrentManifest();
-    const version = manifest?.version ?? null;
-    const sourceSegments = await this.#visibleSegmentRecords(table, version);
+    const sourceSegments = await this.#visibleSegmentRecords(table, snapshot);
     const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
     if (sourceSegments.length < minimumSegments) {
       return compactTableSkipped(
@@ -1079,6 +1250,7 @@ export class BrowserDatabase {
       targetBlockBytes,
       outputCompression,
       memoryBudgetBytes,
+      snapshot,
     );
     const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
     if (minimumMemoryBytes > memoryBudgetBytes) {
@@ -1123,6 +1295,7 @@ export class BrowserDatabase {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
+    await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
     try {
       await this.store.createCompactionJob(job);
       return job;
@@ -1139,6 +1312,7 @@ export class BrowserDatabase {
     targetBlockBytes: number,
     outputCompression: Compression,
     memoryBudgetBytes: number,
+    snapshot: LeasedSnapshot,
   ): Promise<RechunkCompactionRewritePlan> {
     const first = sourceSegments[0];
     const last = sourceSegments[sourceSegments.length - 1];
@@ -1162,6 +1336,7 @@ export class BrowserDatabase {
           throw new Error(`Compaction source column is missing blocks: ${column.name}`);
         }
         for (const blockId of blockIds) {
+          await this.#renewInternalLeaseIfNeeded(snapshot);
           const bytes = await this.store.getBlock(blockId);
           if (bytes === undefined)
             throw new Error(`Compaction source block is missing: ${blockId}`);
@@ -1219,6 +1394,7 @@ export class BrowserDatabase {
       targetBlockBytes,
       outputCompression,
       memoryBudgetBytes,
+      snapshot,
     );
 
     return {
@@ -1240,6 +1416,7 @@ export class BrowserDatabase {
     targetBlockBytes: number,
     outputCompression: Compression,
     memoryBudgetBytes: number,
+    snapshot: LeasedSnapshot,
   ): Promise<RechunkCompactionOutputWindow[]> {
     const outputs: RechunkCompactionOutputWindow[] = [];
     for (const output of estimatedOutputs) {
@@ -1250,6 +1427,7 @@ export class BrowserDatabase {
           targetBlockBytes,
           outputCompression,
           memoryBudgetBytes,
+          snapshot,
         )),
       );
     }
@@ -1262,6 +1440,7 @@ export class BrowserDatabase {
     targetBlockBytes: number,
     outputCompression: Compression,
     memoryBudgetBytes: number,
+    snapshot: LeasedSnapshot,
   ): Promise<RechunkCompactionOutputWindow[]> {
     let splitReason: "target" | "format" | "memory" | null = null;
     const requiredMemoryBytes = Math.max(
@@ -1279,6 +1458,7 @@ export class BrowserDatabase {
               output,
               outputCompression,
               memoryBudgetBytes,
+              snapshot,
             )
           ).encodedByteLength;
         } catch (error) {
@@ -1326,6 +1506,7 @@ export class BrowserDatabase {
         targetBlockBytes,
         outputCompression,
         memoryBudgetBytes,
+        snapshot,
       )),
       ...(await this.#refineRechunkOutputWindow(
         columns,
@@ -1333,6 +1514,7 @@ export class BrowserDatabase {
         targetBlockBytes,
         outputCompression,
         memoryBudgetBytes,
+        snapshot,
       )),
     ];
   }
@@ -1342,12 +1524,14 @@ export class BrowserDatabase {
     output: RechunkCompactionOutputWindow,
     outputCompression: Compression,
     memoryBudgetBytes: number,
+    snapshot: LeasedSnapshot,
   ) {
     const loaded = await this.#loadRechunkPhysicalRanges(
       column,
       output,
       outputCompression,
       memoryBudgetBytes,
+      snapshot,
     );
     return measurePhysicalColumnRanges(column.type, loaded.ranges);
   }
@@ -1543,6 +1727,7 @@ export class BrowserDatabase {
           throw new Error(`Compaction output segment cannot be adopted: ${outputSegmentId}`);
         }
         const visible = (await this.store.listManifests()).some((manifest) => {
+          if (manifest.prunedAt !== undefined) return false;
           const blockIds = new Set(manifest.blockIds);
           return expectedOutputIds.every((id) => blockIds.has(id));
         });
@@ -1723,6 +1908,7 @@ export class BrowserDatabase {
     output: RechunkCompactionOutputWindow,
     outputCompression: Compression,
     memoryBudgetBytes: number,
+    snapshot?: LeasedSnapshot,
   ): Promise<{ ranges: PhysicalColumnRange[]; peakWorkingBytes: number }> {
     const memoryBound = rechunkOutputMemoryBound(column, output, outputCompression);
     if (memoryBound > memoryBudgetBytes) {
@@ -1734,6 +1920,7 @@ export class BrowserDatabase {
     );
     const ranges: PhysicalColumnRange[] = [];
     for (const sourceBlock of overlappingRechunkSourceBlocks(column, output)) {
+      if (snapshot !== undefined) await this.#renewInternalLeaseIfNeeded(snapshot);
       const bytes = await this.store.getBlock(sourceBlock.blockId);
       if (bytes === undefined) {
         throw new Error(`A compaction source block is missing: ${sourceBlock.blockId}`);
@@ -1969,7 +2156,17 @@ export class BrowserDatabase {
     version?: number | null,
     projectedColumns: readonly TableColumnRecord[] = table.columns,
   ): Promise<DatabaseRow[]> {
-    const segments = await this.#visibleSegmentRecords(table, version);
+    return this.#withLeasedSnapshot(version, (snapshot) =>
+      this.#materializeTableAtSnapshot(table, snapshot, projectedColumns),
+    );
+  }
+
+  async #materializeTableAtSnapshot(
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    projectedColumns: readonly TableColumnRecord[] = table.columns,
+  ): Promise<DatabaseRow[]> {
+    const segments = await this.#visibleSegmentRecords(table, snapshot);
     const keyColumn = getUniqueKeyColumn(table);
     const neededColumns = [
       ...projectedColumns,
@@ -1981,10 +2178,11 @@ export class BrowserDatabase {
     const rows: Array<DatabaseRow | undefined> = [];
     const rowIndexByKey = new Map<string, number>();
     for (const segment of segments) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
       const segmentBlockIds = Object.entries(segment.columnBlockIds)
         .filter(([columnId]) => neededColumnIds.has(columnId))
         .flatMap(([, ids]) => ids);
-      const decodedColumns = await this.#loadDecodedBlocks(segmentBlockIds);
+      const decodedColumns = await this.#loadDecodedBlocks(segmentBlockIds, snapshot);
       if (segment.kind === "delete") {
         if (keyColumn === undefined)
           throw new Error(`Delete segment has no unique key: ${segment.id}`);
@@ -2096,11 +2294,15 @@ export class BrowserDatabase {
     return values;
   }
 
-  async #loadDecodedBlocks(blockIds: readonly string[]): Promise<Map<string, DecodedColumn>> {
+  async #loadDecodedBlocks(
+    blockIds: readonly string[],
+    snapshot?: LeasedSnapshot,
+  ): Promise<Map<string, DecodedColumn>> {
     if (blockIds.length === 0) return new Map();
     const decoded = new Map<string, DecodedColumn>();
     const decodeWindow = 16;
     for (let start = 0; start < blockIds.length; start += decodeWindow) {
+      if (snapshot !== undefined) await this.#renewInternalLeaseIfNeeded(snapshot);
       const ids = blockIds.slice(start, start + decodeWindow);
       const blocks = await this.store.getBlocks(ids);
       const columns = await Promise.all(
@@ -2115,11 +2317,7 @@ export class BrowserDatabase {
     return decoded;
   }
 
-  async #visibleSegmentRecords(
-    table: TableRecord,
-    version?: number | null,
-  ): Promise<SegmentRecord[]> {
-    const snapshot = await this.#transactions.openSnapshot(version);
+  async #visibleSegmentRecords(table: TableRecord, snapshot: Snapshot): Promise<SegmentRecord[]> {
     const transactions = new Map(
       (await this.store.listTransactions()).map((record) => [record.id, record]),
     );
@@ -2138,6 +2336,34 @@ export class BrowserDatabase {
           leftOrder - rightOrder || leftVersion - rightVersion || left.id.localeCompare(right.id)
         );
       });
+  }
+
+  async #withLeasedSnapshot<T>(
+    version: number | null | undefined,
+    action: (snapshot: LeasedSnapshot) => Promise<T>,
+  ): Promise<T> {
+    for (;;) {
+      const lease = await this.#transactions.openLeasedSnapshot({
+        id: `${this.#internalLeaseOwnerId}/${String(this.#internalLeaseSequence++)}`,
+        ownerId: this.#internalLeaseOwnerId,
+        ttlMs: INTERNAL_READ_LEASE_TTL_MS,
+        ...(version === undefined ? {} : { version }),
+      });
+      try {
+        return await action(lease);
+      } catch (error) {
+        if (version !== undefined || !(error instanceof SnapshotManifestMissingError)) throw error;
+      } finally {
+        await lease.release();
+      }
+    }
+  }
+
+  async #renewInternalLeaseIfNeeded(snapshot: LeasedSnapshot): Promise<void> {
+    if (snapshot.expiresAt.getTime() - this.#now().getTime() > INTERNAL_READ_LEASE_TTL_MS / 2) {
+      return;
+    }
+    await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
   }
 
   async #findTable(name: string): Promise<TableRecord> {
@@ -2720,6 +2946,34 @@ function compactionCancellationResult(job: CompactionJobRecord): CancelCompactio
     jobId: job.id,
     state: job.state,
     publishedVersion: job.publishedVersion,
+  };
+}
+
+function garbageCollectionProgress(job: GarbageCollectionJobRecord): GarbageCollectionProgress {
+  const result: GarbageCollectionResult | null =
+    job.state === "completed"
+      ? {
+          jobId: job.id,
+          prunedManifestCount: job.prunedManifestCount,
+          alreadyPrunedManifestCount: job.alreadyPrunedManifestCount,
+          retainedManifestCount: job.retainedManifestCount,
+          missingManifestCount: job.missingManifestCount,
+          reclaimedSegmentCount: job.reclaimedSegmentCount,
+          retainedSegmentCount: job.retainedSegmentCount,
+          missingSegmentCount: job.missingSegmentCount,
+          reclaimedBlockCount: job.reclaimedBlockCount,
+          retainedBlockCount: job.retainedBlockCount,
+          missingBlockCount: job.missingBlockCount,
+          physicallyReclaimedBytes: job.reclaimedBlockBytes,
+        }
+      : null;
+  return {
+    jobId: job.id,
+    state: job.state,
+    examinedManifestCount: job.cursor.manifestIndex,
+    examinedSegmentCount: job.cursor.segmentIndex,
+    examinedBlockCount: job.cursor.blockIndex,
+    result,
   };
 }
 

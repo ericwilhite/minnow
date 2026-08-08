@@ -2,8 +2,11 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import {
   CompactionJobConflictError,
+  GarbageCollectionJobConflictError,
   IndexedDbBlockStore,
+  LeaseConflictError,
   MemoryBlockStore,
+  SnapshotManifestMissingError,
   UniqueKeyConflictError,
   type BlockStore,
   type CompactionJobRecord,
@@ -199,6 +202,80 @@ async function createReadyCompaction(
       committedAt: "2026-01-01T00:00:01.000Z",
     },
   };
+}
+
+async function createSupersededStorage(store: BlockStore, prefix: string): Promise<void> {
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  const oldBlockId = `${prefix}/old-block`;
+  const oldSegmentId = `${prefix}/old-segment`;
+  const oldTransactionId = `${prefix}/old-transaction`;
+  await store.addBlock(oldBlockId, Uint8Array.of(1, 2, 3));
+  await store.addSegment({
+    id: oldSegmentId,
+    tableId: "events",
+    transactionId: oldTransactionId,
+    rowCount: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    columnBlockIds: { value: [oldBlockId] },
+    createdAt: timestamp,
+  });
+  await store.createTransaction({
+    ...activeTransaction(oldTransactionId),
+    pendingBlockIds: [oldBlockId],
+    pendingSegmentIds: [oldSegmentId],
+  });
+  await store.commitTransaction({
+    transactionId: oldTransactionId,
+    expectedTransactionRevision: 0,
+    expectedManifestVersion: null,
+    blockIds: [oldBlockId],
+    committedAt: timestamp,
+  });
+
+  const currentBlockId = `${prefix}/current-block`;
+  const currentSegmentId = `${prefix}/current-segment`;
+  const currentTransactionId = `${prefix}/current-transaction`;
+  await store.addBlock(currentBlockId, Uint8Array.of(4, 5));
+  await store.addSegment({
+    id: currentSegmentId,
+    tableId: "events",
+    transactionId: currentTransactionId,
+    rowCount: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    columnBlockIds: { value: [currentBlockId] },
+    createdAt: timestamp,
+  });
+  await store.createTransaction({
+    ...activeTransaction(currentTransactionId),
+    snapshotVersion: 0,
+    pendingBlockIds: [currentBlockId],
+    pendingSegmentIds: [currentSegmentId],
+  });
+  await store.commitTransaction({
+    transactionId: currentTransactionId,
+    expectedTransactionRevision: 0,
+    expectedManifestVersion: 0,
+    blockIds: [currentBlockId],
+    removedBlockIds: [oldBlockId],
+    committedAt: "2026-01-01T00:00:01.000Z",
+  });
+}
+
+async function createSupersededGarbageCollectionJob(
+  store: BlockStore,
+  prefix: string,
+  leaseCutoff = "2026-01-01T00:10:00.000Z",
+) {
+  return store.createGarbageCollectionJob({
+    id: `${prefix}/gc`,
+    candidateManifestVersions: [0],
+    candidateSegmentIds: [`${prefix}/old-segment`],
+    candidateBlockIds: [`${prefix}/old-block`],
+    leaseCutoff,
+    createdAt: "2026-01-01T00:02:00.000Z",
+  });
 }
 
 for (const implementation of stores()) {
@@ -397,32 +474,24 @@ for (const implementation of stores()) {
       store.close();
     });
 
-    it("rejects a transaction whose pending segment metadata is missing", async () => {
+    it("rejects creating a transaction whose pending segment metadata is missing", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
       await store.addBlock("segment-block", Uint8Array.of(1));
-      await store.createTransaction({
-        id: "missing-segment-transaction",
-        snapshotVersion: null,
-        pendingBlockIds: ["segment-block"],
-        pendingSegmentIds: ["missing-segment"],
-        status: "active",
-        revision: 0,
-        startedAt: timestamp,
-        updatedAt: timestamp,
-        committedVersion: null,
-      });
-
       await expect(
-        store.commitTransaction({
-          transactionId: "missing-segment-transaction",
-          expectedTransactionRevision: 0,
-          expectedManifestVersion: null,
-          blockIds: ["segment-block"],
-          committedAt: timestamp,
+        store.createTransaction({
+          id: "missing-segment-transaction",
+          snapshotVersion: null,
+          pendingBlockIds: ["segment-block"],
+          pendingSegmentIds: ["missing-segment"],
+          status: "active",
+          revision: 0,
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          committedVersion: null,
         }),
-      ).rejects.toThrow("missing segment");
-      expect(await store.getCurrentManifest()).toBeUndefined();
+      ).rejects.toThrow("missing pending segment");
+      expect(await store.getTransaction("missing-segment-transaction")).toBeUndefined();
       store.close();
     });
 
@@ -1036,6 +1105,450 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("prunes manifests and reclaims exact physical artifacts in bounded durable steps", async () => {
+      const store = await implementation.create();
+      const prefix = "bounded-gc";
+      await createSupersededStorage(store, prefix);
+      const created = await createSupersededGarbageCollectionJob(store, prefix);
+
+      expect(created).toMatchObject({
+        candidateManifestVersions: [0],
+        candidateSegmentIds: [`${prefix}/old-segment`],
+        candidateBlockIds: [`${prefix}/old-block`],
+        cursor: { manifestIndex: 0, segmentIndex: 0, blockIndex: 0 },
+        state: "planned",
+        revision: 0,
+      });
+
+      const manifestStep = await store.runGarbageCollectionStep({
+        jobId: created.id,
+        expectedRevision: 0,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      });
+      expect(manifestStep).toMatchObject({
+        prunedManifestVersions: [0],
+        reclaimedSegmentIds: [],
+        reclaimedBlockIds: [],
+        reclaimedBlockBytes: 0,
+        job: {
+          cursor: { manifestIndex: 1, segmentIndex: 0, blockIndex: 0 },
+          state: "running",
+          revision: 1,
+        },
+      });
+      expect(await store.getManifest(0)).toMatchObject({
+        blockIds: [`${prefix}/old-block`],
+        prunedAt: "2026-01-01T00:03:00.000Z",
+      });
+      expect(await store.getSegment(`${prefix}/old-segment`)).toBeDefined();
+      expect(await store.getBlock(`${prefix}/old-block`)).toEqual(Uint8Array.of(1, 2, 3));
+
+      const segmentStep = await store.runGarbageCollectionStep({
+        jobId: created.id,
+        expectedRevision: 1,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:04:00.000Z",
+      });
+      expect(segmentStep).toMatchObject({
+        reclaimedSegmentIds: [`${prefix}/old-segment`],
+        reclaimedBlockIds: [],
+        job: {
+          cursor: { manifestIndex: 1, segmentIndex: 1, blockIndex: 0 },
+          state: "running",
+          revision: 2,
+        },
+      });
+      expect(await store.getSegment(`${prefix}/old-segment`)).toBeUndefined();
+
+      const blockStep = await store.runGarbageCollectionStep({
+        jobId: created.id,
+        expectedRevision: 2,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:05:00.000Z",
+      });
+      expect(blockStep).toMatchObject({
+        reclaimedBlockIds: [`${prefix}/old-block`],
+        reclaimedBlockBytes: 3,
+        job: {
+          cursor: { manifestIndex: 1, segmentIndex: 1, blockIndex: 1 },
+          prunedManifestCount: 1,
+          reclaimedSegmentCount: 1,
+          reclaimedBlockCount: 1,
+          reclaimedBlockBytes: 3,
+          state: "completed",
+          revision: 3,
+        },
+      });
+      expect(await store.getBlock(`${prefix}/old-block`)).toBeUndefined();
+      expect(await store.getBlock(`${prefix}/current-block`)).toEqual(Uint8Array.of(4, 5));
+      expect((await store.getCurrentManifest())?.version).toBe(1);
+
+      const repeated = await store.runGarbageCollectionStep({
+        jobId: created.id,
+        expectedRevision: 3,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:06:00.000Z",
+      });
+      expect(repeated.job.revision).toBe(3);
+      expect(repeated.reclaimedBlockIds).toEqual([]);
+      expect(repeated.reclaimedBlockBytes).toBe(0);
+      store.close();
+    });
+
+    it("retains every artifact reachable from an unexpired snapshot lease", async () => {
+      const store = await implementation.create();
+      const prefix = "leased-gc";
+      await createSupersededStorage(store, prefix);
+      await store.createLease({
+        id: `${prefix}/lease`,
+        kind: "reader",
+        manifestVersion: 0,
+        ownerId: "reader",
+        expiresAt: "2026-01-01T00:20:00.000Z",
+        revision: 0,
+      });
+      const job = await createSupersededGarbageCollectionJob(store, prefix);
+      const result = await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: 0,
+        maxItems: 3,
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      });
+
+      expect(result).toMatchObject({
+        retainedManifestVersions: [0],
+        retainedSegmentIds: [`${prefix}/old-segment`],
+        retainedBlockIds: [`${prefix}/old-block`],
+        reclaimedBlockBytes: 0,
+        job: {
+          retainedManifestCount: 1,
+          retainedSegmentCount: 1,
+          retainedBlockCount: 1,
+          state: "completed",
+        },
+      });
+      expect((await store.getManifest(0))?.prunedAt).toBeUndefined();
+      expect(await store.getBlock(`${prefix}/old-block`)).toBeDefined();
+      store.close();
+    });
+
+    it("rejects snapshot pins after an expired lease loses the GC race", async () => {
+      const store = await implementation.create();
+      const prefix = "expired-lease-gc";
+      await createSupersededStorage(store, prefix);
+      await store.createLease({
+        id: `${prefix}/lease`,
+        kind: "reader",
+        manifestVersion: 0,
+        ownerId: "reader",
+        expiresAt: "2026-01-01T00:05:00.000Z",
+        revision: 0,
+      });
+      const job = await createSupersededGarbageCollectionJob(store, prefix);
+      await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: 0,
+        maxItems: 3,
+        updatedAt: "2026-01-01T00:11:00.000Z",
+      });
+
+      expect(await store.getManifest(0)).toMatchObject({
+        prunedAt: "2026-01-01T00:11:00.000Z",
+      });
+      await expect(
+        store.renewLease(`${prefix}/lease`, 0, "2026-01-01T01:00:00.000Z"),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+      await expect(
+        store.createLease({
+          id: `${prefix}/late-lease`,
+          kind: "reader",
+          manifestVersion: 0,
+          ownerId: "late-reader",
+          expiresAt: "2026-01-01T01:00:00.000Z",
+          revision: 0,
+        }),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+      await expect(
+        store.createTransaction({
+          ...activeTransaction(`${prefix}/late-transaction`),
+          snapshotVersion: 0,
+        }),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+
+      const currentTransaction = activeTransaction(`${prefix}/post-gc-transaction`);
+      currentTransaction.snapshotVersion = 1;
+      await store.createTransaction(currentTransaction);
+      await expect(
+        store.updateTransaction(currentTransaction.id, 0, {
+          snapshotVersion: 0,
+          updatedAt: "2026-01-01T00:12:00.000Z",
+        }),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+      expect((await store.getTransaction(currentTransaction.id))?.revision).toBe(0);
+      store.close();
+    });
+
+    it("rejects candidates without persisted manifest or terminal-artifact provenance", async () => {
+      const store = await implementation.create();
+      await store.addBlock("unproven-orphan", Uint8Array.of(1));
+      await expect(
+        store.createGarbageCollectionJob({
+          id: "unsafe-gc",
+          candidateManifestVersions: [],
+          candidateSegmentIds: [],
+          candidateBlockIds: ["unproven-orphan"],
+          leaseCutoff: "2026-01-01T00:00:00.000Z",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ).rejects.toThrow("no persisted provenance");
+      expect(await store.getBlock("unproven-orphan")).toEqual(Uint8Array.of(1));
+      expect(await store.getGarbageCollectionJob("unsafe-gc")).toBeUndefined();
+      store.close();
+    });
+
+    it("allows only one garbage collection step for a job revision", async () => {
+      const store = await implementation.create();
+      const prefix = "contended-gc";
+      await createSupersededStorage(store, prefix);
+      const job = await createSupersededGarbageCollectionJob(store, prefix);
+      const input = {
+        jobId: job.id,
+        expectedRevision: 0,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      };
+      const results = await Promise.allSettled([
+        store.runGarbageCollectionStep(input),
+        store.runGarbageCollectionStep(input),
+      ]);
+
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      const rejection = results.find((result) => result.status === "rejected");
+      expect(rejection?.reason).toBeInstanceOf(GarbageCollectionJobConflictError);
+      expect((await store.getGarbageCollectionJob(job.id))?.revision).toBe(1);
+      store.close();
+    });
+
+    it("removes an expired lease with CAS without erasing a concurrent renewal", async () => {
+      const store = await implementation.create();
+      await expect(
+        store.createLease({
+          id: "invalid-expiry-lease",
+          kind: "reader",
+          manifestVersion: null,
+          ownerId: "reader",
+          expiresAt: "not-a-date",
+          revision: 0,
+        }),
+      ).rejects.toThrow("expiration must be valid");
+      await store.createLease({
+        id: "expiry-cas-lease",
+        kind: "reader",
+        manifestVersion: null,
+        ownerId: "reader",
+        expiresAt: "2026-01-01T00:05:00.000Z",
+        revision: 0,
+      });
+      await expect(store.renewLease("expiry-cas-lease", 0, "not-a-date")).rejects.toThrow(
+        "expiration must be valid",
+      );
+      expect((await store.getLease("expiry-cas-lease"))?.revision).toBe(0);
+      const renewed = await store.renewLease("expiry-cas-lease", 0, "2026-01-01T00:20:00.000Z");
+      await expect(
+        store.removeLeaseIfExpired("expiry-cas-lease", 0, "2026-01-01T00:30:00.000Z"),
+      ).rejects.toBeInstanceOf(LeaseConflictError);
+      expect(
+        await store.removeLeaseIfExpired(
+          "expiry-cas-lease",
+          renewed.revision,
+          "2026-01-01T00:10:00.000Z",
+        ),
+      ).toBe(false);
+      expect(
+        await store.removeLeaseIfExpired(
+          "expiry-cas-lease",
+          renewed.revision,
+          "2026-01-01T00:30:00.000Z",
+        ),
+      ).toBe(true);
+      expect(await store.getLease("expiry-cas-lease")).toBeUndefined();
+      store.close();
+    });
+
+    it("roots a segment owned by an active transaction before its journal checkpoint", async () => {
+      const store = await implementation.create();
+      const prefix = "segment-journal-gap";
+      await createSupersededStorage(store, prefix);
+      const transaction = activeTransaction(`${prefix}/active-transaction`);
+      transaction.snapshotVersion = 1;
+      await store.createTransaction(transaction);
+      await store.addSegment({
+        id: `${prefix}/uncheckpointed-segment`,
+        tableId: "events",
+        transactionId: transaction.id,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [`${prefix}/old-block`] },
+        createdAt: "2026-01-01T00:02:00.000Z",
+      });
+      const job = await store.createGarbageCollectionJob({
+        id: `${prefix}/gc`,
+        candidateManifestVersions: [0],
+        candidateSegmentIds: [`${prefix}/uncheckpointed-segment`],
+        candidateBlockIds: [`${prefix}/old-block`],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:02:00.000Z",
+      });
+      const result = await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: 0,
+        maxItems: 3,
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      });
+
+      expect(result.prunedManifestVersions).toEqual([0]);
+      expect(result.retainedSegmentIds).toEqual([`${prefix}/uncheckpointed-segment`]);
+      expect(result.retainedBlockIds).toEqual([`${prefix}/old-block`]);
+      expect(await store.getSegment(`${prefix}/uncheckpointed-segment`)).toBeDefined();
+      expect(await store.getBlock(`${prefix}/old-block`)).toBeDefined();
+      store.close();
+    });
+
+    it("pins a committed manifest until its compaction job is reconciled", async () => {
+      const store = await implementation.create();
+      const prefix = "unreconciled-compaction";
+      const { job, commit } = await createReadyCompaction(store, prefix);
+      const compactedManifest = await store.commitTransaction(commit);
+      await store.addBlock(`${prefix}/tail-block`, Uint8Array.of(3));
+      await store.createTransaction({
+        ...activeTransaction(`${prefix}/tail-transaction`),
+        snapshotVersion: compactedManifest.version,
+        pendingBlockIds: [`${prefix}/tail-block`],
+      });
+      await store.commitTransaction({
+        transactionId: `${prefix}/tail-transaction`,
+        expectedTransactionRevision: 0,
+        expectedManifestVersion: compactedManifest.version,
+        blockIds: [...compactedManifest.blockIds, `${prefix}/tail-block`],
+        committedAt: "2026-01-01T00:00:02.000Z",
+      });
+      expect((await store.getCompactionJob(job.id))?.state).toBe("ready");
+
+      const gc = await store.createGarbageCollectionJob({
+        id: `${prefix}/gc`,
+        candidateManifestVersions: [compactedManifest.version],
+        candidateSegmentIds: [],
+        candidateBlockIds: [],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:03:00.000Z",
+      });
+      const result = await store.runGarbageCollectionStep({
+        jobId: gc.id,
+        expectedRevision: 0,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:04:00.000Z",
+      });
+
+      expect(result.retainedManifestVersions).toEqual([compactedManifest.version]);
+      expect((await store.getManifest(compactedManifest.version))?.prunedAt).toBeUndefined();
+      store.close();
+    });
+
+    it("atomically rejects transaction journals that reference missing artifacts", async () => {
+      const store = await implementation.create();
+      const transaction = activeTransaction("missing-artifact-transaction");
+      await store.createTransaction(transaction);
+      await expect(
+        store.updateTransaction(transaction.id, 0, {
+          pendingBlockIds: ["missing-block"],
+          updatedAt: "2026-01-01T00:01:00.000Z",
+        }),
+      ).rejects.toThrow("missing pending block");
+      await expect(
+        store.updateTransaction(transaction.id, 0, {
+          pendingSegmentIds: ["missing-segment"],
+          updatedAt: "2026-01-01T00:01:00.000Z",
+        }),
+      ).rejects.toThrow("missing pending segment");
+      expect(await store.getTransaction(transaction.id)).toMatchObject({
+        pendingBlockIds: [],
+        pendingSegmentIds: [],
+        revision: 0,
+      });
+      store.close();
+    });
+
+    it("allows a status-only abort to close a transaction whose artifact is already missing", async () => {
+      const store = await implementation.create();
+      await store.addBlock("lost-pending-block", Uint8Array.of(1));
+      const transaction = {
+        ...activeTransaction("dangling-active-transaction"),
+        pendingBlockIds: ["lost-pending-block"],
+      };
+      await store.createTransaction(transaction);
+      await store.removeBlock("lost-pending-block");
+
+      const aborted = await store.updateTransaction(transaction.id, 0, {
+        status: "aborted",
+        updatedAt: "2026-01-01T00:01:00.000Z",
+      });
+      expect(aborted).toMatchObject({
+        status: "aborted",
+        pendingBlockIds: ["lost-pending-block"],
+        revision: 1,
+      });
+      store.close();
+    });
+
+    it("serializes GC with adoption of an existing block into an active journal", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      await store.addBlock("adoptable-block", Uint8Array.of(7, 8));
+      await store.createTransaction({
+        ...activeTransaction("aborted-owner"),
+        pendingBlockIds: ["adoptable-block"],
+        status: "aborted",
+      });
+      await store.createTransaction(activeTransaction("active-adopter"));
+      const job = await store.createGarbageCollectionJob({
+        id: "adoption-race-gc",
+        candidateManifestVersions: [],
+        candidateSegmentIds: [],
+        candidateBlockIds: ["adoptable-block"],
+        leaseCutoff: timestamp,
+        createdAt: timestamp,
+      });
+
+      const [gcResult, adoptionResult] = await Promise.allSettled([
+        store.runGarbageCollectionStep({
+          jobId: job.id,
+          expectedRevision: 0,
+          maxItems: 1,
+          updatedAt: "2026-01-01T00:01:00.000Z",
+        }),
+        store.updateTransaction("active-adopter", 0, {
+          pendingBlockIds: ["adoptable-block"],
+          updatedAt: "2026-01-01T00:01:00.000Z",
+        }),
+      ]);
+
+      expect(gcResult.status).toBe("fulfilled");
+      if (gcResult.status !== "fulfilled") throw gcResult.reason;
+      if (adoptionResult.status === "fulfilled") {
+        expect(gcResult.value.retainedBlockIds).toEqual(["adoptable-block"]);
+        expect(await store.getBlock("adoptable-block")).toEqual(Uint8Array.of(7, 8));
+        expect(adoptionResult.value.pendingBlockIds).toEqual(["adoptable-block"]);
+      } else {
+        expect(String(adoptionResult.reason)).toContain("missing pending block");
+        expect(gcResult.value.reclaimedBlockIds).toEqual(["adoptable-block"]);
+        expect(await store.getBlock("adoptable-block")).toBeUndefined();
+        expect((await store.getTransaction("active-adopter"))?.pendingBlockIds).toEqual([]);
+      }
+      store.close();
+    });
+
     it("commits unique-key lookups with the database version", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
@@ -1101,6 +1614,95 @@ for (const implementation of stores()) {
     });
   });
 }
+
+it("resumes a garbage collection job atomically after IndexedDB reopen", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const prefix = "reopen-gc";
+  let store = await IndexedDbBlockStore.open({ name, indexedDB });
+  await createSupersededStorage(store, prefix);
+  const job = await createSupersededGarbageCollectionJob(store, prefix);
+  await store.runGarbageCollectionStep({
+    jobId: job.id,
+    expectedRevision: 0,
+    maxItems: 1,
+    updatedAt: "2026-01-01T00:03:00.000Z",
+  });
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB });
+  expect(await store.getGarbageCollectionJob(job.id)).toMatchObject({
+    cursor: { manifestIndex: 1, segmentIndex: 0, blockIndex: 0 },
+    prunedManifestCount: 1,
+    state: "running",
+    revision: 1,
+  });
+  expect(await store.getManifest(0)).toMatchObject({
+    prunedAt: "2026-01-01T00:03:00.000Z",
+  });
+  const completed = await store.runGarbageCollectionStep({
+    jobId: job.id,
+    expectedRevision: 1,
+    maxItems: 2,
+    updatedAt: "2026-01-01T00:04:00.000Z",
+  });
+  expect(completed.job).toMatchObject({
+    state: "completed",
+    reclaimedSegmentCount: 1,
+    reclaimedBlockCount: 1,
+    reclaimedBlockBytes: 3,
+    revision: 2,
+  });
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB });
+  expect(await store.getBlock(`${prefix}/old-block`)).toBeUndefined();
+  expect(await store.getSegment(`${prefix}/old-segment`)).toBeUndefined();
+  expect(await store.getManifest(0)).toBeDefined();
+  expect((await store.getGarbageCollectionJob(job.id))?.reclaimedBlockBytes).toBe(3);
+  store.close();
+});
+
+it("serializes historical lease creation with GC across IndexedDB connections", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const prefix = "lease-race-gc";
+  const collector = await IndexedDbBlockStore.open({ name, indexedDB });
+  await createSupersededStorage(collector, prefix);
+  const job = await createSupersededGarbageCollectionJob(collector, prefix);
+  const reader = await IndexedDbBlockStore.open({ name, indexedDB });
+
+  const [gcResult, leaseResult] = await Promise.allSettled([
+    collector.runGarbageCollectionStep({
+      jobId: job.id,
+      expectedRevision: 0,
+      maxItems: 3,
+      updatedAt: "2026-01-01T00:03:00.000Z",
+    }),
+    reader.createLease({
+      id: `${prefix}/lease`,
+      kind: "reader",
+      manifestVersion: 0,
+      ownerId: "reader",
+      expiresAt: "2026-01-01T01:00:00.000Z",
+      revision: 0,
+    }),
+  ]);
+
+  expect(gcResult.status).toBe("fulfilled");
+  if (gcResult.status !== "fulfilled") throw gcResult.reason;
+  if (leaseResult.status === "fulfilled") {
+    expect(gcResult.value.retainedManifestVersions).toEqual([0]);
+    expect(gcResult.value.retainedBlockIds).toEqual([`${prefix}/old-block`]);
+    expect(await reader.getBlock(`${prefix}/old-block`)).toBeDefined();
+  } else {
+    expect(leaseResult.reason).toBeInstanceOf(SnapshotManifestMissingError);
+    expect(gcResult.value.prunedManifestVersions).toEqual([0]);
+    expect(gcResult.value.reclaimedBlockIds).toEqual([`${prefix}/old-block`]);
+  }
+  collector.close();
+  reader.close();
+});
 
 it("reports complete logical IndexedDB payload after reopen", async () => {
   const indexedDB = new IDBFactory();

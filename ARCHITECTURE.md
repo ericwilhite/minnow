@@ -130,7 +130,7 @@ catalog, manifests, segments, blocks, transactions,
 leases, statistics, temp, gc
 ```
 
-Large immutable values live in `blocks`; small transactional control data lives in the remaining stores. A published block is written with add-if-absent semantics so accidental mutation is rejected. Revisioned compaction-job records share the `gc` store and survive coordinator or database restarts.
+Large immutable values live in `blocks`; small transactional control data lives in the remaining stores. A published block is written with add-if-absent semantics so accidental mutation is rejected. Revisioned compaction and garbage-collection job records share the `gc` store and survive coordinator or database restarts.
 
 ## MVCC and atomic publication
 
@@ -149,7 +149,10 @@ encode/compress new blocks
 
 The manifest never references a partial block. A crash before publication can leave unreachable blocks, which later garbage collection may safely reclaim. A compare-and-swap failure is a normal write conflict; the caller rebases or retries according to transaction semantics. Compaction uses the same atomic publication path: a new manifest replaces its planned source blocks with newly staged blocks. If a concurrent commit only appends data and all planned sources remain visible, compaction rebases and publishes without dropping or reordering that append. If a source changed, the job aborts rather than publishing a stale rewrite. Cancellation and publication serialize through storage transactions: cancellation wins by atomically marking the job `cancelled` and aborting its active transaction, or commit wins and cancellation observes `published` with the committed manifest version. Historical manifests and their source blocks remain unchanged, so replacement or cancellation is not physical deletion.
 
-The library now implements block writes, saved manifest history, stable snapshots, transaction records, competing-writer checks, and reader/backup leases. Garbage collection remains part of the MVCC milestone.
+The library now implements block writes, saved manifest history, stable leased snapshots,
+transaction records, competing-writer checks, reader/backup leases, and reachability-based physical
+collection for artifacts with persisted provenance. Broader orphan and metadata cleanup remains part
+of the MVCC/compaction work.
 
 ### Row identity and mutations
 
@@ -218,14 +221,72 @@ cancellation operation also aborts the linked transaction, so a cancelled job ca
 the commit transaction wins the race first, the job is reconciled as `published` instead. The
 cancelled record preserves its immutable plan, cursor, completed-output IDs, byte counts, and
 high-water metrics for diagnosis and recovery accounting. Already-written immutable blocks and
-segment artifacts are left unreachable. Their physical deletion is deliberately deferred to
-lease-aware reachability and garbage collection rather than performed by cancellation.
+segment artifacts are left unreachable by cancellation itself. A later garbage-collection pass may
+delete them only after atomic reachability revalidation.
+
+### Lease-aware physical garbage collection
+
+The public collection surface has four layers. `collectGarbage()` drives a pass to completion;
+`collectGarbageStep()` plans or advances one bounded durable step;
+`resumeGarbageCollectionJob(jobId)` continues a known pass after a yield or reopen; and
+`listGarbageCollectionJobs()` exposes persisted records. A revisioned job stores immutable manifest,
+segment, and block candidate lists, one fixed lease cutoff, manifest/segment/block cursors,
+cumulative outcome counters, and `planned`, `running`, or `completed` state. Step progress exposes
+cumulative examined counts. A completed result reports pruned, already-pruned, retained, and missing
+manifest counts; reclaimed, retained, and missing segment/block counts; and
+`physicallyReclaimedBytes`.
+
+Planning admits historical manifests, pending artifacts from aborted transaction journals, and
+source/output artifacts recorded by terminal published, cancelled, or aborted compaction jobs.
+Storage rejects candidate block or segment IDs without one of those persisted provenance paths.
+Each step then recomputes live roots rather than trusting the plan:
+
+- the current manifest;
+- reader and backup leases whose expiry is after the job's fixed cutoff;
+- active transaction snapshot manifests plus pending blocks and segments;
+- active (`planned`, `running`, or `ready`) compaction source manifests, source blocks/segments, and
+  output blocks/segments; and
+- every block referenced by a remaining unpruned manifest, with reachable segment descriptors
+  closed over those block and transaction roots.
+
+Terminal compaction records are candidate provenance rather than roots, so cancelled and aborted
+outputs and superseded published inputs become collectible when nothing live reaches them. In the
+Memory store, revision comparison, root revalidation, deletion, and cursor/counter checkpoint share
+the same serialized atomic operation as other metadata changes. IndexedDB performs the equivalent
+work in one read-write transaction spanning the GC, block, segment, catalog, manifest, transaction,
+and lease stores. A racing operation therefore either installs a root first and collection retains
+the artifact, or collection wins and the stale operation fails instead of reviving deleted data.
+
+Collection marks a historical manifest descriptor with `prunedAt` instead of deleting it. The
+descriptor remains available to reconcile a commit whose response was lost, but the version cannot
+be opened as a new snapshot, used to begin/rebase a transaction, or created/renewed as a lease; a
+tombstone no longer roots its former blocks. Transaction begin and rebase retry when the latest
+manifest loses this race. Lease creation and renewal validate availability atomically, and expired
+lease removal uses its own revision comparison so it cannot erase a concurrent renewal.
+`BrowserDatabase` holds transient internal reader leases across table and query materialization,
+renewing long operations and releasing after the required data is materialized. Recovery marks stale
+transactions aborted, then routes any requested physical deletion through a durable collection job
+instead of directly removing their pending objects.
+
+`maxItems`/`maxItemsPerStep` bound how many candidate manifests, segments, and blocks one durable
+step examines and thus how many candidate mutations it can apply. They do not bound the initial
+candidate plan or the complete metadata/root scans currently needed for atomic revalidation. The
+reported `physicallyReclaimedBytes` is the sum of byte lengths for immutable block values actually
+deleted; it excludes descriptor metadata and is not a measurement of browser quota recovery. A
+block written by `addBlock()` before a crash but never attached to a journal or another provenance
+record is not yet enumerated or admitted. Collecting those unknown orphans requires durable
+provenance or a conservative age policy.
+
+An unleased `TransactionManager.openSnapshot()` is only an in-process view of one descriptor; it is
+not a persistent GC root. Long-lived callers must use `openLeasedSnapshot()`, while
+`BrowserDatabase` creates and renews its own short-lived leases around materialization.
 
 This is still a deliberately narrow Phase 6 policy: it selects every eligible contiguous
 append-only segment in a table and publishes one L1 replacement. It does not compact
 upsert/update/delete deltas, select subsets or levels beyond whole-table L0 -> L1, produce L2
-segments, or physically reclaim source/output garbage. Lease-aware reachability and reclamation
-remain separate future steps.
+segments, chunk collection planning/root discovery, or perform broader orphan, catalog, terminal-job,
+and metadata cleanup. Known unreachable source/output artifacts are now physically reclaimable by
+the separate collector.
 
 ## Multi-tab correctness
 
@@ -293,9 +354,14 @@ gates are satisfied.
 
 ## Backup, restore, and garbage collection
 
-A backup pins immutable manifest N and streams its catalog, manifest, segment descriptors, referenced blocks, and checksums. Writers may continue publishing newer manifests. Restore writes and verifies blocks first and publishes the restored manifest last.
+A future backup workflow pins immutable manifest N with a `backup` lease and streams its catalog,
+manifest, segment descriptors, referenced blocks, and checksums while writers publish newer
+versions. Restore will write and verify blocks first and publish the restored manifest last.
 
-Garbage collection computes reachability across current manifests, active snapshots, backups, transactions, and unexpired leases. It removes only immutable blocks that are unreachable from every root. Recovery treats temporary and unpublished objects as reclaimable garbage.
+The implemented garbage collector treats unexpired backup leases exactly like reader leases and
+removes only known-provenance artifacts that remain unreachable after the atomic root check described
+above. Recovery uses that collector for stale transaction artifacts. Unknown pre-journal blocks,
+temporary-store cleanup, and broader catalog/job lifecycle policies remain future work.
 
 ## Durability and lifecycle
 

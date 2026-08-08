@@ -15,6 +15,8 @@ export interface Manifest {
   previousVersion: number | null;
   blockIds: string[];
   createdAt: string;
+  /** A pruned descriptor remains readable for commit reconciliation but cannot be pinned. */
+  prunedAt?: string;
 }
 
 export interface PublishManifestInput {
@@ -215,6 +217,111 @@ export class CompactionJobConflictError extends Error {
   }
 }
 
+export const garbageCollectionJobStates = ["planned", "running", "completed"] as const;
+export type GarbageCollectionJobState = (typeof garbageCollectionJobStates)[number];
+
+export interface GarbageCollectionCursor {
+  manifestIndex: number;
+  segmentIndex: number;
+  blockIndex: number;
+}
+
+export interface CreateGarbageCollectionJobInput {
+  id: string;
+  candidateManifestVersions: readonly number[];
+  candidateSegmentIds: readonly string[];
+  candidateBlockIds: readonly string[];
+  /** Fixed cutoff used to decide which persisted leases protect a manifest for this job. */
+  leaseCutoff: string;
+  createdAt: string;
+}
+
+export interface GarbageCollectionJobRecord {
+  id: string;
+  candidateManifestVersions: number[];
+  candidateSegmentIds: string[];
+  candidateBlockIds: string[];
+  cursor: GarbageCollectionCursor;
+  prunedManifestCount: number;
+  alreadyPrunedManifestCount: number;
+  retainedManifestCount: number;
+  missingManifestCount: number;
+  reclaimedSegmentCount: number;
+  retainedSegmentCount: number;
+  missingSegmentCount: number;
+  reclaimedBlockCount: number;
+  retainedBlockCount: number;
+  missingBlockCount: number;
+  reclaimedBlockBytes: number;
+  state: GarbageCollectionJobState;
+  revision: number;
+  leaseCutoff: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RunGarbageCollectionStepInput {
+  jobId: string;
+  expectedRevision: number;
+  maxItems: number;
+  updatedAt: string;
+}
+
+export interface GarbageCollectionStepResult {
+  job: GarbageCollectionJobRecord;
+  prunedManifestVersions: number[];
+  alreadyPrunedManifestVersions: number[];
+  retainedManifestVersions: number[];
+  missingManifestVersions: number[];
+  reclaimedSegmentIds: string[];
+  retainedSegmentIds: string[];
+  missingSegmentIds: string[];
+  reclaimedBlockIds: string[];
+  retainedBlockIds: string[];
+  missingBlockIds: string[];
+  reclaimedBlockBytes: number;
+}
+
+export class GarbageCollectionJobConflictError extends Error {
+  override readonly name = "GarbageCollectionJobConflictError";
+
+  constructor(
+    readonly jobId: string,
+    readonly expectedRevision: number,
+    readonly actualRevision: number | null,
+  ) {
+    super(
+      `Garbage collection job ${jobId} changed: expected revision ${String(expectedRevision)}, found ${String(actualRevision)}`,
+    );
+  }
+}
+
+export class SnapshotManifestMissingError extends Error {
+  override readonly name = "SnapshotManifestMissingError";
+
+  constructor(readonly version: number) {
+    super(`Snapshot manifest is unavailable: ${String(version)}`);
+  }
+}
+
+export interface GarbageCollectionStepAccounting {
+  examinedManifestCount: number;
+  prunedManifestCount: number;
+  alreadyPrunedManifestCount: number;
+  retainedManifestCount: number;
+  missingManifestCount: number;
+  examinedSegmentCount: number;
+  reclaimedSegmentCount: number;
+  retainedSegmentCount: number;
+  missingSegmentCount: number;
+  examinedBlockCount: number;
+  reclaimedBlockCount: number;
+  retainedBlockCount: number;
+  missingBlockCount: number;
+  reclaimedBlockBytes: number;
+  updatedAt: string;
+}
+
 export class LeaseConflictError extends Error {
   override readonly name = "LeaseConflictError";
 
@@ -345,6 +452,11 @@ export interface BlockStore {
   getLease(id: string): Promise<LeaseRecord | undefined>;
   listLeases(): Promise<LeaseRecord[]>;
   renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord>;
+  removeLeaseIfExpired(
+    id: string,
+    expectedRevision: number,
+    expiresAtCutoff: string,
+  ): Promise<boolean>;
   removeLease(id: string): Promise<void>;
   createCompactionJob(record: CompactionJobRecord): Promise<void>;
   getCompactionJob(id: string): Promise<CompactionJobRecord | undefined>;
@@ -360,6 +472,15 @@ export interface BlockStore {
     cancelledAt: string,
   ): Promise<CompactionJobRecord>;
   removeCompactionJob(id: string): Promise<void>;
+  createGarbageCollectionJob(
+    input: CreateGarbageCollectionJobInput,
+  ): Promise<GarbageCollectionJobRecord>;
+  getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined>;
+  listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;
+  runGarbageCollectionStep(
+    input: RunGarbageCollectionStepInput,
+  ): Promise<GarbageCollectionStepResult>;
+  removeGarbageCollectionJob(id: string): Promise<void>;
   close(): void;
 }
 
@@ -390,6 +511,342 @@ export function updateTransactionRecord(
     updatedAt: update.updatedAt,
     revision: record.revision + 1,
   };
+}
+
+export function createGarbageCollectionJobRecord(
+  input: CreateGarbageCollectionJobInput,
+): GarbageCollectionJobRecord {
+  const candidateManifestVersions = uniqueWholeNumbers(
+    input.candidateManifestVersions,
+    "Garbage collection candidate manifest version",
+  );
+  const candidateSegmentIds = uniqueIds(
+    input.candidateSegmentIds,
+    "Garbage collection candidate segment ID",
+    true,
+  );
+  const candidateBlockIds = uniqueIds(
+    input.candidateBlockIds,
+    "Garbage collection candidate block ID",
+    true,
+  );
+  const createdAt = validTimestamp(input.createdAt, "Garbage collection creation timestamp");
+  const complete =
+    candidateManifestVersions.length === 0 &&
+    candidateSegmentIds.length === 0 &&
+    candidateBlockIds.length === 0;
+  return {
+    id: nonEmptyString(input.id, "Garbage collection job ID"),
+    candidateManifestVersions,
+    candidateSegmentIds,
+    candidateBlockIds,
+    cursor: { manifestIndex: 0, segmentIndex: 0, blockIndex: 0 },
+    prunedManifestCount: 0,
+    alreadyPrunedManifestCount: 0,
+    retainedManifestCount: 0,
+    missingManifestCount: 0,
+    reclaimedSegmentCount: 0,
+    retainedSegmentCount: 0,
+    missingSegmentCount: 0,
+    reclaimedBlockCount: 0,
+    retainedBlockCount: 0,
+    missingBlockCount: 0,
+    reclaimedBlockBytes: 0,
+    state: complete ? "completed" : "planned",
+    revision: 0,
+    leaseCutoff: validTimestamp(input.leaseCutoff, "Garbage collection lease cutoff"),
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+export function normalizeGarbageCollectionJobRecord(
+  record: GarbageCollectionJobRecord,
+): GarbageCollectionJobRecord {
+  const candidateManifestVersions = uniqueWholeNumbers(
+    record.candidateManifestVersions,
+    "Garbage collection candidate manifest version",
+  );
+  const candidateSegmentIds = uniqueIds(
+    record.candidateSegmentIds,
+    "Garbage collection candidate segment ID",
+    true,
+  );
+  const candidateBlockIds = uniqueIds(
+    record.candidateBlockIds,
+    "Garbage collection candidate block ID",
+    true,
+  );
+  const cursor = normalizeGarbageCollectionCursor(record.cursor);
+  const normalized: GarbageCollectionJobRecord = {
+    ...record,
+    id: nonEmptyString(record.id, "Garbage collection job ID"),
+    candidateManifestVersions,
+    candidateSegmentIds,
+    candidateBlockIds,
+    cursor,
+    prunedManifestCount: nonNegativeWholeNumber(
+      record.prunedManifestCount,
+      "Garbage collection pruned manifest count",
+    ),
+    alreadyPrunedManifestCount: nonNegativeWholeNumber(
+      record.alreadyPrunedManifestCount,
+      "Garbage collection already-pruned manifest count",
+    ),
+    retainedManifestCount: nonNegativeWholeNumber(
+      record.retainedManifestCount,
+      "Garbage collection retained manifest count",
+    ),
+    missingManifestCount: nonNegativeWholeNumber(
+      record.missingManifestCount,
+      "Garbage collection missing manifest count",
+    ),
+    reclaimedSegmentCount: nonNegativeWholeNumber(
+      record.reclaimedSegmentCount,
+      "Garbage collection reclaimed segment count",
+    ),
+    retainedSegmentCount: nonNegativeWholeNumber(
+      record.retainedSegmentCount,
+      "Garbage collection retained segment count",
+    ),
+    missingSegmentCount: nonNegativeWholeNumber(
+      record.missingSegmentCount,
+      "Garbage collection missing segment count",
+    ),
+    reclaimedBlockCount: nonNegativeWholeNumber(
+      record.reclaimedBlockCount,
+      "Garbage collection reclaimed block count",
+    ),
+    retainedBlockCount: nonNegativeWholeNumber(
+      record.retainedBlockCount,
+      "Garbage collection retained block count",
+    ),
+    missingBlockCount: nonNegativeWholeNumber(
+      record.missingBlockCount,
+      "Garbage collection missing block count",
+    ),
+    reclaimedBlockBytes: nonNegativeWholeNumber(
+      record.reclaimedBlockBytes,
+      "Garbage collection reclaimed block bytes",
+    ),
+    state: garbageCollectionJobState(record.state),
+    revision: nonNegativeWholeNumber(record.revision, "Garbage collection job revision"),
+    leaseCutoff: validTimestamp(record.leaseCutoff, "Garbage collection lease cutoff"),
+    createdAt: validTimestamp(record.createdAt, "Garbage collection creation timestamp"),
+    updatedAt: validTimestamp(record.updatedAt, "Garbage collection update timestamp"),
+  };
+  if (
+    safeSum(
+      [
+        normalized.prunedManifestCount,
+        normalized.alreadyPrunedManifestCount,
+        normalized.retainedManifestCount,
+        normalized.missingManifestCount,
+      ],
+      "Garbage collection examined manifest count",
+    ) !== cursor.manifestIndex ||
+    safeSum(
+      [
+        normalized.reclaimedSegmentCount,
+        normalized.retainedSegmentCount,
+        normalized.missingSegmentCount,
+      ],
+      "Garbage collection examined segment count",
+    ) !== cursor.segmentIndex ||
+    safeSum(
+      [normalized.reclaimedBlockCount, normalized.retainedBlockCount, normalized.missingBlockCount],
+      "Garbage collection examined block count",
+    ) !== cursor.blockIndex
+  ) {
+    throw new TypeError("Garbage collection cursor does not match its persisted accounting");
+  }
+  if (
+    cursor.manifestIndex > candidateManifestVersions.length ||
+    cursor.segmentIndex > candidateSegmentIds.length ||
+    cursor.blockIndex > candidateBlockIds.length
+  ) {
+    throw new RangeError("Garbage collection cursor is outside its candidate selection");
+  }
+  const complete = garbageCollectionJobComplete(normalized);
+  if ((normalized.state === "completed") !== complete) {
+    throw new TypeError(
+      complete
+        ? "A finished garbage collection cursor requires completed state"
+        : "A completed garbage collection job requires a finished cursor",
+    );
+  }
+  if (
+    normalized.state === "planned" &&
+    (cursor.manifestIndex !== 0 || cursor.segmentIndex !== 0 || cursor.blockIndex !== 0)
+  ) {
+    throw new TypeError("A planned garbage collection job cannot contain progress");
+  }
+  return structuredClone(normalized);
+}
+
+export function advanceGarbageCollectionJobRecord(
+  record: GarbageCollectionJobRecord,
+  accounting: GarbageCollectionStepAccounting,
+): GarbageCollectionJobRecord {
+  const current = normalizeGarbageCollectionJobRecord(record);
+  if (current.state === "completed") return current;
+  const increments = {
+    examinedManifestCount: nonNegativeWholeNumber(
+      accounting.examinedManifestCount,
+      "Garbage collection examined manifest increment",
+    ),
+    prunedManifestCount: nonNegativeWholeNumber(
+      accounting.prunedManifestCount,
+      "Garbage collection pruned manifest increment",
+    ),
+    alreadyPrunedManifestCount: nonNegativeWholeNumber(
+      accounting.alreadyPrunedManifestCount,
+      "Garbage collection already-pruned manifest increment",
+    ),
+    retainedManifestCount: nonNegativeWholeNumber(
+      accounting.retainedManifestCount,
+      "Garbage collection retained manifest increment",
+    ),
+    missingManifestCount: nonNegativeWholeNumber(
+      accounting.missingManifestCount,
+      "Garbage collection missing manifest increment",
+    ),
+    examinedSegmentCount: nonNegativeWholeNumber(
+      accounting.examinedSegmentCount,
+      "Garbage collection examined segment increment",
+    ),
+    reclaimedSegmentCount: nonNegativeWholeNumber(
+      accounting.reclaimedSegmentCount,
+      "Garbage collection reclaimed segment increment",
+    ),
+    retainedSegmentCount: nonNegativeWholeNumber(
+      accounting.retainedSegmentCount,
+      "Garbage collection retained segment increment",
+    ),
+    missingSegmentCount: nonNegativeWholeNumber(
+      accounting.missingSegmentCount,
+      "Garbage collection missing segment increment",
+    ),
+    examinedBlockCount: nonNegativeWholeNumber(
+      accounting.examinedBlockCount,
+      "Garbage collection examined block increment",
+    ),
+    reclaimedBlockCount: nonNegativeWholeNumber(
+      accounting.reclaimedBlockCount,
+      "Garbage collection reclaimed block increment",
+    ),
+    retainedBlockCount: nonNegativeWholeNumber(
+      accounting.retainedBlockCount,
+      "Garbage collection retained block increment",
+    ),
+    missingBlockCount: nonNegativeWholeNumber(
+      accounting.missingBlockCount,
+      "Garbage collection missing block increment",
+    ),
+    reclaimedBlockBytes: nonNegativeWholeNumber(
+      accounting.reclaimedBlockBytes,
+      "Garbage collection reclaimed block byte increment",
+    ),
+  };
+  if (
+    increments.examinedManifestCount !==
+      safeSum(
+        [
+          increments.prunedManifestCount,
+          increments.alreadyPrunedManifestCount,
+          increments.retainedManifestCount,
+          increments.missingManifestCount,
+        ],
+        "Garbage collection manifest increment",
+      ) ||
+    increments.examinedSegmentCount !==
+      safeSum(
+        [
+          increments.reclaimedSegmentCount,
+          increments.retainedSegmentCount,
+          increments.missingSegmentCount,
+        ],
+        "Garbage collection segment increment",
+      ) ||
+    increments.examinedBlockCount !==
+      safeSum(
+        [
+          increments.reclaimedBlockCount,
+          increments.retainedBlockCount,
+          increments.missingBlockCount,
+        ],
+        "Garbage collection block increment",
+      )
+  ) {
+    throw new TypeError("Garbage collection step accounting is incomplete");
+  }
+  const cursor: GarbageCollectionCursor = {
+    manifestIndex: safeSum(
+      [current.cursor.manifestIndex, increments.examinedManifestCount],
+      "Garbage collection manifest cursor",
+    ),
+    segmentIndex: safeSum(
+      [current.cursor.segmentIndex, increments.examinedSegmentCount],
+      "Garbage collection segment cursor",
+    ),
+    blockIndex: safeSum(
+      [current.cursor.blockIndex, increments.examinedBlockCount],
+      "Garbage collection block cursor",
+    ),
+  };
+  const updated: GarbageCollectionJobRecord = {
+    ...current,
+    cursor,
+    prunedManifestCount: safeSum(
+      [current.prunedManifestCount, increments.prunedManifestCount],
+      "Garbage collection pruned manifest count",
+    ),
+    alreadyPrunedManifestCount: safeSum(
+      [current.alreadyPrunedManifestCount, increments.alreadyPrunedManifestCount],
+      "Garbage collection already-pruned manifest count",
+    ),
+    retainedManifestCount: safeSum(
+      [current.retainedManifestCount, increments.retainedManifestCount],
+      "Garbage collection retained manifest count",
+    ),
+    missingManifestCount: safeSum(
+      [current.missingManifestCount, increments.missingManifestCount],
+      "Garbage collection missing manifest count",
+    ),
+    reclaimedSegmentCount: safeSum(
+      [current.reclaimedSegmentCount, increments.reclaimedSegmentCount],
+      "Garbage collection reclaimed segment count",
+    ),
+    retainedSegmentCount: safeSum(
+      [current.retainedSegmentCount, increments.retainedSegmentCount],
+      "Garbage collection retained segment count",
+    ),
+    missingSegmentCount: safeSum(
+      [current.missingSegmentCount, increments.missingSegmentCount],
+      "Garbage collection missing segment count",
+    ),
+    reclaimedBlockCount: safeSum(
+      [current.reclaimedBlockCount, increments.reclaimedBlockCount],
+      "Garbage collection reclaimed block count",
+    ),
+    retainedBlockCount: safeSum(
+      [current.retainedBlockCount, increments.retainedBlockCount],
+      "Garbage collection retained block count",
+    ),
+    missingBlockCount: safeSum(
+      [current.missingBlockCount, increments.missingBlockCount],
+      "Garbage collection missing block count",
+    ),
+    reclaimedBlockBytes: safeSum(
+      [current.reclaimedBlockBytes, increments.reclaimedBlockBytes],
+      "Garbage collection reclaimed block bytes",
+    ),
+    state: "running",
+    revision: current.revision + 1,
+    updatedAt: validTimestamp(accounting.updatedAt, "Garbage collection update timestamp"),
+  };
+  if (garbageCollectionJobComplete(updated)) updated.state = "completed";
+  return normalizeGarbageCollectionJobRecord(updated);
 }
 
 export function normalizeCompactionJobRecord(record: CompactionJobRecord): CompactionJobRecord {
@@ -1008,6 +1465,44 @@ function compactionJobState(state: unknown): CompactionJobState {
   return state as CompactionJobState;
 }
 
+function garbageCollectionJobState(state: unknown): GarbageCollectionJobState {
+  if (
+    typeof state !== "string" ||
+    !(garbageCollectionJobStates as readonly string[]).includes(state)
+  ) {
+    throw new TypeError(`Invalid garbage collection job state: ${String(state)}`);
+  }
+  return state as GarbageCollectionJobState;
+}
+
+function normalizeGarbageCollectionCursor(value: unknown): GarbageCollectionCursor {
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError("Garbage collection cursor must be an object");
+  }
+  return {
+    manifestIndex: nonNegativeWholeNumber(
+      Reflect.get(value, "manifestIndex"),
+      "Garbage collection manifest cursor",
+    ),
+    segmentIndex: nonNegativeWholeNumber(
+      Reflect.get(value, "segmentIndex"),
+      "Garbage collection segment cursor",
+    ),
+    blockIndex: nonNegativeWholeNumber(
+      Reflect.get(value, "blockIndex"),
+      "Garbage collection block cursor",
+    ),
+  };
+}
+
+function garbageCollectionJobComplete(record: GarbageCollectionJobRecord): boolean {
+  return (
+    record.cursor.manifestIndex === record.candidateManifestVersions.length &&
+    record.cursor.segmentIndex === record.candidateSegmentIds.length &&
+    record.cursor.blockIndex === record.candidateBlockIds.length
+  );
+}
+
 function uniqueIds(ids: unknown, label: string, sort: boolean): string[] {
   if (!Array.isArray(ids)) throw new TypeError(`${label}s must be an array`);
   const unique = [...new Set(ids.map((id: unknown) => nonEmptyString(id, label)))];
@@ -1023,6 +1518,13 @@ function orderedUniqueIds(ids: unknown, label: string): string[] {
   return normalized;
 }
 
+function uniqueWholeNumbers(values: unknown, label: string): number[] {
+  if (!Array.isArray(values)) throw new TypeError(`${label}s must be an array`);
+  return [...new Set(values.map((value: unknown) => nonNegativeWholeNumber(value, label)))].sort(
+    (left, right) => left - right,
+  );
+}
+
 function nullableId(id: unknown, label: string): string | null {
   return id === null ? null : nonEmptyString(id, label);
 }
@@ -1032,6 +1534,12 @@ function nonEmptyString(value: unknown, label: string): string {
     throw new TypeError(`${label} cannot be empty`);
   }
   return value;
+}
+
+function validTimestamp(value: unknown, label: string): string {
+  const timestamp = nonEmptyString(value, label);
+  if (!Number.isFinite(Date.parse(timestamp))) throw new TypeError(`${label} must be valid`);
+  return timestamp;
 }
 
 function nonNegativeWholeNumber(value: unknown, label: string): number {

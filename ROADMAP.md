@@ -143,7 +143,8 @@ Exit gate: published benchmark curves for insert, upsert, update, delete, and co
 
 ## Phase 6 — Compaction
 
-Phase 6A and the first Phase 6B physical-rewrite slice are implemented:
+Phase 6A, the first Phase 6B physical-rewrite/cancellation slices, and lease-aware physical
+reclamation for known artifacts are implemented:
 
 - atomic manifest publication can supersede snapshot blocks without deleting historical data;
 - revisioned compaction job records persist in the IndexedDB `gc` store with planned, running,
@@ -174,10 +175,32 @@ Phase 6A and the first Phase 6B physical-rewrite slice are implemented:
   whose stable `logicalOrder` is inherited from its earliest source;
 - publication can rebase safely across a concurrent append when every planned source remains
   visible, so the newly appended L0 segment stays after the consolidated output;
-- historical manifests and source blocks remain available to old snapshots;
+- historical manifests and source blocks remain available while an active transaction or
+  unexpired reader/backup lease roots the version;
 - contiguous internal row-ID ranges are retained without allocating replacement identities;
 - mutation-bearing and non-contiguous inputs return explicit skip reasons;
-- metrics distinguish superseded blocks from physically reclaimed bytes, which remain zero.
+- compaction metrics distinguish logical supersession from physical reclamation; a compaction
+  result remains zero for `physicallyReclaimedBytes` because publication never deletes blocks;
+- `collectGarbage()`, `collectGarbageStep()`, `resumeGarbageCollectionJob()`, and
+  `listGarbageCollectionJobs()` expose completion, one-step execution, restart/resume, and durable
+  job inspection;
+- revisioned garbage-collection jobs persist immutable candidate lists, a fixed lease cutoff,
+  manifest/segment/block cursors, cumulative outcome counters, and `planned`, `running`, or
+  `completed` state in the `gc` store;
+- each Memory or IndexedDB step atomically revalidates roots, applies tombstones/deletions, and
+  checkpoints progress under compare-and-swap; roots cover the current manifest, reader/backup
+  leases unexpired at the fixed pass cutoff, active transaction snapshots and pending artifacts,
+  and active compaction source/output artifacts;
+- cancelled and aborted compaction artifacts, superseded published inputs, and aborted-transaction
+  artifacts can be collected once no live root reaches them;
+- collected manifest descriptors retain `prunedAt` tombstones for lost-commit reconciliation, but
+  cannot be newly opened or pinned and no longer root their blocks;
+- transient internal reader leases protect `BrowserDatabase` table/query materialization, while
+  begin/rebase/pin and lease-expiry races serialize with collection;
+- stale-transaction recovery routes physical deletion through the same durable collector;
+- completed collection results distinguish pruned/already-pruned/retained/missing manifests,
+  reclaimed/retained/missing segments and blocks, and deleted immutable block byte lengths in
+  `physicallyReclaimedBytes`—not browser quota recovery.
 
 The byte target is estimated from source-block encoded density and shared across column output
 windows, then windows are measured and split for skew or a tighter execution budget before the plan
@@ -187,13 +210,22 @@ rewrite execution, not the whole browser process: planning reads one stored bloc
 executor high-water accounting, and native codec, IndexedDB internal allocations, and persisted
 job/transaction metadata are excluded.
 
-Phase 6 remains open. The current policy rewrites all eligible contiguous append-only inputs into
-one whole-table L1 segment. It does not compact upsert/update/delete deltas, choose subsets or level
-policies beyond L0 -> L1, build L2 segments, or reclaim physical blocks. Cancellation is
-cooperative: it cannot preempt physical transforms or native codec work already in progress, but an
-in-flight step observes it at the next durable boundary and `resumeCompactionJob()` throws
-`CompactionJobCancelledError`. Cancelled records retain their plan, cursor, progress, metrics, and
-completed artifact IDs; physical cleanup remains deferred to lease-aware garbage collection.
+`maxItems` bounds candidates examined and possible candidate mutations within a durable collection
+step; it does not bound full candidate planning or the metadata/root scans used for atomic
+revalidation. Candidate admission currently requires persisted provenance from a historical
+manifest, aborted transaction journal, or terminal compaction job. An unknown immutable block left
+by a crash after `addBlock()` but before journal attachment is deliberately omitted until provenance
+or age tracking can make it safe to collect.
+
+Phase 6 remains open. The current compaction policy rewrites all eligible contiguous append-only
+inputs into one whole-table L1 segment. It does not compact upsert/update/delete deltas, choose
+subsets or level policies beyond L0 -> L1, or build L2 segments. Collection still needs a chunked
+planner and indexed/chunked root discovery plus broader unknown-orphan, catalog, terminal-job, and
+metadata cleanup. Cancellation remains cooperative: it cannot preempt physical transforms or native
+codec work already in progress, but an in-flight step observes it at the next durable boundary and
+`resumeCompactionJob()` throws `CompactionJobCancelledError`. Cancelled records retain their plan,
+cursor, progress, metrics, and completed artifact IDs until a collection pass proves their artifacts
+unreachable.
 
 Deliver:
 
@@ -295,12 +327,12 @@ Exit gate: representative changing workloads improve without manual indexes and 
 ## Immediate iteration checklist
 
 The current repository slice has completed the Phase 5 storage/write foundation and its planned
-four-way durability matrix. Phase 6A plus the first Phase 6B slice now provide durable,
+four-way durability matrix. Phase 6A plus the current Phase 6B slices now provide durable,
 restart-safe, output-block-stepped physical rechunking and re-encoding under a modeled
-JavaScript-owned memory budget, including safe cooperative job cancellation. Phase 6 remains open
-until compaction handles mutation deltas and level/subset selection and safely reclaims unreachable
-data. The broader
-Phase 5 performance curves and larger/repeated benchmark tiers remain outstanding.
+JavaScript-owned memory budget, safe cooperative job cancellation, and lease-aware physical
+reclamation for artifacts with persisted provenance. Phase 6 remains open for mutation deltas,
+level/subset selection, chunked planning/indexed roots, and broader orphan/catalog/job cleanup. The
+broader Phase 5 performance curves and larger/repeated benchmark tiers remain outstanding.
 
 - [x] Record architecture and roadmap.
 - [x] Scaffold packages and quality gates.
@@ -331,7 +363,7 @@ Phase 5 performance curves and larger/repeated benchmark tiers remain outstandin
 - [x] Rechunk and re-encode append-only inputs under an explicit JavaScript-owned byte memory budget.
 - [ ] Add subset/level selection beyond whole-table L0 -> L1 and compact mutation deltas.
 - [x] Add safe compaction-job cancellation.
-- [ ] Add lease-aware garbage collection and physical reclamation for superseded blocks.
+- [x] Add lease-aware garbage collection and physical reclamation for superseded blocks.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

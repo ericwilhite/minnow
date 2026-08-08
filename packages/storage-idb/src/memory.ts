@@ -4,14 +4,22 @@ import {
   CompactionJobConflictError,
   type CompactionJobRecordUpdate,
   createManifest,
+  type CreateGarbageCollectionJobInput,
+  createGarbageCollectionJobRecord,
   type BlockStore,
   type BlockWrite,
+  advanceGarbageCollectionJobRecord,
+  type GarbageCollectionJobRecord,
+  GarbageCollectionJobConflictError,
+  type GarbageCollectionStepResult,
   type LeaseRecord,
   LeaseConflictError,
   type Manifest,
   type PublishManifestInput,
   type RowIdRange,
+  type RunGarbageCollectionStepInput,
   type SegmentRecord,
+  SnapshotManifestMissingError,
   type TableRecord,
   type TransactionRecord,
   TransactionRecordConflictError,
@@ -32,6 +40,7 @@ export class MemoryBlockStore implements BlockStore {
   readonly #segments = new Map<string, SegmentRecord>();
   readonly #leases = new Map<string, LeaseRecord>();
   readonly #compactionJobs = new Map<string, CompactionJobRecord>();
+  readonly #garbageCollectionJobs = new Map<string, GarbageCollectionJobRecord>();
   readonly #nextRowIds = new Map<string, bigint>();
   readonly #uniqueKeys = new Map<string, Set<string>>();
   #currentVersion: number | null = null;
@@ -176,9 +185,14 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   async createTransaction(record: TransactionRecord): Promise<void> {
-    if (this.#transactions.has(record.id))
-      throw new Error(`Transaction already exists: ${record.id}`);
-    this.#transactions.set(record.id, structuredClone(record));
+    return this.#runAtomic(() => {
+      if (this.#transactions.has(record.id)) {
+        throw new Error(`Transaction already exists: ${record.id}`);
+      }
+      assertSnapshotAvailable(record.snapshotVersion, this.#manifests, this.#blocks);
+      assertPendingArtifactsAvailable(record, this.#blocks, this.#segments);
+      this.#transactions.set(record.id, structuredClone(record));
+    });
   }
 
   async getTransaction(id: string): Promise<TransactionRecord | undefined> {
@@ -200,14 +214,26 @@ export class MemoryBlockStore implements BlockStore {
     expectedRevision: number,
     update: TransactionRecordUpdate,
   ): Promise<TransactionRecord> {
-    const current = this.#transactions.get(id);
-    if (current?.revision !== expectedRevision) {
-      throw new TransactionRecordConflictError(id, expectedRevision, current?.revision ?? null);
-    }
-    assertGenericTransactionUpdateAllowed(current, update);
-    const updated = updateTransactionRecord(current, update);
-    this.#transactions.set(id, updated);
-    return structuredClone(updated);
+    return this.#runAtomic(() => {
+      const current = this.#transactions.get(id);
+      if (current?.revision !== expectedRevision) {
+        throw new TransactionRecordConflictError(id, expectedRevision, current?.revision ?? null);
+      }
+      assertGenericTransactionUpdateAllowed(current, update);
+      const updated = updateTransactionRecord(current, update);
+      if (update.snapshotVersion !== undefined) {
+        assertSnapshotAvailable(updated.snapshotVersion, this.#manifests, this.#blocks);
+      }
+      assertPendingArtifactsAvailable(
+        updated,
+        this.#blocks,
+        this.#segments,
+        update.pendingBlockIds !== undefined,
+        update.pendingSegmentIds !== undefined,
+      );
+      this.#transactions.set(id, updated);
+      return structuredClone(updated);
+    });
   }
 
   async commitTransaction(input: CommitTransactionInput): Promise<Manifest> {
@@ -318,8 +344,12 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   async createLease(record: LeaseRecord): Promise<void> {
-    if (this.#leases.has(record.id)) throw new Error(`Lease already exists: ${record.id}`);
-    this.#leases.set(record.id, structuredClone(record));
+    validateLeaseExpiration(record.expiresAt);
+    return this.#runAtomic(() => {
+      if (this.#leases.has(record.id)) throw new Error(`Lease already exists: ${record.id}`);
+      assertSnapshotAvailable(record.manifestVersion, this.#manifests, this.#blocks);
+      this.#leases.set(record.id, structuredClone(record));
+    });
   }
 
   async getLease(id: string): Promise<LeaseRecord | undefined> {
@@ -334,17 +364,42 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   async renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord> {
-    const record = this.#leases.get(id);
-    if (record?.revision !== expectedRevision) {
-      throw new LeaseConflictError(id, expectedRevision, record?.revision ?? null);
-    }
-    const renewed = { ...record, expiresAt, revision: record.revision + 1 };
-    this.#leases.set(id, renewed);
-    return structuredClone(renewed);
+    validateLeaseExpiration(expiresAt);
+    return this.#runAtomic(() => {
+      const record = this.#leases.get(id);
+      if (record?.revision !== expectedRevision) {
+        throw new LeaseConflictError(id, expectedRevision, record?.revision ?? null);
+      }
+      assertSnapshotAvailable(record.manifestVersion, this.#manifests, this.#blocks);
+      const renewed = { ...record, expiresAt, revision: record.revision + 1 };
+      this.#leases.set(id, renewed);
+      return structuredClone(renewed);
+    });
+  }
+
+  async removeLeaseIfExpired(
+    id: string,
+    expectedRevision: number,
+    expiresAtCutoff: string,
+  ): Promise<boolean> {
+    const cutoff = Date.parse(expiresAtCutoff);
+    if (!Number.isFinite(cutoff)) throw new TypeError("Lease expiry cutoff must be valid");
+    return this.#runAtomic(() => {
+      const record = this.#leases.get(id);
+      if (record?.revision !== expectedRevision) {
+        throw new LeaseConflictError(id, expectedRevision, record?.revision ?? null);
+      }
+      const expiresAt = Date.parse(record.expiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt > cutoff) return false;
+      this.#leases.delete(id);
+      return true;
+    });
   }
 
   async removeLease(id: string): Promise<void> {
-    this.#leases.delete(id);
+    return this.#runAtomic(() => {
+      this.#leases.delete(id);
+    });
   }
 
   async createCompactionJob(record: CompactionJobRecord): Promise<void> {
@@ -457,8 +512,209 @@ export class MemoryBlockStore implements BlockStore {
     this.#compactionJobs.delete(id);
   }
 
+  async createGarbageCollectionJob(
+    input: CreateGarbageCollectionJobInput,
+  ): Promise<GarbageCollectionJobRecord> {
+    const record = createGarbageCollectionJobRecord(input);
+    return this.#runAtomic(() => {
+      if (this.#garbageCollectionJobs.has(record.id)) {
+        throw new Error(`Garbage collection job already exists: ${record.id}`);
+      }
+      assertGarbageCollectionCandidateProvenance(
+        record,
+        this.#manifests,
+        this.#segments,
+        this.#transactions,
+        this.#compactionJobs,
+      );
+      this.#garbageCollectionJobs.set(record.id, record);
+      return structuredClone(record);
+    });
+  }
+
+  async getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined> {
+    const record = this.#garbageCollectionJobs.get(id);
+    return record === undefined ? undefined : structuredClone(record);
+  }
+
+  async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
+    return [...this.#garbageCollectionJobs.values()]
+      .sort(
+        (left, right) =>
+          left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+      )
+      .map((record) => structuredClone(record));
+  }
+
+  async runGarbageCollectionStep(
+    input: RunGarbageCollectionStepInput,
+  ): Promise<GarbageCollectionStepResult> {
+    validateGarbageCollectionStepInput(input);
+    return this.#runAtomic(() => {
+      const current = this.#garbageCollectionJobs.get(input.jobId);
+      if (current?.revision !== input.expectedRevision) {
+        throw new GarbageCollectionJobConflictError(
+          input.jobId,
+          input.expectedRevision,
+          current?.revision ?? null,
+        );
+      }
+      if (current.state === "completed") return emptyGarbageCollectionStep(current);
+
+      const prunedManifestVersions: number[] = [];
+      const alreadyPrunedManifestVersions: number[] = [];
+      const retainedManifestVersions: number[] = [];
+      const missingManifestVersions: number[] = [];
+      const reclaimedSegmentIds: string[] = [];
+      const retainedSegmentIds: string[] = [];
+      const missingSegmentIds: string[] = [];
+      const reclaimedBlockIds: string[] = [];
+      const retainedBlockIds: string[] = [];
+      const missingBlockIds: string[] = [];
+      let reclaimedBlockBytes = 0;
+      let remaining = input.maxItems;
+
+      const pinnedManifestVersions = collectPinnedManifestVersions(
+        this.#currentVersion,
+        this.#transactions.values(),
+        this.#leases.values(),
+        this.#compactionJobs.values(),
+        Date.parse(current.leaseCutoff),
+      );
+      assertPinnedManifestsAvailable(pinnedManifestVersions, this.#manifests, this.#blocks);
+      let manifestIndex = current.cursor.manifestIndex;
+      while (remaining > 0 && manifestIndex < current.candidateManifestVersions.length) {
+        const version = current.candidateManifestVersions[manifestIndex];
+        if (version === undefined) throw new Error("Garbage collection manifest cursor is invalid");
+        const manifest = this.#manifests.get(version);
+        if (manifest === undefined) missingManifestVersions.push(version);
+        else if (manifest.prunedAt !== undefined) alreadyPrunedManifestVersions.push(version);
+        else if (pinnedManifestVersions.has(version)) retainedManifestVersions.push(version);
+        else prunedManifestVersions.push(version);
+        manifestIndex += 1;
+        remaining -= 1;
+      }
+
+      const prunedManifestVersionSet = new Set(prunedManifestVersions);
+      const remainingManifests = [...this.#manifests.values()].filter(
+        (manifest) =>
+          manifest.prunedAt === undefined && !prunedManifestVersionSet.has(manifest.version),
+      );
+      const roots = collectPhysicalRoots(
+        remainingManifests,
+        this.#segments.values(),
+        this.#transactions.values(),
+        this.#compactionJobs.values(),
+      );
+      assertAllManifestBlocksAvailable(remainingManifests, this.#blocks);
+      let segmentIndex = current.cursor.segmentIndex;
+      while (
+        remaining > 0 &&
+        manifestIndex === current.candidateManifestVersions.length &&
+        segmentIndex < current.candidateSegmentIds.length
+      ) {
+        const id = current.candidateSegmentIds[segmentIndex];
+        if (id === undefined) throw new Error("Garbage collection segment cursor is invalid");
+        if (!this.#segments.has(id)) missingSegmentIds.push(id);
+        else if (roots.segmentIds.has(id)) retainedSegmentIds.push(id);
+        else reclaimedSegmentIds.push(id);
+        segmentIndex += 1;
+        remaining -= 1;
+      }
+
+      let blockIndex = current.cursor.blockIndex;
+      while (
+        remaining > 0 &&
+        manifestIndex === current.candidateManifestVersions.length &&
+        segmentIndex === current.candidateSegmentIds.length &&
+        blockIndex < current.candidateBlockIds.length
+      ) {
+        const id = current.candidateBlockIds[blockIndex];
+        if (id === undefined) throw new Error("Garbage collection block cursor is invalid");
+        const bytes = this.#blocks.get(id);
+        if (bytes === undefined) missingBlockIds.push(id);
+        else if (roots.blockIds.has(id)) retainedBlockIds.push(id);
+        else {
+          reclaimedBlockIds.push(id);
+          reclaimedBlockBytes = safeStorageSum(reclaimedBlockBytes, bytes.byteLength);
+        }
+        blockIndex += 1;
+        remaining -= 1;
+      }
+
+      const updated = advanceGarbageCollectionJobRecord(current, {
+        examinedManifestCount:
+          prunedManifestVersions.length +
+          alreadyPrunedManifestVersions.length +
+          retainedManifestVersions.length +
+          missingManifestVersions.length,
+        prunedManifestCount: prunedManifestVersions.length,
+        alreadyPrunedManifestCount: alreadyPrunedManifestVersions.length,
+        retainedManifestCount: retainedManifestVersions.length,
+        missingManifestCount: missingManifestVersions.length,
+        examinedSegmentCount:
+          reclaimedSegmentIds.length + retainedSegmentIds.length + missingSegmentIds.length,
+        reclaimedSegmentCount: reclaimedSegmentIds.length,
+        retainedSegmentCount: retainedSegmentIds.length,
+        missingSegmentCount: missingSegmentIds.length,
+        examinedBlockCount:
+          reclaimedBlockIds.length + retainedBlockIds.length + missingBlockIds.length,
+        reclaimedBlockCount: reclaimedBlockIds.length,
+        retainedBlockCount: retainedBlockIds.length,
+        missingBlockCount: missingBlockIds.length,
+        reclaimedBlockBytes,
+        updatedAt: input.updatedAt,
+      });
+      prunedManifestVersions.forEach((version) => {
+        const manifest = this.#manifests.get(version);
+        if (manifest !== undefined)
+          this.#manifests.set(version, { ...manifest, prunedAt: input.updatedAt });
+      });
+      reclaimedSegmentIds.forEach((id) => this.#segments.delete(id));
+      reclaimedBlockIds.forEach((id) => this.#blocks.delete(id));
+      this.#garbageCollectionJobs.set(updated.id, updated);
+      return {
+        job: structuredClone(updated),
+        prunedManifestVersions,
+        alreadyPrunedManifestVersions,
+        retainedManifestVersions,
+        missingManifestVersions,
+        reclaimedSegmentIds,
+        retainedSegmentIds,
+        missingSegmentIds,
+        reclaimedBlockIds,
+        retainedBlockIds,
+        missingBlockIds,
+        reclaimedBlockBytes,
+      };
+    });
+  }
+
+  async removeGarbageCollectionJob(id: string): Promise<void> {
+    return this.#runAtomic(() => {
+      this.#garbageCollectionJobs.delete(id);
+    });
+  }
+
   close(): void {
     // The in-memory implementation owns no external resources.
+  }
+
+  #runAtomic<T>(operation: () => T): Promise<T> {
+    let resolveResult: (value: T | PromiseLike<T>) => void;
+    let rejectResult: (reason: unknown) => void;
+    const result = new Promise<T>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    this.#commitQueue = this.#commitQueue.then(() => {
+      try {
+        resolveResult(operation());
+      } catch (error) {
+        rejectResult(error);
+      }
+    });
+    return result;
   }
 }
 
@@ -500,4 +756,238 @@ function assertGenericTransactionUpdateAllowed(
   if (Reflect.has(update, "committedVersion")) {
     throw new TypeError("Only commitTransaction can set a committed transaction version");
   }
+}
+
+function assertSnapshotAvailable(
+  version: number | null,
+  manifests: ReadonlyMap<number, Manifest>,
+  blocks: ReadonlyMap<string, Uint8Array>,
+): void {
+  if (version === null) return;
+  const manifest = manifests.get(version);
+  if (
+    manifest === undefined ||
+    manifest.prunedAt !== undefined ||
+    manifest.blockIds.some((id) => !blocks.has(id))
+  ) {
+    throw new SnapshotManifestMissingError(version);
+  }
+}
+
+function assertPinnedManifestsAvailable(
+  versions: ReadonlySet<number>,
+  manifests: ReadonlyMap<number, Manifest>,
+  blocks: ReadonlyMap<string, Uint8Array>,
+): void {
+  for (const version of versions) assertSnapshotAvailable(version, manifests, blocks);
+}
+
+function assertPendingArtifactsAvailable(
+  transaction: TransactionRecord,
+  blocks: ReadonlyMap<string, Uint8Array>,
+  segments: ReadonlyMap<string, SegmentRecord>,
+  validateBlocks = true,
+  validateSegments = true,
+): void {
+  const missingBlockId = validateBlocks
+    ? transaction.pendingBlockIds.find((id) => !blocks.has(id))
+    : undefined;
+  if (missingBlockId !== undefined) {
+    throw new Error(`Transaction references missing pending block: ${missingBlockId}`);
+  }
+  const missingSegmentId = validateSegments
+    ? transaction.pendingSegmentIds.find((id) => !segments.has(id))
+    : undefined;
+  if (missingSegmentId !== undefined) {
+    throw new Error(`Transaction references missing pending segment: ${missingSegmentId}`);
+  }
+}
+
+function assertAllManifestBlocksAvailable(
+  manifests: Iterable<Manifest>,
+  blocks: ReadonlyMap<string, Uint8Array>,
+): void {
+  for (const manifest of manifests) {
+    if (manifest.blockIds.some((id) => !blocks.has(id))) {
+      throw new SnapshotManifestMissingError(manifest.version);
+    }
+  }
+}
+
+function assertGarbageCollectionCandidateProvenance(
+  job: GarbageCollectionJobRecord,
+  manifests: ReadonlyMap<number, Manifest>,
+  segments: ReadonlyMap<string, SegmentRecord>,
+  transactions: ReadonlyMap<string, TransactionRecord>,
+  compactionJobs: ReadonlyMap<string, CompactionJobRecord>,
+): void {
+  const provenBlockIds = new Set<string>();
+  const provenSegmentIds = new Set<string>();
+  for (const version of job.candidateManifestVersions) {
+    const manifest = manifests.get(version);
+    if (manifest === undefined) {
+      throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
+    }
+    manifest.blockIds.forEach((id) => provenBlockIds.add(id));
+  }
+  for (const transaction of transactions.values()) {
+    if (transaction.status !== "aborted") continue;
+    transaction.pendingBlockIds.forEach((id) => provenBlockIds.add(id));
+    transaction.pendingSegmentIds.forEach((id) => provenSegmentIds.add(id));
+  }
+  for (const compaction of compactionJobs.values()) {
+    if (!isTerminalCompactionJob(compaction)) continue;
+    compaction.sourceBlockIds.forEach((id) => provenBlockIds.add(id));
+    compaction.outputBlockIds.forEach((id) => provenBlockIds.add(id));
+    compaction.sourceSegmentIds.forEach((id) => provenSegmentIds.add(id));
+    if (compaction.outputSegmentId !== null) provenSegmentIds.add(compaction.outputSegmentId);
+  }
+  for (const segment of segments.values()) {
+    const blockIds = segmentBlockIds(segment);
+    if (blockIds.length > 0 && blockIds.every((id) => provenBlockIds.has(id))) {
+      provenSegmentIds.add(segment.id);
+    }
+  }
+  const unprovenBlockId = job.candidateBlockIds.find((id) => !provenBlockIds.has(id));
+  if (unprovenBlockId !== undefined) {
+    throw new Error(
+      `Garbage collection block candidate has no persisted provenance: ${unprovenBlockId}`,
+    );
+  }
+  const unprovenSegmentId = job.candidateSegmentIds.find((id) => !provenSegmentIds.has(id));
+  if (unprovenSegmentId !== undefined) {
+    throw new Error(
+      `Garbage collection segment candidate has no persisted provenance: ${unprovenSegmentId}`,
+    );
+  }
+}
+
+function collectPinnedManifestVersions(
+  currentVersion: number | null,
+  transactions: Iterable<TransactionRecord>,
+  leases: Iterable<LeaseRecord>,
+  compactionJobs: Iterable<CompactionJobRecord>,
+  leaseCutoff: number,
+): Set<number> {
+  const transactionRecords = [...transactions];
+  const transactionsById = new Map(
+    transactionRecords.map((transaction) => [transaction.id, transaction]),
+  );
+  const versions = new Set<number>();
+  if (currentVersion !== null) versions.add(currentVersion);
+  for (const transaction of transactionRecords) {
+    if (transaction.status === "active" && transaction.snapshotVersion !== null) {
+      versions.add(transaction.snapshotVersion);
+    }
+  }
+  for (const lease of leases) {
+    const expiresAt = Date.parse(lease.expiresAt);
+    if (
+      lease.manifestVersion !== null &&
+      (!Number.isFinite(expiresAt) || expiresAt > leaseCutoff)
+    ) {
+      versions.add(lease.manifestVersion);
+    }
+  }
+  for (const job of compactionJobs) {
+    if (isTerminalCompactionJob(job)) continue;
+    versions.add(job.sourceManifestVersion);
+    const linkedTransaction =
+      job.transactionId === null ? undefined : transactionsById.get(job.transactionId);
+    if (linkedTransaction?.status === "committed") {
+      if (linkedTransaction.committedVersion === null) {
+        throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
+      }
+      versions.add(linkedTransaction.committedVersion);
+    }
+  }
+  return versions;
+}
+
+function collectPhysicalRoots(
+  manifests: Iterable<Manifest>,
+  segments: Iterable<SegmentRecord>,
+  transactions: Iterable<TransactionRecord>,
+  compactionJobs: Iterable<CompactionJobRecord>,
+): { blockIds: Set<string>; segmentIds: Set<string> } {
+  const blockIds = new Set<string>();
+  const segmentIds = new Set<string>();
+  const segmentRecords = [...segments];
+  const activeTransactionIds = new Set<string>();
+  for (const manifest of manifests) manifest.blockIds.forEach((id) => blockIds.add(id));
+  for (const transaction of transactions) {
+    if (transaction.status !== "active") continue;
+    activeTransactionIds.add(transaction.id);
+    transaction.pendingBlockIds.forEach((id) => blockIds.add(id));
+    transaction.pendingSegmentIds.forEach((id) => segmentIds.add(id));
+  }
+  for (const job of compactionJobs) {
+    if (isTerminalCompactionJob(job)) continue;
+    job.sourceBlockIds.forEach((id) => blockIds.add(id));
+    job.outputBlockIds.forEach((id) => blockIds.add(id));
+    job.sourceSegmentIds.forEach((id) => segmentIds.add(id));
+    if (job.outputSegmentId !== null) segmentIds.add(job.outputSegmentId);
+  }
+  for (const segment of segmentRecords) {
+    const ids = segmentBlockIds(segment);
+    if (
+      (ids.length > 0 && ids.every((id) => blockIds.has(id))) ||
+      segmentIds.has(segment.id) ||
+      activeTransactionIds.has(segment.transactionId)
+    ) {
+      segmentIds.add(segment.id);
+      ids.forEach((id) => blockIds.add(id));
+    }
+  }
+  return { blockIds, segmentIds };
+}
+
+function segmentBlockIds(segment: SegmentRecord): string[] {
+  return [...new Set(Object.values(segment.columnBlockIds).flat())];
+}
+
+function validateGarbageCollectionStepInput(input: RunGarbageCollectionStepInput): void {
+  if (input.jobId.length === 0) throw new TypeError("Garbage collection job ID cannot be empty");
+  if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+    throw new RangeError(
+      "Garbage collection expected revision must be a non-negative whole number",
+    );
+  }
+  if (!Number.isSafeInteger(input.maxItems) || input.maxItems <= 0) {
+    throw new RangeError("Garbage collection item limit must be a positive whole number");
+  }
+  if (input.updatedAt.length === 0 || !Number.isFinite(Date.parse(input.updatedAt))) {
+    throw new TypeError("Garbage collection update timestamp must be valid");
+  }
+}
+
+function validateLeaseExpiration(expiresAt: string): void {
+  if (expiresAt.length === 0 || !Number.isFinite(Date.parse(expiresAt))) {
+    throw new TypeError("Lease expiration must be valid");
+  }
+}
+
+function emptyGarbageCollectionStep(job: GarbageCollectionJobRecord): GarbageCollectionStepResult {
+  return {
+    job: structuredClone(job),
+    prunedManifestVersions: [],
+    alreadyPrunedManifestVersions: [],
+    retainedManifestVersions: [],
+    missingManifestVersions: [],
+    reclaimedSegmentIds: [],
+    retainedSegmentIds: [],
+    missingSegmentIds: [],
+    reclaimedBlockIds: [],
+    retainedBlockIds: [],
+    missingBlockIds: [],
+    reclaimedBlockBytes: 0,
+  };
+}
+
+function safeStorageSum(left: number, right: number): number {
+  const total = left + right;
+  if (!Number.isSafeInteger(total)) {
+    throw new RangeError("Garbage collection reclaimed block bytes exceed the safe range");
+  }
+  return total;
 }

@@ -3,11 +3,15 @@ import type {
   BlockWrite,
   CompactionJobRecord,
   CompactionJobRecordUpdate,
+  CreateGarbageCollectionJobInput,
+  GarbageCollectionJobRecord,
+  GarbageCollectionStepResult,
   CommitTransactionInput,
   LeaseRecord,
   Manifest,
   PublishManifestInput,
   RowIdRange,
+  RunGarbageCollectionStepInput,
   SegmentRecord,
   TableRecord,
   TransactionRecord,
@@ -170,6 +174,14 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.renewLease(id, expectedRevision, expiresAt);
   }
 
+  removeLeaseIfExpired(
+    id: string,
+    expectedRevision: number,
+    expiresAtCutoff: string,
+  ): Promise<boolean> {
+    return this.inner.removeLeaseIfExpired(id, expectedRevision, expiresAtCutoff);
+  }
+
   removeLease(id: string): Promise<void> {
     return this.inner.removeLease(id);
   }
@@ -204,6 +216,30 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   removeCompactionJob(id: string): Promise<void> {
     return this.inner.removeCompactionJob(id);
+  }
+
+  createGarbageCollectionJob(
+    input: CreateGarbageCollectionJobInput,
+  ): Promise<GarbageCollectionJobRecord> {
+    return this.inner.createGarbageCollectionJob(input);
+  }
+
+  getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined> {
+    return this.inner.getGarbageCollectionJob(id);
+  }
+
+  listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
+    return this.inner.listGarbageCollectionJobs();
+  }
+
+  runGarbageCollectionStep(
+    input: RunGarbageCollectionStepInput,
+  ): Promise<GarbageCollectionStepResult> {
+    return this.inner.runGarbageCollectionStep(input);
+  }
+
+  removeGarbageCollectionJob(id: string): Promise<void> {
+    return this.inner.removeGarbageCollectionJob(id);
   }
 
   close(): void {
