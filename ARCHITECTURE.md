@@ -92,7 +92,7 @@ Database -> Table -> Segment -> Row group -> Column block
 - Inserts, updates, and deletes first land in append-only L0 deltas.
 - Compaction rewrites deltas into larger query-oriented columnar segments.
 
-No row is stored as an individual IndexedDB value, and no entire table is stored as one giant value. Initial block-size experiments cover 256 KiB, 512 KiB, 1 MiB, 2 MiB, and 4 MiB compressed blocks.
+No row is stored as an individual IndexedDB value, and no entire table is stored as one giant value. Initial block-size experiments cover 256 KiB, 512 KiB, 1 MiB, 2 MiB, and 4 MiB estimated pre-compression column-block targets.
 
 ### Binary block container
 

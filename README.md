@@ -161,6 +161,9 @@ The browser dashboard currently supports:
 - repeated tests that highlight the whole run, saving, or loading;
 - progress, cancellation, timing charts, storage estimates, past results, and downloads;
 - one-click comparison of all three compression choices and all five block sizes;
+- optional Playwright evidence capture with repeated cells, explicit aggregation timing, and
+  verified raw JSON downloads; the current cross-browser result provisionally selects gzip with a
+  2 MiB target for storage-oriented physical rewrites;
 - a lazy-loaded public SQL comparison against SQLite Wasm, DuckDB-Wasm, and PGlite using the same
   27-table batches, explicit persistence/configuration disclosures, portable checksum-verified SQL,
   per-query median/p95 timing, engine-reported database size, loaded asset bytes, and available heap

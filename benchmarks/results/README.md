@@ -28,10 +28,12 @@ reference queries. The dashboard also exposes a bounded read-only ad-hoc referen
 parse, median, p95, and row-flow metrics. These timings describe JavaScript execution over a loaded
 snapshot; they are not public `query()`/`prepareQuery()` measurements.
 
-The dashboard can automate a raw/RLE/gzip block-size matrix at 256 KiB through 4 MiB, but no full
-matrix is checked in yet. That evidence—and a documented default block-size decision or reason to
-remain configurable—is the next result milestone. Larger quota-dependent datasets follow after the
-quick matrix establishes safe runtime and memory characteristics.
+The dated 2026-08-08 codec/block-size bundle records the complete raw/RLE/gzip × five-target matrix
+in Chromium and Firefox over 1,930,800 rows and about 90 MiB of encoded column payload. All 30 cells
+verified. The accompanying decision record selects gzip with a provisional 2 MiB target for
+storage-oriented benchmark and physical-rewrite work while leaving the row-partitioned public API
+configurable. Larger quota-dependent datasets and repeated-sample distributions remain future
+evidence work.
 
 The dated four-engine report predates BrowserDatabase's public read-only SQL API, so its
 BrowserDatabase SQL cells remain explicitly unmeasured. The current dashboard comparison now runs

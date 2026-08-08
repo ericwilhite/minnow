@@ -62,7 +62,7 @@ test("shows exact parameters and derives every row count from scale", async ({ p
 
   await expect(page.locator("#scale option:checked")).toHaveText("1× — standard");
   await expect(page.locator("#scale-description")).toContainText("1,000 orders");
-  await expect(page.locator("#block-size option:checked")).toHaveText("512 KiB — 524,288 bytes");
+  await expect(page.locator("#block-size option:checked")).toHaveText("2 MiB — 2,097,152 bytes");
   await expect(page.locator("#run-summary-copy")).toContainText("encode it with gzip");
   await expect(page.locator("#run-summary-copy")).toContainText("27 connected tables");
   await expect(page.locator("#run-summary-copy")).toContainText("IndexedDB durability “relaxed”");

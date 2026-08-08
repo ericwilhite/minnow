@@ -61,9 +61,12 @@ Initial matrix:
 - datasets: quick local smoke tests first, then 100 MiB, 1 GiB, 5 GiB, and 10+ GiB where quota allows;
 - memory budgets to preserve in future query tests: 16, 32, 64, 128, and 256 MiB.
 
-The dashboard automates the raw/RLE/gzip comparison across all five block sizes, but the full
-matrix has not yet been checked in. The current result set contains only one-block smoke runs in two
-browsers, so it does not yet support a default block-size decision.
+The dashboard automates the raw/RLE/gzip comparison across all five block sizes and can preserve a
+raw result bundle from Playwright. The checked-in 2026-08-08 Chromium and Firefox runs cover
+1,930,800 rows and about 90 MiB of encoded payload per cell. All 30 cells verified. The decision
+record selects gzip with a provisional 2 MiB target for storage-oriented benchmark and physical
+rewrite work; the row-partitioned public API remains configurable until Phase 6B adds persisted
+byte-target semantics. Larger quota-dependent tiers and repeated-sample distributions remain open.
 
 Later comparison adapters may benchmark SQLite-Wasm and DuckDB-Wasm as opt-in development-only competitors. They must never be imported by engine packages or used for correctness.
 
@@ -284,7 +287,7 @@ performance curves also remain outstanding.
 - [x] Add unit and real-browser tests.
 - [x] Build the bounded multi-entity storage dashboard and block inventory.
 - [x] Automate the 15-run compression and block-size comparison.
-- [ ] Check in the full raw/RLE/gzip comparison across all five block sizes and document the
+- [x] Check in the full raw/RLE/gzip comparison across all five block sizes and document the
       block-size decision.
 - [x] Implement stable snapshots, transaction journals, atomic commit/rebase, and stale-write recovery.
 - [x] Implement persistent tables, immutable insert/upsert/update/delete segments, and hidden row-ID allocation.
