@@ -2,8 +2,8 @@
 
 BrowserDatabase is an experimental browser-only relational database built around immutable compressed
 columnar blocks and IndexedDB. The current slice includes the block format, atomic storage
-publication, persistent writes and snapshots, a bounded read-only SQL API, conservative append-only
-compaction, deterministic fault injection, and a browser benchmark laboratory.
+publication, persistent writes and snapshots, a bounded read-only SQL API, resumable physical
+compaction of append segments, deterministic fault injection, and a browser benchmark laboratory.
 
 The public logical types are intentionally small:
 
@@ -92,7 +92,7 @@ await database.createTable({
 await database.insert("events", { value: 1 });
 await database.insert("events", { value: 2 });
 
-// Advance a durable append-only compaction job by one immutable block.
+// Advance a durable append-only physical rewrite by one output block.
 let progress = await database.compactTableStep("events", { maxBlocks: 1 });
 while (progress.result === null) {
   if (progress.jobId === null) throw new Error("Expected a compaction job");
@@ -125,24 +125,40 @@ its referenced columns at one manifest version, remains stable across later comm
 closed when no longer needed. This is a correctness-first SQL subset, not a claim of full SQL-92
 coverage.
 
-Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records its
-source manifest and segments, output IDs, active transaction, state, and source block cursor.
-`compactTableStep()` creates or advances the active table job by `maxBlocks`;
+Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records an
+immutable rewrite plan: the source manifest and segments; ordered column/block layout; source row
+ranges, byte lengths, and checksums; output row windows; output compression; row-ID bounds; and logical
+order. It also checkpoints its output IDs, active transaction, state, and next output cursor.
+`compactTableStep()` creates or advances the active table job by at most `maxBlocks` output blocks;
 `resumeCompactionJob()` continues a known job after a yield or database reopen; and
 `listCompactionJobs()` exposes persisted progress. `compactTable()` is a convenience wrapper that
 drives the same checkpointed workflow to completion in steps controlled by `maxBlocksPerStep`.
 
-Each current step copies one encoded immutable block to a deterministic output ID and checkpoints
-after it. Resume verifies an already-written block byte-for-byte and reattaches it to the persisted
-transaction journal when a crash separated those writes; the output segment and a committed
-transaction whose job state was not updated are reconciled similarly. Normal writes are recorded as
-L0 segments. The completed whole-table append job publishes one L1 segment with the earliest source
-`logicalOrder`, which keeps a concurrent append after the consolidated rows when publication safely
-rebases. Older manifests still reference the source blocks, so historical snapshots remain valid.
+Execution decodes verified physical column payloads, slices and concatenates row ranges, and
+re-encodes output windows without materializing JavaScript row objects. The defaults are gzip, a
+2 MiB estimated uncompressed physical target per output column block, and a 32 MiB budget for
+JavaScript-owned rewrite buffers. The planner derives a shared row-window size from observed source
+block density, then measures and splits windows when skew or a tighter execution budget requires it.
+A single row cannot be split, so 2 MiB remains a sizing target rather than a hard output limit; one
+large value may exceed it when its physical and codec bounds still fit the block format. The job
+records a conservative minimum and a modeled high-water mark. Planner inspection reads one stored block at a
+time outside that executor high-water accounting; browser-native codec allocations, IndexedDB
+internals, persisted job/transaction metadata, and other browser heap are also excluded, so the
+option is not a strict total-process heap limit.
 
-This is segment-consolidation scaffolding, not a data rewrite. It does not rechunk or re-encode
-blocks, enforce a byte memory budget, compact upsert/update/delete deltas, choose subsets or levels
-beyond whole-table L0 -> L1, cancel jobs, or reclaim physical blocks. Mutation-bearing and
+Every completed output block is checkpointed under a deterministic ID. Resume decompresses and
+validates an existing output, then compares its physical payload, type, compression, and row count.
+This semantic reconciliation matters for gzip because equivalent streams need not be
+byte-identical. The block is reattached to a replacement transaction when needed. A prepared output
+segment and a commit whose job-state update was lost are reconciled similarly. Normal writes remain
+L0 segments. The completed whole-table append rewrite publishes one L1 segment with the earliest source
+`logicalOrder`, which keeps a concurrent append after the consolidated rows when publication safely
+rebases. A changed or missing planned source aborts the job. Older manifests still reference the
+source blocks, so historical snapshots remain valid.
+
+Phase 6 remains open. The implemented policy only rewrites every eligible, contiguous append-only
+segment in a table from L0 to one L1 segment. It does not compact upsert/update/delete deltas, choose
+source subsets, implement L2 policy, cancel jobs, or reclaim physical blocks. Mutation-bearing and
 non-contiguous inputs are skipped explicitly; superseded blocks remain stored and
 `physicallyReclaimedBytes` is zero until lease-aware garbage collection exists.
 

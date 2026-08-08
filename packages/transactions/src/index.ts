@@ -190,10 +190,10 @@ export class DatabaseTransaction {
     if (additions.some((id) => id.length === 0)) {
       throw new TypeError("Block ID cannot be empty");
     }
-    const blocks = await this.store.getBlocks(additions);
-    const missingIndex = blocks.findIndex((bytes) => bytes === undefined);
-    if (missingIndex >= 0) {
-      throw new Error(`Cannot stage a missing existing block: ${additions[missingIndex] ?? ""}`);
+    for (const id of additions) {
+      if ((await this.store.getBlock(id)) === undefined) {
+        throw new Error(`Cannot stage a missing existing block: ${id}`);
+      }
     }
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingBlockIds: [...this.#record.pendingBlockIds, ...additions],

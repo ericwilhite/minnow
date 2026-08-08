@@ -65,8 +65,9 @@ The dashboard automates the raw/RLE/gzip comparison across all five block sizes 
 raw result bundle from Playwright. The checked-in 2026-08-08 Chromium and Firefox runs cover
 1,930,800 rows and about 90 MiB of encoded payload per cell. All 30 cells verified. The decision
 record selects gzip with a provisional 2 MiB target for storage-oriented benchmark and physical
-rewrite work; the row-partitioned public API remains configurable until Phase 6B adds persisted
-byte-target semantics. Larger quota-dependent tiers and repeated-sample distributions remain open.
+rewrite work. Phase 6B uses that as its default estimated uncompressed physical target and persists
+the selected byte target with each rewrite job; ordinary row-partitioned writes remain separately
+configurable. Larger quota-dependent tiers and repeated-sample distributions remain open.
 
 Later comparison adapters may benchmark SQLite-Wasm and DuckDB-Wasm as opt-in development-only competitors. They must never be imported by engine packages or used for correctness.
 
@@ -142,18 +143,28 @@ Exit gate: published benchmark curves for insert, upsert, update, delete, and co
 
 ## Phase 6 — Compaction
 
-Foundation implemented:
+Phase 6A and the first Phase 6B physical-rewrite slice are implemented:
 
 - atomic manifest publication can supersede snapshot blocks without deleting historical data;
 - revisioned compaction job records persist in the IndexedDB `gc` store with planned, running,
   ready, published, and aborted states;
-- `compactTableStep()` plans or advances a job by a bounded block count,
+- `compactTableStep()` plans or advances a job by a bounded output-block count,
   `resumeCompactionJob()` continues it after a yield or restart, and `listCompactionJobs()` exposes
   durable progress; `compactTable()` remains the convenience wrapper that drives those steps to
   publication;
-- each checkpoint copies one immutable block under a deterministic output ID, then records its
-  source-segment/block cursor and output IDs; retries reconcile blocks or the output segment written
-  before their journal/checkpoint update instead of rewriting different bytes;
+- the immutable `rechunk-v1` plan fingerprints the ordered columns and source blocks with row
+  ranges, stored/encoded lengths, and checksums, and persists output windows, row-ID bounds, logical
+  order, target encoding, and execution settings;
+- execution decompresses validated physical columns, slices and concatenates row ranges, and
+  re-encodes them without materializing JavaScript row objects;
+- the defaults are gzip, a 2 MiB estimated uncompressed physical target per output column block,
+  and a 32 MiB budget for JavaScript-owned executor buffers;
+- each output-block checkpoint records the next window/column cursor, output IDs and bytes, rows,
+  and modeled working-memory high-water for completed outputs; a conservative preflight minimum
+  rejects a budget that cannot execute its largest planned output;
+- retries decompress and validate existing output before comparing its physical semantics; this
+  avoids depending on byte-identical gzip streams and lets recovery reattach the block to a
+  replacement transaction;
 - a job resumes its persisted transaction, and a lost response after a committed transaction is
   reconciled by marking the job published;
 - ordinary write segments are L0; the current whole-table append policy publishes one L1 segment
@@ -165,12 +176,17 @@ Foundation implemented:
 - mutation-bearing and non-contiguous inputs return explicit skip reasons;
 - metrics distinguish superseded blocks from physically reclaimed bytes, which remain zero.
 
-This Phase 6A slice is restart-safe segment-consolidation scaffolding, not yet a physical rewrite.
-It byte-copies the blocks from every eligible visible append segment into a new whole-table L1
-descriptor. It does not rechunk or re-encode data, enforce a byte-based memory budget, compact
-upsert/update/delete deltas, choose source subsets or level policies beyond whole-table L0 -> L1,
-cancel a job, or reclaim any physical block. Those capabilities remain required before Phase 6 is
-complete.
+The byte target is estimated from source-block encoded density and shared across column output
+windows, then windows are measured and split for skew or a tighter execution budget before the plan
+is persisted. A single row cannot be split, so it may exceed the target only when its physical and
+codec bounds still fit the format cap. The conservative memory figures cover buffers owned by
+rewrite execution, not the whole browser process: planning reads one stored block at a time outside
+executor high-water accounting, and native codec, IndexedDB internal allocations, and persisted
+job/transaction metadata are excluded.
+
+Phase 6 remains open. The current policy rewrites all eligible contiguous append-only inputs into
+one whole-table L1 segment. It does not compact upsert/update/delete deltas, choose subsets or level
+policies beyond L0 -> L1, build L2 segments, cancel a job, or reclaim physical blocks.
 
 Deliver:
 
@@ -272,11 +288,11 @@ Exit gate: representative changing workloads improve without manual indexes and 
 ## Immediate iteration checklist
 
 The current repository slice has completed the Phase 5 storage/write foundation and its planned
-four-way durability matrix. Phase 6A now provides durable, restart-safe, block-stepped append
-segment consolidation, but Phase 6 remains open until compaction performs bounded physical
-rewrites, handles mutation deltas and level/subset selection, supports cancellation, and safely
-reclaims unreachable data. The full checked-in codec/block-size evidence and broader Phase 5
-performance curves also remain outstanding.
+four-way durability matrix. Phase 6A plus the first Phase 6B slice now provide durable,
+restart-safe, output-block-stepped physical rechunking and re-encoding under a modeled
+JavaScript-owned memory budget. Phase 6 remains open until compaction handles mutation deltas and
+level/subset selection, supports cancellation, and safely reclaims unreachable data. The broader
+Phase 5 performance curves and larger/repeated benchmark tiers remain outstanding.
 
 - [x] Record architecture and roadmap.
 - [x] Scaffold packages and quality gates.
@@ -304,7 +320,7 @@ performance curves also remain outstanding.
 - [x] Resume compaction transactions and idempotently reconcile interrupted block, segment, and
       publication checkpoints.
 - [x] Preserve L0/L1 logical order while rebasing publication across concurrent appends.
-- [ ] Rechunk and re-encode selected inputs under an explicit byte memory budget.
+- [x] Rechunk and re-encode append-only inputs under an explicit JavaScript-owned byte memory budget.
 - [ ] Add subset/level selection beyond whole-table L0 -> L1 and compact mutation deltas.
 - [ ] Add safe compaction-job cancellation.
 - [ ] Add lease-aware garbage collection and physical reclamation for superseded blocks.

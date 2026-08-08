@@ -1,4 +1,4 @@
-import { decodeBlock } from "@browserdatabase/block-format";
+import { decodeBlock, inspectBlock } from "@browserdatabase/block-format";
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import {
@@ -13,6 +13,7 @@ import { TransactionManager } from "@browserdatabase/transactions";
 import {
   attachLifecycleFlush,
   BrowserDatabase,
+  CompactionMemoryBudgetError,
   MissingKeyError,
   UniqueConstraintError,
 } from "./database.js";
@@ -21,6 +22,8 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   blockWriteCalls = 0;
   blockReadCalls = 0;
   blockIdsRead: string[][] = [];
+  singleBlockIdsRead: string[] = [];
+  pendingBlockJournalSizes: number[] = [];
 
   override async addBlocks(blocks: Parameters<MemoryBlockStore["addBlocks"]>[0]): Promise<void> {
     this.blockWriteCalls += 1;
@@ -33,6 +36,34 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
     this.blockReadCalls += 1;
     this.blockIdsRead.push([...ids]);
     return super.getBlocks(ids);
+  }
+
+  override async getBlock(id: string): Promise<Uint8Array | undefined> {
+    this.singleBlockIdsRead.push(id);
+    return super.getBlock(id);
+  }
+
+  override async updateTransaction(
+    id: Parameters<MemoryBlockStore["updateTransaction"]>[0],
+    expectedRevision: Parameters<MemoryBlockStore["updateTransaction"]>[1],
+    update: Parameters<MemoryBlockStore["updateTransaction"]>[2],
+  ) {
+    if (update.pendingBlockIds !== undefined) {
+      this.pendingBlockJournalSizes.push(update.pendingBlockIds.length);
+    }
+    return super.updateTransaction(id, expectedRevision, update);
+  }
+}
+
+class ReplacementRestageFaultMemoryBlockStore extends CountingMemoryBlockStore {
+  failNextRestageRead = false;
+
+  override async getBlock(id: string): Promise<Uint8Array | undefined> {
+    if (this.failNextRestageRead && id.includes("/rewrite/window/")) {
+      this.failNextRestageRead = false;
+      throw new Error("injected before replacement output restaging");
+    }
+    return super.getBlock(id);
   }
 }
 
@@ -49,6 +80,36 @@ class CheckpointFaultMemoryBlockStore extends MemoryBlockStore {
       throw new Error("injected before compaction cursor checkpoint");
     }
     return super.updateCompactionJob(id, expectedRevision, update);
+  }
+}
+
+class GzipVariantCheckpointFaultMemoryBlockStore extends CheckpointFaultMemoryBlockStore {
+  returnHeaderVariant = false;
+  variantReadCount = 0;
+
+  async getCanonicalBlock(id: string): Promise<Uint8Array | undefined> {
+    return super.getBlock(id);
+  }
+
+  override async getBlock(id: string): Promise<Uint8Array | undefined> {
+    const bytes = await super.getBlock(id);
+    if (
+      bytes === undefined ||
+      !this.returnHeaderVariant ||
+      !id.includes("/rewrite/window/") ||
+      inspectBlock(bytes).compression !== "gzip"
+    ) {
+      return bytes;
+    }
+    const variant = new Uint8Array(bytes);
+    const view = new DataView(variant.buffer, variant.byteOffset, variant.byteLength);
+    const storedOffset = 36 + view.getUint32(20, true);
+    if (variant[storedOffset] !== 0x1f || variant[storedOffset + 1] !== 0x8b) {
+      throw new Error("Expected a gzip compaction payload");
+    }
+    variant[storedOffset + 4] = (variant[storedOffset + 4] ?? 0) ^ 1;
+    this.variantReadCount += 1;
+    return variant;
   }
 }
 
@@ -756,7 +817,7 @@ it("compacts append-only segments without changing current or older snapshots", 
     compacted: true,
     sourceSegmentCount: 2,
     sourceBlockCount: 4,
-    outputBlockCount: 4,
+    outputBlockCount: 2,
     rowCount: 4,
     supersededBlockCount: 4,
     physicallyReclaimedBytes: 0,
@@ -772,6 +833,411 @@ it("compacts append-only segments without changing current or older snapshots", 
   store.close();
 });
 
+it("physically rechunks every simple type on shared bitmap-aligned row windows", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 64 });
+  await database.createTable({
+    name: "readings",
+    columns: [
+      { name: "active", type: "boolean", nullable: true },
+      { name: "score", type: "number", nullable: true },
+      { name: "label", type: "string", nullable: true },
+      { name: "recordedAt", type: "datetime", nullable: true },
+    ],
+  });
+  const expected = Array.from({ length: 17 }, (_, index) => ({
+    active: [0, 7, 8, 15, 16].includes(index) ? null : index % 2 === 0,
+    score: [1, 8, 16].includes(index) ? null : index + 0.25,
+    label: [2, 7, 9, 15].includes(index) ? null : String.fromCharCode(97 + index),
+    recordedAt: [3, 8, 14, 16].includes(index) ? null : new Date(Date.UTC(2026, 0, index + 1)),
+  }));
+  const insertRange = async (start: number, end: number) => {
+    const rows = expected.slice(start, end);
+    return database.insertBatch("readings", {
+      columns: {
+        active: rows.map((row) => row.active),
+        score: rows.map((row) => row.score),
+        label: rows.map((row) => row.label),
+        recordedAt: rows.map((row) => row.recordedAt),
+      },
+    });
+  };
+
+  const first = await insertRange(0, 5);
+  await insertRange(5, 10);
+  const sourceSnapshot = await insertRange(10, 17);
+
+  const result = await database.compactTable("readings", {
+    targetBlockBytes: 75,
+    outputCompression: "rle",
+    maxBlocksPerStep: 1,
+  });
+
+  expect(result).toMatchObject({
+    compacted: true,
+    sourceSegmentCount: 3,
+    sourceBlockCount: 12,
+    outputBlockCount: 8,
+    rowCount: 17,
+    targetBlockBytes: 75,
+    outputCompression: "rle",
+  });
+  expect(await database.readTable("readings")).toEqual(expected);
+  expect(await database.readTable("readings", first.version)).toEqual(expected.slice(0, 5));
+  expect(await database.readTable("readings", sourceSnapshot.version)).toEqual(expected);
+
+  const job = (await database.listCompactionJobs("readings"))[0];
+  if (job?.rewritePlan?.kind !== "rechunk-v1") {
+    throw new Error("Expected a persisted rechunk plan");
+  }
+  expect(job.rewritePlan.outputs).toEqual([
+    { rowStart: 0, rowCount: 9 },
+    { rowStart: 9, rowCount: 8 },
+  ]);
+  if (job.outputSegmentId === null) throw new Error("Expected a compaction output segment");
+  const outputSegment = await store.getSegment(job.outputSegmentId);
+  if (outputSegment === undefined) throw new Error("Expected a compaction output segment");
+  const outputColumns = Object.values(outputSegment.columnBlockIds);
+  expect(outputColumns.map((blockIds) => blockIds.length)).toEqual([2, 2, 2, 2]);
+
+  const outputTypes = new Set<string>();
+  for (const blockIds of outputColumns) {
+    for (const [outputIndex, blockId] of blockIds.entries()) {
+      const bytes = await store.getBlock(blockId);
+      if (bytes === undefined) throw new Error(`Expected compaction block ${blockId}`);
+      const description = inspectBlock(bytes);
+      outputTypes.add(description.type);
+      expect(description.compression).toBe("rle");
+      expect(description.rowCount).toBe(job.rewritePlan.outputs[outputIndex]?.rowCount);
+    }
+  }
+  expect([...outputTypes].sort()).toEqual(["boolean", "datetime", "number", "string"]);
+  store.close();
+});
+
+it("refines skewed strings to exact target-sized windows before persisting the plan", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 64 });
+  await database.createTable({
+    name: "messages",
+    columns: [{ name: "body", type: "string" }],
+  });
+  const values = Array.from({ length: 24 }, (_, index) =>
+    index === 7 ? "x".repeat(100) : String.fromCharCode(97 + index),
+  );
+  await database.insertBatch("messages", { columns: { body: values.slice(0, 16) } });
+  await database.insertBatch("messages", { columns: { body: values.slice(16) } });
+
+  let progress = await database.compactTableStep("messages", {
+    maxBlocks: 1,
+    targetBlockBytes: 64,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+  const jobId = progress.jobId;
+  const planned = await store.getCompactionJob(jobId);
+  if (planned?.rewritePlan?.kind !== "rechunk-v1") {
+    throw new Error("Expected a persisted rechunk plan");
+  }
+  expect(planned.rewritePlan.outputs).toContainEqual({ rowStart: 7, rowCount: 1 });
+  expect(
+    planned.rewritePlan.outputs.reduce((rowCount, output) => rowCount + output.rowCount, 0),
+  ).toBe(values.length);
+
+  const reopened = new BrowserDatabase(store, { compression: "gzip", rowsPerBlock: 1 });
+  while (progress.result === null) {
+    progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
+  }
+  const completed = await store.getCompactionJob(jobId);
+  if (completed?.outputSegmentId === null || completed?.outputSegmentId === undefined) {
+    throw new Error("Expected a completed output segment");
+  }
+  const outputSegment = await store.getSegment(completed.outputSegmentId);
+  if (outputSegment === undefined) throw new Error("Expected a completed output segment");
+  const outputBlockIds = Object.values(outputSegment.columnBlockIds).flat();
+  expect(outputBlockIds).toHaveLength(planned.rewritePlan.outputs.length);
+  for (const [index, blockId] of outputBlockIds.entries()) {
+    const bytes = await store.getBlock(blockId);
+    if (bytes === undefined) throw new Error(`Expected output block ${blockId}`);
+    const description = inspectBlock(bytes);
+    const window = planned.rewritePlan.outputs[index];
+    expect(description.rowCount).toBe(window?.rowCount);
+    if ((window?.rowCount ?? 0) > 1) expect(description.encodedLength).toBeLessThanOrEqual(64);
+    if (window?.rowStart === 7) {
+      expect(window.rowCount).toBe(1);
+      expect(description.encodedLength).toBeGreaterThan(64);
+    }
+  }
+  expect(await reopened.readTable("messages")).toEqual(values.map((body) => ({ body })));
+  store.close();
+});
+
+for (const outputCompression of ["raw", "rle", "gzip"] as const) {
+  it(`rewrites mixed source codecs to persisted ${outputCompression} output after reopen`, async () => {
+    const store = new MemoryBlockStore();
+    const raw = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 64 });
+    await raw.createTable({
+      name: "events",
+      columns: [
+        { name: "value", type: "number", nullable: true },
+        { name: "label", type: "string", nullable: true },
+      ],
+    });
+    const rawInsert = await raw.insertBatch("events", {
+      columns: { value: [1, 2], label: ["a", null] },
+    });
+    const rle = new BrowserDatabase(store, { compression: "rle", rowsPerBlock: 64 });
+    const rleInsert = await rle.insertBatch("events", {
+      columns: { value: [null, 4], label: ["b", "c"] },
+    });
+    const gzip = new BrowserDatabase(store, { compression: "gzip", rowsPerBlock: 64 });
+    const gzipInsert = await gzip.insertBatch("events", {
+      columns: { value: [5, 6], label: [null, "d"] },
+    });
+    const expected = [
+      { value: 1, label: "a" },
+      { value: 2, label: null },
+      { value: null, label: "b" },
+      { value: 4, label: "c" },
+      { value: 5, label: null },
+      { value: 6, label: "d" },
+    ];
+
+    for (const [segmentId, compression] of [
+      [rawInsert.segmentId, "raw"],
+      [rleInsert.segmentId, "rle"],
+      [gzipInsert.segmentId, "gzip"],
+    ] as const) {
+      const segment = await store.getSegment(segmentId);
+      if (segment === undefined) throw new Error(`Expected source segment ${segmentId}`);
+      for (const blockId of Object.values(segment.columnBlockIds).flat()) {
+        const bytes = await store.getBlock(blockId);
+        if (bytes === undefined) throw new Error(`Expected source block ${blockId}`);
+        expect(inspectBlock(bytes).compression).toBe(compression);
+      }
+    }
+
+    let progress = await gzip.compactTableStep("events", {
+      maxBlocks: 1,
+      targetBlockBytes: 20,
+      outputCompression,
+    });
+    if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+    const jobId = progress.jobId;
+    expect(progress).toMatchObject({ state: "running", outputBlockCount: 1, result: null });
+    expect(await store.getCompactionJob(jobId)).toMatchObject({
+      rewritePlan: { kind: "rechunk-v1", targetBlockBytes: 20, outputCompression },
+    });
+
+    store.close();
+    const reopened = new BrowserDatabase(store, {
+      compression: outputCompression === "raw" ? "gzip" : "raw",
+      rowsPerBlock: 1,
+    });
+    while (progress.result === null) {
+      progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
+    }
+
+    expect(progress.result).toMatchObject({
+      compacted: true,
+      outputCompression,
+      targetBlockBytes: 20,
+      rowCount: 6,
+    });
+    const completed = await store.getCompactionJob(jobId);
+    if (completed?.outputSegmentId === null || completed?.outputSegmentId === undefined) {
+      throw new Error("Expected a completed output segment");
+    }
+    const outputSegment = await store.getSegment(completed.outputSegmentId);
+    if (outputSegment === undefined) throw new Error("Expected a completed output segment");
+    for (const blockId of Object.values(outputSegment.columnBlockIds).flat()) {
+      const bytes = await store.getBlock(blockId);
+      if (bytes === undefined) throw new Error(`Expected output block ${blockId}`);
+      expect(inspectBlock(bytes).compression).toBe(outputCompression);
+    }
+    expect(await reopened.readTable("events")).toEqual(expected);
+    expect(await reopened.readTable("events", gzipInsert.version)).toEqual(expected);
+    store.close();
+  });
+}
+
+it("enforces the persisted compaction memory bound before publishing job output", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "events",
+    columns: [
+      { name: "value", type: "number", nullable: true },
+      { name: "label", type: "string", nullable: true },
+    ],
+  });
+  await database.insertBatch("events", {
+    columns: { value: [1, null, 3], label: ["one", null, "three"] },
+  });
+  await database.insertBatch("events", {
+    columns: { value: [4, 5, null], label: ["four", "five", null] },
+  });
+  const sourceBlockIds = await store.listBlockIds();
+  const sourceManifestCount = (await store.listManifests()).length;
+  const options = { targetBlockBytes: 64, outputCompression: "raw" as const };
+
+  let discoveryError: unknown;
+  try {
+    await database.compactTable("events", { ...options, memoryBudgetBytes: 1 });
+  } catch (error) {
+    discoveryError = error;
+  }
+  expect(discoveryError).toBeInstanceOf(CompactionMemoryBudgetError);
+  if (!(discoveryError instanceof CompactionMemoryBudgetError)) {
+    throw new Error("Expected a compaction memory budget error");
+  }
+  expect(discoveryError.minimumBytes).toBeGreaterThan(1);
+
+  await expect(
+    database.compactTable("events", {
+      ...options,
+      memoryBudgetBytes: discoveryError.minimumBytes - 1,
+    }),
+  ).rejects.toMatchObject({
+    name: "CompactionMemoryBudgetError",
+    budgetBytes: discoveryError.minimumBytes - 1,
+    minimumBytes: discoveryError.minimumBytes,
+  });
+  expect(await store.listCompactionJobs()).toEqual([]);
+  expect(await store.listBlockIds()).toEqual(sourceBlockIds);
+  expect(await store.listManifests()).toHaveLength(sourceManifestCount);
+
+  const result = await database.compactTable("events", {
+    ...options,
+    memoryBudgetBytes: discoveryError.minimumBytes,
+  });
+  expect(result).toMatchObject({
+    compacted: true,
+    memoryBudgetBytes: discoveryError.minimumBytes,
+    minimumMemoryBytes: discoveryError.minimumBytes,
+  });
+  expect(result.peakWorkingBytes).toBeLessThanOrEqual(discoveryError.minimumBytes);
+  expect(await database.readTable("events")).toEqual([
+    { value: 1, label: "one" },
+    { value: null, label: null },
+    { value: 3, label: "three" },
+    { value: 4, label: "four" },
+    { value: 5, label: "five" },
+    { value: null, label: null },
+  ]);
+  store.close();
+});
+
+it("resumes with persisted rewrite settings after an IndexedDB close and reopen", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  let store = await IndexedDbBlockStore.open({ name, indexedDB });
+  const database = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 1 });
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("events", { value: 1 });
+  await database.insert("events", { value: 2 });
+  await database.insert("events", { value: 3 });
+
+  let progress = await database.compactTableStep("events", {
+    maxBlocks: 1,
+    targetBlockBytes: 9,
+    outputCompression: "gzip",
+    memoryBudgetBytes: 1_000_000,
+  });
+  if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+  const jobId = progress.jobId;
+  expect(progress).toMatchObject({ state: "running", outputBlockCount: 1 });
+  expect(await store.getCompactionJob(jobId)).toMatchObject({
+    rewritePlan: {
+      kind: "rechunk-v1",
+      targetBlockBytes: 9,
+      outputCompression: "gzip",
+    },
+    memoryBudgetBytes: 1_000_000,
+  });
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB });
+  const reopened = new BrowserDatabase(store, { compression: "rle", rowsPerBlock: 2048 });
+  while (progress.result === null) {
+    progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
+  }
+
+  expect(progress.result).toMatchObject({
+    compacted: true,
+    targetBlockBytes: 9,
+    outputCompression: "gzip",
+    memoryBudgetBytes: 1_000_000,
+    outputBlockCount: 3,
+  });
+  const completed = await store.getCompactionJob(jobId);
+  if (completed?.outputSegmentId === null || completed?.outputSegmentId === undefined) {
+    throw new Error("Expected a completed compaction output segment");
+  }
+  const outputSegment = await store.getSegment(completed.outputSegmentId);
+  if (outputSegment === undefined) throw new Error("Expected a completed output segment");
+  for (const blockId of Object.values(outputSegment.columnBlockIds).flat()) {
+    const bytes = await store.getBlock(blockId);
+    if (bytes === undefined) throw new Error(`Expected compaction block ${blockId}`);
+    expect(inspectBlock(bytes).compression).toBe("gzip");
+  }
+  expect(await reopened.readTable("events")).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
+  store.close();
+});
+
+it("coalesces many small source segments into fewer physical blocks", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { rowsPerBlock: 1 });
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  for (let value = 0; value < 10; value += 1) {
+    await database.insert("events", { value });
+  }
+
+  const result = await database.compactTable("events", {
+    targetBlockBytes: 1024,
+    outputCompression: "raw",
+  });
+
+  expect(result).toMatchObject({
+    compacted: true,
+    sourceSegmentCount: 10,
+    sourceBlockCount: 10,
+    outputBlockCount: 1,
+    rowCount: 10,
+  });
+  expect(result.outputBlockCount).toBeLessThan(result.sourceBlockCount);
+  expect(await database.readTable("events")).toEqual(
+    Array.from({ length: 10 }, (_, value) => ({ value })),
+  );
+  store.close();
+});
+
+it("rejects a rechunk target whose codec worst case exceeds the block format limit", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("events", { value: 1 });
+  await database.insert("events", { value: 2 });
+
+  await expect(
+    database.compactTable("events", {
+      targetBlockBytes: 32 * 1024 * 1024 + 1,
+      outputCompression: "rle",
+    }),
+  ).rejects.toThrow("Compaction target block bytes exceed the rle worst-case format limit");
+  expect(await store.listCompactionJobs()).toEqual([]);
+  store.close();
+});
+
 it("checkpoints and resumes append compaction one immutable block at a time", async () => {
   const store = new MemoryBlockStore();
   const database = new BrowserDatabase(store);
@@ -783,7 +1249,11 @@ it("checkpoints and resumes append compaction one immutable block at a time", as
   await database.insert("events", { value: 2 });
   const third = await database.insert("events", { value: 3 });
 
-  let progress = await database.compactTableStep("events", { maxBlocks: 1 });
+  let progress = await database.compactTableStep("events", {
+    maxBlocks: 1,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
   expect(progress).toMatchObject({
     state: "running",
     processedRows: 1,
@@ -793,7 +1263,7 @@ it("checkpoints and resumes append compaction one immutable block at a time", as
     result: null,
   });
   expect((await database.listCompactionJobs("events"))[0]).toMatchObject({
-    cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
+    outputCursor: { outputIndex: 1, columnIndex: 0, rowStart: 1 },
     processedRows: 1,
   });
 
@@ -827,7 +1297,11 @@ it("rebases resumable compaction across an append without reordering rows", asyn
   });
   await database.insert("events", { value: 1 });
   const second = await database.insert("events", { value: 2 });
-  const progress = await database.compactTableStep("events", { maxBlocks: 1 });
+  const progress = await database.compactTableStep("events", {
+    maxBlocks: 1,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
   expect(progress.state).toBe("running");
 
   await database.insert("events", { value: 3 });
@@ -869,6 +1343,45 @@ it("recovers a compaction block written before its journal checkpoint", async ()
   expect(result.compacted).toBe(true);
   expect(await reopened.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
   expect((await reopened.listCompactionJobs("events"))[0]?.state).toBe("published");
+  store.close();
+});
+
+it("reconciles a valid gzip header variant by decoded physical content", async () => {
+  const store = new GzipVariantCheckpointFaultMemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insert("events", { value: 1 });
+  await database.insert("events", { value: 2 });
+
+  await expect(
+    database.compactTableStep("events", {
+      maxBlocks: 1,
+      outputCompression: "gzip",
+    }),
+  ).rejects.toThrow("injected before compaction cursor checkpoint");
+  const interrupted = (await store.listCompactionJobs())[0];
+  if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
+    throw new Error("Expected a linked compaction transaction");
+  }
+  const transaction = await store.getTransaction(interrupted.transactionId);
+  const outputBlockId = transaction?.pendingBlockIds[0];
+  if (outputBlockId === undefined) throw new Error("Expected an uncheckpointed output block");
+  const canonical = await store.getCanonicalBlock(outputBlockId);
+  if (canonical === undefined) throw new Error("Expected canonical gzip output");
+  store.returnHeaderVariant = true;
+  const variant = await store.getBlock(outputBlockId);
+  if (variant === undefined) throw new Error("Expected gzip header variant");
+  expect(variant).not.toEqual(canonical);
+  expect(await decodeBlock(variant)).toEqual(await decodeBlock(canonical));
+
+  const result = await new BrowserDatabase(store).compactTable("events");
+
+  expect(result).toMatchObject({ compacted: true, outputCompression: "gzip", rowCount: 2 });
+  expect(store.variantReadCount).toBeGreaterThan(0);
+  expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
   store.close();
 });
 
@@ -929,6 +1442,146 @@ it("resumes a ready compaction interrupted before manifest publication", async (
   store.close();
 });
 
+it("restages checkpointed outputs with bounded reads after stale-transaction recovery", async () => {
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  const store = new CountingMemoryBlockStore();
+  const database = new BrowserDatabase(store, { now: () => new Date(now.getTime()) });
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  for (let value = 1; value <= 4; value += 1) {
+    await database.insert("events", { value });
+  }
+
+  const progress = await database.compactTableStep("events", {
+    maxBlocks: 3,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+  const interrupted = await store.getCompactionJob(progress.jobId);
+  expect(interrupted).toMatchObject({
+    state: "running",
+    outputBlockIds: [expect.any(String), expect.any(String), expect.any(String)],
+    outputCursor: { outputIndex: 3, columnIndex: 0, rowStart: 3 },
+  });
+  if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
+    throw new Error("Expected a linked compaction transaction");
+  }
+
+  now = new Date("2026-01-01T01:00:00.000Z");
+  const recovery = new TransactionManager(store, { now: () => new Date(now.getTime()) });
+  const report = await recovery.recover({
+    staleBefore: new Date("2026-01-01T00:30:00.000Z"),
+  });
+  expect(report.abortedTransactionIds).toContain(interrupted.transactionId);
+  expect(report.retainedBlockIds).toEqual([...interrupted.outputBlockIds].sort());
+
+  store.blockReadCalls = 0;
+  store.blockIdsRead = [];
+  store.singleBlockIdsRead = [];
+  store.pendingBlockJournalSizes = [];
+  const reopened = new BrowserDatabase(store, { now: () => new Date(now.getTime()) });
+  const resumed = await reopened.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
+
+  expect(resumed).toMatchObject({
+    state: "published",
+    outputBlockCount: 4,
+    result: { compacted: true, rowCount: 4 },
+  });
+  expect(store.blockReadCalls).toBe(0);
+  expect(
+    store.singleBlockIdsRead.filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
+  ).toEqual(interrupted.outputBlockIds);
+  expect(store.pendingBlockJournalSizes).toEqual([3, 4]);
+  const completed = await store.getCompactionJob(progress.jobId);
+  expect(completed?.transactionId).not.toBe(interrupted.transactionId);
+  expect(await reopened.readTable("events")).toEqual([
+    { value: 1 },
+    { value: 2 },
+    { value: 3 },
+    { value: 4 },
+  ]);
+  store.close();
+});
+
+it("reconciles outputs when a crash follows replacement-transaction linkage", async () => {
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  const store = new ReplacementRestageFaultMemoryBlockStore();
+  const database = new BrowserDatabase(store, { now: () => new Date(now.getTime()) });
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  for (let value = 1; value <= 4; value += 1) {
+    await database.insert("events", { value });
+  }
+
+  const progress = await database.compactTableStep("events", {
+    maxBlocks: 3,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
+  const interrupted = await store.getCompactionJob(progress.jobId);
+  if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
+    throw new Error("Expected a linked compaction transaction");
+  }
+  expect(interrupted.outputBlockIds).toHaveLength(3);
+
+  now = new Date("2026-01-01T01:00:00.000Z");
+  const recovery = new TransactionManager(store, { now: () => new Date(now.getTime()) });
+  const report = await recovery.recover({
+    staleBefore: new Date("2026-01-01T00:30:00.000Z"),
+  });
+  expect(report.abortedTransactionIds).toContain(interrupted.transactionId);
+  store.failNextRestageRead = true;
+
+  await expect(
+    new BrowserDatabase(store, { now: () => new Date(now.getTime()) }).resumeCompactionJob(
+      progress.jobId,
+      { maxBlocks: 1 },
+    ),
+  ).rejects.toThrow("injected before replacement output restaging");
+  const relinked = await store.getCompactionJob(progress.jobId);
+  if (relinked?.transactionId === null || relinked?.transactionId === undefined) {
+    throw new Error("Expected a replacement compaction transaction");
+  }
+  expect(relinked.transactionId).not.toBe(interrupted.transactionId);
+  expect(relinked.outputBlockIds).toEqual(interrupted.outputBlockIds);
+  expect(relinked.error).toBe("injected before replacement output restaging");
+  expect(await store.getTransaction(relinked.transactionId)).toMatchObject({
+    status: "active",
+    pendingBlockIds: [],
+  });
+
+  store.blockReadCalls = 0;
+  store.blockIdsRead = [];
+  store.singleBlockIdsRead = [];
+  store.pendingBlockJournalSizes = [];
+  const reopened = new BrowserDatabase(store, { now: () => new Date(now.getTime()) });
+  const resumed = await reopened.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
+
+  expect(resumed).toMatchObject({
+    state: "published",
+    outputBlockCount: 4,
+    result: { compacted: true, rowCount: 4 },
+  });
+  expect(store.blockReadCalls).toBe(0);
+  expect(
+    store.singleBlockIdsRead.filter((blockId) => interrupted.outputBlockIds.includes(blockId)),
+  ).toEqual(interrupted.outputBlockIds);
+  expect(store.pendingBlockJournalSizes).toEqual([3, 4]);
+  expect(await reopened.readTable("events")).toEqual([
+    { value: 1 },
+    { value: 2 },
+    { value: 3 },
+    { value: 4 },
+  ]);
+  store.close();
+});
+
 for (const implementation of recoveryImplementations()) {
   it(`${implementation.name} resumes checkpointed compaction after recovery aborts its transaction`, async () => {
     const harness = await implementation.create();
@@ -943,12 +1596,16 @@ for (const implementation of recoveryImplementations()) {
     await database.insert("events", { value: 2 });
     await database.insert("events", { value: 3 });
 
-    const progress = await database.compactTableStep("events", { maxBlocks: 1 });
+    const progress = await database.compactTableStep("events", {
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
     if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
     const interrupted = await store.getCompactionJob(progress.jobId);
     expect(interrupted).toMatchObject({
       state: "running",
-      cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 0 },
+      outputCursor: { outputIndex: 1, columnIndex: 0, rowStart: 1 },
       outputBlockIds: [expect.any(String)],
     });
     if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {
@@ -1041,7 +1698,11 @@ it("aborts a replacement compaction transaction when its sources were superseded
   await database.insert("events", { value: 2 });
   await database.insert("events", { value: 3 });
 
-  const progress = await database.compactTableStep("events", { maxBlocks: 1 });
+  const progress = await database.compactTableStep("events", {
+    maxBlocks: 1,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
   if (progress.jobId === null) throw new Error("Expected a persisted compaction job");
   const interrupted = await store.getCompactionJob(progress.jobId);
   if (interrupted?.transactionId === null || interrupted?.transactionId === undefined) {

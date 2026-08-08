@@ -163,7 +163,7 @@ batches currently stage a column at a time. A materialized read fetches projecte
 visible segment in windows of up to 16 block IDs and retains a unique-key column when delta replay
 needs it.
 
-### Resumable compaction foundation
+### Resumable physical compaction
 
 Ordinary write segments are recorded at L0 with a `logicalOrder` derived from their commit version.
 The first policy selects every eligible append-only segment visible in one manifest, requires
@@ -171,24 +171,49 @@ contiguous row-ID ranges, and publishes one L1 segment. Its `logicalOrder` is in
 earliest source, so the consolidated segment remains in the same logical position even if a new L0
 append commits while the job is running.
 
-A compaction job persisted in the IndexedDB `gc` store records its source manifest, segment and block
-IDs, deterministic output IDs, target level, transaction ID, revisioned state, processed rows, and a
-source-segment/block cursor. `compactTableStep()` copies at most the requested number of blocks and
-checkpoints the cursor; `resumeCompactionJob()` reopens the job's active transaction; and
-`listCompactionJobs()` exposes the durable records. `compactTable()` repeatedly uses this machinery
-as a run-to-publication convenience API.
+A compaction job persisted in the IndexedDB `gc` store contains an immutable `rechunk-v1` plan. The
+plan fingerprints the source manifest and segments plus each ordered column block's ID, row range,
+stored/encoded length, and checksum. It also fixes the output windows, schema IDs/types, row-ID
+bounds, inherited logical order, target compression and block-size estimate. Mutable progress holds
+deterministic output IDs, the next output-window/column cursor, transaction ID, revisioned state,
+processed rows and bytes, and the modeled working-memory high-water. `compactTableStep()` processes
+at most the requested number of output blocks; `resumeCompactionJob()` continues the persisted plan
+after a yield or reopen; `listCompactionJobs()` exposes it; and `compactTable()` repeatedly drives
+the same workflow to publication.
 
-Output blocks are deterministic byte-for-byte copies in this phase. If execution stops after the
-immutable block or output segment is stored but before its transaction journal or job cursor is
-updated, resume verifies that object and idempotently attaches it to the transaction. If the
-transaction committed before the job reached `published`, resume reconciles the committed version
-instead of publishing twice. Manifest publication supersedes the source blocks only in the new
-version; prior manifests and their blocks remain readable by historical snapshots.
+Each output is built directly from validated physical column ranges. The implementation
+decompresses source blocks, slices and concatenates their validity/value buffers, recalculates
+canonical metadata, and compresses the result without materializing JavaScript row objects. Output
+windows are shared across columns and derived from the maximum observed source-block encoded bytes
+per row, then measured exactly and split further when skew would exceed the target or the chosen
+execution budget. The defaults are gzip, a 2 MiB estimated uncompressed physical target per output
+column block, and a 32 MiB budget for JavaScript-owned rewrite execution. A single row cannot be
+split and may exceed the target only when its physical and codec bounds remain within the 64 MiB
+format cap.
 
-This is durable segment-consolidation scaffolding. It does not rechunk or re-encode blocks, enforce
-a byte memory budget, compact upsert/update/delete deltas, select subsets or levels beyond the
-whole-table L0 -> L1 policy, cancel a job, or physically reclaim source/output garbage. Lease-aware
-reachability and reclamation remain separate future steps.
+Planning computes a conservative minimum budget from the largest modeled output and refuses a
+smaller budget. Execution checkpoints the maximum such bound for completed outputs. The bound
+includes conservative source/decompression, constructed physical output, compression
+scratch/output, envelope, and reconciliation buffers owned by this workflow. It is not a claim
+about total browser heap: planning reads one stored block at a time outside executor high-water
+accounting, while browser-native compression and IndexedDB may allocate internal memory the library
+cannot observe; persisted job and transaction metadata is also outside the block-buffer figure.
+
+If execution stops after an immutable block or output segment is stored but before its journal or
+cursor update, resume validates and reattaches the existing object. Existing output is decompressed
+and compared by validated physical payload, type, compression, and row count. This semantic check
+does not require equivalent gzip streams to be byte-identical. A replacement transaction preserves
+the completed-output cursor, and a transaction committed before the job reached `published` is
+reconciled instead of published twice. Publication can rebase across a concurrent append while
+every planned source remains visible and unchanged; otherwise it aborts. Manifest replacement
+affects only the new version, so historical snapshots continue reading their original segments and
+blocks.
+
+This is still a deliberately narrow Phase 6 policy: it selects every eligible contiguous
+append-only segment in a table and publishes one L1 replacement. It does not compact
+upsert/update/delete deltas, select subsets or levels beyond whole-table L0 -> L1, produce L2
+segments, cancel jobs, or physically reclaim source/output garbage. Lease-aware reachability and
+reclamation remain separate future steps.
 
 ## Multi-tab correctness
 
@@ -225,8 +250,10 @@ interface Batch {
 The target executor gives every query and physical rewrite job a memory context. Operators reserve
 and release bytes. Sort, hash aggregate, hash join, and distinct operations must spill to temporary
 storage when reservations fail. Memory use is a function of the configured working set, not total
-database size. The current block-count-bounded compaction scaffolding does not yet implement this
-byte-budget contract.
+database size. Physical compaction now has a specialized conservative budget for its JavaScript-owned
+buffers and advances by output block; the general query memory context and spilling contract remain
+future work. As described above, the compaction figure is a modeled workflow bound rather than a
+measurement or hard limit on all browser heap.
 
 ## Automatic data skipping
 

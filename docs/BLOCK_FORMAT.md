@@ -37,3 +37,19 @@ followed by UTF-8 bytes.
 
 The physical IDs allow later versions to encode whole-valued numbers more compactly without asking
 users to choose between integer widths or changing the logical `number` type.
+
+## Physical column operations
+
+The block-format package exposes physical operations for storage rewrites that must avoid
+JavaScript row-object materialization. `decodePhysicalBlock()` decompresses, checksum-verifies, and
+validates a block while retaining its version-zero physical payload. `validatePhysicalColumn()`
+checks an uncompressed payload directly. `measurePhysicalColumnRanges()` computes the exact output
+allocation and canonical metadata for half-open row ranges; `buildPhysicalColumnFromRanges()`,
+`slicePhysicalColumn()`, and `concatenatePhysicalColumns()` construct the corresponding bitmaps,
+fixed-width values, or string offsets/content. `encodePhysicalBlock()` validates and writes that
+payload with raw, RLE, or gzip compression.
+
+These APIs preserve the same canonical null-slot, bitmap-padding, numeric/datetime, UTF-8, offset,
+metadata, checksum, and 64 MiB section rules as ordinary row-value encode/decode. They avoid row
+objects; they do not by themselves impose an executor memory budget or account for browser-native
+codec allocations.

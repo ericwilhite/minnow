@@ -7,6 +7,7 @@ import {
   UniqueKeyConflictError,
   type BlockStore,
   type CompactionJobRecord,
+  type CompactionJobRecordUpdate,
 } from "./index.js";
 
 function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
@@ -18,6 +19,85 @@ function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
         IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
     },
   ];
+}
+
+function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
+  return {
+    id,
+    tableId: "events",
+    sourceManifestVersion: 7,
+    sourceSegmentIds: ["segment-1", "segment-2"],
+    sourceBlockIds: ["name-block", "id-block-2", "id-block-1"],
+    outputBlockIds: [],
+    cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+    processedRows: 0,
+    sourceStoredBytes: 360,
+    outputStoredBytes: 0,
+    logicalBytes: 300,
+    rewritePlan: {
+      kind: "rechunk-v1",
+      targetBlockBytes: 2 * 1024 * 1024,
+      outputCompression: "gzip",
+      totalRows: 4,
+      rowIdStart: 10n,
+      rowIdEndExclusive: 14n,
+      logicalOrder: 5,
+      columns: [
+        {
+          columnId: "id-column",
+          type: "number",
+          sourceBlocks: [
+            {
+              blockId: "id-block-1",
+              rowStart: 0,
+              rowCount: 2,
+              storedBytes: 100,
+              encodedBytes: 80,
+              checksum: 11,
+            },
+            {
+              blockId: "id-block-2",
+              rowStart: 2,
+              rowCount: 2,
+              storedBytes: 110,
+              encodedBytes: 90,
+              checksum: 12,
+            },
+          ],
+        },
+        {
+          columnId: "name-column",
+          type: "string",
+          sourceBlocks: [
+            {
+              blockId: "name-block",
+              rowStart: 0,
+              rowCount: 4,
+              storedBytes: 150,
+              encodedBytes: 130,
+              checksum: 13,
+            },
+          ],
+        },
+      ],
+      outputs: [
+        { rowStart: 0, rowCount: 3 },
+        { rowStart: 3, rowCount: 1 },
+      ],
+    },
+    memoryBudgetBytes: 4096,
+    minimumMemoryBytes: 512,
+    peakWorkingBytes: 0,
+    outputLogicalBytes: 0,
+    targetLevel: 1,
+    state: "planned",
+    transactionId: null,
+    outputSegmentId: `${id}/output-segment`,
+    publishedVersion: null,
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
 }
 
 for (const implementation of stores()) {
@@ -254,6 +334,12 @@ for (const implementation of stores()) {
         sourceSegmentIds: ["segment-b", "segment-a"],
         sourceBlockIds: ["block-a", "block-b"],
         cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+        rewritePlan: { kind: "copy-v1" },
+        outputCursor: null,
+        memoryBudgetBytes: 0,
+        minimumMemoryBytes: 0,
+        peakWorkingBytes: 0,
+        outputLogicalBytes: 0,
       });
 
       await store.createCompactionJob({
@@ -312,6 +398,151 @@ for (const implementation of stores()) {
 
       await store.removeCompactionJob("job-b");
       expect(await store.getCompactionJob("job-b")).toBeUndefined();
+      store.close();
+    });
+
+    it("persists deterministic rechunk plans and output-driven checkpoints", async () => {
+      const store = await implementation.create();
+      const created = rechunkCompactionJob();
+      await store.createCompactionJob(created);
+      const createdPlan = created.rewritePlan;
+      if (createdPlan?.kind !== "rechunk-v1") throw new Error("Expected a rechunk plan");
+      (createdPlan.columns[0]?.sourceBlocks[0] as { blockId: string }).blockId = "mutated";
+      (createdPlan.outputs[0] as { rowCount: number }).rowCount = 99;
+
+      const persisted = await store.getCompactionJob(created.id);
+      expect(persisted?.rewritePlan).toEqual(rechunkCompactionJob().rewritePlan);
+      expect(persisted).toMatchObject({
+        sourceBlockIds: ["id-block-1", "id-block-2", "name-block"],
+        outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+        memoryBudgetBytes: 4096,
+        minimumMemoryBytes: 512,
+        peakWorkingBytes: 0,
+        outputLogicalBytes: 0,
+      });
+
+      const first = await store.updateCompactionJob(created.id, 0, {
+        outputBlockIds: ["output-0-id"],
+        outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+        outputStoredBytes: 70,
+        outputLogicalBytes: 80,
+        peakWorkingBytes: 600,
+        state: "running",
+        transactionId: "rechunk-transaction",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+      expect(first).toMatchObject({
+        outputBlockIds: ["output-0-id"],
+        outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+        processedRows: 0,
+        outputStoredBytes: 70,
+        outputLogicalBytes: 80,
+        peakWorkingBytes: 600,
+        revision: 1,
+      });
+      await expect(
+        store.updateCompactionJob(created.id, 0, {
+          peakWorkingBytes: 700,
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      ).rejects.toBeInstanceOf(CompactionJobConflictError);
+
+      const firstWindow = await store.updateCompactionJob(created.id, first.revision, {
+        outputBlockIds: ["output-0-id", "output-0-name"],
+        outputCursor: { outputIndex: 1, columnIndex: 0, rowStart: 3 },
+        processedRows: 3,
+        outputStoredBytes: 150,
+        outputLogicalBytes: 210,
+        peakWorkingBytes: 700,
+        updatedAt: "2026-01-01T00:00:03.000Z",
+      });
+      const ready = await store.updateCompactionJob(created.id, firstWindow.revision, {
+        outputBlockIds: ["output-0-id", "output-0-name", "output-1-id", "output-1-name"],
+        outputCursor: { outputIndex: 2, columnIndex: 0, rowStart: 4 },
+        processedRows: 4,
+        outputStoredBytes: 240,
+        outputLogicalBytes: 300,
+        peakWorkingBytes: 720,
+        state: "ready",
+        updatedAt: "2026-01-01T00:00:04.000Z",
+      });
+      expect(ready).toMatchObject({
+        state: "ready",
+        processedRows: 4,
+        outputBlockIds: ["output-0-id", "output-0-name", "output-1-id", "output-1-name"],
+        revision: 3,
+      });
+
+      await expect(
+        store.updateCompactionJob(created.id, ready.revision, {
+          rewritePlan: { kind: "copy-v1" },
+          updatedAt: "2026-01-01T00:00:05.000Z",
+        } as CompactionJobRecordUpdate & { rewritePlan: { kind: "copy-v1" } }),
+      ).rejects.toThrow("immutable");
+      await expect(
+        store.updateCompactionJob(created.id, ready.revision, {
+          outputStoredBytes: 239,
+          updatedAt: "2026-01-01T00:00:05.000Z",
+        }),
+      ).rejects.toThrow("cannot decrease");
+      expect((await store.getCompactionJob(created.id))?.revision).toBe(ready.revision);
+      store.close();
+    });
+
+    it("rejects invalid rechunk layouts, budgets, and output checkpoints", async () => {
+      const store = await implementation.create();
+      const tooSmall = rechunkCompactionJob("too-small");
+      await expect(
+        store.createCompactionJob({ ...tooSmall, memoryBudgetBytes: 511 }),
+      ).rejects.toThrow("minimum memory exceeds");
+
+      const missingSource = rechunkCompactionJob("missing-source");
+      await expect(
+        store.createCompactionJob({
+          ...missingSource,
+          sourceBlockIds: ["id-block-1", "name-block"],
+        }),
+      ).rejects.toThrow("every selected source block");
+
+      const duplicateSource = rechunkCompactionJob("duplicate-source");
+      await expect(
+        store.createCompactionJob({
+          ...duplicateSource,
+          sourceBlockIds: [...duplicateSource.sourceBlockIds, "name-block"],
+        }),
+      ).rejects.toThrow("cannot contain duplicates");
+
+      const badRange = rechunkCompactionJob("bad-range");
+      if (badRange.rewritePlan?.kind !== "rechunk-v1") throw new Error("Expected rechunk plan");
+      await expect(
+        store.createCompactionJob({
+          ...badRange,
+          rewritePlan: {
+            ...badRange.rewritePlan,
+            outputs: [
+              { rowStart: 0, rowCount: 2 },
+              { rowStart: 3, rowCount: 1 },
+            ],
+          },
+        }),
+      ).rejects.toThrow("contiguously");
+
+      const checkpoint = rechunkCompactionJob("bad-checkpoint");
+      await store.createCompactionJob(checkpoint);
+      await expect(
+        store.updateCompactionJob(checkpoint.id, 0, {
+          outputBlockIds: ["only-one-output"],
+          outputCursor: { outputIndex: 1, columnIndex: 0, rowStart: 3 },
+          processedRows: 3,
+          outputStoredBytes: 50,
+          outputLogicalBytes: 60,
+          peakWorkingBytes: 600,
+          state: "running",
+          transactionId: "rechunk-transaction",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        }),
+      ).rejects.toThrow("output IDs must match");
+      expect((await store.getCompactionJob(checkpoint.id))?.revision).toBe(0);
       store.close();
     });
 
@@ -590,7 +821,53 @@ it("persists compaction checkpoints across IndexedDB connections", async () => {
     cursor: { sourceSegmentIndex: 1, sourceBlockIndex: 12 },
     processedRows: 52,
     transactionId: "transaction-1",
+    rewritePlan: { kind: "copy-v1" },
+    outputCursor: null,
+    outputLogicalBytes: 4096,
     revision: 3,
+  });
+  store.close();
+});
+
+it("persists rechunk plans and memory accounting across IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const job = rechunkCompactionJob("reopen-rechunk-job");
+  await store.createCompactionJob(job);
+  await store.updateCompactionJob(job.id, 0, {
+    outputBlockIds: ["output-0-id"],
+    outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+    outputStoredBytes: 70,
+    outputLogicalBytes: 80,
+    peakWorkingBytes: 600,
+    state: "running",
+    transactionId: "rechunk-transaction",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+  });
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  expect(await store.getCompactionJob(job.id)).toMatchObject({
+    rewritePlan: {
+      kind: "rechunk-v1",
+      targetBlockBytes: 2 * 1024 * 1024,
+      outputCompression: "gzip",
+      rowIdStart: 10n,
+      rowIdEndExclusive: 14n,
+      logicalOrder: 5,
+      outputs: [
+        { rowStart: 0, rowCount: 3 },
+        { rowStart: 3, rowCount: 1 },
+      ],
+    },
+    outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+    memoryBudgetBytes: 4096,
+    minimumMemoryBytes: 512,
+    peakWorkingBytes: 600,
+    outputStoredBytes: 70,
+    outputLogicalBytes: 80,
+    revision: 1,
   });
   store.close();
 });

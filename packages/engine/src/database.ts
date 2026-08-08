@@ -1,11 +1,19 @@
 import {
+  buildPhysicalColumnFromRanges,
   decodeBlock,
+  decodePhysicalBlock,
   encodeBlock,
+  encodePhysicalBlock,
+  getCompressionMemoryBound,
   inspectBlock,
+  measurePhysicalColumnRanges,
+  slicePhysicalColumn,
   type ColumnInput,
   type Compression,
   type DecodedColumn,
   type LogicalType,
+  type PhysicalColumnRange,
+  type ValidatedPhysicalColumn,
 } from "@browserdatabase/block-format";
 import {
   simpleDataTypes,
@@ -13,6 +21,10 @@ import {
   CompactionJobConflictError,
   type CompactionJobRecord,
   type CompactionJobState,
+  type RechunkCompactionOutputWindow,
+  type RechunkCompactionRewritePlan,
+  type RechunkCompactionSourceBlock,
+  type RechunkCompactionSourceColumn,
   type SegmentRecord,
   type SimpleDataType,
   type TableColumnRecord,
@@ -31,6 +43,10 @@ import {
 } from "./query.js";
 
 const sizeTextEncoder = new TextEncoder();
+const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
+const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
+const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
+const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 
 export interface ColumnDefinition {
   name: string;
@@ -116,9 +132,15 @@ export interface DeleteBatchResult {
 
 export interface CompactTableOptions {
   minimumSegments?: number;
-  /** Number of immutable source blocks processed before yielding and checkpointing. */
+  /** Number of immutable output blocks processed before yielding and checkpointing. */
   maxBlocksPerStep?: number;
   targetLevel?: number;
+  /** Estimated uncompressed physical bytes per output column block. */
+  targetBlockBytes?: number;
+  /** Compression used for rewritten output blocks. */
+  outputCompression?: Compression;
+  /** Upper bound for accounted JavaScript-owned executor buffers. */
+  memoryBudgetBytes?: number;
 }
 
 export interface CompactTableStepOptions extends CompactTableOptions {
@@ -140,6 +162,12 @@ export interface CompactTableResult {
   rowCount: number;
   sourceStoredBytes: number;
   outputStoredBytes: number;
+  outputLogicalBytes?: number;
+  targetBlockBytes?: number;
+  outputCompression?: Compression;
+  memoryBudgetBytes?: number;
+  minimumMemoryBytes?: number;
+  peakWorkingBytes?: number;
   supersededBlockCount: number;
   physicallyReclaimedBytes: 0;
   version: number | null;
@@ -154,6 +182,9 @@ export interface CompactionJobProgress {
   sourceSegmentCount: number;
   sourceBlockCount: number;
   outputBlockCount: number;
+  memoryBudgetBytes?: number;
+  minimumMemoryBytes?: number;
+  peakWorkingBytes?: number;
   result: CompactTableResult | null;
 }
 
@@ -186,6 +217,19 @@ export class MissingKeyError extends Error {
     readonly value: Exclude<BatchValue, null>,
   ) {
     super(`Missing value for ${tableName}.${columnName}: ${formatValue(value)}`);
+  }
+}
+
+export class CompactionMemoryBudgetError extends Error {
+  override readonly name = "CompactionMemoryBudgetError";
+
+  constructor(
+    readonly budgetBytes: number,
+    readonly minimumBytes: number,
+  ) {
+    super(
+      `Compaction needs at least ${String(minimumBytes)} bytes of working memory; budget is ${String(budgetBytes)} bytes`,
+    );
   }
 }
 
@@ -971,6 +1015,43 @@ export class BrowserDatabase {
     }
     if (version === null) throw new Error("Visible compaction segments require a manifest");
 
+    const targetBlockBytes = positiveWholeNumber(
+      options.targetBlockBytes ?? DEFAULT_COMPACTION_TARGET_BLOCK_BYTES,
+      "Compaction target block bytes",
+    );
+    if (targetBlockBytes > MAX_COMPACTION_TARGET_BLOCK_BYTES) {
+      throw new RangeError(
+        `Compaction target block bytes cannot exceed ${String(MAX_COMPACTION_TARGET_BLOCK_BYTES)}`,
+      );
+    }
+    const outputCompression = validateCompression(
+      options.outputCompression ?? "gzip",
+      "Compaction output compression",
+    );
+    if (
+      getCompressionMemoryBound(outputCompression, targetBlockBytes).maximumOutputBytes >
+      MAX_COMPACTION_TARGET_BLOCK_BYTES
+    ) {
+      throw new RangeError(
+        `Compaction target block bytes exceed the ${outputCompression} worst-case format limit`,
+      );
+    }
+    const memoryBudgetBytes = positiveWholeNumber(
+      options.memoryBudgetBytes ?? DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
+      "Compaction memory budget",
+    );
+    const rewritePlan = await this.#createRechunkCompactionPlan(
+      table,
+      sourceSegments,
+      targetBlockBytes,
+      outputCompression,
+      memoryBudgetBytes,
+    );
+    const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
+    if (minimumMemoryBytes > memoryBudgetBytes) {
+      throw new CompactionMemoryBudgetError(memoryBudgetBytes, minimumMemoryBytes);
+    }
+
     let id = ["compaction", table.id, "manifest", String(version)].join("/");
     const existing = await this.store.getCompactionJob(id);
     if (existing !== undefined && existing.state !== "aborted") return existing;
@@ -985,9 +1066,19 @@ export class BrowserDatabase {
       outputBlockIds: [],
       cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
       processedRows: 0,
-      sourceStoredBytes: 0,
+      sourceStoredBytes: rechunkSourceStoredBytes(rewritePlan),
       outputStoredBytes: 0,
-      logicalBytes: 0,
+      logicalBytes: rechunkSourceEncodedBytes(rewritePlan),
+      rewritePlan,
+      outputCursor: {
+        outputIndex: 0,
+        columnIndex: 0,
+        rowStart: rewritePlan.outputs[0]?.rowStart ?? 0,
+      },
+      memoryBudgetBytes,
+      minimumMemoryBytes,
+      peakWorkingBytes: 0,
+      outputLogicalBytes: 0,
       targetLevel,
       state: "planned",
       transactionId: null,
@@ -1007,6 +1098,225 @@ export class BrowserDatabase {
     }
   }
 
+  async #createRechunkCompactionPlan(
+    table: TableRecord,
+    sourceSegments: readonly SegmentRecord[],
+    targetBlockBytes: number,
+    outputCompression: Compression,
+    memoryBudgetBytes: number,
+  ): Promise<RechunkCompactionRewritePlan> {
+    const first = sourceSegments[0];
+    const last = sourceSegments[sourceSegments.length - 1];
+    if (first === undefined || last === undefined) {
+      throw new Error("Compaction needs at least one source segment");
+    }
+    const totalRows = safeWholeNumberSum(
+      sourceSegments.map((segment) => segment.rowCount),
+      "Compaction source row count",
+    );
+    const columns: RechunkCompactionSourceColumn[] = [];
+    let maximumEncodedBytesPerRow = 0;
+
+    for (const column of table.columns) {
+      const sourceBlocks: RechunkCompactionSourceBlock[] = [];
+      let rowStart = 0;
+      for (const segment of sourceSegments) {
+        const segmentStart = rowStart;
+        const blockIds = segment.columnBlockIds[column.id] ?? [];
+        if (blockIds.length === 0) {
+          throw new Error(`Compaction source column is missing blocks: ${column.name}`);
+        }
+        for (const blockId of blockIds) {
+          const bytes = await this.store.getBlock(blockId);
+          if (bytes === undefined)
+            throw new Error(`Compaction source block is missing: ${blockId}`);
+          const description = inspectBlock(bytes);
+          if (description.type !== column.type) {
+            throw new Error(`Compaction source block type differs: ${blockId}`);
+          }
+          if (description.rowCount === 0) {
+            throw new Error(`Compaction source block is empty: ${blockId}`);
+          }
+          sourceBlocks.push({
+            blockId,
+            rowStart,
+            rowCount: description.rowCount,
+            storedBytes: bytes.byteLength,
+            encodedBytes: description.encodedLength,
+            checksum: description.checksum,
+          });
+          maximumEncodedBytesPerRow = Math.max(
+            maximumEncodedBytesPerRow,
+            description.encodedLength / description.rowCount,
+          );
+          rowStart = safeWholeNumberSum(
+            [rowStart, description.rowCount],
+            "Compaction source block rows",
+          );
+        }
+        if (rowStart - segmentStart !== segment.rowCount) {
+          throw new Error(`Compaction source blocks do not cover segment ${segment.id}`);
+        }
+      }
+      if (rowStart !== totalRows) {
+        throw new Error(`Compaction source column does not cover every row: ${column.name}`);
+      }
+      columns.push({ columnId: column.id, type: column.type, sourceBlocks });
+    }
+
+    if (!Number.isFinite(maximumEncodedBytesPerRow) || maximumEncodedBytesPerRow <= 0) {
+      throw new Error("Compaction could not estimate an output block size");
+    }
+    const rowsPerOutput = Math.max(
+      1,
+      Math.min(0xffff_ffff, Math.floor(targetBlockBytes / maximumEncodedBytesPerRow)),
+    );
+    const estimatedOutputs: RechunkCompactionOutputWindow[] = [];
+    for (let rowStart = 0; rowStart < totalRows; rowStart += rowsPerOutput) {
+      estimatedOutputs.push({
+        rowStart,
+        rowCount: Math.min(rowsPerOutput, totalRows - rowStart),
+      });
+    }
+    const outputs = await this.#refineRechunkOutputWindows(
+      columns,
+      estimatedOutputs,
+      targetBlockBytes,
+      outputCompression,
+      memoryBudgetBytes,
+    );
+
+    return {
+      kind: "rechunk-v1",
+      targetBlockBytes,
+      outputCompression,
+      totalRows,
+      rowIdStart: first.rowIdStart,
+      rowIdEndExclusive: last.rowIdEndExclusive,
+      logicalOrder: await this.#firstLogicalOrder(sourceSegments),
+      columns,
+      outputs,
+    };
+  }
+
+  async #refineRechunkOutputWindows(
+    columns: readonly RechunkCompactionSourceColumn[],
+    estimatedOutputs: readonly RechunkCompactionOutputWindow[],
+    targetBlockBytes: number,
+    outputCompression: Compression,
+    memoryBudgetBytes: number,
+  ): Promise<RechunkCompactionOutputWindow[]> {
+    const outputs: RechunkCompactionOutputWindow[] = [];
+    for (const output of estimatedOutputs) {
+      outputs.push(
+        ...(await this.#refineRechunkOutputWindow(
+          columns,
+          output,
+          targetBlockBytes,
+          outputCompression,
+          memoryBudgetBytes,
+        )),
+      );
+    }
+    return outputs;
+  }
+
+  async #refineRechunkOutputWindow(
+    columns: readonly RechunkCompactionSourceColumn[],
+    output: RechunkCompactionOutputWindow,
+    targetBlockBytes: number,
+    outputCompression: Compression,
+    memoryBudgetBytes: number,
+  ): Promise<RechunkCompactionOutputWindow[]> {
+    let splitReason: "target" | "format" | "memory" | null = null;
+    const requiredMemoryBytes = Math.max(
+      ...columns.map((column) => rechunkOutputMemoryBound(column, output, outputCompression)),
+    );
+    if (requiredMemoryBytes > memoryBudgetBytes) {
+      splitReason = "memory";
+    } else {
+      for (const column of columns) {
+        let encodedByteLength: number;
+        try {
+          encodedByteLength = (
+            await this.#measureRechunkPhysicalOutput(
+              column,
+              output,
+              outputCompression,
+              memoryBudgetBytes,
+            )
+          ).encodedByteLength;
+        } catch (error) {
+          if (!isPhysicalColumnLimitError(error)) throw error;
+          splitReason = "format";
+          break;
+        }
+        if (
+          getCompressionMemoryBound(outputCompression, encodedByteLength).maximumOutputBytes >
+          MAX_COMPACTION_TARGET_BLOCK_BYTES
+        ) {
+          splitReason = "format";
+          break;
+        }
+        if (encodedByteLength > targetBlockBytes) {
+          splitReason = "target";
+        }
+      }
+    }
+    if (splitReason === null || (splitReason === "target" && output.rowCount === 1)) {
+      return [output];
+    }
+    if (output.rowCount === 1) {
+      if (splitReason === "memory") {
+        throw new CompactionMemoryBudgetError(memoryBudgetBytes, requiredMemoryBytes);
+      }
+      throw new RangeError(
+        `A single compaction row exceeds the ${outputCompression} block format limit`,
+      );
+    }
+
+    const leftRowCount = Math.floor(output.rowCount / 2);
+    const left = { rowStart: output.rowStart, rowCount: leftRowCount };
+    const right = {
+      rowStart: safeWholeNumberSum(
+        [output.rowStart, leftRowCount],
+        "Compaction split output row start",
+      ),
+      rowCount: output.rowCount - leftRowCount,
+    };
+    return [
+      ...(await this.#refineRechunkOutputWindow(
+        columns,
+        left,
+        targetBlockBytes,
+        outputCompression,
+        memoryBudgetBytes,
+      )),
+      ...(await this.#refineRechunkOutputWindow(
+        columns,
+        right,
+        targetBlockBytes,
+        outputCompression,
+        memoryBudgetBytes,
+      )),
+    ];
+  }
+
+  async #measureRechunkPhysicalOutput(
+    column: RechunkCompactionSourceColumn,
+    output: RechunkCompactionOutputWindow,
+    outputCompression: Compression,
+    memoryBudgetBytes: number,
+  ) {
+    const loaded = await this.#loadRechunkPhysicalRanges(
+      column,
+      output,
+      outputCompression,
+      memoryBudgetBytes,
+    );
+    return measurePhysicalColumnRanges(column.type, loaded.ranges);
+  }
+
   async #runCompactionJob(
     table: TableRecord,
     initialJob: CompactionJobRecord,
@@ -1023,18 +1333,21 @@ export class BrowserDatabase {
       job = await this.#markCompactionPublished(job, linkedTransaction.committedVersion);
       return this.#publishedCompactionProgress(table, job);
     }
-    const sourceSegments = await this.#loadCompactionSources(job);
+    const rewritePlan = job.rewritePlan ?? { kind: "copy-v1" as const };
+    if (rewritePlan.kind === "rechunk-v1") validateRechunkTablePlan(table, rewritePlan);
+    const sourceSegments =
+      rewritePlan.kind === "copy-v1" ? await this.#loadCompactionSources(job) : [];
 
     let transaction: DatabaseTransaction;
     if (job.transactionId === null) {
-      const linked = await this.#beginCompactionTransaction(job, false);
+      const linked = await this.#beginCompactionTransaction(job);
       if (linked.transaction === null) {
         return this.#runCompactionJob(table, linked.job, maxBlocks);
       }
       ({ job, transaction } = linked);
     } else {
       if (linkedTransaction?.status !== "active") {
-        const linked = await this.#beginCompactionTransaction(job, true);
+        const linked = await this.#beginCompactionTransaction(job);
         if (linked.transaction === null) {
           return this.#runCompactionJob(table, linked.job, maxBlocks);
         }
@@ -1052,65 +1365,85 @@ export class BrowserDatabase {
     }
 
     try {
-      let processedBlocks = 0;
-      while (job.cursor.sourceSegmentIndex < sourceSegments.length && processedBlocks < maxBlocks) {
-        const segmentIndex = job.cursor.sourceSegmentIndex;
-        const segment = sourceSegments[segmentIndex];
-        if (segment === undefined) throw new Error("Compaction source cursor is invalid");
-        const entries = compactionBlockEntries(table, segment, segmentIndex, job.id);
-        const entry = entries[job.cursor.sourceBlockIndex];
-        if (entry === undefined) {
-          job = await this.store.updateCompactionJob(job.id, job.revision, {
-            cursor: { sourceSegmentIndex: segmentIndex + 1, sourceBlockIndex: 0 },
-            processedRows: job.processedRows + segment.rowCount,
-            updatedAt: this.#now().toISOString(),
-          });
-          continue;
+      if (job.outputBlockIds.length > 0) {
+        const pendingBlockIds = new Set(transaction.pendingBlockIds);
+        const unjournaledOutputIds = job.outputBlockIds.filter((id) => !pendingBlockIds.has(id));
+        if (unjournaledOutputIds.length > 0) {
+          await transaction.stageExistingBlocks(unjournaledOutputIds);
         }
-
-        const source = await this.store.getBlock(entry.sourceBlockId);
-        if (source === undefined) {
-          throw new Error(`A compaction source block is missing: ${entry.sourceBlockId}`);
+      }
+      if (rewritePlan.kind === "rechunk-v1") {
+        job = await this.#advanceRechunkCompaction(job, transaction, rewritePlan, maxBlocks);
+        if ((job.outputCursor?.outputIndex ?? 0) < rewritePlan.outputs.length) {
+          return compactionProgress(table.name, job, null);
         }
-        const existing = await this.store.getBlock(entry.outputBlockId);
-        if (existing === undefined) {
-          await transaction.stageBlock(entry.outputBlockId, source);
-        } else {
-          if (!sameBytes(existing, source)) {
-            throw new Error(`A resumed compaction block differs: ${entry.outputBlockId}`);
+      } else {
+        let processedBlocks = 0;
+        while (
+          job.cursor.sourceSegmentIndex < sourceSegments.length &&
+          processedBlocks < maxBlocks
+        ) {
+          const segmentIndex = job.cursor.sourceSegmentIndex;
+          const segment = sourceSegments[segmentIndex];
+          if (segment === undefined) throw new Error("Compaction source cursor is invalid");
+          const entries = compactionBlockEntries(table, segment, segmentIndex, job.id);
+          const entry = entries[job.cursor.sourceBlockIndex];
+          if (entry === undefined) {
+            job = await this.store.updateCompactionJob(job.id, job.revision, {
+              cursor: { sourceSegmentIndex: segmentIndex + 1, sourceBlockIndex: 0 },
+              processedRows: job.processedRows + segment.rowCount,
+              updatedAt: this.#now().toISOString(),
+            });
+            continue;
           }
-          await transaction.stageExistingBlocks([entry.outputBlockId]);
+
+          const source = await this.store.getBlock(entry.sourceBlockId);
+          if (source === undefined) {
+            throw new Error(`A compaction source block is missing: ${entry.sourceBlockId}`);
+          }
+          const existing = await this.store.getBlock(entry.outputBlockId);
+          if (existing === undefined) {
+            await transaction.stageBlock(entry.outputBlockId, source);
+          } else {
+            if (!sameBytes(existing, source)) {
+              throw new Error(`A resumed compaction block differs: ${entry.outputBlockId}`);
+            }
+            await transaction.stageExistingBlocks([entry.outputBlockId]);
+          }
+
+          const segmentComplete = job.cursor.sourceBlockIndex + 1 === entries.length;
+          const description = inspectBlock(source);
+          job = await this.store.updateCompactionJob(job.id, job.revision, {
+            outputBlockIds: [...job.outputBlockIds, entry.outputBlockId],
+            cursor: segmentComplete
+              ? { sourceSegmentIndex: segmentIndex + 1, sourceBlockIndex: 0 }
+              : {
+                  sourceSegmentIndex: segmentIndex,
+                  sourceBlockIndex: job.cursor.sourceBlockIndex + 1,
+                },
+            processedRows: job.processedRows + (segmentComplete ? segment.rowCount : 0),
+            sourceStoredBytes: job.sourceStoredBytes + source.byteLength,
+            outputStoredBytes: job.outputStoredBytes + source.byteLength,
+            logicalBytes: job.logicalBytes + description.encodedLength,
+            updatedAt: this.#now().toISOString(),
+            error: null,
+          });
+          processedBlocks += 1;
         }
 
-        const segmentComplete = job.cursor.sourceBlockIndex + 1 === entries.length;
-        const description = inspectBlock(source);
-        job = await this.store.updateCompactionJob(job.id, job.revision, {
-          outputBlockIds: [...job.outputBlockIds, entry.outputBlockId],
-          cursor: segmentComplete
-            ? { sourceSegmentIndex: segmentIndex + 1, sourceBlockIndex: 0 }
-            : {
-                sourceSegmentIndex: segmentIndex,
-                sourceBlockIndex: job.cursor.sourceBlockIndex + 1,
-              },
-          processedRows: job.processedRows + (segmentComplete ? segment.rowCount : 0),
-          sourceStoredBytes: job.sourceStoredBytes + source.byteLength,
-          outputStoredBytes: job.outputStoredBytes + source.byteLength,
-          logicalBytes: job.logicalBytes + description.encodedLength,
-          updatedAt: this.#now().toISOString(),
-          error: null,
-        });
-        processedBlocks += 1;
+        if (job.cursor.sourceSegmentIndex < sourceSegments.length) {
+          return compactionProgress(table.name, job, null);
+        }
       }
 
-      if (job.cursor.sourceSegmentIndex < sourceSegments.length) {
-        return compactionProgress(table.name, job, null);
-      }
-
-      const expectedOutputIds = sourceSegments.flatMap((segment, segmentIndex) =>
-        compactionBlockEntries(table, segment, segmentIndex, job.id).map(
-          (entry) => entry.outputBlockId,
-        ),
-      );
+      const expectedOutputIds =
+        rewritePlan.kind === "rechunk-v1"
+          ? rechunkOutputBlockIds(job.id, rewritePlan)
+          : sourceSegments.flatMap((segment, segmentIndex) =>
+              compactionBlockEntries(table, segment, segmentIndex, job.id).map(
+                (entry) => entry.outputBlockId,
+              ),
+            );
       const pendingOutputIds = new Set(transaction.pendingBlockIds);
       const unjournaledOutputId = expectedOutputIds.find((id) => !pendingOutputIds.has(id));
       if (unjournaledOutputId !== undefined) {
@@ -1120,20 +1453,34 @@ export class BrowserDatabase {
       if (outputSegmentId === null) throw new Error("Compaction output segment ID is missing");
       const first = sourceSegments[0];
       const last = sourceSegments[sourceSegments.length - 1];
-      if (first === undefined || last === undefined)
+      if (rewritePlan.kind === "copy-v1" && (first === undefined || last === undefined)) {
         throw new Error("Compaction sources disappeared");
+      }
       const desiredOutputSegment: SegmentRecord = {
         id: outputSegmentId,
         tableId: table.id,
         transactionId: transaction.id,
-        rowCount: sourceSegments.reduce((total, segment) => total + segment.rowCount, 0),
-        rowIdStart: first.rowIdStart,
-        rowIdEndExclusive: last.rowIdEndExclusive,
-        columnBlockIds: compactionOutputColumns(table, sourceSegments, job.id),
+        rowCount:
+          rewritePlan.kind === "rechunk-v1"
+            ? rewritePlan.totalRows
+            : sourceSegments.reduce((total, segment) => total + segment.rowCount, 0),
+        rowIdStart:
+          rewritePlan.kind === "rechunk-v1" ? rewritePlan.rowIdStart : (first?.rowIdStart ?? 0n),
+        rowIdEndExclusive:
+          rewritePlan.kind === "rechunk-v1"
+            ? rewritePlan.rowIdEndExclusive
+            : (last?.rowIdEndExclusive ?? 0n),
+        columnBlockIds:
+          rewritePlan.kind === "rechunk-v1"
+            ? rechunkOutputColumns(job.id, rewritePlan)
+            : compactionOutputColumns(table, sourceSegments, job.id),
         kind: "insert",
         ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
         level: job.targetLevel,
-        logicalOrder: await this.#firstLogicalOrder(sourceSegments),
+        logicalOrder:
+          rewritePlan.kind === "rechunk-v1"
+            ? rewritePlan.logicalOrder
+            : await this.#firstLogicalOrder(sourceSegments),
         createdAt: this.#now().toISOString(),
       };
       const outputSegment = await this.store.getSegment(outputSegmentId);
@@ -1227,6 +1574,147 @@ export class BrowserDatabase {
     }
   }
 
+  async #advanceRechunkCompaction(
+    initialJob: CompactionJobRecord,
+    transaction: DatabaseTransaction,
+    plan: RechunkCompactionRewritePlan,
+    maxBlocks: number,
+  ): Promise<CompactionJobRecord> {
+    let job = initialJob;
+    let processedBlocks = 0;
+    while ((job.outputCursor?.outputIndex ?? 0) < plan.outputs.length) {
+      if (processedBlocks >= maxBlocks) break;
+      const cursor = job.outputCursor;
+      if (cursor === null || cursor === undefined) {
+        throw new Error("Rechunk compaction cursor is missing");
+      }
+      const output = plan.outputs[cursor.outputIndex];
+      const column = plan.columns[cursor.columnIndex];
+      if (output === undefined || column === undefined) {
+        throw new Error("Rechunk compaction cursor is invalid");
+      }
+      const outputBlockId = rechunkOutputBlockId(job.id, cursor.outputIndex, cursor.columnIndex);
+      const built = await this.#buildRechunkPhysicalOutput(
+        plan,
+        column,
+        output,
+        job.memoryBudgetBytes ?? 0,
+      );
+      const existing = await this.store.getBlock(outputBlockId);
+      let outputBytes: Uint8Array;
+      if (existing === undefined) {
+        outputBytes = await encodePhysicalBlock(built.physical, plan.outputCompression);
+        await transaction.stageBlock(outputBlockId, outputBytes);
+      } else {
+        const decoded = await decodePhysicalBlock(existing);
+        if (
+          decoded.description.type !== column.type ||
+          decoded.description.compression !== plan.outputCompression ||
+          decoded.description.rowCount !== output.rowCount ||
+          !sameBytes(decoded.column.bytes, built.physical.bytes)
+        ) {
+          throw new Error(`A resumed compaction block differs: ${outputBlockId}`);
+        }
+        outputBytes = existing;
+        await transaction.stageExistingBlocks([outputBlockId]);
+      }
+      const description = inspectBlock(outputBytes);
+      const nextColumnIndex = cursor.columnIndex + 1;
+      const nextOutputIndex =
+        nextColumnIndex === plan.columns.length ? cursor.outputIndex + 1 : cursor.outputIndex;
+      const canonicalColumnIndex = nextColumnIndex === plan.columns.length ? 0 : nextColumnIndex;
+      const nextRowStart =
+        nextOutputIndex === plan.outputs.length
+          ? plan.totalRows
+          : (plan.outputs[nextOutputIndex]?.rowStart ?? output.rowStart);
+      job = await this.store.updateCompactionJob(job.id, job.revision, {
+        outputBlockIds: [...job.outputBlockIds, outputBlockId],
+        outputCursor: {
+          outputIndex: nextOutputIndex,
+          columnIndex: canonicalColumnIndex,
+          rowStart: nextRowStart,
+        },
+        processedRows: nextRowStart,
+        outputStoredBytes: safeWholeNumberSum(
+          [job.outputStoredBytes, outputBytes.byteLength],
+          "Compaction output stored bytes",
+        ),
+        outputLogicalBytes: safeWholeNumberSum(
+          [job.outputLogicalBytes ?? 0, description.encodedLength],
+          "Compaction output logical bytes",
+        ),
+        peakWorkingBytes: Math.max(job.peakWorkingBytes ?? 0, built.peakWorkingBytes),
+        updatedAt: this.#now().toISOString(),
+        error: null,
+      });
+      processedBlocks += 1;
+    }
+    return job;
+  }
+
+  async #buildRechunkPhysicalOutput(
+    plan: RechunkCompactionRewritePlan,
+    column: RechunkCompactionSourceColumn,
+    output: RechunkCompactionOutputWindow,
+    memoryBudgetBytes: number,
+  ): Promise<{ physical: ValidatedPhysicalColumn; peakWorkingBytes: number }> {
+    const loaded = await this.#loadRechunkPhysicalRanges(
+      column,
+      output,
+      plan.outputCompression,
+      memoryBudgetBytes,
+    );
+    const measurement = measurePhysicalColumnRanges(column.type, loaded.ranges);
+    if (measurement.rowCount !== output.rowCount) {
+      throw new Error("Compaction source ranges do not cover the planned output");
+    }
+    const physical = buildPhysicalColumnFromRanges(column.type, loaded.ranges);
+    return { physical, peakWorkingBytes: loaded.peakWorkingBytes };
+  }
+
+  async #loadRechunkPhysicalRanges(
+    column: RechunkCompactionSourceColumn,
+    output: RechunkCompactionOutputWindow,
+    outputCompression: Compression,
+    memoryBudgetBytes: number,
+  ): Promise<{ ranges: PhysicalColumnRange[]; peakWorkingBytes: number }> {
+    const memoryBound = rechunkOutputMemoryBound(column, output, outputCompression);
+    if (memoryBound > memoryBudgetBytes) {
+      throw new CompactionMemoryBudgetError(memoryBudgetBytes, memoryBound);
+    }
+    const outputEnd = safeWholeNumberSum(
+      [output.rowStart, output.rowCount],
+      "Compaction output row range",
+    );
+    const ranges: PhysicalColumnRange[] = [];
+    for (const sourceBlock of overlappingRechunkSourceBlocks(column, output)) {
+      const bytes = await this.store.getBlock(sourceBlock.blockId);
+      if (bytes === undefined) {
+        throw new Error(`A compaction source block is missing: ${sourceBlock.blockId}`);
+      }
+      const description = inspectBlock(bytes);
+      if (
+        bytes.byteLength !== sourceBlock.storedBytes ||
+        description.encodedLength !== sourceBlock.encodedBytes ||
+        description.checksum !== sourceBlock.checksum ||
+        description.rowCount !== sourceBlock.rowCount ||
+        description.type !== column.type
+      ) {
+        throw new Error(`A compaction source block differs from its plan: ${sourceBlock.blockId}`);
+      }
+      const decoded = await decodePhysicalBlock(bytes);
+      const sourceEnd = safeWholeNumberSum(
+        [sourceBlock.rowStart, sourceBlock.rowCount],
+        "Compaction source row range",
+      );
+      const start = Math.max(output.rowStart, sourceBlock.rowStart) - sourceBlock.rowStart;
+      const end = Math.min(outputEnd, sourceEnd) - sourceBlock.rowStart;
+      const slice = slicePhysicalColumn(decoded.column, start, end);
+      ranges.push({ column: slice, start: 0, end: slice.rowCount });
+    }
+    return { ranges, peakWorkingBytes: memoryBound };
+  }
+
   async #loadCompactionSources(job: CompactionJobRecord): Promise<SegmentRecord[]> {
     const segments = await Promise.all(job.sourceSegmentIds.map((id) => this.store.getSegment(id)));
     const missingIndex = segments.findIndex((segment) => segment === undefined);
@@ -1238,10 +1726,7 @@ export class BrowserDatabase {
     return segments as SegmentRecord[];
   }
 
-  async #beginCompactionTransaction(
-    job: CompactionJobRecord,
-    resetProgress: boolean,
-  ): Promise<{
+  async #beginCompactionTransaction(job: CompactionJobRecord): Promise<{
     job: CompactionJobRecord;
     transaction: DatabaseTransaction | null;
   }> {
@@ -1264,16 +1749,6 @@ export class BrowserDatabase {
       const linked = await this.store.updateCompactionJob(job.id, job.revision, {
         state: "running",
         transactionId: candidate.id,
-        ...(resetProgress
-          ? {
-              outputBlockIds: [],
-              cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
-              processedRows: 0,
-              sourceStoredBytes: 0,
-              outputStoredBytes: 0,
-              logicalBytes: 0,
-            }
-          : {}),
         updatedAt: this.#now().toISOString(),
         error: null,
       });
@@ -1342,7 +1817,9 @@ export class BrowserDatabase {
     job: CompactionJobRecord,
     version: number,
   ): CompactTableResult {
-    const rowCount = job.processedRows;
+    const rewritePlan = job.rewritePlan ?? { kind: "copy-v1" as const };
+    const rowCount = rewritePlan.kind === "rechunk-v1" ? rewritePlan.totalRows : job.processedRows;
+    const outputLogicalBytes = job.outputLogicalBytes ?? job.logicalBytes;
     const totalMs = Math.max(Date.parse(job.updatedAt) - Date.parse(job.createdAt), 0);
     return {
       jobId: job.id,
@@ -1355,11 +1832,21 @@ export class BrowserDatabase {
       rowCount,
       sourceStoredBytes: job.sourceStoredBytes,
       outputStoredBytes: job.outputStoredBytes,
+      outputLogicalBytes,
+      ...(rewritePlan.kind === "rechunk-v1"
+        ? {
+            targetBlockBytes: rewritePlan.targetBlockBytes,
+            outputCompression: rewritePlan.outputCompression,
+            memoryBudgetBytes: job.memoryBudgetBytes ?? 0,
+            minimumMemoryBytes: job.minimumMemoryBytes ?? 0,
+            peakWorkingBytes: job.peakWorkingBytes ?? 0,
+          }
+        : {}),
       supersededBlockCount: job.sourceBlockIds.length,
       physicallyReclaimedBytes: 0,
       version,
       metrics: createWriteMetrics({
-        logicalBytes: job.logicalBytes,
+        logicalBytes: outputLogicalBytes,
         storedBytes: job.outputStoredBytes,
         encodeMs: 0,
         stageMs: totalMs,
@@ -1895,6 +2382,190 @@ function positiveWholeNumber(value: number, name: string): number {
   return value;
 }
 
+function validateCompression(value: unknown, name: string): Compression {
+  if (value !== "raw" && value !== "rle" && value !== "gzip") {
+    throw new TypeError(`${name} must be raw, rle, or gzip`);
+  }
+  return value;
+}
+
+function isPhysicalColumnLimitError(error: unknown): boolean {
+  return (
+    error instanceof RangeError && error.message === "Physical column exceeds maximum byte length"
+  );
+}
+
+function safeWholeNumberSum(values: readonly number[], name: string): number {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0 || total > Number.MAX_SAFE_INTEGER - value) {
+      throw new RangeError(`${name} exceeds the safe integer range`);
+    }
+    total += value;
+  }
+  return total;
+}
+
+function safeWholeNumberProduct(left: number, right: number, name: string): number {
+  if (
+    !Number.isSafeInteger(left) ||
+    left < 0 ||
+    !Number.isSafeInteger(right) ||
+    right < 0 ||
+    (left !== 0 && right > Math.floor(Number.MAX_SAFE_INTEGER / left))
+  ) {
+    throw new RangeError(`${name} exceeds the safe integer range`);
+  }
+  return left * right;
+}
+
+function validateRechunkTablePlan(table: TableRecord, plan: RechunkCompactionRewritePlan): void {
+  if (
+    table.columns.length !== plan.columns.length ||
+    table.columns.some((column, index) => {
+      const planned = plan.columns[index];
+      return planned?.columnId !== column.id || planned.type !== column.type;
+    })
+  ) {
+    throw new Error(`Compaction table schema changed after planning: ${table.name}`);
+  }
+}
+
+function rechunkSourceStoredBytes(plan: RechunkCompactionRewritePlan): number {
+  return safeWholeNumberSum(
+    plan.columns.flatMap((column) => column.sourceBlocks.map((block) => block.storedBytes)),
+    "Compaction source stored bytes",
+  );
+}
+
+function rechunkSourceEncodedBytes(plan: RechunkCompactionRewritePlan): number {
+  return safeWholeNumberSum(
+    plan.columns.flatMap((column) => column.sourceBlocks.map((block) => block.encodedBytes)),
+    "Compaction source encoded bytes",
+  );
+}
+
+function overlappingRechunkSourceBlocks(
+  column: RechunkCompactionSourceColumn,
+  output: RechunkCompactionOutputWindow,
+): readonly RechunkCompactionSourceBlock[] {
+  const outputEnd = safeWholeNumberSum(
+    [output.rowStart, output.rowCount],
+    "Compaction output row range",
+  );
+  return column.sourceBlocks.filter((block) => {
+    const blockEnd = safeWholeNumberSum(
+      [block.rowStart, block.rowCount],
+      "Compaction source row range",
+    );
+    return block.rowStart < outputEnd && blockEnd > output.rowStart;
+  });
+}
+
+function rechunkOutputMemoryBound(
+  column: RechunkCompactionSourceColumn,
+  output: RechunkCompactionOutputWindow,
+  compression: Compression,
+): number {
+  const sourceBlocks = overlappingRechunkSourceBlocks(column, output);
+  let retainedDecodedBytes = 0;
+  let decodePeakBytes = 0;
+  for (const block of sourceBlocks) {
+    const decodeBytes = safeWholeNumberSum(
+      [
+        retainedDecodedBytes,
+        safeWholeNumberProduct(block.storedBytes, 2, "Compaction decode memory"),
+        safeWholeNumberProduct(block.encodedBytes, 2, "Compaction decode memory"),
+      ],
+      "Compaction decode memory",
+    );
+    decodePeakBytes = Math.max(decodePeakBytes, decodeBytes);
+    retainedDecodedBytes = safeWholeNumberSum(
+      [retainedDecodedBytes, block.encodedBytes],
+      "Compaction decoded source memory",
+    );
+  }
+  const outputEncodedBytes = retainedDecodedBytes;
+  const buildPeakBytes = safeWholeNumberSum(
+    [retainedDecodedBytes, outputEncodedBytes],
+    "Compaction physical build memory",
+  );
+  const compressionBound = getCompressionMemoryBound(compression, outputEncodedBytes);
+  const maximumBlockBytes = safeWholeNumberSum(
+    [MAX_BLOCK_ENVELOPE_BYTES, compressionBound.maximumOutputBytes],
+    "Compaction encoded block memory",
+  );
+  const compressionPeakBytes = safeWholeNumberSum(
+    [outputEncodedBytes, compressionBound.scratchBytes, compressionBound.maximumOutputBytes],
+    "Compaction compression memory",
+  );
+  const envelopePeakBytes = safeWholeNumberSum(
+    [outputEncodedBytes, compressionBound.maximumOutputBytes, maximumBlockBytes],
+    "Compaction block envelope memory",
+  );
+  const reconciliationPeakBytes = safeWholeNumberSum(
+    [
+      safeWholeNumberProduct(outputEncodedBytes, 3, "Compaction reconciliation memory"),
+      safeWholeNumberProduct(maximumBlockBytes, 2, "Compaction reconciliation memory"),
+    ],
+    "Compaction reconciliation memory",
+  );
+  return Math.max(
+    1,
+    decodePeakBytes,
+    buildPeakBytes,
+    compressionPeakBytes,
+    envelopePeakBytes,
+    reconciliationPeakBytes,
+  );
+}
+
+function compactionMinimumMemoryBytes(plan: RechunkCompactionRewritePlan): number {
+  let minimumBytes = 1;
+  for (const output of plan.outputs) {
+    for (const column of plan.columns) {
+      minimumBytes = Math.max(
+        minimumBytes,
+        rechunkOutputMemoryBound(column, output, plan.outputCompression),
+      );
+    }
+  }
+  return minimumBytes;
+}
+
+function rechunkOutputBlockId(jobId: string, outputIndex: number, columnIndex: number): string {
+  return [
+    jobId,
+    "rewrite",
+    "window",
+    String(outputIndex).padStart(8, "0"),
+    "column",
+    String(columnIndex).padStart(8, "0"),
+  ].join("/");
+}
+
+function rechunkOutputBlockIds(jobId: string, plan: RechunkCompactionRewritePlan): string[] {
+  return plan.outputs.flatMap((_output, outputIndex) =>
+    plan.columns.map((_column, columnIndex) =>
+      rechunkOutputBlockId(jobId, outputIndex, columnIndex),
+    ),
+  );
+}
+
+function rechunkOutputColumns(
+  jobId: string,
+  plan: RechunkCompactionRewritePlan,
+): Record<string, string[]> {
+  return Object.fromEntries(
+    plan.columns.map((column, columnIndex) => [
+      column.columnId,
+      plan.outputs.map((_output, outputIndex) =>
+        rechunkOutputBlockId(jobId, outputIndex, columnIndex),
+      ),
+    ]),
+  );
+}
+
 interface CompactionBlockEntry {
   columnId: string;
   sourceBlockId: string;
@@ -1957,6 +2628,7 @@ function compactionProgress(
   job: CompactionJobRecord,
   result: CompactTableResult | null,
 ): CompactionJobProgress {
+  const rewritePlan = job.rewritePlan ?? { kind: "copy-v1" as const };
   return {
     jobId: job.id,
     tableName,
@@ -1965,6 +2637,13 @@ function compactionProgress(
     sourceSegmentCount: job.sourceSegmentIds.length,
     sourceBlockCount: job.sourceBlockIds.length,
     outputBlockCount: job.outputBlockIds.length,
+    ...(rewritePlan.kind === "rechunk-v1"
+      ? {
+          memoryBudgetBytes: job.memoryBudgetBytes ?? 0,
+          minimumMemoryBytes: job.minimumMemoryBytes ?? 0,
+          peakWorkingBytes: job.peakWorkingBytes ?? 0,
+        }
+      : {}),
     result,
   };
 }
