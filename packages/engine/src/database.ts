@@ -55,11 +55,12 @@ import {
 } from "@browserdatabase/transactions";
 import {
   compileQuery,
-  createPreparedQuery,
+  createPreparedColumnarQuery,
   referencedColumns,
   type PreparedQuery,
   type QueryResult,
 } from "./query.js";
+import { createColumnarTable, type ColumnarColumnInput, type ColumnarTable } from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
@@ -1022,13 +1023,13 @@ export class BrowserDatabase {
       tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
     );
     const columns = referencedColumns(plan, schemas);
-    const rows = new Map<string, DatabaseRow[]>();
+    const columnarTables = new Map<string, ColumnarTable>();
     await this.#withLeasedSnapshot(options.version, async (snapshot) => {
       for (const table of tables) {
         const requestedColumns = columns.get(table.name);
-        rows.set(
+        columnarTables.set(
           table.name,
-          await this.#materializeTableAtSnapshot(
+          await this.#materializeColumnarTableAtSnapshot(
             table,
             snapshot,
             resolveReadColumns(
@@ -1039,7 +1040,7 @@ export class BrowserDatabase {
         );
       }
     });
-    return createPreparedQuery(plan, rows);
+    return createPreparedColumnarQuery(plan, columnarTables);
   }
 
   /** Executes a read-only SELECT statement through the public query API. */
@@ -3232,6 +3233,163 @@ export class BrowserDatabase {
     return visibleRows.map((row) =>
       Object.fromEntries(projectedColumns.map((column) => [column.name, row[column.name] ?? null])),
     );
+  }
+
+  async #materializeColumnarTableAtSnapshot(
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    projectedColumns: readonly TableColumnRecord[],
+  ): Promise<ColumnarTable> {
+    const segments = await this.#visibleSegmentRecords(table, snapshot);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (
+      segments.every((segment) => {
+        const kind = segment.kind ?? "insert";
+        return kind === "insert" || kind === "base";
+      })
+    ) {
+      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+      const valuesByColumn = new Map(
+        projectedColumns.map((column) => [column.id, new Array<BatchValue>(rowCount)] as const),
+      );
+      let outputRowStart = 0;
+      for (const segment of segments) {
+        await this.#renewInternalLeaseIfNeeded(snapshot);
+        const segmentBlockIds = projectedColumns.flatMap(
+          (column) => segment.columnBlockIds[column.id] ?? [],
+        );
+        const decodedColumns = await this.#loadDecodedBlocks(segmentBlockIds, snapshot);
+        for (const column of projectedColumns) {
+          const output = valuesByColumn.get(column.id);
+          if (output === undefined) throw new Error(`Projected column is missing: ${column.name}`);
+          const values = this.#readSegmentColumn(column, segment, decodedColumns);
+          for (let row = 0; row < values.length; row += 1) {
+            output[outputRowStart + row] = values[row] ?? null;
+          }
+        }
+        outputRowStart += segment.rowCount;
+      }
+      const columns = new Map<string, ColumnarColumnInput>();
+      for (const column of projectedColumns) {
+        columns.set(column.name, {
+          type: column.type,
+          values: valuesByColumn.get(column.id) ?? [],
+        });
+      }
+      const projectedKey =
+        keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
+          ? keyColumn.name
+          : undefined;
+      return createColumnarTable(table.name, columns, projectedKey);
+    }
+    const neededColumns = [
+      ...projectedColumns,
+      ...(keyColumn === undefined || projectedColumns.some((column) => column.id === keyColumn.id)
+        ? []
+        : [keyColumn]),
+    ];
+    const valuesByColumn = new Map(
+      neededColumns.map((column) => [column.id, [] as BatchValue[]] as const),
+    );
+    const alive: boolean[] = [];
+    const rowIndexByKey = new Map<string, number>();
+
+    for (const segment of segments) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      const segmentBlockIds = neededColumns.flatMap(
+        (column) => segment.columnBlockIds[column.id] ?? [],
+      );
+      const decodedColumns = await this.#loadDecodedBlocks(segmentBlockIds, snapshot);
+      if (segment.kind === "delete") {
+        if (keyColumn === undefined)
+          throw new Error(`Delete segment has no unique key: ${segment.id}`);
+        for (const value of this.#readSegmentColumn(keyColumn, segment, decodedColumns)) {
+          const token = keyToken(keyColumn.type, value);
+          const existingIndex = rowIndexByKey.get(token);
+          if (existingIndex !== undefined) alive[existingIndex] = false;
+          rowIndexByKey.delete(token);
+        }
+        continue;
+      }
+      if (segment.kind === "update") {
+        if (keyColumn === undefined)
+          throw new Error(`Update segment has no unique key: ${segment.id}`);
+        const keyValues = this.#readSegmentColumn(keyColumn, segment, decodedColumns);
+        const changedColumns = projectedColumns.filter(
+          (column) =>
+            column.id !== keyColumn.id && (segment.columnBlockIds[column.id]?.length ?? 0) > 0,
+        );
+        const changedValues = new Map(
+          changedColumns.map(
+            (column) =>
+              [column.id, this.#readSegmentColumn(column, segment, decodedColumns)] as const,
+          ),
+        );
+        keyValues.forEach((value, rowIndex) => {
+          const existingIndex = rowIndexByKey.get(keyToken(keyColumn.type, value));
+          if (existingIndex === undefined || alive[existingIndex] !== true) {
+            throw new Error(`Update segment references a missing key: ${segment.id}`);
+          }
+          for (const column of changedColumns) {
+            const values = valuesByColumn.get(column.id);
+            if (values === undefined)
+              throw new Error(`Projected column is missing: ${column.name}`);
+            values[existingIndex] = changedValues.get(column.id)?.[rowIndex] ?? null;
+          }
+        });
+        continue;
+      }
+
+      const segmentValues = new Map(
+        neededColumns.map(
+          (column) =>
+            [column.id, this.#readSegmentColumn(column, segment, decodedColumns)] as const,
+        ),
+      );
+      for (let segmentRow = 0; segmentRow < segment.rowCount; segmentRow += 1) {
+        let existingIndex: number | undefined;
+        let token: string | undefined;
+        if (keyColumn !== undefined) {
+          const keyValue = segmentValues.get(keyColumn.id)?.[segmentRow] ?? null;
+          token = keyToken(keyColumn.type, keyValue);
+          existingIndex = rowIndexByKey.get(token);
+        }
+        if (segment.kind === "upsert" && existingIndex !== undefined) {
+          for (const column of neededColumns) {
+            const values = valuesByColumn.get(column.id);
+            if (values === undefined)
+              throw new Error(`Projected column is missing: ${column.name}`);
+            values[existingIndex] = segmentValues.get(column.id)?.[segmentRow] ?? null;
+          }
+          alive[existingIndex] = true;
+          continue;
+        }
+        if (existingIndex !== undefined) {
+          throw new Error(`Stored table contains a duplicate unique key: ${table.name}`);
+        }
+        const outputIndex = alive.length;
+        for (const column of neededColumns) {
+          valuesByColumn.get(column.id)?.push(segmentValues.get(column.id)?.[segmentRow] ?? null);
+        }
+        alive.push(true);
+        if (token !== undefined) rowIndexByKey.set(token, outputIndex);
+      }
+    }
+
+    const hasDeletedRows = alive.some((visible) => !visible);
+    const columns = new Map<string, ColumnarColumnInput>();
+    for (const column of projectedColumns) {
+      const sourceValues = valuesByColumn.get(column.id) ?? [];
+      const values = hasDeletedRows
+        ? sourceValues.filter((_value, rowIndex) => alive[rowIndex] === true)
+        : sourceValues;
+      columns.set(column.name, { type: column.type, values });
+    }
+    const projectedKey =
+      keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
+        ? keyColumn.name
+        : undefined;
+    return createColumnarTable(table.name, columns, projectedKey);
   }
 
   #readSegment(

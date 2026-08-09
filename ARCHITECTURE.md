@@ -2,7 +2,7 @@
 
 Status: foundational design, August 2026
 
-BrowserDatabase is a browser-only relational database engine for large local datasets. It is designed around immutable compressed columnar storage, asynchronous worker execution, and IndexedDB transactions. The current implementation proves the storage and MVCC path, exposes a bounded correctness-first SQL subset, and leaves the unified vectorized planner and ORM surface for later phases.
+BrowserDatabase is a browser-only relational database engine for large local datasets. It is designed around immutable compressed columnar storage, asynchronous worker execution, and IndexedDB transactions. The current implementation proves the storage and MVCC path, exposes an intentionally limited correctness-first SQL subset backed by an initial columnar executor, and leaves a fully memory-accounted vectorized planner and the ORM surface for later phases.
 
 ## Architectural invariants
 
@@ -20,7 +20,7 @@ These are constraints, not preferences:
 | Writes                 | Append-only delta segments, compacted asynchronously                                                         |
 | Transactions           | Snapshot isolation through versioned MVCC manifests                                                          |
 | Default durability     | IndexedDB `relaxed` durability                                                                               |
-| Query execution        | Vectorized, streaming, and explicitly memory-bounded                                                         |
+| Query execution        | Vectorized; streaming inputs, explicit memory budgets, and spill remain required exit gates                  |
 | Physical optimization  | Automatic statistics and data skipping; no user-managed indexes                                              |
 | Concurrency            | Concurrent readers and write preparation; serialized metadata commits                                        |
 | Coordination           | Correctness never depends on BroadcastChannel, Web Locks, page-close handlers, or successful background work |
@@ -383,10 +383,17 @@ Large buffers cross worker boundaries as transferables. Transfer of ownership is
 
 The wire protocol is independently versioned. Requests carry protocol version, request ID, operation, and payload. Responses are discriminated success, failure, progress, or result messages. Unknown versions and operations fail explicitly.
 
-## Vectorized bounded-memory execution
+## Vectorized execution and the bounded-memory target
 
-The future vectorized hot path will avoid arrays of row objects and per-row callbacks. Operators
-consume bounded batches:
+Phase 7A introduces typed boolean, number, datetime, and string vectors. Every vector carries a packed
+validity bitmap; strings are dictionary-coded, numbers and datetimes use `Float64Array`, and booleans
+use byte values. `query()` and `prepareQuery()` materialize the referenced columns at one leased
+snapshot, replay visible insert, upsert, update, and delete segments into column values, and bind the
+public SQL plan to those vectors. The executor scans 2,048 source rows per batch and passes
+duplicate-match join fan-out through downstream operators in chunks. Returned `QueryResult` values
+still materialize row objects at the public API boundary.
+
+The target operator shape remains:
 
 ```ts
 interface Vector<T extends ArrayBufferView> {
@@ -401,18 +408,28 @@ interface Batch {
 }
 ```
 
-The target executor gives every query and physical rewrite job a memory context. Operators reserve
-and release bytes. Sort, hash aggregate, hash join, and distinct operations must spill to temporary
-storage when reservations fail. Memory use is a function of the configured working set, not total
-database size. Physical compaction now advances by output block under a specialized conservative
-executor-buffer model. Mutation merge planning applies a separate preflight safety estimate to its
-in-memory key and source-reference state, but does not spill or resume that state. The general query
-memory context and spilling contract remain future work. As described above, both compaction figures
-are modeled workflow bounds rather than measurements or hard limits on all browser heap.
+Phase 7A does not yet satisfy that target. It materializes whole projected input columns before
+execution and has no query `MemoryContext`, configured query-memory budget, reservation accounting,
+or spill path. Join hash tables, grouped aggregate state, ordering buffers, and accumulated results
+can grow with query cardinality even though scan batches and duplicate fan-out handoff are chunked.
+The public result must also remain materialized under the current API contract.
+
+The completed design gives every query and physical rewrite job a memory context. Operators reserve
+and release bytes, while sort, hash aggregate, hash join, and distinct spill to temporary storage when
+reservations fail. Physical compaction already advances by output block under a specialized
+conservative executor-buffer model. Mutation merge planning applies a separate preflight safety
+estimate to its in-memory key and source-reference state, but does not spill or resume that state. The
+general query memory context and spilling contract remain future work. As described above, both
+compaction figures are modeled workflow bounds rather than measurements or hard limits on all browser
+heap.
 
 ## Automatic data skipping
 
-There are no user-managed indexes. The engine records row count, null count, min/max zone maps, approximate distinct counts, dictionary membership, and optional Bloom filters per row group. Scans prune segments and row groups before loading predicate columns, evaluate a selection vector, then late-load projected columns.
+Phase 7A performs no data skipping: it reads every block needed for each referenced projected column.
+There are no user-managed indexes. A later phase will record row count, null count, min/max zone maps,
+approximate distinct counts, dictionary membership, and optional Bloom filters per row group. Those
+statistics will let scans prune segments and row groups before loading predicate columns, evaluate a
+selection vector, and then late-load projected columns.
 
 Workload telemetry may eventually drive compaction order, clustering, and auxiliary per-segment structures. These structures are derived and disposable; logical correctness does not depend on them.
 
@@ -430,9 +447,9 @@ The schema DSL owns stable table and column IDs and emits catalog definitions, s
 
 Live queries record table, column, and predicate dependencies. Commits persist a change set before any notification. The correctness baseline reruns a query when a relevant dependency changes; incremental maintenance is introduced only for proven-safe operator shapes.
 
-A bounded row-oriented read-only SQL subset is implemented ahead of this architecture. Typed shared
-logical/physical plans, the schema DSL, ORM, and live queries remain postponed until their lower
-gates are satisfied.
+An intentionally limited read-only SQL subset and the Phase 7A columnar executor are implemented ahead
+of this architecture. Typed shared logical/physical plans, the schema DSL, ORM, and live queries
+remain postponed until their lower gates are satisfied.
 
 ## Backup, restore, and garbage collection
 
@@ -464,7 +481,7 @@ Core invariants under faults:
 ## Explicit non-goals for the foundation
 
 - No full SQL surface, ORM, schema DSL, migrations, or live-query API yet; the current SQL subset is
-  deliberately bounded and row-oriented.
+  deliberately limited, and its Phase 7A executor does not claim the bounded-memory exit gate.
 - No claim of multi-gigabyte performance until browser measurements support it.
 - No required OPFS, Web Locks, BroadcastChannel, SharedWorker, WASM, or SharedArrayBuffer.
 - No user-facing index DDL.

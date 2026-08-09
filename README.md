@@ -2,9 +2,10 @@
 
 BrowserDatabase is an experimental browser-only relational database built around immutable compressed
 columnar blocks and IndexedDB. The current slice includes the block format, atomic storage
-publication, persistent writes and snapshots, a bounded read-only SQL API, resumable and cancellable
-physical compaction of append and keyed mutation segments, lease-aware physical garbage collection,
-deterministic fault injection, and a browser benchmark laboratory.
+publication, persistent writes and snapshots, an intentionally limited read-only SQL API with an
+initial columnar executor, resumable and cancellable physical compaction of append and keyed mutation
+segments, lease-aware physical garbage collection, deterministic fault injection, and a browser
+benchmark laboratory.
 
 The public logical types are intentionally small:
 
@@ -130,14 +131,27 @@ the writer's `onError`; a main-thread worker proxy can use `attachLifecycleFlush
 request when the document becomes hidden or the page fires `pagehide`. This is an optimization, not
 an unload-time durability guarantee.
 
-`query()` and `prepareQuery()` are the public read-only SQL API. The current intentionally bounded
-SQL surface supports `SELECT`, aliases, inner and left equi-joins, `WHERE` comparisons joined by
+`query()` and `prepareQuery()` are the public read-only SQL API. The current intentionally limited SQL
+surface supports `SELECT`, aliases, inner and left equi-joins, `WHERE` comparisons joined by
 `AND`, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `ROUND`, `GROUP BY`, multi-column `ORDER BY`,
 and `LIMIT`. It rejects multiple statements, comments, writes, unknown or ambiguous columns, and
 unsupported functions instead of silently interpreting them. A prepared query materializes only
 its referenced columns at one manifest version, remains stable across later commits, and must be
 closed when no longer needed. This is a correctness-first SQL subset, not a claim of full SQL-92
 coverage.
+
+Phase 7A backs that public SQL surface with typed column vectors. Booleans use byte values, numbers
+and datetimes use `Float64Array`, strings use dictionary-coded `Uint32Array` values, and every vector
+has a packed validity bitmap. Snapshot preparation replays visible inserts, upserts, updates, and
+deletes directly into projected column values before creating the vectors. Execution scans 2,048
+source rows at a time and feeds duplicate-match join fan-out onward in chunks. It still materializes
+result row objects at the `QueryResult` API boundary.
+
+This first executor is not the Phase 7 bounded-memory exit. It materializes each projected input in
+full, has no query `MemoryContext`, configured query-memory budget, or spill path, and its join hash,
+group, ordering, and result state can grow with the query. It also performs no statistics-driven
+segment or row-group data skipping. Phase 7 remains open for accounted working-set bounds and
+streaming inputs; Phase 8 remains open for pruning and late materialization.
 
 Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records an
 immutable physical rewrite plan. Append-only inputs use `rechunk-v1`, which fixes the ordered
@@ -363,9 +377,9 @@ The ad-hoc console uses a deliberately bounded reference runner over the materia
 supports one read-only `SELECT` with equi-joins, `WHERE` predicates joined by `AND`, grouping,
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, ordering, and a limit. It rejects mutations and unsupported SQL.
 Catalog-query and ad-hoc timings are correctness and workload-shape measurements, not native query
-engine performance claims. They remain separate from the public row-oriented SQL subset; vector
-execution and broader SQL coverage are later roadmap work. The upsert probe is capped at 1,000 saved
-keys and is not presented as a large-scale throughput benchmark.
+engine performance claims. They remain separate from the public vector-backed SQL subset; the full
+bounded-memory vector contract, data skipping, and broader SQL coverage remain roadmap work. The
+upsert probe is capped at 1,000 saved keys and is not presented as a large-scale throughput benchmark.
 
 The cross-engine comparison keeps those reference timings separate. BrowserDatabase is measured
 through `createTable()`, `insertBatch()`, `prepareQuery()`, `query()`, and `listTables()`; each SQL

@@ -1,4 +1,10 @@
 import type { DatabaseRow } from "./database.js";
+import {
+  columnarTableFromRows,
+  prepareVectorQuery,
+  type ColumnarTable,
+  type PreparedVectorQuery,
+} from "./vector.js";
 
 export type QueryValue = boolean | number | string | Date | null;
 export type QueryRow = Record<string, QueryValue>;
@@ -15,18 +21,18 @@ export interface PreparedQuery {
   close(): void;
 }
 
-type BinaryOperator = "+" | "-" | "*" | "/";
-type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
-type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+export type BinaryOperator = "+" | "-" | "*" | "/";
+export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
+export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
 
-type Expression =
+export type Expression =
   | { kind: "literal"; value: QueryValue }
   | { kind: "column"; reference: string }
   | { kind: "wildcard" }
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
   | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[] };
 
-interface SelectItem {
+export interface SelectItem {
   expression: Expression;
   alias: string;
 }
@@ -135,21 +141,108 @@ export function createPreparedQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): PreparedQuery {
+  validateGrouping(plan);
+  if ([...tables.values()].some((rows) => rows.length === 0)) {
+    return createPreparedRowQuery(plan, tables);
+  }
+  return createPreparedColumnarQuery(plan, normalizeColumnarTables(plan, tables));
+}
+
+/** Internal columnar entry point used after BrowserDatabase materializes a stable snapshot. */
+export function createPreparedColumnarQuery(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, ColumnarTable>,
+): PreparedQuery {
+  validateGrouping(plan);
   let closed = false;
+  let prepared: PreparedVectorQuery | undefined = prepareVectorQuery(plan, tables);
   return {
     sql: plan.sql,
     tables: [plan.base.table, ...plan.joins.map((join) => join.table)],
     execute() {
-      if (closed) throw new Error("Prepared query is closed");
-      return executeQuery(plan, tables);
+      if (closed || prepared === undefined) throw new Error("Prepared query is closed");
+      return prepared.execute();
     },
     close() {
       closed = true;
+      prepared = undefined;
     },
   };
 }
 
+function createPreparedRowQuery(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): PreparedQuery {
+  let closed = false;
+  let rows: ReadonlyMap<string, DatabaseRow[]> | undefined = cloneRowTables(tables);
+  return {
+    sql: plan.sql,
+    tables: [plan.base.table, ...plan.joins.map((join) => join.table)],
+    execute() {
+      if (closed || rows === undefined) throw new Error("Prepared query is closed");
+      return executeRowQuery(plan, cloneRowTables(rows));
+    },
+    close() {
+      closed = true;
+      rows = undefined;
+    },
+  };
+}
+
+function cloneRowTables(
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): ReadonlyMap<string, DatabaseRow[]> {
+  return new Map(
+    [...tables].map(([name, rows]) => [
+      name,
+      rows.map((row) =>
+        Object.fromEntries(
+          Object.entries(row).map(([column, value]) => [
+            column,
+            value instanceof Date ? new Date(value.getTime()) : value,
+          ]),
+        ),
+      ),
+    ]),
+  );
+}
+
 export function executeQuery(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): QueryResult {
+  validateGrouping(plan);
+  if ([...tables.values()].some((rows) => rows.length === 0)) {
+    return executeRowQuery(plan, tables);
+  }
+  return prepareVectorQuery(plan, normalizeColumnarTables(plan, tables)).execute();
+}
+
+function normalizeColumnarTables(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): Map<string, ColumnarTable> {
+  const requiredTables = new Set([plan.base.table, ...plan.joins.map((join) => join.table)]);
+  const schemas = new Map(
+    [...tables].map(([name, rows]) => [
+      name,
+      [...new Set(rows.flatMap((row) => Object.keys(row)))],
+    ]),
+  );
+  const requestedColumns = referencedColumns(plan, schemas);
+  return new Map(
+    [...tables]
+      .filter(([name]) => requiredTables.has(name))
+      .map(([name, table]) => [
+        name,
+        columnarTableFromRows(name, table, requestedColumns.get(name) ?? []),
+      ]),
+  );
+}
+
+/** Correctness reference retained while the vector executor matures. */
+export function executeRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {

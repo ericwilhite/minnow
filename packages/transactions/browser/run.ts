@@ -1,6 +1,6 @@
 import { IndexedDbBlockStore, WriteConflictError } from "@browserdatabase/storage-idb";
 import { FaultInjectingBlockStore } from "@browserdatabase/testing";
-import { BrowserDatabase } from "@browserdatabase/engine";
+import { BrowserDatabase, type QueryResult } from "@browserdatabase/engine";
 import { TransactionManager } from "../src/index.js";
 
 interface BrowserTransactionResult {
@@ -43,6 +43,13 @@ interface BrowserTransactionResult {
       visibleSegments: number;
       currentNames: string[];
       historicalRows: number;
+    };
+    vectorQuery: {
+      prepared: { count: number; total: number };
+      historical: { count: number; total: number };
+      current: { count: number; total: number };
+      compacted: { count: number; total: number };
+      reopened: { count: number; total: number };
     };
     l2Compaction: {
       sourceSegments: number[];
@@ -129,6 +136,8 @@ window.runTransactionBrowserTest = async () => {
   const batch = await database.insertBatch("people", {
     columns: { name: ["Ada", "Grace", "Linus"], score: [10, 20, 30] },
   });
+  const aggregateSql = "SELECT COUNT(*) AS count, SUM(score) AS total FROM people";
+  const preparedPeople = await database.prepareQuery(aggregateSql);
   const upsert = await database.upsertBatch("people", {
     columns: { name: ["Grace", "Katherine"], score: [25, 40] },
   });
@@ -137,6 +146,12 @@ window.runTransactionBrowserTest = async () => {
   const deleted = await database.deleteBatch("people", { keys: ["Ada", "Missing"] });
   const rows = await database.readTable("people");
   const updatedScore = rows.find((row) => row.name === "Grace")?.score;
+  const preparedAggregate = summarizeAggregate(preparedPeople.execute());
+  preparedPeople.close();
+  const historicalAggregate = summarizeAggregate(
+    await database.query(aggregateSql, { version: batch.version }),
+  );
+  const currentAggregate = summarizeAggregate(await database.query(aggregateSql));
   const writer = database.bufferedWriter("events", { maxRows: 2, maxAgeMs: 60_000 });
   await writer.add({ happened: new Date("2026-01-01T00:00:00.000Z") });
   const thresholdFlush = await writer.add({ happened: new Date("2026-01-02T00:00:00.000Z") });
@@ -154,6 +169,7 @@ window.runTransactionBrowserTest = async () => {
   const mutationRows = await database.readTable("people");
   const mutationHistoricalRows = await database.readTable("people", batch.version);
   const mutationVisibleSegments = (await database.listVisibleSegments("people")).length;
+  const compactedAggregate = summarizeAggregate(await database.query(aggregateSql));
 
   await database.createTable({
     name: "l2_events",
@@ -202,6 +218,7 @@ window.runTransactionBrowserTest = async () => {
   const reopenedL2Ids = (await reopenedDatabase.listVisibleSegments("l2_events")).map(
     (segment) => segment.id,
   );
+  const reopenedAggregate = summarizeAggregate(await reopenedDatabase.query(aggregateSql));
   reopenedLibraryStore.close();
   await deleteDatabase(libraryName);
 
@@ -248,6 +265,13 @@ window.runTransactionBrowserTest = async () => {
         currentNames: mutationRows.map((row) => String(row.name)),
         historicalRows: mutationHistoricalRows.length,
       },
+      vectorQuery: {
+        prepared: preparedAggregate,
+        historical: historicalAggregate,
+        current: currentAggregate,
+        compacted: compactedAggregate,
+        reopened: reopenedAggregate,
+      },
       l2Compaction: {
         sourceSegments: [firstL2.sourceSegmentCount, secondL2.sourceSegmentCount],
         levels: l2Segments.map((segment) => segment.level ?? 0),
@@ -263,6 +287,15 @@ window.runTransactionBrowserTest = async () => {
     },
   };
 };
+
+function summarizeAggregate(result: QueryResult): { count: number; total: number } {
+  const count = result.rows[0]?.count;
+  const total = result.rows[0]?.total;
+  if (typeof count !== "number" || typeof total !== "number") {
+    throw new Error("Vector aggregate result is missing");
+  }
+  return { count, total };
+}
 
 const ready = document.querySelector("#ready");
 if (ready !== null) ready.textContent = "Transaction tests ready";

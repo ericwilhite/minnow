@@ -46,6 +46,13 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
             currentNames: string[];
             historicalRows: number;
           };
+          vectorQuery: {
+            prepared: { count: number; total: number };
+            historical: { count: number; total: number };
+            current: { count: number; total: number };
+            compacted: { count: number; total: number };
+            reopened: { count: number; total: number };
+          };
           l2Compaction: {
             sourceSegments: number[];
             levels: number[];
@@ -102,6 +109,13 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         visibleSegments: 1,
         currentNames: ["Grace", "Linus", "Katherine"],
         historicalRows: 3,
+      },
+      vectorQuery: {
+        prepared: { count: 3, total: 60 },
+        historical: { count: 3, total: 60 },
+        current: { count: 3, total: 96 },
+        compacted: { count: 3, total: 96 },
+        reopened: { count: 3, total: 96 },
       },
       l2Compaction: {
         sourceSegments: [2, 2],

@@ -52,8 +52,9 @@ multiplier grows every dimension, bridge, transaction, and ledger table. It vali
 reference queries. A measured, read-only ad-hoc reference SQL console remains explicitly separate
 from library timings. The library now has a correctness-first native `query()`/`prepareQuery()` SQL
 subset for projections, filters, equi-joins, grouping, core aggregates, ordering, and limits. The
-four-engine comparison uses that public API and requires matching checksums. Vectorized execution,
-statistics, broader SQL, and cost-based optimization remain planned in Phases 7–13.
+four-engine comparison uses that public API and requires matching checksums. The Phase 7A columnar
+executor now backs the public subset; memory-accounted execution, statistics, broader SQL, and
+cost-based optimization remain planned in Phases 7–13.
 
 Initial matrix:
 
@@ -278,6 +279,21 @@ stay within their explicitly scoped write-amplification budgets.
 
 Deliver bounded `Batch`, typed `Vector`, validity bitmap, string-vector, selection-vector, and memory-context primitives. Initial operators: segment scan, filter, project, limit, aggregate, hash aggregate, sort, and hash join.
 
+Phase 7A is implemented as a deliberately narrower first slice. The public `query()` and
+`prepareQuery()` paths replay visible insert, upsert, update, and delete segments into projected
+column values, then execute against typed boolean, number, datetime, and dictionary-coded string
+vectors with packed validity bitmaps. Scans advance in 2,048-row source batches, and duplicate-match
+join fan-out is passed through the remaining operators in chunks. Filters, projection, limits, core
+aggregates, grouped aggregation, ordering, and equi-joins use this executor; row objects are created
+for the returned `QueryResult` only at the public API boundary.
+
+Phase 7 remains open. Preparation still materializes every projected input column in full. Queries
+have no `MemoryContext`, configured memory budget, reservation accounting, or spill path, and join
+hash tables, group state, ordering buffers, and result state can still grow with the query. Phase 7A
+also does not perform segment or row-group data skipping. Later Phase 7 work must make the input and
+operator working sets explicitly bounded; Phase 8 owns statistics-driven pruning and late
+materialization.
+
 Exit gate: hot paths avoid row-object materialization and per-row callbacks; operator memory is accounted against a configured budget.
 
 ## Phase 8 — Filtering and data skipping
@@ -313,9 +329,9 @@ Deliver lexer, parser, AST, binder/type checker, logical plan, physical plan, an
 Foundation implemented early: a dependency-free read-only lexer/parser and bound projected snapshot
 executor now powers the public `query()` and reusable `prepareQuery()` APIs. It supports SELECT,
 aliases, inner/left equi-joins, AND comparisons, arithmetic, core aggregates, ROUND, GROUP BY,
-multi-column ORDER BY, and LIMIT. Unsupported syntax fails explicitly. This row-oriented foundation
-does not complete Phase 12: typed logical/physical plans, DISTINCT, subqueries, sets, CTEs, windows,
-mutations, and the vector kernel remain outstanding.
+multi-column ORDER BY, and LIMIT. Unsupported syntax fails explicitly. Phase 7A routes this subset
+through its initial columnar executor, but does not complete Phase 12: typed logical/physical plans,
+DISTINCT, subqueries, sets, CTEs, windows, and SQL mutations remain outstanding.
 
 Exit gate: SQL compiles into the same logical representation used by all other APIs; unsupported syntax fails explicitly rather than silently changing semantics.
 
@@ -407,6 +423,8 @@ larger/repeated benchmark tiers remain outstanding.
       accounting.
 - [x] Add safe compaction-job cancellation.
 - [x] Add lease-aware garbage collection and physical reclamation for superseded blocks.
+- [x] Route the public SQL subset and mutation replay through the Phase 7A columnar executor.
+- [ ] Add query memory contexts, explicit working-set budgets, spill, and streaming projected inputs.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording
