@@ -8,9 +8,66 @@ import {
   executeQuery,
   executeRowQuery,
 } from "./query.js";
-import { createColumnarTable } from "./vector.js";
+import { createColumnarTable, type QuerySpillStore } from "./vector.js";
+
+class TestSpillStore implements QuerySpillStore {
+  readonly pages = new Map<string, Uint8Array>();
+
+  async putPage(ownerId: string, runId: string, pageIndex: number, bytes: Uint8Array) {
+    this.pages.set(`${ownerId}/${runId}/${String(pageIndex)}`, bytes.slice());
+  }
+
+  async getPage(ownerId: string, runId: string, pageIndex: number) {
+    return this.pages.get(`${ownerId}/${runId}/${String(pageIndex)}`)?.slice();
+  }
+
+  async removeRun(ownerId: string, runId: string) {
+    const prefix = `${ownerId}/${runId}/`;
+    for (const key of this.pages.keys()) if (key.startsWith(prefix)) this.pages.delete(key);
+  }
+
+  async removeOwner(ownerId: string) {
+    const prefix = `${ownerId}/`;
+    for (const key of this.pages.keys()) if (key.startsWith(prefix)) this.pages.delete(key);
+  }
+}
 
 describe("vector query execution", () => {
+  it("spills stable ORDER BY runs under a budget and removes every temp page", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
+      id: index,
+      bucket: index % 11,
+    }));
+    const plan = compileQuery("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 137");
+    const prepared = createPreparedQuery(plan, new Map([["rows", rows]]), {
+      executionMemoryBudgetBytes: 150_000,
+    });
+    expect(() => prepared.execute()).toThrow(QueryMemoryBudgetError);
+    const spill = new TestSpillStore();
+    const result = await prepared.executeAsync({ spillStore: spill, spillPageRows: 64 });
+    expect(result).toEqual(executeRowQuery(plan, new Map([["rows", rows]])));
+    expect(spill.pages.size).toBe(0);
+    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(150_000);
+    prepared.close();
+  });
+
+  it("partitions high-cardinality hash aggregates and merges ordered result runs", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, id) => ({ id }));
+    const plan = compileQuery(
+      "SELECT id, COUNT(*) AS count FROM rows GROUP BY id ORDER BY id DESC LIMIT 101",
+    );
+    const prepared = createPreparedQuery(plan, new Map([["rows", rows]]), {
+      executionMemoryBudgetBytes: 100_000,
+    });
+    expect(() => prepared.execute()).toThrow(QueryMemoryBudgetError);
+    const spill = new TestSpillStore();
+    expect(await prepared.executeAsync({ spillStore: spill, spillPageRows: 64 })).toEqual(
+      executeRowQuery(plan, new Map([["rows", rows]])),
+    );
+    expect(spill.pages.size).toBe(0);
+    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(100_000);
+    prepared.close();
+  });
   it("accounts retained vectors, scan batches, results, and ordering at an exact budget", () => {
     const plan = compileQuery("SELECT id FROM rows ORDER BY id");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }]]]);

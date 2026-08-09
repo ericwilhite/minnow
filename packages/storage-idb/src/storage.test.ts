@@ -35,6 +35,39 @@ function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   ];
 }
 
+for (const implementation of stores()) {
+  it(`${implementation.name} isolates, clones, and removes temp run pages`, async () => {
+    const store = await implementation.create();
+    const bytes = Uint8Array.of(1, 2, 3);
+    await store.putTempRunPage({ ownerId: "query-a", runId: "run-1", pageIndex: 0, bytes });
+    await store.putTempRunPage({
+      ownerId: "query-a",
+      runId: "run-2",
+      pageIndex: 0,
+      bytes: Uint8Array.of(4),
+    });
+    await store.putTempRunPage({
+      ownerId: "query-b",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(5),
+    });
+    bytes[0] = 9;
+    const loaded = await store.getTempRunPage("query-a", "run-1", 0);
+    expect(loaded).toEqual(Uint8Array.of(1, 2, 3));
+    if (loaded !== undefined) loaded[1] = 9;
+    expect(await store.getTempRunPage("query-a", "run-1", 0)).toEqual(Uint8Array.of(1, 2, 3));
+
+    await store.removeTempRun("query-a", "run-1");
+    expect(await store.getTempRunPage("query-a", "run-1", 0)).toBeUndefined();
+    expect(await store.getTempRunPage("query-a", "run-2", 0)).toEqual(Uint8Array.of(4));
+    await store.removeTempOwner("query-a");
+    expect(await store.getTempRunPage("query-a", "run-2", 0)).toBeUndefined();
+    expect(await store.getTempRunPage("query-b", "run-1", 0)).toEqual(Uint8Array.of(5));
+    store.close();
+  });
+}
+
 function activeTransaction(id: string): TransactionRecord {
   const createdAt = "2026-01-01T00:00:00.000Z";
   return {

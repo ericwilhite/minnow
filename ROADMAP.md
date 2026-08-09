@@ -325,15 +325,20 @@ reserved before allocation. Dense unique integer joins keep their direct typed l
 hash collisions, typed keys, duplicate order, `-0`, SQL `NaN` behavior, exact budget failure, and
 row/vector parity.
 
+Phase 7D-A adds durable temp-run pages plus asynchronous external merge sort and partitioned hash
+aggregation. Budgeted `BrowserDatabase.query()` spills ungrouped ordered output (including joins) or
+single-table grouped ordered output, pairwise-merges fixed pages, applies LIMIT at the final read, and
+removes every owner/run page after success or failure. Synchronous prepared execution remains a
+no-I/O fast path; `executeAsync()` exposes the spill-capable path.
+
 Phase 7 remains open. Preparation still materializes every projected typed input column in full before
 the modeled reservations take effect, and mutation replay can temporarily retain a typed slot
 workspace plus its compacted output. Returned result objects, group-key and retained aggregate
-reference containers, property and JavaScript array-capacity overhead, encoding temporaries, caller-owned
-result lifetime, and allocator overhead are not counted; there is no spill path. Configured exhaustion
-fails instead of spilling, while the default remains effectively unbounded. Phase 7A/B/C-A also do not
-perform segment or row-group data skipping. Later Phase 7 work must stream inputs, replace the
-remaining boxed growing containers, and spill within a hard working-set budget; Phase 8 owns
-statistics-driven pruning and late materialization.
+reference containers, property and JavaScript array-capacity overhead, spill serialization/native
+IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Grouped joins,
+global aggregates, hash joins, and DISTINCT still have no spill path, while the default remains
+effectively unbounded. Later Phase 7 work must stream inputs, replace the remaining boxed growing
+containers, and cover those operator shapes within a hard working-set budget.
 
 The schema-less empty-table row-adapter compatibility path rejects configured budgets rather than
 silently escaping the model; catalog-backed `BrowserDatabase` empty tables stay on the typed path.
@@ -482,6 +487,7 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add Phase 7B-B logical group/result payload and ordering/limit workspace accounting.
 - [x] Replace nested grouping maps with a reserved byte-key arena and typed hash index.
 - [x] Replace hash-join maps and duplicate arrays with a reserved byte-key index and typed row chains.
+- [x] Add durable external sort and single-table partitioned hash-aggregate spill paths.
 - [x] Add numeric/datetime zone-map row-group pruning and predicate-first projected-block loading.
 - [ ] Replace remaining boxed containers, stream projected inputs, and spill under the query budget.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.

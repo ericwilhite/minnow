@@ -13,3 +13,4 @@ export {
   type QueryValue,
 } from "./query.js";
 export { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
+export type { AsyncQueryExecutionOptions, QuerySpillStore } from "./vector.js";

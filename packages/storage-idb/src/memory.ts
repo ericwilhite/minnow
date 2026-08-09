@@ -21,6 +21,7 @@ import {
   type SegmentRecord,
   SnapshotManifestMissingError,
   type TableRecord,
+  type TempRunPage,
   type TransactionRecord,
   TransactionRecordConflictError,
   type TransactionRecordUpdate,
@@ -44,6 +45,7 @@ export class MemoryBlockStore implements BlockStore {
   readonly #garbageCollectionJobs = new Map<string, GarbageCollectionJobRecord>();
   readonly #nextRowIds = new Map<string, bigint>();
   readonly #uniqueKeys = new Map<string, Set<string>>();
+  readonly #tempRunPages = new Map<string, Uint8Array>();
   #currentVersion: number | null = null;
   #commitQueue = Promise.resolve();
 
@@ -81,6 +83,37 @@ export class MemoryBlockStore implements BlockStore {
 
   async listBlockIds(): Promise<string[]> {
     return [...this.#blocks.keys()].sort();
+  }
+
+  async putTempRunPage(page: TempRunPage): Promise<void> {
+    validateTempRunPage(page);
+    this.#tempRunPages.set(
+      tempRunPageKey(page.ownerId, page.runId, page.pageIndex),
+      page.bytes.slice(),
+    );
+  }
+
+  async getTempRunPage(
+    ownerId: string,
+    runId: string,
+    pageIndex: number,
+  ): Promise<Uint8Array | undefined> {
+    validateTempRunPageIdentity(ownerId, runId, pageIndex);
+    return this.#tempRunPages.get(tempRunPageKey(ownerId, runId, pageIndex))?.slice();
+  }
+
+  async removeTempRun(ownerId: string, runId: string): Promise<void> {
+    validateTempRunPageIdentity(ownerId, runId, 0);
+    const prefix = tempRunPagePrefix(ownerId, runId);
+    for (const key of this.#tempRunPages.keys())
+      if (key.startsWith(prefix)) this.#tempRunPages.delete(key);
+  }
+
+  async removeTempOwner(ownerId: string): Promise<void> {
+    validateId(ownerId);
+    const prefix = `${String(ownerId.length)}:${ownerId}:`;
+    for (const key of this.#tempRunPages.keys())
+      if (key.startsWith(prefix)) this.#tempRunPages.delete(key);
   }
 
   async addTable(record: TableRecord): Promise<void> {
@@ -1105,6 +1138,27 @@ function validatePageLimit(limit: number): void {
   if (!Number.isSafeInteger(limit) || limit <= 0) {
     throw new RangeError("Storage page limit must be a positive whole number");
   }
+}
+
+function validateTempRunPage(page: TempRunPage): void {
+  validateTempRunPageIdentity(page.ownerId, page.runId, page.pageIndex);
+  if (!(page.bytes instanceof Uint8Array)) throw new TypeError("Temp run page bytes are invalid");
+}
+
+function validateTempRunPageIdentity(ownerId: string, runId: string, pageIndex: number): void {
+  validateId(ownerId);
+  validateId(runId);
+  if (!Number.isSafeInteger(pageIndex) || pageIndex < 0) {
+    throw new RangeError("Temp run page index must be a non-negative whole number");
+  }
+}
+
+function tempRunPageKey(ownerId: string, runId: string, pageIndex: number): string {
+  return `${String(ownerId.length)}:${ownerId}:${String(runId.length)}:${runId}:${String(pageIndex)}`;
+}
+
+function tempRunPagePrefix(ownerId: string, runId: string): string {
+  return `${String(ownerId.length)}:${ownerId}:${String(runId.length)}:${runId}:`;
 }
 
 function validateLeaseExpiration(expiresAt: string): void {

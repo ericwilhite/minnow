@@ -45,6 +45,7 @@ interface BrowserTransactionResult {
       historicalRows: number;
     };
     vectorQuery: {
+      spilledNames: string[];
       prepared: { count: number; total: number };
       historical: { count: number; total: number };
       current: { count: number; total: number };
@@ -147,6 +148,12 @@ window.runTransactionBrowserTest = async () => {
   const preparedPeople = await database.prepareQuery(aggregateSql);
   const prunedNames = (
     await database.query("SELECT name FROM people WHERE score >= 30 ORDER BY name")
+  ).rows.map((row) => String(row.name));
+  const spilledNames = (
+    await database.query("SELECT name FROM people ORDER BY name DESC", {
+      spillToStorage: true,
+      spillPageRows: 1,
+    })
   ).rows.map((row) => String(row.name));
   const upsert = await database.upsertBatch("people", {
     columns: { name: ["Grace", "Katherine"], score: [25, 40] },
@@ -304,6 +311,7 @@ window.runTransactionBrowserTest = async () => {
       },
       vectorQuery: {
         prunedNames,
+        spilledNames,
         prepared: preparedAggregate,
         historical: historicalAggregate,
         current: currentAggregate,

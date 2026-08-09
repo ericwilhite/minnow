@@ -460,21 +460,30 @@ chains without boxed arrays. Null and `NaN` keys are not indexed, `-0` shares th
 type tags prevent numeric/string aliasing. Dense declared-unique integer keys continue to use a direct
 typed lookup. Growth follows the same reserve-new, copy, release-old high-water contract as grouping.
 
+Phase 7D-A adds asynchronous durable spilling without changing synchronous prepared execution.
+`BrowserDatabase.query()` enables spill automatically when an execution budget is supplied. Ungrouped
+ordered plans, including joins, sort bounded result runs into `temp` pages and pairwise stable-merge
+them. Single-table grouped ordered plans hash source row indexes into 64 durable partitions, aggregate
+one partition at a time, then merge sorted group-result runs. LIMIT applies only at the final read.
+Memory and IndexedDB clone page bytes, and owner-scoped cleanup runs in `finally`.
+`PreparedQuery.executeAsync()` exposes the mechanism through a small spill-store interface.
+
 This slice still does not satisfy the bounded-memory target. Whole projected typed columns are
 materialized before vector accounting begins, and mutation replay can retain both a typed slot
 workspace and compacted output. The model excludes returned result objects, group-key and retained
 aggregate reference containers, property and JavaScript array-capacity overhead,
-encoding/accounting temporaries, caller-owned result lifetime, and
-browser allocator overhead. Exhaustion throws instead of spilling, and the public result remains
-materialized under the current API contract.
+encoding/accounting temporaries, spill serialization/native IndexedDB work, caller-owned result
+lifetime, and browser allocator overhead. Unsupported operator shapes still throw on exhaustion, and
+the public result remains materialized under the current API contract.
 
-The completed design gives every query and physical rewrite job a memory context. Operators reserve
-and release bytes, while sort, hash aggregate, hash join, and distinct spill to temporary storage when
-reservations fail. Physical compaction already advances by output block under a specialized
+The target design gives every query and physical rewrite job a memory context. Operators reserve and
+release bytes, while every cardinality-growing operator can eventually spill. Phase 7D-A currently
+covers external sort and single-table partitioned hash aggregation; grouped joins, global aggregates,
+hash join, and DISTINCT remain in-memory. Physical compaction already advances by output block under a specialized
 conservative executor-buffer model. Mutation merge planning applies a separate preflight safety
 estimate to its in-memory key and source-reference state, but does not spill or resume that state. The
-general query context now provides the narrower Phase 7B/C-A/C-B model above; byte-addressable result
-containers, complete physical accounting, and spilling remain future work. As described above,
+general query context provides the narrower model above; byte-addressable result containers,
+complete physical accounting, and remaining spill shapes are future work. As described above,
 query and compaction figures are modeled workflow bounds rather than measurements or hard limits on
 all browser heap.
 

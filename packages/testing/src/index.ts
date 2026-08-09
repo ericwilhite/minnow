@@ -14,6 +14,7 @@ import type {
   RunGarbageCollectionStepInput,
   SegmentRecord,
   TableRecord,
+  TempRunPage,
   TransactionRecord,
   TransactionRecordUpdate,
 } from "@browserdatabase/storage-idb";
@@ -252,6 +253,26 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   removeGarbageCollectionJob(id: string): Promise<void> {
     return this.inner.removeGarbageCollectionJob(id);
+  }
+
+  putTempRunPage(page: TempRunPage): Promise<void> {
+    return this.inner.putTempRunPage(page);
+  }
+
+  getTempRunPage(
+    ownerId: string,
+    runId: string,
+    pageIndex: number,
+  ): Promise<Uint8Array | undefined> {
+    return this.inner.getTempRunPage(ownerId, runId, pageIndex);
+  }
+
+  removeTempRun(ownerId: string, runId: string): Promise<void> {
+    return this.inner.removeTempRun(ownerId, runId);
+  }
+
+  removeTempOwner(ownerId: string): Promise<void> {
+    return this.inner.removeTempOwner(ownerId);
   }
 
   close(): void {

@@ -510,6 +510,13 @@ export interface BlockWrite {
   bytes: Uint8Array;
 }
 
+export interface TempRunPage {
+  ownerId: string;
+  runId: string;
+  pageIndex: number;
+  bytes: Uint8Array;
+}
+
 export interface BlockStore {
   addBlock(id: string, bytes: Uint8Array): Promise<void>;
   addBlocks(blocks: readonly BlockWrite[]): Promise<void>;
@@ -585,6 +592,14 @@ export interface BlockStore {
     input: RunGarbageCollectionStepInput,
   ): Promise<GarbageCollectionStepResult>;
   removeGarbageCollectionJob(id: string): Promise<void>;
+  putTempRunPage(page: TempRunPage): Promise<void>;
+  getTempRunPage(
+    ownerId: string,
+    runId: string,
+    pageIndex: number,
+  ): Promise<Uint8Array | undefined>;
+  removeTempRun(ownerId: string, runId: string): Promise<void>;
+  removeTempOwner(ownerId: string): Promise<void>;
   close(): void;
 }
 

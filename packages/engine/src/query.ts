@@ -4,6 +4,7 @@ import {
   columnarTableFromRows,
   prepareVectorQuery,
   type ColumnarTable,
+  type AsyncQueryExecutionOptions,
   type PreparedVectorQuery,
 } from "./vector.js";
 
@@ -24,6 +25,7 @@ export interface PreparedQuery {
    */
   readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
+  executeAsync(options?: AsyncQueryExecutionOptions): Promise<QueryResult>;
   close(): void;
 }
 
@@ -200,6 +202,10 @@ export function createPreparedColumnarQuery(
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
       return prepared.execute();
     },
+    async executeAsync(options) {
+      if (closed || prepared === undefined) throw new Error("Prepared query is closed");
+      return prepared.executeAsync(options);
+    },
     close() {
       if (closed) return;
       closed = true;
@@ -224,6 +230,10 @@ function createPreparedRowQuery(
       return memory.usage;
     },
     execute() {
+      if (closed || rows === undefined) throw new Error("Prepared query is closed");
+      return executeRowQuery(plan, cloneRowTables(rows));
+    },
+    async executeAsync() {
       if (closed || rows === undefined) throw new Error("Prepared query is closed");
       return executeRowQuery(plan, cloneRowTables(rows));
     },

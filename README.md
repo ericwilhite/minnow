@@ -191,15 +191,23 @@ Probe traversal preserves build-row order, canonicalizes `-0`, keeps numeric and
 distinct, and follows SQL null and `NaN` equality semantics. Dense unique integer keys retain their
 direct typed lookup fast path.
 
+Phase 7D-A adds durable query spill pages in the existing `temp` store. With an explicit execution
+budget, `BrowserDatabase.query()` automatically uses asynchronous external merge sort for ungrouped
+`ORDER BY` plans, including joined output, and 64-way partitioned hash aggregation for single-table
+`GROUP BY ... ORDER BY` plans. Sorted pages merge pairwise with left-run tie stability; LIMIT applies
+only while reading the final run. Temp pages are removed after success or failure.
+`PreparedQuery.execute()` remains the synchronous no-I/O path; `executeAsync()` accepts a spill store
+for callers that want the operator path directly.
+
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected typed input in full before the vector reservation is installed;
 mutation replay can temporarily retain both its typed slot workspace and compacted output. The model
 does not include returned result objects, properties, group-key and retained `MIN`/`MAX` reference
-containers, or JavaScript array-capacity overhead;
-encoding/accounting temporaries; the lifetime of returned rows after ownership transfers to the
-caller; or engine/browser allocator overhead. Configured exhaustion fails the query instead of
-spilling. Phase 7 remains open for streaming inputs, byte-addressable aggregate/result containers,
-complete physical accounting, and spill.
+containers, JavaScript array-capacity overhead, spill serialization/native IndexedDB work, returned
+row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—global aggregates,
+grouped joins, hash joins, and DISTINCT—still fail on budget exhaustion. Phase 7 remains open for
+streaming inputs, byte-addressable aggregate/result containers, complete physical accounting, and
+those remaining spill paths.
 
 Phase 8A adds conservative row-group skipping for a single append/base table with `AND`-combined
 number or datetime column-to-literal comparisons. Preparation checksum-validates and physically

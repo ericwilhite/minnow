@@ -48,6 +48,7 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
           };
           vectorQuery: {
             prunedNames: string[];
+            spilledNames: string[];
             prepared: { count: number; total: number };
             historical: { count: number; total: number };
             current: { count: number; total: number };
@@ -120,6 +121,7 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
       },
       vectorQuery: {
         prunedNames: ["Linus"],
+        spilledNames: ["Linus", "Grace", "Ada"],
         prepared: { count: 3, total: 60 },
         historical: { count: 3, total: 60 },
         current: { count: 3, total: 96 },

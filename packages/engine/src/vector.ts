@@ -69,7 +69,20 @@ export interface ColumnarTable {
 export interface PreparedVectorQuery {
   readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
+  executeAsync(options?: AsyncQueryExecutionOptions): Promise<QueryResult>;
   close(): void;
+}
+
+export interface QuerySpillStore {
+  putPage(ownerId: string, runId: string, pageIndex: number, bytes: Uint8Array): Promise<void>;
+  getPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;
+  removeRun(ownerId: string, runId: string): Promise<void>;
+  removeOwner(ownerId: string): Promise<void>;
+}
+
+export interface AsyncQueryExecutionOptions {
+  readonly spillStore?: QuerySpillStore;
+  readonly spillPageRows?: number;
 }
 
 export interface PrepareVectorQueryOptions {
@@ -230,6 +243,26 @@ export function prepareVectorQuery(
         const executionMemory = retainedMemory.createChild();
         try {
           return executeBoundPlan(bound, executionMemory);
+        } finally {
+          executionMemory.close();
+        }
+      },
+      async executeAsync(executionOptions = {}) {
+        if (closed) throw new Error("Prepared vector query is closed");
+        const canSpillSort = bound.orderBy.length > 0 && !bound.grouped;
+        const canSpillHash =
+          bound.orderBy.length > 0 &&
+          bound.grouped &&
+          bound.groupBy.length > 0 &&
+          bound.joins.length === 0;
+        if (executionOptions.spillStore === undefined || (!canSpillSort && !canSpillHash)) {
+          return this.execute();
+        }
+        const executionMemory = retainedMemory.createChild();
+        try {
+          return canSpillHash
+            ? await executeBoundPlanWithHashSpill(bound, executionMemory, executionOptions)
+            : await executeBoundPlanWithSortSpill(bound, executionMemory, executionOptions);
         } finally {
           executionMemory.close();
         }
@@ -664,6 +697,537 @@ function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryRes
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output;
   return finishResult(plan, rows, memory);
+}
+
+interface SpillRun {
+  readonly id: string;
+  readonly pageCount: number;
+}
+
+function createSpillOwnerId(): string {
+  return `query-${globalThis.crypto.randomUUID()}`;
+}
+
+async function executeBoundPlanWithSortSpill(
+  plan: BoundPlan,
+  memory: QueryMemoryContext,
+  options: AsyncQueryExecutionOptions,
+): Promise<QueryResult> {
+  const store = required(options.spillStore, "Query spill store is missing");
+  const pageRows = options.spillPageRows ?? DEFAULT_BATCH_ROWS;
+  if (!Number.isSafeInteger(pageRows) || pageRows <= 0) {
+    throw new RangeError("Query spill page rows must be a positive whole number");
+  }
+  const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
+  const ownerId = createSpillOwnerId();
+  const runs: SpillRun[] = [];
+  let runSequence = 0;
+  try {
+    const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
+    const scanBatchRows = Math.min(DEFAULT_BATCH_ROWS, pageRows);
+    for (let start = 0; start < scanRows; start += scanBatchRows) {
+      const length = Math.min(scanBatchRows, scanRows - start);
+      const batchMemory = memory.createChild();
+      try {
+        batchMemory.reserve(
+          safeMemoryProduct(
+            safeMemoryProduct(plan.sourceTables.length, length, "Scan batch row-index count"),
+            Int32Array.BYTES_PER_ELEMENT,
+            "Scan batch row indexes",
+          ),
+          "Scan batch row indexes",
+        );
+        const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
+        const scan = sourceRows[plan.scanSource];
+        if (scan === undefined) continue;
+        for (let index = 0; index < length; index += 1) scan[index] = start + index;
+        await spillJoinedBatches(
+          plan,
+          { length, rowsBySource: sourceRows, memory: batchMemory },
+          0,
+          memory,
+          async (batch) => {
+            const outputMemory = memory.createChild();
+            try {
+              const rows: QueryRow[] = [];
+              projectFilteredBatch(plan, batch, rows, outputMemory);
+              if (rows.length === 0) return;
+              const ordering = outputMemory.reserve(
+                safeMemoryProduct(
+                  rows.length,
+                  Uint32Array.BYTES_PER_ELEMENT * 2 + Uint8Array.BYTES_PER_ELEMENT,
+                  "Spill ordering typed scratch",
+                ),
+                "Spill ordering typed scratch",
+              );
+              try {
+                stableSortRows(rows, plan.orderBy);
+              } finally {
+                ordering.release();
+              }
+              const runId = `run-${String(runSequence++)}`;
+              await store.putPage(ownerId, runId, 0, encodeSpillRows(columns, rows));
+              runs.push({ id: runId, pageCount: 1 });
+            } finally {
+              outputMemory.close();
+            }
+          },
+        );
+      } finally {
+        batchMemory.close();
+      }
+    }
+
+    if (runs.length === 0) return { columns, rows: [] };
+    let active = runs;
+    while (active.length > 1) {
+      const merged: SpillRun[] = [];
+      for (let index = 0; index < active.length; index += 2) {
+        const left = required(active[index], "Left spill run is missing");
+        const right = active[index + 1];
+        if (right === undefined) {
+          merged.push(left);
+          continue;
+        }
+        const outputId = `merge-${String(runSequence++)}`;
+        merged.push(
+          await mergeSpillRuns(
+            store,
+            ownerId,
+            left,
+            right,
+            outputId,
+            columns,
+            plan.orderBy,
+            pageRows,
+            memory,
+          ),
+        );
+        await store.removeRun(ownerId, left.id);
+        await store.removeRun(ownerId, right.id);
+      }
+      active = merged;
+    }
+    const finalRun = required(active[0], "Final spill run is missing");
+    const rows: QueryRow[] = [];
+    const limit = plan.limit ?? Number.MAX_SAFE_INTEGER;
+    for (let pageIndex = 0; pageIndex < finalRun.pageCount && rows.length < limit; pageIndex += 1) {
+      const bytes = await store.getPage(ownerId, finalRun.id, pageIndex);
+      if (bytes === undefined) throw new Error("Query spill page is missing");
+      for (const row of decodeSpillRows(columns, bytes)) {
+        if (rows.length === limit) break;
+        rows.push(row);
+      }
+    }
+    return { columns, rows };
+  } finally {
+    await store.removeOwner(ownerId);
+  }
+}
+
+async function executeBoundPlanWithHashSpill(
+  plan: BoundPlan,
+  memory: QueryMemoryContext,
+  options: AsyncQueryExecutionOptions,
+): Promise<QueryResult> {
+  const store = required(options.spillStore, "Query spill store is missing");
+  const pageRows = options.spillPageRows ?? DEFAULT_BATCH_ROWS;
+  if (!Number.isSafeInteger(pageRows) || pageRows <= 0) {
+    throw new RangeError("Query spill page rows must be a positive whole number");
+  }
+  const partitionCount = 64;
+  const columns = plan.select.map((item) => item.alias);
+  const ownerId = createSpillOwnerId();
+  const partitionPages = new Uint32Array(partitionCount);
+  let runSequence = 0;
+  try {
+    const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
+    if (scanRows > 0xffffffff) throw new RangeError("Hash spill row indexes exceed uint32");
+    for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
+      const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
+      const scanRowsBySource = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
+      const scan = scanRowsBySource[plan.scanSource];
+      if (scan === undefined) continue;
+      for (let index = 0; index < length; index += 1) scan[index] = start + index;
+      const batch: BatchRows = { length, rowsBySource: scanRowsBySource };
+      const partitionRows = new Map<number, number[]>();
+      for (let row = 0; row < length; row += 1) {
+        if (
+          !plan.predicates.every((predicate) => evaluateBatchPredicate(plan, predicate, batch, row))
+        ) {
+          continue;
+        }
+        const values = plan.groupBy.map((expression) =>
+          asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
+        );
+        const partition = hashQueryValues(values) & (partitionCount - 1);
+        const indexes = partitionRows.get(partition) ?? [];
+        indexes.push(start + row);
+        partitionRows.set(partition, indexes);
+      }
+      for (const [partition, indexes] of partitionRows) {
+        const pageIndex = partitionPages[partition] ?? 0;
+        await store.putPage(
+          ownerId,
+          `partition-${String(partition)}`,
+          pageIndex,
+          encodeRowIndexes(indexes),
+        );
+        partitionPages[partition] = pageIndex + 1;
+      }
+    }
+
+    const runs: SpillRun[] = [];
+    for (let partition = 0; partition < partitionCount; partition += 1) {
+      const sourcePageCount = partitionPages[partition] ?? 0;
+      if (sourcePageCount === 0) continue;
+      const partitionMemory = memory.createChild();
+      try {
+        const groups = new ByteGroupIndex<GroupState>(partitionMemory);
+        for (let pageIndex = 0; pageIndex < sourcePageCount; pageIndex += 1) {
+          const bytes = await store.getPage(ownerId, `partition-${String(partition)}`, pageIndex);
+          if (bytes === undefined) throw new Error("Query hash spill page is missing");
+          const rowIndexes = decodeRowIndexes(bytes);
+          const pageMemory = partitionMemory.createChild();
+          try {
+            pageMemory.reserve(rowIndexes.byteLength, "Hash spill row indexes");
+            const rowsBySource: Int32Array[] = plan.sourceTables.map(() =>
+              new Int32Array(rowIndexes.length).fill(-1),
+            );
+            rowsBySource[plan.scanSource] = rowIndexes;
+            consumeBatch(
+              plan,
+              { length: rowIndexes.length, rowsBySource },
+              groups,
+              [],
+              partitionMemory,
+            );
+          } finally {
+            pageMemory.close();
+          }
+        }
+        const rows = finishGroups(plan, groups.values(), partitionMemory);
+        const ordering = partitionMemory.reserve(
+          safeMemoryProduct(
+            rows.length,
+            Uint32Array.BYTES_PER_ELEMENT * 2 + Uint8Array.BYTES_PER_ELEMENT,
+            "Hash spill ordering typed scratch",
+          ),
+          "Hash spill ordering typed scratch",
+        );
+        try {
+          stableSortRows(rows, plan.orderBy);
+        } finally {
+          ordering.release();
+        }
+        const runId = `group-${String(runSequence++)}`;
+        let outputPage = 0;
+        for (let start = 0; start < rows.length; start += pageRows) {
+          await store.putPage(
+            ownerId,
+            runId,
+            outputPage,
+            encodeSpillRows(columns, rows.slice(start, start + pageRows)),
+          );
+          outputPage += 1;
+        }
+        runs.push({ id: runId, pageCount: outputPage });
+      } finally {
+        partitionMemory.close();
+        await store.removeRun(ownerId, `partition-${String(partition)}`);
+      }
+    }
+
+    if (runs.length === 0) return { columns, rows: [] };
+    const finalRun = await mergeAllSpillRuns(
+      store,
+      ownerId,
+      runs,
+      columns,
+      plan.orderBy,
+      pageRows,
+      () => `merge-${String(runSequence++)}`,
+      memory,
+    );
+    return await readFinalSpillRun(store, ownerId, finalRun, columns, plan.limit);
+  } finally {
+    await store.removeOwner(ownerId);
+  }
+}
+
+async function mergeAllSpillRuns(
+  store: QuerySpillStore,
+  ownerId: string,
+  runs: readonly SpillRun[],
+  columns: readonly string[],
+  orderBy: BoundPlan["orderBy"],
+  pageRows: number,
+  nextRunId: () => string,
+  memory: QueryMemoryContext,
+): Promise<SpillRun> {
+  let active = [...runs];
+  while (active.length > 1) {
+    const merged: SpillRun[] = [];
+    for (let index = 0; index < active.length; index += 2) {
+      const left = required(active[index], "Left spill run is missing");
+      const right = active[index + 1];
+      if (right === undefined) {
+        merged.push(left);
+        continue;
+      }
+      const outputId = nextRunId();
+      merged.push(
+        await mergeSpillRuns(
+          store,
+          ownerId,
+          left,
+          right,
+          outputId,
+          columns,
+          orderBy,
+          pageRows,
+          memory,
+        ),
+      );
+      await store.removeRun(ownerId, left.id);
+      await store.removeRun(ownerId, right.id);
+    }
+    active = merged;
+  }
+  return required(active[0], "Final spill run is missing");
+}
+
+async function readFinalSpillRun(
+  store: QuerySpillStore,
+  ownerId: string,
+  run: SpillRun,
+  columns: readonly string[],
+  requestedLimit?: number,
+): Promise<QueryResult> {
+  const rows: QueryRow[] = [];
+  const limit = requestedLimit ?? Number.MAX_SAFE_INTEGER;
+  for (let pageIndex = 0; pageIndex < run.pageCount && rows.length < limit; pageIndex += 1) {
+    const bytes = await store.getPage(ownerId, run.id, pageIndex);
+    if (bytes === undefined) {
+      throw new Error(`Query spill page is missing: ${run.id}/${String(pageIndex)}`);
+    }
+    for (const row of decodeSpillRows(columns, bytes)) {
+      if (rows.length === limit) break;
+      rows.push(row);
+    }
+  }
+  return { columns: [...columns], rows };
+}
+
+function hashQueryValues(values: readonly QueryValue[]): number {
+  let hash = 0x811c9dc5;
+  for (const value of values) {
+    const bytes = vectorTextEncoder.encode(JSON.stringify(encodeSpillValue(value)));
+    for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+    hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+function encodeRowIndexes(indexes: readonly number[]): Uint8Array {
+  const bytes = new Uint8Array(indexes.length * Uint32Array.BYTES_PER_ELEMENT);
+  const view = new DataView(bytes.buffer);
+  indexes.forEach((row, index) => view.setUint32(index * 4, row, true));
+  return bytes;
+}
+
+function decodeRowIndexes(bytes: Uint8Array): Int32Array {
+  if (bytes.byteLength % Uint32Array.BYTES_PER_ELEMENT !== 0) {
+    throw new Error("Query hash spill indexes are invalid");
+  }
+  const rows = new Int32Array(bytes.byteLength / Uint32Array.BYTES_PER_ELEMENT);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let index = 0; index < rows.length; index += 1)
+    rows[index] = view.getUint32(index * 4, true);
+  return rows;
+}
+
+async function spillJoinedBatches(
+  plan: BoundPlan,
+  batch: BatchRows,
+  joinIndex: number,
+  memory: QueryMemoryContext,
+  consume: (batch: BatchRows) => Promise<void>,
+): Promise<void> {
+  const join = plan.joins[joinIndex];
+  if (join === undefined) {
+    await consume(batch);
+    return;
+  }
+  for (const joined of joinBatches(plan, batch, join, memory)) {
+    try {
+      await spillJoinedBatches(plan, joined, joinIndex + 1, memory, consume);
+    } finally {
+      joined.memory?.close();
+    }
+  }
+}
+
+function projectFilteredBatch(
+  plan: BoundPlan,
+  batch: BatchRows,
+  output: QueryRow[],
+  memory: QueryMemoryContext,
+): void {
+  for (let row = 0; row < batch.length; row += 1) {
+    if (
+      !plan.predicates.every((predicate) => evaluateBatchPredicate(plan, predicate, batch, row))
+    ) {
+      continue;
+    }
+    const resultRow = projectBatchRow(plan, batch, row);
+    memory.reserve(queryRowPayloadBytes(resultRow), "Spill result row");
+    output.push(resultRow);
+  }
+}
+
+async function mergeSpillRuns(
+  store: QuerySpillStore,
+  ownerId: string,
+  left: SpillRun,
+  right: SpillRun,
+  outputId: string,
+  columns: readonly string[],
+  orderBy: BoundPlan["orderBy"],
+  pageRows: number,
+  memory: QueryMemoryContext,
+): Promise<SpillRun> {
+  const mergeMemory = memory.createChild();
+  const leftReader = createSpillRunReader(store, ownerId, left, columns, mergeMemory);
+  const rightReader = createSpillRunReader(store, ownerId, right, columns, mergeMemory);
+  let outputPage: QueryRow[] = [];
+  let outputMemory = mergeMemory.createChild();
+  let pageIndex = 0;
+  const flush = async () => {
+    if (outputPage.length === 0) return;
+    await store.putPage(ownerId, outputId, pageIndex, encodeSpillRows(columns, outputPage));
+    outputPage = [];
+    outputMemory.close();
+    outputMemory = mergeMemory.createChild();
+    pageIndex += 1;
+  };
+  try {
+    let leftRow = await leftReader.next();
+    let rightRow = await rightReader.next();
+    while (leftRow !== undefined || rightRow !== undefined) {
+      if (
+        rightRow === undefined ||
+        (leftRow !== undefined && compareOrderedRows(leftRow, rightRow, orderBy) <= 0)
+      ) {
+        const row = required(leftRow, "Left spill row is missing");
+        outputMemory.reserve(queryRowPayloadBytes(row), "Spill merge output row");
+        outputPage.push(row);
+        leftRow = await leftReader.next();
+      } else {
+        outputMemory.reserve(queryRowPayloadBytes(rightRow), "Spill merge output row");
+        outputPage.push(rightRow);
+        rightRow = await rightReader.next();
+      }
+      if (outputPage.length === pageRows) await flush();
+    }
+    await flush();
+    return { id: outputId, pageCount: pageIndex };
+  } finally {
+    outputMemory.close();
+    leftReader.close();
+    rightReader.close();
+    mergeMemory.close();
+  }
+}
+
+function createSpillRunReader(
+  store: QuerySpillStore,
+  ownerId: string,
+  run: SpillRun,
+  columns: readonly string[],
+  memory: QueryMemoryContext,
+): { next(): Promise<QueryRow | undefined>; close(): void } {
+  let pageIndex = 0;
+  let rows: QueryRow[] = [];
+  let rowIndex = 0;
+  let pageReservation: QueryMemoryReservation | undefined;
+  return {
+    async next() {
+      while (rowIndex >= rows.length) {
+        if (pageIndex >= run.pageCount) return undefined;
+        const bytes = await store.getPage(ownerId, run.id, pageIndex);
+        if (bytes === undefined) throw new Error("Query spill page is missing");
+        pageReservation?.release();
+        rows = decodeSpillRows(columns, bytes);
+        pageReservation = memory.reserve(
+          rows.reduce(
+            (total, row) => safeMemorySum(total, queryRowPayloadBytes(row), "Spill input page"),
+            0,
+          ),
+          "Spill input page",
+        );
+        rowIndex = 0;
+        pageIndex += 1;
+      }
+      const row = rows[rowIndex];
+      rowIndex += 1;
+      return row;
+    },
+    close() {
+      pageReservation?.release();
+      pageReservation = undefined;
+      rows = [];
+    },
+  };
+}
+
+function compareOrderedRows(
+  left: QueryRow,
+  right: QueryRow,
+  orderBy: BoundPlan["orderBy"],
+): number {
+  for (const order of orderBy) {
+    const comparison = compareValues(left[order.outputName], right[order.outputName]);
+    if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
+  }
+  return 0;
+}
+
+function encodeSpillRows(columns: readonly string[], rows: readonly QueryRow[]): Uint8Array {
+  const encoded = rows.map((row) => columns.map((column) => encodeSpillValue(row[column] ?? null)));
+  return vectorTextEncoder.encode(JSON.stringify(encoded));
+}
+
+function decodeSpillRows(columns: readonly string[], bytes: Uint8Array): QueryRow[] {
+  const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  if (!Array.isArray(value)) throw new Error("Query spill page is invalid");
+  return value.map((encodedRow) => {
+    if (!Array.isArray(encodedRow) || encodedRow.length !== columns.length) {
+      throw new Error("Query spill row is invalid");
+    }
+    return Object.fromEntries(
+      columns.map((column, index) => [column, decodeSpillValue(encodedRow[index])]),
+    );
+  });
+}
+
+function encodeSpillValue(value: QueryValue): readonly unknown[] {
+  if (value === null) return [0];
+  if (typeof value === "boolean") return [1, value];
+  if (typeof value === "number") return [2, String(value)];
+  if (typeof value === "string") return [3, value];
+  return [4, value.getTime()];
+}
+
+function decodeSpillValue(value: unknown): QueryValue {
+  if (!Array.isArray(value)) throw new Error("Query spill value is invalid");
+  const tag: unknown = value[0];
+  if (tag === 0) return null;
+  if (tag === 1 && typeof value[1] === "boolean") return value[1];
+  if (tag === 2 && typeof value[1] === "string") return Number(value[1]);
+  if (tag === 3 && typeof value[1] === "string") return value[1];
+  if (tag === 4 && typeof value[1] === "number") return new Date(value[1]);
+  throw new Error("Query spill value is invalid");
 }
 
 function executeMetadataCount(

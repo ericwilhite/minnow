@@ -63,7 +63,7 @@ import {
   type PreparedQuery,
   type QueryResult,
 } from "./query.js";
-import { QueryMemoryContext } from "./memory.js";
+import { QueryMemoryBudgetError, QueryMemoryContext } from "./memory.js";
 import { type ColumnarTable, type ColumnVector } from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
@@ -208,6 +208,10 @@ export interface QueryOptions {
    * allocator overhead are not included in this Phase 7B-B model.
    */
   readonly executionMemoryBudgetBytes?: number;
+  /** Forces durable temp pages; with an explicit budget, spill otherwise retries only after exhaustion. */
+  readonly spillToStorage?: boolean;
+  /** Maximum rows encoded in each merged spill page. */
+  readonly spillPageRows?: number;
 }
 
 export interface DeleteBatchInput {
@@ -1105,7 +1109,26 @@ export class BrowserDatabase {
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
     const prepared = await this.prepareQuery(sql, options);
     try {
-      return prepared.execute();
+      const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
+      if (!spill) return prepared.execute();
+      if (options.spillToStorage !== true) {
+        try {
+          return prepared.execute();
+        } catch (error) {
+          if (!(error instanceof QueryMemoryBudgetError)) throw error;
+        }
+      }
+      return await prepared.executeAsync({
+        ...(options.spillPageRows === undefined ? {} : { spillPageRows: options.spillPageRows }),
+        spillStore: {
+          putPage: (ownerId, runId, pageIndex, bytes) =>
+            this.store.putTempRunPage({ ownerId, runId, pageIndex, bytes }),
+          getPage: (ownerId, runId, pageIndex) =>
+            this.store.getTempRunPage(ownerId, runId, pageIndex),
+          removeRun: (ownerId, runId) => this.store.removeTempRun(ownerId, runId),
+          removeOwner: (ownerId) => this.store.removeTempOwner(ownerId),
+        },
+      });
     } finally {
       prepared.close();
     }

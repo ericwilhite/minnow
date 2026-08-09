@@ -22,6 +22,7 @@ import {
   type SegmentRecord,
   SnapshotManifestMissingError,
   type TableRecord,
+  type TempRunPage,
   type TransactionRecord,
   TransactionRecordConflictError,
   type TransactionRecordUpdate,
@@ -134,6 +135,47 @@ export class IndexedDbBlockStore implements BlockStore {
     const keys = await requestResult(transaction.objectStore("blocks").getAllKeys());
     await transactionDone(transaction);
     return keys.map(String).sort();
+  }
+
+  async putTempRunPage(page: TempRunPage): Promise<void> {
+    validateTempRunPage(page);
+    const transaction = this.#transaction("temp", "readwrite");
+    transaction.objectStore("temp").put(page.bytes.slice(), tempRunPageKey(page));
+    await transactionDone(transaction);
+  }
+
+  async getTempRunPage(
+    ownerId: string,
+    runId: string,
+    pageIndex: number,
+  ): Promise<Uint8Array | undefined> {
+    validateTempRunPageIdentity(ownerId, runId, pageIndex);
+    const transaction = this.#transaction("temp", "readonly");
+    const value: unknown = await requestResult(
+      transaction.objectStore("temp").get(["run", ownerId, runId, pageIndex]),
+    );
+    await transactionDone(transaction);
+    return value === undefined ? undefined : asBytes(value).slice();
+  }
+
+  async removeTempRun(ownerId: string, runId: string): Promise<void> {
+    validateTempRunPageIdentity(ownerId, runId, 0);
+    const transaction = this.#transaction("temp", "readwrite");
+    const store = transaction.objectStore("temp");
+    await visitObjectStoreSequentially(store, (_value, key) => {
+      if (isTempRunPageKey(key, ownerId, runId)) store.delete(key);
+    });
+    await transactionDone(transaction);
+  }
+
+  async removeTempOwner(ownerId: string): Promise<void> {
+    validateTempId(ownerId, "Temp run owner ID");
+    const transaction = this.#transaction("temp", "readwrite");
+    const store = transaction.objectStore("temp");
+    await visitObjectStoreSequentially(store, (_value, key) => {
+      if (isTempRunPageKey(key, ownerId)) store.delete(key);
+    });
+    await transactionDone(transaction);
   }
 
   async addTable(record: TableRecord): Promise<void> {
@@ -1690,6 +1732,36 @@ function validateCount(count: number): void {
   if (!Number.isSafeInteger(count) || count <= 0) {
     throw new RangeError("Row ID reservation count must be a positive whole number");
   }
+}
+
+function validateTempRunPage(page: TempRunPage): void {
+  validateTempRunPageIdentity(page.ownerId, page.runId, page.pageIndex);
+  if (!(page.bytes instanceof Uint8Array)) throw new TypeError("Temp run page bytes are invalid");
+}
+
+function validateTempRunPageIdentity(ownerId: string, runId: string, pageIndex: number): void {
+  validateTempId(ownerId, "Temp run owner ID");
+  validateTempId(runId, "Temp run ID");
+  if (!Number.isSafeInteger(pageIndex) || pageIndex < 0) {
+    throw new RangeError("Temp run page index must be a non-negative whole number");
+  }
+}
+
+function validateTempId(id: string, label: string): void {
+  if (id.length === 0) throw new TypeError(`${label} cannot be empty`);
+}
+
+function tempRunPageKey(page: TempRunPage): IDBValidKey {
+  return ["run", page.ownerId, page.runId, page.pageIndex];
+}
+
+function isTempRunPageKey(key: IDBValidKey, ownerId: string, runId?: string): boolean {
+  return (
+    Array.isArray(key) &&
+    key[0] === "run" &&
+    key[1] === ownerId &&
+    (runId === undefined || key[2] === runId)
+  );
 }
 
 function uniqueKeyKey(tableId: string, keyToken: string): IDBValidKey {

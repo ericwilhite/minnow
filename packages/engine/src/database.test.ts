@@ -4864,6 +4864,49 @@ it("shares one visibility catalog across multi-table query preparation", async (
 });
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} executes durable ORDER BY spill through the public query API`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 256, compression: "raw" });
+    await database.createTable({
+      name: "spill_rows",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "bucket", type: "number" },
+      ],
+    });
+    const rowCount = 5_000;
+    await database.insertBatch("spill_rows", {
+      columns: {
+        id: Array.from({ length: rowCount }, (_, index) => index),
+        bucket: Array.from({ length: rowCount }, (_, index) => index % 11),
+      },
+    });
+
+    const result = await database.query(
+      "SELECT id, bucket FROM spill_rows ORDER BY bucket, id DESC LIMIT 137",
+      { executionMemoryBudgetBytes: 150_000, spillPageRows: 64 },
+    );
+    expect(result.rows).toHaveLength(137);
+    expect(result.rows.slice(0, 3)).toEqual([
+      { id: 4994, bucket: 0 },
+      { id: 4983, bucket: 0 },
+      { id: 4972, bucket: 0 },
+    ]);
+    expect(result.rows[136]).toEqual({ id: 3498, bucket: 0 });
+    const grouped = await database.query(
+      "SELECT id, COUNT(*) AS count FROM spill_rows GROUP BY id ORDER BY id DESC LIMIT 101",
+      { executionMemoryBudgetBytes: 150_000, spillPageRows: 64 },
+    );
+    expect(grouped.rows).toHaveLength(101);
+    expect(grouped.rows.slice(0, 2)).toEqual([
+      { id: 4999, count: 1 },
+      { id: 4998, count: 1 },
+    ]);
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
   it(`${implementation.name} reclaims cancelled compaction output without changing current rows`, async () => {
     const store = await implementation.create();
     const database = new BrowserDatabase(store);
