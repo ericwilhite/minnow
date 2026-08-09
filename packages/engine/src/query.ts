@@ -94,8 +94,6 @@ const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MA
 export function compileQuery(sql: string): CompiledQuery {
   const normalized = sql.trim().replace(/;$/, "").trim();
   if (normalized.length === 0) throw new TypeError("Enter a SELECT query");
-  if (normalized.includes(";")) throw new TypeError("Run one SELECT statement at a time");
-  if (/--|\/\*/.test(normalized)) throw new TypeError("SQL comments are not supported");
   const parser = new Parser(tokenize(normalized));
   return parser.parse(normalized);
 }
@@ -371,7 +369,7 @@ function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]
   const index = new Map<unknown, DatabaseRow[]>();
   for (const row of rows) {
     const key = comparable(evaluate(rightExpression, { [join.alias]: row }));
-    if (key === null || key === undefined) continue;
+    if (!isSqlJoinKey(key)) continue;
     const matches = index.get(key) ?? [];
     matches.push(row);
     index.set(key, matches);
@@ -379,12 +377,18 @@ function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]
   const joined: RowContext[] = [];
   for (const context of contexts) {
     const leftKey = comparable(evaluate(leftExpression, context));
-    const matches = leftKey === null || leftKey === undefined ? [] : (index.get(leftKey) ?? []);
+    const matches = isSqlJoinKey(leftKey) ? (index.get(leftKey) ?? []) : [];
     if (matches.length === 0 && join.kind === "left")
       joined.push({ ...context, [join.alias]: undefined });
     else for (const row of matches) joined.push({ ...context, [join.alias]: row });
   }
   return joined;
+}
+
+function isSqlJoinKey(value: unknown): boolean {
+  return (
+    value !== null && value !== undefined && !(typeof value === "number" && Number.isNaN(value))
+  );
 }
 
 function project(
@@ -883,6 +887,10 @@ function tokenize(sql: string): Token[] {
       continue;
     }
     const pair = sql.slice(index, index + 2);
+    if (pair === "--" || pair === "/*") {
+      throw new TypeError("SQL comments are not supported");
+    }
+    if (character === ";") throw new TypeError("Run one SELECT statement at a time");
     if ([">=", "<=", "!=", "<>"].includes(pair)) {
       tokens.push({ kind: "operator", text: pair });
       index += 2;

@@ -221,6 +221,20 @@ describe("public SQL queries", () => {
     ).rejects.toThrow("Table aliases must be unique");
   });
 
+  it("allows comment markers and statement delimiters inside string literals", () => {
+    const plan = compileQuery("SELECT '--;/*' AS marker FROM events;");
+    expect(executeQuery(plan, new Map([["events", [{ value: 1 }]]]))).toEqual({
+      columns: ["marker"],
+      rows: [{ marker: "--;/*" }],
+    });
+    expect(() => compileQuery("SELECT * FROM events -- comment")).toThrow(
+      "comments are not supported",
+    );
+    expect(() => compileQuery("SELECT * FROM events /* comment */")).toThrow(
+      "comments are not supported",
+    );
+  });
+
   it("executes an already materialized prepared plan repeatedly", () => {
     const plan = compileQuery("SELECT COUNT(*) AS count FROM rows");
     const prepared = createPreparedQuery(plan, new Map([["rows", [{ value: 1 }, { value: 2 }]]]));

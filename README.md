@@ -124,7 +124,9 @@ contain only the key and changed columns; it rejects missing keys and rechecks t
 Unique-key checks use atomic, versioned persistent key chunks, so they avoid both table-block scans
 and one-IndexedDB-operation-per-key overhead.
 Rows can be deleted by unique key. Buffered writers combine individual rows into column batches and
-flush at a row, byte, or age limit. `readTable` accepts a column projection and fetches the required
+flush at a row, byte, or age limit. An age-triggered flush waits behind an already-running batch and
+then drains rows accepted during that batch, so the timer cannot be consumed while data remains
+pending. `readTable` accepts a column projection and fetches the required
 blocks for each visible segment in bulk windows of up to 16 block IDs; replay may also load a unique
 key column needed to apply mutations. `requestFlush()` is non-blocking and reports failures through
 the writer's `onError`; a main-thread worker proxy can use `attachLifecycleFlush()` to send that
@@ -144,8 +146,12 @@ Phase 7A backs that public SQL surface with typed column vectors. Booleans use b
 and datetimes use `Float64Array`, strings use dictionary-coded `Uint32Array` values, and every vector
 has a packed validity bitmap. Snapshot preparation replays visible inserts, upserts, updates, and
 deletes directly into projected column values before creating the vectors. Execution scans 2,048
-source rows at a time and feeds duplicate-match join fan-out onward in chunks. It still materializes
-result row objects at the `QueryResult` API boundary.
+source rows at a time and feeds duplicate-match join fan-out onward in reserved `Int32Array` chunks.
+Multi-table preparation loads one shared transaction/segment visibility catalog instead of rescanning
+it per table. Column-free append/base queries such as `COUNT(*)` derive their scan cardinality from
+visible segment metadata without loading a data block; keyed mutation replay loads the key when it is
+needed to recover the live-row count. The executor still materializes result row objects at the
+`QueryResult` API boundary.
 
 Phase 7B-A adds a deliberately scoped query-memory model. `query()` and `prepareQuery()` accept
 `executionMemoryBudgetBytes`; prepared queries expose `{ budgetBytes, usedBytes, peakBytes }` through
@@ -167,7 +173,9 @@ index. Typed scalar and compound keys are encoded into a retained byte arena; ca
 type tags, and length-delimited strings preserve SQL grouping distinctions. Collision-checked hashes
 address typed bucket, chain, offset, length, and hash arrays. Every arena or index growth reserves the
 new typed capacity before allocation and releases the superseded reservation only after copying.
-Insertion order remains stable for deterministic grouped results.
+The lookup-or-insert path encodes and hashes each new group key once, and the encoder allocates the
+exact contiguous key bytes instead of an intermediate boxed byte array. Insertion order remains
+stable for deterministic grouped results.
 
 Phase 7C-B applies the same physical-accounting boundary to hash joins. Non-direct join keys use a
 collision-checked scalar byte arena with typed bucket and entry arrays; duplicate build rows are

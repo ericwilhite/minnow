@@ -111,6 +111,11 @@ interface MergeResolvedRow {
   readonly sources: readonly MergeResolvedSource[];
 }
 
+interface SegmentVisibilityCatalog {
+  readonly transactions: ReadonlyMap<string, { readonly committedVersion: number | null }>;
+  readonly segmentsByTable: ReadonlyMap<string, readonly SegmentRecord[]>;
+}
+
 export interface ColumnDefinition {
   name: string;
   type: SimpleDataType;
@@ -1038,17 +1043,31 @@ export class BrowserDatabase {
       const columns = referencedColumns(plan, schemas);
       const columnarTables = new Map<string, ColumnarTable>();
       await this.#withLeasedSnapshot(options.version, async (snapshot) => {
+        const tableIds = new Set(tables.map((table) => table.id));
+        const [transactionRecords, segmentRecords] = await Promise.all([
+          this.store.listTransactions(),
+          tables.length === 1 ? this.store.listSegments(tables[0]?.id) : this.store.listSegments(),
+        ]);
+        const segmentsByTable = new Map<string, SegmentRecord[]>();
+        for (const segment of segmentRecords) {
+          if (!tableIds.has(segment.tableId)) continue;
+          const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
+          tableSegments.push(segment);
+          segmentsByTable.set(segment.tableId, tableSegments);
+        }
+        const visibility: SegmentVisibilityCatalog = {
+          transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
+          segmentsByTable,
+        };
         for (const table of tables) {
-          const requestedColumns = columns.get(table.name);
+          const requestedColumns = columns.get(table.name) ?? [];
           columnarTables.set(
             table.name,
             await this.#materializeColumnarTableAtSnapshot(
               table,
               snapshot,
-              resolveReadColumns(
-                table,
-                requestedColumns?.length === 0 ? [table.columns[0]?.name ?? ""] : requestedColumns,
-              ),
+              requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
+              visibility,
             ),
           );
         }
@@ -3256,8 +3275,9 @@ export class BrowserDatabase {
     table: TableRecord,
     snapshot: LeasedSnapshot,
     projectedColumns: readonly TableColumnRecord[],
+    visibility?: SegmentVisibilityCatalog,
   ): Promise<ColumnarTable> {
-    const segments = await this.#visibleSegmentRecords(table, snapshot);
+    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
     const keyColumn = getUniqueKeyColumn(table);
     if (
       segments.every((segment) => {
@@ -3266,6 +3286,9 @@ export class BrowserDatabase {
       })
     ) {
       const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+      if (projectedColumns.length === 0) {
+        return { name: table.name, rowCount, columns: new Map() };
+      }
       const valuesByColumn = new Map(
         projectedColumns.map((column) => [column.id, new Array<BatchValue>(rowCount)] as const),
       );
@@ -3394,6 +3417,13 @@ export class BrowserDatabase {
     }
 
     const hasDeletedRows = alive.some((visible) => !visible);
+    if (projectedColumns.length === 0) {
+      return {
+        name: table.name,
+        rowCount: hasDeletedRows ? alive.filter(Boolean).length : alive.length,
+        columns: new Map(),
+      };
+    }
     const columns = new Map<string, ColumnarColumnInput>();
     for (const column of projectedColumns) {
       const sourceValues = valuesByColumn.get(column.id) ?? [];
@@ -3470,11 +3500,17 @@ export class BrowserDatabase {
     return decoded;
   }
 
-  async #visibleSegmentRecords(table: TableRecord, snapshot: Snapshot): Promise<SegmentRecord[]> {
-    const transactions = new Map(
-      (await this.store.listTransactions()).map((record) => [record.id, record]),
-    );
-    return (await this.store.listSegments(table.id))
+  async #visibleSegmentRecords(
+    table: TableRecord,
+    snapshot: Snapshot,
+    catalog?: SegmentVisibilityCatalog,
+  ): Promise<SegmentRecord[]> {
+    const transactions =
+      catalog?.transactions ??
+      new Map((await this.store.listTransactions()).map((record) => [record.id, record]));
+    const segments =
+      catalog?.segmentsByTable.get(table.id) ?? (await this.store.listSegments(table.id));
+    return segments
       .filter((segment) =>
         Object.values(segment.columnBlockIds)
           .flat()
@@ -3630,7 +3666,7 @@ export class BufferedTableWriter {
     if (this.#timer !== undefined || this.#rows.length === 0 || this.#closed) return;
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
-      void this.flush().catch((error: unknown) => this.#onError?.(error));
+      void this.#flushPending().catch((error: unknown) => this.#onError?.(error));
     }, this.#maxAgeMs);
   }
 

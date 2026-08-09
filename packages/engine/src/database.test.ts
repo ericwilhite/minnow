@@ -26,6 +26,8 @@ import {
 class CountingMemoryBlockStore extends MemoryBlockStore {
   blockWriteCalls = 0;
   blockReadCalls = 0;
+  transactionListCalls = 0;
+  segmentListCalls = 0;
   blockIdsRead: string[][] = [];
   singleBlockIdsRead: string[] = [];
   pendingBlockJournalSizes: number[] = [];
@@ -46,6 +48,16 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   override async getBlock(id: string): Promise<Uint8Array | undefined> {
     this.singleBlockIdsRead.push(id);
     return super.getBlock(id);
+  }
+
+  override async listTransactions() {
+    this.transactionListCalls += 1;
+    return super.listTransactions();
+  }
+
+  override async listSegments(tableId?: string) {
+    this.segmentListCalls += 1;
+    return super.listSegments(tableId);
   }
 
   override async updateTransaction(
@@ -4495,6 +4507,29 @@ it("flushes a buffered writer after its age limit", async () => {
   store.close();
 });
 
+it("does not lose an age flush that fires behind an in-flight batch", async () => {
+  const store = new FirstCommitBarrierMemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const writer = database.bufferedWriter("events", { maxAgeMs: 5, maxRows: 100 });
+  await writer.add({ value: 1 });
+  const firstFlush = writer.flush();
+  await store.firstCommitReached;
+  await writer.add({ value: 2 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  store.releaseFirstCommit();
+  await firstFlush;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(writer.pendingRowCount).toBe(0);
+  expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
+  await writer.close();
+  store.close();
+});
+
 it("requests a best-effort buffered flush when a page becomes hidden", async () => {
   const store = new MemoryBlockStore();
   const database = new BrowserDatabase(store);
@@ -4554,6 +4589,52 @@ it("stages a bounded batch in one write and uses bulk reads", async () => {
   await expect(database.readTable("events", { columns: ["missing"] })).rejects.toThrow(
     "Unknown column",
   );
+  store.close();
+});
+
+it("answers metadata-only queries without loading a data block", async () => {
+  const store = new CountingMemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  await database.insertBatch("events", { columns: { value: [1, 2, 3] } });
+  store.blockReadCalls = 0;
+  store.blockIdsRead = [];
+  store.transactionListCalls = 0;
+  store.segmentListCalls = 0;
+
+  expect(await database.query("SELECT COUNT(*) AS count FROM events")).toEqual({
+    columns: ["count"],
+    rows: [{ count: 3 }],
+  });
+  expect(store.blockReadCalls).toBe(0);
+  expect(store.transactionListCalls).toBe(1);
+  expect(store.segmentListCalls).toBe(1);
+  store.close();
+});
+
+it("shares one visibility catalog across multi-table query preparation", async () => {
+  const store = new CountingMemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  for (const table of ["left_rows", "right_rows"]) {
+    await database.createTable({
+      name: table,
+      columns: [{ name: "id", type: "number" }],
+    });
+    await database.insertBatch(table, { columns: { id: [1, 2] } });
+  }
+  store.transactionListCalls = 0;
+  store.segmentListCalls = 0;
+
+  expect(
+    await database.query(
+      "SELECT COUNT(*) AS count FROM left_rows l JOIN right_rows r ON r.id = l.id",
+    ),
+  ).toEqual({ columns: ["count"], rows: [{ count: 2 }] });
+  expect(store.transactionListCalls).toBe(1);
+  expect(store.segmentListCalls).toBe(1);
   store.close();
 });
 

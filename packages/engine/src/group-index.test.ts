@@ -75,4 +75,26 @@ describe("byte group index", () => {
     expect(index.values()).toEqual([1, 2]);
     memory.close();
   });
+
+  it("creates a missing value once and returns it without replacing insertion order", () => {
+    const memory = new QueryMemoryContext(512);
+    const index = new ByteGroupIndex<object>(memory);
+    const first = {};
+    let creates = 0;
+    expect(
+      index.getOrInsertOne("key", () => {
+        creates += 1;
+        return first;
+      }),
+    ).toBe(first);
+    expect(
+      index.getOrInsertOne("key", () => {
+        creates += 1;
+        return {};
+      }),
+    ).toBe(first);
+    expect(creates).toBe(1);
+    expect(index.values()).toEqual([first]);
+    memory.close();
+  });
 });

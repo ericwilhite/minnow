@@ -175,6 +175,11 @@ batches currently stage a column at a time. A materialized read fetches projecte
 visible segment in windows of up to 16 block IDs and retains a unique-key column when delta replay
 needs it.
 
+An age-triggered buffered flush is a drain request rather than a single attempt. If another batch is
+already committing, the timer waits for it and then flushes rows accepted in the meantime; lifecycle
+requests use the same draining behavior. This closes the timer/in-flight race without broadening the
+best-effort page-lifecycle durability contract.
+
 ### Resumable physical compaction
 
 Ordinary write segments are recorded at L0 with a `logicalOrder` derived from their commit version.
@@ -390,8 +395,11 @@ validity bitmap; strings are dictionary-coded, numbers and datetimes use `Float6
 use byte values. `query()` and `prepareQuery()` materialize the referenced columns at one leased
 snapshot, replay visible insert, upsert, update, and delete segments into column values, and bind the
 public SQL plan to those vectors. The executor scans 2,048 source rows per batch and passes
-duplicate-match join fan-out through downstream operators in chunks. Returned `QueryResult` values
-still materialize row objects at the public API boundary.
+duplicate-match join fan-out through downstream operators in reserved `Int32Array` chunks. Query
+preparation reads the transaction/segment visibility catalog once per leased multi-table snapshot.
+When a plan references no data column, append/base cardinality comes directly from visible segment
+metadata; mutation replay retains only the unique key needed to derive live rows. Returned
+`QueryResult` values still materialize row objects at the public API boundary.
 
 The target operator shape remains:
 
@@ -430,6 +438,8 @@ stored hashes and exact encoded-byte comparisons resolve collisions. Insertion-o
 are addressed by typed hash, offset, length, and chain arrays. Arena, entry, and bucket growth reserves
 the full replacement buffer before allocation, copies under the combined peak, then releases the old
 reservation. This removes the unmodeled nested `Map` tree without changing grouped result order.
+The executor's lookup-or-insert path evaluates, encodes, and hashes each new group key once. Its
+encoder precomputes the exact contiguous byte length and avoids a boxed array entry for every byte.
 
 Phase 7C-B makes the general hash-join lookup physically accountable. Canonical scalar key bytes are
 stored in a collision-checked arena addressed by typed bucket, hash, offset, length, and chain arrays.

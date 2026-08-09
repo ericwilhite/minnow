@@ -219,13 +219,15 @@ describe("vector query execution", () => {
       ],
     ]);
 
-    expect(executeQuery(plan, tables)).toEqual({
+    const expected = {
       columns: ["left_label", "right_label"],
       rows: [
         { left_label: "finite", right_label: "finite-match" },
         { left_label: "not-a-number", right_label: null },
       ],
-    });
+    };
+    expect(executeQuery(plan, tables)).toEqual(expected);
+    expect(executeRowQuery(plan, tables)).toEqual(expected);
   });
 
   it("builds typed vectors with explicit validity and dictionary contracts", () => {

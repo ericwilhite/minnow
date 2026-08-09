@@ -54,6 +54,24 @@ export class ByteGroupIndex<T> {
       this.#values[existing] = value;
       return;
     }
+    this.#insert(encoded, hash, value);
+  }
+
+  getOrInsert(keys: readonly GroupIndexKey[], create: () => T): T {
+    const encoded = encodeGroupKey(keys);
+    const hash = hashBytes(encoded);
+    const existing = this.#find(encoded, hash);
+    if (existing >= 0) return this.#values[existing] as T;
+    const value = create();
+    this.#insert(encoded, hash, value);
+    return value;
+  }
+
+  getOrInsertOne(key: GroupIndexKey, create: () => T): T {
+    return this.getOrInsert([key], create);
+  }
+
+  #insert(encoded: Uint8Array, hash: number, value: T): void {
     const index = this.#values.length;
     this.#ensureEntryCapacity(index + 1);
     this.#ensureBucketCapacity(index + 1);
@@ -178,36 +196,49 @@ export class ByteGroupIndex<T> {
 }
 
 function encodeGroupKey(keys: readonly GroupIndexKey[]): Uint8Array {
-  const bytes: number[] = [];
-  const numberBuffer = new ArrayBuffer(Float64Array.BYTES_PER_ELEMENT);
-  const numberView = new DataView(numberBuffer);
-  for (const key of keys) {
-    if (key === null) {
-      bytes.push(0);
-    } else if (typeof key === "boolean") {
-      bytes.push(key ? 2 : 1);
+  const stringPayloads = new Map<number, Uint8Array>();
+  let byteLength = 0;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === null || typeof key === "boolean") {
+      byteLength = safeSum(byteLength, 1, "Encoded group key");
     } else if (typeof key === "number") {
       if (!Number.isFinite(key)) throw new TypeError("Group index numbers must be finite");
-      bytes.push(3);
-      numberView.setFloat64(0, key === 0 ? 0 : key, true);
-      for (let index = 0; index < Float64Array.BYTES_PER_ELEMENT; index += 1) {
-        bytes.push(numberView.getUint8(index));
-      }
+      byteLength = safeSum(byteLength, 1 + Float64Array.BYTES_PER_ELEMENT, "Encoded group key");
     } else {
-      bytes.push(4);
-      const encoded = groupKeyEncoder.encode(key);
-      if (encoded.byteLength > 0xffff_ffff) throw new RangeError("Group index string is too large");
-      bytes.push(
-        encoded.byteLength & 0xff,
-        (encoded.byteLength >>> 8) & 0xff,
-        (encoded.byteLength >>> 16) & 0xff,
-        (encoded.byteLength >>> 24) & 0xff,
-      );
-      for (const byte of encoded) bytes.push(byte);
+      const payload = groupKeyEncoder.encode(key);
+      if (payload.byteLength > 0xffff_ffff) throw new RangeError("Group index string is too large");
+      stringPayloads.set(index, payload);
+      byteLength = safeSum(byteLength, 5 + payload.byteLength, "Encoded group key");
     }
   }
-  if (bytes.length > 0xffff_ffff) throw new RangeError("Encoded group key is too large");
-  return Uint8Array.from(bytes);
+  if (byteLength > 0xffff_ffff) throw new RangeError("Encoded group key is too large");
+
+  const encoded = new Uint8Array(byteLength);
+  const view = new DataView(encoded.buffer);
+  let offset = 0;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === null) {
+      encoded[offset] = 0;
+      offset += 1;
+    } else if (typeof key === "boolean") {
+      encoded[offset] = key ? 2 : 1;
+      offset += 1;
+    } else if (typeof key === "number") {
+      encoded[offset] = 3;
+      view.setFloat64(offset + 1, key === 0 ? 0 : key, true);
+      offset += 1 + Float64Array.BYTES_PER_ELEMENT;
+    } else {
+      const payload = stringPayloads.get(index);
+      if (payload === undefined) throw new Error("Encoded group string is missing");
+      encoded[offset] = 4;
+      view.setUint32(offset + 1, payload.byteLength, true);
+      encoded.set(payload, offset + 5);
+      offset += 5 + payload.byteLength;
+    }
+  }
+  return encoded;
 }
 
 function hashBytes(bytes: Uint8Array): number {
@@ -235,4 +266,10 @@ function safeProduct(left: number, right: number, label: string): number {
   if (!Number.isSafeInteger(product))
     throw new RangeError(`${label} exceeds the safe integer range`);
   return product;
+}
+
+function safeSum(left: number, right: number, label: string): number {
+  const sum = left + right;
+  if (!Number.isSafeInteger(sum)) throw new RangeError(`${label} exceeds the safe integer range`);
+  return sum;
 }

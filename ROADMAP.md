@@ -122,6 +122,8 @@ Deliver:
 - bounded age/row/byte write buffers (complete);
 - append-only insert segments, upsert patches, narrow keyed update patches, and key deletion markers (complete);
 - immediate flush request on hidden/pagehide as a best-effort optimization (complete);
+- age timers drain rows accepted behind an in-flight flush instead of losing their wake-up
+  (complete);
 - instrumentation for rows/s, encoding/staging/commit latency, retries, and write amplification (complete);
 - atomic versioned unique-key chunks that replace per-key IndexedDB operations (complete);
 - one bounded IndexedDB block-staging transaction per insert/upsert batch instead of one per column
@@ -283,7 +285,9 @@ Phase 7A is implemented as a deliberately narrower first slice. The public `quer
 `prepareQuery()` paths replay visible insert, upsert, update, and delete segments into projected
 column values, then execute against typed boolean, number, datetime, and dictionary-coded string
 vectors with packed validity bitmaps. Scans advance in 2,048-row source batches, and duplicate-match
-join fan-out is passed through the remaining operators in chunks. Filters, projection, limits, core
+join fan-out is passed through the remaining operators in reserved typed chunks. Multi-table snapshot
+preparation shares one transaction/segment visibility catalog, and metadata-only append/base scans do
+not load an arbitrary data column. Filters, projection, limits, core
 aggregates, grouped aggregation, ordering, and equi-joins use this executor; row objects are created
 for the returned `QueryResult` only at the public API boundary.
 
@@ -304,7 +308,8 @@ Canonical typed/compound keys live in a growable arena addressed by collision-ch
 chain, hash, offset, and length arrays. Growth reserves replacement capacity before allocation, keeps
 old and new buffers in the high-water mark while copying, and releases old reservations afterward.
 Direct and SQL-level tests cover type boundaries, compound-key framing, `-0`, growth, budget failure,
-cleanup, insertion order, and randomized grouping parity.
+cleanup, insertion order, and randomized grouping parity. The group lookup-or-insert hot path encodes
+and hashes a new key once and writes exact contiguous bytes without a boxed per-byte staging array.
 
 Phase 7C-B replaces the general hash-join `Map` and boxed duplicate arrays with a scalar byte key
 index and typed build-row chains. Exact encoded bytes resolve hash collisions, typed tags preserve SQL

@@ -610,7 +610,7 @@ function createDirectLookup(
   const range = maximum - minimum + 1;
   if (range > Math.max(1_024, vector.length * 4) || range > 10_000_000) return undefined;
   const reservation = memory.reserve(
-    safeMemoryProduct(range + 1, Int32Array.BYTES_PER_ELEMENT, "Direct join lookup"),
+    safeMemoryProduct(range, Int32Array.BYTES_PER_ELEMENT, "Direct join lookup"),
     "Direct join lookup",
   );
   const rowByKey = new Int32Array(range);
@@ -769,69 +769,61 @@ function* joinBatches(
     yield joinUniqueBatch(plan, input, join, memory);
     return;
   }
-  const workspace = memory.reserve(
-    safeMemoryProduct(
-      safeMemoryProduct(
-        plan.sourceTables.length,
-        DEFAULT_BATCH_ROWS,
-        "Join fan-out workspace slots",
-      ),
-      8,
-      "Join fan-out workspace",
-    ),
-    "Join fan-out workspace",
-  );
+  let outputMemory: QueryMemoryContext | undefined;
   try {
-    let outputRows = plan.sourceTables.map(() => [] as number[]);
+    let outputRows: Int32Array[] | undefined;
+    let outputLength = 0;
+    const ensureOutput = (): Int32Array[] => {
+      if (outputRows !== undefined) return outputRows;
+      outputMemory = memory.createChild();
+      outputMemory.reserve(
+        safeMemoryProduct(
+          safeMemoryProduct(
+            plan.sourceTables.length,
+            DEFAULT_BATCH_ROWS,
+            "Join fan-out row-index count",
+          ),
+          Int32Array.BYTES_PER_ELEMENT,
+          "Join fan-out row indexes",
+        ),
+        "Join fan-out row indexes",
+      );
+      outputRows = plan.sourceTables.map(() => new Int32Array(DEFAULT_BATCH_ROWS));
+      return outputRows;
+    };
+    const emit = function* (): Generator<BatchRows> {
+      if (outputRows === undefined || outputMemory === undefined || outputLength === 0) return;
+      const batch = {
+        length: outputLength,
+        rowsBySource: outputRows,
+        memory: outputMemory,
+      };
+      outputRows = undefined;
+      outputMemory = undefined;
+      outputLength = 0;
+      yield batch;
+    };
     for (let row = 0; row < input.length; row += 1) {
       const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
       let buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
       if (buildRow < 0) {
-        if (join.kind === "left") appendJoinedRow(outputRows, input, row, join.buildSource, -1);
+        if (join.kind === "left") {
+          appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, -1);
+          outputLength += 1;
+        }
       } else {
         while (buildRow >= 0) {
-          appendJoinedRow(outputRows, input, row, join.buildSource, buildRow);
-          if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
-            yield materializeJoinedRows(outputRows, memory);
-            outputRows = plan.sourceTables.map(() => [] as number[]);
-          }
+          appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, buildRow);
+          outputLength += 1;
+          if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
           buildRow = join.lookup.nextRow(buildRow);
         }
       }
-      if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
-        yield materializeJoinedRows(outputRows, memory);
-        outputRows = plan.sourceTables.map(() => [] as number[]);
-      }
+      if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
     }
-    if ((outputRows[0]?.length ?? 0) > 0) yield materializeJoinedRows(outputRows, memory);
+    yield* emit();
   } finally {
-    workspace.release();
-  }
-}
-
-function materializeJoinedRows(
-  outputRows: readonly number[][],
-  memory: QueryMemoryContext,
-): BatchRows {
-  const batchMemory = memory.createChild();
-  try {
-    const length = outputRows[0]?.length ?? 0;
-    batchMemory.reserve(
-      safeMemoryProduct(
-        safeMemoryProduct(outputRows.length, length, "Joined batch row-index count"),
-        Int32Array.BYTES_PER_ELEMENT,
-        "Joined batch row indexes",
-      ),
-      "Joined batch row indexes",
-    );
-    return {
-      length,
-      rowsBySource: outputRows.map((rows) => Int32Array.from(rows)),
-      memory: batchMemory,
-    };
-  } catch (error) {
-    batchMemory.close();
-    throw error;
+    outputMemory?.close();
   }
 }
 
@@ -896,16 +888,19 @@ function joinUniqueBatch(
 }
 
 function appendJoinedRow(
-  output: number[][],
+  output: Int32Array[],
+  outputRow: number,
   input: BatchRows,
   row: number,
   buildSource: number,
   buildRow: number,
 ): void {
   for (let source = 0; source < output.length; source += 1) {
-    output[source]?.push(
-      source === buildSource ? buildRow : (input.rowsBySource[source]?.[row] ?? -1),
-    );
+    const rows = output[source];
+    if (rows !== undefined) {
+      rows[outputRow] =
+        source === buildSource ? buildRow : (input.rowsBySource[source]?.[row] ?? -1);
+    }
   }
 }
 
@@ -924,33 +919,28 @@ function consumeBatch(
     }
     if (plan.grouped) {
       let state: GroupState | undefined;
-      let groupKeys: GroupIndexKey[] | undefined;
       if (plan.groupBy.length === 0) state = groups.getEmpty();
       else if (plan.groupBy.length === 1) {
-        state = groups.getOne(
-          groupKey(
-            evaluateBatchExpression(
-              plan,
-              required(plan.groupBy[0], "Group expression is missing"),
-              batch,
-              row,
-            ),
+        const groupValue = asQueryValue(
+          evaluateBatchExpression(
+            plan,
+            required(plan.groupBy[0], "Group expression is missing"),
+            batch,
+            row,
           ),
         );
-      } else {
-        groupKeys = plan.groupBy.map((expression) =>
-          groupKey(evaluateBatchExpression(plan, expression, batch, row)),
+        state = groups.getOrInsertOne(groupKey(groupValue), () =>
+          createGroupState([groupValue], plan, memory),
         );
-        state = groups.get(groupKeys);
-      }
-      if (state === undefined) {
+      } else {
         const groupValues = plan.groupBy.map((expression) =>
           asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
         );
-        state = createGroupState(groupValues, plan, memory);
-        if (plan.groupBy.length === 1) groups.setOne(groupKey(groupValues[0]), state);
-        else groups.set(groupKeys ?? [], state);
+        state = groups.getOrInsert(groupValues.map(groupKey), () =>
+          createGroupState(groupValues, plan, memory),
+        );
       }
+      if (state === undefined) throw new Error("Grouped query state is missing");
       updateAggregates(plan, state, batch, row, memory);
     } else {
       const resultRow = projectBatchRow(plan, batch, row);
