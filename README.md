@@ -147,11 +147,21 @@ deletes directly into projected column values before creating the vectors. Execu
 source rows at a time and feeds duplicate-match join fan-out onward in chunks. It still materializes
 result row objects at the `QueryResult` API boundary.
 
-This first executor is not the Phase 7 bounded-memory exit. It materializes each projected input in
-full, has no query `MemoryContext`, configured query-memory budget, or spill path, and its join hash,
-group, ordering, and result state can grow with the query. It also performs no statistics-driven
-segment or row-group data skipping. Phase 7 remains open for accounted working-set bounds and
-streaming inputs; Phase 8 remains open for pruning and late materialization.
+Phase 7B-A adds a deliberately scoped query-memory model. `query()` and `prepareQuery()` accept
+`executionMemoryBudgetBytes`; prepared queries expose `{ budgetBytes, usedBytes, peakBytes }` through
+`memoryUsage`. The model reserves retained typed-vector payloads (including validity, codes, and UTF-8
+dictionary bytes), join row indexes, scan row-index batches, selection/build arrays, and chunked join
+fan-out buffers. A reservation that would exceed the configured budget throws
+`QueryMemoryBudgetError` before allocating the modeled executor buffer. Temporary reservations are
+released after each execution, including failures, and `close()` releases retained reservations.
+
+This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
+still materializes each projected input in full before the vector reservation is installed. The model
+does not include boxed preparation values, JavaScript `Map`/object/array overhead, grouped aggregate
+state, ordering buffers, returned row objects, or engine/browser allocator overhead. Those states can
+still grow with query cardinality, and there is no spill path. It also performs no statistics-driven
+segment or row-group data skipping. Phase 7 remains open for streaming inputs, complete operator
+accounting, and spill; Phase 8 remains open for pruning and late materialization.
 
 Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records an
 immutable physical rewrite plan. Append-only inputs use `rechunk-v1`, which fixes the ordered

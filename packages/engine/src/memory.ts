@@ -1,0 +1,115 @@
+export interface QueryMemoryUsage {
+  readonly budgetBytes: number;
+  readonly usedBytes: number;
+  readonly peakBytes: number;
+}
+
+export class QueryMemoryBudgetError extends Error {
+  override readonly name = "QueryMemoryBudgetError";
+
+  constructor(
+    readonly label: string,
+    readonly requestedBytes: number,
+    readonly usedBytes: number,
+    readonly budgetBytes: number,
+  ) {
+    super(
+      `${label} requested ${String(requestedBytes)} accounted bytes with ${String(usedBytes)} of ${String(budgetBytes)} bytes already reserved`,
+    );
+  }
+}
+
+interface QueryMemoryState {
+  readonly budgetBytes: number;
+  usedBytes: number;
+  peakBytes: number;
+}
+
+export class QueryMemoryContext {
+  readonly #state: QueryMemoryState;
+  readonly #parent: QueryMemoryContext | undefined;
+  readonly #children = new Set<QueryMemoryContext>();
+  readonly #reservations = new Set<QueryMemoryReservation>();
+  #closed = false;
+
+  constructor(budgetBytes: number = Number.MAX_SAFE_INTEGER, parent?: QueryMemoryContext) {
+    if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 0) {
+      throw new RangeError("Query memory budget must be a non-negative safe integer");
+    }
+    this.#parent = parent;
+    if (parent === undefined) this.#state = { budgetBytes, usedBytes: 0, peakBytes: 0 };
+    else {
+      this.#state = parent.#state;
+      parent.#children.add(this);
+    }
+  }
+
+  get usage(): QueryMemoryUsage {
+    return { ...this.#state };
+  }
+
+  createChild(): QueryMemoryContext {
+    this.#assertOpen();
+    return new QueryMemoryContext(this.#state.budgetBytes, this);
+  }
+
+  reserve(bytes: number, label: string): QueryMemoryReservation {
+    this.#assertOpen();
+    validateMemoryBytes(bytes, "Query memory reservation");
+    const nextUsed = this.#state.usedBytes + bytes;
+    if (!Number.isSafeInteger(nextUsed) || nextUsed > this.#state.budgetBytes) {
+      throw new QueryMemoryBudgetError(
+        label,
+        bytes,
+        this.#state.usedBytes,
+        this.#state.budgetBytes,
+      );
+    }
+    this.#state.usedBytes = nextUsed;
+    this.#state.peakBytes = Math.max(this.#state.peakBytes, nextUsed);
+    const reservation = new QueryMemoryReservation(this, bytes);
+    this.#reservations.add(reservation);
+    return reservation;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const child of [...this.#children]) child.close();
+    for (const reservation of [...this.#reservations]) reservation.release();
+    if (this.#parent !== undefined) this.#parent.#children.delete(this);
+  }
+
+  release(reservation: QueryMemoryReservation, bytes: number): void {
+    if (!this.#reservations.delete(reservation)) return;
+    this.#state.usedBytes -= bytes;
+    if (this.#state.usedBytes < 0) throw new Error("Query memory accounting underflow");
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("Query memory context is closed");
+  }
+}
+
+export class QueryMemoryReservation {
+  readonly #context: QueryMemoryContext;
+  readonly bytes: number;
+  #released = false;
+
+  constructor(context: QueryMemoryContext, bytes: number) {
+    this.#context = context;
+    this.bytes = bytes;
+  }
+
+  release(): void {
+    if (this.#released) return;
+    this.#released = true;
+    this.#context.release(this, this.bytes);
+  }
+}
+
+function validateMemoryBytes(bytes: number, label: string): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) {
+    throw new RangeError(`${label} must be a non-negative safe integer`);
+  }
+}

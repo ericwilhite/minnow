@@ -1,6 +1,6 @@
 import { IndexedDbBlockStore, WriteConflictError } from "@browserdatabase/storage-idb";
 import { FaultInjectingBlockStore } from "@browserdatabase/testing";
-import { BrowserDatabase, type QueryResult } from "@browserdatabase/engine";
+import { BrowserDatabase, QueryMemoryBudgetError, type QueryResult } from "@browserdatabase/engine";
 import { TransactionManager } from "../src/index.js";
 
 interface BrowserTransactionResult {
@@ -50,6 +50,13 @@ interface BrowserTransactionResult {
       current: { count: number; total: number };
       compacted: { count: number; total: number };
       reopened: { count: number; total: number };
+      memoryBudget: {
+        retainedBytes: number;
+        peakBytes: number;
+        prepareRejected: boolean;
+        executeRejected: boolean;
+        exactSucceeded: boolean;
+      };
     };
     l2Compaction: {
       sourceSegments: number[];
@@ -146,12 +153,39 @@ window.runTransactionBrowserTest = async () => {
   const deleted = await database.deleteBatch("people", { keys: ["Ada", "Missing"] });
   const rows = await database.readTable("people");
   const updatedScore = rows.find((row) => row.name === "Grace")?.score;
+  const retainedBytes = preparedPeople.memoryUsage.usedBytes;
   const preparedAggregate = summarizeAggregate(preparedPeople.execute());
+  const peakBytes = preparedPeople.memoryUsage.peakBytes;
   preparedPeople.close();
   const historicalAggregate = summarizeAggregate(
     await database.query(aggregateSql, { version: batch.version }),
   );
   const currentAggregate = summarizeAggregate(await database.query(aggregateSql));
+  let prepareRejected = false;
+  try {
+    const unexpected = await database.prepareQuery(aggregateSql, {
+      executionMemoryBudgetBytes: retainedBytes - 1,
+    });
+    unexpected.close();
+  } catch (error) {
+    prepareRejected = error instanceof QueryMemoryBudgetError;
+  }
+  const belowPeak = await database.prepareQuery(aggregateSql, {
+    executionMemoryBudgetBytes: peakBytes - 1,
+  });
+  let executeRejected = false;
+  try {
+    belowPeak.execute();
+  } catch (error) {
+    executeRejected = error instanceof QueryMemoryBudgetError;
+  } finally {
+    belowPeak.close();
+  }
+  const exactBudget = await database.prepareQuery(aggregateSql, {
+    executionMemoryBudgetBytes: peakBytes,
+  });
+  const exactSucceeded = summarizeAggregate(exactBudget.execute()).total === 96;
+  exactBudget.close();
   const writer = database.bufferedWriter("events", { maxRows: 2, maxAgeMs: 60_000 });
   await writer.add({ happened: new Date("2026-01-01T00:00:00.000Z") });
   const thresholdFlush = await writer.add({ happened: new Date("2026-01-02T00:00:00.000Z") });
@@ -271,6 +305,13 @@ window.runTransactionBrowserTest = async () => {
         current: currentAggregate,
         compacted: compactedAggregate,
         reopened: reopenedAggregate,
+        memoryBudget: {
+          retainedBytes,
+          peakBytes,
+          prepareRejected,
+          executeRejected,
+          exactSucceeded,
+        },
       },
       l2Compaction: {
         sourceSegments: [firstL2.sourceSegmentCount, secondL2.sourceSegmentCount],

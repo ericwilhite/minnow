@@ -60,6 +60,7 @@ import {
   type PreparedQuery,
   type QueryResult,
 } from "./query.js";
+import { QueryMemoryContext } from "./memory.js";
 import { createColumnarTable, type ColumnarColumnInput, type ColumnarTable } from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
@@ -175,6 +176,16 @@ export interface WriteMetrics {
 export interface ReadTableOptions {
   version?: number;
   columns?: readonly string[];
+}
+
+export interface QueryOptions {
+  readonly version?: number;
+  /**
+   * Budget for the currently accounted vector payload, join row indexes, and batch buffers.
+   * Boxed snapshot preparation, hash-map overhead, grouped/sorted state, and result rows are not yet
+   * included in this Phase 7B-A model.
+   */
+  readonly executionMemoryBudgetBytes?: number;
 }
 
 export interface DeleteBatchInput {
@@ -1014,37 +1025,43 @@ export class BrowserDatabase {
    * Compiles a read-only SELECT statement and materializes one stable snapshot.
    * Repeated execute() calls measure query execution without including storage I/O.
    */
-  async prepareQuery(sql: string, options: { version?: number } = {}): Promise<PreparedQuery> {
+  async prepareQuery(sql: string, options: QueryOptions = {}): Promise<PreparedQuery> {
     const plan = compileQuery(sql);
-    const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
-    const uniqueTableNames = [...new Set(tableNames)];
-    const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
-    const schemas = new Map(
-      tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
-    );
-    const columns = referencedColumns(plan, schemas);
-    const columnarTables = new Map<string, ColumnarTable>();
-    await this.#withLeasedSnapshot(options.version, async (snapshot) => {
-      for (const table of tables) {
-        const requestedColumns = columns.get(table.name);
-        columnarTables.set(
-          table.name,
-          await this.#materializeColumnarTableAtSnapshot(
-            table,
-            snapshot,
-            resolveReadColumns(
+    const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
+    try {
+      const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
+      const uniqueTableNames = [...new Set(tableNames)];
+      const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
+      const schemas = new Map(
+        tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
+      );
+      const columns = referencedColumns(plan, schemas);
+      const columnarTables = new Map<string, ColumnarTable>();
+      await this.#withLeasedSnapshot(options.version, async (snapshot) => {
+        for (const table of tables) {
+          const requestedColumns = columns.get(table.name);
+          columnarTables.set(
+            table.name,
+            await this.#materializeColumnarTableAtSnapshot(
               table,
-              requestedColumns?.length === 0 ? [table.columns[0]?.name ?? ""] : requestedColumns,
+              snapshot,
+              resolveReadColumns(
+                table,
+                requestedColumns?.length === 0 ? [table.columns[0]?.name ?? ""] : requestedColumns,
+              ),
             ),
-          ),
-        );
-      }
-    });
-    return createPreparedColumnarQuery(plan, columnarTables);
+          );
+        }
+      });
+      return createPreparedColumnarQuery(plan, columnarTables, memory);
+    } catch (error) {
+      memory.close();
+      throw error;
+    }
   }
 
   /** Executes a read-only SELECT statement through the public query API. */
-  async query(sql: string, options: { version?: number } = {}): Promise<QueryResult> {
+  async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
     const prepared = await this.prepareQuery(sql, options);
     try {
       return prepared.execute();

@@ -287,11 +287,18 @@ join fan-out is passed through the remaining operators in chunks. Filters, proje
 aggregates, grouped aggregation, ordering, and equi-joins use this executor; row objects are created
 for the returned `QueryResult` only at the public API boundary.
 
-Phase 7 remains open. Preparation still materializes every projected input column in full. Queries
-have no `MemoryContext`, configured memory budget, reservation accounting, or spill path, and join
-hash tables, group state, ordering buffers, and result state can still grow with the query. Phase 7A
-also does not perform segment or row-group data skipping. Later Phase 7 work must make the input and
-operator working sets explicitly bounded; Phase 8 owns statistics-driven pruning and late
+Phase 7B-A adds a modeled query memory context without claiming the phase exit. Public query options
+accept `executionMemoryBudgetBytes`, prepared queries report current and peak accounted bytes, and
+typed-vector payloads plus scan, selection, join row-index, and chunked fan-out buffers reserve and
+release against the shared budget. Exact-boundary tests cover success, pre-allocation rejection, and
+cleanup after both success and failure.
+
+Phase 7 remains open. Preparation still materializes every projected input column in full before the
+modeled reservations take effect. Boxed preparation values, JavaScript hash/object/array overhead,
+group state, ordering buffers, result rows, and allocator overhead are not counted; there is no spill
+path. Those states can still grow with query cardinality. Phase 7A/B-A also do not perform segment or
+row-group data skipping. Later Phase 7 work must stream inputs, account every material operator state,
+and spill within a hard working-set budget; Phase 8 owns statistics-driven pruning and late
 materialization.
 
 Exit gate: hot paths avoid row-object materialization and per-row callbacks; operator memory is accounted against a configured budget.
@@ -424,7 +431,8 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add safe compaction-job cancellation.
 - [x] Add lease-aware garbage collection and physical reclamation for superseded blocks.
 - [x] Route the public SQL subset and mutation replay through the Phase 7A columnar executor.
-- [ ] Add query memory contexts, explicit working-set budgets, spill, and streaming projected inputs.
+- [x] Add the Phase 7B-A modeled query memory context for vector and row-index buffers.
+- [ ] Extend query accounting to all material operator state, spill, and streaming projected inputs.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

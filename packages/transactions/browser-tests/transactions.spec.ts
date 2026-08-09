@@ -52,6 +52,13 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
             current: { count: number; total: number };
             compacted: { count: number; total: number };
             reopened: { count: number; total: number };
+            memoryBudget: {
+              retainedBytes: number;
+              peakBytes: number;
+              prepareRejected: boolean;
+              executeRejected: boolean;
+              exactSucceeded: boolean;
+            };
           };
           l2Compaction: {
             sourceSegments: number[];
@@ -116,6 +123,13 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         current: { count: 3, total: 96 },
         compacted: { count: 3, total: 96 },
         reopened: { count: 3, total: 96 },
+        memoryBudget: {
+          retainedBytes: 25,
+          peakBytes: 37,
+          prepareRejected: true,
+          executeRejected: true,
+          exactSucceeded: true,
+        },
       },
       l2Compaction: {
         sourceSegments: [2, 2],

@@ -9,9 +9,11 @@ import type {
   QueryValue,
   SelectItem,
 } from "./query.js";
+import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
 const NULL_STRING_CODE = 0xffffffff;
+const vectorTextEncoder = new TextEncoder();
 
 export type VectorType = "boolean" | "number" | "string" | "datetime";
 
@@ -56,7 +58,13 @@ export interface ColumnarTable {
 }
 
 export interface PreparedVectorQuery {
+  readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
+  close(): void;
+}
+
+export interface PrepareVectorQueryOptions {
+  readonly memoryContext?: QueryMemoryContext;
 }
 
 type BoundExpression =
@@ -138,6 +146,7 @@ interface BoundPlan {
 interface BatchRows {
   readonly length: number;
   readonly rowsBySource: readonly Int32Array[];
+  readonly memory?: QueryMemoryContext;
 }
 
 interface JoinLookup {
@@ -195,9 +204,42 @@ export function columnarTableFromRows(
 export function prepareVectorQuery(
   plan: CompiledQuery,
   inputTables: ReadonlyMap<string, ColumnarTable>,
+  options: PrepareVectorQueryOptions = {},
 ): PreparedVectorQuery {
-  const bound = bindPlan(plan, inputTables);
-  return { execute: () => executeBoundPlan(bound) };
+  const rootMemory = options.memoryContext ?? new QueryMemoryContext();
+  const ownsRootMemory = options.memoryContext === undefined;
+  const retainedMemory = rootMemory.createChild();
+  try {
+    for (const table of new Set(inputTables.values())) {
+      retainedMemory.reserve(columnarTablePayloadBytes(table), `Columnar table ${table.name}`);
+    }
+    const bound = bindPlan(plan, inputTables, retainedMemory);
+    let closed = false;
+    return {
+      get memoryUsage() {
+        return rootMemory.usage;
+      },
+      execute() {
+        if (closed) throw new Error("Prepared vector query is closed");
+        const executionMemory = retainedMemory.createChild();
+        try {
+          return executeBoundPlan(bound, executionMemory);
+        } finally {
+          executionMemory.close();
+        }
+      },
+      close() {
+        if (closed) return;
+        closed = true;
+        retainedMemory.close();
+        if (ownsRootMemory) rootMemory.close();
+      },
+    };
+  } catch (error) {
+    retainedMemory.close();
+    if (ownsRootMemory) rootMemory.close();
+    throw error;
+  }
 }
 
 function createVector(input: ColumnarColumnInput): ColumnVector {
@@ -292,7 +334,31 @@ function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue {
   return code === NULL_STRING_CODE ? null : (vector.dictionary[code] ?? null);
 }
 
-function bindPlan(plan: CompiledQuery, tables: ReadonlyMap<string, ColumnarTable>): BoundPlan {
+function columnarTablePayloadBytes(table: ColumnarTable): number {
+  let total = 0;
+  for (const vector of table.columns.values()) {
+    total = safeMemorySum(total, vector.validity.byteLength, "Column vector payload");
+    if (vector.kind === "string") {
+      total = safeMemorySum(total, vector.codes.byteLength, "Column vector payload");
+      for (const value of vector.dictionary) {
+        total = safeMemorySum(
+          total,
+          vectorTextEncoder.encode(value).byteLength,
+          "String dictionary payload",
+        );
+      }
+    } else {
+      total = safeMemorySum(total, vector.values.byteLength, "Column vector payload");
+    }
+  }
+  return total;
+}
+
+function bindPlan(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, ColumnarTable>,
+  memory: QueryMemoryContext,
+): BoundPlan {
   const sources = [plan.base, ...plan.joins];
   const sourceTables = sources.map((source) => {
     const table = tables.get(source.table);
@@ -348,6 +414,7 @@ function bindPlan(plan: CompiledQuery, tables: ReadonlyMap<string, ColumnarTable
       probe,
       build,
       required(sourceTables[source], `JOIN table is missing: ${join.table}`),
+      memory,
     );
   });
 
@@ -463,14 +530,22 @@ function createBoundJoin(
   probe: BoundExpression,
   build: BoundExpression,
   table: ColumnarTable,
+  memory: QueryMemoryContext,
 ): BoundJoin {
-  return { kind, buildSource, probe, build, lookup: createJoinLookup(table, build, buildSource) };
+  return {
+    kind,
+    buildSource,
+    probe,
+    build,
+    lookup: createJoinLookup(table, build, buildSource, memory),
+  };
 }
 
 function createJoinLookup(
   table: ColumnarTable,
   expression: BoundExpression,
   source: number,
+  memory: QueryMemoryContext,
 ): JoinLookup {
   if (
     expression.kind === "column" &&
@@ -478,24 +553,36 @@ function createJoinLookup(
     expression.column === table.uniqueKey
   ) {
     const vector = table.columns.get(expression.column);
-    const direct = vector === undefined ? undefined : createDirectLookup(vector);
+    const direct = vector === undefined ? undefined : createDirectLookup(vector, memory);
     if (direct !== undefined) return direct;
   }
+  memory.reserve(
+    safeMemoryProduct(table.rowCount + 1, Int32Array.BYTES_PER_ELEMENT, "Hash join row indexes"),
+    `Hash join ${table.name}`,
+  );
   const firstRowByKey = new Map<unknown, number>();
   const duplicateRowsByKey = new Map<unknown, number[]>();
-  const rowBySource = new Int32Array(source + 1);
-  rowBySource.fill(-1);
-  for (let rowIndex = 0; rowIndex < table.rowCount; rowIndex += 1) {
-    rowBySource[source] = rowIndex;
-    const key = comparable(evaluateExpression(expression, rowBySource));
-    if (key === null || key === undefined) continue;
-    const firstRow = firstRowByKey.get(key);
-    if (firstRow === undefined) firstRowByKey.set(key, rowIndex);
-    else {
-      const rows = duplicateRowsByKey.get(key) ?? [firstRow];
-      rows.push(rowIndex);
-      duplicateRowsByKey.set(key, rows);
+  const buildScratch = memory.reserve(
+    safeMemoryProduct(source + 1, Int32Array.BYTES_PER_ELEMENT, "Hash join bind scratch"),
+    `Hash join ${table.name} bind scratch`,
+  );
+  try {
+    const rowBySource = new Int32Array(source + 1);
+    rowBySource.fill(-1);
+    for (let rowIndex = 0; rowIndex < table.rowCount; rowIndex += 1) {
+      rowBySource[source] = rowIndex;
+      const key = comparable(evaluateExpression(expression, rowBySource));
+      if (key === null || key === undefined) continue;
+      const firstRow = firstRowByKey.get(key);
+      if (firstRow === undefined) firstRowByKey.set(key, rowIndex);
+      else {
+        const rows = duplicateRowsByKey.get(key) ?? [firstRow];
+        rows.push(rowIndex);
+        duplicateRowsByKey.set(key, rows);
+      }
     }
+  } finally {
+    buildScratch.release();
   }
   const unique = duplicateRowsByKey.size === 0;
   const singleton = new Int32Array(1);
@@ -516,7 +603,10 @@ function createJoinLookup(
   };
 }
 
-function createDirectLookup(vector: ColumnVector): JoinLookup | undefined {
+function createDirectLookup(
+  vector: ColumnVector,
+  memory: QueryMemoryContext,
+): JoinLookup | undefined {
   if (vector.kind !== "number") return undefined;
   let minimum = Number.POSITIVE_INFINITY;
   let maximum = Number.NEGATIVE_INFINITY;
@@ -532,12 +622,19 @@ function createDirectLookup(vector: ColumnVector): JoinLookup | undefined {
   }
   const range = maximum - minimum + 1;
   if (range > Math.max(1_024, vector.length * 4) || range > 10_000_000) return undefined;
+  const reservation = memory.reserve(
+    safeMemoryProduct(range + 1, Int32Array.BYTES_PER_ELEMENT, "Direct join lookup"),
+    "Direct join lookup",
+  );
   const rowByKey = new Int32Array(range);
   rowByKey.fill(-1);
   for (let index = 0; index < vector.length; index += 1) {
     if (!isValid(vector.validity, index)) continue;
     const slot = (vector.values[index] ?? 0) - minimum;
-    if ((rowByKey[slot] ?? -1) !== -1) return undefined;
+    if ((rowByKey[slot] ?? -1) !== -1) {
+      reservation.release();
+      return undefined;
+    }
     rowByKey[slot] = index;
   }
   const singleton = new Int32Array(1);
@@ -560,7 +657,7 @@ function createDirectLookup(vector: ColumnVector): JoinLookup | undefined {
   };
 }
 
-function executeBoundPlan(plan: BoundPlan): QueryResult {
+function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryResult {
   const metadataCount = executeMetadataCount(plan);
   if (metadataCount !== undefined) return metadataCount;
   const groups = new NestedGroupMap<GroupState>();
@@ -569,12 +666,25 @@ function executeBoundPlan(plan: BoundPlan): QueryResult {
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
     const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
-    const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
-    const scan = sourceRows[plan.scanSource];
-    if (scan === undefined) continue;
-    for (let index = 0; index < length; index += 1) scan[index] = start + index;
-    const batch: BatchRows = { length, rowsBySource: sourceRows };
-    if (consumeJoinedBatches(plan, batch, 0, groups, output)) break;
+    const batchMemory = memory.createChild();
+    try {
+      batchMemory.reserve(
+        safeMemoryProduct(
+          safeMemoryProduct(plan.sourceTables.length, length, "Scan batch row-index count"),
+          Int32Array.BYTES_PER_ELEMENT,
+          "Scan batch row indexes",
+        ),
+        "Scan batch row indexes",
+      );
+      const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
+      const scan = sourceRows[plan.scanSource];
+      if (scan === undefined) continue;
+      for (let index = 0; index < length; index += 1) scan[index] = start + index;
+      const batch: BatchRows = { length, rowsBySource: sourceRows, memory: batchMemory };
+      if (consumeJoinedBatches(plan, batch, 0, groups, output, memory)) break;
+    } finally {
+      batchMemory.close();
+    }
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values()) : output;
   return finishResult(plan, rows);
@@ -621,14 +731,19 @@ function consumeJoinedBatches(
   joinIndex: number,
   groups: NestedGroupMap<GroupState>,
   output: QueryRow[],
+  memory: QueryMemoryContext,
 ): boolean {
   const join = plan.joins[joinIndex];
   if (join === undefined) {
     consumeBatch(plan, batch, groups, output);
     return reachedEarlyLimit(plan, output.length);
   }
-  for (const joined of joinBatches(plan, batch, join)) {
-    if (consumeJoinedBatches(plan, joined, joinIndex + 1, groups, output)) return true;
+  for (const joined of joinBatches(plan, batch, join, memory)) {
+    try {
+      if (consumeJoinedBatches(plan, joined, joinIndex + 1, groups, output, memory)) return true;
+    } finally {
+      joined.memory?.close();
+    }
   }
   return false;
 }
@@ -642,67 +757,139 @@ function reachedEarlyLimit(plan: BoundPlan, outputRows: number): boolean {
   );
 }
 
-function* joinBatches(plan: BoundPlan, input: BatchRows, join: BoundJoin): Generator<BatchRows> {
+function* joinBatches(
+  plan: BoundPlan,
+  input: BatchRows,
+  join: BoundJoin,
+  memory: QueryMemoryContext,
+): Generator<BatchRows> {
   if (join.lookup.unique) {
-    yield joinUniqueBatch(plan, input, join);
+    yield joinUniqueBatch(plan, input, join, memory);
     return;
   }
-  let outputRows = plan.sourceTables.map(() => [] as number[]);
-  for (let row = 0; row < input.length; row += 1) {
-    const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
-    const matches = probeKey === null ? [] : join.lookup.matches(probeKey);
-    if (matches.length === 0) {
-      if (join.kind === "left") appendJoinedRow(outputRows, input, row, join.buildSource, -1);
-    } else {
-      for (const buildRow of matches) {
-        appendJoinedRow(outputRows, input, row, join.buildSource, buildRow);
-        if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
-          yield materializeJoinedRows(outputRows);
-          outputRows = plan.sourceTables.map(() => [] as number[]);
+  const workspace = memory.reserve(
+    safeMemoryProduct(
+      safeMemoryProduct(
+        plan.sourceTables.length,
+        DEFAULT_BATCH_ROWS,
+        "Join fan-out workspace slots",
+      ),
+      8,
+      "Join fan-out workspace",
+    ),
+    "Join fan-out workspace",
+  );
+  try {
+    let outputRows = plan.sourceTables.map(() => [] as number[]);
+    for (let row = 0; row < input.length; row += 1) {
+      const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
+      const matches = probeKey === null ? [] : join.lookup.matches(probeKey);
+      if (matches.length === 0) {
+        if (join.kind === "left") appendJoinedRow(outputRows, input, row, join.buildSource, -1);
+      } else {
+        for (const buildRow of matches) {
+          appendJoinedRow(outputRows, input, row, join.buildSource, buildRow);
+          if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
+            yield materializeJoinedRows(outputRows, memory);
+            outputRows = plan.sourceTables.map(() => [] as number[]);
+          }
         }
       }
+      if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
+        yield materializeJoinedRows(outputRows, memory);
+        outputRows = plan.sourceTables.map(() => [] as number[]);
+      }
     }
-    if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
-      yield materializeJoinedRows(outputRows);
-      outputRows = plan.sourceTables.map(() => [] as number[]);
-    }
+    if ((outputRows[0]?.length ?? 0) > 0) yield materializeJoinedRows(outputRows, memory);
+  } finally {
+    workspace.release();
   }
-  if ((outputRows[0]?.length ?? 0) > 0) yield materializeJoinedRows(outputRows);
 }
 
-function materializeJoinedRows(outputRows: readonly number[][]): BatchRows {
-  return {
-    length: outputRows[0]?.length ?? 0,
-    rowsBySource: outputRows.map((rows) => Int32Array.from(rows)),
-  };
+function materializeJoinedRows(
+  outputRows: readonly number[][],
+  memory: QueryMemoryContext,
+): BatchRows {
+  const batchMemory = memory.createChild();
+  try {
+    const length = outputRows[0]?.length ?? 0;
+    batchMemory.reserve(
+      safeMemoryProduct(
+        safeMemoryProduct(outputRows.length, length, "Joined batch row-index count"),
+        Int32Array.BYTES_PER_ELEMENT,
+        "Joined batch row indexes",
+      ),
+      "Joined batch row indexes",
+    );
+    return {
+      length,
+      rowsBySource: outputRows.map((rows) => Int32Array.from(rows)),
+      memory: batchMemory,
+    };
+  } catch (error) {
+    batchMemory.close();
+    throw error;
+  }
 }
 
-function joinUniqueBatch(plan: BoundPlan, input: BatchRows, join: BoundJoin): BatchRows {
-  const selectedRows = new Uint32Array(input.length);
-  const buildRows = new Int32Array(input.length);
-  let outputLength = 0;
-  for (let row = 0; row < input.length; row += 1) {
-    const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
-    const buildRow = probeKey === null ? -1 : join.lookup.uniqueRow(probeKey);
-    if (buildRow < 0 && join.kind === "inner") continue;
-    selectedRows[outputLength] = row;
-    buildRows[outputLength] = buildRow;
-    outputLength += 1;
-  }
-  if (outputLength === input.length) {
-    const rowsBySource = [...input.rowsBySource];
-    rowsBySource[join.buildSource] = buildRows;
-    return { length: outputLength, rowsBySource };
-  }
-  const rowsBySource = input.rowsBySource.map((inputRows, source) => {
-    if (source === join.buildSource) return buildRows.slice(0, outputLength);
-    const outputRows = new Int32Array(outputLength);
-    for (let output = 0; output < outputLength; output += 1) {
-      outputRows[output] = inputRows[selectedRows[output] ?? 0] ?? -1;
+function joinUniqueBatch(
+  plan: BoundPlan,
+  input: BatchRows,
+  join: BoundJoin,
+  memory: QueryMemoryContext,
+): BatchRows {
+  const batchMemory = memory.createChild();
+  try {
+    const selectedReservation = batchMemory.reserve(
+      safeMemoryProduct(input.length, Uint32Array.BYTES_PER_ELEMENT, "Join selection vector"),
+      "Join selection vector",
+    );
+    const buildReservation = batchMemory.reserve(
+      safeMemoryProduct(input.length, Int32Array.BYTES_PER_ELEMENT, "Join build rows"),
+      "Join build rows",
+    );
+    const selectedRows = new Uint32Array(input.length);
+    const buildRows = new Int32Array(input.length);
+    let outputLength = 0;
+    for (let row = 0; row < input.length; row += 1) {
+      const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
+      const buildRow = probeKey === null ? -1 : join.lookup.uniqueRow(probeKey);
+      if (buildRow < 0 && join.kind === "inner") continue;
+      selectedRows[outputLength] = row;
+      buildRows[outputLength] = buildRow;
+      outputLength += 1;
     }
-    return outputRows;
-  });
-  return { length: outputLength, rowsBySource };
+    if (outputLength === input.length) {
+      selectedReservation.release();
+      const rowsBySource = [...input.rowsBySource];
+      rowsBySource[join.buildSource] = buildRows;
+      return { length: outputLength, rowsBySource, memory: batchMemory };
+    }
+    batchMemory.reserve(
+      safeMemoryProduct(
+        safeMemoryProduct(plan.sourceTables.length, outputLength, "Filtered join row-index count"),
+        Int32Array.BYTES_PER_ELEMENT,
+        "Filtered join row indexes",
+      ),
+      "Filtered join row indexes",
+    );
+    const rowsBySource = input.rowsBySource.map((inputRows, source) => {
+      const outputRows = new Int32Array(outputLength);
+      for (let output = 0; output < outputLength; output += 1) {
+        outputRows[output] =
+          source === join.buildSource
+            ? (buildRows[output] ?? -1)
+            : (inputRows[selectedRows[output] ?? 0] ?? -1);
+      }
+      return outputRows;
+    });
+    selectedReservation.release();
+    buildReservation.release();
+    return { length: outputLength, rowsBySource, memory: batchMemory };
+  } catch (error) {
+    batchMemory.close();
+    throw error;
+  }
 }
 
 function appendJoinedRow(
@@ -1057,6 +1244,22 @@ function asQueryValue(value: unknown): QueryValue {
 function required<T>(value: T | undefined, message: string): T {
   if (value === undefined) throw new Error(message);
   return value;
+}
+
+function safeMemorySum(left: number, right: number, label: string): number {
+  const total = left + right;
+  if (!Number.isSafeInteger(total) || total < 0) {
+    throw new RangeError(`${label} exceeds the safe integer range`);
+  }
+  return total;
+}
+
+function safeMemoryProduct(left: number, right: number, label: string): number {
+  const product = left * right;
+  if (!Number.isSafeInteger(product) || product < 0) {
+    throw new RangeError(`${label} exceeds the safe integer range`);
+  }
+  return product;
 }
 
 class NestedGroupMap<T> {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DatabaseRow } from "./database.js";
+import { QueryMemoryBudgetError } from "./memory.js";
 import {
   compileQuery,
   createPreparedColumnarQuery,
@@ -10,6 +11,74 @@ import {
 import { createColumnarTable } from "./vector.js";
 
 describe("vector query execution", () => {
+  it("accounts retained vectors and scan batches at an exact execution budget", () => {
+    const plan = compileQuery("SELECT id FROM rows ORDER BY id");
+    const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }]]]);
+    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 25 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 25, usedBytes: 17, peakBytes: 17 });
+    expect(prepared.execute()).toEqual({ columns: ["id"], rows: [{ id: 1 }, { id: 2 }] });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 25, usedBytes: 17, peakBytes: 25 });
+    prepared.close();
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 25, usedBytes: 0, peakBytes: 25 });
+
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 24 });
+    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
+    expect(below.memoryUsage).toEqual({ budgetBytes: 24, usedBytes: 17, peakBytes: 17 });
+    below.close();
+  });
+
+  it("accounts dictionary codes, validity, and UTF-8 dictionary payload", () => {
+    const plan = compileQuery("SELECT label FROM rows");
+    const tables = new Map<string, DatabaseRow[]>([
+      ["rows", [{ label: "é" }, { label: "é" }, { label: null }, { label: "x" }]],
+    ]);
+    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 36 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 36, usedBytes: 20, peakBytes: 20 });
+    expect(prepared.execute().rows).toEqual([
+      { label: "é" },
+      { label: "é" },
+      { label: null },
+      { label: "x" },
+    ]);
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 36, usedBytes: 20, peakBytes: 36 });
+    prepared.close();
+  });
+
+  it("releases temporary join reservations after success and budget failure", () => {
+    const plan = compileQuery(
+      "SELECT l.id, r.value FROM left_rows l JOIN right_rows r ON r.id = l.id ORDER BY l.id",
+    );
+    const tables = new Map<string, DatabaseRow[]>([
+      ["left_rows", [{ id: 1 }, { id: 2 }]],
+      [
+        "right_rows",
+        [
+          { id: 1, value: "one" },
+          { id: 2, value: "two" },
+        ],
+      ],
+    ]);
+    const measured = createPreparedQuery(plan, tables);
+    const retainedBytes = measured.memoryUsage.usedBytes;
+    measured.execute();
+    const peakBytes = measured.memoryUsage.peakBytes;
+    expect(peakBytes).toBeGreaterThan(retainedBytes);
+    expect(measured.memoryUsage.usedBytes).toBe(retainedBytes);
+    measured.close();
+
+    const below = createPreparedQuery(plan, tables, {
+      executionMemoryBudgetBytes: peakBytes - 1,
+    });
+    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
+    expect(below.memoryUsage.usedBytes).toBe(retainedBytes);
+    below.close();
+
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: peakBytes });
+    expect(exact.execute()).toEqual(executeRowQuery(plan, tables));
+    expect(exact.memoryUsage.peakBytes).toBe(peakBytes);
+    exact.close();
+  });
+
   it("builds typed vectors with explicit validity and dictionary contracts", () => {
     const firstDate = new Date("2025-01-01T00:00:00.000Z");
     const secondDate = new Date("2025-01-02T00:00:00.000Z");

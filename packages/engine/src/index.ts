@@ -9,5 +9,7 @@ export {
   type PreparedQuery,
   type QueryResult,
   type QueryRow,
+  type QueryExecutionOptions,
   type QueryValue,
 } from "./query.js";
+export { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";

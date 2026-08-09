@@ -6,6 +6,7 @@ import {
 } from "@browserdatabase/storage-idb";
 import { describe, expect, it } from "vitest";
 import { BrowserDatabase, type DatabaseRow } from "./database.js";
+import { QueryMemoryBudgetError } from "./memory.js";
 import { compileQuery, createPreparedQuery, executeQuery, executeRowQuery } from "./query.js";
 
 interface QueryStoreHarness {
@@ -120,6 +121,36 @@ describe("public SQL queries", () => {
     ]);
     prepared.close();
     expect(() => prepared.execute()).toThrow("Prepared query is closed");
+  });
+
+  it("applies the execution memory budget through BrowserDatabase query preparation", async () => {
+    const database = new BrowserDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await database.insertBatch("events", { columns: { value: [1, 2, 3] } });
+    const sql = "SELECT value FROM events WHERE value >= 2 ORDER BY value";
+    const measured = await database.prepareQuery(sql);
+    const retainedBytes = measured.memoryUsage.usedBytes;
+    expect(measured.execute().rows).toEqual([{ value: 2 }, { value: 3 }]);
+    const peakBytes = measured.memoryUsage.peakBytes;
+    measured.close();
+
+    await expect(
+      database.prepareQuery(sql, { executionMemoryBudgetBytes: retainedBytes - 1 }),
+    ).rejects.toThrow(QueryMemoryBudgetError);
+    const below = await database.prepareQuery(sql, {
+      executionMemoryBudgetBytes: peakBytes - 1,
+    });
+    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
+    expect(below.memoryUsage.usedBytes).toBe(retainedBytes);
+    below.close();
+
+    const exact = await database.prepareQuery(sql, { executionMemoryBudgetBytes: peakBytes });
+    expect(exact.execute().rows).toEqual([{ value: 2 }, { value: 3 }]);
+    expect(exact.memoryUsage.peakBytes).toBe(peakBytes);
+    exact.close();
   });
 
   it("implements left joins and SQL null comparison semantics", () => {

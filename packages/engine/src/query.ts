@@ -1,4 +1,5 @@
 import type { DatabaseRow } from "./database.js";
+import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import {
   columnarTableFromRows,
   prepareVectorQuery,
@@ -17,8 +18,18 @@ export interface QueryResult {
 export interface PreparedQuery {
   readonly sql: string;
   readonly tables: string[];
+  /** Current and high-water byte counts for the documented modeled query-memory scope. */
+  readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
   close(): void;
+}
+
+export interface QueryExecutionOptions {
+  /**
+   * Bounds the modeled vector payload and row-index buffers. This is not a total JavaScript heap
+   * limit; input preparation, object/hash overhead, group/order state, and result rows are excluded.
+   */
+  readonly executionMemoryBudgetBytes?: number;
 }
 
 export type BinaryOperator = "+" | "-" | "*" | "/";
@@ -140,32 +151,52 @@ export function referencedColumns(
 export function createPreparedQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
+  options: QueryExecutionOptions = {},
 ): PreparedQuery {
   validateGrouping(plan);
+  const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
   if ([...tables.values()].some((rows) => rows.length === 0)) {
-    return createPreparedRowQuery(plan, tables);
+    return createPreparedRowQuery(plan, tables, memory);
   }
-  return createPreparedColumnarQuery(plan, normalizeColumnarTables(plan, tables));
+  try {
+    return createPreparedColumnarQuery(plan, normalizeColumnarTables(plan, tables), memory);
+  } catch (error) {
+    memory.close();
+    throw error;
+  }
 }
 
 /** Internal columnar entry point used after BrowserDatabase materializes a stable snapshot. */
 export function createPreparedColumnarQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
+  memory: QueryMemoryContext = new QueryMemoryContext(),
 ): PreparedQuery {
   validateGrouping(plan);
   let closed = false;
-  let prepared: PreparedVectorQuery | undefined = prepareVectorQuery(plan, tables);
+  let prepared: PreparedVectorQuery | undefined;
+  try {
+    prepared = prepareVectorQuery(plan, tables, { memoryContext: memory });
+  } catch (error) {
+    memory.close();
+    throw error;
+  }
   return {
     sql: plan.sql,
     tables: [plan.base.table, ...plan.joins.map((join) => join.table)],
+    get memoryUsage() {
+      return memory.usage;
+    },
     execute() {
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
       return prepared.execute();
     },
     close() {
+      if (closed) return;
       closed = true;
+      prepared?.close();
       prepared = undefined;
+      memory.close();
     },
   };
 }
@@ -173,12 +204,16 @@ export function createPreparedColumnarQuery(
 function createPreparedRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
+  memory: QueryMemoryContext,
 ): PreparedQuery {
   let closed = false;
   let rows: ReadonlyMap<string, DatabaseRow[]> | undefined = cloneRowTables(tables);
   return {
     sql: plan.sql,
     tables: [plan.base.table, ...plan.joins.map((join) => join.table)],
+    get memoryUsage() {
+      return memory.usage;
+    },
     execute() {
       if (closed || rows === undefined) throw new Error("Prepared query is closed");
       return executeRowQuery(plan, cloneRowTables(rows));
@@ -186,6 +221,7 @@ function createPreparedRowQuery(
     close() {
       closed = true;
       rows = undefined;
+      memory.close();
     },
   };
 }
@@ -211,12 +247,14 @@ function cloneRowTables(
 export function executeQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
+  options: QueryExecutionOptions = {},
 ): QueryResult {
-  validateGrouping(plan);
-  if ([...tables.values()].some((rows) => rows.length === 0)) {
-    return executeRowQuery(plan, tables);
+  const prepared = createPreparedQuery(plan, tables, options);
+  try {
+    return prepared.execute();
+  } finally {
+    prepared.close();
   }
-  return prepareVectorQuery(plan, normalizeColumnarTables(plan, tables)).execute();
 }
 
 function normalizeColumnarTables(
