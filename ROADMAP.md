@@ -298,10 +298,11 @@ typed-vector payloads plus scan, selection, join row-index, and chunked fan-out 
 release against the shared budget. Exact-boundary tests cover success, pre-allocation rejection, and
 cleanup after both success and failure.
 
-Phase 7B-B extends the same context to growing group and output state. Group entries reserve logical
-key payload and fixed aggregate slots, retained `MIN`/`MAX` values replace their reservations, result
-construction reserves row-reference plus tagged scalar payload, and ordering/limit reserve modeled
-row-reference workspaces. Exact-boundary tests cover grouped string state, accumulated results,
+Phase 7B-B extends the same context to growing group and output state. Counts and sums live in typed
+numeric arrays rather than boxed accumulator objects. Group entries reserve logical key payload and
+fixed aggregate slots, retained `MIN`/`MAX` values replace their reservations, and result construction
+reserves row-reference plus tagged scalar payload. Ordering uses an explicit stable typed-index
+merge/cycle sort with fully reserved scratch; LIMIT truncates in place. Exact-boundary tests cover grouped string state, accumulated results,
 ordering, limiting, failure atomicity, and cleanup.
 
 Phase 7C-A replaces the nested JavaScript grouping maps with an insertion-ordered byte key index.
@@ -321,8 +322,8 @@ row/vector parity.
 
 Phase 7 remains open. Preparation still materializes every projected typed input column in full before
 the modeled reservations take effect, and mutation replay can temporarily retain a typed slot
-workspace plus its compacted output. Boxed aggregate/result objects, property and JavaScript
-array-capacity overhead, sort implementation scratch, encoding temporaries, caller-owned
+workspace plus its compacted output. Returned result objects, group-key and retained aggregate
+reference containers, property and JavaScript array-capacity overhead, encoding temporaries, caller-owned
 result lifetime, and allocator overhead are not counted; there is no spill path. Configured exhaustion
 fails instead of spilling, while the default remains effectively unbounded. Phase 7A/B/C-A also do not
 perform segment or row-group data skipping. Later Phase 7 work must stream inputs, replace the

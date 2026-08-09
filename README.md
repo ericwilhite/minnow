@@ -164,10 +164,12 @@ fan-out buffers. A reservation that would exceed the configured budget throws
 state reserves before it is retained by the operator. Temporary reservations are released after each
 execution, including failures, and `close()` releases retained reservations.
 
-Phase 7B-B extends that model to cardinality-growing operators. Each group reserves a modeled entry
-containing its logical key payload and fixed aggregate slots; retained `MIN`/`MAX` values replace their
-own reservations atomically. Accumulated output reserves a row-reference slot plus tagged logical
-scalar payload, and `ORDER BY`/`LIMIT` reserve their modeled row-reference workspaces. These bytes
+Phase 7B-B extends that model to cardinality-growing operators. Aggregate counts and sums use typed
+numeric arrays instead of per-aggregate objects; each group reserves its logical key payload and
+fixed aggregate slots, while retained `MIN`/`MAX` values replace their own reservations atomically.
+Accumulated output reserves a row-reference slot plus tagged logical scalar payload. `ORDER BY` uses
+an explicit stable merge/cycle sort whose two `Uint32Array` indexes and visited bitmap are reserved
+before allocation, and `LIMIT` truncates the owned result array in place. These bytes
 contribute to `peakBytes` and are released when execution returns ownership of the `QueryResult`.
 
 Phase 7C-A replaces the grouped executor's nested JavaScript `Map` tree with a byte-addressable key
@@ -189,8 +191,8 @@ direct typed lookup fast path.
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected typed input in full before the vector reservation is installed;
 mutation replay can temporarily retain both its typed slot workspace and compacted output. The model
-does not include aggregate/result objects, properties, or JavaScript
-array-capacity overhead; the sort implementation's internal scratch;
+does not include returned result objects, properties, group-key and retained `MIN`/`MAX` reference
+containers, or JavaScript array-capacity overhead;
 encoding/accounting temporaries; the lifetime of returned rows after ownership transfers to the
 caller; or engine/browser allocator overhead. Configured exhaustion fails the query instead of
 spilling. It also performs no statistics-driven segment or row-group data skipping. Phase 7 remains

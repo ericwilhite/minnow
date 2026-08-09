@@ -125,16 +125,12 @@ interface AggregateSpec {
   readonly argument: BoundExpression;
 }
 
-interface AggregateAccumulator {
-  count: number;
-  value: QueryValue | undefined;
-  valueReservation?: QueryMemoryReservation;
-  sum: number;
-}
-
 interface GroupState {
   readonly groupValues: QueryValue[];
-  readonly aggregates: AggregateAccumulator[];
+  readonly counts: Float64Array;
+  readonly sums: Float64Array;
+  readonly values: Array<QueryValue | undefined>;
+  readonly valueReservations: Array<QueryMemoryReservation | undefined>;
 }
 
 interface BoundPlan {
@@ -688,7 +684,7 @@ function executeMetadataCount(
   }
   const state = createGroupState([], plan, memory);
   const rowCount = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-  for (const accumulator of state.aggregates) accumulator.count = rowCount;
+  state.counts.fill(rowCount);
   return finishResult(plan, finishGroups(plan, [state], memory), memory);
 }
 
@@ -697,31 +693,24 @@ function finishResult(
   inputRows: QueryRow[],
   memory: QueryMemoryContext,
 ): QueryResult {
-  let rows = inputRows;
+  const rows = inputRows;
   if (plan.orderBy.length > 0) {
     const ordering = memory.reserve(
-      safeMemoryProduct(rows.length, QUERY_REFERENCE_BYTES, "Ordering row references"),
-      "Ordering row references",
+      safeMemoryProduct(
+        rows.length,
+        Uint32Array.BYTES_PER_ELEMENT * 2 + Uint8Array.BYTES_PER_ELEMENT,
+        "Ordering typed scratch",
+      ),
+      "Ordering typed scratch",
     );
     try {
-      rows.sort((left, right) => {
-        for (const order of plan.orderBy) {
-          const comparison = compareValues(left[order.outputName], right[order.outputName]);
-          if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
-        }
-        return 0;
-      });
+      stableSortRows(rows, plan.orderBy);
     } finally {
       ordering.release();
     }
   }
   if (plan.limit !== undefined) {
-    const limitedLength = Math.min(plan.limit, rows.length);
-    memory.reserve(
-      safeMemoryProduct(limitedLength, QUERY_REFERENCE_BYTES, "LIMIT row references"),
-      "LIMIT row references",
-    );
-    rows = rows.slice(0, plan.limit);
+    rows.length = Math.min(plan.limit, rows.length);
   }
   const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
   return { columns, rows };
@@ -973,7 +962,10 @@ function createGroupState(
   memory.reserve(payloadBytes, "Group state");
   return {
     groupValues,
-    aggregates: plan.aggregates.map(() => ({ count: 0, value: undefined, sum: 0 })),
+    counts: new Float64Array(plan.aggregates.length),
+    sums: new Float64Array(plan.aggregates.length),
+    values: new Array<QueryValue | undefined>(plan.aggregates.length),
+    valueReservations: new Array<QueryMemoryReservation | undefined>(plan.aggregates.length),
   };
 }
 
@@ -986,38 +978,38 @@ function updateAggregates(
 ): void {
   for (let index = 0; index < plan.aggregates.length; index += 1) {
     const spec = required(plan.aggregates[index], "Aggregate specification is missing");
-    const accumulator = required(state.aggregates[index], "Aggregate accumulator is missing");
     const value =
       spec.argument.kind === "wildcard"
         ? 1
         : evaluateBatchExpression(plan, spec.argument, batch, row);
     if (value === null || value === undefined) continue;
-    accumulator.count += 1;
-    if (spec.name === "SUM" || spec.name === "AVG") accumulator.sum += numeric(value);
-    else if (
+    state.counts[index] = (state.counts[index] ?? 0) + 1;
+    if (spec.name === "SUM" || spec.name === "AVG") {
+      state.sums[index] = (state.sums[index] ?? 0) + numeric(value);
+    } else if (
       spec.name === "MIN" &&
-      (accumulator.value === undefined || compareValues(value, accumulator.value) < 0)
+      (state.values[index] === undefined || compareValues(value, state.values[index]) < 0)
     ) {
       const replacementValue = asQueryValue(value);
       const replacement = memory.reserve(
         queryValuePayloadBytes(replacementValue),
         "MIN aggregate value",
       );
-      accumulator.valueReservation?.release();
-      accumulator.valueReservation = replacement;
-      accumulator.value = replacementValue;
+      state.valueReservations[index]?.release();
+      state.valueReservations[index] = replacement;
+      state.values[index] = replacementValue;
     } else if (
       spec.name === "MAX" &&
-      (accumulator.value === undefined || compareValues(value, accumulator.value) > 0)
+      (state.values[index] === undefined || compareValues(value, state.values[index]) > 0)
     ) {
       const replacementValue = asQueryValue(value);
       const replacement = memory.reserve(
         queryValuePayloadBytes(replacementValue),
         "MAX aggregate value",
       );
-      accumulator.valueReservation?.release();
-      accumulator.valueReservation = replacement;
-      accumulator.value = replacementValue;
+      state.valueReservations[index]?.release();
+      state.valueReservations[index] = replacement;
+      state.values[index] = replacementValue;
     }
   }
 }
@@ -1072,13 +1064,15 @@ function evaluateFinalExpression(
         : numeric(evaluateFinalExpression(plan, expression.arguments[1], group)),
     );
   }
-  const accumulator = group.aggregates[expression.aggregateIndex ?? -1];
-  if (accumulator === undefined) throw new Error("Aggregate state is missing");
-  if (expression.name === "COUNT") return accumulator.count;
-  if (accumulator.count === 0) return null;
-  if (expression.name === "SUM") return accumulator.sum;
-  if (expression.name === "AVG") return accumulator.sum / accumulator.count;
-  return accumulator.value ?? null;
+  const aggregateIndex = expression.aggregateIndex ?? -1;
+  const count = group.counts[aggregateIndex];
+  if (count === undefined) throw new Error("Aggregate state is missing");
+  if (expression.name === "COUNT") return count;
+  if (count === 0) return null;
+  const sum = group.sums[aggregateIndex] ?? 0;
+  if (expression.name === "SUM") return sum;
+  if (expression.name === "AVG") return sum / count;
+  return group.values[aggregateIndex] ?? null;
 }
 
 function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryRow {
@@ -1259,6 +1253,65 @@ function groupKey(value: unknown): GroupIndexKey {
     return comparableValue;
   }
   throw new TypeError("Group keys must be SQL scalar values");
+}
+
+function stableSortRows(
+  rows: QueryRow[],
+  orderBy: ReadonlyArray<{ outputName: string; direction: "asc" | "desc" }>,
+): void {
+  if (rows.length > 0xffffffff) throw new RangeError("Too many rows to order");
+  const indexes = new Uint32Array(rows.length);
+  const scratch = new Uint32Array(rows.length);
+  for (let index = 0; index < indexes.length; index += 1) indexes[index] = index;
+  let source = indexes;
+  let target = scratch;
+  const compareIndexes = (leftIndex: number, rightIndex: number): number => {
+    const left = required(rows[leftIndex], "Ordering row is missing");
+    const right = required(rows[rightIndex], "Ordering row is missing");
+    for (const order of orderBy) {
+      const comparison = compareValues(left[order.outputName], right[order.outputName]);
+      if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
+    }
+    return 0;
+  };
+  for (let width = 1; width < rows.length; width *= 2) {
+    for (let start = 0; start < rows.length; start += width * 2) {
+      const middle = Math.min(start + width, rows.length);
+      const end = Math.min(start + width * 2, rows.length);
+      let left = start;
+      let right = middle;
+      for (let output = start; output < end; output += 1) {
+        if (
+          right >= end ||
+          (left < middle && compareIndexes(source[left] ?? 0, source[right] ?? 0) <= 0)
+        ) {
+          target[output] = source[left] ?? 0;
+          left += 1;
+        } else {
+          target[output] = source[right] ?? 0;
+          right += 1;
+        }
+      }
+    }
+    [source, target] = [target, source];
+  }
+  if (source !== indexes) indexes.set(source);
+
+  const visited = new Uint8Array(rows.length);
+  for (let start = 0; start < rows.length; start += 1) {
+    if (visited[start] === 1) continue;
+    const first = required(rows[start], "Ordering row is missing");
+    let output = start;
+    let input = indexes[output] ?? start;
+    while (input !== start) {
+      visited[output] = 1;
+      rows[output] = required(rows[input], "Ordering row is missing");
+      output = input;
+      input = indexes[output] ?? start;
+    }
+    visited[output] = 1;
+    rows[output] = first;
+  }
 }
 
 function compareValues(left: unknown, right: unknown): number {

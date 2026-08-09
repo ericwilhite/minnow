@@ -14,16 +14,16 @@ describe("vector query execution", () => {
   it("accounts retained vectors, scan batches, results, and ordering at an exact budget", () => {
     const plan = compileQuery("SELECT id FROM rows ORDER BY id");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }]]]);
-    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 67 });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 67, usedBytes: 17, peakBytes: 17 });
+    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 69 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 69, usedBytes: 17, peakBytes: 17 });
     expect(prepared.execute()).toEqual({ columns: ["id"], rows: [{ id: 1 }, { id: 2 }] });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 67, usedBytes: 17, peakBytes: 67 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 69, usedBytes: 17, peakBytes: 69 });
     prepared.close();
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 67, usedBytes: 0, peakBytes: 67 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 69, usedBytes: 0, peakBytes: 69 });
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 66 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 68 });
     expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
-    expect(below.memoryUsage).toEqual({ budgetBytes: 66, usedBytes: 17, peakBytes: 59 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 68, usedBytes: 17, peakBytes: 59 });
     below.close();
   });
 
@@ -66,10 +66,10 @@ describe("vector query execution", () => {
       ],
     };
 
-    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 451 });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 451, usedBytes: 40, peakBytes: 40 });
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 454 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 454, usedBytes: 40, peakBytes: 40 });
     expect(exact.execute()).toEqual(expected);
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 451, usedBytes: 40, peakBytes: 451 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 454, usedBytes: 40, peakBytes: 454 });
     exact.close();
 
     const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 367 });
@@ -100,7 +100,7 @@ describe("vector query execution", () => {
     expect(resultBelow.memoryUsage).toEqual({ budgetBytes: 378, usedBytes: 40, peakBytes: 368 });
     resultBelow.close();
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 450 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 453 });
     let orderingFailure: unknown;
     try {
       below.execute();
@@ -109,21 +109,21 @@ describe("vector query execution", () => {
     }
     expect(orderingFailure).toMatchObject({
       name: "QueryMemoryBudgetError",
-      label: "Ordering row references",
+      label: "Ordering typed scratch",
     });
-    expect(below.memoryUsage).toEqual({ budgetBytes: 450, usedBytes: 40, peakBytes: 427 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 453, usedBytes: 40, peakBytes: 427 });
     below.close();
   });
 
-  it("accounts the returned LIMIT reference slice after early result accumulation", () => {
+  it("applies LIMIT in place without allocating a second boxed reference slice", () => {
     const plan = compileQuery("SELECT id FROM rows LIMIT 2");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }, { id: 3 }]]]);
-    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 75 });
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 71 });
     expect(exact.execute().rows).toEqual([{ id: 1 }, { id: 2 }]);
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 75, usedBytes: 25, peakBytes: 75 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 71, usedBytes: 25, peakBytes: 71 });
     exact.close();
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 74 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 70 });
     let failure: unknown;
     try {
       below.execute();
@@ -132,9 +132,9 @@ describe("vector query execution", () => {
     }
     expect(failure).toMatchObject({
       name: "QueryMemoryBudgetError",
-      label: "LIMIT row references",
+      label: "Accumulated result row",
     });
-    expect(below.memoryUsage).toEqual({ budgetBytes: 74, usedBytes: 25, peakBytes: 71 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 70, usedBytes: 25, peakBytes: 54 });
     below.close();
   });
 

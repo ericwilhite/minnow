@@ -426,11 +426,12 @@ temporary reservations after every execution path; the prepared query retains it
 indexes until `close()`. Public options set `executionMemoryBudgetBytes`, `memoryUsage` exposes the
 current/peak model, and failed reservations throw `QueryMemoryBudgetError` without changing usage.
 
-Phase 7B-B uses the same execution child for cardinality-growing state. A group entry models one
-row-reference slot, tagged logical key payload, and three fixed eight-byte slots per accumulator;
-retained `MIN`/`MAX` payloads are separately replaceable. Accumulated output models one row-reference
-slot plus tagged logical scalar payload. In-place ordering reserves a modeled row-reference scratch
-set, and `LIMIT` reserves the returned reference slice. Those reservations participate in the peak
+Phase 7B-B uses the same execution child for cardinality-growing state. Counts and sums occupy typed
+numeric arrays instead of per-aggregate objects. A group entry models one row-reference slot, tagged
+logical key payload, and three fixed eight-byte slots per accumulator; retained `MIN`/`MAX` payloads
+are separately replaceable. Accumulated output models one row-reference slot plus tagged logical
+scalar payload. Stable ordering uses two reserved `Uint32Array` merge indexes plus a visited bitmap
+to reorder rows in place, and `LIMIT` truncates that owned array without a second reference slice. Those reservations participate in the peak
 while execution owns them and are released when the result transfers to the caller.
 
 Phase 7C-A makes grouping-key lookup physically accountable. A canonical encoder writes null,
@@ -452,9 +453,9 @@ typed lookup. Growth follows the same reserve-new, copy, release-old high-water 
 
 This slice still does not satisfy the bounded-memory target. Whole projected typed columns are
 materialized before vector accounting begins, and mutation replay can retain both a typed slot
-workspace and compacted output. The model excludes boxed
-aggregate/result objects, property and JavaScript array-capacity overhead,
-sort-implementation scratch, encoding/accounting temporaries, caller-owned result lifetime, and
+workspace and compacted output. The model excludes returned result objects, group-key and retained
+aggregate reference containers, property and JavaScript array-capacity overhead,
+encoding/accounting temporaries, caller-owned result lifetime, and
 browser allocator overhead. Exhaustion throws instead of spilling, and the public result remains
 materialized under the current API contract.
 
