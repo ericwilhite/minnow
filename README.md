@@ -152,16 +152,30 @@ Phase 7B-A adds a deliberately scoped query-memory model. `query()` and `prepare
 `memoryUsage`. The model reserves retained typed-vector payloads (including validity, codes, and UTF-8
 dictionary bytes), join row indexes, scan row-index batches, selection/build arrays, and chunked join
 fan-out buffers. A reservation that would exceed the configured budget throws
-`QueryMemoryBudgetError` before allocating the modeled executor buffer. Temporary reservations are
-released after each execution, including failures, and `close()` releases retained reservations.
+`QueryMemoryBudgetError`; typed executor buffers reserve before allocation, and logical group/result
+state reserves before it is retained by the operator. Temporary reservations are released after each
+execution, including failures, and `close()` releases retained reservations.
+
+Phase 7B-B extends that model to cardinality-growing operators. Each group reserves a modeled entry
+containing its logical key payload and fixed aggregate slots; retained `MIN`/`MAX` values replace their
+own reservations atomically. Accumulated output reserves a row-reference slot plus tagged logical
+scalar payload, and `ORDER BY`/`LIMIT` reserve their modeled row-reference workspaces. These bytes
+contribute to `peakBytes` and are released when execution returns ownership of the `QueryResult`.
 
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected input in full before the vector reservation is installed. The model
-does not include boxed preparation values, JavaScript `Map`/object/array overhead, grouped aggregate
-state, ordering buffers, returned row objects, or engine/browser allocator overhead. Those states can
-still grow with query cardinality, and there is no spill path. It also performs no statistics-driven
-segment or row-group data skipping. Phase 7 remains open for streaming inputs, complete operator
-accounting, and spill; Phase 8 remains open for pruning and late materialization.
+does not include boxed preparation values; JavaScript `Map`, object, property, or array-capacity
+overhead; the sort implementation's internal scratch; encoding/accounting temporaries; the lifetime
+of returned rows after ownership transfers to the caller; or engine/browser allocator overhead.
+Configured exhaustion fails the query instead of spilling. It also performs no statistics-driven
+segment or row-group data skipping. Phase 7 remains open for streaming inputs, byte-addressable
+operator containers, complete physical accounting, and spill; Phase 8 remains open for pruning and
+late materialization.
+
+The exported row-array helper retains a compatibility oracle for schema-less empty inputs. Because it
+cannot construct typed empty vectors without column types, that fallback rejects an explicit memory
+budget instead of silently bypassing it. `BrowserDatabase` knows catalog types and supports budgeted
+queries over empty tables through the columnar path.
 
 Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records an
 immutable physical rewrite plan. Append-only inputs use `rechunk-v1`, which fixes the ordered

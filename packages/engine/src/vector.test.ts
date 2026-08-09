@@ -11,19 +11,19 @@ import {
 import { createColumnarTable } from "./vector.js";
 
 describe("vector query execution", () => {
-  it("accounts retained vectors and scan batches at an exact execution budget", () => {
+  it("accounts retained vectors, scan batches, results, and ordering at an exact budget", () => {
     const plan = compileQuery("SELECT id FROM rows ORDER BY id");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }]]]);
-    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 25 });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 25, usedBytes: 17, peakBytes: 17 });
+    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 67 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 67, usedBytes: 17, peakBytes: 17 });
     expect(prepared.execute()).toEqual({ columns: ["id"], rows: [{ id: 1 }, { id: 2 }] });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 25, usedBytes: 17, peakBytes: 25 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 67, usedBytes: 17, peakBytes: 67 });
     prepared.close();
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 25, usedBytes: 0, peakBytes: 25 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 67, usedBytes: 0, peakBytes: 67 });
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 24 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 66 });
     expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
-    expect(below.memoryUsage).toEqual({ budgetBytes: 24, usedBytes: 17, peakBytes: 17 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 66, usedBytes: 17, peakBytes: 59 });
     below.close();
   });
 
@@ -32,16 +32,135 @@ describe("vector query execution", () => {
     const tables = new Map<string, DatabaseRow[]>([
       ["rows", [{ label: "é" }, { label: "é" }, { label: null }, { label: "x" }]],
     ]);
-    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 36 });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 36, usedBytes: 20, peakBytes: 20 });
+    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 77 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 77, usedBytes: 20, peakBytes: 20 });
     expect(prepared.execute().rows).toEqual([
       { label: "é" },
       { label: "é" },
       { label: null },
       { label: "x" },
     ]);
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 36, usedBytes: 20, peakBytes: 36 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 77, usedBytes: 20, peakBytes: 77 });
     prepared.close();
+  });
+
+  it("accounts group state, aggregate values, result rows, ordering, and LIMIT buffers", () => {
+    const plan = compileQuery(
+      "SELECT category, COUNT(*) AS count, MAX(label) AS max_label FROM rows GROUP BY category ORDER BY category LIMIT 2",
+    );
+    const tables = new Map<string, DatabaseRow[]>([
+      [
+        "rows",
+        [
+          { category: "a", label: "one" },
+          { category: "b", label: "two" },
+          { category: "c", label: "three" },
+        ],
+      ],
+    ]);
+    const expected = {
+      columns: ["category", "count", "max_label"],
+      rows: [
+        { category: "a", count: 1, max_label: "one" },
+        { category: "b", count: 1, max_label: "two" },
+      ],
+    };
+
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 323 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 323, usedBytes: 40, peakBytes: 40 });
+    expect(exact.execute()).toEqual(expected);
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 323, usedBytes: 40, peakBytes: 323 });
+    exact.close();
+
+    const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 239 });
+    let groupFailure: unknown;
+    try {
+      groupBelow.execute();
+    } catch (error) {
+      groupFailure = error;
+    }
+    expect(groupFailure).toMatchObject({
+      name: "QueryMemoryBudgetError",
+      label: "MAX aggregate value",
+    });
+    expect(groupBelow.memoryUsage).toEqual({ budgetBytes: 239, usedBytes: 40, peakBytes: 234 });
+    groupBelow.close();
+
+    const resultBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 250 });
+    let resultFailure: unknown;
+    try {
+      resultBelow.execute();
+    } catch (error) {
+      resultFailure = error;
+    }
+    expect(resultFailure).toMatchObject({
+      name: "QueryMemoryBudgetError",
+      label: "Accumulated grouped result row",
+    });
+    expect(resultBelow.memoryUsage).toEqual({ budgetBytes: 250, usedBytes: 40, peakBytes: 240 });
+    resultBelow.close();
+
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 322 });
+    let orderingFailure: unknown;
+    try {
+      below.execute();
+    } catch (error) {
+      orderingFailure = error;
+    }
+    expect(orderingFailure).toMatchObject({
+      name: "QueryMemoryBudgetError",
+      label: "Ordering row references",
+    });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 322, usedBytes: 40, peakBytes: 299 });
+    below.close();
+  });
+
+  it("accounts the returned LIMIT reference slice after early result accumulation", () => {
+    const plan = compileQuery("SELECT id FROM rows LIMIT 2");
+    const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }, { id: 3 }]]]);
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 75 });
+    expect(exact.execute().rows).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 75, usedBytes: 25, peakBytes: 75 });
+    exact.close();
+
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 74 });
+    let failure: unknown;
+    try {
+      below.execute();
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      name: "QueryMemoryBudgetError",
+      label: "LIMIT row references",
+    });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 74, usedBytes: 25, peakBytes: 71 });
+    below.close();
+  });
+
+  it("replaces retained aggregate payload reservations instead of accumulating old values", () => {
+    const plan = compileQuery("SELECT MAX(label) AS maximum FROM rows");
+    const tables = new Map<string, DatabaseRow[]>([
+      ["rows", [{ label: "a" }, { label: "bb" }, { label: "ccc" }]],
+    ]);
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 70 });
+    expect(exact.execute()).toEqual({ columns: ["maximum"], rows: [{ maximum: "ccc" }] });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 70, usedBytes: 19, peakBytes: 70 });
+    exact.close();
+
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 69 });
+    let failure: unknown;
+    try {
+      below.execute();
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      name: "QueryMemoryBudgetError",
+      label: "MAX aggregate value",
+    });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 69, usedBytes: 19, peakBytes: 68 });
+    below.close();
   });
 
   it("releases temporary join reservations after success and budget failure", () => {
@@ -157,6 +276,15 @@ describe("vector query execution", () => {
       columns: ["value"],
       rows: [],
     });
+  });
+
+  it("rejects a modeled budget when schema-less empty row inputs require the oracle fallback", () => {
+    const plan = compileQuery("SELECT value FROM rows");
+    expect(() =>
+      createPreparedQuery(plan, new Map<string, DatabaseRow[]>([["rows", []]]), {
+        executionMemoryBudgetBytes: 1_024,
+      }),
+    ).toThrow("Query memory budgets require typed columnar schemas when an input table is empty");
   });
 
   it("does not validate unused heterogeneous row-adapter columns", () => {

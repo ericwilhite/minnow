@@ -18,7 +18,10 @@ export interface QueryResult {
 export interface PreparedQuery {
   readonly sql: string;
   readonly tables: string[];
-  /** Current and high-water byte counts for the documented modeled query-memory scope. */
+  /**
+   * Current retained and high-water byte counts for the documented modeled query-memory scope.
+   * Result-construction bytes affect the peak but transfer out of the context when execute returns.
+   */
   readonly memoryUsage: QueryMemoryUsage;
   execute(): QueryResult;
   close(): void;
@@ -26,8 +29,10 @@ export interface PreparedQuery {
 
 export interface QueryExecutionOptions {
   /**
-   * Bounds the modeled vector payload and row-index buffers. This is not a total JavaScript heap
-   * limit; input preparation, object/hash overhead, group/order state, and result rows are excluded.
+   * Bounds the modeled vector, row-index, group/result payload, and ordering buffers. This is not a
+   * total JavaScript heap limit; input preparation, container/allocator overhead, and returned-result
+   * lifetime are excluded. The schema-less empty-table row adapter rejects configured budgets;
+   * BrowserDatabase retains catalog types and does not use that fallback.
    */
   readonly executionMemoryBudgetBytes?: number;
 }
@@ -156,6 +161,12 @@ export function createPreparedQuery(
   validateGrouping(plan);
   const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
   if ([...tables.values()].some((rows) => rows.length === 0)) {
+    if (options.executionMemoryBudgetBytes !== undefined) {
+      memory.close();
+      throw new TypeError(
+        "Query memory budgets require typed columnar schemas when an input table is empty",
+      );
+    }
     return createPreparedRowQuery(plan, tables, memory);
   }
   try {

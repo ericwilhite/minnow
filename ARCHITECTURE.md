@@ -416,21 +416,28 @@ temporary reservations after every execution path; the prepared query retains it
 indexes until `close()`. Public options set `executionMemoryBudgetBytes`, `memoryUsage` exposes the
 current/peak model, and failed reservations throw `QueryMemoryBudgetError` without changing usage.
 
+Phase 7B-B uses the same execution child for cardinality-growing state. A group entry models one
+row-reference slot, tagged logical key payload, and three fixed eight-byte slots per accumulator;
+retained `MIN`/`MAX` payloads are separately replaceable. Accumulated output models one row-reference
+slot plus tagged logical scalar payload. In-place ordering reserves a modeled row-reference scratch
+set, and `LIMIT` reserves the returned reference slice. Those reservations participate in the peak
+while execution owns them and are released when the result transfers to the caller.
+
 This slice still does not satisfy the bounded-memory target. Whole projected columns and their boxed
 preparation values are materialized before vector accounting begins. The model excludes JavaScript
-hash-map/object/array overhead, grouped aggregate state, ordering buffers, accumulated and returned
-rows, encoding/accounting temporaries, and browser allocator overhead. Those states can grow with
-query cardinality even though scan batches and duplicate fan-out handoff are chunked. There is no
-spill path, and the public result remains materialized under the current API contract.
+hash-map/object/property/array-capacity overhead, sort-implementation scratch, encoding/accounting
+temporaries, caller-owned result lifetime, and browser allocator overhead. Exhaustion throws instead
+of spilling, and the public result remains materialized under the current API contract.
 
 The completed design gives every query and physical rewrite job a memory context. Operators reserve
 and release bytes, while sort, hash aggregate, hash join, and distinct spill to temporary storage when
 reservations fail. Physical compaction already advances by output block under a specialized
 conservative executor-buffer model. Mutation merge planning applies a separate preflight safety
 estimate to its in-memory key and source-reference state, but does not spill or resume that state. The
-general query context now provides the narrower Phase 7B-A model above; complete operator accounting
-and spilling remain future work. As described above, query and compaction figures are modeled workflow
-bounds rather than measurements or hard limits on all browser heap.
+general query context now provides the narrower Phase 7B model above; byte-addressable operator
+containers, complete physical accounting, and spilling remain future work. As described above, query
+and compaction figures are modeled workflow bounds rather than measurements or hard limits on all
+browser heap.
 
 ## Automatic data skipping
 

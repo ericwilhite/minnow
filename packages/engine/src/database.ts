@@ -181,9 +181,9 @@ export interface ReadTableOptions {
 export interface QueryOptions {
   readonly version?: number;
   /**
-   * Budget for the currently accounted vector payload, join row indexes, and batch buffers.
-   * Boxed snapshot preparation, hash-map overhead, grouped/sorted state, and result rows are not yet
-   * included in this Phase 7B-A model.
+   * Budget for the documented modeled vector, row-index, group/result payload, and ordering buffers.
+   * Boxed snapshot preparation, JavaScript container overhead, returned-result lifetime, and browser
+   * allocator overhead are not included in this Phase 7B-B model.
    */
   readonly executionMemoryBudgetBytes?: number;
 }

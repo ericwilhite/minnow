@@ -153,6 +153,25 @@ describe("public SQL queries", () => {
     exact.close();
   });
 
+  it("keeps catalog-typed empty BrowserDatabase queries inside the memory model", async () => {
+    const database = new BrowserDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "empty_events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    const sql = "SELECT COUNT(*) AS count FROM empty_events";
+    const exact = await database.prepareQuery(sql, { executionMemoryBudgetBytes: 49 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 49, usedBytes: 0, peakBytes: 0 });
+    expect(exact.execute()).toEqual({ columns: ["count"], rows: [{ count: 0 }] });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 49, usedBytes: 0, peakBytes: 49 });
+    exact.close();
+
+    const below = await database.prepareQuery(sql, { executionMemoryBudgetBytes: 48 });
+    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
+    expect(below.memoryUsage).toEqual({ budgetBytes: 48, usedBytes: 0, peakBytes: 32 });
+    below.close();
+  });
+
   it("implements left joins and SQL null comparison semantics", () => {
     const plan = compileQuery(
       "SELECT a.id, b.value FROM a LEFT JOIN b ON b.id = a.id WHERE b.value != NULL ORDER BY a.id",

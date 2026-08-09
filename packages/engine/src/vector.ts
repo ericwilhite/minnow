@@ -9,10 +9,17 @@ import type {
   QueryValue,
   SelectItem,
 } from "./query.js";
-import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
+import {
+  QueryMemoryContext,
+  type QueryMemoryReservation,
+  type QueryMemoryUsage,
+} from "./memory.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
 const NULL_STRING_CODE = 0xffffffff;
+const QUERY_REFERENCE_BYTES = 8;
+const QUERY_VALUE_TAG_BYTES = 1;
+const AGGREGATE_ACCUMULATOR_BYTES = 24;
 const vectorTextEncoder = new TextEncoder();
 
 export type VectorType = "boolean" | "number" | "string" | "datetime";
@@ -119,6 +126,7 @@ interface AggregateSpec {
 interface AggregateAccumulator {
   count: number;
   value: QueryValue | undefined;
+  valueReservation?: QueryMemoryReservation;
   sum: number;
 }
 
@@ -658,10 +666,12 @@ function createDirectLookup(
 }
 
 function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryResult {
-  const metadataCount = executeMetadataCount(plan);
+  const metadataCount = executeMetadataCount(plan, memory);
   if (metadataCount !== undefined) return metadataCount;
   const groups = new NestedGroupMap<GroupState>();
-  if (plan.grouped && plan.groupBy.length === 0) groups.setEmpty(createGroupState([], plan));
+  if (plan.grouped && plan.groupBy.length === 0) {
+    groups.setEmpty(createGroupState([], plan, memory));
+  }
   const output: QueryRow[] = [];
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
@@ -686,11 +696,14 @@ function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryRes
       batchMemory.close();
     }
   }
-  const rows = plan.grouped ? finishGroups(plan, groups.values()) : output;
-  return finishResult(plan, rows);
+  const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output;
+  return finishResult(plan, rows, memory);
 }
 
-function executeMetadataCount(plan: BoundPlan): QueryResult | undefined {
+function executeMetadataCount(
+  plan: BoundPlan,
+  memory: QueryMemoryContext,
+): QueryResult | undefined {
   if (
     !plan.grouped ||
     plan.groupBy.length > 0 ||
@@ -703,24 +716,43 @@ function executeMetadataCount(plan: BoundPlan): QueryResult | undefined {
   ) {
     return undefined;
   }
-  const state = createGroupState([], plan);
+  const state = createGroupState([], plan, memory);
   const rowCount = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (const accumulator of state.aggregates) accumulator.count = rowCount;
-  return finishResult(plan, finishGroups(plan, [state]));
+  return finishResult(plan, finishGroups(plan, [state], memory), memory);
 }
 
-function finishResult(plan: BoundPlan, inputRows: QueryRow[]): QueryResult {
+function finishResult(
+  plan: BoundPlan,
+  inputRows: QueryRow[],
+  memory: QueryMemoryContext,
+): QueryResult {
   let rows = inputRows;
   if (plan.orderBy.length > 0) {
-    rows.sort((left, right) => {
-      for (const order of plan.orderBy) {
-        const comparison = compareValues(left[order.outputName], right[order.outputName]);
-        if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
-      }
-      return 0;
-    });
+    const ordering = memory.reserve(
+      safeMemoryProduct(rows.length, QUERY_REFERENCE_BYTES, "Ordering row references"),
+      "Ordering row references",
+    );
+    try {
+      rows.sort((left, right) => {
+        for (const order of plan.orderBy) {
+          const comparison = compareValues(left[order.outputName], right[order.outputName]);
+          if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
+        }
+        return 0;
+      });
+    } finally {
+      ordering.release();
+    }
   }
-  if (plan.limit !== undefined) rows = rows.slice(0, plan.limit);
+  if (plan.limit !== undefined) {
+    const limitedLength = Math.min(plan.limit, rows.length);
+    memory.reserve(
+      safeMemoryProduct(limitedLength, QUERY_REFERENCE_BYTES, "LIMIT row references"),
+      "LIMIT row references",
+    );
+    rows = rows.slice(0, plan.limit);
+  }
   const columns = plan.wildcard ? wildcardColumnNames(plan) : plan.select.map((item) => item.alias);
   return { columns, rows };
 }
@@ -735,7 +767,7 @@ function consumeJoinedBatches(
 ): boolean {
   const join = plan.joins[joinIndex];
   if (join === undefined) {
-    consumeBatch(plan, batch, groups, output);
+    consumeBatch(plan, batch, groups, output, memory);
     return reachedEarlyLimit(plan, output.length);
   }
   for (const joined of joinBatches(plan, batch, join, memory)) {
@@ -911,6 +943,7 @@ function consumeBatch(
   batch: BatchRows,
   groups: NestedGroupMap<GroupState>,
   output: QueryRow[],
+  memory: QueryMemoryContext,
 ): void {
   for (let row = 0; row < batch.length; row += 1) {
     if (
@@ -943,27 +976,53 @@ function consumeBatch(
         const groupValues = plan.groupBy.map((expression) =>
           asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
         );
-        state = createGroupState(groupValues, plan);
+        state = createGroupState(groupValues, plan, memory);
         if (plan.groupBy.length === 1) groups.setOne(groupKey(groupValues[0]), state);
         else groups.set(groupKeys ?? [], state);
       }
-      updateAggregates(plan, state, batch, row);
+      updateAggregates(plan, state, batch, row, memory);
     } else {
-      output.push(projectBatchRow(plan, batch, row));
+      const resultRow = projectBatchRow(plan, batch, row);
+      memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
+      output.push(resultRow);
       if (plan.orderBy.length === 0 && plan.limit !== undefined && output.length >= plan.limit)
         return;
     }
   }
 }
 
-function createGroupState(groupValues: QueryValue[], plan: BoundPlan): GroupState {
+function createGroupState(
+  groupValues: QueryValue[],
+  plan: BoundPlan,
+  memory: QueryMemoryContext,
+): GroupState {
+  let payloadBytes = QUERY_REFERENCE_BYTES;
+  for (const value of groupValues) {
+    payloadBytes = safeMemorySum(payloadBytes, queryValuePayloadBytes(value), "Group state");
+  }
+  payloadBytes = safeMemorySum(
+    payloadBytes,
+    safeMemoryProduct(
+      plan.aggregates.length,
+      AGGREGATE_ACCUMULATOR_BYTES,
+      "Aggregate accumulator state",
+    ),
+    "Group state",
+  );
+  memory.reserve(payloadBytes, "Group state");
   return {
     groupValues,
     aggregates: plan.aggregates.map(() => ({ count: 0, value: undefined, sum: 0 })),
   };
 }
 
-function updateAggregates(plan: BoundPlan, state: GroupState, batch: BatchRows, row: number): void {
+function updateAggregates(
+  plan: BoundPlan,
+  state: GroupState,
+  batch: BatchRows,
+  row: number,
+  memory: QueryMemoryContext,
+): void {
   for (let index = 0; index < plan.aggregates.length; index += 1) {
     const spec = required(plan.aggregates[index], "Aggregate specification is missing");
     const accumulator = required(state.aggregates[index], "Aggregate accumulator is missing");
@@ -978,25 +1037,47 @@ function updateAggregates(plan: BoundPlan, state: GroupState, batch: BatchRows, 
       spec.name === "MIN" &&
       (accumulator.value === undefined || compareValues(value, accumulator.value) < 0)
     ) {
-      accumulator.value = asQueryValue(value);
+      const replacementValue = asQueryValue(value);
+      const replacement = memory.reserve(
+        queryValuePayloadBytes(replacementValue),
+        "MIN aggregate value",
+      );
+      accumulator.valueReservation?.release();
+      accumulator.valueReservation = replacement;
+      accumulator.value = replacementValue;
     } else if (
       spec.name === "MAX" &&
       (accumulator.value === undefined || compareValues(value, accumulator.value) > 0)
     ) {
-      accumulator.value = asQueryValue(value);
+      const replacementValue = asQueryValue(value);
+      const replacement = memory.reserve(
+        queryValuePayloadBytes(replacementValue),
+        "MAX aggregate value",
+      );
+      accumulator.valueReservation?.release();
+      accumulator.valueReservation = replacement;
+      accumulator.value = replacementValue;
     }
   }
 }
 
-function finishGroups(plan: BoundPlan, groups: readonly GroupState[]): QueryRow[] {
-  return groups.map((group) =>
-    Object.fromEntries(
+function finishGroups(
+  plan: BoundPlan,
+  groups: readonly GroupState[],
+  memory: QueryMemoryContext,
+): QueryRow[] {
+  const rows: QueryRow[] = [];
+  for (const group of groups) {
+    const row = Object.fromEntries(
       plan.select.map((item) => [
         item.alias,
         asQueryValue(evaluateFinalExpression(plan, item.expression, group)),
       ]),
-    ),
-  );
+    );
+    memory.reserve(queryRowPayloadBytes(row), "Accumulated grouped result row");
+    rows.push(row);
+  }
+  return rows;
 }
 
 function evaluateFinalExpression(
@@ -1244,6 +1325,27 @@ function asQueryValue(value: unknown): QueryValue {
 function required<T>(value: T | undefined, message: string): T {
   if (value === undefined) throw new Error(message);
   return value;
+}
+
+function queryRowPayloadBytes(row: QueryRow): number {
+  let total = QUERY_REFERENCE_BYTES;
+  for (const value of Object.values(row)) {
+    total = safeMemorySum(total, queryValuePayloadBytes(value), "Result row payload");
+  }
+  return total;
+}
+
+function queryValuePayloadBytes(value: QueryValue): number {
+  if (value === null) return QUERY_VALUE_TAG_BYTES;
+  if (typeof value === "boolean") return QUERY_VALUE_TAG_BYTES + 1;
+  if (typeof value === "number" || value instanceof Date) {
+    return QUERY_VALUE_TAG_BYTES + Float64Array.BYTES_PER_ELEMENT;
+  }
+  return safeMemorySum(
+    QUERY_VALUE_TAG_BYTES,
+    vectorTextEncoder.encode(value).byteLength,
+    "String query value payload",
+  );
 }
 
 function safeMemorySum(left: number, right: number, label: string): number {
