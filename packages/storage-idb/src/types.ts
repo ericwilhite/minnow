@@ -517,6 +517,26 @@ export interface TempRunPage {
   bytes: Uint8Array;
 }
 
+export interface TempOwnerRecord {
+  ownerId: string;
+  expiresAt: string;
+  revision: number;
+}
+
+export class TempOwnerConflictError extends Error {
+  override readonly name = "TempOwnerConflictError";
+
+  constructor(
+    readonly ownerId: string,
+    readonly expectedRevision: number,
+    readonly actualRevision: number | null,
+  ) {
+    super(
+      `Temp owner ${ownerId} changed: expected revision ${String(expectedRevision)}, found ${String(actualRevision)}`,
+    );
+  }
+}
+
 export interface BlockStore {
   addBlock(id: string, bytes: Uint8Array): Promise<void>;
   addBlocks(blocks: readonly BlockWrite[]): Promise<void>;
@@ -601,6 +621,18 @@ export interface BlockStore {
   ): Promise<Uint8Array | undefined>;
   removeTempRun(ownerId: string, runId: string): Promise<void>;
   removeTempOwner(ownerId: string): Promise<void>;
+  createTempOwner(record: TempOwnerRecord): Promise<void>;
+  getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined>;
+  renewTempOwner(
+    ownerId: string,
+    expectedRevision: number,
+    expiresAt: string,
+  ): Promise<TempOwnerRecord>;
+  removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean>;
+  listTempOwnerIdsPage(
+    afterOwnerId: string | null,
+    limit: number,
+  ): Promise<StoragePage<string, string>>;
   close(): void;
 }
 

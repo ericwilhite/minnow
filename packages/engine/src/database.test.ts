@@ -4928,6 +4928,95 @@ for (const implementation of implementations()) {
 }
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} leases spill owners during execution and leaves no temp state behind`, async () => {
+    const store = await implementation.create();
+    let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const database = new BrowserDatabase(store, {
+      rowsPerBlock: 256,
+      compression: "raw",
+      now: () => new Date((nowMs += 1)),
+      spillOwnerLeaseMs: 10,
+    });
+    await database.createTable({
+      name: "leased_spill_rows",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "bucket", type: "number" },
+      ],
+    });
+    const rowCount = 5_000;
+    await database.insertBatch("leased_spill_rows", {
+      columns: {
+        id: Array.from({ length: rowCount }, (_, index) => index),
+        bucket: Array.from({ length: rowCount }, (_, index) => index % 11),
+      },
+    });
+
+    const result = await database.query(
+      "SELECT id, bucket FROM leased_spill_rows ORDER BY bucket, id DESC LIMIT 7",
+      { executionMemoryBudgetBytes: 150_000, spillPageRows: 64 },
+    );
+    expect(result.rows).toHaveLength(7);
+    expect(await store.listTempOwnerIdsPage(null, 16)).toEqual({
+      records: [],
+      nextCursor: null,
+    });
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} reclaims abandoned spill owners only after their lease expires`, async () => {
+    const store = await implementation.create();
+    let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const database = new BrowserDatabase(store, { now: () => new Date(nowMs) });
+
+    await store.createTempOwner({
+      ownerId: "abandoned-query",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await store.putTempRunPage({
+      ownerId: "abandoned-query",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(1, 2),
+    });
+    await store.createTempOwner({
+      ownerId: "live-query",
+      expiresAt: "2026-01-01T01:00:00.000Z",
+      revision: 0,
+    });
+    await store.putTempRunPage({
+      ownerId: "live-query",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(3),
+    });
+    await store.putTempRunPage({
+      ownerId: "orphan-query",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(4),
+    });
+
+    const early = await database.cleanupQuerySpill();
+    expect(early).toEqual({ ownersExamined: 3, ownersReclaimed: 1, ownersRetained: 2 });
+    expect(await store.getTempRunPage("orphan-query", "run-1", 0)).toBeUndefined();
+    expect(await store.getTempRunPage("abandoned-query", "run-1", 0)).toEqual(Uint8Array.of(1, 2));
+
+    nowMs = Date.parse("2026-01-01T00:02:00.000Z");
+    const later = await database.cleanupQuerySpill({ maxOwners: 8 });
+    expect(later).toEqual({ ownersExamined: 2, ownersReclaimed: 1, ownersRetained: 1 });
+    expect(await store.getTempOwner("abandoned-query")).toBeUndefined();
+    expect(await store.getTempRunPage("abandoned-query", "run-1", 0)).toBeUndefined();
+    expect(await store.getTempRunPage("live-query", "run-1", 0)).toEqual(Uint8Array.of(3));
+    expect(await store.getTempOwner("live-query")).toMatchObject({ revision: 0 });
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
   it(`${implementation.name} reclaims cancelled compaction output without changing current rows`, async () => {
     const store = await implementation.create();
     const database = new BrowserDatabase(store);

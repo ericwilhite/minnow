@@ -13,7 +13,9 @@ import type {
   RowIdRange,
   RunGarbageCollectionStepInput,
   SegmentRecord,
+  StoragePage,
   TableRecord,
+  TempOwnerRecord,
   TempRunPage,
   TransactionRecord,
   TransactionRecordUpdate,
@@ -277,6 +279,33 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   removeTempOwner(ownerId: string): Promise<void> {
     return this.inner.removeTempOwner(ownerId);
+  }
+
+  createTempOwner(record: TempOwnerRecord): Promise<void> {
+    return this.inner.createTempOwner(record);
+  }
+
+  getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined> {
+    return this.inner.getTempOwner(ownerId);
+  }
+
+  renewTempOwner(
+    ownerId: string,
+    expectedRevision: number,
+    expiresAt: string,
+  ): Promise<TempOwnerRecord> {
+    return this.inner.renewTempOwner(ownerId, expectedRevision, expiresAt);
+  }
+
+  removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean> {
+    return this.inner.removeTempOwnerIfExpired(ownerId, expiresAtCutoff);
+  }
+
+  listTempOwnerIdsPage(
+    afterOwnerId: string | null,
+    limit: number,
+  ): Promise<StoragePage<string, string>> {
+    return this.inner.listTempOwnerIdsPage(afterOwnerId, limit);
   }
 
   close(): void {

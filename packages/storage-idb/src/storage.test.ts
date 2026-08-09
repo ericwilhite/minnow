@@ -7,6 +7,7 @@ import {
   LeaseConflictError,
   MemoryBlockStore,
   SnapshotManifestMissingError,
+  TempOwnerConflictError,
   UniqueKeyConflictError,
   floorWholeNumberProduct,
   type BlockStore,
@@ -64,6 +65,154 @@ for (const implementation of stores()) {
     await store.removeTempOwner("query-a");
     expect(await store.getTempRunPage("query-a", "run-2", 0)).toBeUndefined();
     expect(await store.getTempRunPage("query-b", "run-1", 0)).toEqual(Uint8Array.of(5));
+    store.close();
+  });
+
+  it(`${implementation.name} enforces temp owner lease creation and renewal`, async () => {
+    const store = await implementation.create();
+    await store.createTempOwner({
+      ownerId: "query-a",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await expect(
+      store.createTempOwner({
+        ownerId: "query-a",
+        expiresAt: "2026-01-01T00:02:00.000Z",
+        revision: 0,
+      }),
+    ).rejects.toThrow(/already exists/);
+    await expect(
+      store.createTempOwner({
+        ownerId: "query-b",
+        expiresAt: "2026-01-01T00:01:00.000Z",
+        revision: 3,
+      }),
+    ).rejects.toThrow(/revision zero/);
+    expect(await store.getTempOwner("query-a")).toEqual({
+      ownerId: "query-a",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    const renewed = await store.renewTempOwner("query-a", 0, "2026-01-01T00:03:00.000Z");
+    expect(renewed).toEqual({
+      ownerId: "query-a",
+      expiresAt: "2026-01-01T00:03:00.000Z",
+      revision: 1,
+    });
+    await expect(store.renewTempOwner("query-a", 0, "2026-01-01T00:04:00.000Z")).rejects.toThrow(
+      TempOwnerConflictError,
+    );
+    await expect(store.renewTempOwner("missing", 0, "2026-01-01T00:04:00.000Z")).rejects.toThrow(
+      TempOwnerConflictError,
+    );
+    store.close();
+  });
+
+  it(`${implementation.name} reclaims only expired or ownerless temp spill state`, async () => {
+    const store = await implementation.create();
+    await store.createTempOwner({
+      ownerId: "query-live",
+      expiresAt: "2026-01-01T00:10:00.000Z",
+      revision: 0,
+    });
+    await store.putTempRunPage({
+      ownerId: "query-live",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(1),
+    });
+    await store.createTempOwner({
+      ownerId: "query-stale",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await store.putTempRunPage({
+      ownerId: "query-stale",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(2),
+    });
+    await store.putTempRunPage({
+      ownerId: "query-orphan",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(3),
+    });
+
+    expect(await store.removeTempOwnerIfExpired("query-live", "2026-01-01T00:05:00.000Z")).toBe(
+      false,
+    );
+    expect(await store.getTempRunPage("query-live", "run-1", 0)).toEqual(Uint8Array.of(1));
+    expect(await store.removeTempOwnerIfExpired("query-stale", "2026-01-01T00:05:00.000Z")).toBe(
+      true,
+    );
+    expect(await store.getTempOwner("query-stale")).toBeUndefined();
+    expect(await store.getTempRunPage("query-stale", "run-1", 0)).toBeUndefined();
+    expect(await store.removeTempOwnerIfExpired("query-orphan", "2026-01-01T00:05:00.000Z")).toBe(
+      true,
+    );
+    expect(await store.getTempRunPage("query-orphan", "run-1", 0)).toBeUndefined();
+    expect(await store.getTempRunPage("query-live", "run-1", 0)).toEqual(Uint8Array.of(1));
+
+    await store.removeTempOwner("query-live");
+    expect(await store.getTempOwner("query-live")).toBeUndefined();
+    await store.createTempOwner({
+      ownerId: "query-live",
+      expiresAt: "2026-01-01T00:20:00.000Z",
+      revision: 0,
+    });
+    store.close();
+  });
+
+  it(`${implementation.name} pages distinct temp owner IDs across records and orphan pages`, async () => {
+    const store = await implementation.create();
+    await store.createTempOwner({
+      ownerId: "owner-a",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await store.createTempOwner({
+      ownerId: "owner-d",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await store.putTempRunPage({
+      ownerId: "owner-a",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(1),
+    });
+    await store.putTempRunPage({
+      ownerId: "owner-b",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(2),
+    });
+    await store.putTempRunPage({
+      ownerId: "owner-b",
+      runId: "run-2",
+      pageIndex: 1,
+      bytes: Uint8Array.of(3),
+    });
+    await store.putTempRunPage({
+      ownerId: "owner-c",
+      runId: "run-1",
+      pageIndex: 0,
+      bytes: Uint8Array.of(4),
+    });
+
+    const first = await store.listTempOwnerIdsPage(null, 2);
+    expect(first.records).toEqual(["owner-a", "owner-b"]);
+    expect(first.nextCursor).toBe("owner-b");
+    const second = await store.listTempOwnerIdsPage(first.nextCursor, 2);
+    expect(second.records).toEqual(["owner-c", "owner-d"]);
+    const third = await store.listTempOwnerIdsPage("owner-d", 2);
+    expect(third.records).toEqual([]);
+    expect(third.nextCursor).toBeNull();
+    const all = await store.listTempOwnerIdsPage(null, 16);
+    expect(all.records).toEqual(["owner-a", "owner-b", "owner-c", "owner-d"]);
+    expect(all.nextCursor).toBeNull();
     store.close();
   });
 }

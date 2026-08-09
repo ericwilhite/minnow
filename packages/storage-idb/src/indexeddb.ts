@@ -21,7 +21,10 @@ import {
   type RunGarbageCollectionStepInput,
   type SegmentRecord,
   SnapshotManifestMissingError,
+  type StoragePage,
   type TableRecord,
+  type TempOwnerRecord,
+  TempOwnerConflictError,
   type TempRunPage,
   type TransactionRecord,
   TransactionRecordConflictError,
@@ -175,7 +178,97 @@ export class IndexedDbBlockStore implements BlockStore {
     await visitObjectStoreSequentially(store, (_value, key) => {
       if (isTempRunPageKey(key, ownerId)) store.delete(key);
     });
+    store.delete(tempOwnerKey(ownerId));
     await transactionDone(transaction);
+  }
+
+  async createTempOwner(record: TempOwnerRecord): Promise<void> {
+    validateTempOwnerRecord(record);
+    const transaction = this.#transaction("temp", "readwrite");
+    const store = transaction.objectStore("temp");
+    const existing = await requestResult(store.getKey(tempOwnerKey(record.ownerId)));
+    if (existing !== undefined) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new Error(`Temp owner already exists: ${record.ownerId}`);
+    }
+    store.put(structuredClone(record), tempOwnerKey(record.ownerId));
+    await transactionDone(transaction);
+  }
+
+  async getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined> {
+    validateTempId(ownerId, "Temp run owner ID");
+    const transaction = this.#transaction("temp", "readonly");
+    const value: unknown = await requestResult(
+      transaction.objectStore("temp").get(tempOwnerKey(ownerId)),
+    );
+    await transactionDone(transaction);
+    return value === undefined ? undefined : asTempOwnerRecord(value);
+  }
+
+  async renewTempOwner(
+    ownerId: string,
+    expectedRevision: number,
+    expiresAt: string,
+  ): Promise<TempOwnerRecord> {
+    validateTempId(ownerId, "Temp run owner ID");
+    validateLeaseExpiration(expiresAt);
+    const transaction = this.#transaction("temp", "readwrite");
+    const store = transaction.objectStore("temp");
+    const value: unknown = await requestResult(store.get(tempOwnerKey(ownerId)));
+    const record = value === undefined ? undefined : asTempOwnerRecord(value);
+    if (record?.revision !== expectedRevision) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new TempOwnerConflictError(ownerId, expectedRevision, record?.revision ?? null);
+    }
+    const renewed = { ...record, expiresAt, revision: record.revision + 1 };
+    store.put(renewed, tempOwnerKey(ownerId));
+    await transactionDone(transaction);
+    return structuredClone(renewed);
+  }
+
+  async removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean> {
+    validateTempId(ownerId, "Temp run owner ID");
+    const cutoff = Date.parse(expiresAtCutoff);
+    if (!Number.isFinite(cutoff)) throw new TypeError("Temp owner expiry cutoff must be valid");
+    const transaction = this.#transaction("temp", "readwrite");
+    const store = transaction.objectStore("temp");
+    const value: unknown = await requestResult(store.get(tempOwnerKey(ownerId)));
+    if (value !== undefined) {
+      const record = asTempOwnerRecord(value);
+      const expiresAt = Date.parse(record.expiresAt);
+      if (Number.isFinite(expiresAt) && expiresAt > cutoff) {
+        await transactionDone(transaction);
+        return false;
+      }
+    }
+    await visitObjectStoreSequentially(store, (_value, key) => {
+      if (isTempRunPageKey(key, ownerId)) store.delete(key);
+    });
+    store.delete(tempOwnerKey(ownerId));
+    await transactionDone(transaction);
+    return true;
+  }
+
+  async listTempOwnerIdsPage(
+    afterOwnerId: string | null,
+    limit: number,
+  ): Promise<StoragePage<string, string>> {
+    validatePageLimit(limit);
+    const transaction = this.#transaction("temp", "readonly");
+    const store = transaction.objectStore("temp");
+    const [recordOwnerIds, pageOwnerIds] = await Promise.all([
+      readTempOwnerRecordIds(store, afterOwnerId, limit + 1),
+      readTempPageOwnerIds(store, afterOwnerId, limit + 1),
+    ]);
+    await transactionDone(transaction);
+    const union = [...new Set([...recordOwnerIds, ...pageOwnerIds])].sort();
+    const records = union.slice(0, limit);
+    return {
+      records,
+      nextCursor: union.length > limit ? (records.at(-1) ?? null) : null,
+    };
   }
 
   async addTable(record: TableRecord): Promise<void> {
@@ -1771,6 +1864,90 @@ function isTempRunPageKey(key: IDBValidKey, ownerId: string, runId?: string): bo
     key[1] === ownerId &&
     (runId === undefined || key[2] === runId)
   );
+}
+
+function tempOwnerKey(ownerId: string): IDBValidKey {
+  return ["owner", ownerId];
+}
+
+function validateTempOwnerRecord(record: TempOwnerRecord): void {
+  validateTempId(record.ownerId, "Temp run owner ID");
+  validateLeaseExpiration(record.expiresAt);
+  if (record.revision !== 0) {
+    throw new RangeError("Temp owner record must be created at revision zero");
+  }
+}
+
+function asTempOwnerRecord(value: unknown): TempOwnerRecord {
+  return structuredClone(value) as TempOwnerRecord;
+}
+
+// Both scans run without IDBKeyRange (absent from the injected test factory environment): owner
+// keys ["owner", id] sort before page keys ["run", id, runId, index], and an empty array sorts
+// after every string, so ["run", id, []] jumps past one owner's remaining pages.
+function readTempOwnerRecordIds(
+  store: IDBObjectStore,
+  afterOwnerId: string | null,
+  max: number,
+): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const ownerIds: string[] = [];
+    const request = store.openKeyCursor();
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor === null || ownerIds.length >= max) {
+        resolve(ownerIds);
+        return;
+      }
+      const key = cursor.key;
+      if (!Array.isArray(key) || key[0] !== "owner" || typeof key[1] !== "string") {
+        resolve(ownerIds);
+        return;
+      }
+      if (afterOwnerId === null || key[1] > afterOwnerId) ownerIds.push(key[1]);
+      if (ownerIds.length >= max) resolve(ownerIds);
+      else cursor.continue();
+    };
+  });
+}
+
+function readTempPageOwnerIds(
+  store: IDBObjectStore,
+  afterOwnerId: string | null,
+  max: number,
+): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const ownerIds: string[] = [];
+    const request = store.openKeyCursor();
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor === null || ownerIds.length >= max) {
+        resolve(ownerIds);
+        return;
+      }
+      const key = cursor.key;
+      if (Array.isArray(key) && key[0] === "owner") {
+        cursor.continue(["run"]);
+        return;
+      }
+      if (!Array.isArray(key) || key[0] !== "run" || typeof key[1] !== "string") {
+        cursor.continue();
+        return;
+      }
+      if (afterOwnerId !== null && key[1] <= afterOwnerId) {
+        cursor.continue(["run", afterOwnerId, []]);
+        return;
+      }
+      ownerIds.push(key[1]);
+      if (ownerIds.length >= max) {
+        resolve(ownerIds);
+        return;
+      }
+      cursor.continue(["run", key[1], []]);
+    };
+  });
 }
 
 function uniqueKeyKey(tableId: string, keyToken: string): IDBValidKey {

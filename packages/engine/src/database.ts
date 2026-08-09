@@ -65,7 +65,7 @@ import {
   type QueryResult,
 } from "./query.js";
 import { QueryMemoryBudgetError, QueryMemoryContext } from "./memory.js";
-import { type ColumnarTable, type ColumnVector } from "./vector.js";
+import { type ColumnarTable, type ColumnVector, type QuerySpillStore } from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
 const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -431,6 +431,19 @@ export interface BrowserDatabaseOptions {
   maxCommitRetries?: number;
   now?: () => Date;
   createId?: () => string;
+  /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
+  spillOwnerLeaseMs?: number;
+}
+
+export interface QuerySpillCleanupOptions {
+  /** Maximum owners examined in this pass. */
+  maxOwners?: number;
+}
+
+export interface QuerySpillCleanupResult {
+  ownersExamined: number;
+  ownersReclaimed: number;
+  ownersRetained: number;
 }
 
 export interface BufferedWriterOptions {
@@ -475,6 +488,7 @@ export class BrowserDatabase {
   readonly #rowsPerBlock: number;
   readonly #maxCommitRetries: number;
   readonly #now: () => Date;
+  readonly #spillOwnerLeaseMs: number;
   readonly #createId: () => string;
   readonly #internalLeaseOwnerId = `browserdatabase/${crypto.randomUUID()}`;
   #internalLeaseSequence = 0;
@@ -494,6 +508,10 @@ export class BrowserDatabase {
     }
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? (() => crypto.randomUUID());
+    this.#spillOwnerLeaseMs = options.spillOwnerLeaseMs ?? 60_000;
+    if (!Number.isSafeInteger(this.#spillOwnerLeaseMs) || this.#spillOwnerLeaseMs <= 0) {
+      throw new RangeError("Spill owner lease lifetime must be a positive whole number");
+    }
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
       createId: this.#createId,
@@ -1126,18 +1144,95 @@ export class BrowserDatabase {
       }
       return await prepared.executeAsync({
         ...(spillPageRows === undefined ? {} : { spillPageRows }),
-        spillStore: {
-          putPage: (ownerId, runId, pageIndex, bytes) =>
-            this.store.putTempRunPage({ ownerId, runId, pageIndex, bytes }),
-          getPage: (ownerId, runId, pageIndex) =>
-            this.store.getTempRunPage(ownerId, runId, pageIndex),
-          removeRun: (ownerId, runId) => this.store.removeTempRun(ownerId, runId),
-          removeOwner: (ownerId) => this.store.removeTempOwner(ownerId),
-        },
+        spillStore: this.#leasedSpillStore(),
       });
     } finally {
       prepared.close();
     }
+  }
+
+  /**
+   * Backs the executor's spill pages with durable owner leases: each owner registers a lease
+   * before its first page write and renews it while pages are read or written, so an abandoned
+   * owner becomes reclaimable only after its lease expires.
+   */
+  #leasedSpillStore(): QuerySpillStore {
+    const leases = new Map<string, { revision: number; expiresAtMs: number }>();
+    const ensureLease = async (ownerId: string): Promise<void> => {
+      const nowMs = this.#now().getTime();
+      const lease = leases.get(ownerId);
+      if (lease === undefined) {
+        const expiresAtMs = nowMs + this.#spillOwnerLeaseMs;
+        await this.store.createTempOwner({
+          ownerId,
+          expiresAt: new Date(expiresAtMs).toISOString(),
+          revision: 0,
+        });
+        leases.set(ownerId, { revision: 0, expiresAtMs });
+        return;
+      }
+      if (nowMs < lease.expiresAtMs - this.#spillOwnerLeaseMs / 2) return;
+      const expiresAtMs = nowMs + this.#spillOwnerLeaseMs;
+      const renewed = await this.store.renewTempOwner(
+        ownerId,
+        lease.revision,
+        new Date(expiresAtMs).toISOString(),
+      );
+      leases.set(ownerId, { revision: renewed.revision, expiresAtMs });
+    };
+    return {
+      putPage: async (ownerId, runId, pageIndex, bytes) => {
+        await ensureLease(ownerId);
+        await this.store.putTempRunPage({ ownerId, runId, pageIndex, bytes });
+      },
+      getPage: async (ownerId, runId, pageIndex) => {
+        await ensureLease(ownerId);
+        return this.store.getTempRunPage(ownerId, runId, pageIndex);
+      },
+      removeRun: (ownerId, runId) => this.store.removeTempRun(ownerId, runId),
+      removeOwner: async (ownerId) => {
+        await this.store.removeTempOwner(ownerId);
+        leases.delete(ownerId);
+      },
+    };
+  }
+
+  /**
+   * Reclaims temp spill pages whose owner lease is expired or missing at a cutoff fixed when the
+   * pass starts. Owners with an unexpired lease are retained; each owner is removed atomically
+   * against a concurrent renewal.
+   */
+  async cleanupQuerySpill(
+    options: QuerySpillCleanupOptions = {},
+  ): Promise<QuerySpillCleanupResult> {
+    const maxOwners =
+      options.maxOwners === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : positiveWholeNumber(options.maxOwners, "Spill cleanup owner limit");
+    const cutoff = this.#now().toISOString();
+    const result: QuerySpillCleanupResult = {
+      ownersExamined: 0,
+      ownersReclaimed: 0,
+      ownersRetained: 0,
+    };
+    let afterOwnerId: string | null = null;
+    while (result.ownersExamined < maxOwners) {
+      const page = await this.store.listTempOwnerIdsPage(
+        afterOwnerId,
+        Math.min(64, maxOwners - result.ownersExamined),
+      );
+      for (const ownerId of page.records) {
+        result.ownersExamined += 1;
+        if (await this.store.removeTempOwnerIfExpired(ownerId, cutoff)) {
+          result.ownersReclaimed += 1;
+        } else {
+          result.ownersRetained += 1;
+        }
+      }
+      if (page.nextCursor === null) break;
+      afterOwnerId = page.nextCursor;
+    }
+    return result;
   }
 
   async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {

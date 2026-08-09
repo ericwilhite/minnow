@@ -117,6 +117,9 @@ while (gcProgress.result === null) {
   gcProgress = await database.resumeGarbageCollectionJob(gcProgress.jobId, { maxItems: 8 });
 }
 const collectionJobs = await database.listGarbageCollectionJobs();
+
+// Reclaim query spill pages abandoned by an abrupt tab loss once their owner leases expire.
+const spillCleanup = await database.cleanupQuerySpill({ maxOwners: 64 });
 ```
 
 `result` reports the row count, block count, saved bytes, database version, encoding/staging/commit
@@ -197,11 +200,17 @@ Phase 7D-A adds durable query spill pages in the existing `temp` store. With an 
 budget, `BrowserDatabase.query()` automatically uses asynchronous external merge sort for ungrouped
 `ORDER BY` plans, including joined output, and 64-way partitioned hash aggregation for single-table
 `GROUP BY ... ORDER BY` plans. Sorted pages merge pairwise with left-run tie stability; LIMIT applies
-only while reading the final run. Temp pages are removed after ordinary success or failure. An abrupt
-process/tab loss can leave owner pages behind because durable spill-owner leases and age-based temp
-cleanup are not implemented yet.
+only while reading the final run. Temp pages are removed after ordinary success or failure. Each
+spill owner also registers a durable lease before its first page write and renews it while pages are
+read or written; the default lifetime is one minute and `spillOwnerLeaseMs` tunes it.
+`cleanupQuerySpill()` reclaims owner pages abandoned by an abrupt process/tab loss once their lease
+is expired or missing at a cutoff fixed when the pass starts, retains every unexpired owner, pages
+through owner IDs in bounded windows, accepts `maxOwners`, and reports examined, reclaimed, and
+retained owner counts. Reclamation races a live renewal atomically, so a concurrently renewed owner
+is retained rather than torn down mid-query.
 `PreparedQuery.execute()` remains the synchronous no-I/O path; `executeAsync()` accepts a spill store
-for callers that want the operator path directly.
+for callers that want the operator path directly; leases protect only spill stores created by
+`BrowserDatabase.query()`, and a caller-supplied spill store manages its own cleanup.
 
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected typed input in full before the vector reservation is installed;

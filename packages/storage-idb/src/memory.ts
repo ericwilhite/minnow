@@ -20,7 +20,10 @@ import {
   type RunGarbageCollectionStepInput,
   type SegmentRecord,
   SnapshotManifestMissingError,
+  type StoragePage,
   type TableRecord,
+  type TempOwnerRecord,
+  TempOwnerConflictError,
   type TempRunPage,
   type TransactionRecord,
   TransactionRecordConflictError,
@@ -46,6 +49,7 @@ export class MemoryBlockStore implements BlockStore {
   readonly #nextRowIds = new Map<string, bigint>();
   readonly #uniqueKeys = new Map<string, Set<string>>();
   readonly #tempRunPages = new Map<string, Uint8Array>();
+  readonly #tempOwners = new Map<string, TempOwnerRecord>();
   #currentVersion: number | null = null;
   #commitQueue = Promise.resolve();
 
@@ -114,6 +118,79 @@ export class MemoryBlockStore implements BlockStore {
     const prefix = `${String(ownerId.length)}:${ownerId}:`;
     for (const key of this.#tempRunPages.keys())
       if (key.startsWith(prefix)) this.#tempRunPages.delete(key);
+    this.#tempOwners.delete(ownerId);
+  }
+
+  async createTempOwner(record: TempOwnerRecord): Promise<void> {
+    validateTempOwnerRecord(record);
+    return this.#runAtomic(() => {
+      if (this.#tempOwners.has(record.ownerId)) {
+        throw new Error(`Temp owner already exists: ${record.ownerId}`);
+      }
+      this.#tempOwners.set(record.ownerId, structuredClone(record));
+    });
+  }
+
+  async getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined> {
+    validateId(ownerId);
+    const record = this.#tempOwners.get(ownerId);
+    return record === undefined ? undefined : structuredClone(record);
+  }
+
+  async renewTempOwner(
+    ownerId: string,
+    expectedRevision: number,
+    expiresAt: string,
+  ): Promise<TempOwnerRecord> {
+    validateLeaseExpiration(expiresAt);
+    return this.#runAtomic(() => {
+      const record = this.#tempOwners.get(ownerId);
+      if (record?.revision !== expectedRevision) {
+        throw new TempOwnerConflictError(ownerId, expectedRevision, record?.revision ?? null);
+      }
+      const renewed = { ...record, expiresAt, revision: record.revision + 1 };
+      this.#tempOwners.set(ownerId, renewed);
+      return structuredClone(renewed);
+    });
+  }
+
+  async removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean> {
+    validateId(ownerId);
+    const cutoff = Date.parse(expiresAtCutoff);
+    if (!Number.isFinite(cutoff)) throw new TypeError("Temp owner expiry cutoff must be valid");
+    return this.#runAtomic(() => {
+      const record = this.#tempOwners.get(ownerId);
+      if (record !== undefined) {
+        const expiresAt = Date.parse(record.expiresAt);
+        if (Number.isFinite(expiresAt) && expiresAt > cutoff) return false;
+      }
+      const prefix = `${String(ownerId.length)}:${ownerId}:`;
+      for (const key of this.#tempRunPages.keys())
+        if (key.startsWith(prefix)) this.#tempRunPages.delete(key);
+      this.#tempOwners.delete(ownerId);
+      return true;
+    });
+  }
+
+  async listTempOwnerIdsPage(
+    afterOwnerId: string | null,
+    limit: number,
+  ): Promise<StoragePage<string, string>> {
+    validatePageLimit(limit);
+    const ownerIds = new Set<string>(this.#tempOwners.keys());
+    for (const key of this.#tempRunPages.keys()) {
+      const separator = key.indexOf(":");
+      const length = Number(key.slice(0, separator));
+      ownerIds.add(key.slice(separator + 1, separator + 1 + length));
+    }
+    const sorted = [...ownerIds]
+      .filter((ownerId) => afterOwnerId === null || ownerId > afterOwnerId)
+      .sort();
+    const records = sorted.slice(0, limit);
+    return {
+      records,
+      nextCursor: sorted.length > limit ? (records[records.length - 1] ?? null) : null,
+    };
   }
 
   async addTable(record: TableRecord): Promise<void> {
@@ -1157,6 +1234,14 @@ function validateTempRunPageIdentity(ownerId: string, runId: string, pageIndex: 
   validateId(runId);
   if (!Number.isSafeInteger(pageIndex) || pageIndex < 0) {
     throw new RangeError("Temp run page index must be a non-negative whole number");
+  }
+}
+
+function validateTempOwnerRecord(record: TempOwnerRecord): void {
+  validateId(record.ownerId);
+  validateLeaseExpiration(record.expiresAt);
+  if (record.revision !== 0) {
+    throw new RangeError("Temp owner record must be created at revision zero");
   }
 }
 

@@ -329,8 +329,10 @@ row/vector parity.
 Phase 7D-A adds durable temp-run pages plus asynchronous external merge sort and partitioned hash
 aggregation. Budgeted `BrowserDatabase.query()` spills ungrouped ordered output (including joins) or
 single-table grouped ordered output, pairwise-merges fixed pages, applies LIMIT at the final read, and
-removes every owner/run page after ordinary success or failure. Abrupt tab/process loss can leave
-owner pages until durable spill-owner leases and age-based temp cleanup are implemented. Synchronous
+removes every owner/run page after ordinary success or failure. Spill owners now register and renew
+durable leases while executing, and `cleanupQuerySpill()` reclaims pages whose owner lease is expired
+or missing at a fixed cutoff—covering abrupt tab/process loss—while atomically retaining owners that
+renewed concurrently. Synchronous
 prepared execution remains a no-I/O fast path; `executeAsync()` exposes the spill-capable path.
 
 Phase 7 remains open. Preparation still materializes every projected typed input column in full before
@@ -493,8 +495,8 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Replace hash-join maps and duplicate arrays with a reserved byte-key index and typed row chains.
 - [x] Add durable external sort and single-table partitioned hash-aggregate spill paths.
 - [x] Add numeric/datetime zone-map row-group pruning and predicate-first projected-block loading.
-- [ ] Stream projected inputs, add the remaining spill shapes, and reclaim spill pages abandoned by
-      abrupt tab/process loss.
+- [x] Reclaim spill pages abandoned by abrupt tab/process loss through durable spill-owner leases.
+- [ ] Stream projected inputs and add the remaining spill shapes.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording
