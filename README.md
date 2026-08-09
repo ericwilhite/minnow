@@ -3,8 +3,8 @@
 BrowserDatabase is an experimental browser-only relational database built around immutable compressed
 columnar blocks and IndexedDB. The current slice includes the block format, atomic storage
 publication, persistent writes and snapshots, a bounded read-only SQL API, resumable and cancellable
-physical compaction of append segments, lease-aware physical garbage collection, deterministic fault
-injection, and a browser benchmark laboratory.
+physical compaction of append and keyed mutation segments, lease-aware physical garbage collection,
+deterministic fault injection, and a browser benchmark laboratory.
 
 The public logical types are intentionally small:
 
@@ -93,7 +93,7 @@ await database.createTable({
 await database.insert("events", { value: 1 });
 await database.insert("events", { value: 2 });
 
-// Advance a durable append-only physical rewrite by one output block.
+// Advance a durable physical rewrite by one output block.
 let progress = await database.compactTableStep("events", { maxBlocks: 1 });
 while (progress.result === null) {
   if (progress.jobId === null) throw new Error("Expected a compaction job");
@@ -140,9 +140,14 @@ closed when no longer needed. This is a correctness-first SQL subset, not a clai
 coverage.
 
 Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records an
-immutable rewrite plan: the source manifest and segments; ordered column/block layout; source row
-ranges, byte lengths, and checksums; output row windows; output compression; row-ID bounds; and logical
-order. It also checkpoints its output IDs, active transaction, state, and next output cursor.
+immutable physical rewrite plan. Append-only inputs use `rechunk-v1`, which fixes the ordered
+column/block layout, source row ranges, byte lengths and checksums, output windows, row-ID bounds,
+compression, and logical order. Keyed inputs containing upserts, partial updates, deletes, or an
+earlier merged base use `merge-v1`. That plan fingerprints the source segments in logical/commit
+order—including their kind, key, level, hidden row-ID metadata, and unique block fingerprints—and
+freezes logical key replay as ordered per-column source ranges. Execution therefore never has to
+repeat replay or trust mutable segment metadata after planning. The job checkpoints its output IDs,
+active transaction, state, and next output-window/column cursor.
 `compactTableStep()` creates or advances the active table job by at most `maxBlocks` output blocks;
 `resumeCompactionJob()` continues a known job after a yield or database reopen; and
 `listCompactionJobs()` exposes persisted progress. `compactTable()` is a convenience wrapper that
@@ -151,27 +156,40 @@ drives the same checkpointed workflow to completion in steps controlled by `maxB
 its linked transaction. It is idempotent and returns the job's terminal state plus any published
 version, so a caller also sees when publication or an earlier abort had already won.
 
-Execution decodes verified physical column payloads, slices and concatenates row ranges, and
-re-encodes output windows without materializing JavaScript row objects. The defaults are gzip, a
-2 MiB estimated uncompressed physical target per output column block, and a 32 MiB budget for
-JavaScript-owned rewrite buffers. The planner derives a shared row-window size from observed source
-block density, then measures and splits windows when skew or a tighter execution budget requires it.
-A single row cannot be split, so 2 MiB remains a sizing target rather than a hard output limit; one
-large value may exceed it when its physical and codec bounds still fit the block format. The job
-records a conservative minimum and a modeled high-water mark. Planner inspection reads one stored block at a
-time outside that executor high-water accounting; browser-native codec allocations, IndexedDB
-internals, persisted job/transaction metadata, and other browser heap are also excluded, so the
-option is not a strict total-process heap limit.
+Execution decodes verified physical column payloads, slices and concatenates the frozen source
+ranges, and re-encodes output windows without materializing column values as JavaScript row objects.
+The defaults are gzip, a 2 MiB estimated uncompressed physical target per output column block, and a
+32 MiB `memoryBudgetBytes` setting. Append planning reads one stored block at a time. Merge planning
+must also hold keyed replay metadata, so it first checks a separate conservative safety estimate
+derived from candidate rows, table width, and encoded key bytes. The same configured budget gates
+that planner estimate and the independently modeled executor-buffer minimum; only executor output
+work records the persisted high-water mark. The merge planner currently has neither spill nor a
+durable replay cursor, so planning itself is not restartable even though the resulting job is.
+
+The planner derives shared output windows from observed source-block density, then measures and
+splits them when skew or a tighter executor budget requires it. A single row cannot be split, so 2
+MiB remains a sizing target rather than a hard output limit; one large value may exceed it when its
+physical and codec bounds still fit the block format. Browser-native codec allocations, IndexedDB
+internals, persisted job metadata, and other browser heap are excluded from both modeled figures, so
+`memoryBudgetBytes` is a conservative workflow guard rather than a strict total-process heap limit.
 
 Every completed output block is checkpointed under a deterministic ID. Resume decompresses and
 validates an existing output, then compares its physical payload, type, compression, and row count.
 This semantic reconciliation matters for gzip because equivalent streams need not be
 byte-identical. The block is reattached to a replacement transaction when needed. A prepared output
 segment and a commit whose job-state update was lost are reconciled similarly. Normal writes remain
-L0 segments. The completed whole-table append rewrite publishes one L1 segment with the earliest source
-`logicalOrder`, which keeps a concurrent append after the consolidated rows when publication safely
-rebases. A changed or missing planned source aborts the job. Older manifests still reference the
-source blocks, so historical snapshots remain valid.
+L0 segments. A non-empty whole-table rewrite publishes one L1 segment with the earliest source
+`logicalOrder`. Mutation merges use the explicit full-row `base` kind and ordered `rowIdSpans` so
+updates and matching upserts preserve identity, deleted identities disappear, new keys retain their
+reserved IDs, and numerically out-of-order reservations do not change logical row order. If every row
+was deleted, publication supersedes the sources with no output block or globally visible empty
+segment.
+
+The frozen plan represents one leased source snapshot. Publication may rebase across later appends
+or mutation deltas while every planned source remains visible and unchanged; those later segments
+stay after the consolidated base and are not absorbed into it. A changed or missing planned source
+aborts the job. Older manifests still reference their original source blocks, so reads at historical
+versions remain valid before, during, and after publication.
 
 Cancellation is cooperative: it does not preempt synchronous physical transforms or browser-native
 codec work already in progress. An in-flight step observes cancellation at its next durable boundary
@@ -221,12 +239,13 @@ journals, or terminal compaction jobs. An otherwise unknown immutable block left
 `addBlock()` but before journal attachment is omitted until provenance or conservative age tracking
 exists.
 
-Phase 6 remains open. The implemented policy only rewrites every eligible, contiguous append-only
-segment in a table from L0 to one L1 segment. It does not compact upsert/update/delete deltas, choose
-source subsets, or implement L2 policy. Mutation-bearing and non-contiguous inputs are skipped
-explicitly. Garbage collection now reclaims known unreachable physical artifacts, but its planner
-and root discovery are not yet chunked/indexed, and unknown pre-journal orphans plus broader
-catalog, terminal-job, and metadata cleanup remain future work. A compaction result's
+Phase 6 remains open. The implemented policy rewrites a whole table at once: contiguous append-only
+inputs use `rechunk-v1`, while keyed mutation histories use `merge-v1` and publish a row-ID-preserving
+`base`. It does not choose source subsets, implement level selection beyond L0 -> L1, or build L2
+segments. Merge planning has no spill path or resumable planning cursor. Garbage collection now
+reclaims known unreachable physical artifacts, but its planner and root discovery are not yet
+chunked/indexed, and unknown pre-journal orphans plus broader catalog, terminal-job, and metadata
+cleanup remain future work. A compaction result's
 `physicallyReclaimedBytes` remains zero because compaction never deletes in the publication path;
 the separate garbage-collection result reports bytes deleted later.
 

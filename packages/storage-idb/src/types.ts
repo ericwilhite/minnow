@@ -45,7 +45,14 @@ export interface TableRecord {
   createdAt: string;
 }
 
-export type SegmentKind = "insert" | "upsert" | "update" | "delete";
+export type SegmentKind = "insert" | "upsert" | "update" | "delete" | "base";
+
+/** Maps a contiguous segment-row run to its immutable hidden row IDs. */
+export interface RowIdSpan {
+  readonly rowStart: number;
+  readonly rowCount: number;
+  readonly rowIdStart: bigint;
+}
 
 export interface SegmentRecord {
   id: string;
@@ -61,6 +68,8 @@ export interface SegmentRecord {
   level?: number;
   /** Missing on legacy records, where commit order supplies the logical order. */
   logicalOrder?: number;
+  /** Missing on legacy insert/upsert records, which imply one contiguous row-ID span. */
+  rowIdSpans?: readonly RowIdSpan[];
   createdAt: string;
 }
 
@@ -95,7 +104,7 @@ export interface CompactionJobCursor {
   sourceBlockIndex: number;
 }
 
-export const compactionRewritePlanKinds = ["copy-v1", "rechunk-v1"] as const;
+export const compactionRewritePlanKinds = ["copy-v1", "rechunk-v1", "merge-v1"] as const;
 export type CompactionRewritePlanKind = (typeof compactionRewritePlanKinds)[number];
 
 export interface CopyCompactionRewritePlan {
@@ -140,7 +149,71 @@ export interface RechunkCompactionRewritePlan {
   readonly outputs: readonly RechunkCompactionOutputWindow[];
 }
 
-export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan;
+export interface MergeCompactionSourceBlock {
+  readonly blockId: string;
+  /** Row offset within the source segment column. */
+  readonly rowStart: number;
+  readonly rowCount: number;
+  readonly storedBytes: number;
+  readonly encodedBytes: number;
+  readonly checksum: number;
+}
+
+export interface MergeCompactionSourceColumn {
+  readonly columnId: string;
+  readonly type: SimpleDataType;
+  readonly sourceBlocks: readonly MergeCompactionSourceBlock[];
+}
+
+export interface MergeCompactionSourceSegment {
+  readonly segmentId: string;
+  readonly transactionId: string;
+  readonly committedVersion: number;
+  readonly kind: SegmentKind;
+  readonly keyColumnId: string | null;
+  readonly level: number;
+  readonly logicalOrder: number;
+  readonly rowCount: number;
+  readonly rowIdStart: bigint;
+  readonly rowIdEndExclusive: bigint;
+  readonly rowIdSpans: readonly RowIdSpan[];
+  readonly columns: readonly MergeCompactionSourceColumn[];
+}
+
+export interface MergeCompactionOutputSourceRange {
+  /** Row offset within the canonical merged output. */
+  readonly outputRowStart: number;
+  readonly sourceBlockId: string;
+  /** Row offset within sourceBlockId. */
+  readonly sourceRowStart: number;
+  readonly rowCount: number;
+}
+
+export interface MergeCompactionOutputColumn {
+  readonly columnId: string;
+  readonly type: SimpleDataType;
+  readonly sourceRanges: readonly MergeCompactionOutputSourceRange[];
+}
+
+/** An immutable logical replay result followed by a physical, output-driven rewrite. */
+export interface MergeCompactionRewritePlan {
+  readonly kind: "merge-v1";
+  readonly targetBlockBytes: number;
+  readonly outputCompression: CompactionOutputCompression;
+  readonly keyColumnId: string;
+  readonly totalRows: number;
+  /** Bounding row-ID envelope; spans preserve gaps and output order. */
+  readonly rowIdStart: bigint;
+  readonly rowIdEndExclusive: bigint;
+  readonly rowIdSpans: readonly RowIdSpan[];
+  readonly logicalOrder: number;
+  readonly sourceSegments: readonly MergeCompactionSourceSegment[];
+  readonly columns: readonly MergeCompactionOutputColumn[];
+  readonly outputs: readonly RechunkCompactionOutputWindow[];
+}
+
+export type CompactionRewritePlan =
+  CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan;
 
 /**
  * The next rechunk output to emit, ordered by output window and then column. A completed cursor
@@ -944,10 +1017,10 @@ export function updateCompactionJobRecord(
       throw new TypeError(`Compaction ${field} is immutable`);
     }
   }
-  if (current.rewritePlan?.kind === "rechunk-v1") {
+  if (isOutputDrivenCompactionPlan(current.rewritePlan)) {
     for (const field of ["cursor", "sourceStoredBytes", "logicalBytes"] as const) {
       if (Reflect.has(update, field)) {
-        throw new TypeError(`Rechunk compaction ${field} is immutable`);
+        throw new TypeError(`Output-driven compaction ${field} is immutable`);
       }
     }
   }
@@ -990,6 +1063,15 @@ export function updateCompactionJobRecord(
 }
 
 function validateCompactionJobState(record: CompactionJobRecord): void {
+  const plan = record.rewritePlan ?? { kind: "copy-v1" };
+  if (plan.kind === "merge-v1") {
+    if (plan.totalRows === 0 && record.outputSegmentId !== null) {
+      throw new TypeError("An empty merge compaction cannot have an output segment");
+    }
+    if (plan.totalRows > 0 && record.outputSegmentId === null) {
+      throw new TypeError("A non-empty merge compaction requires an output segment ID");
+    }
+  }
   if (record.state === "cancelled" && record.error !== undefined) {
     throw new TypeError("A cancelled compaction cannot contain an error");
   }
@@ -1013,8 +1095,11 @@ function validateCompactionJobState(record: CompactionJobRecord): void {
     throw new TypeError("A running compaction requires a transaction ID");
   }
   if (record.state === "ready" || record.state === "published") {
-    if (record.transactionId === null || record.outputSegmentId === null) {
-      throw new TypeError(`${record.state} compaction requires transaction and output segment IDs`);
+    if (
+      record.transactionId === null ||
+      (record.outputSegmentId === null && !(plan.kind === "merge-v1" && plan.totalRows === 0))
+    ) {
+      throw new TypeError(`${record.state} compaction requires its transaction and output segment`);
     }
     if (!hasCompletedCompactionCursor(record)) {
       throw new TypeError(`${record.state} compaction requires a completed cursor`);
@@ -1023,10 +1108,11 @@ function validateCompactionJobState(record: CompactionJobRecord): void {
       throw new TypeError(`${record.state} compaction requires every output block`);
     }
     if (
-      record.rewritePlan?.kind === "rechunk-v1" &&
+      isOutputDrivenCompactionPlan(record.rewritePlan) &&
+      expectedCompactionOutputCount(record) > 0 &&
       (record.peakWorkingBytes ?? 0) < (record.minimumMemoryBytes ?? 0)
     ) {
-      throw new TypeError(`${record.state} rechunk compaction requires complete memory accounting`);
+      throw new TypeError(`${record.state} compaction requires complete memory accounting`);
     }
   }
   if (record.state === "published") {
@@ -1063,10 +1149,11 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
   }
 
   if (record.cursor.sourceSegmentIndex !== 0 || record.cursor.sourceBlockIndex !== 0) {
-    throw new TypeError("A rechunk compaction does not use the source-driven cursor");
+    throw new TypeError("An output-driven compaction does not use the source cursor");
   }
-  if (memoryBudgetBytes === 0 || minimumMemoryBytes === 0) {
-    throw new RangeError("A rechunk compaction requires a memory budget and minimum memory");
+  const permitsZeroMinimum = plan.kind === "merge-v1" && plan.totalRows === 0;
+  if (memoryBudgetBytes === 0 || (minimumMemoryBytes === 0 && !permitsZeroMinimum)) {
+    throw new RangeError("An output-driven compaction requires a memory budget and minimum memory");
   }
   if (minimumMemoryBytes > memoryBudgetBytes) {
     throw new RangeError("Compaction minimum memory exceeds its memory budget");
@@ -1075,17 +1162,22 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
     throw new RangeError("Compaction peak working bytes exceed its memory budget");
   }
 
-  const plannedBlocks = plan.columns.flatMap((column) => column.sourceBlocks);
+  const plannedBlocks =
+    plan.kind === "rechunk-v1"
+      ? plan.columns.flatMap((column) => column.sourceBlocks)
+      : plan.sourceSegments.flatMap((segment) =>
+          segment.columns.flatMap((column) => column.sourceBlocks),
+        );
   const plannedBlockIds = plannedBlocks.map((block) => block.blockId);
   if (new Set(plannedBlockIds).size !== plannedBlockIds.length) {
-    throw new TypeError("A rechunk source block can only appear once in its source layout");
+    throw new TypeError("A planned source block can only appear once in its source layout");
   }
   const sortedPlannedIds = [...plannedBlockIds].sort();
   if (
     sortedPlannedIds.length !== record.sourceBlockIds.length ||
     sortedPlannedIds.some((id, index) => id !== record.sourceBlockIds[index])
   ) {
-    throw new TypeError("Rechunk source layout must describe every selected source block");
+    throw new TypeError("The rewrite source layout must describe every selected source block");
   }
   const plannedStoredBytes = safeSum(
     plannedBlocks.map((block) => block.storedBytes),
@@ -1096,15 +1188,37 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
     "Rechunk source encoded bytes",
   );
   if (record.sourceStoredBytes !== plannedStoredBytes) {
-    throw new TypeError("Rechunk source stored bytes must match its immutable source layout");
+    throw new TypeError("Source stored bytes must match the immutable rewrite layout");
   }
   if (record.logicalBytes !== plannedEncodedBytes) {
-    throw new TypeError("Rechunk logical bytes must match its immutable source layout");
+    throw new TypeError("Logical bytes must match the immutable rewrite layout");
+  }
+
+  if (plan.kind === "merge-v1") {
+    if (
+      plan.totalRows === 0 &&
+      (record.outputBlockIds.length !== 0 ||
+        record.outputStoredBytes !== 0 ||
+        outputLogicalBytes !== 0 ||
+        peakWorkingBytes !== 0 ||
+        minimumMemoryBytes !== 0)
+    ) {
+      throw new TypeError("An empty merge compaction cannot contain physical output progress");
+    }
+    const plannedSegmentIds = plan.sourceSegments.map((segment) => segment.segmentId);
+    if (
+      plannedSegmentIds.length !== record.sourceSegmentIds.length ||
+      plannedSegmentIds.some((id, index) => id !== record.sourceSegmentIds[index])
+    ) {
+      throw new TypeError(
+        "Merge source layout must preserve every selected source segment in order",
+      );
+    }
   }
 
   const cursor = record.outputCursor;
   if (cursor === null || cursor === undefined) {
-    throw new TypeError("A rechunk compaction requires an output cursor");
+    throw new TypeError("An output-driven compaction requires an output cursor");
   }
   const completedOutputs = safeSum(
     [
@@ -1114,14 +1228,14 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
     "Rechunk output cursor",
   );
   if (record.outputBlockIds.length !== completedOutputs) {
-    throw new TypeError("Rechunk output IDs must match its output cursor");
+    throw new TypeError("Compaction output IDs must match the output cursor");
   }
   const expectedProcessedRows =
     cursor.outputIndex === plan.outputs.length
       ? plan.totalRows
       : (plan.outputs[cursor.outputIndex]?.rowStart ?? 0);
   if (record.processedRows !== expectedProcessedRows) {
-    throw new TypeError("Rechunk processed rows must match its completed output windows");
+    throw new TypeError("Processed rows must match completed output windows");
   }
 }
 
@@ -1145,12 +1259,18 @@ function validateCompactionJobProgress(
   if (next.outputBlockIds.length < previous.outputBlockIds.length) {
     throw new TypeError("Compaction output block IDs cannot be removed");
   }
-  if (previous.rewritePlan?.kind === "rechunk-v1") {
+  if (isOutputDrivenCompactionPlan(previous.rewritePlan)) {
     if (previous.outputBlockIds.some((id, index) => next.outputBlockIds[index] !== id)) {
-      throw new TypeError("Rechunk output block IDs are an append-only ordered checkpoint");
+      throw new TypeError("Output block IDs are an append-only ordered checkpoint");
     }
     if (compactionOutputOrdinal(next) < compactionOutputOrdinal(previous)) {
-      throw new RangeError("Rechunk output cursor cannot move backwards");
+      throw new RangeError("Output cursor cannot move backwards");
+    }
+    if (
+      previous.rewritePlan.kind === "merge-v1" &&
+      previous.outputSegmentId !== next.outputSegmentId
+    ) {
+      throw new TypeError("Merge output segment ID is immutable");
     }
   } else {
     const nextIds = new Set(next.outputBlockIds);
@@ -1173,10 +1293,9 @@ function isInitialOutputCursor(record: CompactionJobRecord): boolean {
   const plan = record.rewritePlan ?? { kind: "copy-v1" };
   if (plan.kind === "copy-v1") return record.outputCursor === null;
   const cursor = record.outputCursor;
+  const initialRowStart = plan.outputs[0]?.rowStart ?? plan.totalRows;
   return (
-    cursor?.outputIndex === 0 &&
-    cursor.columnIndex === 0 &&
-    cursor.rowStart === plan.outputs[0]?.rowStart
+    cursor?.outputIndex === 0 && cursor.columnIndex === 0 && cursor.rowStart === initialRowStart
   );
 }
 
@@ -1203,7 +1322,7 @@ function expectedCompactionOutputCount(record: CompactionJobRecord): number {
 function compactionOutputOrdinal(record: CompactionJobRecord): number {
   const plan = record.rewritePlan;
   const cursor = record.outputCursor;
-  if (plan?.kind !== "rechunk-v1" || cursor === null || cursor === undefined) return 0;
+  if (!isOutputDrivenCompactionPlan(plan) || cursor === null || cursor === undefined) return 0;
   return safeSum(
     [
       safeProduct(cursor.outputIndex, plan.columns.length, "Rechunk output cursor"),
@@ -1211,6 +1330,12 @@ function compactionOutputOrdinal(record: CompactionJobRecord): number {
     ],
     "Rechunk output cursor",
   );
+}
+
+function isOutputDrivenCompactionPlan(
+  plan: CompactionRewritePlan | undefined,
+): plan is RechunkCompactionRewritePlan | MergeCompactionRewritePlan {
+  return plan?.kind === "rechunk-v1" || plan?.kind === "merge-v1";
 }
 
 function validateCompactionJobTransition(
@@ -1253,6 +1378,7 @@ function normalizeCompactionRewritePlan(value: unknown): CompactionRewritePlan {
   }
   const kind: unknown = Reflect.get(value, "kind");
   if (kind === "copy-v1") return { kind: "copy-v1" };
+  if (kind === "merge-v1") return normalizeMergeCompactionRewritePlan(value);
   if (kind !== "rechunk-v1") {
     throw new TypeError(`Invalid compaction rewrite plan: ${String(kind)}`);
   }
@@ -1378,6 +1504,429 @@ function normalizeRechunkSourceColumn(
   };
 }
 
+function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewritePlan {
+  const totalRows = nonNegativeWholeNumber(
+    Reflect.get(value, "totalRows"),
+    "Merge total row count",
+  );
+  const rowIdStart = nonNegativeBigInt(Reflect.get(value, "rowIdStart"), "Merge row ID start");
+  const rowIdEndExclusive = nonNegativeBigInt(
+    Reflect.get(value, "rowIdEndExclusive"),
+    "Merge row ID end",
+  );
+  const rowIdSpans = normalizeRowIdSpans(
+    Reflect.get(value, "rowIdSpans"),
+    totalRows,
+    rowIdStart,
+    rowIdEndExclusive,
+    "Merge output row ID spans",
+  );
+  const keyColumnId = nonEmptyString(Reflect.get(value, "keyColumnId"), "Merge key column ID");
+
+  const sourceSegmentsValue: unknown = Reflect.get(value, "sourceSegments");
+  if (!Array.isArray(sourceSegmentsValue) || sourceSegmentsValue.length === 0) {
+    throw new TypeError("A merge plan requires at least one source segment");
+  }
+  const sourceSegments = sourceSegmentsValue.map((segment, index) =>
+    normalizeMergeSourceSegment(segment, index),
+  );
+  const sourceSegmentIds = sourceSegments.map((segment) => segment.segmentId);
+  if (new Set(sourceSegmentIds).size !== sourceSegmentIds.length) {
+    throw new TypeError("A merge source segment can only appear once");
+  }
+  for (let index = 1; index < sourceSegments.length; index += 1) {
+    const previous = sourceSegments[index - 1];
+    const current = sourceSegments[index];
+    if (
+      previous !== undefined &&
+      current !== undefined &&
+      compareMergeSourceSegments(previous, current) >= 0
+    ) {
+      throw new TypeError("Merge source segments must use canonical logical order");
+    }
+  }
+
+  const sourceBlocks = new Map<
+    string,
+    { columnId: string; type: SimpleDataType; rowCount: number }
+  >();
+  for (const segment of sourceSegments) {
+    for (const column of segment.columns) {
+      for (const block of column.sourceBlocks) {
+        if (sourceBlocks.has(block.blockId)) {
+          throw new TypeError("A merge source block can only appear once");
+        }
+        sourceBlocks.set(block.blockId, {
+          columnId: column.columnId,
+          type: column.type,
+          rowCount: block.rowCount,
+        });
+      }
+    }
+  }
+
+  const columnsValue: unknown = Reflect.get(value, "columns");
+  if (!Array.isArray(columnsValue) || columnsValue.length === 0) {
+    throw new TypeError("A merge plan requires at least one output column");
+  }
+  const columns = columnsValue.map((column, index) =>
+    normalizeMergeOutputColumn(column, totalRows, sourceBlocks, index),
+  );
+  const columnIds = columns.map((column) => column.columnId);
+  if (new Set(columnIds).size !== columnIds.length) {
+    throw new TypeError("A merge plan cannot contain duplicate output columns");
+  }
+  if (!columnIds.includes(keyColumnId)) {
+    throw new TypeError("A merge plan must output its key column");
+  }
+  validateMergeSourceShapes(sourceSegments, columns, keyColumnId);
+
+  const outputsValue: unknown = Reflect.get(value, "outputs");
+  if (!Array.isArray(outputsValue)) throw new TypeError("Merge outputs must be an array");
+  if ((totalRows === 0) !== (outputsValue.length === 0)) {
+    throw new TypeError("Merge output windows must be empty exactly when no rows survive");
+  }
+  const outputs = outputsValue.map((output, index) => {
+    if (typeof output !== "object" || output === null) {
+      throw new TypeError(`Merge output window ${String(index)} must be an object`);
+    }
+    return {
+      rowStart: nonNegativeWholeNumber(
+        Reflect.get(output, "rowStart"),
+        `Merge output window ${String(index)} row start`,
+      ),
+      rowCount: positiveUint32(
+        Reflect.get(output, "rowCount"),
+        `Merge output window ${String(index)} row count`,
+      ),
+    };
+  });
+  validateContiguousRows(outputs, totalRows, "Merge output windows");
+
+  const logicalOrder = nonNegativeWholeNumber(
+    Reflect.get(value, "logicalOrder"),
+    "Merge logical order",
+  );
+  if (logicalOrder !== sourceSegments[0]?.logicalOrder) {
+    throw new TypeError("Merge logical order must match its earliest source segment");
+  }
+
+  return {
+    kind: "merge-v1",
+    targetBlockBytes: positiveWholeNumber(
+      Reflect.get(value, "targetBlockBytes"),
+      "Merge target block bytes",
+    ),
+    outputCompression: compactionOutputCompression(Reflect.get(value, "outputCompression")),
+    keyColumnId,
+    totalRows,
+    rowIdStart,
+    rowIdEndExclusive,
+    rowIdSpans,
+    logicalOrder,
+    sourceSegments,
+    columns,
+    outputs,
+  };
+}
+
+function normalizeMergeSourceSegment(
+  value: unknown,
+  segmentIndex: number,
+): MergeCompactionSourceSegment {
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError(`Merge source segment ${String(segmentIndex)} must be an object`);
+  }
+  const label = `Merge source segment ${String(segmentIndex)}`;
+  const kind = segmentKind(Reflect.get(value, "kind"));
+  const rowCount = positiveWholeNumber(Reflect.get(value, "rowCount"), `${label} row count`);
+  const rowIdStart = nonNegativeBigInt(Reflect.get(value, "rowIdStart"), `${label} row ID start`);
+  const rowIdEndExclusive = nonNegativeBigInt(
+    Reflect.get(value, "rowIdEndExclusive"),
+    `${label} row ID end`,
+  );
+  let rowIdSpans: RowIdSpan[];
+  if (kind === "insert" || kind === "upsert" || kind === "base") {
+    rowIdSpans = normalizeRowIdSpans(
+      Reflect.get(value, "rowIdSpans"),
+      rowCount,
+      rowIdStart,
+      rowIdEndExclusive,
+      `${label} row ID spans`,
+    );
+  } else {
+    const spans: unknown = Reflect.get(value, "rowIdSpans");
+    if (!Array.isArray(spans) || spans.length !== 0) {
+      throw new TypeError(`${label} mutation markers cannot own row IDs`);
+    }
+    if (rowIdStart !== 0n || rowIdEndExclusive !== 0n) {
+      throw new TypeError(`${label} mutation marker row ID envelope must be empty`);
+    }
+    rowIdSpans = [];
+  }
+
+  const columnsValue: unknown = Reflect.get(value, "columns");
+  if (!Array.isArray(columnsValue) || columnsValue.length === 0) {
+    throw new TypeError(`${label} requires at least one source column`);
+  }
+  const columns = columnsValue.map((column, columnIndex) =>
+    normalizeMergeSourceColumn(column, rowCount, segmentIndex, columnIndex),
+  );
+  const columnIds = columns.map((column) => column.columnId);
+  if (new Set(columnIds).size !== columnIds.length) {
+    throw new TypeError(`${label} cannot contain duplicate source columns`);
+  }
+
+  return {
+    segmentId: nonEmptyString(Reflect.get(value, "segmentId"), `${label} ID`),
+    transactionId: nonEmptyString(Reflect.get(value, "transactionId"), `${label} transaction ID`),
+    committedVersion: nonNegativeWholeNumber(
+      Reflect.get(value, "committedVersion"),
+      `${label} committed version`,
+    ),
+    kind,
+    keyColumnId: nullableId(Reflect.get(value, "keyColumnId"), `${label} key column ID`),
+    level: nonNegativeWholeNumber(Reflect.get(value, "level"), `${label} level`),
+    logicalOrder: nonNegativeWholeNumber(
+      Reflect.get(value, "logicalOrder"),
+      `${label} logical order`,
+    ),
+    rowCount,
+    rowIdStart,
+    rowIdEndExclusive,
+    rowIdSpans,
+    columns,
+  };
+}
+
+function normalizeMergeSourceColumn(
+  value: unknown,
+  segmentRowCount: number,
+  segmentIndex: number,
+  columnIndex: number,
+): MergeCompactionSourceColumn {
+  const label = `Merge source column ${String(segmentIndex)}:${String(columnIndex)}`;
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const sourceBlocksValue: unknown = Reflect.get(value, "sourceBlocks");
+  if (!Array.isArray(sourceBlocksValue) || sourceBlocksValue.length === 0) {
+    throw new TypeError(`${label} requires source blocks`);
+  }
+  const sourceBlocks = sourceBlocksValue.map((block, blockIndex) => {
+    if (typeof block !== "object" || block === null) {
+      throw new TypeError(`${label} block ${String(blockIndex)} must be an object`);
+    }
+    return {
+      blockId: nonEmptyString(Reflect.get(block, "blockId"), `${label} block ID`),
+      rowStart: nonNegativeWholeNumber(Reflect.get(block, "rowStart"), `${label} block row start`),
+      rowCount: positiveUint32(Reflect.get(block, "rowCount"), `${label} block row count`),
+      storedBytes: positiveWholeNumber(
+        Reflect.get(block, "storedBytes"),
+        `${label} block stored bytes`,
+      ),
+      encodedBytes: nonNegativeWholeNumber(
+        Reflect.get(block, "encodedBytes"),
+        `${label} block encoded bytes`,
+      ),
+      checksum: uint32(Reflect.get(block, "checksum"), `${label} block checksum`),
+    };
+  });
+  validateContiguousRows(sourceBlocks, segmentRowCount, `${label} blocks`);
+  return {
+    columnId: nonEmptyString(Reflect.get(value, "columnId"), `${label} ID`),
+    type: simpleDataType(Reflect.get(value, "type")),
+    sourceBlocks,
+  };
+}
+
+function normalizeMergeOutputColumn(
+  value: unknown,
+  totalRows: number,
+  sourceBlocks: ReadonlyMap<string, { columnId: string; type: SimpleDataType; rowCount: number }>,
+  columnIndex: number,
+): MergeCompactionOutputColumn {
+  const label = `Merge output column ${String(columnIndex)}`;
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const columnId = nonEmptyString(Reflect.get(value, "columnId"), `${label} ID`);
+  const type = simpleDataType(Reflect.get(value, "type"));
+  const rangesValue: unknown = Reflect.get(value, "sourceRanges");
+  if (!Array.isArray(rangesValue)) throw new TypeError(`${label} source ranges must be an array`);
+  const sourceRanges = rangesValue.map((range, rangeIndex) => {
+    if (typeof range !== "object" || range === null) {
+      throw new TypeError(`${label} source range ${String(rangeIndex)} must be an object`);
+    }
+    const normalized: MergeCompactionOutputSourceRange = {
+      outputRowStart: nonNegativeWholeNumber(
+        Reflect.get(range, "outputRowStart"),
+        `${label} source range output row start`,
+      ),
+      sourceBlockId: nonEmptyString(
+        Reflect.get(range, "sourceBlockId"),
+        `${label} source range block ID`,
+      ),
+      sourceRowStart: nonNegativeWholeNumber(
+        Reflect.get(range, "sourceRowStart"),
+        `${label} source range block row start`,
+      ),
+      rowCount: positiveUint32(Reflect.get(range, "rowCount"), `${label} source range row count`),
+    };
+    const source = sourceBlocks.get(normalized.sourceBlockId);
+    if (source === undefined) throw new TypeError(`${label} references an unknown source block`);
+    if (source.columnId !== columnId || source.type !== type) {
+      throw new TypeError(`${label} source range has the wrong column or type`);
+    }
+    if (
+      safeSum([normalized.sourceRowStart, normalized.rowCount], `${label} source range rows`) >
+      source.rowCount
+    ) {
+      throw new RangeError(`${label} source range is outside its source block`);
+    }
+    return normalized;
+  });
+  let outputRowStart = 0;
+  for (let index = 0; index < sourceRanges.length; index += 1) {
+    const range = sourceRanges[index];
+    if (range === undefined) continue;
+    if (range.outputRowStart !== outputRowStart) {
+      throw new RangeError(`${label} source ranges must cover output rows contiguously`);
+    }
+    const previous = sourceRanges[index - 1];
+    if (
+      previous?.sourceBlockId === range.sourceBlockId &&
+      previous.sourceRowStart + previous.rowCount === range.sourceRowStart
+    ) {
+      throw new TypeError(`${label} contains adjacent source ranges that must be coalesced`);
+    }
+    outputRowStart = safeSum([outputRowStart, range.rowCount], `${label} output row count`);
+  }
+  if (outputRowStart !== totalRows) {
+    throw new RangeError(`${label} source ranges must cover every merged output row`);
+  }
+  return { columnId, type, sourceRanges };
+}
+
+function validateMergeSourceShapes(
+  sourceSegments: readonly MergeCompactionSourceSegment[],
+  outputColumns: readonly MergeCompactionOutputColumn[],
+  keyColumnId: string,
+): void {
+  const outputIds = outputColumns.map((column) => column.columnId);
+  const outputTypes = new Map(outputColumns.map((column) => [column.columnId, column.type]));
+  for (const segment of sourceSegments) {
+    if (segment.keyColumnId !== keyColumnId) {
+      throw new TypeError(`Merge source segment ${segment.segmentId} has the wrong key column`);
+    }
+    const sourceIds = segment.columns.map((column) => column.columnId);
+    if (segment.columns.some((column) => outputTypes.get(column.columnId) !== column.type)) {
+      throw new TypeError(
+        `Merge source segment ${segment.segmentId} has an unknown column or type`,
+      );
+    }
+    const canonicalIds = outputIds.filter((id) => sourceIds.includes(id));
+    if (canonicalIds.some((id, index) => sourceIds[index] !== id)) {
+      throw new TypeError(`Merge source segment ${segment.segmentId} columns are not canonical`);
+    }
+    if (segment.kind === "insert" || segment.kind === "upsert" || segment.kind === "base") {
+      if (
+        sourceIds.length !== outputIds.length ||
+        sourceIds.some((id, index) => outputIds[index] !== id)
+      ) {
+        throw new TypeError(`Merge ${segment.kind} segment must contain every output column`);
+      }
+    } else if (segment.kind === "delete") {
+      if (sourceIds.length !== 1 || sourceIds[0] !== keyColumnId) {
+        throw new TypeError("A merge delete segment must contain only its key column");
+      }
+    } else if (
+      sourceIds.length < 2 ||
+      !sourceIds.includes(keyColumnId) ||
+      sourceIds.every((id) => id === keyColumnId)
+    ) {
+      throw new TypeError("A merge update segment requires its key and a changed column");
+    }
+  }
+}
+
+function normalizeRowIdSpans(
+  value: unknown,
+  totalRows: number,
+  rowIdStart: bigint,
+  rowIdEndExclusive: bigint,
+  label: string,
+): RowIdSpan[] {
+  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
+  const spans = value.map((span, index) => {
+    if (typeof span !== "object" || span === null) {
+      throw new TypeError(`${label} ${String(index)} must be an object`);
+    }
+    return {
+      rowStart: nonNegativeWholeNumber(
+        Reflect.get(span, "rowStart"),
+        `${label} ${String(index)} row start`,
+      ),
+      rowCount: positiveWholeNumber(
+        Reflect.get(span, "rowCount"),
+        `${label} ${String(index)} row count`,
+      ),
+      rowIdStart: nonNegativeBigInt(
+        Reflect.get(span, "rowIdStart"),
+        `${label} ${String(index)} row ID start`,
+      ),
+    };
+  });
+  let rowStart = 0;
+  for (let index = 0; index < spans.length; index += 1) {
+    const span = spans[index];
+    if (span === undefined) continue;
+    if (span.rowStart !== rowStart) throw new RangeError(`${label} must cover rows contiguously`);
+    const previous = spans[index - 1];
+    if (
+      previous !== undefined &&
+      previous.rowIdStart + BigInt(previous.rowCount) === span.rowIdStart
+    ) {
+      throw new TypeError(`${label} contains adjacent spans that must be coalesced`);
+    }
+    rowStart = safeSum([rowStart, span.rowCount], `${label} row count`);
+  }
+  if (rowStart !== totalRows) throw new RangeError(`${label} must cover every row`);
+  if (spans.length === 0) {
+    if (totalRows !== 0 || rowIdStart !== 0n || rowIdEndExclusive !== 0n) {
+      throw new RangeError(`${label} has an invalid empty row ID envelope`);
+    }
+    return spans;
+  }
+  const intervals = spans
+    .map((span) => ({ start: span.rowIdStart, end: span.rowIdStart + BigInt(span.rowCount) }))
+    .sort((left, right) => (left.start < right.start ? -1 : left.start > right.start ? 1 : 0));
+  for (let index = 1; index < intervals.length; index += 1) {
+    const previous = intervals[index - 1];
+    const current = intervals[index];
+    if (previous !== undefined && current !== undefined && current.start < previous.end) {
+      throw new RangeError(`${label} cannot contain overlapping row IDs`);
+    }
+  }
+  const minimum = intervals[0]?.start;
+  const maximum = intervals[intervals.length - 1]?.end;
+  if (minimum !== rowIdStart || maximum !== rowIdEndExclusive) {
+    throw new RangeError(`${label} must match its row ID envelope`);
+  }
+  return spans;
+}
+
+function compareMergeSourceSegments(
+  left: MergeCompactionSourceSegment,
+  right: MergeCompactionSourceSegment,
+): number {
+  return (
+    left.logicalOrder - right.logicalOrder ||
+    left.committedVersion - right.committedVersion ||
+    left.segmentId.localeCompare(right.segmentId)
+  );
+}
+
 function normalizeCompactionOutputCursor(
   value: unknown,
   plan: CompactionRewritePlan,
@@ -1389,6 +1938,9 @@ function normalizeCompactionOutputCursor(
     return null;
   }
   if (value === undefined) {
+    if (plan.kind === "merge-v1") {
+      throw new TypeError("A merge compaction requires an explicit output cursor");
+    }
     return { outputIndex: 0, columnIndex: 0, rowStart: plan.outputs[0]?.rowStart ?? 0 };
   }
   if (typeof value !== "object" || value === null) {
@@ -1453,9 +2005,22 @@ function compactionOutputCompression(value: unknown): CompactionOutputCompressio
 
 function simpleDataType(value: unknown): SimpleDataType {
   if (typeof value !== "string" || !(simpleDataTypes as readonly string[]).includes(value)) {
-    throw new TypeError(`Invalid rechunk source column type: ${String(value)}`);
+    throw new TypeError(`Invalid compaction column type: ${String(value)}`);
   }
   return value as SimpleDataType;
+}
+
+function segmentKind(value: unknown): SegmentKind {
+  if (
+    value !== "insert" &&
+    value !== "upsert" &&
+    value !== "update" &&
+    value !== "delete" &&
+    value !== "base"
+  ) {
+    throw new TypeError(`Invalid merge source segment kind: ${String(value)}`);
+  }
+  return value;
 }
 
 function compactionJobState(state: unknown): CompactionJobState {

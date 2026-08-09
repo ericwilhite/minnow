@@ -147,7 +147,7 @@ encode/compress new blocks
         -> commit metadata transaction
 ```
 
-The manifest never references a partial block. A crash before publication can leave unreachable blocks, which later garbage collection may safely reclaim. A compare-and-swap failure is a normal write conflict; the caller rebases or retries according to transaction semantics. Compaction uses the same atomic publication path: a new manifest replaces its planned source blocks with newly staged blocks. If a concurrent commit only appends data and all planned sources remain visible, compaction rebases and publishes without dropping or reordering that append. If a source changed, the job aborts rather than publishing a stale rewrite. Cancellation and publication serialize through storage transactions: cancellation wins by atomically marking the job `cancelled` and aborting its active transaction, or commit wins and cancellation observes `published` with the committed manifest version. Historical manifests and their source blocks remain unchanged, so replacement or cancellation is not physical deletion.
+The manifest never references a partial block. A crash before publication can leave unreachable blocks, which later garbage collection may safely reclaim. A compare-and-swap failure is a normal write conflict; the caller rebases or retries according to transaction semantics. Compaction uses the same atomic publication path: a new manifest replaces its planned source blocks with newly staged blocks. If a concurrent commit adds later append or mutation segments and all planned sources remain visible, compaction rebases and publishes without absorbing, dropping, or reordering those later deltas. If a source changed, the job aborts rather than publishing a stale rewrite. Cancellation and publication serialize through storage transactions: cancellation wins by atomically marking the job `cancelled` and aborting its active transaction, or commit wins and cancellation observes `published` with the committed manifest version. Historical manifests and their source blocks remain unchanged, so replacement or cancellation is not physical deletion.
 
 The library now implements block writes, saved manifest history, stable leased snapshots,
 transaction records, competing-writer checks, reader/backup leases, and reachability-based physical
@@ -157,6 +157,15 @@ of the MVCC/compaction work.
 ### Row identity and mutations
 
 Tables receive a hidden immutable row ID. Its storage width is not part of the public type system. Writers atomically reserve ranges so they do not coordinate once per row. Inserts create immutable column segments. Upserts create newer keyed segments; reads use the newest row for each key while old snapshots keep the older value. Partial updates create narrow segments containing the key and changed columns only. Deletes create small key-only markers. Published blocks are never updated in place.
+
+Mutation compaction preserves those identities with ordered `rowIdSpans`. Each span maps a positive
+run of logical output rows to consecutive hidden IDs. Together the spans cover the output row count
+exactly and do not overlap, but their numeric ID ranges may be out of order because reservation order
+can differ from commit order. Matching upserts and updates retain the existing ID, deletes remove it,
+and a newly inserted key uses its reserved ID. A non-empty merged output is an explicit full-row
+`base` segment rather than an ordinary insert. This discriminator is also a rolling-version safety
+property: readers treat it as full-row data, while an older append-only compactor rejects it instead
+of silently discarding the span metadata.
 
 Tables with a unique key keep a small persistent key lookup in IndexedDB. The key changes and new manifest version commit together, so another tab cannot observe one without the other. Older tables that do not have this lookup remain correct by using a table scan until they are rebuilt.
 
@@ -169,50 +178,63 @@ needs it.
 ### Resumable physical compaction
 
 Ordinary write segments are recorded at L0 with a `logicalOrder` derived from their commit version.
-The first policy selects every eligible append-only segment visible in one manifest, requires
-contiguous row-ID ranges, and publishes one L1 segment. Its `logicalOrder` is inherited from the
-earliest source, so the consolidated segment remains in the same logical position even if a new L0
-append commits while the job is running.
+The implemented policy selects every table segment visible in one leased source snapshot.
+Contiguous append-only inputs use `rechunk-v1`; keyed histories containing upsert, update, delete, or
+a prior base use `merge-v1`. Both publish at L1 and inherit the earliest source `logicalOrder`, so a
+later L0 delta remains after the consolidated output if publication rebases.
 
-A compaction job persisted in the IndexedDB `gc` store contains an immutable `rechunk-v1` plan. The
-plan fingerprints the source manifest and segments plus each ordered column block's ID, row range,
-stored/encoded length, and checksum. It also fixes the output windows, schema IDs/types, row-ID
-bounds, inherited logical order, target compression and block-size estimate. Mutable progress holds
-deterministic output IDs, the next output-window/column cursor, transaction ID, revisioned state,
-processed rows and bytes, and the modeled working-memory high-water. `compactTableStep()` processes
-at most the requested number of output blocks; `resumeCompactionJob()` continues the persisted plan
-after a yield or reopen; `listCompactionJobs()` exposes it; and `compactTable()` repeatedly drives
-the same workflow to publication. `cancelCompactionJob(jobId)` settles an unpublished job in a
-distinct terminal `cancelled` state and returns the terminal state plus any published version.
-Repeated calls are idempotent; terminal `published` and `aborted` jobs keep their existing outcome.
+A `rechunk-v1` plan fingerprints each ordered column block's ID, row range, stored/encoded length,
+and checksum. It fixes output windows, schema IDs/types, contiguous row-ID bounds, compression, and
+logical order. A `merge-v1` plan additionally fingerprints source segments in exact
+logical/commit/ID order with normalized kind, key, level, row-ID spans, and unique source blocks.
+Planning replays keys once and freezes the surviving value of every output cell as an ordered
+source-block range. Each output column's ranges cover the logical output without gaps. That
+immutable per-column map is the durable logical replay result; a cursor over an otherwise in-memory
+key map would not be restart-safe.
 
-Each output is built directly from validated physical column ranges. The implementation
-decompresses source blocks, slices and concatenates their validity/value buffers, recalculates
-canonical metadata, and compresses the result without materializing JavaScript row objects. Output
-windows are shared across columns and derived from the maximum observed source-block encoded bytes
-per row, then measured exactly and split further when skew would exceed the target or the chosen
-execution budget. The defaults are gzip, a 2 MiB estimated uncompressed physical target per output
-column block, and a 32 MiB budget for JavaScript-owned rewrite execution. A single row cannot be
-split and may exceed the target only when its physical and codec bounds remain within the 64 MiB
-format cap.
+Mutable job progress holds deterministic output IDs, the next output-window/column cursor,
+transaction ID, revisioned state, processed rows and bytes, and the modeled executor-memory
+high-water. `compactTableStep()` processes at most the requested number of output blocks;
+`resumeCompactionJob()` continues the persisted plan after a yield or reopen;
+`listCompactionJobs()` exposes it; and `compactTable()` repeatedly drives the same workflow to
+publication. `cancelCompactionJob(jobId)` settles an unpublished job in a distinct terminal
+`cancelled` state and returns the terminal state plus any published version. Repeated calls are
+idempotent; terminal `published` and `aborted` jobs keep their existing outcome.
 
-Planning computes a conservative minimum budget from the largest modeled output and refuses a
-smaller budget. Execution checkpoints the maximum such bound for completed outputs. The bound
-includes conservative source/decompression, constructed physical output, compression
-scratch/output, envelope, and reconciliation buffers owned by this workflow. It is not a claim
-about total browser heap: planning reads one stored block at a time outside executor high-water
-accounting, while browser-native compression and IndexedDB may allocate internal memory the library
-cannot observe; persisted job and transaction metadata is also outside the block-buffer figure.
+Each output is built directly from validated physical column ranges. The implementation decompresses
+source blocks, slices and concatenates their validity/value buffers, recalculates canonical metadata,
+and compresses the result without materializing column values as JavaScript row objects. Output
+windows are shared across columns and derived from observed encoded density, then measured exactly
+and split further when skew would exceed the target or the chosen executor budget. The defaults are
+gzip, a 2 MiB estimated uncompressed physical target per output column block, and a 32 MiB
+`memoryBudgetBytes` setting. A single row cannot be split and may exceed the target only when its
+physical and codec bounds remain within the 64 MiB format cap.
+
+The one setting gates two different conservative models. Before keyed replay, `memoryBudgetBytes`
+acts as a planner safety cap on an estimate based on candidate rows, table width, and encoded key
+bytes. Physical execution separately treats it as an executor-buffer budget for the largest
+source/decompression, constructed-output, compression, envelope, and reconciliation buffer bound,
+and checkpoints the high-water for completed outputs. The planner estimate is not executor
+high-water: merge planning currently neither spills its key map/source references nor checkpoints a
+replay cursor, so an interruption before the immutable plan is written restarts planning. Native
+codec and IndexedDB allocations, persisted metadata, and other browser heap remain outside both
+figures.
 
 If execution stops after an immutable block or output segment is stored but before its journal or
 cursor update, resume validates and reattaches the existing object. Existing output is decompressed
 and compared by validated physical payload, type, compression, and row count. This semantic check
 does not require equivalent gzip streams to be byte-identical. A replacement transaction preserves
 the completed-output cursor, and a transaction committed before the job reached `published` is
-reconciled instead of published twice. Publication can rebase across a concurrent append while
-every planned source remains visible and unchanged; otherwise it aborts. Manifest replacement
-affects only the new version, so historical snapshots continue reading their original segments and
-blocks.
+reconciled instead of published twice. Publication can rebase across later append or mutation
+segments while every planned source remains visible and unchanged; the frozen plan does not absorb
+them. Otherwise the job aborts. Manifest replacement affects only the new version, so historical
+snapshots continue reading their original segments and blocks.
+
+A successful non-empty merge publishes one full-row `base` segment and copies the plan's canonical
+`rowIdSpans` into its descriptor. When replay deletes every row, the job still commits a new manifest
+that supersedes all source blocks, but its output segment ID is null and it publishes no output
+blocks or globally visible empty segment. Both forms remain restart-safe after the immutable plan
+exists.
 
 Cancellation is cooperative rather than preemptive. Physical transforms and an active native codec
 operation run to their next durable boundary; an in-flight step that then observes cancellation, or
@@ -281,12 +303,12 @@ An unleased `TransactionManager.openSnapshot()` is only an in-process view of on
 not a persistent GC root. Long-lived callers must use `openLeasedSnapshot()`, while
 `BrowserDatabase` creates and renews its own short-lived leases around materialization.
 
-This is still a deliberately narrow Phase 6 policy: it selects every eligible contiguous
-append-only segment in a table and publishes one L1 replacement. It does not compact
-upsert/update/delete deltas, select subsets or levels beyond whole-table L0 -> L1, produce L2
-segments, chunk collection planning/root discovery, or perform broader orphan, catalog, terminal-job,
-and metadata cleanup. Known unreachable source/output artifacts are now physically reclaimable by
-the separate collector.
+This is still a deliberately narrow Phase 6 policy: it rewrites a whole table into one L1 segment—a
+`base` for a keyed mutation history—or no segment when no row survives. It handles append and keyed
+upsert/update/delete histories but does not select subsets or levels beyond whole-table L0 -> L1,
+produce L2 segments, spill or resume merge planning before plan creation, chunk collection
+planning/root discovery, or perform broader orphan, catalog, terminal-job, and metadata cleanup.
+Known unreachable source/output artifacts are physically reclaimable by the separate collector.
 
 ## Multi-tab correctness
 
@@ -323,10 +345,11 @@ interface Batch {
 The target executor gives every query and physical rewrite job a memory context. Operators reserve
 and release bytes. Sort, hash aggregate, hash join, and distinct operations must spill to temporary
 storage when reservations fail. Memory use is a function of the configured working set, not total
-database size. Physical compaction now has a specialized conservative budget for its JavaScript-owned
-buffers and advances by output block; the general query memory context and spilling contract remain
-future work. As described above, the compaction figure is a modeled workflow bound rather than a
-measurement or hard limit on all browser heap.
+database size. Physical compaction now advances by output block under a specialized conservative
+executor-buffer model. Mutation merge planning applies a separate preflight safety estimate to its
+in-memory key and source-reference state, but does not spill or resume that state. The general query
+memory context and spilling contract remain future work. As described above, both compaction figures
+are modeled workflow bounds rather than measurements or hard limits on all browser heap.
 
 ## Automatic data skipping
 

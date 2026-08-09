@@ -39,6 +39,13 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
             oldSnapshotRows: number;
             physicallyReclaimedBytes: number;
           };
+          mutationCompaction: {
+            compacted: boolean;
+            sourceSegments: number;
+            visibleSegments: number;
+            currentNames: string[];
+            historicalRows: number;
+          };
         };
       }>;
     };
@@ -78,6 +85,13 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         currentRows: 3,
         oldSnapshotRows: 2,
         physicallyReclaimedBytes: 0,
+      },
+      mutationCompaction: {
+        compacted: true,
+        sourceSegments: 4,
+        visibleSegments: 1,
+        currentNames: ["Grace", "Linus", "Katherine"],
+        historicalRows: 3,
       },
     },
   });

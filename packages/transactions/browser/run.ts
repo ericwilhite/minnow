@@ -37,6 +37,13 @@ interface BrowserTransactionResult {
       oldSnapshotRows: number;
       physicallyReclaimedBytes: number;
     };
+    mutationCompaction: {
+      compacted: boolean;
+      sourceSegments: number;
+      visibleSegments: number;
+      currentNames: string[];
+      historicalRows: number;
+    };
   };
 }
 
@@ -133,6 +140,10 @@ window.runTransactionBrowserTest = async () => {
   const compactedVisibleSegments = (await database.listVisibleSegments("events")).length;
   const tableNames = (await database.listTables()).map((table) => table.name);
   const visibleSegments = (await database.listVisibleSegments("people")).length;
+  const mutationCompaction = await database.compactTable("people", { maxBlocksPerStep: 1 });
+  const mutationRows = await database.readTable("people");
+  const mutationHistoricalRows = await database.readTable("people", batch.version);
+  const mutationVisibleSegments = (await database.listVisibleSegments("people")).length;
   libraryStore.close();
   await deleteDatabase(libraryName);
 
@@ -171,6 +182,13 @@ window.runTransactionBrowserTest = async () => {
         currentRows: bufferedRows,
         oldSnapshotRows,
         physicallyReclaimedBytes: compaction.physicallyReclaimedBytes,
+      },
+      mutationCompaction: {
+        compacted: mutationCompaction.compacted,
+        sourceSegments: mutationCompaction.sourceSegmentCount,
+        visibleSegments: mutationVisibleSegments,
+        currentNames: mutationRows.map((row) => String(row.name)),
+        historicalRows: mutationHistoricalRows.length,
       },
     },
   };

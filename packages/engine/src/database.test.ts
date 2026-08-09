@@ -1,4 +1,4 @@
-import { decodeBlock, inspectBlock } from "@browserdatabase/block-format";
+import { decodeBlock, encodeBlock, inspectBlock } from "@browserdatabase/block-format";
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import {
@@ -7,6 +7,9 @@ import {
   type BlockStore,
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
+  type RowIdSpan,
+  type SegmentRecord,
+  type TableRecord,
 } from "@browserdatabase/storage-idb";
 import { FaultInjectingBlockStore } from "@browserdatabase/testing";
 import { TransactionManager } from "@browserdatabase/transactions";
@@ -15,6 +18,7 @@ import {
   BrowserDatabase,
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
+  type DatabaseRow,
   MissingKeyError,
   UniqueConstraintError,
 } from "./database.js";
@@ -160,6 +164,33 @@ class InitialCompactionPlanningBarrierStore extends MemoryBlockStore {
   }
 }
 
+class FirstCommitBarrierMemoryBlockStore extends MemoryBlockStore {
+  #pauseNextCommit = true;
+  #signalFirstCommit: (() => void) | undefined;
+  #releaseFirstCommit: (() => void) | undefined;
+  readonly firstCommitReached = new Promise<void>((resolve) => {
+    this.#signalFirstCommit = resolve;
+  });
+  readonly #firstCommitRelease = new Promise<void>((resolve) => {
+    this.#releaseFirstCommit = resolve;
+  });
+
+  releaseFirstCommit(): void {
+    this.#releaseFirstCommit?.();
+  }
+
+  override async commitTransaction(
+    input: Parameters<MemoryBlockStore["commitTransaction"]>[0],
+  ): ReturnType<MemoryBlockStore["commitTransaction"]> {
+    if (this.#pauseNextCommit) {
+      this.#pauseNextCommit = false;
+      this.#signalFirstCommit?.();
+      await this.#firstCommitRelease;
+    }
+    return super.commitTransaction(input);
+  }
+}
+
 function implementations(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
     { name: "memory", create: async () => new MemoryBlockStore() },
@@ -200,6 +231,294 @@ function recoveryImplementations(): Array<{
       },
     },
   ];
+}
+
+interface MutationCompactionFixture {
+  database: BrowserDatabase;
+  tableId: string;
+  snapshots: Array<{ version: number; rows: DatabaseRow[] }>;
+  expectedRows: DatabaseRow[];
+  expectedRowIds: bigint[];
+  sourceBlockIds: string[];
+  sourceSegmentIds: string[];
+}
+
+async function createMutationCompactionFixture(
+  store: BlockStore,
+  tableName = "mutation_accounts",
+): Promise<MutationCompactionFixture> {
+  const database = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 2 });
+  await database.createTable({
+    name: tableName,
+    uniqueKey: "email",
+    columns: [
+      { name: "email", type: "string" },
+      { name: "score", type: "number", nullable: true },
+      { name: "active", type: "boolean" },
+      { name: "note", type: "string", nullable: true },
+    ],
+  });
+
+  const snapshots: Array<{ version: number; rows: DatabaseRow[] }> = [];
+  const remember = async (version: number | null): Promise<void> => {
+    if (version === null) throw new Error("Expected a committed mutation version");
+    snapshots.push({ version, rows: await database.readTable(tableName, version) });
+  };
+
+  const inserted = await database.insertBatch(tableName, {
+    columns: {
+      email: ["a@example.com", "b@example.com", "c@example.com"],
+      score: [1, 2, 3],
+      active: [true, true, false],
+      note: ["a", "b", null],
+    },
+  });
+  await remember(inserted.version);
+  const upserted = await database.upsertBatch(tableName, {
+    columns: {
+      email: ["b@example.com", "d@example.com"],
+      score: [20, 4],
+      active: [false, true],
+      note: ["b2", "d"],
+    },
+  });
+  await remember(upserted.version);
+  const updated = await database.updateBatch(tableName, {
+    keys: ["b@example.com", "d@example.com"],
+    changes: { score: [21, 40], note: [null, "d2"] },
+  });
+  await remember(updated.version);
+  const deletedA = await database.deleteBatch(tableName, {
+    keys: ["a@example.com", "missing@example.com"],
+  });
+  await remember(deletedA.version);
+  const resurrectedA = await database.upsert(tableName, {
+    email: "a@example.com",
+    score: 10,
+    active: false,
+    note: "a2",
+  });
+  await remember(resurrectedA.version);
+  const deletedC = await database.deleteBatch(tableName, { keys: ["c@example.com"] });
+  await remember(deletedC.version);
+
+  const table = await store.getTableByName(tableName);
+  if (table === undefined) throw new Error(`Expected mutation table ${tableName}`);
+  const initialSegment = await requiredSegment(store, inserted.segmentId);
+  const upsertSegment = await requiredSegment(store, upserted.segmentId);
+  const resurrectionSegment = await requiredSegment(store, resurrectedA.segmentId);
+  const initialRowIds = expandSegmentRowIds(initialSegment);
+  const upsertRowIds = expandSegmentRowIds(upsertSegment);
+  const resurrectionRowIds = expandSegmentRowIds(resurrectionSegment);
+  const expectedRowIds = [
+    requiredItem(initialRowIds, 1, "initial B row ID"),
+    requiredItem(upsertRowIds, 1, "upserted D row ID"),
+    requiredItem(resurrectionRowIds, 0, "resurrected A row ID"),
+  ];
+  expect(expectedRowIds[0]).not.toBe(upsertRowIds[0]);
+
+  const sourceSegments = await store.listSegments(table.id);
+  const sourceBlockIds = [
+    ...new Set(sourceSegments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+  ].sort();
+  const expectedRows: DatabaseRow[] = [
+    { email: "b@example.com", score: 21, active: false, note: null },
+    { email: "d@example.com", score: 40, active: true, note: "d2" },
+    { email: "a@example.com", score: 10, active: false, note: "a2" },
+  ];
+  expect(await database.readTable(tableName)).toEqual(expectedRows);
+
+  return {
+    database,
+    tableId: table.id,
+    snapshots,
+    expectedRows,
+    expectedRowIds,
+    sourceBlockIds,
+    sourceSegmentIds: sourceSegments.map((segment) => segment.id).sort(),
+  };
+}
+
+async function requiredSegment(store: BlockStore, segmentId: string): Promise<SegmentRecord> {
+  const segment = await store.getSegment(segmentId);
+  if (segment === undefined) throw new Error(`Expected segment ${segmentId}`);
+  return segment;
+}
+
+function requiredItem<T>(values: readonly T[], index: number, label: string): T {
+  const value = values[index];
+  if (value === undefined) throw new Error(`Expected ${label}`);
+  return value;
+}
+
+function expandSegmentRowIds(segment: SegmentRecord): bigint[] {
+  const spans =
+    segment.rowIdSpans ??
+    (segment.rowCount === 0
+      ? []
+      : [{ rowStart: 0, rowCount: segment.rowCount, rowIdStart: segment.rowIdStart }]);
+  const rowIds: Array<bigint | undefined> = Array.from({ length: segment.rowCount });
+  for (const span of spans) {
+    for (let offset = 0; offset < span.rowCount; offset += 1) {
+      rowIds[span.rowStart + offset] = span.rowIdStart + BigInt(offset);
+    }
+  }
+  if (rowIds.some((rowId) => rowId === undefined)) {
+    throw new Error(`Row-ID spans do not cover segment ${segment.id}`);
+  }
+  return rowIds as bigint[];
+}
+
+function canonicalRowIdSpans(rowIds: readonly bigint[]): RowIdSpan[] {
+  const spans: Array<{ rowStart: number; rowCount: number; rowIdStart: bigint }> = [];
+  for (const [rowStart, rowId] of rowIds.entries()) {
+    const previous = spans.at(-1);
+    if (previous !== undefined && previous.rowIdStart + BigInt(previous.rowCount) === rowId) {
+      previous.rowCount += 1;
+    } else {
+      spans.push({ rowStart, rowCount: 1, rowIdStart: rowId });
+    }
+  }
+  return spans;
+}
+
+function legacyAppendOnlyCompactionEligible(segment: SegmentRecord): boolean {
+  return (segment.kind ?? "insert") === "insert";
+}
+
+async function assertPublishedMutationMerge(
+  store: BlockStore,
+  database: BrowserDatabase,
+  tableName: string,
+  jobId: string,
+  expectedRows: readonly DatabaseRow[],
+  expectedRowIds: readonly bigint[],
+): Promise<SegmentRecord> {
+  const job = await store.getCompactionJob(jobId);
+  if (job === undefined) throw new Error(`Expected compaction job ${jobId}`);
+  if (job.rewritePlan?.kind !== "merge-v1") throw new Error("Expected a merge-v1 plan");
+  expect(job).toMatchObject({ state: "published", processedRows: expectedRows.length });
+  expect(new Set(job.outputBlockIds).size).toBe(job.outputBlockIds.length);
+  expect(job.rewritePlan).toMatchObject({
+    totalRows: expectedRows.length,
+    rowIdSpans: canonicalRowIdSpans(expectedRowIds),
+  });
+  if (job.outputSegmentId === null) throw new Error("Expected a merged output segment");
+  const output = await requiredSegment(store, job.outputSegmentId);
+  const table = await store.getTableByName(tableName);
+  if (table === undefined) throw new Error(`Expected table ${tableName}`);
+  const minimumRowId = expectedRowIds.reduce((minimum, rowId) =>
+    rowId < minimum ? rowId : minimum,
+  );
+  const maximumRowId = expectedRowIds.reduce((maximum, rowId) =>
+    rowId > maximum ? rowId : maximum,
+  );
+  expect(output).toMatchObject({
+    tableId: table.id,
+    kind: "base",
+    keyColumnId: table.uniqueKeyColumnId,
+    level: 1,
+    rowCount: expectedRows.length,
+    rowIdStart: minimumRowId,
+    rowIdEndExclusive: maximumRowId + 1n,
+    rowIdSpans: canonicalRowIdSpans(expectedRowIds),
+  });
+  expect(Object.keys(output.columnBlockIds).sort()).toEqual(
+    table.columns.map((column) => column.id).sort(),
+  );
+  expect(expandSegmentRowIds(output)).toEqual(expectedRowIds);
+  expect(await database.readTable(tableName)).toEqual(expectedRows);
+  expect(await database.listVisibleSegments(tableName)).toHaveLength(1);
+  return output;
+}
+
+interface MutationRebaseGuardFixture {
+  database: BrowserDatabase;
+  table: TableRecord;
+  job: CompactionJobRecord;
+  expectedRows: DatabaseRow[];
+}
+
+async function createMutationRebaseGuardFixture(
+  store: MemoryBlockStore,
+  tableName: string,
+): Promise<MutationRebaseGuardFixture> {
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: tableName,
+    uniqueKey: "email",
+    columns: [
+      { name: "email", type: "string" },
+      { name: "score", type: "number" },
+    ],
+  });
+  await database.insert(tableName, { email: "a@example.com", score: 1 });
+  await database.insert(tableName, { email: "b@example.com", score: 2 });
+  await database.update(tableName, "a@example.com", { score: 10 });
+  const expectedRows: DatabaseRow[] = [
+    { email: "a@example.com", score: 10 },
+    { email: "b@example.com", score: 2 },
+  ];
+  expect(await database.readTable(tableName)).toEqual(expectedRows);
+
+  const progress = await database.compactTableStep(tableName, {
+    maxBlocks: 1,
+    targetBlockBytes: 64,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a guarded mutation compaction job");
+  expect(progress).toMatchObject({ state: "running", outputBlockCount: 1, result: null });
+  const job = await store.getCompactionJob(progress.jobId);
+  if (job?.rewritePlan?.kind !== "merge-v1") throw new Error("Expected a merge-v1 guard plan");
+  const table = await store.getTableByName(tableName);
+  if (table === undefined) throw new Error(`Expected guard table ${tableName}`);
+  return { database, table, job, expectedRows };
+}
+
+async function commitLowLevelDeleteSegment(
+  store: MemoryBlockStore,
+  table: TableRecord,
+  input: {
+    segmentId: string;
+    logicalOrder: number;
+    blockId?: string;
+    key?: string;
+  },
+): Promise<{ manifestVersion: number; segmentId: string; blockId: string }> {
+  const keyColumn = table.columns.find((column) => column.id === table.uniqueKeyColumnId);
+  if (keyColumn?.type !== "string") {
+    throw new Error("Expected a string-key guard table");
+  }
+  const manager = new TransactionManager(store, {
+    createId: () => `${input.segmentId}/transaction`,
+  });
+  const transaction = await manager.begin();
+  const blockId = input.blockId ?? `${input.segmentId}/key-block`;
+  if (input.blockId === undefined) {
+    await transaction.stageBlock(
+      blockId,
+      await encodeBlock({ type: "string", values: [input.key ?? "missing@example.com"] }, "raw"),
+    );
+  }
+  const bytes = await store.getBlock(blockId);
+  if (bytes === undefined) throw new Error(`Expected guard block ${blockId}`);
+  const rowCount = inspectBlock(bytes).rowCount;
+  await transaction.stageSegment({
+    id: input.segmentId,
+    tableId: table.id,
+    transactionId: transaction.id,
+    rowCount,
+    rowIdStart: 0n,
+    rowIdEndExclusive: 0n,
+    columnBlockIds: { [keyColumn.id]: [blockId] },
+    kind: "delete",
+    keyColumnId: keyColumn.id,
+    level: 0,
+    logicalOrder: input.logicalOrder,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  const manifest = await transaction.commit();
+  return { manifestVersion: manifest.version, segmentId: input.segmentId, blockId };
 }
 
 for (const implementation of implementations()) {
@@ -2207,29 +2526,559 @@ it("aborts the unlinked transaction when initial compaction coordinators race", 
   store.close();
 });
 
-it("skips mutation segments until delta-aware compaction is available", async () => {
-  const store = new MemoryBlockStore();
+for (const implementation of implementations()) {
+  it(`${implementation.name} merges mutation deltas with stable row IDs and can merge new deltas again`, async () => {
+    const store = await implementation.create();
+    const tableName = `merge_${implementation.name}`;
+    const fixture = await createMutationCompactionFixture(store, tableName);
+
+    const first = await fixture.database.compactTable(tableName, {
+      maxBlocksPerStep: 1,
+      targetBlockBytes: 64,
+      outputCompression: "raw",
+    });
+    if (first.jobId === undefined || first.version === null) {
+      throw new Error("Expected a published mutation compaction");
+    }
+    expect(first).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: fixture.sourceSegmentIds.length,
+      sourceBlockCount: fixture.sourceBlockIds.length,
+      rowCount: fixture.expectedRows.length,
+      supersededBlockCount: fixture.sourceBlockIds.length,
+      physicallyReclaimedBytes: 0,
+      outputCompression: "raw",
+    });
+    const firstOutput = await assertPublishedMutationMerge(
+      store,
+      fixture.database,
+      tableName,
+      first.jobId,
+      fixture.expectedRows,
+      fixture.expectedRowIds,
+    );
+    expect(legacyAppendOnlyCompactionEligible(firstOutput)).toBe(false);
+    const firstManifest = await store.getCurrentManifest();
+    expect(
+      fixture.sourceBlockIds.every((blockId) => !firstManifest?.blockIds.includes(blockId)),
+    ).toBe(true);
+    for (const snapshot of fixture.snapshots) {
+      expect(await fixture.database.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
+    }
+    expect(await fixture.database.readTable(tableName, first.version)).toEqual(
+      fixture.expectedRows,
+    );
+
+    await fixture.database.update(tableName, "b@example.com", { active: true });
+    await fixture.database.deleteBatch(tableName, { keys: ["d@example.com"] });
+    const postMergeUpsert = await fixture.database.upsertBatch(tableName, {
+      columns: {
+        email: ["a@example.com", "e@example.com"],
+        score: [11, 5],
+        active: [true, false],
+        note: ["a3", "e"],
+      },
+    });
+    const postMergeUpsertSegment = await requiredSegment(store, postMergeUpsert.segmentId);
+    const postMergeCandidateIds = expandSegmentRowIds(postMergeUpsertSegment);
+    const secondExpectedRowIds = [
+      requiredItem(fixture.expectedRowIds, 0, "B row ID after first merge"),
+      requiredItem(fixture.expectedRowIds, 2, "A row ID after first merge"),
+      requiredItem(postMergeCandidateIds, 1, "new E row ID"),
+    ];
+    expect(postMergeCandidateIds[0]).not.toBe(secondExpectedRowIds[1]);
+    const secondExpectedRows: DatabaseRow[] = [
+      { email: "b@example.com", score: 21, active: true, note: null },
+      { email: "a@example.com", score: 11, active: true, note: "a3" },
+      { email: "e@example.com", score: 5, active: false, note: "e" },
+    ];
+    expect(await fixture.database.readTable(tableName)).toEqual(secondExpectedRows);
+    const preSecondMergeSnapshot = await store.getCurrentManifest();
+    if (preSecondMergeSnapshot === undefined) throw new Error("Expected a second merge snapshot");
+
+    const second = await fixture.database.compactTable(tableName, {
+      maxBlocksPerStep: 1,
+      targetBlockBytes: 64,
+      outputCompression: "rle",
+    });
+    if (second.jobId === undefined) throw new Error("Expected a second mutation compaction");
+    expect(second).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: 4,
+      rowCount: secondExpectedRows.length,
+      outputCompression: "rle",
+    });
+    await assertPublishedMutationMerge(
+      store,
+      fixture.database,
+      tableName,
+      second.jobId,
+      secondExpectedRows,
+      secondExpectedRowIds,
+    );
+    expect(await fixture.database.readTable(tableName, first.version)).toEqual(
+      fixture.expectedRows,
+    );
+    expect(await fixture.database.readTable(tableName, preSecondMergeSnapshot.version)).toEqual(
+      secondExpectedRows,
+    );
+    for (const snapshot of fixture.snapshots) {
+      expect(await fixture.database.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
+    }
+    store.close();
+  });
+
+  it(`${implementation.name} publishes an all-deleted merge without a globally visible empty segment`, async () => {
+    const store = await implementation.create();
+    const tableName = `empty_merge_${implementation.name}`;
+    const database = new BrowserDatabase(store, { compression: "raw" });
+    await database.createTable({
+      name: tableName,
+      uniqueKey: "email",
+      columns: [
+        { name: "email", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    const inserted = await database.insert(tableName, { email: "a@example.com", score: 1 });
+    const insertedSegment = await requiredSegment(store, inserted.segmentId);
+    const insertedRowId = requiredItem(expandSegmentRowIds(insertedSegment), 0, "inserted row ID");
+    await database.deleteBatch(tableName, { keys: ["a@example.com"] });
+    const sourceBlockIds = await store.listBlockIds();
+
+    const result = await database.compactTable(tableName, {
+      maxBlocksPerStep: 1,
+      outputCompression: "raw",
+    });
+    if (result.jobId === undefined) throw new Error("Expected an empty merge job");
+    expect(result).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: 2,
+      sourceBlockCount: sourceBlockIds.length,
+      outputSegmentId: null,
+      outputBlockCount: 0,
+      rowCount: 0,
+      supersededBlockCount: sourceBlockIds.length,
+    });
+    const job = await store.getCompactionJob(result.jobId);
+    expect(job).toMatchObject({
+      state: "published",
+      outputBlockIds: [],
+      outputSegmentId: null,
+      processedRows: 0,
+      rewritePlan: { kind: "merge-v1", totalRows: 0, rowIdSpans: [], outputs: [] },
+    });
+    expect((await store.getCurrentManifest())?.blockIds).toEqual([]);
+    expect(await database.readTable(tableName)).toEqual([]);
+    expect(await database.listVisibleSegments(tableName)).toEqual([]);
+    expect(await database.readTable(tableName, inserted.version)).toEqual([
+      { email: "a@example.com", score: 1 },
+    ]);
+    const reinserted = await database.insert(tableName, { email: "a@example.com", score: 2 });
+    const reinsertedSegment = await requiredSegment(store, reinserted.segmentId);
+    expect(
+      requiredItem(expandSegmentRowIds(reinsertedSegment), 0, "reinserted row ID"),
+    ).toBeGreaterThan(insertedRowId);
+    expect(await database.readTable(tableName)).toEqual([{ email: "a@example.com", score: 2 }]);
+    store.close();
+  });
+}
+
+for (const implementation of recoveryImplementations()) {
+  it(`${implementation.name} resumes a checkpointed mutation merge with its persisted row identities`, async () => {
+    const harness = await implementation.create();
+    let store = harness.store;
+    const tableName = `resume_merge_${implementation.name.replaceAll(" ", "_")}`;
+    const fixture = await createMutationCompactionFixture(store, tableName);
+    let progress = await fixture.database.compactTableStep(tableName, {
+      maxBlocks: 1,
+      targetBlockBytes: 64,
+      outputCompression: "gzip",
+    });
+    if (progress.jobId === null) throw new Error("Expected a checkpointed mutation merge");
+    const jobId = progress.jobId;
+    expect(progress).toMatchObject({ state: "running", outputBlockCount: 1, result: null });
+    expect(await store.getCompactionJob(jobId)).toMatchObject({
+      rewritePlan: {
+        kind: "merge-v1",
+        rowIdSpans: canonicalRowIdSpans(fixture.expectedRowIds),
+      },
+      outputBlockIds: [expect.any(String)],
+    });
+
+    store = await harness.reopen();
+    const reopened = new BrowserDatabase(store, { compression: "rle", rowsPerBlock: 1 });
+    while (progress.result === null) {
+      progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
+    }
+    expect(progress).toMatchObject({
+      state: "published",
+      result: { compacted: true, outputCompression: "gzip", rowCount: 3 },
+    });
+    await assertPublishedMutationMerge(
+      store,
+      reopened,
+      tableName,
+      jobId,
+      fixture.expectedRows,
+      fixture.expectedRowIds,
+    );
+    for (const snapshot of fixture.snapshots) {
+      expect(await reopened.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
+    }
+    store.close();
+  });
+}
+
+it("recovers a mutation-merge block whose durable cursor checkpoint was lost", async () => {
+  const store = new CheckpointFaultMemoryBlockStore();
+  const tableName = "checkpoint_merge_accounts";
+  const fixture = await createMutationCompactionFixture(store, tableName);
+
+  await expect(
+    fixture.database.compactTableStep(tableName, {
+      maxBlocks: 1,
+      targetBlockBytes: 64,
+      outputCompression: "raw",
+    }),
+  ).rejects.toThrow("injected before compaction cursor checkpoint");
+  const interrupted = (await store.listCompactionJobs(fixture.tableId))[0];
+  if (interrupted === undefined) throw new Error("Expected an interrupted merge job");
+  expect(interrupted).toMatchObject({
+    state: "running",
+    outputBlockIds: [],
+    rewritePlan: { kind: "merge-v1" },
+  });
+  if (interrupted.transactionId === null) throw new Error("Expected a merge transaction");
+  expect((await store.getTransaction(interrupted.transactionId))?.pendingBlockIds).toHaveLength(1);
+
+  const reopened = new BrowserDatabase(store);
+  const result = await reopened.compactTable(tableName, { maxBlocksPerStep: 1 });
+  expect(result).toMatchObject({ jobId: interrupted.id, compacted: true, rowCount: 3 });
+  await assertPublishedMutationMerge(
+    store,
+    reopened,
+    tableName,
+    interrupted.id,
+    fixture.expectedRows,
+    fixture.expectedRowIds,
+  );
+  store.close();
+});
+
+it("preserves logical row order when row-ID reservation order differs from commit order", async () => {
+  const store = new FirstCommitBarrierMemoryBlockStore();
   const database = new BrowserDatabase(store);
   await database.createTable({
-    name: "accounts",
+    name: "reverse_ids",
     uniqueKey: "email",
     columns: [
       { name: "email", type: "string" },
       { name: "score", type: "number" },
     ],
   });
-  await database.insert("accounts", { email: "a@example.com", score: 1 });
-  await database.update("accounts", "a@example.com", { score: 2 });
 
-  const result = await database.compactTable("accounts");
+  const firstPromise = database.insert("reverse_ids", { email: "first@example.com", score: 1 });
+  await store.firstCommitReached;
+  let second;
+  try {
+    second = await database.insert("reverse_ids", { email: "second@example.com", score: 2 });
+  } finally {
+    store.releaseFirstCommit();
+  }
+  const first = await firstPromise;
+  expect(second.version).toBeLessThan(first.version);
+  const firstId = requiredItem(
+    expandSegmentRowIds(await requiredSegment(store, first.segmentId)),
+    0,
+    "first reserved row ID",
+  );
+  const secondId = requiredItem(
+    expandSegmentRowIds(await requiredSegment(store, second.segmentId)),
+    0,
+    "second reserved row ID",
+  );
+  expect(firstId).toBeLessThan(secondId);
+  expect(await database.readTable("reverse_ids")).toEqual([
+    { email: "second@example.com", score: 2 },
+    { email: "first@example.com", score: 1 },
+  ]);
+  await database.update("reverse_ids", "first@example.com", { score: 10 });
 
-  expect(result).toMatchObject({
-    compacted: false,
-    skipReason: "contains-mutation-segments",
-    sourceSegmentCount: 2,
-    version: 1,
+  const result = await database.compactTable("reverse_ids", { outputCompression: "raw" });
+  if (result.jobId === undefined) throw new Error("Expected a reverse-order merge job");
+  await assertPublishedMutationMerge(
+    store,
+    database,
+    "reverse_ids",
+    result.jobId,
+    [
+      { email: "second@example.com", score: 2 },
+      { email: "first@example.com", score: 10 },
+    ],
+    [secondId, firstId],
+  );
+  store.close();
+});
+
+it("rebases a mutation merge across later IndexedDB deltas without absorbing them", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const compactorStore = await IndexedDbBlockStore.open({ name, indexedDB });
+  const writerStore = await IndexedDbBlockStore.open({ name, indexedDB });
+  const tableName = "concurrent_merge_accounts";
+  const fixture = await createMutationCompactionFixture(compactorStore, tableName);
+  const writer = new BrowserDatabase(writerStore);
+
+  const progress = await fixture.database.compactTableStep(tableName, {
+    maxBlocks: 1,
+    targetBlockBytes: 64,
+    outputCompression: "raw",
   });
-  expect(await database.readTable("accounts")).toEqual([{ email: "a@example.com", score: 2 }]);
+  if (progress.jobId === null) throw new Error("Expected a concurrent mutation merge");
+  const sourceVersion = fixture.snapshots.at(-1)?.version;
+  if (sourceVersion === undefined) throw new Error("Expected a mutation source version");
+  await writer.update(tableName, "b@example.com", { active: true });
+  await writer.deleteBatch(tableName, { keys: ["d@example.com"] });
+  const laterUpsert = await writer.upsertBatch(tableName, {
+    columns: {
+      email: ["a@example.com", "e@example.com"],
+      score: [11, 5],
+      active: [true, false],
+      note: ["a3", "e"],
+    },
+  });
+  const laterCandidateIds = expandSegmentRowIds(
+    await requiredSegment(writerStore, laterUpsert.segmentId),
+  );
+  const expectedRows: DatabaseRow[] = [
+    { email: "b@example.com", score: 21, active: true, note: null },
+    { email: "a@example.com", score: 11, active: true, note: "a3" },
+    { email: "e@example.com", score: 5, active: false, note: "e" },
+  ];
+  const expectedRowIds = [
+    requiredItem(fixture.expectedRowIds, 0, "concurrent B row ID"),
+    requiredItem(fixture.expectedRowIds, 2, "concurrent A row ID"),
+    requiredItem(laterCandidateIds, 1, "concurrent E row ID"),
+  ];
+
+  let resumed = await fixture.database.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
+  while (resumed.result === null) {
+    resumed = await fixture.database.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
+  }
+  expect(resumed.result).toMatchObject({ compacted: true, sourceSegmentCount: 6 });
+  expect(await fixture.database.readTable(tableName)).toEqual(expectedRows);
+  expect(await fixture.database.readTable(tableName, sourceVersion)).toEqual(fixture.expectedRows);
+  expect(await fixture.database.listVisibleSegments(tableName)).toHaveLength(4);
+  const firstOutput = await requiredSegment(
+    compactorStore,
+    resumed.result.outputSegmentId ?? "missing-output",
+  );
+  expect(expandSegmentRowIds(firstOutput)).toEqual(fixture.expectedRowIds);
+
+  const consolidated = await fixture.database.compactTable(tableName, {
+    maxBlocksPerStep: 1,
+    outputCompression: "gzip",
+  });
+  if (consolidated.jobId === undefined) throw new Error("Expected a post-rebase merge");
+  await assertPublishedMutationMerge(
+    compactorStore,
+    fixture.database,
+    tableName,
+    consolidated.jobId,
+    expectedRows,
+    expectedRowIds,
+  );
+  expect(await fixture.database.readTable(tableName, sourceVersion)).toEqual(fixture.expectedRows);
+  compactorStore.close();
+  writerStore.close();
+});
+
+it("aborts a mutation merge when a concurrent segment would sort inside its source interval", async () => {
+  const store = new MemoryBlockStore();
+  const fixture = await createMutationRebaseGuardFixture(store, "interleaved_merge_guard");
+  const plan = fixture.job.rewritePlan;
+  if (plan?.kind !== "merge-v1") throw new Error("Expected an interleaved merge plan");
+  const earliest = requiredItem(plan.sourceSegments, 0, "earliest guarded source");
+  const latest = requiredItem(
+    plan.sourceSegments,
+    plan.sourceSegments.length - 1,
+    "latest guarded source",
+  );
+  const interleavedLogicalOrder = 1;
+  expect(interleavedLogicalOrder).toBeGreaterThan(earliest.logicalOrder);
+  expect(interleavedLogicalOrder).toBeLessThan(latest.logicalOrder);
+  const manifestBeforeConcurrent = await store.getCurrentManifest();
+  if (manifestBeforeConcurrent === undefined) throw new Error("Expected a guarded source manifest");
+  const concurrent = await commitLowLevelDeleteSegment(store, fixture.table, {
+    segmentId: "interleaved-concurrent-delete",
+    logicalOrder: interleavedLogicalOrder,
+    key: "missing@example.com",
+  });
+  const concurrentManifest = await store.getCurrentManifest();
+  expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
+  expect(concurrentManifest?.blockIds).toContain(concurrent.blockId);
+
+  await expect(
+    fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
+  ).rejects.toThrow(`Concurrent segment would reorder compaction output: ${concurrent.segmentId}`);
+  const aborted = await store.getCompactionJob(fixture.job.id);
+  expect(aborted).toMatchObject({
+    state: "aborted",
+    error: `Concurrent segment would reorder compaction output: ${concurrent.segmentId}`,
+    publishedVersion: null,
+  });
+  if (fixture.job.transactionId === null) throw new Error("Expected a guarded transaction");
+  expect(await store.getTransaction(fixture.job.transactionId)).toMatchObject({
+    status: "aborted",
+  });
+  expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
+  expect(
+    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  expect(
+    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  expect(await fixture.database.readTable(fixture.table.name)).toEqual(fixture.expectedRows);
+  store.close();
+});
+
+it("aborts a mutation merge when a later concurrent tuple shares the base logical order", async () => {
+  const store = new MemoryBlockStore();
+  const fixture = await createMutationRebaseGuardFixture(store, "equal_order_merge_guard");
+  const plan = fixture.job.rewritePlan;
+  if (plan?.kind !== "merge-v1") throw new Error("Expected an equal-order merge plan");
+  const latestPlannedCommit = Math.max(
+    ...plan.sourceSegments.map((segment) => segment.committedVersion),
+  );
+  const manifestBeforeConcurrent = await store.getCurrentManifest();
+  if (manifestBeforeConcurrent === undefined) throw new Error("Expected a guarded source manifest");
+  const concurrent = await commitLowLevelDeleteSegment(store, fixture.table, {
+    segmentId: "equal-base-order-concurrent-delete",
+    logicalOrder: plan.logicalOrder,
+    key: "missing@example.com",
+  });
+  const concurrentManifest = await store.getCurrentManifest();
+  expect(concurrent.manifestVersion).toBeGreaterThan(latestPlannedCommit);
+  expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
+  expect(concurrentManifest?.blockIds).toContain(concurrent.blockId);
+
+  await expect(
+    fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
+  ).rejects.toThrow(`Concurrent segment would reorder compaction output: ${concurrent.segmentId}`);
+  const aborted = await store.getCompactionJob(fixture.job.id);
+  expect(aborted).toMatchObject({
+    state: "aborted",
+    error: `Concurrent segment would reorder compaction output: ${concurrent.segmentId}`,
+    publishedVersion: null,
+  });
+  if (fixture.job.transactionId === null) throw new Error("Expected a guarded transaction");
+  expect(await store.getTransaction(fixture.job.transactionId)).toMatchObject({
+    status: "aborted",
+  });
+  expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
+  expect(
+    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  expect(
+    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  expect(await fixture.database.readTable(fixture.table.name)).toEqual(fixture.expectedRows);
+  store.close();
+});
+
+it("aborts a mutation merge before supersession when a concurrent segment aliases a source block", async () => {
+  const store = new MemoryBlockStore();
+  const fixture = await createMutationRebaseGuardFixture(store, "shared_block_merge_guard");
+  const plan = fixture.job.rewritePlan;
+  if (plan?.kind !== "merge-v1") throw new Error("Expected a shared-block merge plan");
+  const keyBlockId = plan.sourceSegments
+    .flatMap((segment) => segment.columns)
+    .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
+  if (keyBlockId === undefined) throw new Error("Expected a guarded source key block");
+  const manifestBeforeConcurrent = await store.getCurrentManifest();
+  if (manifestBeforeConcurrent === undefined) throw new Error("Expected a guarded source manifest");
+  const concurrent = await commitLowLevelDeleteSegment(store, fixture.table, {
+    segmentId: "shared-source-block-delete",
+    logicalOrder: 10,
+    blockId: keyBlockId,
+  });
+  const concurrentManifest = await store.getCurrentManifest();
+  expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
+  expect(concurrentManifest?.blockIds).toEqual(manifestBeforeConcurrent.blockIds);
+
+  await expect(
+    fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
+  ).rejects.toThrow(`Concurrent segment shares a compaction source block: ${concurrent.segmentId}`);
+  const aborted = await store.getCompactionJob(fixture.job.id);
+  expect(aborted).toMatchObject({
+    state: "aborted",
+    error: `Concurrent segment shares a compaction source block: ${concurrent.segmentId}`,
+    publishedVersion: null,
+  });
+  if (fixture.job.transactionId === null) throw new Error("Expected a guarded transaction");
+  expect(await store.getTransaction(fixture.job.transactionId)).toMatchObject({
+    status: "aborted",
+  });
+  expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
+  expect(
+    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  expect(
+    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  store.close();
+});
+
+it("aborts a mutation merge when a segment from another table aliases a global source block", async () => {
+  const store = new MemoryBlockStore();
+  const fixture = await createMutationRebaseGuardFixture(store, "cross_table_block_merge_guard");
+  const plan = fixture.job.rewritePlan;
+  if (plan?.kind !== "merge-v1") throw new Error("Expected a cross-table merge plan");
+  const keyBlockId = plan.sourceSegments
+    .flatMap((segment) => segment.columns)
+    .find((column) => column.columnId === plan.keyColumnId)?.sourceBlocks[0]?.blockId;
+  if (keyBlockId === undefined) throw new Error("Expected a cross-table guarded source block");
+  await fixture.database.createTable({
+    name: "source_alias_owner",
+    uniqueKey: "alias",
+    columns: [{ name: "alias", type: "string" }],
+  });
+  const aliasTable = await store.getTableByName("source_alias_owner");
+  if (aliasTable === undefined) throw new Error("Expected a source-alias table");
+  expect(aliasTable.id).not.toBe(fixture.table.id);
+  const manifestBeforeConcurrent = await store.getCurrentManifest();
+  if (manifestBeforeConcurrent === undefined) throw new Error("Expected a guarded source manifest");
+  const concurrent = await commitLowLevelDeleteSegment(store, aliasTable, {
+    segmentId: "cross-table-shared-source-block-delete",
+    logicalOrder: 0,
+    blockId: keyBlockId,
+  });
+  expect((await store.getSegment(concurrent.segmentId))?.tableId).toBe(aliasTable.id);
+  const concurrentManifest = await store.getCurrentManifest();
+  expect(concurrent.manifestVersion).toBe(manifestBeforeConcurrent.version + 1);
+  expect(concurrentManifest?.blockIds).toEqual(manifestBeforeConcurrent.blockIds);
+
+  await expect(
+    fixture.database.resumeCompactionJob(fixture.job.id, { maxBlocks: 16 }),
+  ).rejects.toThrow(`Concurrent segment shares a compaction source block: ${concurrent.segmentId}`);
+  const aborted = await store.getCompactionJob(fixture.job.id);
+  expect(aborted).toMatchObject({
+    state: "aborted",
+    error: `Concurrent segment shares a compaction source block: ${concurrent.segmentId}`,
+    publishedVersion: null,
+  });
+  if (fixture.job.transactionId === null) throw new Error("Expected a guarded transaction");
+  expect(await store.getTransaction(fixture.job.transactionId)).toMatchObject({
+    status: "aborted",
+  });
+  expect(await store.getCurrentManifest()).toEqual(concurrentManifest);
+  expect(
+    fixture.job.sourceBlockIds.every((blockId) => concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
+  expect(
+    fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
+  ).toBe(true);
   store.close();
 });
 

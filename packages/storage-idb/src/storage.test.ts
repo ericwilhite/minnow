@@ -12,6 +12,7 @@ import {
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
   type CommitTransactionInput,
+  type MergeCompactionRewritePlan,
   type TransactionRecord,
   type TransactionRecordUpdate,
 } from "./index.js";
@@ -106,6 +107,205 @@ function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
         { rowStart: 3, rowCount: 1 },
       ],
     },
+    memoryBudgetBytes: 4096,
+    minimumMemoryBytes: 512,
+    peakWorkingBytes: 0,
+    outputLogicalBytes: 0,
+    targetLevel: 1,
+    state: "planned",
+    transactionId: null,
+    outputSegmentId: `${id}/output-segment`,
+    publishedVersion: null,
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function mergeCompactionJob(id = "merge-job"): CompactionJobRecord {
+  return {
+    id,
+    tableId: "events",
+    sourceManifestVersion: 9,
+    sourceSegmentIds: ["base-segment", "delete-segment", "upsert-segment"],
+    sourceBlockIds: ["upsert-value", "base-key", "delete-key", "upsert-key", "base-value"],
+    outputBlockIds: [],
+    cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+    processedRows: 0,
+    sourceStoredBytes: 45,
+    outputStoredBytes: 0,
+    logicalBytes: 35,
+    rewritePlan: {
+      kind: "merge-v1",
+      targetBlockBytes: 2 * 1024 * 1024,
+      outputCompression: "gzip",
+      keyColumnId: "id-column",
+      totalRows: 2,
+      rowIdStart: 3n,
+      rowIdEndExclusive: 11n,
+      rowIdSpans: [
+        { rowStart: 0, rowCount: 1, rowIdStart: 10n },
+        { rowStart: 1, rowCount: 1, rowIdStart: 3n },
+      ],
+      logicalOrder: 0,
+      sourceSegments: [
+        {
+          segmentId: "base-segment",
+          transactionId: "base-transaction",
+          committedVersion: 7,
+          kind: "base",
+          keyColumnId: "id-column",
+          level: 0,
+          logicalOrder: 0,
+          rowCount: 2,
+          rowIdStart: 10n,
+          rowIdEndExclusive: 12n,
+          rowIdSpans: [{ rowStart: 0, rowCount: 2, rowIdStart: 10n }],
+          columns: [
+            {
+              columnId: "id-column",
+              type: "number",
+              sourceBlocks: [
+                {
+                  blockId: "base-key",
+                  rowStart: 0,
+                  rowCount: 2,
+                  storedBytes: 10,
+                  encodedBytes: 8,
+                  checksum: 1,
+                },
+              ],
+            },
+            {
+              columnId: "value-column",
+              type: "string",
+              sourceBlocks: [
+                {
+                  blockId: "base-value",
+                  rowStart: 0,
+                  rowCount: 2,
+                  storedBytes: 11,
+                  encodedBytes: 9,
+                  checksum: 2,
+                },
+              ],
+            },
+          ],
+        },
+        {
+          segmentId: "delete-segment",
+          transactionId: "delete-transaction",
+          committedVersion: 8,
+          kind: "delete",
+          keyColumnId: "id-column",
+          level: 0,
+          logicalOrder: 1,
+          rowCount: 1,
+          rowIdStart: 0n,
+          rowIdEndExclusive: 0n,
+          rowIdSpans: [],
+          columns: [
+            {
+              columnId: "id-column",
+              type: "number",
+              sourceBlocks: [
+                {
+                  blockId: "delete-key",
+                  rowStart: 0,
+                  rowCount: 1,
+                  storedBytes: 7,
+                  encodedBytes: 5,
+                  checksum: 3,
+                },
+              ],
+            },
+          ],
+        },
+        {
+          segmentId: "upsert-segment",
+          transactionId: "upsert-transaction",
+          committedVersion: 9,
+          kind: "upsert",
+          keyColumnId: "id-column",
+          level: 0,
+          logicalOrder: 2,
+          rowCount: 1,
+          rowIdStart: 3n,
+          rowIdEndExclusive: 4n,
+          rowIdSpans: [{ rowStart: 0, rowCount: 1, rowIdStart: 3n }],
+          columns: [
+            {
+              columnId: "id-column",
+              type: "number",
+              sourceBlocks: [
+                {
+                  blockId: "upsert-key",
+                  rowStart: 0,
+                  rowCount: 1,
+                  storedBytes: 8,
+                  encodedBytes: 6,
+                  checksum: 4,
+                },
+              ],
+            },
+            {
+              columnId: "value-column",
+              type: "string",
+              sourceBlocks: [
+                {
+                  blockId: "upsert-value",
+                  rowStart: 0,
+                  rowCount: 1,
+                  storedBytes: 9,
+                  encodedBytes: 7,
+                  checksum: 5,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      columns: [
+        {
+          columnId: "id-column",
+          type: "number",
+          sourceRanges: [
+            {
+              outputRowStart: 0,
+              sourceBlockId: "base-key",
+              sourceRowStart: 0,
+              rowCount: 1,
+            },
+            {
+              outputRowStart: 1,
+              sourceBlockId: "upsert-key",
+              sourceRowStart: 0,
+              rowCount: 1,
+            },
+          ],
+        },
+        {
+          columnId: "value-column",
+          type: "string",
+          sourceRanges: [
+            {
+              outputRowStart: 0,
+              sourceBlockId: "base-value",
+              sourceRowStart: 0,
+              rowCount: 1,
+            },
+            {
+              outputRowStart: 1,
+              sourceBlockId: "upsert-value",
+              sourceRowStart: 0,
+              rowCount: 1,
+            },
+          ],
+        },
+      ],
+      outputs: [{ rowStart: 0, rowCount: 2 }],
+    },
+    outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
     memoryBudgetBytes: 4096,
     minimumMemoryBytes: 512,
     peakWorkingBytes: 0,
@@ -375,6 +575,51 @@ for (const implementation of stores()) {
       expect((await store.listSegments("people-id"))[0]?.rowIdEndExclusive).toBe(3n);
       expect(await store.getSegment("segment-1")).not.toHaveProperty("level");
       expect(await store.getSegment("segment-2")).toMatchObject({ level: 1, logicalOrder: 4 });
+      store.close();
+    });
+
+    it("round trips ordered row-ID spans without changing legacy segment metadata", async () => {
+      const store = await implementation.create();
+      const rowIdSpans = [
+        { rowStart: 0, rowCount: 1, rowIdStart: 10n },
+        { rowStart: 1, rowCount: 1, rowIdStart: 3n },
+      ];
+      await store.addSegment({
+        id: "merged-segment",
+        tableId: "events",
+        transactionId: "merge-transaction",
+        rowCount: 2,
+        rowIdStart: 3n,
+        rowIdEndExclusive: 11n,
+        rowIdSpans,
+        columnBlockIds: { value: ["merged-block"] },
+        kind: "base",
+        level: 1,
+        logicalOrder: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      rowIdSpans[0] = { rowStart: 0, rowCount: 2, rowIdStart: 99n };
+      expect(await store.getSegment("merged-segment")).toMatchObject({
+        kind: "base",
+        rowIdStart: 3n,
+        rowIdEndExclusive: 11n,
+        rowIdSpans: [
+          { rowStart: 0, rowCount: 1, rowIdStart: 10n },
+          { rowStart: 1, rowCount: 1, rowIdStart: 3n },
+        ],
+      });
+
+      await store.addSegment({
+        id: "legacy-segment",
+        tableId: "events",
+        transactionId: "legacy-transaction",
+        rowCount: 1,
+        rowIdStart: 20n,
+        rowIdEndExclusive: 21n,
+        columnBlockIds: { value: ["legacy-block"] },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      expect(await store.getSegment("legacy-segment")).not.toHaveProperty("rowIdSpans");
       store.close();
     });
 
@@ -962,6 +1207,187 @@ for (const implementation of stores()) {
         }),
       ).rejects.toThrow("output IDs must match");
       expect((await store.getCompactionJob(checkpoint.id))?.revision).toBe(0);
+      store.close();
+    });
+
+    it("persists immutable merge plans and advances output-driven checkpoints", async () => {
+      const store = await implementation.create();
+      const created = mergeCompactionJob();
+      await store.createCompactionJob(created);
+      const createdPlan = created.rewritePlan;
+      if (createdPlan?.kind !== "merge-v1") throw new Error("Expected a merge plan");
+      (createdPlan.rowIdSpans[0] as { rowIdStart: bigint }).rowIdStart = 999n;
+      (createdPlan.sourceSegments[0]?.columns[0]?.sourceBlocks[0] as { blockId: string }).blockId =
+        "mutated";
+
+      const persisted = await store.getCompactionJob(created.id);
+      expect(persisted).toMatchObject({
+        sourceSegmentIds: ["base-segment", "delete-segment", "upsert-segment"],
+        sourceBlockIds: ["base-key", "base-value", "delete-key", "upsert-key", "upsert-value"],
+        rewritePlan: {
+          kind: "merge-v1",
+          totalRows: 2,
+          rowIdStart: 3n,
+          rowIdEndExclusive: 11n,
+          rowIdSpans: [
+            { rowStart: 0, rowCount: 1, rowIdStart: 10n },
+            { rowStart: 1, rowCount: 1, rowIdStart: 3n },
+          ],
+        },
+        outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+      });
+
+      const first = await store.updateCompactionJob(created.id, 0, {
+        outputBlockIds: ["merge-output-id"],
+        outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+        outputStoredBytes: 70,
+        outputLogicalBytes: 80,
+        peakWorkingBytes: 600,
+        state: "running",
+        transactionId: "merge-transaction",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+      expect(first).toMatchObject({
+        processedRows: 0,
+        outputBlockIds: ["merge-output-id"],
+        outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+        revision: 1,
+      });
+
+      const ready = await store.updateCompactionJob(created.id, first.revision, {
+        outputBlockIds: ["merge-output-id", "merge-output-value"],
+        outputCursor: { outputIndex: 1, columnIndex: 0, rowStart: 2 },
+        processedRows: 2,
+        outputStoredBytes: 140,
+        outputLogicalBytes: 160,
+        peakWorkingBytes: 700,
+        state: "ready",
+        updatedAt: "2026-01-01T00:00:02.000Z",
+      });
+      expect(ready).toMatchObject({ state: "ready", processedRows: 2, revision: 2 });
+
+      await expect(
+        store.updateCompactionJob(created.id, ready.revision, {
+          outputSegmentId: "replacement-output-segment",
+          updatedAt: "2026-01-01T00:00:03.000Z",
+        }),
+      ).rejects.toThrow("immutable");
+      expect((await store.getCompactionJob(created.id))?.revision).toBe(ready.revision);
+      store.close();
+    });
+
+    it("rejects malformed merge fingerprints, source maps, and row-ID spans", async () => {
+      const store = await implementation.create();
+
+      const mismatchedSegments = mergeCompactionJob("merge-mismatched-segments");
+      mismatchedSegments.sourceSegmentIds = ["delete-segment", "base-segment", "upsert-segment"];
+      await expect(store.createCompactionJob(mismatchedSegments)).rejects.toThrow(
+        "preserve every selected source segment",
+      );
+
+      const duplicateBlock = mergeCompactionJob("merge-duplicate-block");
+      if (duplicateBlock.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      (
+        duplicateBlock.rewritePlan.sourceSegments[2]?.columns[0]?.sourceBlocks[0] as {
+          blockId: string;
+        }
+      ).blockId = "base-key";
+      await expect(store.createCompactionJob(duplicateBlock)).rejects.toThrow(
+        "source block can only appear once",
+      );
+
+      const unknownRange = mergeCompactionJob("merge-unknown-range");
+      if (unknownRange.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      (
+        unknownRange.rewritePlan.columns[0]?.sourceRanges[0] as { sourceBlockId: string }
+      ).sourceBlockId = "unknown";
+      await expect(store.createCompactionJob(unknownRange)).rejects.toThrow("unknown source block");
+
+      const overlappingIds = mergeCompactionJob("merge-overlapping-row-ids");
+      if (overlappingIds.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      (overlappingIds.rewritePlan.rowIdSpans[1] as { rowIdStart: bigint }).rowIdStart = 10n;
+      await expect(store.createCompactionJob(overlappingIds)).rejects.toThrow(
+        "overlapping row IDs",
+      );
+
+      const gappedRanges = mergeCompactionJob("merge-gapped-ranges");
+      if (gappedRanges.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      (
+        gappedRanges.rewritePlan.columns[0]?.sourceRanges[1] as { outputRowStart: number }
+      ).outputRowStart = 2;
+      await expect(store.createCompactionJob(gappedRanges)).rejects.toThrow(
+        "cover output rows contiguously",
+      );
+
+      const invalidDelete = mergeCompactionJob("merge-invalid-delete");
+      if (invalidDelete.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      (invalidDelete.rewritePlan.sourceSegments[1] as { kind: "update" }).kind = "update";
+      await expect(store.createCompactionJob(invalidDelete)).rejects.toThrow(
+        "update segment requires",
+      );
+
+      expect(await store.listCompactionJobs()).toEqual([]);
+      store.close();
+    });
+
+    it("publishes an empty merge without fabricating an output segment", async () => {
+      const store = await implementation.create();
+      const nonEmpty = mergeCompactionJob("empty-merge");
+      if (nonEmpty.rewritePlan?.kind !== "merge-v1") throw new Error("Expected merge plan");
+      const emptyPlan: MergeCompactionRewritePlan = {
+        ...nonEmpty.rewritePlan,
+        totalRows: 0,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        rowIdSpans: [],
+        columns: nonEmpty.rewritePlan.columns.map((column) => ({ ...column, sourceRanges: [] })),
+        outputs: [],
+      };
+      const empty: CompactionJobRecord = {
+        ...nonEmpty,
+        rewritePlan: emptyPlan,
+        outputSegmentId: null,
+        outputCursor: { outputIndex: 0, columnIndex: 0, rowStart: 0 },
+        minimumMemoryBytes: 0,
+      };
+      await store.createCompactionJob(empty);
+
+      const running = await store.updateCompactionJob(empty.id, 0, {
+        state: "running",
+        transactionId: "empty-merge-transaction",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+      const ready = await store.updateCompactionJob(empty.id, running.revision, {
+        state: "ready",
+        updatedAt: "2026-01-01T00:00:02.000Z",
+      });
+      const published = await store.updateCompactionJob(empty.id, ready.revision, {
+        state: "published",
+        publishedVersion: 10,
+        updatedAt: "2026-01-01T00:00:03.000Z",
+      });
+      expect(published).toMatchObject({
+        state: "published",
+        outputSegmentId: null,
+        outputBlockIds: [],
+        processedRows: 0,
+        publishedVersion: 10,
+      });
+
+      const invalidEmpty: CompactionJobRecord = {
+        ...mergeCompactionJob("invalid-empty-merge"),
+        rewritePlan: emptyPlan,
+        minimumMemoryBytes: 0,
+      };
+      await expect(store.createCompactionJob(invalidEmpty)).rejects.toThrow(
+        "cannot have an output segment",
+      );
+
+      const invalidNonEmpty = mergeCompactionJob("invalid-nonempty-merge");
+      invalidNonEmpty.outputSegmentId = null;
+      await expect(store.createCompactionJob(invalidNonEmpty)).rejects.toThrow(
+        "requires an output segment ID",
+      );
       store.close();
     });
 
@@ -1845,6 +2271,50 @@ it("persists rechunk plans and memory accounting across IndexedDB connections", 
     peakWorkingBytes: 600,
     outputStoredBytes: 70,
     outputLogicalBytes: 80,
+    revision: 1,
+  });
+  store.close();
+});
+
+it("persists merge source maps and row-ID spans across IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const job = mergeCompactionJob("reopen-merge-job");
+  await store.createCompactionJob(job);
+  await store.updateCompactionJob(job.id, 0, {
+    outputBlockIds: ["merge-output-id"],
+    outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+    outputStoredBytes: 70,
+    outputLogicalBytes: 80,
+    peakWorkingBytes: 600,
+    state: "running",
+    transactionId: "merge-transaction",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+  });
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  expect(await store.getCompactionJob(job.id)).toMatchObject({
+    sourceSegmentIds: ["base-segment", "delete-segment", "upsert-segment"],
+    rewritePlan: {
+      kind: "merge-v1",
+      keyColumnId: "id-column",
+      totalRows: 2,
+      rowIdStart: 3n,
+      rowIdEndExclusive: 11n,
+      rowIdSpans: [
+        { rowStart: 0, rowCount: 1, rowIdStart: 10n },
+        { rowStart: 1, rowCount: 1, rowIdStart: 3n },
+      ],
+      sourceSegments: [
+        { segmentId: "base-segment", committedVersion: 7, kind: "base" },
+        { segmentId: "delete-segment", committedVersion: 8, kind: "delete" },
+        { segmentId: "upsert-segment", committedVersion: 9, kind: "upsert" },
+      ],
+    },
+    outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+    outputBlockIds: ["merge-output-id"],
     revision: 1,
   });
   store.close();
