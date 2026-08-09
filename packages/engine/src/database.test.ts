@@ -4904,6 +4904,36 @@ for (const implementation of implementations()) {
     store.close();
   });
 
+  it(`${implementation.name} caps each paged garbage-collection plan`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store);
+    await database.createTable({
+      name: "gc_paged_candidates",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 1; value <= 6; value += 1) {
+      await database.insert("gc_paged_candidates", { value });
+    }
+    const compaction = await database.compactTableStep("gc_paged_candidates", {
+      maxBlocks: 3,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (compaction.jobId === null) throw new Error("Expected a paged GC compaction job");
+    await database.cancelCompactionJob(compaction.jobId);
+
+    const progress = await database.collectGarbageStep({ maxItems: 1, maxPlanningItems: 2 });
+    const job = await store.getGarbageCollectionJob(progress.jobId);
+    if (job === undefined) throw new Error("Expected a paged garbage-collection job");
+    expect(job.candidateBlockIds.length + job.candidateSegmentIds.length).toBeLessThanOrEqual(2);
+    expect(
+      job.candidateManifestVersions.length +
+        job.candidateBlockIds.length +
+        job.candidateSegmentIds.length,
+    ).toBeGreaterThan(0);
+    store.close();
+  });
+
   it(`${implementation.name} keeps compacted history while leased and reclaims exact bytes after release`, async () => {
     const store = await implementation.create();
     const database = new BrowserDatabase(store);

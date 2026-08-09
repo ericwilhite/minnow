@@ -319,11 +319,15 @@ export interface CancelCompactionJobResult {
 export interface CollectGarbageOptions {
   /** Maximum candidates examined and checkpointed by each durable reclamation step. */
   maxItemsPerStep?: number;
+  /** Maximum block/segment candidates copied into one durable planning record. */
+  maxPlanningItems?: number;
 }
 
 export interface CollectGarbageStepOptions {
   /** Maximum candidates examined and checkpointed by this durable reclamation step. */
   maxItems?: number;
+  /** Maximum block/segment candidates copied into a newly planned job. */
+  maxPlanningItems?: number;
 }
 
 export interface GarbageCollectionResult {
@@ -1206,7 +1210,12 @@ export class BrowserDatabase {
       options.maxItemsPerStep ?? 64,
       "Garbage collection items per step",
     );
-    let progress = await this.collectGarbageStep({ maxItems });
+    let progress = await this.collectGarbageStep({
+      maxItems,
+      ...(options.maxPlanningItems === undefined
+        ? {}
+        : { maxPlanningItems: options.maxPlanningItems }),
+    });
     while (progress.result === null) {
       progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
     }
@@ -1220,7 +1229,11 @@ export class BrowserDatabase {
     const active = (await this.store.listGarbageCollectionJobs()).find(
       (job) => job.state === "planned" || job.state === "running",
     );
-    const job = active ?? (await this.#planGarbageCollection());
+    const job =
+      active ??
+      (await this.#planGarbageCollection(
+        positiveWholeNumber(options.maxPlanningItems ?? 1_024, "Garbage collection planning limit"),
+      ));
     return this.#runGarbageCollectionJob(
       job,
       positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
@@ -1244,41 +1257,153 @@ export class BrowserDatabase {
     return this.store.listGarbageCollectionJobs();
   }
 
-  async #planGarbageCollection(): Promise<GarbageCollectionJobRecord> {
-    const [current, manifests, transactions, compactionJobs] = await Promise.all([
-      this.store.getCurrentManifest(),
-      this.store.listManifests(),
-      this.store.listTransactions(),
-      this.store.listCompactionJobs(),
-    ]);
-    const historicalManifests = manifests.filter(
-      (manifest) => manifest.version !== current?.version && manifest.prunedAt === undefined,
-    );
-    const terminalTransactions = transactions.filter((record) => record.status === "aborted");
-    const terminalCompactionJobs = compactionJobs.filter(
-      (job) => job.state === "published" || job.state === "cancelled" || job.state === "aborted",
-    );
-    const candidateBlockIds = new Set(historicalManifests.flatMap((manifest) => manifest.blockIds));
-    const candidateSegmentIds = new Set<string>();
-    for (const transaction of terminalTransactions) {
-      transaction.pendingBlockIds.forEach((id) => candidateBlockIds.add(id));
-      transaction.pendingSegmentIds.forEach((id) => candidateSegmentIds.add(id));
+  async #planGarbageCollection(maxPlanningItems: number): Promise<GarbageCollectionJobRecord> {
+    const current = await this.store.getCurrentManifest();
+    const currentBlockIds = new Set(current?.blockIds ?? []);
+    const candidateManifestVersions: number[] = [];
+    const candidateBlockIds: string[] = [];
+    const candidateSegmentIds: string[] = [];
+    const candidateBlockIdSet = new Set<string>();
+    const candidateSegmentIdSet = new Set<string>();
+    const remaining = () =>
+      maxPlanningItems - candidateBlockIds.length - candidateSegmentIds.length;
+    const addBlocks = (ids: readonly string[]) => {
+      for (const id of ids) {
+        if (remaining() <= 0) break;
+        if (candidateBlockIdSet.has(id)) continue;
+        candidateBlockIdSet.add(id);
+        candidateBlockIds.push(id);
+      }
+    };
+    const addSegments = (ids: readonly string[]) => {
+      for (const id of ids) {
+        if (remaining() <= 0) break;
+        if (candidateSegmentIdSet.has(id)) continue;
+        candidateSegmentIdSet.add(id);
+        candidateSegmentIds.push(id);
+      }
+    };
+    let manifestCursor: number | null = null;
+    do {
+      const page = await this.store.listManifestPage(manifestCursor, 64);
+      for (const manifest of page.records) {
+        if (manifest.version === current?.version) continue;
+        const existing = await this.#existingGarbageBlockCandidates(
+          manifest.blockIds,
+          currentBlockIds,
+          remaining(),
+        );
+        if (manifest.prunedAt === undefined || existing.length > 0) {
+          candidateManifestVersions.push(manifest.version);
+          addBlocks(existing);
+        }
+        if (remaining() <= 0 || candidateManifestVersions.length === 64) break;
+      }
+      if (remaining() <= 0 || candidateManifestVersions.length === 64) break;
+      manifestCursor = page.nextCursor;
+    } while (manifestCursor !== null);
+
+    if (remaining() > 0) {
+      let transactionCursor: string | null = null;
+      do {
+        const page = await this.store.listTransactionPage(transactionCursor, 64);
+        for (const transaction of page.records) {
+          if (transaction.status !== "aborted") continue;
+          addBlocks(
+            await this.#existingGarbageBlockCandidates(
+              transaction.pendingBlockIds,
+              currentBlockIds,
+              remaining(),
+            ),
+          );
+          addSegments(
+            await this.#existingGarbageSegmentCandidates(
+              transaction.pendingSegmentIds,
+              remaining(),
+            ),
+          );
+          if (remaining() <= 0) break;
+        }
+        if (remaining() <= 0) break;
+        transactionCursor = page.nextCursor;
+      } while (transactionCursor !== null);
     }
-    for (const job of terminalCompactionJobs) {
-      job.sourceBlockIds.forEach((id) => candidateBlockIds.add(id));
-      job.outputBlockIds.forEach((id) => candidateBlockIds.add(id));
-      job.sourceSegmentIds.forEach((id) => candidateSegmentIds.add(id));
-      if (job.outputSegmentId !== null) candidateSegmentIds.add(job.outputSegmentId);
+
+    if (remaining() > 0) {
+      let compactionCursor: string | null = null;
+      do {
+        const page = await this.store.listCompactionJobPage(compactionCursor, 64);
+        for (const job of page.records) {
+          if (job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted") {
+            continue;
+          }
+          addBlocks(
+            await this.#existingGarbageBlockCandidates(
+              [...job.sourceBlockIds, ...job.outputBlockIds],
+              currentBlockIds,
+              remaining(),
+            ),
+          );
+          addSegments(
+            await this.#existingGarbageSegmentCandidates(
+              [
+                ...job.sourceSegmentIds,
+                ...(job.outputSegmentId === null ? [] : [job.outputSegmentId]),
+              ],
+              remaining(),
+            ),
+          );
+          if (remaining() <= 0) break;
+        }
+        if (remaining() <= 0) break;
+        compactionCursor = page.nextCursor;
+      } while (compactionCursor !== null);
     }
     const timestamp = this.#now().toISOString();
     return this.store.createGarbageCollectionJob({
       id: `garbage-collection/${this.#createId()}`,
-      candidateManifestVersions: historicalManifests.map((manifest) => manifest.version),
-      candidateSegmentIds: [...candidateSegmentIds],
-      candidateBlockIds: [...candidateBlockIds],
+      candidateManifestVersions,
+      candidateSegmentIds,
+      candidateBlockIds,
       leaseCutoff: timestamp,
       createdAt: timestamp,
     });
+  }
+
+  async #existingGarbageBlockCandidates(
+    ids: readonly string[],
+    currentBlockIds: ReadonlySet<string>,
+    limit: number,
+  ): Promise<string[]> {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    for (let start = 0; start < ids.length && candidates.length < limit; start += 64) {
+      const page = ids.slice(start, start + 64);
+      const blocks = await this.store.getBlocks(page);
+      for (let index = 0; index < page.length && candidates.length < limit; index += 1) {
+        const id = page[index] ?? "";
+        if (blocks[index] !== undefined && !currentBlockIds.has(id) && !seen.has(id)) {
+          seen.add(id);
+          candidates.push(id);
+        }
+      }
+    }
+    return candidates;
+  }
+
+  async #existingGarbageSegmentCandidates(
+    ids: readonly string[],
+    limit: number,
+  ): Promise<string[]> {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (candidates.length >= limit) break;
+      if (seen.has(id) || (await this.store.getSegment(id)) === undefined) continue;
+      seen.add(id);
+      candidates.push(id);
+    }
+    return candidates;
   }
 
   async #runGarbageCollectionJob(

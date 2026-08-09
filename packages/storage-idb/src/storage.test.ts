@@ -543,6 +543,38 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("pages manifests and transactions with stable exclusive cursors", async () => {
+      const store = await implementation.create();
+      await store.addBlock("page-block", Uint8Array.of(1));
+      await store.publishManifest({ expectedVersion: null, blockIds: ["page-block"] });
+      await store.publishManifest({ expectedVersion: 0, blockIds: ["page-block"] });
+      await store.publishManifest({ expectedVersion: 1, blockIds: ["page-block"] });
+      for (const id of ["transaction-c", "transaction-a", "transaction-b"]) {
+        await store.createTransaction({ ...activeTransaction(id), snapshotVersion: 2 });
+      }
+
+      const firstManifests = await store.listManifestPage(null, 2);
+      expect(firstManifests.records.map((manifest) => manifest.version)).toEqual([0, 1]);
+      expect(firstManifests.nextCursor).toBe(1);
+      const finalManifests = await store.listManifestPage(firstManifests.nextCursor, 2);
+      expect(finalManifests.records.map((manifest) => manifest.version)).toEqual([2]);
+      expect(finalManifests.nextCursor).toBeNull();
+
+      const firstTransactions = await store.listTransactionPage(null, 2);
+      expect(firstTransactions.records.map((transaction) => transaction.id)).toEqual([
+        "transaction-a",
+        "transaction-b",
+      ]);
+      expect(firstTransactions.nextCursor).toBe("transaction-b");
+      const finalTransactions = await store.listTransactionPage(firstTransactions.nextCursor, 2);
+      expect(finalTransactions.records.map((transaction) => transaction.id)).toEqual([
+        "transaction-c",
+      ]);
+      expect(finalTransactions.nextCursor).toBeNull();
+      await expect(store.listManifestPage(null, 0)).rejects.toThrow("positive whole number");
+      store.close();
+    });
+
     it("never publishes a missing block", async () => {
       const store = await implementation.create();
       await expect(
@@ -952,6 +984,12 @@ for (const implementation of stores()) {
       });
       expect((await store.listCompactionJobs()).map((job) => job.id)).toEqual(["job-a", "job-b"]);
       expect((await store.listCompactionJobs("events")).map((job) => job.id)).toEqual(["job-b"]);
+      const firstPage = await store.listCompactionJobPage(null, 1);
+      expect(firstPage.records.map((job) => job.id)).toEqual(["job-a"]);
+      expect(firstPage.nextCursor).toBe("job-a");
+      expect(
+        (await store.listCompactionJobPage(firstPage.nextCursor, 1)).records.map((job) => job.id),
+      ).toEqual(["job-b"]);
 
       const outputBlockIds = ["output-b", "output-a", "output-b"];
       const cursor = { sourceSegmentIndex: 1, sourceBlockIndex: 8 };

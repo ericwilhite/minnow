@@ -124,6 +124,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.listManifests();
   }
 
+  listManifestPage(afterVersion: number | null, limit: number) {
+    return this.inner.listManifestPage(afterVersion, limit);
+  }
+
   async publishManifest(input: PublishManifestInput): Promise<Manifest> {
     await this.inject("beforeManifestCommit");
     const manifest = await this.inner.publishManifest(input);
@@ -141,6 +145,10 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   listTransactions(): Promise<TransactionRecord[]> {
     return this.inner.listTransactions();
+  }
+
+  listTransactionPage(afterId: string | null, limit: number) {
+    return this.inner.listTransactionPage(afterId, limit);
   }
 
   updateTransaction(
@@ -196,6 +204,10 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   listCompactionJobs(tableId?: string): Promise<CompactionJobRecord[]> {
     return this.inner.listCompactionJobs(tableId);
+  }
+
+  listCompactionJobPage(afterId: string | null, limit: number) {
+    return this.inner.listCompactionJobPage(afterId, limit);
   }
 
   updateCompactionJob(

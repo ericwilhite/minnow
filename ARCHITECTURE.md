@@ -302,7 +302,7 @@ delete them only after atomic reachability revalidation.
 
 ### Lease-aware physical garbage collection
 
-The public collection surface has four layers. `collectGarbage()` drives a pass to completion;
+The public collection surface has four layers. `collectGarbage()` drives one bounded candidate pass to completion;
 `collectGarbageStep()` plans or advances one bounded durable step;
 `resumeGarbageCollectionJob(jobId)` continues a known pass after a yield or reopen; and
 `listGarbageCollectionJobs()` exposes persisted records. A revisioned job stores immutable manifest,
@@ -315,6 +315,10 @@ manifest counts; reclaimed, retained, and missing segment/block counts; and
 Planning admits historical manifests, pending artifacts from aborted transaction journals, and
 source/output artifacts recorded by terminal published, cancelled, or aborted compaction jobs.
 Storage rejects candidate block or segment IDs without one of those persisted provenance paths.
+Discovery walks each source through stable 64-record storage cursor pages, probes block existence in
+64-ID windows, and copies at most `maxPlanningItems` block/segment IDs (1,024 by default) plus at most
+64 manifest provenance versions into a new job. Subsequent calls discover later chunks without
+building a database-wide candidate union.
 Each step then recomputes live roots rather than trusting the plan:
 
 - the current manifest;
@@ -345,8 +349,10 @@ transactions aborted, then routes any requested physical deletion through a dura
 instead of directly removing their pending objects.
 
 `maxItems`/`maxItemsPerStep` bound how many candidate manifests, segments, and blocks one durable
-step examines and thus how many candidate mutations it can apply. They do not bound the initial
-candidate plan or the complete metadata/root scans currently needed for atomic revalidation. The
+step examines and thus how many candidate mutations it can apply. `maxPlanningItems` bounds the
+block/segment candidate arrays persisted for a new job. A single large manifest, transaction, or
+compaction record and the complete metadata/root scans currently needed for atomic revalidation are
+still unbounded. The
 reported `physicallyReclaimedBytes` is the sum of byte lengths for immutable block values actually
 deleted; it excludes descriptor metadata and is not a measurement of browser quota recovery. A
 block written by `addBlock()` before a crash but never attached to a journal or another provenance

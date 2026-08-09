@@ -230,6 +230,8 @@ bounded L0-prefix selection and lease-aware physical reclamation for known artif
 - completed collection results distinguish pruned/already-pruned/retained/missing manifests,
   reclaimed/retained/missing segments and blocks, and deleted immutable block byte lengths in
   `physicallyReclaimedBytes`—not browser quota recovery.
+- candidate discovery uses stable 64-record manifest/transaction/compaction pages, 64-block
+  existence windows, and a configurable/default-1,024 block/segment cap per durable job;
 
 The byte target is estimated from source-block encoded density and shared across column output
 windows, then windows are measured and split for skew or a tighter execution budget before the plan
@@ -242,8 +244,9 @@ its output cursor are restartable. Neither model covers native codec allocations
 internals, persisted metadata, or the whole browser process.
 
 `maxItems` bounds candidates examined and possible candidate mutations within a durable collection
-step; it does not bound full candidate planning or the metadata/root scans used for atomic
-revalidation. Candidate admission currently requires persisted provenance from a historical
+step. `maxPlanningItems` bounds block/segment IDs copied into one job while storage cursors page the
+candidate sources; one large source record and the metadata/root scans used for atomic revalidation
+remain unbounded. Candidate admission currently requires persisted provenance from a historical
 manifest, aborted transaction journal, or terminal compaction job. An unknown immutable block left
 by a crash after `addBlock()` but before journal attachment is deliberately omitted until provenance
 or age tracking can make it safe to collect.
@@ -271,7 +274,7 @@ Remaining Phase 6 delivery:
 - keyed/clustered multi-range L2 selection;
 - lifetime write-amplification accounting that includes cancelled and aborted attempts;
 - spillable or resumable merge planning before the immutable plan exists;
-- chunked collection planning and indexed root discovery; and
+- bounded source-record envelopes and indexed/paged atomic root discovery; and
 - broader unknown-orphan, catalog, terminal-job, and metadata cleanup.
 
 Exit gate: interrupted compactions recover safely and sustained append and keyed/clustered ingestion

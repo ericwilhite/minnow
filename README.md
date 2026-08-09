@@ -106,7 +106,10 @@ while (progress.result === null) {
 const jobs = await database.listCompactionJobs("events");
 
 // Reclaim unreachable history and terminal-job artifacts to completion.
-const collection = await database.collectGarbage({ maxItemsPerStep: 64 });
+const collection = await database.collectGarbage({
+  maxItemsPerStep: 64,
+  maxPlanningItems: 1024,
+});
 
 // Or drive the same durable pass explicitly across yields or database reopens.
 let gcProgress = await database.collectGarbageStep({ maxItems: 8 });
@@ -314,8 +317,10 @@ immutable output blocks or segment artifacts already written remain unreachable 
 deleted by cancellation itself; a later garbage-collection pass can reclaim them after revalidating
 that they are still unreachable.
 
-Garbage collection is restart-safe and lease-aware. `collectGarbage()` drives one persisted pass to
-completion, using `maxItemsPerStep` to control each checkpoint. `collectGarbageStep()` plans or
+Garbage collection is restart-safe and lease-aware. `collectGarbage()` drives one bounded persisted
+candidate pass to completion, using `maxItemsPerStep` to control each checkpoint and
+`maxPlanningItems` to cap block/segment IDs copied into a newly persisted job. Repeated calls discover
+later candidate chunks. `collectGarbageStep()` plans or
 advances one pass, `resumeGarbageCollectionJob()` continues its durable cursor by ID, and
 `listGarbageCollectionJobs()` exposes the revisioned `planned`, `running`, and `completed` records
 stored in `gc`. Progress reports cumulative examined manifest, segment, and block counts. The
@@ -344,9 +349,12 @@ with collection, so a race either establishes a valid root or receives
 recovery also routes deletion through the durable collector instead of deleting pending artifacts
 directly.
 
-`maxItems` bounds the number of manifest, segment, and block candidates examined—and therefore the
-maximum candidate mutations—within one durable step. It does not bound initial candidate planning
-or the full metadata/root scans currently repeated for atomic revalidation. Collection intentionally
+Candidate discovery walks manifests, transactions, and compaction jobs through stable storage cursor
+pages of at most 64 records. It checks block existence in 64-ID windows and defaults each new durable
+job to at most 1,024 block/segment candidates; at most 64 manifest provenance records accompany a
+job. `maxItems` separately bounds the candidates examined and possible mutations in one durable
+step. A single large source record is still cloned by the underlying store, and the full metadata/root
+scans repeated for atomic revalidation are not yet bounded. Collection intentionally
 accepts only candidates with persisted provenance in historical manifests, aborted transaction
 journals, or terminal compaction jobs. An otherwise unknown immutable block left by a crash after
 `addBlock()` but before journal attachment is omitted until provenance or conservative age tracking

@@ -369,6 +369,11 @@ export interface GarbageCollectionStepResult {
   reclaimedBlockBytes: number;
 }
 
+export interface StoragePage<T, Cursor> {
+  records: T[];
+  nextCursor: Cursor | null;
+}
+
 export class GarbageCollectionJobConflictError extends Error {
   override readonly name = "GarbageCollectionJobConflictError";
 
@@ -525,10 +530,18 @@ export interface BlockStore {
   getCurrentManifest(): Promise<Manifest | undefined>;
   getManifest(version: number): Promise<Manifest | undefined>;
   listManifests(): Promise<Manifest[]>;
+  listManifestPage(
+    afterVersion: number | null,
+    limit: number,
+  ): Promise<StoragePage<Manifest, number>>;
   publishManifest(input: PublishManifestInput): Promise<Manifest>;
   createTransaction(record: TransactionRecord): Promise<void>;
   getTransaction(id: string): Promise<TransactionRecord | undefined>;
   listTransactions(): Promise<TransactionRecord[]>;
+  listTransactionPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<TransactionRecord, string>>;
   updateTransaction(
     id: string,
     expectedRevision: number,
@@ -548,6 +561,10 @@ export interface BlockStore {
   createCompactionJob(record: CompactionJobRecord): Promise<void>;
   getCompactionJob(id: string): Promise<CompactionJobRecord | undefined>;
   listCompactionJobs(tableId?: string): Promise<CompactionJobRecord[]>;
+  listCompactionJobPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<CompactionJobRecord, string>>;
   updateCompactionJob(
     id: string,
     expectedRevision: number,

@@ -162,6 +162,19 @@ export class MemoryBlockStore implements BlockStore {
       .map((manifest) => structuredClone(manifest));
   }
 
+  async listManifestPage(afterVersion: number | null, limit: number) {
+    validatePageLimit(limit);
+    const records = [...this.#manifests.values()]
+      .filter((manifest) => afterVersion === null || manifest.version > afterVersion)
+      .sort((left, right) => left.version - right.version)
+      .slice(0, limit)
+      .map((manifest) => structuredClone(manifest));
+    return {
+      records,
+      nextCursor: records.length === limit ? (records.at(-1)?.version ?? null) : null,
+    };
+  }
+
   async publishManifest(input: PublishManifestInput): Promise<Manifest> {
     let resolveResult: (manifest: Manifest) => void;
     let rejectResult: (reason: unknown) => void;
@@ -211,6 +224,16 @@ export class MemoryBlockStore implements BlockStore {
           left.startedAt.localeCompare(right.startedAt) || left.id.localeCompare(right.id),
       )
       .map((record) => structuredClone(record));
+  }
+
+  async listTransactionPage(afterId: string | null, limit: number) {
+    validatePageLimit(limit);
+    const records = [...this.#transactions.values()]
+      .filter((record) => afterId === null || record.id > afterId)
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map((record) => structuredClone(record));
+    return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
 
   async updateTransaction(
@@ -427,6 +450,16 @@ export class MemoryBlockStore implements BlockStore {
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
       .map((record) => structuredClone(record));
+  }
+
+  async listCompactionJobPage(afterId: string | null, limit: number) {
+    validatePageLimit(limit);
+    const records = [...this.#compactionJobs.values()]
+      .filter((record) => afterId === null || record.id > afterId)
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map((record) => structuredClone(record));
+    return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
 
   async updateCompactionJob(
@@ -962,6 +995,12 @@ function validateGarbageCollectionStepInput(input: RunGarbageCollectionStepInput
   }
   if (input.updatedAt.length === 0 || !Number.isFinite(Date.parse(input.updatedAt))) {
     throw new TypeError("Garbage collection update timestamp must be valid");
+  }
+}
+
+function validatePageLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new RangeError("Storage page limit must be a positive whole number");
   }
 }
 

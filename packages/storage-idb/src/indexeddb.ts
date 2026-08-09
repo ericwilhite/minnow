@@ -285,6 +285,22 @@ export class IndexedDbBlockStore implements BlockStore {
     return values.map(asManifest).sort((left, right) => left.version - right.version);
   }
 
+  async listManifestPage(afterVersion: number | null, limit: number) {
+    validatePageLimit(limit);
+    const transaction = this.#transaction("manifests", "readonly");
+    const records = await readCursorPage(
+      transaction.objectStore("manifests"),
+      limit,
+      asManifest,
+      (key) => typeof key === "number" && (afterVersion === null || key > afterVersion),
+    );
+    await transactionDone(transaction);
+    return {
+      records,
+      nextCursor: records.length === limit ? (records.at(-1)?.version ?? null) : null,
+    };
+  }
+
   async publishManifest(input: PublishManifestInput): Promise<Manifest> {
     const transaction = this.#transaction(["blocks", "catalog", "manifests"], "readwrite");
     const catalog = transaction.objectStore("catalog");
@@ -349,6 +365,19 @@ export class IndexedDbBlockStore implements BlockStore {
         (left, right) =>
           left.startedAt.localeCompare(right.startedAt) || left.id.localeCompare(right.id),
       );
+  }
+
+  async listTransactionPage(afterId: string | null, limit: number) {
+    validatePageLimit(limit);
+    const transaction = this.#transaction("transactions", "readonly");
+    const records = await readCursorPage(
+      transaction.objectStore("transactions"),
+      limit,
+      asTransactionRecord,
+      (key) => typeof key === "string" && (afterId === null || key > afterId),
+    );
+    await transactionDone(transaction);
+    return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
 
   async updateTransaction(
@@ -704,6 +733,22 @@ export class IndexedDbBlockStore implements BlockStore {
         (left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       );
+  }
+
+  async listCompactionJobPage(afterId: string | null, limit: number) {
+    validatePageLimit(limit);
+    const transaction = this.#transaction("gc", "readonly");
+    const records = await readCursorPage(
+      transaction.objectStore("gc"),
+      limit,
+      (value) => asCompactionJobEnvelope(value),
+      (key) =>
+        typeof key === "string" &&
+        key.startsWith(COMPACTION_JOB_KEY_PREFIX) &&
+        (afterId === null || key > compactionJobKey(afterId)),
+    );
+    await transactionDone(transaction);
+    return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
 
   async updateCompactionJob(
@@ -1086,6 +1131,33 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   });
 }
 
+function readCursorPage<T>(
+  store: IDBObjectStore,
+  limit: number,
+  decode: (value: unknown) => T,
+  acceptKey: (key: IDBValidKey) => boolean,
+): Promise<T[]> {
+  return new Promise((resolve, reject) => {
+    const records: T[] = [];
+    const request = store.openCursor();
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor === null || records.length === limit) {
+        resolve(records);
+        return;
+      }
+      try {
+        if (acceptKey(cursor.key)) records.push(decode(cursor.value));
+        if (records.length === limit) resolve(records);
+        else cursor.continue();
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+  });
+}
+
 function transactionDone(transaction: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
     transaction.addEventListener("complete", () => resolve(), { once: true });
@@ -1436,6 +1508,12 @@ function validateGarbageCollectionStepInput(input: RunGarbageCollectionStepInput
   }
   if (input.updatedAt.length === 0 || !Number.isFinite(Date.parse(input.updatedAt))) {
     throw new TypeError("Garbage collection update timestamp must be valid");
+  }
+}
+
+function validatePageLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new RangeError("Storage page limit must be a positive whole number");
   }
 }
 
