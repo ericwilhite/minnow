@@ -573,7 +573,11 @@ function compareValues(left: unknown, right: unknown): number {
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;
-  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "number" && typeof b === "number") {
+    if (Number.isNaN(a)) return Number.isNaN(b) ? 0 : 1;
+    if (Number.isNaN(b)) return -1;
+    return a - b;
+  }
   if (typeof a === "string" && typeof b === "string") return a.localeCompare(b);
   if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
   throw new TypeError("Values must have comparable SQL types");

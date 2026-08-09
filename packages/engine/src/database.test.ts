@@ -27,6 +27,8 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   blockWriteCalls = 0;
   blockReadCalls = 0;
   transactionListCalls = 0;
+  transactionGetCalls = 0;
+  transactionBatchCalls = 0;
   segmentListCalls = 0;
   blockIdsRead: string[][] = [];
   singleBlockIdsRead: string[] = [];
@@ -53,6 +55,17 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   override async listTransactions() {
     this.transactionListCalls += 1;
     return super.listTransactions();
+  }
+
+  override async getTransaction(id: string) {
+    this.transactionGetCalls += 1;
+    return super.getTransaction(id);
+  }
+
+  override async getTransactions(ids: readonly string[]) {
+    this.transactionBatchCalls += 1;
+    this.transactionGetCalls += ids.length;
+    return super.getTransactions(ids);
   }
 
   override async listSegments(tableId?: string) {
@@ -4764,6 +4777,8 @@ it("answers metadata-only queries without loading a data block", async () => {
   store.blockReadCalls = 0;
   store.blockIdsRead = [];
   store.transactionListCalls = 0;
+  store.transactionGetCalls = 0;
+  store.transactionBatchCalls = 0;
   store.segmentListCalls = 0;
 
   expect(await database.query("SELECT COUNT(*) AS count FROM events")).toEqual({
@@ -4771,7 +4786,9 @@ it("answers metadata-only queries without loading a data block", async () => {
     rows: [{ count: 3 }],
   });
   expect(store.blockReadCalls).toBe(0);
-  expect(store.transactionListCalls).toBe(1);
+  expect(store.transactionListCalls).toBe(0);
+  expect(store.transactionGetCalls).toBe(1);
+  expect(store.transactionBatchCalls).toBe(1);
   expect(store.segmentListCalls).toBe(1);
   store.close();
 });
@@ -4851,6 +4868,8 @@ it("shares one visibility catalog across multi-table query preparation", async (
     await database.insertBatch(table, { columns: { id: [1, 2] } });
   }
   store.transactionListCalls = 0;
+  store.transactionGetCalls = 0;
+  store.transactionBatchCalls = 0;
   store.segmentListCalls = 0;
 
   expect(
@@ -4858,7 +4877,9 @@ it("shares one visibility catalog across multi-table query preparation", async (
       "SELECT COUNT(*) AS count FROM left_rows l JOIN right_rows r ON r.id = l.id",
     ),
   ).toEqual({ columns: ["count"], rows: [{ count: 2 }] });
-  expect(store.transactionListCalls).toBe(1);
+  expect(store.transactionListCalls).toBe(0);
+  expect(store.transactionGetCalls).toBe(2);
+  expect(store.transactionBatchCalls).toBe(1);
   expect(store.segmentListCalls).toBe(1);
   store.close();
 });

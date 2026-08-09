@@ -292,8 +292,9 @@ replay insert, upsert, update, and delete segments through typed mutation worksp
 against typed boolean, number, datetime, and dictionary-coded string vectors with packed validity
 bitmaps. Neither path builds a full boxed-value copy. Scans advance in 2,048-row source batches, and duplicate-match
 join fan-out is passed through the remaining operators in reserved typed chunks. Multi-table snapshot
-preparation shares one transaction/segment visibility catalog, and metadata-only append/base scans do
-not load an arbitrary data column. Filters, projection, limits, core
+preparation shares one segment visibility catalog and batch-fetches only referenced transaction
+owners in 64-ID windows; it does not scan the complete transaction history. Metadata-only append/base
+scans do not load an arbitrary data column. Filters, projection, limits, core
 aggregates, grouped aggregation, ordering, and equi-joins use this executor; row objects are created
 for the returned `QueryResult` only at the public API boundary.
 
@@ -328,12 +329,15 @@ row/vector parity.
 Phase 7D-A adds durable temp-run pages plus asynchronous external merge sort and partitioned hash
 aggregation. Budgeted `BrowserDatabase.query()` spills ungrouped ordered output (including joins) or
 single-table grouped ordered output, pairwise-merges fixed pages, applies LIMIT at the final read, and
-removes every owner/run page after success or failure. Synchronous prepared execution remains a
-no-I/O fast path; `executeAsync()` exposes the spill-capable path.
+removes every owner/run page after ordinary success or failure. Abrupt tab/process loss can leave
+owner pages until durable spill-owner leases and age-based temp cleanup are implemented. Synchronous
+prepared execution remains a no-I/O fast path; `executeAsync()` exposes the spill-capable path.
 
 Phase 7 remains open. Preparation still materializes every projected typed input column in full before
 the modeled reservations take effect, and mutation replay can temporarily retain a typed slot
-workspace plus its compacted output. Returned result objects, group-key and retained aggregate
+workspace plus its compacted output. Merge planning updates source slots in place and emits row-ID
+spans and column ranges in one pass, but still retains a whole-plan key map and source slots. Returned
+result objects, group-key and retained aggregate
 reference containers, property and JavaScript array-capacity overhead, spill serialization/native
 IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Grouped joins,
 global aggregates, hash joins, and DISTINCT still have no spill path, while the default remains
@@ -489,7 +493,8 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Replace hash-join maps and duplicate arrays with a reserved byte-key index and typed row chains.
 - [x] Add durable external sort and single-table partitioned hash-aggregate spill paths.
 - [x] Add numeric/datetime zone-map row-group pruning and predicate-first projected-block loading.
-- [ ] Replace remaining boxed containers, stream projected inputs, and spill under the query budget.
+- [ ] Stream projected inputs, add the remaining spill shapes, and reclaim spill pages abandoned by
+      abrupt tab/process loss.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

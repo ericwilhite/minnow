@@ -144,6 +144,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.getTransaction(id);
   }
 
+  getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>> {
+    return this.inner.getTransactions(ids);
+  }
+
   listTransactions(): Promise<TransactionRecord[]> {
     return this.inner.listTransactions();
   }

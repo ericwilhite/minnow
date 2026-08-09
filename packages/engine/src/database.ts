@@ -43,6 +43,7 @@ import {
   type SimpleDataType,
   type TableColumnRecord,
   type TableRecord,
+  type TransactionRecord,
   SnapshotManifestMissingError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
@@ -113,7 +114,7 @@ interface MergeResolvedSource {
 
 interface MergeResolvedRow {
   readonly rowId: bigint;
-  readonly sources: readonly MergeResolvedSource[];
+  readonly sources: MergeResolvedSource[];
 }
 
 interface SegmentVisibilityCatalog {
@@ -1069,10 +1070,11 @@ export class BrowserDatabase {
       const columnarTables = new Map<string, ColumnarTable>();
       await this.#withLeasedSnapshot(options.version, async (snapshot) => {
         const tableIds = new Set(tables.map((table) => table.id));
-        const [transactionRecords, segmentRecords] = await Promise.all([
-          this.store.listTransactions(),
-          tables.length === 1 ? this.store.listSegments(tables[0]?.id) : this.store.listSegments(),
-        ]);
+        const segmentRecords =
+          tables.length === 1
+            ? await this.store.listSegments(tables[0]?.id)
+            : await this.store.listSegments();
+        const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
         const segmentsByTable = new Map<string, SegmentRecord[]>();
         for (const segment of segmentRecords) {
           if (!tableIds.has(segment.tableId)) continue;
@@ -1107,6 +1109,10 @@ export class BrowserDatabase {
 
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    const spillPageRows =
+      options.spillPageRows === undefined
+        ? undefined
+        : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
     const prepared = await this.prepareQuery(sql, options);
     try {
       const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
@@ -1119,7 +1125,7 @@ export class BrowserDatabase {
         }
       }
       return await prepared.executeAsync({
-        ...(options.spillPageRows === undefined ? {} : { spillPageRows: options.spillPageRows }),
+        ...(spillPageRows === undefined ? {} : { spillPageRows }),
         spillStore: {
           putPage: (ownerId, runId, pageIndex, bytes) =>
             this.store.putTempRunPage({ ownerId, runId, pageIndex, bytes }),
@@ -1791,7 +1797,12 @@ export class BrowserDatabase {
     anchorSourceStoredBytes: number;
   }> {
     const transactions = new Map(
-      (await this.store.listTransactions()).map((record) => [record.id, record]),
+      (
+        await this.#transactionRecordsForSegments([
+          ...(anchor === undefined ? [] : [anchor]),
+          ...level0Segments,
+        ])
+      ).map((record) => [record.id, record]),
     );
     const logicalOrder = (segment: SegmentRecord): number => {
       const owner = transactions.get(segment.transactionId);
@@ -2003,7 +2014,10 @@ export class BrowserDatabase {
       throw new Error(`Mutation compaction requires a unique key: ${table.name}`);
     }
     const transactions = new Map(
-      (await this.store.listTransactions()).map((record) => [record.id, record]),
+      (await this.#transactionRecordsForSegments(sourceSegments)).map((record) => [
+        record.id,
+        record,
+      ]),
     );
     const describedSegments: MergeCompactionSourceSegment[] = [];
     const sourceBlocksById = new Map<string, MergeCompactionSourceBlock>();
@@ -2186,15 +2200,13 @@ export class BrowserDatabase {
           if (existingIndex === undefined || existing === undefined) {
             throw new Error(`Update segment references a missing key: ${segment.segmentId}`);
           }
-          const sources = [...existing.sources];
           for (const columnId of changedColumnIds) {
             const columnIndex = columnIndexById.get(columnId);
             if (columnIndex === undefined) {
               throw new Error(`Mutation compaction column is missing: ${columnId}`);
             }
-            sources[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
+            existing.sources[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
           }
-          rows[existingIndex] = { rowId: existing.rowId, sources };
         });
         continue;
       }
@@ -2219,23 +2231,32 @@ export class BrowserDatabase {
       });
     }
 
-    const visibleRows = rows.filter((row): row is MergeResolvedRow => row !== undefined);
+    const rowIdSpans: RowIdSpan[] = [];
+    const sourceRangesByColumn = table.columns.map(() => [] as MergeCompactionOutputSourceRange[]);
+    let totalRows = 0;
+    for (const row of rows) {
+      if (row === undefined) continue;
+      appendRowIdSpan(rowIdSpans, totalRows, row.rowId);
+      for (let columnIndex = 0; columnIndex < table.columns.length; columnIndex += 1) {
+        const column = table.columns[columnIndex];
+        const source = row.sources[columnIndex];
+        if (column === undefined || source === undefined) {
+          throw new Error("Mutation compaction row is missing a column source");
+        }
+        const sourceRanges = sourceRangesByColumn[columnIndex];
+        if (sourceRanges === undefined) throw new Error("Mutation output column is missing");
+        appendMergeOutputRange(sourceRanges, totalRows, source);
+      }
+      totalRows += 1;
+    }
     return {
-      rowIdSpans: coalesceRowIdSpans(visibleRows.map((row) => row.rowId)),
-      columns: table.columns.map((column, columnIndex) => ({
-        columnId: column.id,
-        type: column.type,
-        sourceRanges: coalesceMergeOutputRanges(
-          visibleRows.map((row) => {
-            const source = row.sources[columnIndex];
-            if (source === undefined) {
-              throw new Error(`Mutation compaction row is missing column ${column.name}`);
-            }
-            return source;
-          }),
-        ),
-      })),
-      totalRows: visibleRows.length,
+      rowIdSpans,
+      columns: table.columns.map((column, columnIndex) => {
+        const sourceRanges = sourceRangesByColumn[columnIndex];
+        if (sourceRanges === undefined) throw new Error("Mutation output column is missing");
+        return { columnId: column.id, type: column.type, sourceRanges };
+      }),
+      totalRows,
     };
   }
 
@@ -2917,13 +2938,18 @@ export class BrowserDatabase {
   ): Promise<void> {
     const plan = job.rewritePlan ?? { kind: "copy-v1" as const };
     const sourceIds = new Set(job.sourceSegmentIds);
-    const transactions = new Map(
-      (await this.store.listTransactions()).map((record) => [record.id, record]),
-    );
     const allVisibleSegments = (await this.store.listSegments()).filter((segment) =>
       Object.values(segment.columnBlockIds)
         .flat()
         .every((blockId) => snapshot.hasBlock(blockId)),
+    );
+    const plannedSourceSegments = (
+      await Promise.all(job.sourceSegmentIds.map((id) => this.store.getSegment(id)))
+    ).filter((segment): segment is SegmentRecord => segment !== undefined);
+    const transactions = new Map(
+      (
+        await this.#transactionRecordsForSegments([...allVisibleSegments, ...plannedSourceSegments])
+      ).map((record) => [record.id, record]),
     );
     const visibleSegments = allVisibleSegments.filter((segment) => segment.tableId === job.tableId);
     const sourceBlockIds = new Set(job.sourceBlockIds);
@@ -3279,7 +3305,10 @@ export class BrowserDatabase {
 
   async #firstLogicalOrder(sourceSegments: readonly SegmentRecord[]): Promise<number> {
     const transactions = new Map(
-      (await this.store.listTransactions()).map((record) => [record.id, record]),
+      (await this.#transactionRecordsForSegments(sourceSegments)).map((record) => [
+        record.id,
+        record,
+      ]),
     );
     return Math.min(
       ...sourceSegments.map(
@@ -3992,11 +4021,13 @@ export class BrowserDatabase {
     snapshot: Snapshot,
     catalog?: SegmentVisibilityCatalog,
   ): Promise<SegmentRecord[]> {
-    const transactions =
-      catalog?.transactions ??
-      new Map((await this.store.listTransactions()).map((record) => [record.id, record]));
     const segments =
       catalog?.segmentsByTable.get(table.id) ?? (await this.store.listSegments(table.id));
+    const transactions =
+      catalog?.transactions ??
+      new Map(
+        (await this.#transactionRecordsForSegments(segments)).map((record) => [record.id, record]),
+      );
     return segments
       .filter((segment) =>
         Object.values(segment.columnBlockIds)
@@ -4012,6 +4043,19 @@ export class BrowserDatabase {
           leftOrder - rightOrder || leftVersion - rightVersion || left.id.localeCompare(right.id)
         );
       });
+  }
+
+  async #transactionRecordsForSegments(
+    segments: readonly SegmentRecord[],
+  ): Promise<TransactionRecord[]> {
+    const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
+    const records: TransactionRecord[] = [];
+    for (let start = 0; start < transactionIds.length; start += 64) {
+      const window = transactionIds.slice(start, start + 64);
+      const loaded = await this.store.getTransactions(window);
+      for (const record of loaded) if (record !== undefined) records.push(record);
+    }
+    return records;
   }
 
   async #withLeasedSnapshot<T>(
@@ -4835,17 +4879,17 @@ function rowRangeAt<T extends { readonly rowStart: number; readonly rowCount: nu
   return undefined;
 }
 
-function coalesceRowIdSpans(rowIds: readonly bigint[]): RowIdSpan[] {
-  const spans: RowIdSpan[] = [];
-  for (const [rowStart, rowId] of rowIds.entries()) {
-    const previous = spans[spans.length - 1];
-    if (previous !== undefined && previous.rowIdStart + BigInt(previous.rowCount) === rowId) {
-      spans[spans.length - 1] = { ...previous, rowCount: previous.rowCount + 1 };
-    } else {
-      spans.push({ rowStart, rowCount: 1, rowIdStart: rowId });
-    }
+function appendRowIdSpan(spans: RowIdSpan[], rowStart: number, rowId: bigint): void {
+  const previous = spans[spans.length - 1];
+  if (
+    previous !== undefined &&
+    previous.rowStart + previous.rowCount === rowStart &&
+    previous.rowIdStart + BigInt(previous.rowCount) === rowId
+  ) {
+    spans[spans.length - 1] = { ...previous, rowCount: previous.rowCount + 1 };
+  } else {
+    spans.push({ rowStart, rowCount: 1, rowIdStart: rowId });
   }
-  return spans;
 }
 
 function rowIdSpanEnvelope(spans: readonly RowIdSpan[]): {
@@ -4863,27 +4907,26 @@ function rowIdSpanEnvelope(spans: readonly RowIdSpan[]): {
   return { start, endExclusive };
 }
 
-function coalesceMergeOutputRanges(
-  sources: readonly MergeResolvedSource[],
-): MergeCompactionOutputSourceRange[] {
-  const ranges: MergeCompactionOutputSourceRange[] = [];
-  for (const [outputRowStart, source] of sources.entries()) {
-    const previous = ranges[ranges.length - 1];
-    if (
-      previous?.sourceBlockId === source.blockId &&
-      previous.sourceRowStart + previous.rowCount === source.sourceRowIndex
-    ) {
-      ranges[ranges.length - 1] = { ...previous, rowCount: previous.rowCount + 1 };
-    } else {
-      ranges.push({
-        outputRowStart,
-        sourceBlockId: source.blockId,
-        sourceRowStart: source.sourceRowIndex,
-        rowCount: 1,
-      });
-    }
+function appendMergeOutputRange(
+  ranges: MergeCompactionOutputSourceRange[],
+  outputRowStart: number,
+  source: MergeResolvedSource,
+): void {
+  const previous = ranges[ranges.length - 1];
+  if (
+    previous?.sourceBlockId === source.blockId &&
+    previous.outputRowStart + previous.rowCount === outputRowStart &&
+    previous.sourceRowStart + previous.rowCount === source.sourceRowIndex
+  ) {
+    ranges[ranges.length - 1] = { ...previous, rowCount: previous.rowCount + 1 };
+  } else {
+    ranges.push({
+      outputRowStart,
+      sourceBlockId: source.blockId,
+      sourceRowStart: source.sourceRowIndex,
+      rowCount: 1,
+    });
   }
-  return ranges;
 }
 
 function validatePhysicalTablePlan(table: TableRecord, plan: PhysicalCompactionRewritePlan): void {

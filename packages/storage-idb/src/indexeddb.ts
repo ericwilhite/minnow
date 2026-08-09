@@ -248,12 +248,13 @@ export class IndexedDbBlockStore implements BlockStore {
 
   async listSegments(tableId?: string): Promise<SegmentRecord[]> {
     const transaction = this.#transaction("segments", "readonly");
-    const values: unknown[] = await requestResult(transaction.objectStore("segments").getAll());
+    const records: SegmentRecord[] = [];
+    await visitObjectStoreSequentially(transaction.objectStore("segments"), (value) => {
+      const record = asSegmentRecord(value);
+      if (tableId === undefined || record.tableId === tableId) records.push(record);
+    });
     await transactionDone(transaction);
-    return values
-      .map(asSegmentRecord)
-      .filter((record) => tableId === undefined || record.tableId === tableId)
-      .sort((left, right) => left.id.localeCompare(right.id));
+    return records.sort((left, right) => left.id.localeCompare(right.id));
   }
 
   async removeSegment(id: string): Promise<void> {
@@ -393,6 +394,14 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     await transactionDone(transaction);
     return value === undefined ? undefined : asTransactionRecord(value);
+  }
+
+  async getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>> {
+    const transaction = this.#transaction("transactions", "readonly");
+    const store = transaction.objectStore("transactions");
+    const values = await Promise.all(ids.map((id) => requestResult<unknown>(store.get(id))));
+    await transactionDone(transaction);
+    return values.map((value) => (value === undefined ? undefined : asTransactionRecord(value)));
   }
 
   async listTransactions(): Promise<TransactionRecord[]> {

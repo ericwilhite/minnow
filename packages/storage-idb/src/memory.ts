@@ -250,6 +250,13 @@ export class MemoryBlockStore implements BlockStore {
     return record === undefined ? undefined : structuredClone(record);
   }
 
+  async getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>> {
+    return ids.map((id) => {
+      const record = this.#transactions.get(id);
+      return record === undefined ? undefined : structuredClone(record);
+    });
+  }
+
   async listTransactions(): Promise<TransactionRecord[]> {
     return [...this.#transactions.values()]
       .sort(

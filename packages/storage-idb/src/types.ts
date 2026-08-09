@@ -544,6 +544,7 @@ export interface BlockStore {
   publishManifest(input: PublishManifestInput): Promise<Manifest>;
   createTransaction(record: TransactionRecord): Promise<void>;
   getTransaction(id: string): Promise<TransactionRecord | undefined>;
+  getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>>;
   listTransactions(): Promise<TransactionRecord[]>;
   listTransactionPage(
     afterId: string | null,

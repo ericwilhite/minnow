@@ -887,6 +887,26 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("reads transaction batches in request order with isolated records", async () => {
+      const store = await implementation.create();
+      const first = activeTransaction("batch-first");
+      const second = activeTransaction("batch-second");
+      await store.createTransaction(first);
+      await store.createTransaction(second);
+
+      const records = await store.getTransactions([
+        second.id,
+        "batch-missing",
+        first.id,
+        second.id,
+      ]);
+      expect(records).toEqual([second, undefined, first, second]);
+      const returned = records[0];
+      if (returned !== undefined) returned.pendingBlockIds.push("mutated-result");
+      expect(await store.getTransaction(second.id)).toEqual(second);
+      store.close();
+    });
+
     it("prevents an aborted transaction from being reactivated or mutated", async () => {
       const store = await implementation.create();
       const created = activeTransaction("terminal-abort");

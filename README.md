@@ -152,8 +152,10 @@ preallocated vectors without a full boxed-value copy. Keyed mutation snapshots r
 upserts, updates, and deletes through typed mutable vectors and compact live slots into the retained
 vectors, likewise avoiding full-table boxed column arrays. Execution scans 2,048
 source rows at a time and feeds duplicate-match join fan-out onward in reserved `Int32Array` chunks.
-Multi-table preparation loads one shared transaction/segment visibility catalog instead of rescanning
-it per table. Column-free append/base queries such as `COUNT(*)` derive their scan cardinality from
+Multi-table preparation loads one shared segment visibility catalog instead of rescanning it per
+table, then batch-fetches only the transaction owners referenced by those segments in 64-ID windows.
+It does not materialize the database-wide transaction history. Column-free append/base queries such
+as `COUNT(*)` derive their scan cardinality from
 visible segment metadata without loading a data block; keyed mutation replay loads the key when it is
 needed to recover the live-row count. The executor still materializes result row objects at the
 `QueryResult` API boundary.
@@ -195,13 +197,18 @@ Phase 7D-A adds durable query spill pages in the existing `temp` store. With an 
 budget, `BrowserDatabase.query()` automatically uses asynchronous external merge sort for ungrouped
 `ORDER BY` plans, including joined output, and 64-way partitioned hash aggregation for single-table
 `GROUP BY ... ORDER BY` plans. Sorted pages merge pairwise with left-run tie stability; LIMIT applies
-only while reading the final run. Temp pages are removed after success or failure.
+only while reading the final run. Temp pages are removed after ordinary success or failure. An abrupt
+process/tab loss can leave owner pages behind because durable spill-owner leases and age-based temp
+cleanup are not implemented yet.
 `PreparedQuery.execute()` remains the synchronous no-I/O path; `executeAsync()` accepts a spill store
 for callers that want the operator path directly.
 
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected typed input in full before the vector reservation is installed;
-mutation replay can temporarily retain both its typed slot workspace and compacted output. The model
+mutation replay can temporarily retain both its typed slot workspace and compacted output. Mutation
+merge planning now updates retained source slots in place and emits row-ID spans plus all output
+ranges in one pass, avoiding a second live-row array and per-column source-array copies, but its key
+map and source slots remain whole-plan state. The model
 does not include returned result objects, properties, group-key and retained `MIN`/`MAX` reference
 containers, JavaScript array-capacity overhead, spill serialization/native IndexedDB work, returned
 row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—global aggregates,

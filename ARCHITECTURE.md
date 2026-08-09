@@ -407,7 +407,8 @@ vectors; keyed mutations replay into typed slot vectors and compact live slots w
 column copy. The engine then binds the
 public SQL plan to those vectors. The executor scans 2,048 source rows per batch and passes
 duplicate-match join fan-out through downstream operators in reserved `Int32Array` chunks. Query
-preparation reads the transaction/segment visibility catalog once per leased multi-table snapshot.
+preparation reads one segment visibility catalog per leased multi-table snapshot and batch-fetches
+only its referenced transaction owners in 64-ID windows instead of scanning transaction history.
 When a plan references no data column, append/base cardinality comes directly from visible segment
 metadata; mutation replay retains only the unique key needed to derive live rows. Returned
 `QueryResult` values still materialize row objects at the public API boundary.
@@ -465,7 +466,9 @@ Phase 7D-A adds asynchronous durable spilling without changing synchronous prepa
 ordered plans, including joins, sort bounded result runs into `temp` pages and pairwise stable-merge
 them. Single-table grouped ordered plans hash source row indexes into 64 durable partitions, aggregate
 one partition at a time, then merge sorted group-result runs. LIMIT applies only at the final read.
-Memory and IndexedDB clone page bytes, and owner-scoped cleanup runs in `finally`.
+Memory and IndexedDB clone page bytes, and owner-scoped cleanup runs in `finally` for ordinary success
+or failure. Abrupt tab/process loss can leave pages because spill-owner leases and age-based temp
+cleanup are not yet implemented.
 `PreparedQuery.executeAsync()` exposes the mechanism through a small spill-store interface.
 
 This slice still does not satisfy the bounded-memory target. Whole projected typed columns are
@@ -481,7 +484,10 @@ release bytes, while every cardinality-growing operator can eventually spill. Ph
 covers external sort and single-table partitioned hash aggregation; grouped joins, global aggregates,
 hash join, and DISTINCT remain in-memory. Physical compaction already advances by output block under a specialized
 conservative executor-buffer model. Mutation merge planning applies a separate preflight safety
-estimate to its in-memory key and source-reference state, but does not spill or resume that state. The
+estimate to its in-memory key and source-reference state, but does not spill or resume that state.
+The planner updates existing source slots in place and emits row-ID spans plus every output-column
+range in one pass, avoiding a second live-row array and per-column source-array copies without
+changing that whole-plan bound. The
 general query context provides the narrower model above; byte-addressable result containers,
 complete physical accounting, and remaining spill shapes are future work. As described above,
 query and compaction figures are modeled workflow bounds rather than measurements or hard limits on
@@ -534,7 +540,8 @@ versions. Restore will write and verify blocks first and publish the restored ma
 The implemented garbage collector treats unexpired backup leases exactly like reader leases and
 removes only known-provenance artifacts that remain unreachable after the atomic root check described
 above. Recovery uses that collector for stale transaction artifacts. Unknown pre-journal blocks,
-temporary-store cleanup, and broader catalog/job lifecycle policies remain future work.
+cleanup of query spill owners abandoned by abrupt process loss, and broader catalog/job lifecycle
+policies remain future work.
 
 ## Durability and lifecycle
 

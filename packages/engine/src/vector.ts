@@ -22,6 +22,8 @@ const NULL_STRING_CODE = 0xffffffff;
 const QUERY_REFERENCE_BYTES = 8;
 const QUERY_VALUE_TAG_BYTES = 1;
 const AGGREGATE_ACCUMULATOR_BYTES = 24;
+const SPILL_PAGE_MAGIC = 0x5350494c;
+const SPILL_PAGE_HEADER_BYTES = 8;
 const vectorTextEncoder = new TextEncoder();
 
 export type VectorType = "boolean" | "number" | "string" | "datetime";
@@ -887,10 +889,10 @@ async function executeBoundPlanWithHashSpill(
         for (let pageIndex = 0; pageIndex < sourcePageCount; pageIndex += 1) {
           const bytes = await store.getPage(ownerId, `partition-${String(partition)}`, pageIndex);
           if (bytes === undefined) throw new Error("Query hash spill page is missing");
-          const rowIndexes = decodeRowIndexes(bytes);
           const pageMemory = partitionMemory.createChild();
           try {
-            pageMemory.reserve(rowIndexes.byteLength, "Hash spill row indexes");
+            pageMemory.reserve(bytes.byteLength, "Hash spill row indexes");
+            const rowIndexes = decodeRowIndexes(bytes);
             const rowsBySource: Int32Array[] = plan.sourceTables.map(() =>
               new Int32Array(rowIndexes.length).fill(-1),
             );
@@ -1021,7 +1023,8 @@ async function readFinalSpillRun(
 
 function hashQueryValues(values: readonly QueryValue[]): number {
   let hash = 0x811c9dc5;
-  for (const value of values) {
+  for (const rawValue of values) {
+    const value = groupKey(rawValue);
     const bytes = vectorTextEncoder.encode(JSON.stringify(encodeSpillValue(value)));
     for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
     hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
@@ -1158,14 +1161,8 @@ function createSpillRunReader(
         const bytes = await store.getPage(ownerId, run.id, pageIndex);
         if (bytes === undefined) throw new Error("Query spill page is missing");
         pageReservation?.release();
+        pageReservation = memory.reserve(spillRowsModeledBytes(bytes), "Spill input page");
         rows = decodeSpillRows(columns, bytes);
-        pageReservation = memory.reserve(
-          rows.reduce(
-            (total, row) => safeMemorySum(total, queryRowPayloadBytes(row), "Spill input page"),
-            0,
-          ),
-          "Spill input page",
-        );
         rowIndex = 0;
         pageIndex += 1;
       }
@@ -1195,11 +1192,25 @@ function compareOrderedRows(
 
 function encodeSpillRows(columns: readonly string[], rows: readonly QueryRow[]): Uint8Array {
   const encoded = rows.map((row) => columns.map((column) => encodeSpillValue(row[column] ?? null)));
-  return vectorTextEncoder.encode(JSON.stringify(encoded));
+  const payload = vectorTextEncoder.encode(JSON.stringify(encoded));
+  const modeledBytes = rows.reduce(
+    (total, row) => safeMemorySum(total, queryRowPayloadBytes(row), "Spill page rows"),
+    0,
+  );
+  if (modeledBytes > 0xffffffff) throw new RangeError("Spill page modeled bytes exceed uint32");
+  const bytes = new Uint8Array(SPILL_PAGE_HEADER_BYTES + payload.byteLength);
+  const header = new DataView(bytes.buffer);
+  header.setUint32(0, SPILL_PAGE_MAGIC, true);
+  header.setUint32(4, modeledBytes, true);
+  bytes.set(payload, SPILL_PAGE_HEADER_BYTES);
+  return bytes;
 }
 
 function decodeSpillRows(columns: readonly string[], bytes: Uint8Array): QueryRow[] {
-  const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  spillRowsModeledBytes(bytes);
+  const value: unknown = JSON.parse(
+    new TextDecoder().decode(bytes.subarray(SPILL_PAGE_HEADER_BYTES)),
+  );
   if (!Array.isArray(value)) throw new Error("Query spill page is invalid");
   return value.map((encodedRow) => {
     if (!Array.isArray(encodedRow) || encodedRow.length !== columns.length) {
@@ -1211,10 +1222,19 @@ function decodeSpillRows(columns: readonly string[], bytes: Uint8Array): QueryRo
   });
 }
 
+function spillRowsModeledBytes(bytes: Uint8Array): number {
+  if (bytes.byteLength < SPILL_PAGE_HEADER_BYTES) throw new Error("Query spill page is invalid");
+  const header = new DataView(bytes.buffer, bytes.byteOffset, SPILL_PAGE_HEADER_BYTES);
+  if (header.getUint32(0, true) !== SPILL_PAGE_MAGIC) {
+    throw new Error("Query spill page header is invalid");
+  }
+  return header.getUint32(4, true);
+}
+
 function encodeSpillValue(value: QueryValue): readonly unknown[] {
   if (value === null) return [0];
   if (typeof value === "boolean") return [1, value];
-  if (typeof value === "number") return [2, String(value)];
+  if (typeof value === "number") return [2, Object.is(value, -0) ? "-0" : String(value)];
   if (typeof value === "string") return [3, value];
   return [4, value.getTime()];
 }
@@ -1884,7 +1904,11 @@ function compareValues(left: unknown, right: unknown): number {
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;
-  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "number" && typeof b === "number") {
+    if (Number.isNaN(a)) return Number.isNaN(b) ? 0 : 1;
+    if (Number.isNaN(b)) return -1;
+    return a - b;
+  }
   if (typeof a === "string" && typeof b === "string") return a.localeCompare(b);
   if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
   throw new TypeError("Values must have comparable SQL types");

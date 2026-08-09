@@ -411,6 +411,33 @@ describe("vector query execution", () => {
     expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
   });
 
+  it("partitions non-finite group keys consistently when spilling", async () => {
+    const plan = compileQuery(
+      "SELECT numerator / denominator AS quotient, COUNT(*) AS count FROM rows GROUP BY numerator / denominator ORDER BY quotient",
+    );
+    const input = new Map<string, DatabaseRow[]>([
+      [
+        "rows",
+        [
+          { numerator: 0, denominator: 0 },
+          { numerator: 0, denominator: 0 },
+          { numerator: 1, denominator: 0 },
+          { numerator: -1, denominator: 0 },
+          { numerator: 0, denominator: -1 },
+        ],
+      ],
+    ]);
+    const prepared = createPreparedQuery(plan, input, {
+      executionMemoryBudgetBytes: 16_384,
+    });
+    const spill = new TestSpillStore();
+    expect(await prepared.executeAsync({ spillStore: spill, spillPageRows: 2 })).toEqual(
+      executeRowQuery(plan, input),
+    );
+    expect(spill.pages.size).toBe(0);
+    prepared.close();
+  });
+
   it("preserves logical left-to-right INNER JOIN order before LIMIT", () => {
     const plan = compileQuery(
       "SELECT a.id AS aid, b.sequence FROM a JOIN b ON b.id = a.id LIMIT 1",
