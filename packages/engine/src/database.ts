@@ -2657,11 +2657,7 @@ export class BrowserDatabase {
           ) {
             throw new Error(`Compaction output segment cannot be adopted: ${outputSegmentId}`);
           }
-          const visible = (await this.store.listManifests()).some((manifest) => {
-            if (manifest.prunedAt !== undefined) return false;
-            const blockIds = new Set(manifest.blockIds);
-            return expectedOutputIds.every((id) => blockIds.has(id));
-          });
+          const visible = await this.#unprunedManifestContainsAll(expectedOutputIds);
           if (visible) {
             throw new Error(`Compaction output segment is already visible: ${outputSegmentId}`);
           }
@@ -4056,6 +4052,20 @@ export class BrowserDatabase {
       for (const record of loaded) if (record !== undefined) records.push(record);
     }
     return records;
+  }
+
+  async #unprunedManifestContainsAll(blockIds: readonly string[]): Promise<boolean> {
+    let cursor: number | null = null;
+    do {
+      const page = await this.store.listManifestPage(cursor, 8);
+      for (const manifest of page.records) {
+        if (manifest.prunedAt !== undefined) continue;
+        const visibleBlockIds = new Set(manifest.blockIds);
+        if (blockIds.every((id) => visibleBlockIds.has(id))) return true;
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    return false;
   }
 
   async #withLeasedSnapshot<T>(

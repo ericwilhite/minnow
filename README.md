@@ -391,9 +391,10 @@ guarantee is intentionally narrower than total browser write amplification. It e
 written by cancelled or aborted attempts, IndexedDB and manifest metadata, browser storage-engine
 overhead, garbage collection, and any claim about bytes ultimately returned to quota. Phase 6 still
 needs keyed/clustered multi-range L2, lifetime accounting for failed attempts, and spillable or
-resumable merge planning. Garbage collection now reclaims known unreachable physical artifacts, but
-its planner and root discovery are not yet chunked/indexed, and unknown pre-journal orphans plus
-broader catalog, terminal-job, and metadata cleanup remain future work. A compaction result's
+resumable merge planning. Garbage collection now reclaims known unreachable physical artifacts with
+paged/capped candidate and root envelopes, but scan work still scales with history and a single large
+metadata record remains unbounded. Unknown pre-journal orphans plus broader catalog, terminal-job,
+and metadata cleanup remain future work. A compaction result's
 `physicallyReclaimedBytes` remains zero because compaction never deletes in the publication path;
 the separate garbage-collection result reports bytes deleted later.
 

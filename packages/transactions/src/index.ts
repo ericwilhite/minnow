@@ -450,26 +450,29 @@ export class TransactionManager {
     const skippedTransactionIds: string[] = [];
     const candidates = new Set<string>();
     const segmentCandidates = new Set<string>();
-    const records = await this.store.listTransactions();
-
-    for (const record of records) {
-      if (record.status !== "active" || Date.parse(record.updatedAt) >= staleBefore) continue;
-      try {
-        await this.store.updateTransaction(record.id, record.revision, {
-          status: "aborted",
-          updatedAt: this.#now().toISOString(),
-        });
-        abortedTransactionIds.push(record.id);
-        record.pendingBlockIds.forEach((id) => candidates.add(id));
-        record.pendingSegmentIds.forEach((id) => segmentCandidates.add(id));
-      } catch (error) {
-        if (error instanceof TransactionRecordConflictError) {
-          skippedTransactionIds.push(record.id);
-          continue;
+    let transactionCursor: string | null = null;
+    do {
+      const page = await this.store.listTransactionPage(transactionCursor, 64);
+      for (const record of page.records) {
+        if (record.status !== "active" || Date.parse(record.updatedAt) >= staleBefore) continue;
+        try {
+          await this.store.updateTransaction(record.id, record.revision, {
+            status: "aborted",
+            updatedAt: this.#now().toISOString(),
+          });
+          abortedTransactionIds.push(record.id);
+          record.pendingBlockIds.forEach((id) => candidates.add(id));
+          record.pendingSegmentIds.forEach((id) => segmentCandidates.add(id));
+        } catch (error) {
+          if (error instanceof TransactionRecordConflictError) {
+            skippedTransactionIds.push(record.id);
+            continue;
+          }
+          throw error;
         }
-        throw error;
       }
-    }
+      transactionCursor = page.nextCursor;
+    } while (transactionCursor !== null);
 
     const removedBlockIds: string[] = [];
     const retainedBlockIds: string[] = [];
