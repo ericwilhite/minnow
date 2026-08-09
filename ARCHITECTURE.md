@@ -178,10 +178,15 @@ needs it.
 ### Resumable physical compaction
 
 Ordinary write segments are recorded at L0 with a `logicalOrder` derived from their commit version.
-The implemented policy selects every table segment visible in one leased source snapshot.
-Contiguous append-only inputs use `rechunk-v1`; keyed histories containing upsert, update, delete, or
-a prior base use `merge-v1`. Both publish at L1 and inherit the earliest source `logicalOrder`, so a
-later L0 delta remains after the consolidated output if publication rebases.
+The implemented policy selects a canonical oldest prefix from one leased source snapshot: an
+optional single L1 anchor followed by complete groups of L0 segments. It requires at least two L0
+segments by default and targets at most 16 L0 segments or 64 MiB of newly promoted L0 blocks. The
+minimum and an indivisible equal-`logicalOrder` group can exceed those targets to guarantee progress
+without changing replay order. Contiguous append-only inputs use `rechunk-v1`; keyed histories
+containing upsert, update, delete, a prior base, or noncontiguous row IDs use `merge-v1`. Both publish
+at L1 and inherit the earliest source `logicalOrder`, so an unselected or concurrently committed L0
+suffix remains after the consolidated output. A caller can explicitly lower the minimum to one to
+drain `L1 + 1 L0`; a table without an anchor still requires at least two sources.
 
 A `rechunk-v1` plan fingerprints each ordered column block's ID, row range, stored/encoded length,
 and checksum. It fixes output windows, schema IDs/types, contiguous row-ID bounds, compression, and
@@ -194,7 +199,11 @@ key map would not be restart-safe.
 
 Mutable job progress holds deterministic output IDs, the next output-window/column cursor,
 transaction ID, revisioned state, processed rows and bytes, and the modeled executor-memory
-high-water. `compactTableStep()` processes at most the requested number of output blocks;
+high-water. New jobs also persist stored bytes attributed to newly promoted L0 inputs separately
+from the rewritten L1 anchor. Completed results divide output stored bytes by promoted L0 bytes as
+`compactionWriteAmplification`; summing those numerators and denominators across jobs produces the
+cumulative incremental ratio. `compactTableStep()` processes at most the requested number of
+output blocks;
 `resumeCompactionJob()` continues the persisted plan after a yield or reopen;
 `listCompactionJobs()` exposes it; and `compactTable()` repeatedly drives the same workflow to
 publication. `cancelCompactionJob(jobId)` settles an unpublished job in a distinct terminal
@@ -303,12 +312,14 @@ An unleased `TransactionManager.openSnapshot()` is only an in-process view of on
 not a persistent GC root. Long-lived callers must use `openLeasedSnapshot()`, while
 `BrowserDatabase` creates and renews its own short-lived leases around materialization.
 
-This is still a deliberately narrow Phase 6 policy: it rewrites a whole table into one L1 segment—a
-`base` for a keyed mutation history—or no segment when no row survives. It handles append and keyed
-upsert/update/delete histories but does not select subsets or levels beyond whole-table L0 -> L1,
-produce L2 segments, spill or resume merge planning before plan creation, chunk collection
-planning/root discovery, or perform broader orphan, catalog, terminal-job, and metadata cleanup.
-Known unreachable source/output artifacts are physically reclaimable by the separate collector.
+This is still a deliberately narrow Phase 6 policy: it folds an oldest L0 prefix and optional L1
+anchor into one L1 segment—a `base` for a keyed mutation history—or no segment when no selected row
+survives. It rejects multiple/non-leading anchors and levels above L1. Because every mutation merge
+must include the full anchor, its 16-segment/64-MiB L0 targets do not impose a hard bound on total
+rewrite bytes; a clustered/key-range L2 policy is still needed for that. The implementation also
+does not spill or resume merge planning before plan creation, chunk collection planning/root
+discovery, or perform broader orphan, catalog, terminal-job, and metadata cleanup. Known unreachable
+source/output artifacts are physically reclaimable by the separate collector.
 
 ## Multi-tab correctness
 

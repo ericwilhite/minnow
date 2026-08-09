@@ -156,6 +156,17 @@ drives the same checkpointed workflow to completion in steps controlled by `maxB
 its linked transaction. It is idempotent and returns the job's terminal state plus any published
 version, so a caller also sees when publication or an earlier abort had already won.
 
+Planning selects one order-safe prefix: an existing L1 anchor, when present, plus the oldest L0
+segments. The default policy requires two L0 segments and targets at most 16 L0 segments or
+64 MiB of newly promoted stored data. `minimumLevel0Segments`, `maxLevel0Segments`, and
+`maxLevel0StoredBytes` tune those targets; the old `minimumSegments` name remains a deprecated alias
+for the L0 minimum. Setting `minimumLevel0Segments: 1` explicitly drains a one-segment tail only
+when an L1 anchor already exists; without an anchor the planner still requires two inputs so the job
+reduces segment count. The minimum and a complete equal-`logicalOrder` group take precedence over
+either maximum so the planner cannot split an ordering unit or starve an oversized oldest segment.
+Only a leading L1 anchor followed by L0 inputs is accepted, and new jobs in this slice accept only
+`targetLevel: 1`.
+
 Execution decodes verified physical column payloads, slices and concatenates the frozen source
 ranges, and re-encodes output windows without materializing column values as JavaScript row objects.
 The defaults are gzip, a 2 MiB estimated uncompressed physical target per output column block, and a
@@ -178,8 +189,9 @@ validates an existing output, then compares its physical payload, type, compress
 This semantic reconciliation matters for gzip because equivalent streams need not be
 byte-identical. The block is reattached to a replacement transaction when needed. A prepared output
 segment and a commit whose job-state update was lost are reconciled similarly. Normal writes remain
-L0 segments. A non-empty whole-table rewrite publishes one L1 segment with the earliest source
-`logicalOrder`. Mutation merges use the explicit full-row `base` kind and ordered `rowIdSpans` so
+L0 segments. A non-empty prefix rewrite publishes one L1 segment with the earliest source
+`logicalOrder`; a later L0 suffix remains visible and replays afterward. Mutation merges use the
+explicit full-row `base` kind and ordered `rowIdSpans` so
 updates and matching upserts preserve identity, deleted identities disappear, new keys retain their
 reserved IDs, and numerically out-of-order reservations do not change logical row order. If every row
 was deleted, publication supersedes the sources with no output block or globally visible empty
@@ -239,10 +251,14 @@ journals, or terminal compaction jobs. An otherwise unknown immutable block left
 `addBlock()` but before journal attachment is omitted until provenance or conservative age tracking
 exists.
 
-Phase 6 remains open. The implemented policy rewrites a whole table at once: contiguous append-only
-inputs use `rechunk-v1`, while keyed mutation histories use `merge-v1` and publish a row-ID-preserving
-`base`. It does not choose source subsets, implement level selection beyond L0 -> L1, or build L2
-segments. Merge planning has no spill path or resumable planning cursor. Garbage collection now
+Phase 6 remains open. The implemented policy incrementally folds an order-safe oldest L0 prefix and
+an optional leading L1 anchor into one L1 segment. Contiguous append-only inputs use `rechunk-v1`,
+while keyed mutation histories use `merge-v1` and publish a row-ID-preserving `base`. Jobs persist
+`level0SourceStoredBytes` and `anchorSourceStoredBytes`; completed results report
+`compactionWriteAmplification` as output stored bytes divided by newly promoted L0 bytes. This is an
+observable incremental cost, not a hard total rewrite bound, because the mandatory anchor can grow.
+The policy does not build L2 or clustered/key-range segments. Merge planning has no spill path or
+resumable planning cursor. Garbage collection now
 reclaims known unreachable physical artifacts, but its planner and root discovery are not yet
 chunked/indexed, and unknown pre-journal orphans plus broader catalog, terminal-job, and metadata
 cleanup remain future work. A compaction result's

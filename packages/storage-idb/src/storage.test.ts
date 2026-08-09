@@ -871,6 +871,88 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("persists immutable source-level compaction byte accounting", async () => {
+      const store = await implementation.create();
+      const accounted: CompactionJobRecord = {
+        ...rechunkCompactionJob("source-level-byte-accounting"),
+        level0SourceStoredBytes: 240,
+        anchorSourceStoredBytes: 120,
+      };
+      await store.createCompactionJob(accounted);
+      expect(await store.getCompactionJob(accounted.id)).toMatchObject({
+        sourceStoredBytes: 360,
+        level0SourceStoredBytes: 240,
+        anchorSourceStoredBytes: 120,
+      });
+
+      const legacy = rechunkCompactionJob("legacy-source-level-byte-accounting");
+      await store.createCompactionJob(legacy);
+      const persistedLegacy = await store.getCompactionJob(legacy.id);
+      expect(persistedLegacy).not.toHaveProperty("level0SourceStoredBytes");
+      expect(persistedLegacy).not.toHaveProperty("anchorSourceStoredBytes");
+
+      const invalidRecords: Array<{ record: CompactionJobRecord; message: string }> = [
+        {
+          record: {
+            ...rechunkCompactionJob("partial-level-zero-byte-accounting"),
+            level0SourceStoredBytes: 360,
+          },
+          message: "requires both stored byte fields",
+        },
+        {
+          record: {
+            ...rechunkCompactionJob("partial-anchor-byte-accounting"),
+            anchorSourceStoredBytes: 360,
+          },
+          message: "requires both stored byte fields",
+        },
+        {
+          record: {
+            ...rechunkCompactionJob("zero-level-zero-byte-accounting"),
+            level0SourceStoredBytes: 0,
+            anchorSourceStoredBytes: 360,
+          },
+          message: "must be positive",
+        },
+        {
+          record: {
+            ...rechunkCompactionJob("mismatched-source-level-byte-accounting"),
+            level0SourceStoredBytes: 240,
+            anchorSourceStoredBytes: 119,
+          },
+          message: "must equal source stored bytes",
+        },
+      ];
+      for (const invalid of invalidRecords) {
+        await expect(store.createCompactionJob(invalid.record)).rejects.toThrow(invalid.message);
+        expect(await store.getCompactionJob(invalid.record.id)).toBeUndefined();
+      }
+
+      const immutableBypassUpdates = [
+        [
+          {
+            level0SourceStoredBytes: 1,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+          "level0SourceStoredBytes",
+        ],
+        [
+          {
+            anchorSourceStoredBytes: 1,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+          "anchorSourceStoredBytes",
+        ],
+      ] as const;
+      for (const [update, field] of immutableBypassUpdates) {
+        await expect(store.updateCompactionJob(accounted.id, 0, update)).rejects.toThrow(
+          `Compaction ${field} is immutable`,
+        );
+      }
+      expect((await store.getCompactionJob(accounted.id))?.revision).toBe(0);
+      store.close();
+    });
+
     it("atomically cancels a compaction and aborts its active transaction", async () => {
       const store = await implementation.create();
       const { job, commit } = await createReadyCompaction(store);

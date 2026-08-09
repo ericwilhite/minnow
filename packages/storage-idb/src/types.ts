@@ -245,6 +245,10 @@ export interface CompactionJobRecord {
   readonly memoryBudgetBytes?: number;
   /** Immutable planner estimate. Zero for copy-v1 jobs. */
   readonly minimumMemoryBytes?: number;
+  /** Immutable stored bytes from newly promoted level-zero sources. Missing on legacy jobs. */
+  readonly level0SourceStoredBytes?: number;
+  /** Immutable stored bytes from the retained level-one anchor. Missing on legacy jobs. */
+  readonly anchorSourceStoredBytes?: number;
   peakWorkingBytes?: number;
   outputLogicalBytes?: number;
   targetLevel: number;
@@ -929,6 +933,39 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
   }
   const rewritePlan = normalizeCompactionRewritePlan(record.rewritePlan);
   const logicalBytes = nonNegativeWholeNumber(record.logicalBytes, "Compaction logical bytes");
+  const sourceStoredBytes = nonNegativeWholeNumber(
+    record.sourceStoredBytes,
+    "Compaction source stored bytes",
+  );
+  const hasLevel0SourceStoredBytes = record.level0SourceStoredBytes !== undefined;
+  const hasAnchorSourceStoredBytes = record.anchorSourceStoredBytes !== undefined;
+  if (hasLevel0SourceStoredBytes !== hasAnchorSourceStoredBytes) {
+    throw new TypeError("Compaction source-level byte accounting requires both stored byte fields");
+  }
+  const sourceLevelStoredBytes = hasLevel0SourceStoredBytes
+    ? {
+        level0SourceStoredBytes: positiveWholeNumber(
+          record.level0SourceStoredBytes,
+          "Compaction level-zero source stored bytes",
+        ),
+        anchorSourceStoredBytes: nonNegativeWholeNumber(
+          record.anchorSourceStoredBytes,
+          "Compaction anchor source stored bytes",
+        ),
+      }
+    : undefined;
+  if (
+    sourceLevelStoredBytes !== undefined &&
+    safeSum(
+      [
+        sourceLevelStoredBytes.level0SourceStoredBytes,
+        sourceLevelStoredBytes.anchorSourceStoredBytes,
+      ],
+      "Compaction source-level stored bytes",
+    ) !== sourceStoredBytes
+  ) {
+    throw new TypeError("Compaction source-level stored bytes must equal source stored bytes");
+  }
   const normalized: CompactionJobRecord = {
     ...record,
     id: nonEmptyString(record.id, "Compaction job ID"),
@@ -951,10 +988,7 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
         : orderedUniqueIds(record.outputBlockIds, "Compaction output block ID"),
     cursor: normalizeCompactionJobCursor(record.cursor),
     processedRows: nonNegativeWholeNumber(record.processedRows, "Compaction processed row count"),
-    sourceStoredBytes: nonNegativeWholeNumber(
-      record.sourceStoredBytes,
-      "Compaction source stored bytes",
-    ),
+    sourceStoredBytes,
     outputStoredBytes: nonNegativeWholeNumber(
       record.outputStoredBytes,
       "Compaction output stored bytes",
@@ -970,6 +1004,7 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
       record.minimumMemoryBytes ?? 0,
       "Compaction minimum memory",
     ),
+    ...(sourceLevelStoredBytes ?? {}),
     peakWorkingBytes: nonNegativeWholeNumber(
       record.peakWorkingBytes ?? 0,
       "Compaction peak working bytes",
@@ -1012,7 +1047,13 @@ export function updateCompactionJobRecord(
   update: CompactionJobRecordUpdate,
 ): CompactionJobRecord {
   const current = normalizeCompactionJobRecord(record);
-  for (const field of ["rewritePlan", "memoryBudgetBytes", "minimumMemoryBytes"] as const) {
+  for (const field of [
+    "rewritePlan",
+    "memoryBudgetBytes",
+    "minimumMemoryBytes",
+    "level0SourceStoredBytes",
+    "anchorSourceStoredBytes",
+  ] as const) {
     if (Reflect.has(update, field)) {
       throw new TypeError(`Compaction ${field} is immutable`);
     }

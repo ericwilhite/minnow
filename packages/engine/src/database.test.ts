@@ -317,7 +317,12 @@ async function createMutationCompactionFixture(
   ];
   expect(expectedRowIds[0]).not.toBe(upsertRowIds[0]);
 
-  const sourceSegments = await store.listSegments(table.id);
+  const visibleSourceIds = (await database.listVisibleSegments(tableName)).map(
+    (segment) => segment.id,
+  );
+  const sourceSegments = await Promise.all(
+    visibleSourceIds.map((segmentId) => requiredSegment(store, segmentId)),
+  );
   const sourceBlockIds = [
     ...new Set(sourceSegments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
   ].sort();
@@ -335,7 +340,7 @@ async function createMutationCompactionFixture(
     expectedRows,
     expectedRowIds,
     sourceBlockIds,
-    sourceSegmentIds: sourceSegments.map((segment) => segment.id).sort(),
+    sourceSegmentIds: visibleSourceIds,
   };
 }
 
@@ -343,6 +348,58 @@ async function requiredSegment(store: BlockStore, segmentId: string): Promise<Se
   const segment = await store.getSegment(segmentId);
   if (segment === undefined) throw new Error(`Expected segment ${segmentId}`);
   return segment;
+}
+
+interface CompactionSourceStats {
+  blockIds: string[];
+  storedBytes: number;
+}
+
+async function compactionSourceStats(
+  store: BlockStore,
+  segmentIds: readonly string[],
+): Promise<CompactionSourceStats> {
+  const segments = await Promise.all(
+    segmentIds.map((segmentId) => requiredSegment(store, segmentId)),
+  );
+  const blockIds = [
+    ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+  ].sort();
+  const blocks = await store.getBlocks(blockIds);
+  let storedBytes = 0;
+  for (const [index, bytes] of blocks.entries()) {
+    if (bytes === undefined) {
+      throw new Error(`Expected compaction source block ${blockIds[index] ?? ""}`);
+    }
+    storedBytes += bytes.byteLength;
+  }
+  return { blockIds, storedBytes };
+}
+
+async function assertPersistedCompactionSelection(
+  store: BlockStore,
+  jobId: string,
+  sourceSegmentIds: readonly string[],
+  anchorSegmentId: string | null,
+): Promise<CompactionSourceStats> {
+  const job = await store.getCompactionJob(jobId);
+  if (job === undefined) throw new Error(`Expected compaction job ${jobId}`);
+  const sourceStats = await compactionSourceStats(store, sourceSegmentIds);
+  const level0SourceIds = anchorSegmentId === null ? sourceSegmentIds : sourceSegmentIds.slice(1);
+  const level0Stats = await compactionSourceStats(store, level0SourceIds);
+  const anchorStats =
+    anchorSegmentId === null
+      ? { blockIds: [], storedBytes: 0 }
+      : await compactionSourceStats(store, [anchorSegmentId]);
+  expect(job).toMatchObject({
+    sourceSegmentIds: [...sourceSegmentIds],
+    sourceStoredBytes: sourceStats.storedBytes,
+    level0SourceStoredBytes: level0Stats.storedBytes,
+    anchorSourceStoredBytes: anchorStats.storedBytes,
+  });
+  expect([...job.sourceBlockIds].sort()).toEqual(sourceStats.blockIds);
+  expect(job.sourceStoredBytes).toBe(level0Stats.storedBytes + anchorStats.storedBytes);
+  return sourceStats;
 }
 
 function requiredItem<T>(values: readonly T[], index: number, label: string): T {
@@ -519,6 +576,44 @@ async function commitLowLevelDeleteSegment(
   });
   const manifest = await transaction.commit();
   return { manifestVersion: manifest.version, segmentId: input.segmentId, blockId };
+}
+
+async function commitLowLevelNumberSegment(
+  store: MemoryBlockStore,
+  table: TableRecord,
+  input: {
+    segmentId: string;
+    level: number;
+    logicalOrder: number;
+    rowId: bigint;
+    value: number;
+  },
+): Promise<void> {
+  const column = requiredItem(table.columns, 0, "low-level number column");
+  if (column.type !== "number") throw new Error("Expected a number layout-test column");
+  const manager = new TransactionManager(store, {
+    createId: () => `${input.segmentId}/transaction`,
+  });
+  const transaction = await manager.begin();
+  const blockId = `${input.segmentId}/block`;
+  await transaction.stageBlock(
+    blockId,
+    await encodeBlock({ type: "number", values: [input.value] }, "raw"),
+  );
+  await transaction.stageSegment({
+    id: input.segmentId,
+    tableId: table.id,
+    transactionId: transaction.id,
+    rowCount: 1,
+    rowIdStart: input.rowId,
+    rowIdEndExclusive: input.rowId + 1n,
+    columnBlockIds: { [column.id]: [blockId] },
+    kind: "insert",
+    level: input.level,
+    logicalOrder: input.logicalOrder,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  await transaction.commit();
 }
 
 for (const implementation of implementations()) {
@@ -3079,6 +3174,657 @@ it("aborts a mutation merge when a segment from another table aliases a global s
   expect(
     fixture.job.outputBlockIds.every((blockId) => !concurrentManifest?.blockIds.includes(blockId)),
   ).toBe(true);
+  store.close();
+});
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} repeatedly compacts bounded oldest append prefixes with subset metrics`, async () => {
+    const store = await implementation.create();
+    const tableName = `bounded_append_${implementation.name}`;
+    const database = new BrowserDatabase(store, { compression: "raw" });
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "number" }],
+    });
+    const inserts = [];
+    for (let value = 1; value <= 6; value += 1) {
+      inserts.push(await database.insert(tableName, { value }));
+    }
+    const originalSegmentIds = inserts.map((insert) => insert.segmentId);
+    const expectedRows = inserts.map((_insert, index) => ({ value: index + 1 }));
+    const snapshots = inserts.map((insert, index) => ({
+      version: insert.version,
+      rows: expectedRows.slice(0, index + 1),
+    }));
+    expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual(
+      originalSegmentIds,
+    );
+
+    let anchorSegmentId: string | null = null;
+    for (let jobIndex = 0; jobIndex < 3; jobIndex += 1) {
+      const promotedIds = originalSegmentIds.slice(jobIndex * 2, jobIndex * 2 + 2);
+      const expectedSourceIds =
+        anchorSegmentId === null ? promotedIds : [anchorSegmentId, ...promotedIds];
+      const level0Stats = await compactionSourceStats(store, promotedIds);
+      const result = await database.compactTable(tableName, {
+        minimumLevel0Segments: 2,
+        maxLevel0Segments: 2,
+        maxLevel0StoredBytes: 1024 * 1024,
+        targetBlockBytes: 1024,
+        outputCompression: "raw",
+        maxBlocksPerStep: 1,
+      });
+      if (result.jobId === undefined || result.outputSegmentId === null) {
+        throw new Error("Expected a bounded append output");
+      }
+      const sourceStats = await assertPersistedCompactionSelection(
+        store,
+        result.jobId,
+        expectedSourceIds,
+        anchorSegmentId,
+      );
+      const selectedRowCount = (jobIndex + 1) * 2;
+      expect(result).toMatchObject({
+        compacted: true,
+        sourceSegmentCount: expectedSourceIds.length,
+        sourceBlockCount: sourceStats.blockIds.length,
+        rowCount: selectedRowCount,
+        sourceStoredBytes: sourceStats.storedBytes,
+        level0SourceStoredBytes: level0Stats.storedBytes,
+        supersededBlockCount: sourceStats.blockIds.length,
+        physicallyReclaimedBytes: 0,
+      });
+      expect(result.anchorSourceStoredBytes).toBe(
+        sourceStats.storedBytes - level0Stats.storedBytes,
+      );
+      expect(result.compactionWriteAmplification).toBe(
+        result.outputStoredBytes / level0Stats.storedBytes,
+      );
+      expect(result.metrics).toMatchObject({
+        logicalBytes: result.outputLogicalBytes,
+        storedBytes: result.outputStoredBytes,
+        writeAmplification:
+          result.outputStoredBytes / (result.outputLogicalBytes ?? Number.POSITIVE_INFINITY),
+        retries: 0,
+      });
+      expect(result.metrics?.rowsPerSecond).toBeGreaterThan(0);
+
+      const output = await requiredSegment(store, result.outputSegmentId);
+      expect(output).toMatchObject({ level: 1, rowCount: selectedRowCount, logicalOrder: 0 });
+      anchorSegmentId = output.id;
+      expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+        anchorSegmentId,
+        ...originalSegmentIds.slice((jobIndex + 1) * 2),
+      ]);
+      expect(await database.readTable(tableName)).toEqual(expectedRows);
+      for (const snapshot of snapshots) {
+        expect(await database.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
+      }
+    }
+    expect(await database.listVisibleSegments(tableName)).toHaveLength(1);
+    store.close();
+  });
+
+  it(`${implementation.name} converges bounded base and mutation prefixes without changing row identities`, async () => {
+    const store = await implementation.create();
+    const tableName = `bounded_mutation_${implementation.name}`;
+    const fixture = await createMutationCompactionFixture(store, tableName);
+    const originalSegmentIds = fixture.sourceSegmentIds;
+    const initialRowIds = expandSegmentRowIds(
+      await requiredSegment(
+        store,
+        requiredItem(originalSegmentIds, 0, "initial bounded mutation segment"),
+      ),
+    );
+    const upsertRowIds = expandSegmentRowIds(
+      await requiredSegment(
+        store,
+        requiredItem(originalSegmentIds, 1, "bounded mutation upsert segment"),
+      ),
+    );
+    const expectedOutputRowIds = [
+      [
+        requiredItem(initialRowIds, 0, "initial A row ID"),
+        requiredItem(initialRowIds, 1, "initial B row ID"),
+        requiredItem(initialRowIds, 2, "initial C row ID"),
+        requiredItem(upsertRowIds, 1, "new D row ID"),
+      ],
+      [
+        requiredItem(initialRowIds, 1, "updated B row ID"),
+        requiredItem(initialRowIds, 2, "retained C row ID"),
+        requiredItem(upsertRowIds, 1, "updated D row ID"),
+      ],
+      fixture.expectedRowIds,
+    ];
+
+    let anchorSegmentId: string | null = null;
+    for (let jobIndex = 0; jobIndex < 3; jobIndex += 1) {
+      const promotedIds = originalSegmentIds.slice(jobIndex * 2, jobIndex * 2 + 2);
+      const expectedSourceIds =
+        anchorSegmentId === null ? promotedIds : [anchorSegmentId, ...promotedIds];
+      const result = await fixture.database.compactTable(tableName, {
+        minimumLevel0Segments: 2,
+        maxLevel0Segments: 2,
+        maxLevel0StoredBytes: 1024 * 1024,
+        targetBlockBytes: 64,
+        outputCompression: "raw",
+        maxBlocksPerStep: 1,
+      });
+      if (result.jobId === undefined || result.outputSegmentId === null) {
+        throw new Error("Expected a bounded mutation base");
+      }
+      const sourceStats = await assertPersistedCompactionSelection(
+        store,
+        result.jobId,
+        expectedSourceIds,
+        anchorSegmentId,
+      );
+      const rowIds = requiredItem(expectedOutputRowIds, jobIndex, "bounded output row IDs");
+      expect(result).toMatchObject({
+        compacted: true,
+        sourceSegmentCount: expectedSourceIds.length,
+        sourceBlockCount: sourceStats.blockIds.length,
+        sourceStoredBytes: sourceStats.storedBytes,
+        rowCount: rowIds.length,
+        supersededBlockCount: sourceStats.blockIds.length,
+      });
+      const job = await store.getCompactionJob(result.jobId);
+      expect(job?.rewritePlan).toMatchObject({
+        kind: "merge-v1",
+        totalRows: rowIds.length,
+        rowIdSpans: canonicalRowIdSpans(rowIds),
+      });
+      const output = await requiredSegment(store, result.outputSegmentId);
+      expect(output).toMatchObject({
+        kind: "base",
+        level: 1,
+        rowCount: rowIds.length,
+        rowIdSpans: canonicalRowIdSpans(rowIds),
+      });
+      expect(expandSegmentRowIds(output)).toEqual(rowIds);
+      anchorSegmentId = output.id;
+      expect(
+        (await fixture.database.listVisibleSegments(tableName)).map((segment) => segment.id),
+      ).toEqual([anchorSegmentId, ...originalSegmentIds.slice((jobIndex + 1) * 2)]);
+      expect(await fixture.database.readTable(tableName)).toEqual(fixture.expectedRows);
+      for (const snapshot of fixture.snapshots) {
+        expect(await fixture.database.readTable(tableName, snapshot.version)).toEqual(
+          snapshot.rows,
+        );
+      }
+    }
+    expect(await fixture.database.listVisibleSegments(tableName)).toHaveLength(1);
+    store.close();
+  });
+
+  it(`${implementation.name} preserves a later upsert when a bounded prefix deletes every base row`, async () => {
+    const store = await implementation.create();
+    const tableName = `bounded_empty_${implementation.name}`;
+    const database = new BrowserDatabase(store, { compression: "raw" });
+    await database.createTable({
+      name: tableName,
+      uniqueKey: "email",
+      columns: [
+        { name: "email", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    const inserted = await database.insert(tableName, { email: "a@example.com", score: 1 });
+    const insertedRowId = requiredItem(
+      expandSegmentRowIds(await requiredSegment(store, inserted.segmentId)),
+      0,
+      "bounded deleted row ID",
+    );
+    const deleted = await database.deleteBatch(tableName, { keys: ["a@example.com"] });
+    if (deleted.segmentId === null) throw new Error("Expected a bounded delete segment");
+    const later = await database.upsert(tableName, { email: "a@example.com", score: 2 });
+    const laterRowId = requiredItem(
+      expandSegmentRowIds(await requiredSegment(store, later.segmentId)),
+      0,
+      "bounded later upsert row ID",
+    );
+    expect(laterRowId).toBeGreaterThan(insertedRowId);
+
+    const result = await database.compactTable(tableName, {
+      minimumLevel0Segments: 2,
+      maxLevel0Segments: 2,
+      outputCompression: "raw",
+    });
+    if (result.jobId === undefined) throw new Error("Expected a bounded empty-prefix job");
+    await assertPersistedCompactionSelection(
+      store,
+      result.jobId,
+      [inserted.segmentId, deleted.segmentId],
+      null,
+    );
+    expect(result).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: 2,
+      outputSegmentId: null,
+      outputBlockCount: 0,
+      rowCount: 0,
+    });
+    expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+      later.segmentId,
+    ]);
+    expect(await database.readTable(tableName)).toEqual([{ email: "a@example.com", score: 2 }]);
+    expect(await database.readTable(tableName, inserted.version)).toEqual([
+      { email: "a@example.com", score: 1 },
+    ]);
+    store.close();
+  });
+}
+
+for (const implementation of recoveryImplementations()) {
+  it(`${implementation.name} reopens a checkpointed bounded job with its exact persisted prefix`, async () => {
+    const harness = await implementation.create();
+    let store = harness.store;
+    const tableName = `bounded_reopen_${implementation.name.replaceAll(" ", "_")}`;
+    const database = new BrowserDatabase(store, { compression: "raw" });
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "number" }],
+    });
+    const inserts = [];
+    for (let value = 1; value <= 4; value += 1) {
+      inserts.push(await database.insert(tableName, { value }));
+    }
+    const sourceSegmentIds = inserts.slice(0, 2).map((insert) => insert.segmentId);
+    let progress = await database.compactTableStep(tableName, {
+      minimumLevel0Segments: 2,
+      maxLevel0Segments: 2,
+      maxLevel0StoredBytes: 1024 * 1024,
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (progress.jobId === null) throw new Error("Expected a checkpointed bounded job");
+    const jobId = progress.jobId;
+    expect(progress).toMatchObject({
+      state: "running",
+      sourceSegmentCount: 2,
+      outputBlockCount: 1,
+      result: null,
+    });
+    await assertPersistedCompactionSelection(store, jobId, sourceSegmentIds, null);
+
+    store = await harness.reopen();
+    await assertPersistedCompactionSelection(store, jobId, sourceSegmentIds, null);
+    const reopened = new BrowserDatabase(store, { compression: "gzip", rowsPerBlock: 2048 });
+    while (progress.result === null) {
+      progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
+    }
+    if (progress.result.outputSegmentId === null) {
+      throw new Error("Expected a reopened bounded output");
+    }
+    expect(progress.result).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: 2,
+      rowCount: 2,
+      outputCompression: "raw",
+    });
+    expect((await reopened.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+      progress.result.outputSegmentId,
+      ...inserts.slice(2).map((insert) => insert.segmentId),
+    ]);
+    expect(await reopened.readTable(tableName)).toEqual(
+      inserts.map((_insert, index) => ({ value: index + 1 })),
+    );
+    expect(
+      await reopened.readTable(tableName, requiredItem(inserts, 3, "last insert").version),
+    ).toEqual(inserts.map((_insert, index) => ({ value: index + 1 })));
+    store.close();
+  });
+}
+
+it("rebases a bounded IndexedDB mutation prefix without absorbing its existing or concurrent tail", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const compactorStore = await IndexedDbBlockStore.open({ name, indexedDB });
+  const writerStore = await IndexedDbBlockStore.open({ name, indexedDB });
+  const tableName = "bounded_rebase_accounts";
+  const compactor = new BrowserDatabase(compactorStore, { compression: "raw" });
+  const writer = new BrowserDatabase(writerStore, { compression: "raw" });
+  await compactor.createTable({
+    name: tableName,
+    uniqueKey: "email",
+    columns: [
+      { name: "email", type: "string" },
+      { name: "score", type: "number" },
+    ],
+  });
+  const inserted = await compactor.insertBatch(tableName, {
+    columns: { email: ["a@example.com", "b@example.com"], score: [1, 2] },
+  });
+  const initialRowIds = expandSegmentRowIds(
+    await requiredSegment(compactorStore, inserted.segmentId),
+  );
+  const upserted = await compactor.upsertBatch(tableName, {
+    columns: { email: ["b@example.com", "c@example.com"], score: [20, 3] },
+  });
+  const upsertRowIds = expandSegmentRowIds(
+    await requiredSegment(compactorStore, upserted.segmentId),
+  );
+  const tailUpdate = await compactor.update(tableName, "a@example.com", { score: 10 });
+  const sourceVersion = tailUpdate.version;
+
+  let progress = await compactor.compactTableStep(tableName, {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    maxBlocks: 1,
+    targetBlockBytes: 64,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a bounded rebase job");
+  const jobId = progress.jobId;
+  await assertPersistedCompactionSelection(
+    compactorStore,
+    jobId,
+    [inserted.segmentId, upserted.segmentId],
+    null,
+  );
+  const concurrentDelete = await writer.deleteBatch(tableName, { keys: ["c@example.com"] });
+  if (concurrentDelete.segmentId === null) throw new Error("Expected a concurrent delete tail");
+
+  while (progress.result === null) {
+    progress = await compactor.resumeCompactionJob(jobId, { maxBlocks: 1 });
+  }
+  if (progress.result.outputSegmentId === null) throw new Error("Expected a rebased bounded base");
+  const firstOutput = await requiredSegment(compactorStore, progress.result.outputSegmentId);
+  expect(firstOutput).toMatchObject({ kind: "base", level: 1 });
+  expect(expandSegmentRowIds(firstOutput)).toEqual([
+    requiredItem(initialRowIds, 0, "rebased A row ID"),
+    requiredItem(initialRowIds, 1, "rebased B row ID"),
+    requiredItem(upsertRowIds, 1, "rebased C row ID"),
+  ]);
+  expect((await compactor.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+    firstOutput.id,
+    tailUpdate.segmentId,
+    concurrentDelete.segmentId,
+  ]);
+  expect(await compactor.readTable(tableName)).toEqual([
+    { email: "a@example.com", score: 10 },
+    { email: "b@example.com", score: 20 },
+  ]);
+  expect(await compactor.readTable(tableName, sourceVersion)).toEqual([
+    { email: "a@example.com", score: 10 },
+    { email: "b@example.com", score: 20 },
+    { email: "c@example.com", score: 3 },
+  ]);
+
+  const converged = await compactor.compactTable(tableName, {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    outputCompression: "raw",
+  });
+  if (converged.outputSegmentId === null) throw new Error("Expected a converged bounded base");
+  expect((await compactor.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+    converged.outputSegmentId,
+  ]);
+  expect(
+    expandSegmentRowIds(await requiredSegment(compactorStore, converged.outputSegmentId)),
+  ).toEqual([
+    requiredItem(initialRowIds, 0, "converged A row ID"),
+    requiredItem(initialRowIds, 1, "converged B row ID"),
+  ]);
+  expect(await compactor.readTable(tableName)).toEqual([
+    { email: "a@example.com", score: 10 },
+    { email: "b@example.com", score: 20 },
+  ]);
+  compactorStore.close();
+  writerStore.close();
+});
+
+it("keeps an oversized oldest equal-order L0 group indivisible", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "equal_order_prefix",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const table = await store.getTableByName("equal_order_prefix");
+  if (table === undefined) throw new Error("Expected an equal-order table");
+  const segmentIds = ["equal-group-a", "equal-group-b", "equal-group-c", "later-group"];
+  for (const [index, segmentId] of segmentIds.entries()) {
+    await commitLowLevelNumberSegment(store, table, {
+      segmentId,
+      level: 0,
+      logicalOrder: index < 3 ? 0 : 1,
+      rowId: BigInt(index),
+      value: index + 1,
+    });
+  }
+
+  const result = await database.compactTable("equal_order_prefix", {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    maxLevel0StoredBytes: 1,
+    outputCompression: "raw",
+  });
+  if (result.jobId === undefined || result.outputSegmentId === null) {
+    throw new Error("Expected an oversized equal-order prefix");
+  }
+  expect(result.sourceSegmentCount).toBe(3);
+  await assertPersistedCompactionSelection(store, result.jobId, segmentIds.slice(0, 3), null);
+  expect(
+    (await database.listVisibleSegments("equal_order_prefix")).map((segment) => segment.id),
+  ).toEqual([result.outputSegmentId, requiredItem(segmentIds, 3, "later equal-order segment")]);
+  expect(await database.readTable("equal_order_prefix")).toEqual([
+    { value: 1 },
+    { value: 2 },
+    { value: 3 },
+    { value: 4 },
+  ]);
+  store.close();
+});
+
+it("stops an oldest-prefix selection at its L0 stored-byte cap after the minimum", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "stored_byte_prefix",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const inserts = [];
+  for (let value = 1; value <= 4; value += 1) {
+    inserts.push(await database.insert("stored_byte_prefix", { value }));
+  }
+  const sourceSegmentIds = inserts.slice(0, 2).map((insert) => insert.segmentId);
+  const sourceStats = await compactionSourceStats(store, sourceSegmentIds);
+
+  const result = await database.compactTable("stored_byte_prefix", {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 16,
+    maxLevel0StoredBytes: sourceStats.storedBytes,
+    outputCompression: "raw",
+  });
+  if (result.jobId === undefined || result.outputSegmentId === null) {
+    throw new Error("Expected a stored-byte-bounded prefix");
+  }
+  await assertPersistedCompactionSelection(store, result.jobId, sourceSegmentIds, null);
+  expect(result).toMatchObject({
+    compacted: true,
+    sourceSegmentCount: 2,
+    sourceBlockCount: sourceStats.blockIds.length,
+    sourceStoredBytes: sourceStats.storedBytes,
+    level0SourceStoredBytes: sourceStats.storedBytes,
+  });
+  expect(
+    (await database.listVisibleSegments("stored_byte_prefix")).map((segment) => segment.id),
+  ).toEqual([result.outputSegmentId, ...inserts.slice(2).map((insert) => insert.segmentId)]);
+  expect(await database.readTable("stored_byte_prefix")).toEqual(
+    inserts.map((_insert, index) => ({ value: index + 1 })),
+  );
+  store.close();
+});
+
+it("drains an odd append tail only when an anchored job explicitly lowers its minimum", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "odd_tail_drain",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const inserts = [];
+  for (let value = 1; value <= 5; value += 1) {
+    inserts.push(await database.insert("odd_tail_drain", { value }));
+  }
+  const expectedRows = inserts.map((_insert, index) => ({ value: index + 1 }));
+  const snapshots = inserts.map((insert, index) => ({
+    version: insert.version,
+    rows: expectedRows.slice(0, index + 1),
+  }));
+
+  const first = await database.compactTable("odd_tail_drain", {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    outputCompression: "raw",
+  });
+  if (first.jobId === undefined || first.outputSegmentId === null) {
+    throw new Error("Expected the first odd-tail compaction");
+  }
+  await assertPersistedCompactionSelection(
+    store,
+    first.jobId,
+    inserts.slice(0, 2).map((insert) => insert.segmentId),
+    null,
+  );
+
+  const second = await database.compactTable("odd_tail_drain", {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    outputCompression: "raw",
+  });
+  if (second.jobId === undefined || second.outputSegmentId === null) {
+    throw new Error("Expected the second odd-tail compaction");
+  }
+  await assertPersistedCompactionSelection(
+    store,
+    second.jobId,
+    [first.outputSegmentId, ...inserts.slice(2, 4).map((insert) => insert.segmentId)],
+    first.outputSegmentId,
+  );
+  expect(
+    (await database.listVisibleSegments("odd_tail_drain")).map((segment) => segment.id),
+  ).toEqual([second.outputSegmentId, requiredItem(inserts, 4, "odd L0 tail").segmentId]);
+
+  const skipped = await database.compactTable("odd_tail_drain");
+  expect(skipped).toMatchObject({
+    compacted: false,
+    skipReason: "below-segment-threshold",
+    sourceSegmentCount: 2,
+  });
+  expect(await store.listCompactionJobs()).toHaveLength(2);
+
+  const drained = await database.compactTable("odd_tail_drain", {
+    minimumLevel0Segments: 1,
+    maxLevel0Segments: 1,
+    outputCompression: "raw",
+  });
+  if (drained.jobId === undefined || drained.outputSegmentId === null) {
+    throw new Error("Expected the explicit odd-tail drain");
+  }
+  await assertPersistedCompactionSelection(
+    store,
+    drained.jobId,
+    [second.outputSegmentId, requiredItem(inserts, 4, "drained L0 tail").segmentId],
+    second.outputSegmentId,
+  );
+  expect(await database.listVisibleSegments("odd_tail_drain")).toEqual([
+    expect.objectContaining({ id: drained.outputSegmentId, rowCount: 5 }),
+  ]);
+  expect(await database.readTable("odd_tail_drain")).toEqual(expectedRows);
+  for (const snapshot of snapshots) {
+    expect(await database.readTable("odd_tail_drain", snapshot.version)).toEqual(snapshot.rows);
+  }
+  store.close();
+});
+
+it("validates bounded compaction options and preserves the deprecated threshold alias", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "bounded_options",
+    columns: [{ name: "value", type: "number" }],
+  });
+  for (const options of [
+    { minimumLevel0Segments: 0 },
+    { minimumLevel0Segments: 2.5 },
+    { minimumLevel0Segments: 3, maxLevel0Segments: 2 },
+    { maxLevel0Segments: 0 },
+    { maxLevel0Segments: 2.5 },
+    { maxLevel0StoredBytes: 0 },
+    { maxLevel0StoredBytes: 2.5 },
+    { targetLevel: 2 },
+    { minimumSegments: 2, minimumLevel0Segments: 3 },
+  ]) {
+    await expect(database.compactTable("bounded_options", options)).rejects.toBeInstanceOf(
+      RangeError,
+    );
+  }
+  expect(await store.listCompactionJobs()).toEqual([]);
+
+  await database.insert("bounded_options", { value: 1 });
+  expect(
+    await database.compactTable("bounded_options", {
+      minimumLevel0Segments: 1,
+      maxLevel0Segments: 1,
+    }),
+  ).toMatchObject({
+    compacted: false,
+    skipReason: "below-segment-threshold",
+    sourceSegmentCount: 1,
+  });
+  await database.insert("bounded_options", { value: 2 });
+  const aliased = await database.compactTable("bounded_options", {
+    minimumSegments: 2,
+    outputCompression: "raw",
+  });
+  expect(aliased).toMatchObject({ compacted: true, sourceSegmentCount: 2 });
+  store.close();
+});
+
+it("skips unsupported compaction level layouts without creating jobs", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  const layouts = [
+    {
+      tableName: "multiple_anchors",
+      levels: [1, 1, 0, 0],
+    },
+    {
+      tableName: "nonleading_anchor",
+      levels: [0, 1, 0],
+    },
+    {
+      tableName: "level_two_anchor",
+      levels: [2, 0, 0],
+    },
+  ];
+  for (const { tableName, levels } of layouts) {
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "number" }],
+    });
+    const table = await store.getTableByName(tableName);
+    if (table === undefined) throw new Error(`Expected layout table ${tableName}`);
+    for (const [index, level] of levels.entries()) {
+      await commitLowLevelNumberSegment(store, table, {
+        segmentId: `${tableName}-${String(index)}`,
+        level,
+        logicalOrder: index,
+        rowId: BigInt(index),
+        value: index,
+      });
+    }
+    const result = await database.compactTable(tableName, { minimumLevel0Segments: 2 });
+    expect(result).toMatchObject({
+      compacted: false,
+      skipReason: "unsupported-level-layout",
+      sourceSegmentCount: levels.length,
+    });
+  }
+  expect(await store.listCompactionJobs()).toEqual([]);
   store.close();
 });
 

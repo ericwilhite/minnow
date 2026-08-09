@@ -62,6 +62,9 @@ import {
 const sizeTextEncoder = new TextEncoder();
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
+const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
+const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS = 16;
+const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_STORED_BYTES = 64 * 1024 * 1024;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 const INTERNAL_READ_LEASE_TTL_MS = 60_000;
@@ -186,9 +189,17 @@ export interface DeleteBatchResult {
 }
 
 export interface CompactTableOptions {
+  /** @deprecated Use minimumLevel0Segments. */
   minimumSegments?: number;
+  /** Minimum L0 segments promoted; one drains a tail only when an L1 anchor exists. */
+  minimumLevel0Segments?: number;
+  /** Target maximum L0 segments promoted by one job. Equal-order groups remain indivisible. */
+  maxLevel0Segments?: number;
+  /** Target maximum stored L0 bytes promoted by one job. The L1 anchor is excluded. */
+  maxLevel0StoredBytes?: number;
   /** Number of immutable output blocks processed before yielding and checkpointing. */
   maxBlocksPerStep?: number;
+  /** Output level. The current bounded-prefix policy supports L1 only. */
   targetLevel?: number;
   /** Estimated uncompressed physical bytes per output column block. */
   targetBlockBytes?: number;
@@ -203,7 +214,10 @@ export interface CompactTableStepOptions extends CompactTableOptions {
 }
 
 export type CompactionSkipReason =
-  "below-segment-threshold" | "contains-mutation-segments" | "non-contiguous-row-ids";
+  | "below-segment-threshold"
+  | "contains-mutation-segments"
+  | "non-contiguous-row-ids"
+  | "unsupported-level-layout";
 
 export interface CompactTableResult {
   jobId?: string;
@@ -217,6 +231,9 @@ export interface CompactTableResult {
   rowCount: number;
   sourceStoredBytes: number;
   outputStoredBytes: number;
+  level0SourceStoredBytes?: number;
+  anchorSourceStoredBytes?: number;
+  compactionWriteAmplification?: number;
   outputLogicalBytes?: number;
   targetBlockBytes?: number;
   outputCompression?: Compression;
@@ -237,6 +254,8 @@ export interface CompactionJobProgress {
   sourceSegmentCount: number;
   sourceBlockCount: number;
   outputBlockCount: number;
+  level0SourceStoredBytes?: number;
+  anchorSourceStoredBytes?: number;
   memoryBudgetBytes?: number;
   minimumMemoryBytes?: number;
   peakWorkingBytes?: number;
@@ -1228,26 +1247,82 @@ export class BrowserDatabase {
     version: number | null,
     snapshot: LeasedSnapshot,
   ): Promise<CompactionJobRecord | CompactTableResult> {
-    const minimumSegments = positiveWholeNumber(
-      options.minimumSegments ?? 2,
-      "Compaction segment threshold",
+    const legacyMinimumSegments: number | undefined = Reflect.get(options, "minimumSegments");
+    if (
+      options.minimumLevel0Segments !== undefined &&
+      legacyMinimumSegments !== undefined &&
+      options.minimumLevel0Segments !== legacyMinimumSegments
+    ) {
+      throw new RangeError("Compaction L0 segment thresholds conflict");
+    }
+    const minimumLevel0Segments = positiveWholeNumber(
+      options.minimumLevel0Segments ??
+        legacyMinimumSegments ??
+        DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS,
+      "Compaction minimum L0 segments",
+    );
+    const maxLevel0Segments = positiveWholeNumber(
+      options.maxLevel0Segments ?? DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS,
+      "Compaction maximum L0 segments",
+    );
+    if (maxLevel0Segments < minimumLevel0Segments) {
+      throw new RangeError("Compaction maximum L0 segments cannot be smaller than its minimum");
+    }
+    const maxLevel0StoredBytes = positiveWholeNumber(
+      options.maxLevel0StoredBytes ?? DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_STORED_BYTES,
+      "Compaction maximum L0 stored bytes",
     );
     const targetLevel = positiveWholeNumber(options.targetLevel ?? 1, "Compaction target level");
-    const sourceSegments = await this.#visibleSegmentRecords(table, snapshot);
-    const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
-    if (sourceSegments.length < minimumSegments) {
+    if (targetLevel !== 1) {
+      throw new RangeError("Compaction target level must be 1");
+    }
+    const visibleSegments = await this.#visibleSegmentRecords(table, snapshot);
+    const visibleBlockIds = uniqueSegmentBlockIds(visibleSegments);
+    const firstLevel = visibleSegments[0]?.level ?? 0;
+    const hasAnchor = firstLevel === 1;
+    const level0Offset = hasAnchor ? 1 : 0;
+    const supportedLevelLayout =
+      firstLevel <= 1 &&
+      visibleSegments.slice(level0Offset).every((segment) => (segment.level ?? 0) === 0);
+    if (!supportedLevelLayout) {
       return compactTableSkipped(
         table.name,
-        "below-segment-threshold",
-        sourceSegments,
-        sourceBlockIds,
+        "unsupported-level-layout",
+        visibleSegments,
+        visibleBlockIds,
         version,
       );
     }
-    const requiresMerge = sourceSegments.some(
-      (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+    const level0Segments = visibleSegments.slice(level0Offset);
+    const effectiveMinimumLevel0Segments = hasAnchor
+      ? minimumLevel0Segments
+      : Math.max(2, minimumLevel0Segments);
+    if (level0Segments.length < effectiveMinimumLevel0Segments) {
+      return compactTableSkipped(
+        table.name,
+        "below-segment-threshold",
+        visibleSegments,
+        visibleBlockIds,
+        version,
+      );
+    }
+    const selection = await this.#selectCompactionSources(
+      hasAnchor ? visibleSegments[0] : undefined,
+      level0Segments,
+      effectiveMinimumLevel0Segments,
+      maxLevel0Segments,
+      maxLevel0StoredBytes,
+      snapshot,
     );
-    if (!requiresMerge && !hasContiguousRowIds(sourceSegments)) {
+    const sourceSegments = selection.sourceSegments;
+    const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
+    const hasContiguousSourceRowIds = hasContiguousRowIds(sourceSegments);
+    const requiresMerge =
+      sourceSegments.some(
+        (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+      ) ||
+      (!hasContiguousSourceRowIds && table.uniqueKeyColumnId !== undefined);
+    if (!requiresMerge && !hasContiguousSourceRowIds) {
       return compactTableSkipped(
         table.name,
         "non-contiguous-row-ids",
@@ -1304,6 +1379,13 @@ export class BrowserDatabase {
     if (minimumMemoryBytes > memoryBudgetBytes) {
       throw new CompactionMemoryBudgetError(memoryBudgetBytes, minimumMemoryBytes);
     }
+    const sourceStoredBytes = physicalRewriteSourceStoredBytes(rewritePlan);
+    if (
+      selection.anchorSourceStoredBytes + selection.level0SourceStoredBytes !==
+      sourceStoredBytes
+    ) {
+      throw new Error("Compaction source byte accounting differs from its rewrite plan");
+    }
 
     let id = ["compaction", table.id, "manifest", String(version)].join("/");
     const existing = await this.store.getCompactionJob(id);
@@ -1321,7 +1403,9 @@ export class BrowserDatabase {
       outputBlockIds: [],
       cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
       processedRows: 0,
-      sourceStoredBytes: physicalRewriteSourceStoredBytes(rewritePlan),
+      sourceStoredBytes,
+      level0SourceStoredBytes: selection.level0SourceStoredBytes,
+      anchorSourceStoredBytes: selection.anchorSourceStoredBytes,
       outputStoredBytes: 0,
       logicalBytes: physicalRewriteSourceEncodedBytes(rewritePlan),
       rewritePlan,
@@ -1355,6 +1439,114 @@ export class BrowserDatabase {
       if (raced !== undefined) return raced;
       throw error;
     }
+  }
+
+  async #selectCompactionSources(
+    anchor: SegmentRecord | undefined,
+    level0Segments: readonly SegmentRecord[],
+    minimumLevel0Segments: number,
+    maxLevel0Segments: number,
+    maxLevel0StoredBytes: number,
+    snapshot: LeasedSnapshot,
+  ): Promise<{
+    sourceSegments: SegmentRecord[];
+    level0SourceStoredBytes: number;
+    anchorSourceStoredBytes: number;
+  }> {
+    const transactions = new Map(
+      (await this.store.listTransactions()).map((record) => [record.id, record]),
+    );
+    const logicalOrder = (segment: SegmentRecord): number => {
+      const owner = transactions.get(segment.transactionId);
+      if (owner?.status !== "committed" || owner.committedVersion === null) {
+        throw new Error(`Compaction source segment has no committed owner: ${segment.id}`);
+      }
+      return segment.logicalOrder ?? owner.committedVersion;
+    };
+    const seenBlockIds = new Set<string>();
+    const measureStoredBytes = async (
+      segments: readonly SegmentRecord[],
+    ): Promise<{ storedBytes: number; blockIds: string[]; duplicateBlockId: string | null }> => {
+      let total = 0;
+      const blockIds: string[] = [];
+      const measuredBlockIds = new Set<string>();
+      let duplicateBlockId: string | null = null;
+      for (const segment of segments) {
+        for (const blockId of Object.values(segment.columnBlockIds).flat()) {
+          if (seenBlockIds.has(blockId) || measuredBlockIds.has(blockId)) {
+            duplicateBlockId ??= blockId;
+          }
+          measuredBlockIds.add(blockId);
+          blockIds.push(blockId);
+          await this.#renewInternalLeaseIfNeeded(snapshot);
+          const bytes = await this.store.getBlock(blockId);
+          if (bytes === undefined)
+            throw new Error(`Compaction source block is missing: ${blockId}`);
+          total = safeWholeNumberSum([total, bytes.byteLength], "Compaction selected stored bytes");
+        }
+      }
+      return { storedBytes: total, blockIds, duplicateBlockId };
+    };
+    const acceptMeasurement = (measurement: {
+      blockIds: readonly string[];
+      duplicateBlockId: string | null;
+    }): void => {
+      if (measurement.duplicateBlockId !== null) {
+        throw new Error(
+          `Compaction source block is referenced more than once: ${measurement.duplicateBlockId}`,
+        );
+      }
+      measurement.blockIds.forEach((blockId) => seenBlockIds.add(blockId));
+    };
+
+    let anchorSourceStoredBytes = 0;
+    if (anchor !== undefined) {
+      const anchorMeasurement = await measureStoredBytes([anchor]);
+      acceptMeasurement(anchorMeasurement);
+      anchorSourceStoredBytes = anchorMeasurement.storedBytes;
+    }
+    const selectedLevel0: SegmentRecord[] = [];
+    let level0SourceStoredBytes = 0;
+    for (let start = 0; start < level0Segments.length;) {
+      const first = level0Segments[start];
+      if (first === undefined) throw new Error("Compaction L0 source selection is unavailable");
+      const order = logicalOrder(first);
+      let end = start + 1;
+      for (;;) {
+        const next = level0Segments[end];
+        if (next === undefined || logicalOrder(next) !== order) break;
+        end += 1;
+      }
+      const group = level0Segments.slice(start, end);
+      if (
+        selectedLevel0.length >= minimumLevel0Segments &&
+        selectedLevel0.length + group.length > maxLevel0Segments
+      ) {
+        break;
+      }
+      const groupMeasurement = await measureStoredBytes(group);
+      if (
+        selectedLevel0.length >= minimumLevel0Segments &&
+        groupMeasurement.storedBytes > maxLevel0StoredBytes - level0SourceStoredBytes
+      ) {
+        break;
+      }
+      acceptMeasurement(groupMeasurement);
+      selectedLevel0.push(...group);
+      level0SourceStoredBytes = safeWholeNumberSum(
+        [level0SourceStoredBytes, groupMeasurement.storedBytes],
+        "Compaction selected L0 stored bytes",
+      );
+      start = end;
+    }
+    if (selectedLevel0.length < minimumLevel0Segments) {
+      throw new Error("Compaction source selection did not satisfy its minimum L0 segment count");
+    }
+    return {
+      sourceSegments: anchor === undefined ? selectedLevel0 : [anchor, ...selectedLevel0],
+      level0SourceStoredBytes,
+      anchorSourceStoredBytes,
+    };
   }
 
   async #createRechunkCompactionPlan(
@@ -2385,6 +2577,9 @@ export class BrowserDatabase {
     }
     for (const segment of visibleSegments) {
       if (sourceIds.has(segment.id)) continue;
+      if ((segment.level ?? 0) !== 0) {
+        throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
+      }
       const committedVersion = transactions.get(segment.transactionId)?.committedVersion;
       if (committedVersion === null || committedVersion === undefined) {
         throw new Error(`Concurrent compaction segment has no committed owner: ${segment.id}`);
@@ -2529,6 +2724,13 @@ export class BrowserDatabase {
       rowCount,
       sourceStoredBytes: job.sourceStoredBytes,
       outputStoredBytes: job.outputStoredBytes,
+      ...(job.level0SourceStoredBytes === undefined || job.anchorSourceStoredBytes === undefined
+        ? {}
+        : {
+            level0SourceStoredBytes: job.level0SourceStoredBytes,
+            anchorSourceStoredBytes: job.anchorSourceStoredBytes,
+            compactionWriteAmplification: job.outputStoredBytes / job.level0SourceStoredBytes,
+          }),
       outputLogicalBytes,
       ...(rewritePlan.kind !== "copy-v1"
         ? {
@@ -3695,6 +3897,12 @@ function compactionProgress(
     sourceSegmentCount: job.sourceSegmentIds.length,
     sourceBlockCount: job.sourceBlockIds.length,
     outputBlockCount: job.outputBlockIds.length,
+    ...(job.level0SourceStoredBytes === undefined || job.anchorSourceStoredBytes === undefined
+      ? {}
+      : {
+          level0SourceStoredBytes: job.level0SourceStoredBytes,
+          anchorSourceStoredBytes: job.anchorSourceStoredBytes,
+        }),
     ...(rewritePlan.kind !== "copy-v1"
       ? {
           memoryBudgetBytes: job.memoryBudgetBytes ?? 0,
