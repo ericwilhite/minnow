@@ -393,7 +393,9 @@ The wire protocol is independently versioned. Requests carry protocol version, r
 Phase 7A introduces typed boolean, number, datetime, and string vectors. Every vector carries a packed
 validity bitmap; strings are dictionary-coded, numbers and datetimes use `Float64Array`, and booleans
 use byte values. `query()` and `prepareQuery()` materialize the referenced columns at one leased
-snapshot, replay visible insert, upsert, update, and delete segments into column values, and bind the
+snapshot. Append/base segments decode from validated physical blocks directly into preallocated
+vectors; keyed mutations replay into typed slot vectors and compact live slots without a full boxed
+column copy. The engine then binds the
 public SQL plan to those vectors. The executor scans 2,048 source rows per batch and passes
 duplicate-match join fan-out through downstream operators in reserved `Int32Array` chunks. Query
 preparation reads the transaction/segment visibility catalog once per leased multi-table snapshot.
@@ -448,8 +450,9 @@ chains without boxed arrays. Null and `NaN` keys are not indexed, `-0` shares th
 type tags prevent numeric/string aliasing. Dense declared-unique integer keys continue to use a direct
 typed lookup. Growth follows the same reserve-new, copy, release-old high-water contract as grouping.
 
-This slice still does not satisfy the bounded-memory target. Whole projected columns and their boxed
-preparation values are materialized before vector accounting begins. The model excludes boxed
+This slice still does not satisfy the bounded-memory target. Whole projected typed columns are
+materialized before vector accounting begins, and mutation replay can retain both a typed slot
+workspace and compacted output. The model excludes boxed
 aggregate/result objects, property and JavaScript array-capacity overhead,
 sort-implementation scratch, encoding/accounting temporaries, caller-owned result lifetime, and
 browser allocator overhead. Exhaustion throws instead of spilling, and the public result remains

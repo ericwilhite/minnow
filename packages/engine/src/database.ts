@@ -61,9 +61,11 @@ import {
   type QueryResult,
 } from "./query.js";
 import { QueryMemoryContext } from "./memory.js";
-import { createColumnarTable, type ColumnarColumnInput, type ColumnarTable } from "./vector.js";
+import { type ColumnarTable, type ColumnVector } from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
+const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
+const NULL_STRING_VECTOR_CODE = 0xffffffff;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
@@ -3289,38 +3291,23 @@ export class BrowserDatabase {
       if (projectedColumns.length === 0) {
         return { name: table.name, rowCount, columns: new Map() };
       }
-      const valuesByColumn = new Map(
-        projectedColumns.map((column) => [column.id, new Array<BatchValue>(rowCount)] as const),
-      );
-      let outputRowStart = 0;
-      for (const segment of segments) {
-        await this.#renewInternalLeaseIfNeeded(snapshot);
-        const segmentBlockIds = projectedColumns.flatMap(
-          (column) => segment.columnBlockIds[column.id] ?? [],
-        );
-        const decodedColumns = await this.#loadDecodedBlocks(segmentBlockIds, snapshot);
-        for (const column of projectedColumns) {
-          const output = valuesByColumn.get(column.id);
-          if (output === undefined) throw new Error(`Projected column is missing: ${column.name}`);
-          const values = this.#readSegmentColumn(column, segment, decodedColumns);
-          for (let row = 0; row < values.length; row += 1) {
-            output[outputRowStart + row] = values[row] ?? null;
-          }
-        }
-        outputRowStart += segment.rowCount;
-      }
-      const columns = new Map<string, ColumnarColumnInput>();
+      const columns = new Map<string, ColumnVector>();
       for (const column of projectedColumns) {
-        columns.set(column.name, {
-          type: column.type,
-          values: valuesByColumn.get(column.id) ?? [],
-        });
+        columns.set(
+          column.name,
+          await this.#materializeAppendColumnVector(column, segments, snapshot, rowCount),
+        );
       }
       const projectedKey =
         keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
           ? keyColumn.name
           : undefined;
-      return createColumnarTable(table.name, columns, projectedKey);
+      return {
+        name: table.name,
+        rowCount,
+        columns,
+        ...(projectedKey ? { uniqueKey: projectedKey } : {}),
+      };
     }
     const neededColumns = [
       ...projectedColumns,
@@ -3328,25 +3315,44 @@ export class BrowserDatabase {
         ? []
         : [keyColumn]),
     ];
-    const valuesByColumn = new Map(
-      neededColumns.map((column) => [column.id, [] as BatchValue[]] as const),
+    const maximumRows = segments.reduce((total, segment) => {
+      const kind = segment.kind ?? "insert";
+      return (
+        total + (kind === "insert" || kind === "base" || kind === "upsert" ? segment.rowCount : 0)
+      );
+    }, 0);
+    const vectorsByColumn = new Map(
+      neededColumns.map(
+        (column) => [column.id, createEmptyColumnVector(column.type, maximumRows)] as const,
+      ),
     );
-    const alive: boolean[] = [];
+    const dictionaryIndexes = new Map(
+      neededColumns
+        .filter((column) => column.type === "string")
+        .map((column) => [column.id, new Map<string, number>()] as const),
+    );
+    const alive = new Uint8Array(maximumRows);
     const rowIndexByKey = new Map<string, number>();
+    let slotCount = 0;
 
     for (const segment of segments) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
-      const segmentBlockIds = neededColumns.flatMap(
-        (column) => segment.columnBlockIds[column.id] ?? [],
-      );
-      const decodedColumns = await this.#loadDecodedBlocks(segmentBlockIds, snapshot);
+      const segmentVectors = new Map<string, ColumnVector>();
+      for (const column of neededColumns) {
+        if ((segment.columnBlockIds[column.id]?.length ?? 0) === 0) continue;
+        segmentVectors.set(
+          column.id,
+          await this.#materializeAppendColumnVector(column, [segment], snapshot, segment.rowCount),
+        );
+      }
       if (segment.kind === "delete") {
         if (keyColumn === undefined)
           throw new Error(`Delete segment has no unique key: ${segment.id}`);
-        for (const value of this.#readSegmentColumn(keyColumn, segment, decodedColumns)) {
-          const token = keyToken(keyColumn.type, value);
+        const keyVector = requiredColumnVector(segmentVectors, keyColumn, segment);
+        for (let row = 0; row < segment.rowCount; row += 1) {
+          const token = columnVectorKeyToken(keyColumn.type, keyVector, row);
           const existingIndex = rowIndexByKey.get(token);
-          if (existingIndex !== undefined) alive[existingIndex] = false;
+          if (existingIndex !== undefined) alive[existingIndex] = 0;
           rowIndexByKey.delete(token);
         }
         continue;
@@ -3354,89 +3360,186 @@ export class BrowserDatabase {
       if (segment.kind === "update") {
         if (keyColumn === undefined)
           throw new Error(`Update segment has no unique key: ${segment.id}`);
-        const keyValues = this.#readSegmentColumn(keyColumn, segment, decodedColumns);
+        const keyVector = requiredColumnVector(segmentVectors, keyColumn, segment);
         const changedColumns = projectedColumns.filter(
           (column) =>
             column.id !== keyColumn.id && (segment.columnBlockIds[column.id]?.length ?? 0) > 0,
         );
-        const changedValues = new Map(
-          changedColumns.map(
-            (column) =>
-              [column.id, this.#readSegmentColumn(column, segment, decodedColumns)] as const,
-          ),
-        );
-        keyValues.forEach((value, rowIndex) => {
-          const existingIndex = rowIndexByKey.get(keyToken(keyColumn.type, value));
-          if (existingIndex === undefined || alive[existingIndex] !== true) {
+        for (let row = 0; row < segment.rowCount; row += 1) {
+          const existingIndex = rowIndexByKey.get(
+            columnVectorKeyToken(keyColumn.type, keyVector, row),
+          );
+          if (existingIndex === undefined || alive[existingIndex] !== 1) {
             throw new Error(`Update segment references a missing key: ${segment.id}`);
           }
           for (const column of changedColumns) {
-            const values = valuesByColumn.get(column.id);
-            if (values === undefined)
-              throw new Error(`Projected column is missing: ${column.name}`);
-            values[existingIndex] = changedValues.get(column.id)?.[rowIndex] ?? null;
+            copyColumnVectorValue(
+              requiredColumnVector(segmentVectors, column, segment),
+              row,
+              requiredColumnVector(vectorsByColumn, column, segment),
+              existingIndex,
+              dictionaryIndexes.get(column.id),
+            );
           }
-        });
+        }
         continue;
       }
 
-      const segmentValues = new Map(
-        neededColumns.map(
-          (column) =>
-            [column.id, this.#readSegmentColumn(column, segment, decodedColumns)] as const,
-        ),
-      );
       for (let segmentRow = 0; segmentRow < segment.rowCount; segmentRow += 1) {
         let existingIndex: number | undefined;
         let token: string | undefined;
         if (keyColumn !== undefined) {
-          const keyValue = segmentValues.get(keyColumn.id)?.[segmentRow] ?? null;
-          token = keyToken(keyColumn.type, keyValue);
+          token = columnVectorKeyToken(
+            keyColumn.type,
+            requiredColumnVector(segmentVectors, keyColumn, segment),
+            segmentRow,
+          );
           existingIndex = rowIndexByKey.get(token);
         }
         if (segment.kind === "upsert" && existingIndex !== undefined) {
           for (const column of neededColumns) {
-            const values = valuesByColumn.get(column.id);
-            if (values === undefined)
-              throw new Error(`Projected column is missing: ${column.name}`);
-            values[existingIndex] = segmentValues.get(column.id)?.[segmentRow] ?? null;
+            copyColumnVectorValue(
+              requiredColumnVector(segmentVectors, column, segment),
+              segmentRow,
+              requiredColumnVector(vectorsByColumn, column, segment),
+              existingIndex,
+              dictionaryIndexes.get(column.id),
+            );
           }
-          alive[existingIndex] = true;
+          alive[existingIndex] = 1;
           continue;
         }
         if (existingIndex !== undefined) {
           throw new Error(`Stored table contains a duplicate unique key: ${table.name}`);
         }
-        const outputIndex = alive.length;
+        const outputIndex = slotCount;
         for (const column of neededColumns) {
-          valuesByColumn.get(column.id)?.push(segmentValues.get(column.id)?.[segmentRow] ?? null);
+          copyColumnVectorValue(
+            requiredColumnVector(segmentVectors, column, segment),
+            segmentRow,
+            requiredColumnVector(vectorsByColumn, column, segment),
+            outputIndex,
+            dictionaryIndexes.get(column.id),
+          );
         }
-        alive.push(true);
+        alive[outputIndex] = 1;
+        slotCount += 1;
         if (token !== undefined) rowIndexByKey.set(token, outputIndex);
       }
     }
 
-    const hasDeletedRows = alive.some((visible) => !visible);
+    let visibleRowCount = 0;
+    for (let row = 0; row < slotCount; row += 1) visibleRowCount += alive[row] ?? 0;
     if (projectedColumns.length === 0) {
-      return {
-        name: table.name,
-        rowCount: hasDeletedRows ? alive.filter(Boolean).length : alive.length,
-        columns: new Map(),
-      };
+      return { name: table.name, rowCount: visibleRowCount, columns: new Map() };
     }
-    const columns = new Map<string, ColumnarColumnInput>();
+    const columns = new Map<string, ColumnVector>();
     for (const column of projectedColumns) {
-      const sourceValues = valuesByColumn.get(column.id) ?? [];
-      const values = hasDeletedRows
-        ? sourceValues.filter((_value, rowIndex) => alive[rowIndex] === true)
-        : sourceValues;
-      columns.set(column.name, { type: column.type, values });
+      const source = requiredColumnVector(vectorsByColumn, column);
+      const output = createEmptyColumnVector(column.type, visibleRowCount);
+      const outputDictionaryIndex =
+        column.type === "string" ? new Map<string, number>() : undefined;
+      let outputRow = 0;
+      for (let sourceRow = 0; sourceRow < slotCount; sourceRow += 1) {
+        if (alive[sourceRow] !== 1) continue;
+        copyColumnVectorValue(source, sourceRow, output, outputRow, outputDictionaryIndex);
+        outputRow += 1;
+      }
+      columns.set(column.name, output);
     }
     const projectedKey =
       keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
         ? keyColumn.name
         : undefined;
-    return createColumnarTable(table.name, columns, projectedKey);
+    return {
+      name: table.name,
+      rowCount: visibleRowCount,
+      columns,
+      ...(projectedKey ? { uniqueKey: projectedKey } : {}),
+    };
+  }
+
+  async #materializeAppendColumnVector(
+    column: TableColumnRecord,
+    segments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+    rowCount: number,
+  ): Promise<ColumnVector> {
+    const validity = new Uint8Array(Math.ceil(rowCount / 8));
+    const values =
+      column.type === "boolean"
+        ? new Uint8Array(rowCount)
+        : column.type === "number" || column.type === "datetime"
+          ? new Float64Array(rowCount)
+          : undefined;
+    const stringCodes = column.type === "string" ? new Uint32Array(rowCount) : undefined;
+    stringCodes?.fill(NULL_STRING_VECTOR_CODE);
+    const stringDictionary: string[] = [];
+    const stringDictionaryIndex = new Map<string, number>();
+    let outputRow = 0;
+
+    for (const segment of segments) {
+      const blockIds = segment.columnBlockIds[column.id] ?? [];
+      let segmentRows = 0;
+      for (let start = 0; start < blockIds.length; start += 16) {
+        await this.#renewInternalLeaseIfNeeded(snapshot);
+        const ids = blockIds.slice(start, start + 16);
+        const blocks = await this.store.getBlocks(ids);
+        const decodedBlocks = await Promise.all(
+          blocks.map(async (bytes, index) => {
+            const blockId = ids[index] ?? "";
+            if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+            return decodePhysicalBlock(bytes);
+          }),
+        );
+        for (const decoded of decodedBlocks) {
+          if (decoded.column.type !== column.type) {
+            throw new Error(`Column type mismatch: ${column.name}`);
+          }
+          if (outputRow + decoded.column.rowCount > rowCount) {
+            throw new Error(`Column row count mismatch: ${column.name}`);
+          }
+          appendPhysicalColumnToVector(
+            decoded.column,
+            outputRow,
+            validity,
+            values,
+            stringCodes,
+            stringDictionary,
+            stringDictionaryIndex,
+          );
+          outputRow += decoded.column.rowCount;
+          segmentRows += decoded.column.rowCount;
+        }
+      }
+      if (segmentRows !== segment.rowCount) {
+        throw new Error(`Column row count mismatch: ${column.name}`);
+      }
+    }
+    if (outputRow !== rowCount) throw new Error(`Column row count mismatch: ${column.name}`);
+    if (column.type === "string") {
+      return {
+        kind: "string",
+        length: rowCount,
+        validity,
+        codes: stringCodes ?? new Uint32Array(),
+        dictionary: stringDictionary,
+      };
+    }
+    if (column.type === "boolean") {
+      return {
+        kind: "boolean",
+        length: rowCount,
+        validity,
+        values: values as Uint8Array,
+      };
+    }
+    return {
+      kind: column.type,
+      length: rowCount,
+      validity,
+      values: values as Float64Array,
+    };
   }
 
   #readSegment(
@@ -3853,6 +3956,168 @@ function positiveFiniteNumber(value: number, name: string): number {
     throw new RangeError(`${name} must be a positive finite number`);
   }
   return value;
+}
+
+function appendPhysicalColumnToVector(
+  column: ValidatedPhysicalColumn,
+  outputRowStart: number,
+  outputValidity: Uint8Array,
+  outputValues: Uint8Array | Float64Array | undefined,
+  outputStringCodes: Uint32Array | undefined,
+  stringDictionary: string[],
+  stringDictionaryIndex: Map<string, number>,
+): void {
+  const sourceValidityLength = Math.ceil(column.rowCount / 8);
+  const sourceValidity = column.bytes.subarray(0, sourceValidityLength);
+  for (let row = 0; row < column.rowCount; row += 1) {
+    if (bitmapHasValue(sourceValidity, row)) setBitmapValue(outputValidity, outputRowStart + row);
+  }
+
+  if (column.type === "boolean") {
+    if (!(outputValues instanceof Uint8Array)) throw new Error("Boolean vector is missing");
+    const sourceValues = column.bytes.subarray(sourceValidityLength);
+    for (let row = 0; row < column.rowCount; row += 1) {
+      if (bitmapHasValue(sourceValues, row)) outputValues[outputRowStart + row] = 1;
+    }
+    return;
+  }
+  if (column.type === "number" || column.type === "datetime") {
+    if (!(outputValues instanceof Float64Array))
+      throw new Error(`${column.type} vector is missing`);
+    const sourceValues = new DataView(
+      column.bytes.buffer,
+      column.bytes.byteOffset + sourceValidityLength,
+      column.rowCount * 8,
+    );
+    for (let row = 0; row < column.rowCount; row += 1) {
+      if (bitmapHasValue(sourceValidity, row)) {
+        outputValues[outputRowStart + row] = sourceValues.getFloat64(row * 8, true);
+      }
+    }
+    return;
+  }
+  if (outputStringCodes === undefined) throw new Error("String vector is missing");
+  const offsetsLength = (column.rowCount + 1) * 4;
+  const offsets = new DataView(
+    column.bytes.buffer,
+    column.bytes.byteOffset + sourceValidityLength,
+    offsetsLength,
+  );
+  const content = column.bytes.subarray(sourceValidityLength + offsetsLength);
+  for (let row = 0; row < column.rowCount; row += 1) {
+    if (!bitmapHasValue(sourceValidity, row)) continue;
+    const start = offsets.getUint32(row * 4, true);
+    const end = offsets.getUint32((row + 1) * 4, true);
+    const value = vectorTextDecoder.decode(content.subarray(start, end));
+    let code = stringDictionaryIndex.get(value);
+    if (code === undefined) {
+      code = stringDictionary.length;
+      stringDictionary.push(value);
+      stringDictionaryIndex.set(value, code);
+    }
+    outputStringCodes[outputRowStart + row] = code;
+  }
+}
+
+function createEmptyColumnVector(type: SimpleDataType, length: number): ColumnVector {
+  const validity = new Uint8Array(Math.ceil(length / 8));
+  if (type === "boolean") {
+    return { kind: type, length, validity, values: new Uint8Array(length) };
+  }
+  if (type === "number" || type === "datetime") {
+    return { kind: type, length, validity, values: new Float64Array(length) };
+  }
+  const codes = new Uint32Array(length);
+  codes.fill(NULL_STRING_VECTOR_CODE);
+  return { kind: type, length, validity, codes, dictionary: [] };
+}
+
+function requiredColumnVector(
+  vectors: ReadonlyMap<string, ColumnVector>,
+  column: TableColumnRecord,
+  segment?: SegmentRecord,
+): ColumnVector {
+  const vector = vectors.get(column.id);
+  if (vector === undefined) {
+    throw new Error(
+      segment === undefined
+        ? `Projected column is missing: ${column.name}`
+        : `Visible column is missing: ${segment.id}.${column.name}`,
+    );
+  }
+  return vector;
+}
+
+function copyColumnVectorValue(
+  source: ColumnVector,
+  sourceRow: number,
+  target: ColumnVector,
+  targetRow: number,
+  targetDictionaryIndex?: Map<string, number>,
+): void {
+  if (source.kind !== target.kind) throw new Error("Column vector type mismatch");
+  if (!bitmapHasValue(source.validity, sourceRow)) {
+    clearBitmapValue(target.validity, targetRow);
+    if (target.kind === "string") target.codes[targetRow] = NULL_STRING_VECTOR_CODE;
+    else target.values[targetRow] = 0;
+    return;
+  }
+  setBitmapValue(target.validity, targetRow);
+  if (source.kind === "boolean" && target.kind === "boolean") {
+    target.values[targetRow] = source.values[sourceRow] ?? 0;
+    return;
+  }
+  if (
+    (source.kind === "number" || source.kind === "datetime") &&
+    (target.kind === "number" || target.kind === "datetime")
+  ) {
+    target.values[targetRow] = source.values[sourceRow] ?? 0;
+    return;
+  }
+  if (source.kind !== "string" || target.kind !== "string" || targetDictionaryIndex === undefined) {
+    throw new Error("String vector dictionary is missing");
+  }
+  const sourceCode = source.codes[sourceRow] ?? NULL_STRING_VECTOR_CODE;
+  const value = source.dictionary[sourceCode];
+  if (value === undefined) throw new Error("String vector code is invalid");
+  let targetCode = targetDictionaryIndex.get(value);
+  if (targetCode === undefined) {
+    targetCode = target.dictionary.length;
+    (target.dictionary as string[]).push(value);
+    targetDictionaryIndex.set(value, targetCode);
+  }
+  target.codes[targetRow] = targetCode;
+}
+
+function columnVectorKeyToken(type: SimpleDataType, vector: ColumnVector, row: number): string {
+  if (!bitmapHasValue(vector.validity, row)) return keyToken(type, null);
+  if (type === "boolean" && vector.kind === "boolean") {
+    return keyToken(type, vector.values[row] === 1);
+  }
+  if (type === "number" && vector.kind === "number") {
+    return keyToken(type, vector.values[row] ?? Number.NaN);
+  }
+  if (type === "datetime" && vector.kind === "datetime") {
+    return keyToken(type, new Date(vector.values[row] ?? Number.NaN));
+  }
+  if (type === "string" && vector.kind === "string") {
+    return keyToken(type, vector.dictionary[vector.codes[row] ?? NULL_STRING_VECTOR_CODE] ?? null);
+  }
+  throw new Error("Column vector type mismatch");
+}
+
+function bitmapHasValue(bitmap: Uint8Array, index: number): boolean {
+  return ((bitmap[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0;
+}
+
+function setBitmapValue(bitmap: Uint8Array, index: number): void {
+  const byte = index >>> 3;
+  bitmap[byte] = (bitmap[byte] ?? 0) | (1 << (index & 7));
+}
+
+function clearBitmapValue(bitmap: Uint8Array, index: number): void {
+  const byte = index >>> 3;
+  bitmap[byte] = (bitmap[byte] ?? 0) & ~(1 << (index & 7));
 }
 
 function validateCompression(value: unknown, name: string): Compression {

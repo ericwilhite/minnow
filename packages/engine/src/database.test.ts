@@ -1344,6 +1344,167 @@ it("physically rechunks every simple type on shared bitmap-aligned row windows",
   store.close();
 });
 
+it("prepares append and compacted snapshots directly into stable vectors", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "gzip", rowsPerBlock: 2 });
+  await database.createTable({
+    name: "vector_readings",
+    columns: [
+      { name: "active", type: "boolean", nullable: true },
+      { name: "score", type: "number", nullable: true },
+      { name: "label", type: "string", nullable: true },
+      { name: "recordedAt", type: "datetime", nullable: true },
+    ],
+  });
+  const first = await database.insertBatch("vector_readings", {
+    columns: {
+      active: [true, null, false],
+      score: [1.5, null, -2],
+      label: ["shared", null, "third"],
+      recordedAt: [new Date("2026-01-01T00:00:00Z"), null, new Date("2026-01-03T00:00:00Z")],
+    },
+  });
+  await database.insertBatch("vector_readings", {
+    columns: {
+      active: [null, true],
+      score: [4, 5],
+      label: ["shared", "fifth"],
+      recordedAt: [null, new Date("2026-01-05T00:00:00Z")],
+    },
+  });
+
+  const prepared = await database.prepareQuery(
+    "SELECT active, score, label, recordedAt FROM vector_readings ORDER BY score",
+  );
+  const beforeCompaction = prepared.execute();
+  await database.compactTable("vector_readings", {
+    targetBlockBytes: 64,
+    outputCompression: "rle",
+  });
+  expect(prepared.execute()).toEqual(beforeCompaction);
+  prepared.close();
+  expect(
+    await database.query(
+      "SELECT active, score, label, recordedAt FROM vector_readings ORDER BY score",
+    ),
+  ).toEqual(beforeCompaction);
+  expect(
+    await database.query(
+      "SELECT active, score, label, recordedAt FROM vector_readings ORDER BY score",
+      { version: first.version },
+    ),
+  ).toEqual({
+    columns: ["active", "score", "label", "recordedAt"],
+    rows: [
+      {
+        active: null,
+        score: null,
+        label: null,
+        recordedAt: null,
+      },
+      {
+        active: false,
+        score: -2,
+        label: "third",
+        recordedAt: new Date("2026-01-03T00:00:00Z"),
+      },
+      {
+        active: true,
+        score: 1.5,
+        label: "shared",
+        recordedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ],
+  });
+  store.close();
+});
+
+it("replays keyed mutations into typed vectors without changing historical results", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "rle", rowsPerBlock: 1 });
+  await database.createTable({
+    name: "vector_accounts",
+    uniqueKey: "email",
+    columns: [
+      { name: "email", type: "string" },
+      { name: "active", type: "boolean", nullable: true },
+      { name: "score", type: "number", nullable: true },
+      { name: "seenAt", type: "datetime", nullable: true },
+    ],
+  });
+  const inserted = await database.insertBatch("vector_accounts", {
+    columns: {
+      email: ["a@example.com", "b@example.com", "c@example.com"],
+      active: [true, false, null],
+      score: [1, 2, null],
+      seenAt: [new Date("2026-02-01T00:00:00Z"), null, new Date("2026-02-03T00:00:00Z")],
+    },
+  });
+  await database.update("vector_accounts", "a@example.com", {
+    active: null,
+    score: 4,
+    seenAt: new Date("2026-02-04T00:00:00Z"),
+  });
+  await database.deleteBatch("vector_accounts", { keys: ["b@example.com"] });
+  await database.upsert("vector_accounts", {
+    email: "c@example.com",
+    active: true,
+    score: 5,
+    seenAt: null,
+  });
+  await database.upsert("vector_accounts", {
+    email: "d@example.com",
+    active: false,
+    score: 6,
+    seenAt: new Date("2026-02-06T00:00:00Z"),
+  });
+
+  expect(
+    await database.query("SELECT email, active, score, seenAt FROM vector_accounts ORDER BY email"),
+  ).toEqual({
+    columns: ["email", "active", "score", "seenAt"],
+    rows: [
+      {
+        email: "a@example.com",
+        active: null,
+        score: 4,
+        seenAt: new Date("2026-02-04T00:00:00Z"),
+      },
+      { email: "c@example.com", active: true, score: 5, seenAt: null },
+      {
+        email: "d@example.com",
+        active: false,
+        score: 6,
+        seenAt: new Date("2026-02-06T00:00:00Z"),
+      },
+    ],
+  });
+  expect(
+    await database.query(
+      "SELECT email, active, score, seenAt FROM vector_accounts ORDER BY email",
+      { version: inserted.version },
+    ),
+  ).toEqual({
+    columns: ["email", "active", "score", "seenAt"],
+    rows: [
+      {
+        email: "a@example.com",
+        active: true,
+        score: 1,
+        seenAt: new Date("2026-02-01T00:00:00Z"),
+      },
+      { email: "b@example.com", active: false, score: 2, seenAt: null },
+      {
+        email: "c@example.com",
+        active: null,
+        score: null,
+        seenAt: new Date("2026-02-03T00:00:00Z"),
+      },
+    ],
+  });
+  store.close();
+});
+
 it("refines skewed strings to exact target-sized windows before persisting the plan", async () => {
   const store = new MemoryBlockStore();
   const database = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 64 });

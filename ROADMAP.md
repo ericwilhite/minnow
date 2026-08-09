@@ -282,9 +282,10 @@ stay within their explicitly scoped write-amplification budgets.
 Deliver bounded `Batch`, typed `Vector`, validity bitmap, string-vector, selection-vector, and memory-context primitives. Initial operators: segment scan, filter, project, limit, aggregate, hash aggregate, sort, and hash join.
 
 Phase 7A is implemented as a deliberately narrower first slice. The public `query()` and
-`prepareQuery()` paths replay visible insert, upsert, update, and delete segments into projected
-column values, then execute against typed boolean, number, datetime, and dictionary-coded string
-vectors with packed validity bitmaps. Scans advance in 2,048-row source batches, and duplicate-match
+`prepareQuery()` paths decode append/base physical blocks directly into preallocated vectors and
+replay insert, upsert, update, and delete segments through typed mutation workspaces, then execute
+against typed boolean, number, datetime, and dictionary-coded string vectors with packed validity
+bitmaps. Neither path builds a full boxed-value copy. Scans advance in 2,048-row source batches, and duplicate-match
 join fan-out is passed through the remaining operators in reserved typed chunks. Multi-table snapshot
 preparation shares one transaction/segment visibility catalog, and metadata-only append/base scans do
 not load an arbitrary data column. Filters, projection, limits, core
@@ -318,8 +319,9 @@ reserved before allocation. Dense unique integer joins keep their direct typed l
 hash collisions, typed keys, duplicate order, `-0`, SQL `NaN` behavior, exact budget failure, and
 row/vector parity.
 
-Phase 7 remains open. Preparation still materializes every projected input column in full before the
-modeled reservations take effect. Boxed aggregate/result objects, property and JavaScript
+Phase 7 remains open. Preparation still materializes every projected typed input column in full before
+the modeled reservations take effect, and mutation replay can temporarily retain a typed slot
+workspace plus its compacted output. Boxed aggregate/result objects, property and JavaScript
 array-capacity overhead, sort implementation scratch, encoding temporaries, caller-owned
 result lifetime, and allocator overhead are not counted; there is no spill path. Configured exhaustion
 fails instead of spilling, while the default remains effectively unbounded. Phase 7A/B/C-A also do not

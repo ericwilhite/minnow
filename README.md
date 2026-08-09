@@ -144,8 +144,10 @@ coverage.
 
 Phase 7A backs that public SQL surface with typed column vectors. Booleans use byte values, numbers
 and datetimes use `Float64Array`, strings use dictionary-coded `Uint32Array` values, and every vector
-has a packed validity bitmap. Snapshot preparation replays visible inserts, upserts, updates, and
-deletes directly into projected column values before creating the vectors. Execution scans 2,048
+has a packed validity bitmap. Append/base snapshots decode validated physical blocks directly into
+preallocated vectors without a full boxed-value copy. Keyed mutation snapshots replay inserts,
+upserts, updates, and deletes through typed mutable vectors and compact live slots into the retained
+vectors, likewise avoiding full-table boxed column arrays. Execution scans 2,048
 source rows at a time and feeds duplicate-match join fan-out onward in reserved `Int32Array` chunks.
 Multi-table preparation loads one shared transaction/segment visibility catalog instead of rescanning
 it per table. Column-free append/base queries such as `COUNT(*)` derive their scan cardinality from
@@ -185,8 +187,9 @@ distinct, and follows SQL null and `NaN` equality semantics. Dense unique intege
 direct typed lookup fast path.
 
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
-still materializes each projected input in full before the vector reservation is installed. The model
-does not include boxed preparation values; aggregate/result objects, properties, or JavaScript
+still materializes each projected typed input in full before the vector reservation is installed;
+mutation replay can temporarily retain both its typed slot workspace and compacted output. The model
+does not include aggregate/result objects, properties, or JavaScript
 array-capacity overhead; the sort implementation's internal scratch;
 encoding/accounting temporaries; the lifetime of returned rows after ownership transfers to the
 caller; or engine/browser allocator overhead. Configured exhaustion fails the query instead of
