@@ -46,9 +46,9 @@ Deliver a browser page that runs all database work in a dedicated worker and mea
 - logical bytes, stored bytes, compression ratio, block count, and failures;
 - environment metadata sufficient to compare runs.
 
-The dashboard's default correctness workload is a deterministic 27-table commerce graph. One scale
+The dashboard's default correctness workload is a deterministic 50-table commerce graph. One scale
 multiplier grows every dimension, bridge, transaction, and ledger table. It validates primary keys,
-41 foreign-key paths, value domains, and transaction coverage before running 15 oracle-checked
+81 foreign-key paths, value domains, and transaction coverage before running 15 oracle-checked
 reference queries. A measured, read-only ad-hoc reference SQL console remains explicitly separate
 from library timings. The library now has a correctness-first native `query()`/`prepareQuery()` SQL
 subset for projections, filters, equi-joins, grouping, core aggregates, ordering, and limits. The
@@ -63,8 +63,8 @@ Initial matrix:
 - memory budgets to preserve in future query tests: 16, 32, 64, 128, and 256 MiB.
 
 The dashboard automates the raw/RLE/gzip comparison across all five block sizes and can preserve a
-raw result bundle from Playwright. The checked-in 2026-08-08 Chromium and Firefox runs cover
-1,930,800 rows and about 90 MiB of encoded payload per cell. All 30 cells verified. The decision
+raw result bundle from Playwright. The earlier checked-in 2026-08-08 27-table Chromium and Firefox
+runs cover 1,930,800 rows and about 90 MiB of encoded payload per cell. All 30 cells verified. The decision
 record selects gzip with a provisional 2 MiB target for storage-oriented benchmark and physical
 rewrite work. Phase 6B uses that as its default estimated uncompressed physical target and persists
 the selected byte target with each rewrite job; ordinary row-partitioned writes remain separately

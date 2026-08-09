@@ -406,9 +406,9 @@ keeps a snapshot across asynchronous work or an explicit collection pass must us
 
 The browser dashboard currently supports:
 
-- one deterministic 27-table commerce graph spanning geography, currencies, tax, catalog,
-  suppliers, customers, addresses, payment methods, promotions, orders, line items, discounts,
-  payments, payment transactions, fulfillment, returns, refunds, and inventory ledgers;
+- one deterministic 50-table commerce graph spanning geography, currencies, channels, stores,
+  staff, tax, catalog, procurement, customers, loyalty, carts, orders, payments, fulfillment,
+  returns, support, audit, and inventory ledgers;
 - a single scale multiplier that grows every dimension, bridge, transaction, and supporting table;
 - data groups with numbers, text, dates, and yes/no values;
 - block sizes from 256 KB to 4 MB;
@@ -421,7 +421,7 @@ The browser dashboard currently supports:
   verified raw JSON downloads; the current cross-browser result provisionally selects gzip with a
   2 MiB target for storage-oriented physical rewrites;
 - a lazy-loaded public SQL comparison against SQLite Wasm, DuckDB-Wasm, and PGlite using the same
-  27-table batches, explicit persistence/configuration disclosures, portable checksum-verified SQL,
+  50-table batches, explicit persistence/configuration disclosures, portable checksum-verified SQL,
   per-query median/p95 timing, engine-reported database size, loaded asset bytes, and available heap
   telemetry; all four engines must return matching checksums, and BrowserDatabase reports snapshot
   preparation separately from repeated `PreparedQuery.execute()` timing;
@@ -438,7 +438,7 @@ The browser dashboard currently supports:
 - per-write encoding, staging, commit, retry, throughput, and write-amplification metrics;
 - an append-compaction probe that verifies current rows, historical snapshots, manifest visibility,
   and retained source blocks;
-- 41 checked foreign-key paths plus primary-key, value-domain, and transaction-ledger integrity
+- 81 checked foreign-key paths plus primary-key, value-domain, and transaction-ledger integrity
   checks;
 - 15 relational reference queries ranging from a point lookup and date filter to joins,
   aggregates, anti-joins, cohort analysis, revenue matrices, tax, fulfillment, payment-funnel,
@@ -456,13 +456,13 @@ SQL API timings. `readTable` loads one shared snapshot, reusable JavaScript hash
 once, and each optimized query reports a seven-sample total plus median and p95 per execution. Fast
 queries are batched within each sample to exceed coarse browser timer resolution, and the actual
 execution count plus measurement wall time are disclosed. A separate implementation acts as a
-result oracle; row counts and normalized checksums must agree. The suite also validates all 27 table
-counts, primary-key uniqueness, 41 foreign-key paths, dates, statuses, quantities, discounts,
+result oracle; row counts and normalized checksums must agree. The suite also validates all 50 table
+counts, primary-key uniqueness, 81 foreign-key paths, dates, statuses, quantities, discounts,
 monetary values, and transaction/ledger coverage. The dashboard reports snapshot loading and index
 construction separately and shows the reference SQL for every catalog query.
 
-The ad-hoc console uses a deliberately bounded reference runner over the materialized snapshot. It
-supports one read-only `SELECT` with equi-joins, `WHERE` predicates joined by `AND`, grouping,
+The ad-hoc console reopens the latest persisted IndexedDB dataset and prepares only columns referenced
+by the query. It supports one read-only `SELECT` with equi-joins, `WHERE` predicates joined by `AND`, grouping,
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, ordering, and a limit. It rejects mutations and unsupported SQL.
 Catalog-query and ad-hoc timings are correctness and workload-shape measurements, not native query
 engine performance claims. They remain separate from the public vector-backed SQL subset; the full

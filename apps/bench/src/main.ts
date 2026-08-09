@@ -10,6 +10,7 @@ import {
   type BenchmarkProgress,
   type BenchmarkResult,
   type DurabilityMode,
+  type PersistedDatasetStatus,
 } from "./benchmark.js";
 import type { EngineComparisonResult } from "./engine-comparison.js";
 import "./style.css";
@@ -63,6 +64,7 @@ const historyTable = required<HTMLElement>("#history-table");
 const historyRows = required<HTMLElement>("#history-rows");
 const comparisonSummary = required<HTMLElement>("#comparison-summary");
 const adHocDatasetState = required<HTMLElement>("#ad-hoc-dataset-state");
+const wipeDatasetsButton = required<HTMLButtonElement>("#wipe-datasets");
 const adHocSql = required<HTMLTextAreaElement>("#ad-hoc-sql");
 const runAdHocButton = required<HTMLButtonElement>("#run-ad-hoc");
 const adHocStatus = required<HTMLElement>("#ad-hoc-status");
@@ -84,6 +86,9 @@ const adHocHistory: AdHocQueryResult[] = [];
 let activeRequestId: string | undefined;
 let activeQueryRequestId: string | undefined;
 let activeEngineComparisonRequestId: string | undefined;
+let activeDatasetRequestId: string | undefined;
+let activeDatasetRequestKind: "status" | "wipe" | undefined;
+let persistedDatasetAvailable = false;
 let pendingConfigs: BenchmarkConfig[] = [];
 let batchTotal = 0;
 let batchCompleted = 0;
@@ -96,6 +101,11 @@ WHERE o.status = 'paid'
 GROUP BY c.segment
 ORDER BY revenue DESC
 LIMIT 20`,
+  orders: `SELECT o.status, COUNT(*) AS orders, SUM(o.total) AS gross_total
+FROM orders o
+GROUP BY o.status
+ORDER BY gross_total DESC
+LIMIT 10`,
   tax: `SELECT j.name, COUNT(*) AS tax_lines, SUM(t.tax_amount) AS tax_collected
 FROM order_taxes t
 JOIN tax_rates r ON r.tax_rate_id = t.tax_rate_id
@@ -109,6 +119,18 @@ JOIN inventory_movements m ON m.supplier_id = s.supplier_id
 GROUP BY s.name
 ORDER BY movements DESC
 LIMIT 25`,
+  returns: `SELECT c.segment, COUNT(*) AS returns
+FROM returns r
+JOIN orders o ON o.order_id = r.order_id
+JOIN customers c ON c.customer_id = o.customer_id
+GROUP BY c.segment
+ORDER BY returns DESC
+LIMIT 10`,
+  events: `SELECT e.event_type, COUNT(*) AS events
+FROM order_events e
+GROUP BY e.event_type
+ORDER BY events DESC
+LIMIT 10`,
 };
 
 updateConfigurationSummary();
@@ -131,6 +153,13 @@ worker.addEventListener("message", (event: MessageEvent<WorkerResponse>) => {
       adHocStatus.className = "query-error";
       return;
     }
+    if (message.requestId === activeDatasetRequestId) {
+      activeDatasetRequestId = undefined;
+      activeDatasetRequestKind = undefined;
+      adHocDatasetState.textContent = `${message.error.name}: ${message.error.message}`;
+      wipeDatasetsButton.disabled = !persistedDatasetAvailable;
+      return;
+    }
     if (message.requestId === activeEngineComparisonRequestId) {
       activeEngineComparisonRequestId = undefined;
       engineComparisonState.textContent = "Failed";
@@ -146,6 +175,13 @@ worker.addEventListener("message", (event: MessageEvent<WorkerResponse>) => {
     runAdHocButton.disabled = false;
     adHocHistory.unshift(message.result);
     renderAdHocResult(message.result);
+    return;
+  }
+  if (message.requestId === activeDatasetRequestId && isPersistedDatasetStatus(message.result)) {
+    const requestKind = activeDatasetRequestKind;
+    activeDatasetRequestId = undefined;
+    activeDatasetRequestKind = undefined;
+    renderPersistedDatasetStatus(message.result, requestKind === "wipe");
     return;
   }
   if (
@@ -176,6 +212,8 @@ worker.addEventListener("error", (event) => {
   finishWithError(`Worker error: ${event.message}`);
 });
 
+refreshPersistedDatasetStatus();
+
 form.addEventListener("input", updateConfigurationSummary);
 form.addEventListener("change", updateConfigurationSummary);
 
@@ -198,6 +236,25 @@ runAdHocButton.addEventListener("click", () => {
     requestId: activeQueryRequestId,
     operation: "adHocQuery",
     payload: { sql: adHocSql.value },
+  });
+});
+
+wipeDatasetsButton.addEventListener("click", () => {
+  if (
+    activeDatasetRequestId !== undefined ||
+    !window.confirm("Delete every dataset retained by this dashboard? This cannot be undone.")
+  )
+    return;
+  activeDatasetRequestId = crypto.randomUUID();
+  activeDatasetRequestKind = "wipe";
+  wipeDatasetsButton.disabled = true;
+  runAdHocButton.disabled = true;
+  adHocDatasetState.textContent = "Wiping stored datasets…";
+  worker.postMessage({
+    version: protocolVersion,
+    requestId: activeDatasetRequestId,
+    operation: "wipeDatasets",
+    payload: {},
   });
 });
 
@@ -279,8 +336,10 @@ function beginBatch(configs: BenchmarkConfig[]): void {
   batchCompleted = 0;
   setRunning(true);
   runAdHocButton.disabled = true;
-  adHocDatasetState.textContent = "Generating a new dataset…";
-  adHocStatus.textContent = "Available when the current run completes.";
+  adHocDatasetState.textContent = persistedDatasetAvailable
+    ? "Creating a new persistent dataset · existing data remains stored"
+    : "Creating a persistent dataset…";
+  adHocStatus.textContent = "Queries resume when the current run completes.";
   startNextRun();
 }
 
@@ -335,9 +394,7 @@ function renderResult(result: BenchmarkResult): void {
   verificationBadge.textContent = result.verified
     ? "✓ Storage, transactions, writes, and reference queries pass"
     : "× A storage, transaction, write, or reference-query check failed";
-  runAdHocButton.disabled = false;
-  adHocDatasetState.textContent = `${formatDecimal(result.config.scale)}× · ${formatInteger(result.referenceQueries.totalRows)} rows loaded`;
-  adHocStatus.textContent = "Ready. Seven timed iterations per query.";
+  refreshPersistedDatasetStatus();
 
   const primary = primaryMetric(result);
   const primarySeconds = Math.max(primary.value / 1_000, 0.000_001);
@@ -498,10 +555,14 @@ function renderAdHocResult(result: AdHocQueryResult): void {
   adHocMetrics.innerHTML = [
     metric("Median", formatDuration(result.metrics.executeMedianMs), "execution · 7 iterations"),
     metric("p95", formatDuration(result.metrics.executeP95Ms), "execution tail"),
-    metric("Parse", formatDuration(result.metrics.parseMs), "validation + plan"),
-    metric("Source rows", formatInteger(result.metrics.sourceRows), "rows read by table sources"),
-    metric("Joined rows", formatInteger(result.metrics.joinedRows), "before WHERE filtering"),
-    metric("Result rows", formatInteger(result.rowCount), "before preview limit"),
+    metric("Prepare + read", formatDuration(result.metrics.prepareMs), "IndexedDB + decode + plan"),
+    metric("Source rows", formatInteger(result.metrics.sourceRows), "rows in referenced tables"),
+    metric(
+      "Dataset",
+      formatInteger(result.metrics.datasetRows),
+      "persisted rows across all tables",
+    ),
+    metric("Stored", formatBytes(result.metrics.storedBytes), "logical IndexedDB payload"),
   ].join("");
   adHocResultHead.innerHTML = `<tr>${result.columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr>`;
   adHocResultRows.innerHTML = result.previewRows
@@ -524,10 +585,49 @@ function renderAdHocResult(result: AdHocQueryResult): void {
         <td>${formatInteger(query.rowCount)}</td>
         <td>${formatDuration(query.metrics.executeMedianMs)}</td>
         <td>${formatDuration(query.metrics.executeP95Ms)}</td>
-        <td>${formatDuration(query.metrics.parseMs)}</td>
+        <td>${formatDuration(query.metrics.prepareMs)}</td>
       </tr>`,
     )
     .join("");
+}
+
+function refreshPersistedDatasetStatus(): void {
+  if (activeDatasetRequestId !== undefined) return;
+  activeDatasetRequestId = crypto.randomUUID();
+  activeDatasetRequestKind = "status";
+  worker.postMessage({
+    version: protocolVersion,
+    requestId: activeDatasetRequestId,
+    operation: "datasetStatus",
+    payload: {},
+  });
+}
+
+function renderPersistedDatasetStatus(status: PersistedDatasetStatus, wiped: boolean): void {
+  persistedDatasetAvailable = status.available;
+  runAdHocButton.disabled =
+    !status.available || activeQueryRequestId !== undefined || activeRequestId !== undefined;
+  wipeDatasetsButton.disabled =
+    !status.available ||
+    activeRequestId !== undefined ||
+    activeEngineComparisonRequestId !== undefined;
+  if (!status.available) {
+    adHocDatasetState.textContent = "No persisted dataset";
+    adHocStatus.className = "";
+    adHocStatus.textContent = wiped
+      ? "Stored datasets were wiped. Run a benchmark to create one."
+      : "Run a benchmark to create a persistent dataset first.";
+    if (wiped) {
+      adHocResult.hidden = true;
+      adHocHistory.splice(0);
+      adHocHistoryTable.hidden = true;
+      adHocHistoryEmpty.hidden = false;
+    }
+    return;
+  }
+  adHocDatasetState.textContent = `Persisted · ${formatDecimal(status.scale ?? 0)}× · ${formatInteger(status.totalRows ?? 0)} rows · ${formatBytes(status.storedBytes ?? 0)} · ${String(status.datasetCount)} saved`;
+  adHocStatus.className = "";
+  adHocStatus.textContent = "Ready from IndexedDB. Preparation and execution are timed separately.";
 }
 
 function formatQueryValue(value: unknown): string {
@@ -640,19 +740,23 @@ function updateConfigurationSummary(): void {
   const scale = Number(scaleSelect.value);
   const totalRows = relationalTotalRows(scale);
   const orderRows = relationalRowCount("orders", scale);
+  const largestTable = scenario.entities.reduce((largest, entity) =>
+    entity.rows(scale) > largest.rows(scale) ? entity : largest,
+  );
+  const largestTableRows = largestTable.rows(scale);
   const repetitions = Number(repetitionsSelect.value);
   const repetitionCopy = repetitions === 1 ? "one run" : `${String(repetitions)} sequential runs`;
   const blockSize = blockSizeSelect.selectedOptions[0]?.textContent ?? blockSizeSelect.value;
 
-  scaleDescription.textContent = `${formatInteger(totalRows)} total rows · ${formatInteger(orderRows)} orders.`;
-  datasetPlanSummary.textContent = `${formatDecimal(scale)}× grows every dimension, bridge, transaction, and ledger table from one deterministic baseline. ${formatInteger(totalRows)} rows will be generated across ${String(scenario.entities.length)} tables.`;
+  scaleDescription.textContent = `${formatInteger(totalRows)} total rows · ${formatInteger(orderRows)} orders · largest table ${formatInteger(largestTableRows)} rows.`;
+  datasetPlanSummary.textContent = `${formatDecimal(scale)}× grows every dimension, bridge, transaction, and ledger table from one deterministic baseline. ${formatInteger(totalRows)} rows will be generated across ${String(scenario.entities.length)} tables; ${largestTable.name} is largest at ${formatInteger(largestTableRows)} rows.`;
   datasetPlanTables.innerHTML = scenario.entities
     .map(
       (entity) =>
         `<span><strong>${escapeHtml(entity.name)}</strong>${formatInteger(entity.rows(scale))}</span>`,
     )
     .join("");
-  runSummaryCopy.textContent = `For ${repetitionCopy}, generate the ${formatDecimal(scale)}× relational commerce dataset (${formatInteger(totalRows)} rows across ${String(scenario.entities.length)} connected tables); encode it with ${compressionSelect.value}; split columns into blocks targeting ${blockSize}; journal and atomically commit with IndexedDB durability “${durabilitySelect.value}”; then read and verify every value. The public API persists the same tables, while fixed probes cover inserts, upserts, partial updates, projections, deletes, conflicts, compaction, and recovery. The relational suite validates primary keys, ${String(41)} foreign-key paths, value domains, and transaction ledgers before running 15 oracle-checked queries seven times each. The ad-hoc console then remains attached to the loaded snapshot. Highlighted time: “${focusSelect.value}”.`;
+  runSummaryCopy.textContent = `${formatDecimal(scale)}× commerce · ${formatInteger(totalRows)} rows in ${String(scenario.entities.length)} tables · ${compressionSelect.value} into ${blockSize} blocks · ${durabilitySelect.value} IndexedDB · ${repetitionCopy}. Includes full readback, write and recovery checks, and 15 verified queries. Highlights ${focusSelect.value}.`;
 }
 
 function finishRun(): void {
@@ -686,6 +790,7 @@ function setRunning(running: boolean): void {
   runButton.disabled = running;
   compareButton.disabled = running;
   compareEnginesButton.disabled = running;
+  wipeDatasetsButton.disabled = running || !persistedDatasetAvailable;
   cancelButton.hidden = !running;
 }
 
@@ -969,6 +1074,17 @@ function isAdHocQueryResult(value: unknown): value is AdHocQueryResult {
     "previewRows" in value &&
     "metrics" in value &&
     "rowCount" in value
+  );
+}
+
+function isPersistedDatasetStatus(value: unknown): value is PersistedDatasetStatus {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "kind" in value &&
+    value.kind === "persisted-dataset-status" &&
+    "available" in value &&
+    typeof value.available === "boolean"
   );
 }
 

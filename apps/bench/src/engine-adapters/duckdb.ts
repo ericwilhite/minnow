@@ -1,8 +1,6 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { tableFromArrays } from "apache-arrow";
-import duckdbEhWasm from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
 import duckdbMvpWasm from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
-import duckdbEhWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import duckdbMvpWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
 import { generateEntityBatch } from "../benchmark.js";
 import {
@@ -25,23 +23,34 @@ export async function runDuckDb(context: AdapterContext): Promise<AdapterMeasure
   const heapBefore = heapBytes();
   let peakHeapBytes = heapBefore;
   const coldStarted = performance.now();
-  const bundle = await duckdb.selectBundle({
-    mvp: { mainModule: duckdbMvpWasm, mainWorker: duckdbMvpWorker },
-    eh: { mainModule: duckdbEhWasm, mainWorker: duckdbEhWorker },
-  });
-  if (bundle.mainWorker === null) throw new Error("DuckDB-Wasm did not select a worker bundle");
-  const worker = new Worker(bundle.mainWorker);
+  context.report("DuckDB-Wasm · starting portable runtime", 0, context.totalRows);
+  const worker = new Worker(duckdbMvpWorker);
   const database = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), worker);
-  await database.instantiate(bundle.mainModule, bundle.pthreadWorker);
-  await database.open({ path: ":memory:" });
-  const connection = await database.connect();
-  const coldStartMs = performance.now() - coldStarted;
+  let connection: duckdb.AsyncDuckDBConnection | undefined;
   let generateMs = 0;
   let insertMs = 0;
   let maxGeneratedBatchBytes = 0;
   try {
+    await withTimeout(
+      database.instantiate(duckdbMvpWasm),
+      20_000,
+      "DuckDB-Wasm worker startup timed out after 20 seconds",
+    );
+    context.report("DuckDB-Wasm · opening in-memory database", 0, context.totalRows);
+    await withTimeout(
+      database.open({ path: ":memory:" }),
+      10_000,
+      "DuckDB-Wasm database open timed out after 10 seconds",
+    );
+    const activeConnection = await withTimeout(
+      database.connect(),
+      10_000,
+      "DuckDB-Wasm connection timed out after 10 seconds",
+    );
+    connection = activeConnection;
+    const coldStartMs = performance.now() - coldStarted;
     const schemaStarted = performance.now();
-    for (const entity of context.entities) await connection.query(createTableSql(entity));
+    for (const entity of context.entities) await activeConnection.query(createTableSql(entity));
     const schemaMs = performance.now() - schemaStarted;
     let completedRows = 0;
     for (const entity of context.entities) {
@@ -66,7 +75,7 @@ export async function runDuckDb(context: AdapterContext): Promise<AdapterMeasure
         );
         const table = tableFromArrays(arrowColumns);
         const insertStarted = performance.now();
-        await connection.insertArrowTable(table, { name: entity.name, create: false });
+        await activeConnection.insertArrowTable(table, { name: entity.name, create: false });
         insertMs += performance.now() - insertStarted;
         completedRows += rowCount;
         peakHeapBytes = maxOptional(peakHeapBytes, heapBytes());
@@ -78,17 +87,17 @@ export async function runDuckDb(context: AdapterContext): Promise<AdapterMeasure
       }
     }
     const indexStarted = performance.now();
-    for (const sql of secondaryIndexSql(context.entities)) await connection.query(sql);
+    for (const sql of secondaryIndexSql(context.entities)) await activeConnection.query(sql);
     const indexMs = performance.now() - indexStarted;
     const queries = await measureSqlQueries(context.queries, async (sql) => {
-      const table = await connection.query(sql);
+      const table = await activeConnection.query(sql);
       return normalizeRows(table.toArray());
     });
-    const countTable = await connection.query("SELECT COUNT(*) AS row_count FROM orders");
+    const countTable = await activeConnection.query("SELECT COUNT(*) AS row_count FROM orders");
     const countRow = normalizeRows(countTable.toArray())[0] as { row_count?: unknown } | undefined;
     const orderRows =
       context.entities.find((entity) => entity.name === "orders")?.rows(context.config.scale) ?? 0;
-    const sizeTable = await connection.query("PRAGMA database_size");
+    const sizeTable = await activeConnection.query("PRAGMA database_size");
     const sizeRow = normalizeRows(sizeTable.toArray())[0] as
       { memory_usage?: unknown; database_size?: unknown } | undefined;
     const storedBytes = parseDuckDbBytes(sizeRow?.memory_usage ?? sizeRow?.database_size);
@@ -98,7 +107,7 @@ export async function runDuckDb(context: AdapterContext): Promise<AdapterMeasure
       version: await database.getVersion(),
       recommendedSettings: [
         "AsyncDuckDB worker",
-        "selectBundle() feature detection",
+        "portable MVP Wasm bundle",
         "Arrow record-batch ingestion",
         "in-memory analytical database",
       ],
@@ -123,11 +132,23 @@ export async function runDuckDb(context: AdapterContext): Promise<AdapterMeasure
       queries,
       verified,
       disclosure:
-        "Uses AsyncDuckDB and insertArrowTable() through the public API. DuckDB-Wasm's OPFS path was exercised separately but failed close/recreate/reopen verification in this build, so this adapter remains transparently in-memory. Size is DuckDB's reported database memory.",
+        "Uses AsyncDuckDB and insertArrowTable() through the public API with the portable MVP bundle for consistent worker startup across browser shells. DuckDB-Wasm's OPFS path was exercised separately but failed close/recreate/reopen verification in this build, so this adapter remains transparently in-memory. Size is DuckDB's reported database memory.",
     };
   } finally {
-    await connection.close().catch(() => undefined);
-    await database.terminate();
+    await connection?.close().catch(() => undefined);
+    worker.terminate();
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = self.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) self.clearTimeout(timer);
   }
 }
 

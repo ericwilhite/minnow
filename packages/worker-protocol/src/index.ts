@@ -8,7 +8,9 @@ export type WorkerOperation =
   | "benchmark"
   | "compareEngines"
   | "cancelBenchmark"
-  | "adHocQuery";
+  | "adHocQuery"
+  | "datasetStatus"
+  | "wipeDatasets";
 
 export interface WorkerRequest<T = unknown> {
   version: typeof protocolVersion;
@@ -75,5 +77,7 @@ function isOperation(value: unknown): value is WorkerOperation {
     "compareEngines",
     "cancelBenchmark",
     "adHocQuery",
+    "datasetStatus",
+    "wipeDatasets",
   ].includes(String(value));
 }

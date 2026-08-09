@@ -64,7 +64,7 @@ export function executeReferenceSql(
   const totalStarted = performance.now();
   const parseStarted = performance.now();
   const plan = parseQuery(sql, tables);
-  const parseMs = performance.now() - parseStarted;
+  const prepareMs = performance.now() - parseStarted;
   executePlan(plan, tables);
   const samples: number[] = [];
   let execution: ExecutionResult = { rows: [], sourceRows: 0, joinedRows: 0 };
@@ -86,13 +86,14 @@ export function executeReferenceSql(
     previewRows,
     truncated: execution.rows.length > previewRows.length,
     metrics: {
-      parseMs,
+      prepareMs,
       executeMedianMs: median,
       executeP95Ms: p95,
       totalMs: performance.now() - totalStarted,
       iterations,
       sourceRows: execution.sourceRows,
-      joinedRows: execution.joinedRows,
+      datasetRows: [...tables.values()].reduce((total, rows) => total + rows.length, 0),
+      storedBytes: 0,
     },
   };
 }

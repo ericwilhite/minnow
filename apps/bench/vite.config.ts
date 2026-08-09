@@ -5,12 +5,16 @@ export default defineConfig({
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
+      // WebKit fails a reloaded page's module-worker load "due to access control checks" when
+      // the worker script revalidates from cache under COEP; bypassing the cache avoids it.
+      "Cache-Control": "no-store",
     },
   },
   preview: {
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
+      "Cache-Control": "no-store",
     },
   },
   optimizeDeps: {

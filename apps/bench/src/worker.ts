@@ -27,6 +27,7 @@ import {
   durabilityModes,
   getScenario,
   scenarioIds,
+  type AdHocQueryResult,
   type BenchmarkConfig,
   type BenchmarkProgress,
   type BenchmarkResult,
@@ -36,9 +37,9 @@ import {
   type EntityDefinition,
   type LibraryCheckMeasurement,
   type LibraryTableMeasurement,
+  type PersistedDatasetStatus,
   type TransactionCheckMeasurement,
 } from "./benchmark.js";
-import { executeReferenceSql } from "./reference-sql.js";
 
 interface PendingBlock {
   measurement: BlockMeasurement;
@@ -49,8 +50,22 @@ interface PendingBlock {
 }
 
 const cancelledRuns = new Set<string>();
-let activeRelationalDataset:
-  { runId: string; tables: ReadonlyMap<string, DatabaseRow[]> } | undefined;
+const DATASET_REGISTRY_NAME = "browserdatabase-dashboard-datasets-v1";
+const DATASET_REGISTRY_STORE = "datasets";
+const DATASET_DATABASE_PREFIX = "browserdatabase-dashboard-dataset-";
+
+interface PersistedDatasetRecord {
+  runId: string;
+  databaseName: string;
+  createdAt: string;
+  scale: number;
+  compression: BenchmarkConfig["compression"];
+  targetBlockBytes: number;
+  durability: BenchmarkConfig["durability"];
+  totalRows: number;
+  storedBytes: number;
+  tableRows: Record<string, number>;
+}
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
   void runRequest(event.data);
@@ -66,22 +81,18 @@ async function runRequest(raw: unknown): Promise<void> {
       self.postMessage(success(request.requestId, { cancelled: payload.requestId }));
       return;
     }
+    if (request.operation === "datasetStatus") {
+      self.postMessage(success(request.requestId, await persistedDatasetStatus()));
+      return;
+    }
+    if (request.operation === "wipeDatasets") {
+      self.postMessage(success(request.requestId, await wipePersistedDatasets()));
+      return;
+    }
     if (request.operation === "adHocQuery") {
       const payload = request.payload as { sql?: unknown };
       if (typeof payload.sql !== "string") throw new TypeError("Query SQL must be a string");
-      if (activeRelationalDataset === undefined) {
-        throw new Error("Run the relational benchmark before executing an ad-hoc query");
-      }
-      self.postMessage(
-        success(
-          request.requestId,
-          executeReferenceSql(
-            payload.sql,
-            activeRelationalDataset.tables,
-            activeRelationalDataset.runId,
-          ),
-        ),
-      );
+      self.postMessage(success(request.requestId, await executePersistedAdHocQuery(payload.sql)));
       return;
     }
     if (request.operation === "compareEngines") {
@@ -137,7 +148,6 @@ async function runRequest(raw: unknown): Promise<void> {
 async function benchmark(requestId: string, config: BenchmarkConfig): Promise<BenchmarkResult> {
   const scenario = getScenario(config.scenario);
   const runId = crypto.randomUUID();
-  activeRelationalDataset = undefined;
   const databaseName = `browserdatabase-bench-${runId}`;
   const estimateBefore = await storageEstimate();
   const store = await IndexedDbBlockStore.open({
@@ -1125,7 +1135,7 @@ async function benchmarkReferenceQueries(
   config: BenchmarkConfig,
   runId: string,
 ): Promise<BenchmarkResult["referenceQueries"]> {
-  const databaseName = `browserdatabase-query-reference-${runId}`;
+  const databaseName = `${DATASET_DATABASE_PREFIX}${Date.now().toString(36)}-${runId}`;
   const store = await IndexedDbBlockStore.open({
     name: databaseName,
     durability: config.durability,
@@ -1149,84 +1159,40 @@ async function benchmarkReferenceQueries(
     relationship: entity.relationship ?? "supporting relation",
   }));
   const setupStarted = performance.now();
+  let retained = false;
 
   try {
     await createReferenceTables(database, relationalScenario.entities);
     await insertReferenceDataset(database, relationalScenario.entities, config.scale);
     const setupMs = performance.now() - setupStarted;
-    const loadStarted = performance.now();
-    const materialized = new Map<string, DatabaseRow[]>();
-    await Promise.all(
-      tableMetadata.map(async (table) => {
-        const tableStarted = performance.now();
-        const tableRows = await database.readTable(table.name);
-        table.loadMs = performance.now() - tableStarted;
-        materialized.set(table.name, tableRows);
-      }),
-    );
-    const loadMs = performance.now() - loadStarted;
-    const integrityChecks = validateReferenceDataset(materialized, tableMetadata);
-    const indexStarted = performance.now();
-    const context = buildReferenceQueryContext(materialized);
-    const indexMs = performance.now() - indexStarted;
+    const integrityStarted = performance.now();
+    const integrityChecks = await validatePersistedReferenceDataset(database, tableMetadata);
+    let loadMs = performance.now() - integrityStarted;
+    let indexMs = 0;
     const queries = referenceQueryDefinitions(orderRows);
     const measurements: BenchmarkResult["referenceQueries"]["queries"] = [];
     const sampleCount = 7;
 
     for (const query of queries) {
-      const warmupStarted = performance.now();
-      let result = query.execute(context);
-      const warmupMs = performance.now() - warmupStarted;
-      const executionsPerSample = Math.min(
-        5_000,
-        Math.max(1, Math.ceil(10 / Math.max(warmupMs, 0.002))),
-      );
-      const samples: number[] = [];
-      let measurementMs = 0;
-      for (let sample = 0; sample < sampleCount; sample += 1) {
-        const computeStarted = performance.now();
-        for (let execution = 0; execution < executionsPerSample; execution += 1) {
-          result = query.execute(context);
-        }
-        const elapsed = performance.now() - computeStarted;
-        measurementMs += elapsed;
-        samples.push(elapsed / executionsPerSample);
-      }
-      samples.sort((left, right) => left - right);
-      const medianMs = samples[Math.floor(samples.length / 2)] ?? 0;
-      const p95Ms = samples[Math.ceil(samples.length * 0.95) - 1] ?? medianMs;
-      const totalMs = sum(samples);
-      const checksum = referenceChecksum(result);
-      const oracleStarted = performance.now();
-      const oracleResult = query.oracle(materialized);
-      const oracleMs = performance.now() - oracleStarted;
-      const oracleChecksum = referenceChecksum(oracleResult);
-      measurements.push({
-        id: query.id,
-        name: query.name,
-        complexity: query.complexity,
-        sql: query.sql,
-        tables: query.tables,
-        sampleCount,
-        iterations: sampleCount * executionsPerSample,
-        executionsPerSample,
-        medianMs,
-        p95Ms,
-        oracleMs,
-        totalMs,
-        measurementMs,
-        resultRows: result.length,
-        expectedRows: query.expectedRows,
-        checksum,
-        oracleChecksum,
-        verified:
-          result.length === query.expectedRows &&
-          oracleResult.length === query.expectedRows &&
-          checksum === oracleChecksum,
-      });
+      const measured = await measureReferenceQueryFromStorage(database, query, sampleCount);
+      loadMs += measured.loadMs;
+      indexMs += measured.indexMs;
+      measurements.push(measured.measurement);
     }
 
-    activeRelationalDataset = { runId, tables: materialized };
+    await registerPersistedDataset({
+      runId,
+      databaseName,
+      createdAt: new Date().toISOString(),
+      scale: config.scale,
+      compression: config.compression,
+      targetBlockBytes: config.targetBlockBytes,
+      durability: config.durability,
+      totalRows: sum(tableMetadata.map((table) => table.rows)),
+      storedBytes: await store.getLogicalStorageBytes(),
+      tableRows: Object.fromEntries(tableMetadata.map((table) => [table.name, table.rows])),
+    });
+    retained = true;
     return {
       orderRows,
       totalRows: sum(tableMetadata.map((table) => table.rows)),
@@ -1241,12 +1207,84 @@ async function benchmarkReferenceQueries(
       passed:
         integrityChecks.every((check) => check.passed) &&
         measurements.every((query) => query.verified),
-      note: "Reference workload only: readTable loads one shared snapshot and JavaScript builds reusable hash indexes. Each query reports seven normalized timing samples. Fast queries are executed repeatedly inside each sample to exceed coarse browser timer resolution; the card also discloses the actual execution count and measurement wall time. An untimed independent implementation must produce the same row count and checksum. These are not query-engine operator timings.",
+      note: "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings.",
     };
   } finally {
     store.close();
-    await deleteDatabase(databaseName);
+    if (!retained) await deleteDatabase(databaseName);
   }
+}
+
+async function measureReferenceQueryFromStorage(
+  database: BrowserDatabase,
+  query: ReferenceQueryDefinition,
+  sampleCount: number,
+): Promise<{
+  loadMs: number;
+  indexMs: number;
+  measurement: BenchmarkResult["referenceQueries"]["queries"][number];
+}> {
+  const loadStarted = performance.now();
+  const tableEntries: Array<[string, DatabaseRow[]]> = [];
+  for (const table of query.tables) tableEntries.push([table, await database.readTable(table)]);
+  const materialized = new Map(tableEntries);
+  const loadMs = performance.now() - loadStarted;
+  const indexStarted = performance.now();
+  const context = buildReferenceQueryContext(materialized);
+  const indexMs = performance.now() - indexStarted;
+  const warmupStarted = performance.now();
+  let result = query.execute(context);
+  const warmupMs = performance.now() - warmupStarted;
+  const executionsPerSample = Math.min(
+    5_000,
+    Math.max(1, Math.ceil(10 / Math.max(warmupMs, 0.002))),
+  );
+  const samples: number[] = [];
+  let measurementMs = 0;
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const computeStarted = performance.now();
+    for (let execution = 0; execution < executionsPerSample; execution += 1) {
+      result = query.execute(context);
+    }
+    const elapsed = performance.now() - computeStarted;
+    measurementMs += elapsed;
+    samples.push(elapsed / executionsPerSample);
+  }
+  samples.sort((left, right) => left - right);
+  const medianMs = samples[Math.floor(samples.length / 2)] ?? 0;
+  const p95Ms = samples[Math.ceil(samples.length * 0.95) - 1] ?? medianMs;
+  const checksum = referenceChecksum(result);
+  const oracleStarted = performance.now();
+  const oracleResult = query.oracle(materialized);
+  const oracleMs = performance.now() - oracleStarted;
+  const oracleChecksum = referenceChecksum(oracleResult);
+  return {
+    loadMs,
+    indexMs,
+    measurement: {
+      id: query.id,
+      name: query.name,
+      complexity: query.complexity,
+      sql: query.sql,
+      tables: query.tables,
+      sampleCount,
+      iterations: sampleCount * executionsPerSample,
+      executionsPerSample,
+      medianMs,
+      p95Ms,
+      oracleMs,
+      totalMs: sum(samples),
+      measurementMs,
+      resultRows: result.length,
+      expectedRows: query.expectedRows,
+      checksum,
+      oracleChecksum,
+      verified:
+        result.length === query.expectedRows &&
+        oracleResult.length === query.expectedRows &&
+        checksum === oracleChecksum,
+    },
+  };
 }
 
 async function createReferenceTables(
@@ -1279,21 +1317,106 @@ async function insertReferenceDataset(
   }
 }
 
-function validateReferenceDataset(
-  tables: ReadonlyMap<string, DatabaseRow[]>,
-  metadata: ReadonlyArray<{ name: string; rows: number }>,
-): BenchmarkResult["referenceQueries"]["integrityChecks"] {
+const referenceRelationships = [
+  ["regions", "country_id", "countries", "country_id"],
+  ["tax_jurisdictions", "region_id", "regions", "region_id"],
+  ["tax_rates", "jurisdiction_id", "tax_jurisdictions", "jurisdiction_id"],
+  ["warehouses", "region_id", "regions", "region_id"],
+  ["suppliers", "region_id", "regions", "region_id"],
+  ["products", "brand_id", "brands", "brand_id"],
+  ["products", "category_id", "categories", "category_id"],
+  ["product_suppliers", "product_id", "products", "product_id"],
+  ["product_suppliers", "supplier_id", "suppliers", "supplier_id"],
+  ["customers", "region_id", "regions", "region_id"],
+  ["customer_addresses", "customer_id", "customers", "customer_id"],
+  ["customer_addresses", "region_id", "regions", "region_id"],
+  ["customer_addresses", "jurisdiction_id", "tax_jurisdictions", "jurisdiction_id"],
+  ["customer_payment_methods", "customer_id", "customers", "customer_id"],
+  ["orders", "customer_id", "customers", "customer_id"],
+  ["orders", "shipping_address_id", "customer_addresses", "address_id"],
+  ["orders", "currency_id", "currencies", "currency_id"],
+  ["order_items", "order_id", "orders", "order_id"],
+  ["order_items", "product_id", "products", "product_id"],
+  ["order_discounts", "order_id", "orders", "order_id"],
+  ["order_discounts", "promotion_id", "promotions", "promotion_id"],
+  ["order_taxes", "order_id", "orders", "order_id"],
+  ["order_taxes", "item_id", "order_items", "item_id"],
+  ["order_taxes", "tax_rate_id", "tax_rates", "tax_rate_id"],
+  ["payments", "order_id", "orders", "order_id"],
+  ["payments", "payment_method_id", "customer_payment_methods", "payment_method_id"],
+  ["payments", "currency_id", "currencies", "currency_id"],
+  ["payment_transactions", "payment_id", "payments", "payment_id"],
+  ["shipments", "order_id", "orders", "order_id"],
+  ["shipments", "warehouse_id", "warehouses", "warehouse_id"],
+  ["shipment_items", "shipment_id", "shipments", "shipment_id"],
+  ["shipment_items", "item_id", "order_items", "item_id"],
+  ["returns", "order_id", "orders", "order_id"],
+  ["returns", "item_id", "order_items", "item_id"],
+  ["return_items", "return_id", "returns", "return_id"],
+  ["return_items", "item_id", "order_items", "item_id"],
+  ["refunds", "return_id", "returns", "return_id"],
+  ["refunds", "payment_id", "payments", "payment_id"],
+  ["inventory_movements", "product_id", "products", "product_id"],
+  ["inventory_movements", "warehouse_id", "warehouses", "warehouse_id"],
+  ["inventory_movements", "supplier_id", "suppliers", "supplier_id"],
+  ["stores", "region_id", "regions", "region_id"],
+  ["stores", "warehouse_id", "warehouses", "warehouse_id"],
+  ["employees", "store_id", "stores", "store_id"],
+  ["loyalty_accounts", "customer_id", "customers", "customer_id"],
+  ["loyalty_accounts", "segment_id", "customer_segments", "segment_id"],
+  ["loyalty_transactions", "loyalty_account_id", "loyalty_accounts", "loyalty_account_id"],
+  ["loyalty_transactions", "order_id", "orders", "order_id"],
+  ["price_lists", "currency_id", "currencies", "currency_id"],
+  ["price_lists", "channel_id", "sales_channels", "channel_id"],
+  ["product_prices", "product_id", "products", "product_id"],
+  ["product_prices", "price_list_id", "price_lists", "price_list_id"],
+  ["purchase_orders", "supplier_id", "suppliers", "supplier_id"],
+  ["purchase_orders", "warehouse_id", "warehouses", "warehouse_id"],
+  ["purchase_orders", "currency_id", "currencies", "currency_id"],
+  ["purchase_order_items", "purchase_order_id", "purchase_orders", "purchase_order_id"],
+  ["purchase_order_items", "product_id", "products", "product_id"],
+  ["receipts", "purchase_order_id", "purchase_orders", "purchase_order_id"],
+  ["receipts", "warehouse_id", "warehouses", "warehouse_id"],
+  ["receipt_items", "receipt_id", "receipts", "receipt_id"],
+  ["receipt_items", "purchase_order_item_id", "purchase_order_items", "purchase_order_item_id"],
+  ["carts", "customer_id", "customers", "customer_id"],
+  ["carts", "channel_id", "sales_channels", "channel_id"],
+  ["carts", "currency_id", "currencies", "currency_id"],
+  ["cart_items", "cart_id", "carts", "cart_id"],
+  ["cart_items", "product_id", "products", "product_id"],
+  ["order_events", "order_id", "orders", "order_id"],
+  ["order_events", "employee_id", "employees", "employee_id"],
+  ["payment_attempts", "payment_id", "payments", "payment_id"],
+  ["fraud_reviews", "payment_id", "payments", "payment_id"],
+  ["fraud_reviews", "employee_id", "employees", "employee_id"],
+  ["shipment_events", "shipment_id", "shipments", "shipment_id"],
+  ["delivery_attempts", "shipment_id", "shipments", "shipment_id"],
+  ["support_tickets", "customer_id", "customers", "customer_id"],
+  ["support_tickets", "order_id", "orders", "order_id"],
+  ["support_messages", "ticket_id", "support_tickets", "ticket_id"],
+  ["support_messages", "employee_id", "employees", "employee_id"],
+  ["inventory_snapshots", "product_id", "products", "product_id"],
+  ["inventory_snapshots", "warehouse_id", "warehouses", "warehouse_id"],
+  ["audit_events", "employee_id", "employees", "employee_id"],
+  ["audit_events", "order_id", "orders", "order_id"],
+] as const;
+
+async function validatePersistedReferenceDataset(
+  database: BrowserDatabase,
+  metadata: Array<{ name: string; rows: number; loadMs: number }>,
+): Promise<BenchmarkResult["referenceQueries"]["integrityChecks"]> {
   const checks: BenchmarkResult["referenceQueries"]["integrityChecks"] = [];
   const primaryKeys = new Map(
     getScenario("commerce").entities.map((entity) => [entity.name, entity.primaryKey ?? ""]),
   );
-
   let started = performance.now();
   const invalidTables: string[] = [];
   for (const table of metadata) {
-    const tableRows = rows(tables, table.name);
-    const key = primaryKeys.get(table.name);
-    const keys = new Set(key === undefined ? [] : tableRows.map((row) => numberField(row, key)));
+    const key = primaryKeys.get(table.name) ?? "";
+    const tableStarted = performance.now();
+    const tableRows = await database.readTable(table.name, { columns: [key] });
+    table.loadMs = performance.now() - tableStarted;
+    const keys = new Set(tableRows.map((row) => numberField(row, key)));
     if (tableRows.length !== table.rows || keys.size !== table.rows) invalidTables.push(table.name);
   }
   checks.push({
@@ -1308,53 +1431,12 @@ function validateReferenceDataset(
   });
 
   started = performance.now();
-  const relationships = [
-    ["regions", "country_id", "countries", "country_id"],
-    ["tax_jurisdictions", "region_id", "regions", "region_id"],
-    ["tax_rates", "jurisdiction_id", "tax_jurisdictions", "jurisdiction_id"],
-    ["warehouses", "region_id", "regions", "region_id"],
-    ["suppliers", "region_id", "regions", "region_id"],
-    ["products", "brand_id", "brands", "brand_id"],
-    ["products", "category_id", "categories", "category_id"],
-    ["product_suppliers", "product_id", "products", "product_id"],
-    ["product_suppliers", "supplier_id", "suppliers", "supplier_id"],
-    ["customers", "region_id", "regions", "region_id"],
-    ["customer_addresses", "customer_id", "customers", "customer_id"],
-    ["customer_addresses", "region_id", "regions", "region_id"],
-    ["customer_addresses", "jurisdiction_id", "tax_jurisdictions", "jurisdiction_id"],
-    ["customer_payment_methods", "customer_id", "customers", "customer_id"],
-    ["orders", "customer_id", "customers", "customer_id"],
-    ["orders", "shipping_address_id", "customer_addresses", "address_id"],
-    ["orders", "currency_id", "currencies", "currency_id"],
-    ["order_items", "order_id", "orders", "order_id"],
-    ["order_items", "product_id", "products", "product_id"],
-    ["order_discounts", "order_id", "orders", "order_id"],
-    ["order_discounts", "promotion_id", "promotions", "promotion_id"],
-    ["order_taxes", "order_id", "orders", "order_id"],
-    ["order_taxes", "item_id", "order_items", "item_id"],
-    ["order_taxes", "tax_rate_id", "tax_rates", "tax_rate_id"],
-    ["payments", "order_id", "orders", "order_id"],
-    ["payments", "payment_method_id", "customer_payment_methods", "payment_method_id"],
-    ["payments", "currency_id", "currencies", "currency_id"],
-    ["payment_transactions", "payment_id", "payments", "payment_id"],
-    ["shipments", "order_id", "orders", "order_id"],
-    ["shipments", "warehouse_id", "warehouses", "warehouse_id"],
-    ["shipment_items", "shipment_id", "shipments", "shipment_id"],
-    ["shipment_items", "item_id", "order_items", "item_id"],
-    ["returns", "order_id", "orders", "order_id"],
-    ["returns", "item_id", "order_items", "item_id"],
-    ["return_items", "return_id", "returns", "return_id"],
-    ["return_items", "item_id", "order_items", "item_id"],
-    ["refunds", "return_id", "returns", "return_id"],
-    ["refunds", "payment_id", "payments", "payment_id"],
-    ["inventory_movements", "product_id", "products", "product_id"],
-    ["inventory_movements", "warehouse_id", "warehouses", "warehouse_id"],
-    ["inventory_movements", "supplier_id", "suppliers", "supplier_id"],
-  ] as const;
   let missingForeignKeys = 0;
-  for (const [childTable, childColumn, parentTable, parentColumn] of relationships) {
-    const parentKeys = numericKeySet(tables, parentTable, parentColumn);
-    missingForeignKeys += rows(tables, childTable).filter(
+  for (const [childTable, childColumn, parentTable, parentColumn] of referenceRelationships) {
+    const parentRows = await database.readTable(parentTable, { columns: [parentColumn] });
+    const parentKeys = new Set(parentRows.map((row) => numberField(row, parentColumn)));
+    const childRows = await database.readTable(childTable, { columns: [childColumn] });
+    missingForeignKeys += childRows.filter(
       (row) => !parentKeys.has(numberField(row, childColumn)),
     ).length;
   }
@@ -1363,35 +1445,43 @@ function validateReferenceDataset(
     label: "Foreign-key graph",
     detail:
       missingForeignKeys === 0
-        ? `All ${String(relationships.length)} foreign-key paths resolve without orphan rows`
+        ? `All ${String(referenceRelationships.length)} foreign-key paths resolve without orphan rows`
         : `${String(missingForeignKeys)} orphan references found`,
     durationMs: performance.now() - started,
     passed: missingForeignKeys === 0,
   });
 
   started = performance.now();
+  const orders = await database.readTable("orders", {
+    columns: ["status", "total", "placed_at"],
+  });
+  const items = await database.readTable("order_items", {
+    columns: ["quantity", "unit_price", "discount_pct"],
+  });
+  const payments = await database.readTable("payments", {
+    columns: ["status", "captured_amount"],
+  });
   const validStatuses = new Set(["created", "paid", "shipped", "returned"]);
   const validPaymentStatuses = new Set(["failed", "captured"]);
-  const invalidOrders = rows(tables, "orders").filter(
-    (row) =>
-      !validStatuses.has(stringField(row, "status")) ||
-      !Number.isFinite(numberField(row, "total")) ||
-      numberField(row, "total") < 0 ||
-      !Number.isFinite(dateField(row, "placed_at").getTime()),
-  ).length;
-  const invalidItems = rows(tables, "order_items").filter(
-    (row) =>
-      numberField(row, "quantity") <= 0 ||
-      numberField(row, "unit_price") < 0 ||
-      numberField(row, "discount_pct") < 0 ||
-      numberField(row, "discount_pct") >= 1,
-  ).length;
-  const invalidPayments = rows(tables, "payments").filter(
-    (row) =>
-      !validPaymentStatuses.has(stringField(row, "status")) ||
-      numberField(row, "captured_amount") < 0,
-  ).length;
-  const invalidValues = invalidOrders + invalidItems + invalidPayments;
+  const invalidValues =
+    orders.filter(
+      (row) =>
+        !validStatuses.has(stringField(row, "status")) ||
+        numberField(row, "total") < 0 ||
+        !Number.isFinite(dateField(row, "placed_at").getTime()),
+    ).length +
+    items.filter(
+      (row) =>
+        numberField(row, "quantity") <= 0 ||
+        numberField(row, "unit_price") < 0 ||
+        numberField(row, "discount_pct") < 0 ||
+        numberField(row, "discount_pct") >= 1,
+    ).length +
+    payments.filter(
+      (row) =>
+        !validPaymentStatuses.has(stringField(row, "status")) ||
+        numberField(row, "captured_amount") < 0,
+    ).length;
   checks.push({
     id: "value-domains",
     label: "Types and value domains",
@@ -1404,32 +1494,42 @@ function validateReferenceDataset(
   });
 
   started = performance.now();
-  const ordersWithItems = new Set(
-    rows(tables, "order_items").map((row) => numberField(row, "order_id")),
-  );
-  const ordersWithTaxes = new Set(
-    rows(tables, "order_taxes").map((row) => numberField(row, "order_id")),
-  );
-  const ordersWithPayments = new Set(
-    rows(tables, "payments").map((row) => numberField(row, "order_id")),
-  );
-  const uncoveredOrders = rows(tables, "orders").filter((row) => {
-    const orderId = numberField(row, "order_id");
-    return (
-      !ordersWithItems.has(orderId) ||
-      !ordersWithTaxes.has(orderId) ||
-      !ordersWithPayments.has(orderId)
-    );
-  }).length;
-  const invalidCapturedAmounts = rows(tables, "payments").filter((row) => {
+  const orderCount = metadata.find((table) => table.name === "orders")?.rows ?? 0;
+  const coverage = new Uint8Array(orderCount + 1);
+  for (const [tableName, bit] of [
+    ["order_items", 1],
+    ["order_taxes", 2],
+    ["payments", 4],
+  ] as const) {
+    const coverageRows = await database.readTable(tableName, { columns: ["order_id"] });
+    for (const row of coverageRows) {
+      const orderId = numberField(row, "order_id");
+      coverage[orderId] = (coverage[orderId] ?? 0) | bit;
+    }
+  }
+  const orderIds = await database.readTable("orders", { columns: ["order_id"] });
+  const uncoveredOrders = orderIds.filter(
+    (row) => coverage[numberField(row, "order_id")] !== 7,
+  ).length;
+  const paymentValues = await database.readTable("payments", {
+    columns: ["status", "captured_amount"],
+  });
+  const invalidCapturedAmounts = paymentValues.filter((row) => {
     const captured = numberField(row, "captured_amount");
     return stringField(row, "status") === "failed" ? captured !== 0 : captured <= 0;
   }).length;
-  const invalidLedgerRows =
-    rows(tables, "payment_transactions").filter((row) => numberField(row, "amount") <= 0).length +
-    rows(tables, "order_taxes").filter((row) => numberField(row, "tax_amount") <= 0).length +
-    rows(tables, "inventory_movements").filter((row) => numberField(row, "quantity_delta") === 0)
-      .length;
+  let invalidLedgerRows = 0;
+  for (const [tableName, columnName] of [
+    ["payment_transactions", "amount"],
+    ["order_taxes", "tax_amount"],
+    ["inventory_movements", "quantity_delta"],
+  ] as const) {
+    const ledgerRows = await database.readTable(tableName, { columns: [columnName] });
+    invalidLedgerRows += ledgerRows.filter((row) => {
+      const value = numberField(row, columnName);
+      return columnName === "quantity_delta" ? value === 0 : value <= 0;
+    }).length;
+  }
   const transactionErrors = uncoveredOrders + invalidCapturedAmounts + invalidLedgerRows;
   checks.push({
     id: "transaction-balances",
@@ -2560,6 +2660,188 @@ async function storageEstimate(): Promise<StorageEstimate> {
   } catch {
     return {};
   }
+}
+
+async function executePersistedAdHocQuery(sql: string): Promise<AdHocQueryResult> {
+  const dataset = (await listPersistedDatasets())[0];
+  if (dataset === undefined) {
+    throw new Error("Run the relational benchmark before executing an ad-hoc query");
+  }
+  const totalStarted = performance.now();
+  const store = await IndexedDbBlockStore.open({
+    name: dataset.databaseName,
+    durability: dataset.durability,
+  });
+  const database = new BrowserDatabase(store, {
+    compression: dataset.compression,
+    rowsPerBlock: Math.max(1, Math.min(50_000, Math.floor(dataset.targetBlockBytes / 16))),
+  });
+  let prepared: Awaited<ReturnType<BrowserDatabase["prepareQuery"]>> | undefined;
+  try {
+    const prepareStarted = performance.now();
+    prepared = await database.prepareQuery(sql);
+    const prepareMs = performance.now() - prepareStarted;
+    prepared.execute();
+    const samples: number[] = [];
+    let result = prepared.execute();
+    for (let index = 0; index < 7; index += 1) {
+      const started = performance.now();
+      result = prepared.execute();
+      samples.push(performance.now() - started);
+    }
+    samples.sort((left, right) => left - right);
+    const median = samples[Math.floor(samples.length / 2)] ?? 0;
+    const p95 = samples[Math.ceil(samples.length * 0.95) - 1] ?? median;
+    const previewRows = result.rows.slice(0, 100);
+    const sourceRows = [...new Set(prepared.tables)].reduce(
+      (total, table) => total + (dataset.tableRows[table] ?? 0),
+      0,
+    );
+    return {
+      runId: dataset.runId,
+      sql: sql.trim(),
+      tables: prepared.tables,
+      columns: result.columns,
+      rowCount: result.rows.length,
+      previewRows,
+      truncated: result.rows.length > previewRows.length,
+      metrics: {
+        prepareMs,
+        executeMedianMs: median,
+        executeP95Ms: p95,
+        totalMs: performance.now() - totalStarted,
+        iterations: samples.length,
+        sourceRows,
+        datasetRows: dataset.totalRows,
+        storedBytes: dataset.storedBytes,
+      },
+    };
+  } finally {
+    prepared?.close();
+    store.close();
+  }
+}
+
+async function persistedDatasetStatus(): Promise<PersistedDatasetStatus> {
+  const datasets = await listPersistedDatasets();
+  const active = datasets[0];
+  if (active === undefined) {
+    return { kind: "persisted-dataset-status", available: false, datasetCount: 0 };
+  }
+  return {
+    kind: "persisted-dataset-status",
+    available: true,
+    datasetCount: datasets.length,
+    runId: active.runId,
+    databaseName: active.databaseName,
+    createdAt: active.createdAt,
+    scale: active.scale,
+    totalRows: active.totalRows,
+    storedBytes: active.storedBytes,
+  };
+}
+
+async function wipePersistedDatasets(): Promise<PersistedDatasetStatus> {
+  const datasets = await listPersistedDatasets();
+  for (const dataset of datasets) await deleteDatabase(dataset.databaseName);
+  const registry = await openDatasetRegistry();
+  try {
+    const transaction = registry.transaction(DATASET_REGISTRY_STORE, "readwrite");
+    transaction.objectStore(DATASET_REGISTRY_STORE).clear();
+    await indexedDbTransactionDone(transaction);
+  } finally {
+    registry.close();
+  }
+  return { kind: "persisted-dataset-status", available: false, datasetCount: 0 };
+}
+
+async function registerPersistedDataset(record: PersistedDatasetRecord): Promise<void> {
+  const registry = await openDatasetRegistry();
+  try {
+    const transaction = registry.transaction(DATASET_REGISTRY_STORE, "readwrite");
+    transaction.objectStore(DATASET_REGISTRY_STORE).put(record);
+    await indexedDbTransactionDone(transaction);
+  } finally {
+    registry.close();
+  }
+}
+
+async function listPersistedDatasets(): Promise<PersistedDatasetRecord[]> {
+  const registry = await openDatasetRegistry();
+  try {
+    const transaction = registry.transaction(DATASET_REGISTRY_STORE, "readonly");
+    const request = transaction.objectStore(DATASET_REGISTRY_STORE).getAll();
+    const records = (await indexedDbRequest<unknown[]>(request as IDBRequest<unknown[]>)).filter(
+      isPersistedDatasetRecord,
+    );
+    await indexedDbTransactionDone(transaction);
+    return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  } finally {
+    registry.close();
+  }
+}
+
+function isPersistedDatasetRecord(value: unknown): value is PersistedDatasetRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.runId === "string" &&
+    typeof record.databaseName === "string" &&
+    record.databaseName.startsWith(DATASET_DATABASE_PREFIX) &&
+    typeof record.createdAt === "string" &&
+    typeof record.scale === "number" &&
+    typeof record.totalRows === "number" &&
+    typeof record.storedBytes === "number" &&
+    typeof record.tableRows === "object" &&
+    record.tableRows !== null &&
+    ["raw", "rle", "gzip"].includes(String(record.compression)) &&
+    typeof record.targetBlockBytes === "number" &&
+    ["relaxed", "strict"].includes(String(record.durability))
+  );
+}
+
+function openDatasetRegistry(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DATASET_REGISTRY_NAME, 1);
+    request.addEventListener("upgradeneeded", () => {
+      if (!request.result.objectStoreNames.contains(DATASET_REGISTRY_STORE)) {
+        request.result.createObjectStore(DATASET_REGISTRY_STORE, { keyPath: "runId" });
+      }
+    });
+    request.addEventListener("success", () => resolve(request.result), { once: true });
+    request.addEventListener(
+      "error",
+      () => reject(request.error ?? new Error("Dataset registry could not be opened")),
+      { once: true },
+    );
+  });
+}
+
+function indexedDbRequest<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.addEventListener("success", () => resolve(request.result), { once: true });
+    request.addEventListener(
+      "error",
+      () => reject(request.error ?? new Error("IndexedDB request failed")),
+      { once: true },
+    );
+  });
+}
+
+function indexedDbTransactionDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.addEventListener("complete", () => resolve(), { once: true });
+    transaction.addEventListener(
+      "error",
+      () => reject(transaction.error ?? new Error("IndexedDB transaction failed")),
+      { once: true },
+    );
+    transaction.addEventListener(
+      "abort",
+      () => reject(transaction.error ?? new Error("IndexedDB transaction aborted")),
+      { once: true },
+    );
+  });
 }
 
 async function deleteDatabase(name: string): Promise<void> {

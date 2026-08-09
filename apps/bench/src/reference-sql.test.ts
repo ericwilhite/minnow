@@ -31,7 +31,7 @@ describe("reference SQL runner", () => {
     expect(result.previewRows).toEqual([{ segment: "growth", orders: 2, revenue: 100 }]);
     expect(result.rowCount).toBe(1);
     expect(result.tables).toEqual(["customers", "orders"]);
-    expect(result.metrics).toMatchObject({ iterations: 3, sourceRows: 5, joinedRows: 3 });
+    expect(result.metrics).toMatchObject({ iterations: 3, sourceRows: 5, datasetRows: 5 });
   });
 
   it("supports point filters and rejects mutation statements", () => {

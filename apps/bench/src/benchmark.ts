@@ -245,13 +245,14 @@ export interface ReferenceQueryBenchmarkMeasurement {
 }
 
 export interface AdHocQueryMetrics {
-  parseMs: number;
+  prepareMs: number;
   executeMedianMs: number;
   executeP95Ms: number;
   totalMs: number;
   iterations: number;
   sourceRows: number;
-  joinedRows: number;
+  datasetRows: number;
+  storedBytes: number;
 }
 
 export interface AdHocQueryResult {
@@ -263,6 +264,18 @@ export interface AdHocQueryResult {
   previewRows: Array<Record<string, unknown>>;
   truncated: boolean;
   metrics: AdHocQueryMetrics;
+}
+
+export interface PersistedDatasetStatus {
+  kind: "persisted-dataset-status";
+  available: boolean;
+  datasetCount: number;
+  runId?: string;
+  databaseName?: string;
+  createdAt?: string;
+  scale?: number;
+  totalRows?: number;
+  storedBytes?: number;
 }
 
 export interface BenchmarkResult {
@@ -360,7 +373,7 @@ export const scenarios: ScenarioDefinition[] = [
     id: "commerce",
     name: "Relational commerce",
     description:
-      "27 connected commerce tables covering catalog, customers, tax, orders, payments, fulfillment, returns, and inventory.",
+      "50 connected commerce tables ranging from compact dimensions to multi-million-row transactional ledgers.",
     entities: relationalCommerceEntities(),
   },
   {
@@ -391,30 +404,53 @@ export const relationalBaseRows = {
   countries: 8,
   regions: 16,
   currencies: 4,
+  sales_channels: 6,
+  customer_segments: 6,
   tax_jurisdictions: 24,
   tax_rates: 48,
   warehouses: 8,
+  stores: 24,
+  employees: 120,
   suppliers: 40,
   brands: 30,
   categories: 20,
   products: 200,
   product_suppliers: 400,
+  price_lists: 12,
+  product_prices: 600,
+  purchase_orders: 240,
+  purchase_order_items: 1_200,
+  receipts: 900,
+  receipt_items: 2_700,
   customers: 200,
   customer_addresses: 300,
   customer_payment_methods: 250,
+  loyalty_accounts: 180,
+  loyalty_transactions: 1_200,
   promotions: 30,
+  carts: 600,
+  cart_items: 2_400,
   orders: 1_000,
   order_items: 3_000,
+  order_events: 25_000,
   order_discounts: 250,
   order_taxes: 3_000,
   payments: 1_000,
   payment_transactions: 2_000,
+  payment_attempts: 3_000,
+  fraud_reviews: 120,
   shipments: 800,
   shipment_items: 2_400,
+  shipment_events: 3_200,
+  delivery_attempts: 1_000,
   returns: 100,
   return_items: 100,
   refunds: 80,
+  support_tickets: 300,
+  support_messages: 1_500,
   inventory_movements: 4_000,
+  inventory_snapshots: 10_000,
+  audit_events: 22_000,
 } as const;
 
 export type RelationalTableName = keyof typeof relationalBaseRows;
@@ -459,6 +495,26 @@ function relationalCommerceEntities(): EntityDefinition[] {
       stringColumn("code", (index) => ["USD", "EUR", "GBP", "CAD"][index % 4] ?? "USD", 7),
       numberColumn("usd_rate", (index) => 0.75 + (index % 8) * 0.1),
     ]),
+    entity("sales_channels", "channel_id", "sales channels 1 → many carts/price lists", [
+      numberColumn("channel_id", (index) => index + 1),
+      stringColumn(
+        "name",
+        (index) =>
+          ["web", "mobile", "store", "marketplace", "partner", "phone"][index % 6] ?? "web",
+        14,
+      ),
+      booleanColumn("active", (index) => index % 11 !== 0),
+    ]),
+    entity("customer_segments", "segment_id", "segments 1 → many loyalty accounts", [
+      numberColumn("segment_id", (index) => index + 1),
+      stringColumn(
+        "name",
+        (index) =>
+          ["new", "starter", "growth", "premium", "enterprise", "at_risk"][index % 6] ?? "new",
+        14,
+      ),
+      numberColumn("points_multiplier", (index) => 1 + (index % 4) * 0.25),
+    ]),
     entity("tax_jurisdictions", "jurisdiction_id", "jurisdictions many → 1 regions", [
       numberColumn("jurisdiction_id", (index) => index + 1),
       numberColumn("region_id", (index, _rows, scale) => foreign("regions", index, scale)),
@@ -476,6 +532,24 @@ function relationalCommerceEntities(): EntityDefinition[] {
       numberColumn("warehouse_id", (index) => index + 1),
       numberColumn("region_id", (index, _rows, scale) => foreign("regions", index, scale)),
       stringColumn("name", (index) => `Warehouse ${String(index + 1)}`, 20),
+    ]),
+    entity("stores", "store_id", "stores many → 1 regions/warehouses", [
+      numberColumn("store_id", (index) => index + 1),
+      numberColumn("region_id", (index, _rows, scale) => foreign("regions", index, scale)),
+      numberColumn("warehouse_id", (index, _rows, scale) => foreign("warehouses", index, scale)),
+      stringColumn("name", (index) => `Store ${String(index + 1)}`, 18),
+      booleanColumn("active", (index) => index % 17 !== 0),
+    ]),
+    entity("employees", "employee_id", "employees many → 1 stores", [
+      numberColumn("employee_id", (index) => index + 1),
+      numberColumn("store_id", (index, _rows, scale) => foreign("stores", index, scale)),
+      stringColumn(
+        "role",
+        (index) =>
+          ["associate", "manager", "support", "operations", "auditor"][index % 5] ?? "associate",
+        14,
+      ),
+      booleanColumn("active", (index) => index % 23 !== 0),
     ]),
     entity("suppliers", "supplier_id", "suppliers many → 1 regions", [
       numberColumn("supplier_id", (index) => index + 1),
@@ -515,6 +589,66 @@ function relationalCommerceEntities(): EntityDefinition[] {
       numberColumn("supplier_id", (index, _rows, scale) => foreign("suppliers", index * 7, scale)),
       numberColumn("supplier_cost", (index) => 4 + (index % 90) * 1.1),
     ]),
+    entity("price_lists", "price_list_id", "price lists many → 1 currencies/channels", [
+      numberColumn("price_list_id", (index) => index + 1),
+      numberColumn("currency_id", (index, _rows, scale) => foreign("currencies", index, scale)),
+      numberColumn("channel_id", (index, _rows, scale) => foreign("sales_channels", index, scale)),
+      stringColumn("name", (index) => `Price list ${String(index + 1)}`, 20),
+      booleanColumn("active", (index) => index % 13 !== 0),
+    ]),
+    entity("product_prices", "product_price_id", "prices many → 1 products/price lists", [
+      numberColumn("product_price_id", (index) => index + 1),
+      numberColumn("product_id", (index, _rows, scale) => foreign("products", index, scale)),
+      numberColumn("price_list_id", (index, _rows, scale) => foreign("price_lists", index, scale)),
+      numberColumn("amount", (index) => 10 + (index % 240) * 1.35),
+      datetimeColumn("effective_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
+    ]),
+    entity("purchase_orders", "purchase_order_id", "purchase orders → suppliers/warehouses", [
+      numberColumn("purchase_order_id", (index) => index + 1),
+      numberColumn("supplier_id", (index, _rows, scale) => foreign("suppliers", index, scale)),
+      numberColumn("warehouse_id", (index, _rows, scale) => foreign("warehouses", index, scale)),
+      numberColumn("currency_id", (index, _rows, scale) => foreign("currencies", index, scale)),
+      stringColumn(
+        "status",
+        (index) => ["draft", "submitted", "received", "closed"][index % 4] ?? "draft",
+        12,
+      ),
+      datetimeColumn("ordered_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
+    ]),
+    entity(
+      "purchase_order_items",
+      "purchase_order_item_id",
+      "purchase lines → purchase orders/products",
+      [
+        numberColumn("purchase_order_item_id", (index) => index + 1),
+        numberColumn("purchase_order_id", (index, _rows, scale) =>
+          foreign("purchase_orders", Math.floor(index / 5), scale),
+        ),
+        numberColumn("product_id", (index, _rows, scale) => foreign("products", index, scale)),
+        numberColumn("quantity", (index) => 10 + (index % 90)),
+        numberColumn("unit_cost", (index) => 4 + (index % 120) * 0.95),
+      ],
+    ),
+    entity("receipts", "receipt_id", "receipts → purchase orders/warehouses", [
+      numberColumn("receipt_id", (index) => index + 1),
+      numberColumn("purchase_order_id", (index, _rows, scale) =>
+        foreign("purchase_orders", index, scale),
+      ),
+      numberColumn("warehouse_id", (index, _rows, scale) => foreign("warehouses", index, scale)),
+      datetimeColumn("received_at", (index) => epoch(2025, ((index % 365) + 3) * 86_400_000)),
+      stringColumn("status", (index) => (index % 9 === 0 ? "partial" : "received"), 10),
+    ]),
+    entity("receipt_items", "receipt_item_id", "receipt lines → receipts/purchase lines", [
+      numberColumn("receipt_item_id", (index) => index + 1),
+      numberColumn("receipt_id", (index, _rows, scale) =>
+        foreign("receipts", Math.floor(index / 3), scale),
+      ),
+      numberColumn("purchase_order_item_id", (index, _rows, scale) =>
+        foreign("purchase_order_items", index, scale),
+      ),
+      numberColumn("quantity_received", (index) => 1 + (index % 40)),
+      booleanColumn("damaged", (index) => index % 97 === 0),
+    ]),
     entity("customers", "customer_id", "customers many → 1 regions; 1 → many orders", [
       numberColumn("customer_id", (index) => index + 1),
       numberColumn("region_id", (index, _rows, scale) => foreign("regions", index, scale)),
@@ -540,11 +674,47 @@ function relationalCommerceEntities(): EntityDefinition[] {
       stringColumn("method", (index) => ["card", "bank", "wallet"][index % 3] ?? "card", 10),
       booleanColumn("active", (index) => index % 17 !== 0),
     ]),
+    entity("loyalty_accounts", "loyalty_account_id", "loyalty accounts → customers/segments", [
+      numberColumn("loyalty_account_id", (index) => index + 1),
+      numberColumn("customer_id", (index, _rows, scale) => foreign("customers", index, scale)),
+      numberColumn("segment_id", (index, _rows, scale) =>
+        foreign("customer_segments", index, scale),
+      ),
+      numberColumn("points_balance", (index) => (index * 37) % 25_000),
+      datetimeColumn("enrolled_at", (index) => epoch(2024, (index % 365) * 86_400_000)),
+    ]),
+    entity("loyalty_transactions", "loyalty_transaction_id", "loyalty ledger → accounts/orders", [
+      numberColumn("loyalty_transaction_id", (index) => index + 1),
+      numberColumn("loyalty_account_id", (index, _rows, scale) =>
+        foreign("loyalty_accounts", index, scale),
+      ),
+      numberColumn("order_id", (index, _rows, scale) => foreign("orders", index, scale)),
+      stringColumn("kind", (index) => (index % 5 === 0 ? "redeem" : "earn"), 8),
+      numberColumn("points_delta", (index) => (index % 5 === 0 ? -50 : 20 + (index % 80))),
+      datetimeColumn("occurred_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
+    ]),
     entity("promotions", "promotion_id", "promotions 1 → many order discounts", [
       numberColumn("promotion_id", (index) => index + 1),
       stringColumn("code", (index) => `PROMO-${String(index + 1)}`, 14),
       numberColumn("discount_pct", (index) => 0.05 + (index % 4) * 0.025),
       booleanColumn("active", (index) => index % 7 !== 0),
+    ]),
+    entity("carts", "cart_id", "carts → customers/channels/currencies", [
+      numberColumn("cart_id", (index) => index + 1),
+      numberColumn("customer_id", (index, _rows, scale) => foreign("customers", index, scale)),
+      numberColumn("channel_id", (index, _rows, scale) => foreign("sales_channels", index, scale)),
+      numberColumn("currency_id", (index, _rows, scale) => foreign("currencies", index, scale)),
+      stringColumn("status", (index) => (index % 4 === 0 ? "converted" : "open"), 10),
+      datetimeColumn("updated_at", (index) => epoch(2025, (index % 90) * 86_400_000)),
+    ]),
+    entity("cart_items", "cart_item_id", "cart items → carts/products", [
+      numberColumn("cart_item_id", (index) => index + 1),
+      numberColumn("cart_id", (index, _rows, scale) =>
+        foreign("carts", Math.floor(index / 4), scale),
+      ),
+      numberColumn("product_id", (index, _rows, scale) => foreign("products", index, scale)),
+      numberColumn("quantity", (index) => 1 + (index % 5)),
+      numberColumn("unit_price", (index) => 10 + (index % 200) * 1.2),
     ]),
     entity("orders", "order_id", "orders many → 1 customers/addresses/currencies", [
       numberColumn("order_id", (index) => index + 1),
@@ -570,6 +740,23 @@ function relationalCommerceEntities(): EntityDefinition[] {
       numberColumn("quantity", (index) => (index % 4) + 1),
       numberColumn("unit_price", (index) => 12 + (index % 180) * 1.4),
       numberColumn("discount_pct", (index) => [0, 0.05, 0.1, 0.15][index % 4] ?? 0),
+    ]),
+    entity("order_events", "order_event_id", "high-volume order event ledger → orders/employees", [
+      numberColumn("order_event_id", (index) => index + 1),
+      numberColumn("order_id", (index, _rows, scale) =>
+        foreign("orders", Math.floor(index / 25), scale),
+      ),
+      numberColumn("employee_id", (index, _rows, scale) => foreign("employees", index, scale)),
+      stringColumn(
+        "event_type",
+        (index) =>
+          ["created", "priced", "authorized", "allocated", "packed", "shipped", "delivered"][
+            index % 7
+          ] ?? "created",
+        14,
+      ),
+      stringColumn("source", (index) => (index % 3 === 0 ? "system" : "user"), 8),
+      datetimeColumn("occurred_at", (index) => epoch(2025, (index % 31_536_000) * 1_000)),
     ]),
     entity("order_discounts", "order_discount_id", "discounts many → 1 orders/promotions", [
       numberColumn("order_discount_id", (index) => index + 1),
@@ -609,6 +796,24 @@ function relationalCommerceEntities(): EntityDefinition[] {
       numberColumn("amount", (index) => 10 + (index % 300) * 1.25),
       datetimeColumn("processed_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
     ]),
+    entity("payment_attempts", "payment_attempt_id", "payment attempts many → 1 payments", [
+      numberColumn("payment_attempt_id", (index) => index + 1),
+      numberColumn("payment_id", (index, _rows, scale) =>
+        foreign("payments", Math.floor(index / 3), scale),
+      ),
+      stringColumn("processor", (index) => ["stripe", "adyen", "bank"][index % 3] ?? "stripe", 10),
+      stringColumn("outcome", (index) => (index % 11 === 0 ? "declined" : "approved"), 10),
+      numberColumn("latency_ms", (index) => 40 + (index % 900)),
+      datetimeColumn("attempted_at", (index) => epoch(2025, (index % 31_536_000) * 1_000)),
+    ]),
+    entity("fraud_reviews", "fraud_review_id", "fraud reviews → payments/employees", [
+      numberColumn("fraud_review_id", (index) => index + 1),
+      numberColumn("payment_id", (index, _rows, scale) => foreign("payments", index * 9, scale)),
+      numberColumn("employee_id", (index, _rows, scale) => foreign("employees", index, scale)),
+      stringColumn("decision", (index) => (index % 8 === 0 ? "reject" : "approve"), 10),
+      numberColumn("risk_score", (index) => (index * 17) % 100),
+      datetimeColumn("reviewed_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
+    ]),
     entity("shipments", "shipment_id", "shipments many → 1 orders/warehouses", [
       numberColumn("shipment_id", (index) => index + 1),
       numberColumn("order_id", (index, _rows, scale) => foreign("orders", index, scale)),
@@ -632,6 +837,26 @@ function relationalCommerceEntities(): EntityDefinition[] {
       ),
       numberColumn("item_id", (index, _rows, scale) => foreign("order_items", index, scale)),
       numberColumn("quantity", (index) => (index % 4) + 1),
+    ]),
+    entity("shipment_events", "shipment_event_id", "shipment event ledger → shipments", [
+      numberColumn("shipment_event_id", (index) => index + 1),
+      numberColumn("shipment_id", (index, _rows, scale) =>
+        foreign("shipments", Math.floor(index / 4), scale),
+      ),
+      stringColumn(
+        "event_type",
+        (index) => ["labelled", "picked_up", "in_transit", "delivered"][index % 4] ?? "labelled",
+        12,
+      ),
+      stringColumn("location", (index) => `Hub ${String((index % 40) + 1)}`, 12),
+      datetimeColumn("occurred_at", (index) => epoch(2025, (index % 31_536_000) * 1_000)),
+    ]),
+    entity("delivery_attempts", "delivery_attempt_id", "delivery attempts many → 1 shipments", [
+      numberColumn("delivery_attempt_id", (index) => index + 1),
+      numberColumn("shipment_id", (index, _rows, scale) => foreign("shipments", index, scale)),
+      numberColumn("attempt_number", (index) => 1 + (index % 3)),
+      stringColumn("outcome", (index) => (index % 7 === 0 ? "missed" : "delivered"), 10),
+      datetimeColumn("attempted_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
     ]),
     entity("returns", "return_id", "returns many → 1 orders/items", [
       numberColumn("return_id", (index) => index + 1),
@@ -657,6 +882,24 @@ function relationalCommerceEntities(): EntityDefinition[] {
       numberColumn("amount", (index) => 8 + (index % 75) * 1.2),
       stringColumn("status", (index) => (index % 9 === 0 ? "pending" : "settled"), 10),
     ]),
+    entity("support_tickets", "ticket_id", "support tickets → customers/orders", [
+      numberColumn("ticket_id", (index) => index + 1),
+      numberColumn("customer_id", (index, _rows, scale) => foreign("customers", index, scale)),
+      numberColumn("order_id", (index, _rows, scale) => foreign("orders", index * 3, scale)),
+      stringColumn("priority", (index) => ["low", "normal", "high"][index % 3] ?? "normal", 8),
+      stringColumn("status", (index) => (index % 5 === 0 ? "closed" : "open"), 8),
+      datetimeColumn("opened_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
+    ]),
+    entity("support_messages", "message_id", "support messages → tickets/employees", [
+      numberColumn("message_id", (index) => index + 1),
+      numberColumn("ticket_id", (index, _rows, scale) =>
+        foreign("support_tickets", Math.floor(index / 5), scale),
+      ),
+      numberColumn("employee_id", (index, _rows, scale) => foreign("employees", index, scale)),
+      stringColumn("author_type", (index) => (index % 3 === 0 ? "customer" : "agent"), 10),
+      stringColumn("body", (index) => `Deterministic support message ${String(index + 1)}`, 48),
+      datetimeColumn("sent_at", (index) => epoch(2025, (index % 31_536_000) * 1_000)),
+    ]),
     entity(
       "inventory_movements",
       "movement_id",
@@ -675,6 +918,26 @@ function relationalCommerceEntities(): EntityDefinition[] {
         datetimeColumn("occurred_at", (index) => epoch(2025, (index % 365) * 86_400_000)),
       ],
     ),
+    entity("inventory_snapshots", "snapshot_id", "inventory snapshots → products/warehouses", [
+      numberColumn("snapshot_id", (index) => index + 1),
+      numberColumn("product_id", (index, _rows, scale) => foreign("products", index, scale)),
+      numberColumn("warehouse_id", (index, _rows, scale) => foreign("warehouses", index, scale)),
+      numberColumn("quantity_on_hand", (index) => 20 + (index % 500)),
+      numberColumn("quantity_reserved", (index) => index % 40),
+      datetimeColumn("captured_at", (index) => epoch(2025, (index % 8_760) * 3_600_000)),
+    ]),
+    entity("audit_events", "audit_event_id", "high-volume audit ledger → employees/orders", [
+      numberColumn("audit_event_id", (index) => index + 1),
+      numberColumn("employee_id", (index, _rows, scale) => foreign("employees", index, scale)),
+      numberColumn("order_id", (index, _rows, scale) => foreign("orders", index, scale)),
+      stringColumn(
+        "action",
+        (index) => ["read", "create", "update", "approve", "export"][index % 5] ?? "read",
+        10,
+      ),
+      stringColumn("entity_type", (index) => (index % 2 === 0 ? "order" : "payment"), 10),
+      datetimeColumn("occurred_at", (index) => epoch(2025, (index % 31_536_000) * 1_000)),
+    ]),
   ];
 }
 
