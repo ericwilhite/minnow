@@ -162,15 +162,22 @@ own reservations atomically. Accumulated output reserves a row-reference slot pl
 scalar payload, and `ORDER BY`/`LIMIT` reserve their modeled row-reference workspaces. These bytes
 contribute to `peakBytes` and are released when execution returns ownership of the `QueryResult`.
 
+Phase 7C-A replaces the grouped executor's nested JavaScript `Map` tree with a byte-addressable key
+index. Typed scalar and compound keys are encoded into a retained byte arena; canonical numeric keys,
+type tags, and length-delimited strings preserve SQL grouping distinctions. Collision-checked hashes
+address typed bucket, chain, offset, length, and hash arrays. Every arena or index growth reserves the
+new typed capacity before allocation and releases the superseded reservation only after copying.
+Insertion order remains stable for deterministic grouped results.
+
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected input in full before the vector reservation is installed. The model
-does not include boxed preparation values; JavaScript `Map`, object, property, or array-capacity
-overhead; the sort implementation's internal scratch; encoding/accounting temporaries; the lifetime
-of returned rows after ownership transfers to the caller; or engine/browser allocator overhead.
-Configured exhaustion fails the query instead of spilling. It also performs no statistics-driven
-segment or row-group data skipping. Phase 7 remains open for streaming inputs, byte-addressable
-operator containers, complete physical accounting, and spill; Phase 8 remains open for pruning and
-late materialization.
+does not include boxed preparation values; the remaining join `Map`, aggregate/result objects,
+properties, or JavaScript array-capacity overhead; the sort implementation's internal scratch;
+encoding/accounting temporaries; the lifetime of returned rows after ownership transfers to the
+caller; or engine/browser allocator overhead. Configured exhaustion fails the query instead of
+spilling. It also performs no statistics-driven segment or row-group data skipping. Phase 7 remains
+open for streaming inputs, byte-addressable join/aggregate/result containers, complete physical
+accounting, and spill; Phase 8 remains open for pruning and late materialization.
 
 The exported row-array helper retains a compatibility oracle for schema-less empty inputs. Because it
 cannot construct typed empty vectors without column types, that fallback rejects an explicit memory

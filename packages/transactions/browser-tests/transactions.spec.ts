@@ -125,7 +125,7 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         reopened: { count: 3, total: 96 },
         memoryBudget: {
           retainedBytes: 25,
-          peakBytes: 107,
+          peakBytes: 203,
           prepareRejected: true,
           executeRejected: true,
           exactSucceeded: true,

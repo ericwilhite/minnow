@@ -9,6 +9,7 @@ import type {
   QueryValue,
   SelectItem,
 } from "./query.js";
+import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
 import {
   QueryMemoryContext,
   type QueryMemoryReservation,
@@ -668,7 +669,7 @@ function createDirectLookup(
 function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryResult {
   const metadataCount = executeMetadataCount(plan, memory);
   if (metadataCount !== undefined) return metadataCount;
-  const groups = new NestedGroupMap<GroupState>();
+  const groups = new ByteGroupIndex<GroupState>(memory);
   if (plan.grouped && plan.groupBy.length === 0) {
     groups.setEmpty(createGroupState([], plan, memory));
   }
@@ -761,7 +762,7 @@ function consumeJoinedBatches(
   plan: BoundPlan,
   batch: BatchRows,
   joinIndex: number,
-  groups: NestedGroupMap<GroupState>,
+  groups: ByteGroupIndex<GroupState>,
   output: QueryRow[],
   memory: QueryMemoryContext,
 ): boolean {
@@ -941,7 +942,7 @@ function appendJoinedRow(
 function consumeBatch(
   plan: BoundPlan,
   batch: BatchRows,
-  groups: NestedGroupMap<GroupState>,
+  groups: ByteGroupIndex<GroupState>,
   output: QueryRow[],
   memory: QueryMemoryContext,
 ): void {
@@ -953,7 +954,7 @@ function consumeBatch(
     }
     if (plan.grouped) {
       let state: GroupState | undefined;
-      let groupKeys: unknown[] | undefined;
+      let groupKeys: GroupIndexKey[] | undefined;
       if (plan.groupBy.length === 0) state = groups.getEmpty();
       else if (plan.groupBy.length === 1) {
         state = groups.getOne(
@@ -1286,8 +1287,18 @@ function comparable(value: unknown): unknown {
   return value instanceof Date ? value.getTime() : value;
 }
 
-function groupKey(value: unknown): unknown {
-  return typeof value === "number" && !Number.isFinite(value) ? null : comparable(value);
+function groupKey(value: unknown): GroupIndexKey {
+  const comparableValue = comparable(value);
+  if (typeof comparableValue === "number" && !Number.isFinite(comparableValue)) return null;
+  if (
+    comparableValue === null ||
+    typeof comparableValue === "boolean" ||
+    typeof comparableValue === "number" ||
+    typeof comparableValue === "string"
+  ) {
+    return comparableValue;
+  }
+  throw new TypeError("Group keys must be SQL scalar values");
 }
 
 function compareValues(left: unknown, right: unknown): number {
@@ -1362,63 +1373,4 @@ function safeMemoryProduct(left: number, right: number, label: string): number {
     throw new RangeError(`${label} exceeds the safe integer range`);
   }
   return product;
-}
-
-class NestedGroupMap<T> {
-  readonly #root = new Map<unknown, unknown>();
-  readonly #values: T[] = [];
-
-  get(keys: readonly unknown[]): T | undefined {
-    if (keys.length === 0) return this.#root.get(NestedGroupMap) as T | undefined;
-    let node: unknown = this.#root;
-    for (const key of keys) {
-      if (!(node instanceof Map)) return undefined;
-      node = node.get(key);
-    }
-    return node as T | undefined;
-  }
-
-  getEmpty(): T | undefined {
-    return this.#root.get(NestedGroupMap) as T | undefined;
-  }
-
-  getOne(key: unknown): T | undefined {
-    return this.#root.get(key) as T | undefined;
-  }
-
-  set(keys: readonly unknown[], value: T): void {
-    if (keys.length === 0) {
-      if (!this.#root.has(NestedGroupMap)) this.#values.push(value);
-      this.#root.set(NestedGroupMap, value);
-      return;
-    }
-    let node = this.#root;
-    for (let index = 0; index < keys.length - 1; index += 1) {
-      const key = keys[index];
-      const existing = node.get(key);
-      if (existing instanceof Map) node = existing as Map<unknown, unknown>;
-      else {
-        const child = new Map<unknown, unknown>();
-        node.set(key, child);
-        node = child;
-      }
-    }
-    const finalKey = keys[keys.length - 1];
-    if (!node.has(finalKey)) this.#values.push(value);
-    node.set(finalKey, value);
-  }
-
-  setEmpty(value: T): void {
-    if (!this.#root.has(NestedGroupMap)) this.#values.push(value);
-    this.#root.set(NestedGroupMap, value);
-  }
-
-  setOne(key: unknown, value: T): void {
-    if (!this.#root.has(key)) this.#values.push(value);
-    this.#root.set(key, value);
-  }
-
-  values(): readonly T[] {
-    return this.#values;
-  }
 }

@@ -299,14 +299,21 @@ construction reserves row-reference plus tagged scalar payload, and ordering/lim
 row-reference workspaces. Exact-boundary tests cover grouped string state, accumulated results,
 ordering, limiting, failure atomicity, and cleanup.
 
+Phase 7C-A replaces the nested JavaScript grouping maps with an insertion-ordered byte key index.
+Canonical typed/compound keys live in a growable arena addressed by collision-checked typed bucket,
+chain, hash, offset, and length arrays. Growth reserves replacement capacity before allocation, keeps
+old and new buffers in the high-water mark while copying, and releases old reservations afterward.
+Direct and SQL-level tests cover type boundaries, compound-key framing, `-0`, growth, budget failure,
+cleanup, insertion order, and randomized grouping parity.
+
 Phase 7 remains open. Preparation still materializes every projected input column in full before the
-modeled reservations take effect. JavaScript hash/object/property/array-capacity overhead, sort
-implementation scratch, encoding temporaries, caller-owned result lifetime, and allocator overhead
-are not counted; there is no spill path. Configured exhaustion fails instead of spilling, while the
-default remains effectively unbounded. Phase 7A/B also do not perform segment or row-group data
-skipping. Later Phase 7 work must stream inputs, replace boxed growing containers with byte-addressable
-accounted structures, and spill within a hard working-set budget; Phase 8 owns statistics-driven
-pruning and late materialization.
+modeled reservations take effect. The remaining join map, boxed aggregate/result objects, property and
+JavaScript array-capacity overhead, sort implementation scratch, encoding temporaries, caller-owned
+result lifetime, and allocator overhead are not counted; there is no spill path. Configured exhaustion
+fails instead of spilling, while the default remains effectively unbounded. Phase 7A/B/C-A also do not
+perform segment or row-group data skipping. Later Phase 7 work must stream inputs, replace the
+remaining boxed growing containers, and spill within a hard working-set budget; Phase 8 owns
+statistics-driven pruning and late materialization.
 
 The schema-less empty-table row-adapter compatibility path rejects configured budgets rather than
 silently escaping the model; catalog-backed `BrowserDatabase` empty tables stay on the typed path.
@@ -443,7 +450,8 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Route the public SQL subset and mutation replay through the Phase 7A columnar executor.
 - [x] Add the Phase 7B-A modeled query memory context for vector and row-index buffers.
 - [x] Add Phase 7B-B logical group/result payload and ordering/limit workspace accounting.
-- [ ] Replace boxed operator containers, stream projected inputs, and spill under the query budget.
+- [x] Replace nested grouping maps with a reserved byte-key arena and typed hash index.
+- [ ] Replace remaining boxed containers, stream projected inputs, and spill under the query budget.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

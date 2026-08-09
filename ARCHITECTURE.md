@@ -423,21 +423,30 @@ slot plus tagged logical scalar payload. In-place ordering reserves a modeled ro
 set, and `LIMIT` reserves the returned reference slice. Those reservations participate in the peak
 while execution owns them and are released when the result transfers to the caller.
 
+Phase 7C-A makes grouping-key lookup physically accountable. A canonical encoder writes null,
+boolean, finite-number, and length-delimited UTF-8 string keys into a byte arena; compound keys are
+unambiguous and `-0` follows JavaScript/SQL equality with `0`. FNV hashes choose typed buckets, while
+stored hashes and exact encoded-byte comparisons resolve collisions. Insertion-ordered group values
+are addressed by typed hash, offset, length, and chain arrays. Arena, entry, and bucket growth reserves
+the full replacement buffer before allocation, copies under the combined peak, then releases the old
+reservation. This removes the unmodeled nested `Map` tree without changing grouped result order.
+
 This slice still does not satisfy the bounded-memory target. Whole projected columns and their boxed
-preparation values are materialized before vector accounting begins. The model excludes JavaScript
-hash-map/object/property/array-capacity overhead, sort-implementation scratch, encoding/accounting
-temporaries, caller-owned result lifetime, and browser allocator overhead. Exhaustion throws instead
-of spilling, and the public result remains materialized under the current API contract.
+preparation values are materialized before vector accounting begins. The model excludes the remaining
+join hash map, boxed aggregate/result objects, property and JavaScript array-capacity overhead,
+sort-implementation scratch, encoding/accounting temporaries, caller-owned result lifetime, and
+browser allocator overhead. Exhaustion throws instead of spilling, and the public result remains
+materialized under the current API contract.
 
 The completed design gives every query and physical rewrite job a memory context. Operators reserve
 and release bytes, while sort, hash aggregate, hash join, and distinct spill to temporary storage when
 reservations fail. Physical compaction already advances by output block under a specialized
 conservative executor-buffer model. Mutation merge planning applies a separate preflight safety
 estimate to its in-memory key and source-reference state, but does not spill or resume that state. The
-general query context now provides the narrower Phase 7B model above; byte-addressable operator
-containers, complete physical accounting, and spilling remain future work. As described above, query
-and compaction figures are modeled workflow bounds rather than measurements or hard limits on all
-browser heap.
+general query context now provides the narrower Phase 7B/C-A model above; byte-addressable join and
+result containers, complete physical accounting, and spilling remain future work. As described above,
+query and compaction figures are modeled workflow bounds rather than measurements or hard limits on
+all browser heap.
 
 ## Automatic data skipping
 

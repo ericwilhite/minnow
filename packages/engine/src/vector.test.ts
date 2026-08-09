@@ -66,13 +66,13 @@ describe("vector query execution", () => {
       ],
     };
 
-    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 323 });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 323, usedBytes: 40, peakBytes: 40 });
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 451 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 451, usedBytes: 40, peakBytes: 40 });
     expect(exact.execute()).toEqual(expected);
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 323, usedBytes: 40, peakBytes: 323 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 451, usedBytes: 40, peakBytes: 451 });
     exact.close();
 
-    const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 239 });
+    const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 367 });
     let groupFailure: unknown;
     try {
       groupBelow.execute();
@@ -83,10 +83,10 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "MAX aggregate value",
     });
-    expect(groupBelow.memoryUsage).toEqual({ budgetBytes: 239, usedBytes: 40, peakBytes: 234 });
+    expect(groupBelow.memoryUsage).toEqual({ budgetBytes: 367, usedBytes: 40, peakBytes: 362 });
     groupBelow.close();
 
-    const resultBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 250 });
+    const resultBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 378 });
     let resultFailure: unknown;
     try {
       resultBelow.execute();
@@ -97,10 +97,10 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "Accumulated grouped result row",
     });
-    expect(resultBelow.memoryUsage).toEqual({ budgetBytes: 250, usedBytes: 40, peakBytes: 240 });
+    expect(resultBelow.memoryUsage).toEqual({ budgetBytes: 378, usedBytes: 40, peakBytes: 368 });
     resultBelow.close();
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 322 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 450 });
     let orderingFailure: unknown;
     try {
       below.execute();
@@ -111,7 +111,7 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "Ordering row references",
     });
-    expect(below.memoryUsage).toEqual({ budgetBytes: 322, usedBytes: 40, peakBytes: 299 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 450, usedBytes: 40, peakBytes: 427 });
     below.close();
   });
 
@@ -143,12 +143,12 @@ describe("vector query execution", () => {
     const tables = new Map<string, DatabaseRow[]>([
       ["rows", [{ label: "a" }, { label: "bb" }, { label: "ccc" }]],
     ]);
-    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 70 });
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 166 });
     expect(exact.execute()).toEqual({ columns: ["maximum"], rows: [{ maximum: "ccc" }] });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 70, usedBytes: 19, peakBytes: 70 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 166, usedBytes: 19, peakBytes: 166 });
     exact.close();
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 69 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 165 });
     let failure: unknown;
     try {
       below.execute();
@@ -159,7 +159,7 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "MAX aggregate value",
     });
-    expect(below.memoryUsage).toEqual({ budgetBytes: 69, usedBytes: 19, peakBytes: 68 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 165, usedBytes: 19, peakBytes: 164 });
     below.close();
   });
 
