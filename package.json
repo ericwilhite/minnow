@@ -16,7 +16,7 @@
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
-    "check": "npm run format && npm run lint && npm run typecheck && npm test",
+    "check": "npm run format && npm run typecheck && npm run lint && npm test",
     "check:release": "npm run check && npm run test:library-browser && npm run test:browser"
   },
   "devDependencies": {
