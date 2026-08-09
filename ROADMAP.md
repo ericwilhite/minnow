@@ -339,6 +339,16 @@ Exit gate: hot paths avoid row-object materialization and per-row callbacks; ope
 
 Deliver automatic min/max, null count, approximate distinct, dictionary membership, and optional Bloom metadata; segment/row-group pruning; predicate-column-first reads; late materialization.
 
+Phase 8A implements a conservative first slice for one append/base table. Simple `AND`-combined
+number/datetime column-to-literal predicates checksum-validate and physically decode predicate blocks
+before trusting persisted min/max and null counts, skip impossible groups before logical vector
+materialization, evaluate candidate predicate vectors into a typed selection, and late-load projected blocks only for candidate groups before compacting exact
+matches. Joins, mutation replay, strings, computed predicates, and layouts without aligned block
+counts fall back to the full scan. Predicate values are still fetched as complete IndexedDB records;
+header-only metadata access, segment summaries, richer statistics, and the selectivity benchmark
+matrix remain open. The authenticated physical decode is deliberate because version-zero metadata
+JSON does not carry an independent checksum.
+
 Benchmark selectivity at 100%, 50%, 10%, 1%, 0.1%, and 0.01%.
 
 Exit gate: selective queries read fewer blocks/bytes and get materially faster as more row groups can be ruled out.
@@ -467,6 +477,7 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add Phase 7B-B logical group/result payload and ordering/limit workspace accounting.
 - [x] Replace nested grouping maps with a reserved byte-key arena and typed hash index.
 - [x] Replace hash-join maps and duplicate arrays with a reserved byte-key index and typed row chains.
+- [x] Add numeric/datetime zone-map row-group pruning and predicate-first projected-block loading.
 - [ ] Replace remaining boxed containers, stream projected inputs, and spill under the query budget.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 

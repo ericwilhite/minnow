@@ -145,6 +145,9 @@ window.runTransactionBrowserTest = async () => {
   });
   const aggregateSql = "SELECT COUNT(*) AS count, SUM(score) AS total FROM people";
   const preparedPeople = await database.prepareQuery(aggregateSql);
+  const prunedNames = (
+    await database.query("SELECT name FROM people WHERE score >= 30 ORDER BY name")
+  ).rows.map((row) => String(row.name));
   const upsert = await database.upsertBatch("people", {
     columns: { name: ["Grace", "Katherine"], score: [25, 40] },
   });
@@ -300,6 +303,7 @@ window.runTransactionBrowserTest = async () => {
         historicalRows: mutationHistoricalRows.length,
       },
       vectorQuery: {
+        prunedNames,
         prepared: preparedAggregate,
         historical: historicalAggregate,
         current: currentAggregate,

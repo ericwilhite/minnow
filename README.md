@@ -195,9 +195,19 @@ does not include returned result objects, properties, group-key and retained `MI
 containers, or JavaScript array-capacity overhead;
 encoding/accounting temporaries; the lifetime of returned rows after ownership transfers to the
 caller; or engine/browser allocator overhead. Configured exhaustion fails the query instead of
-spilling. It also performs no statistics-driven segment or row-group data skipping. Phase 7 remains
-open for streaming inputs, byte-addressable aggregate/result containers, complete physical
-accounting, and spill; Phase 8 remains open for pruning and late materialization.
+spilling. Phase 7 remains open for streaming inputs, byte-addressable aggregate/result containers,
+complete physical accounting, and spill.
+
+Phase 8A adds conservative row-group skipping for a single append/base table with `AND`-combined
+number or datetime column-to-literal comparisons. Preparation checksum-validates and physically
+decodes predicate blocks before trusting their derived min/max and null-count metadata, rejects
+impossible groups before logical vector materialization, evaluates surviving predicate vectors into
+a typed selection, and only then loads projected
+blocks for candidate groups and compacts exact matches. Joins, keyed mutation snapshots, strings,
+computed predicates, and unsupported layouts retain the full-scan path. IndexedDB currently returns
+the complete predicate block value rather than trusted header/index metadata, so this slice primarily
+saves non-predicate block I/O and vector work; richer statistics, authenticated metadata access, and
+selective benchmarks remain.
 
 The exported row-array helper retains a compatibility oracle for schema-less empty inputs. Because it
 cannot construct typed empty vectors without column types, that fallback rejects an explicit memory

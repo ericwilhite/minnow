@@ -471,11 +471,21 @@ all browser heap.
 
 ## Automatic data skipping
 
-Phase 7A performs no data skipping: it reads every block needed for each referenced projected column.
-There are no user-managed indexes. A later phase will record row count, null count, min/max zone maps,
-approximate distinct counts, dictionary membership, and optional Bloom filters per row group. Those
-statistics will let scans prune segments and row groups before loading predicate columns, evaluate a
-selection vector, and then late-load projected columns.
+Phase 8A uses the existing physical block row count, null count, and numeric/datetime min/max zone map
+for a conservative scan fast path. A single append/base table with simple `AND`-combined
+column-to-literal predicates first fetches, decompresses, checksum-verifies, and validates predicate
+blocks before trusting their derived metadata. Impossible row groups are rejected before logical
+vector materialization; candidate predicate vectors are evaluated into a typed row selection. Only
+projected blocks from candidate groups are then loaded, and exact
+matches are compacted into the retained table vectors. Block-count or row-window mismatches fail back
+or fail closed rather than risking cross-column misalignment.
+
+This does not yet provide an authenticated header-only IndexedDB access path: predicate block values
+are fetched and physically decoded because version-zero metadata JSON has no independent checksum.
+Joins, mutation snapshots, strings, computed predicates,
+and other layouts retain the full scan. Approximate distinct counts, dictionary membership, Bloom
+filters, segment summaries, and broader cost-based pruning remain future work. There are no
+user-managed indexes.
 
 Workload telemetry may eventually drive compaction order, clustering, and auxiliary per-segment structures. These structures are derived and disposable; logical correctness does not depend on them.
 

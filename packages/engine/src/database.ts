@@ -12,6 +12,7 @@ import {
   type ColumnInput,
   type Compression,
   type DecodedColumn,
+  type DecodedPhysicalBlock,
   type LogicalType,
   type PhysicalColumnRange,
   type ValidatedPhysicalColumn,
@@ -57,6 +58,8 @@ import {
   compileQuery,
   createPreparedColumnarQuery,
   referencedColumns,
+  type ComparisonOperator,
+  type CompiledQuery,
   type PreparedQuery,
   type QueryResult,
 } from "./query.js";
@@ -116,6 +119,18 @@ interface MergeResolvedRow {
 interface SegmentVisibilityCatalog {
   readonly transactions: ReadonlyMap<string, { readonly committedVersion: number | null }>;
   readonly segmentsByTable: ReadonlyMap<string, readonly SegmentRecord[]>;
+}
+
+interface ZonePredicate {
+  readonly column: TableColumnRecord;
+  readonly operator: ComparisonOperator;
+  readonly value: number;
+}
+
+interface SelectedAppendSegment {
+  readonly segment: SegmentRecord;
+  readonly blockIndexes: readonly number[];
+  readonly rowCounts: readonly number[];
 }
 
 export interface ColumnDefinition {
@@ -1070,6 +1085,7 @@ export class BrowserDatabase {
               snapshot,
               requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
               visibility,
+              tables.length === 1 ? plan : undefined,
             ),
           );
         }
@@ -3278,6 +3294,7 @@ export class BrowserDatabase {
     snapshot: LeasedSnapshot,
     projectedColumns: readonly TableColumnRecord[],
     visibility?: SegmentVisibilityCatalog,
+    plan?: CompiledQuery,
   ): Promise<ColumnarTable> {
     const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
     const keyColumn = getUniqueKeyColumn(table);
@@ -3287,6 +3304,17 @@ export class BrowserDatabase {
         return kind === "insert" || kind === "base";
       })
     ) {
+      const predicates = plan === undefined ? [] : zonePredicates(plan, table);
+      if (predicates.length > 0) {
+        const pruned = await this.#materializePrunedAppendTable(
+          table,
+          snapshot,
+          projectedColumns,
+          segments,
+          predicates,
+        );
+        if (pruned !== undefined) return pruned;
+      }
       const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
       if (projectedColumns.length === 0) {
         return { name: table.name, rowCount, columns: new Map() };
@@ -3459,11 +3487,199 @@ export class BrowserDatabase {
     };
   }
 
+  async #materializePrunedAppendTable(
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    projectedColumns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    predicates: readonly ZonePredicate[],
+  ): Promise<ColumnarTable | undefined> {
+    const predicateColumns = [
+      ...new Map(predicates.map((predicate) => [predicate.column.id, predicate.column])).values(),
+    ];
+    const storedBlocks = new Map<string, Uint8Array>();
+    const decodedPredicateBlocks = new Map<string, DecodedPhysicalBlock>();
+    const predicateBlockIds = [
+      ...new Set(
+        segments.flatMap((segment) =>
+          predicateColumns.flatMap((column) => segment.columnBlockIds[column.id] ?? []),
+        ),
+      ),
+    ];
+    for (let start = 0; start < predicateBlockIds.length; start += 16) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      const ids = predicateBlockIds.slice(start, start + 16);
+      const blocks = await this.store.getBlocks(ids);
+      const decoded = await Promise.all(
+        blocks.map(async (bytes, index) => {
+          const id = ids[index] ?? "";
+          if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+          return decodePhysicalBlock(bytes);
+        }),
+      );
+      for (let index = 0; index < ids.length; index += 1) {
+        const id = ids[index] ?? "";
+        const bytes = blocks[index];
+        const physical = decoded[index];
+        if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+        if (physical === undefined) throw new Error(`Visible block is missing: ${id}`);
+        storedBlocks.set(id, bytes);
+        decodedPredicateBlocks.set(id, physical);
+      }
+    }
+
+    const selectedSegments: SelectedAppendSegment[] = [];
+    for (const segment of segments) {
+      const firstIds = segment.columnBlockIds[predicateColumns[0]?.id ?? ""] ?? [];
+      if (
+        predicateColumns.some(
+          (column) => (segment.columnBlockIds[column.id]?.length ?? 0) !== firstIds.length,
+        ) ||
+        projectedColumns.some(
+          (column) => (segment.columnBlockIds[column.id]?.length ?? 0) !== firstIds.length,
+        )
+      ) {
+        return undefined;
+      }
+      const blockIndexes: number[] = [];
+      const rowCounts: number[] = [];
+      let segmentRows = 0;
+      for (let blockIndex = 0; blockIndex < firstIds.length; blockIndex += 1) {
+        let rowCount: number | undefined;
+        let canMatch = true;
+        for (const predicate of predicates) {
+          const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
+          const decoded = decodedPredicateBlocks.get(blockId);
+          if (decoded === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+          const { description } = decoded;
+          if (description.type !== predicate.column.type) {
+            throw new Error(`Column type mismatch: ${predicate.column.name}`);
+          }
+          if (rowCount !== undefined && description.rowCount !== rowCount) return undefined;
+          rowCount = description.rowCount;
+          if (!zoneMapCanMatch(description, predicate)) canMatch = false;
+        }
+        if (rowCount === undefined) return undefined;
+        segmentRows += rowCount;
+        if (canMatch) {
+          blockIndexes.push(blockIndex);
+          rowCounts.push(rowCount);
+        }
+      }
+      if (segmentRows !== segment.rowCount) return undefined;
+      if (blockIndexes.length > 0) selectedSegments.push({ segment, blockIndexes, rowCounts });
+    }
+
+    const expectedRows = new Map<string, number>();
+    const candidateSegments = selectedSegments.map(({ segment, blockIndexes, rowCounts }) => {
+      const columnBlockIds = Object.fromEntries(
+        projectedColumns.map((column) => [
+          column.id,
+          blockIndexes.map((blockIndex, index) => {
+            const blockId = segment.columnBlockIds[column.id]?.[blockIndex] ?? "";
+            expectedRows.set(blockId, rowCounts[index] ?? 0);
+            return blockId;
+          }),
+        ]),
+      );
+      return {
+        ...segment,
+        rowCount: rowCounts.reduce((total, count) => total + count, 0),
+        columnBlockIds,
+      };
+    });
+    const candidateRowCount = candidateSegments.reduce(
+      (total, segment) => total + segment.rowCount,
+      0,
+    );
+    const candidateVectors = new Map<string, ColumnVector>();
+    for (const column of predicateColumns) {
+      candidateVectors.set(
+        column.id,
+        await this.#materializeAppendColumnVector(
+          column,
+          candidateSegments,
+          snapshot,
+          candidateRowCount,
+          storedBlocks,
+          expectedRows,
+          decodedPredicateBlocks,
+        ),
+      );
+    }
+    const selectedRows = new Uint32Array(candidateRowCount);
+    let selectedRowCount = 0;
+    for (let row = 0; row < candidateRowCount; row += 1) {
+      if (
+        predicates.every((predicate) =>
+          vectorPredicateMatches(
+            requiredColumnVector(candidateVectors, predicate.column),
+            row,
+            predicate,
+          ),
+        )
+      ) {
+        selectedRows[selectedRowCount] = row;
+        selectedRowCount += 1;
+      }
+    }
+    for (const column of projectedColumns) {
+      if (candidateVectors.has(column.id)) continue;
+      candidateVectors.set(
+        column.id,
+        selectedRowCount === 0
+          ? createEmptyColumnVector(column.type, 0)
+          : await this.#materializeAppendColumnVector(
+              column,
+              candidateSegments,
+              snapshot,
+              candidateRowCount,
+              storedBlocks,
+              expectedRows,
+            ),
+      );
+    }
+    const columns = new Map<string, ColumnVector>();
+    for (const column of projectedColumns) {
+      const candidate = requiredColumnVector(candidateVectors, column);
+      if (selectedRowCount === candidateRowCount) {
+        columns.set(column.name, candidate);
+        continue;
+      }
+      const output = createEmptyColumnVector(column.type, selectedRowCount);
+      const dictionaryIndex = column.type === "string" ? new Map<string, number>() : undefined;
+      for (let outputRow = 0; outputRow < selectedRowCount; outputRow += 1) {
+        copyColumnVectorValue(
+          candidate,
+          selectedRows[outputRow] ?? 0,
+          output,
+          outputRow,
+          dictionaryIndex,
+        );
+      }
+      columns.set(column.name, output);
+    }
+    const keyColumn = getUniqueKeyColumn(table);
+    const projectedKey =
+      keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
+        ? keyColumn.name
+        : undefined;
+    return {
+      name: table.name,
+      rowCount: selectedRowCount,
+      columns,
+      ...(projectedKey ? { uniqueKey: projectedKey } : {}),
+    };
+  }
+
   async #materializeAppendColumnVector(
     column: TableColumnRecord,
     segments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
     rowCount: number,
+    storedBlocks?: Map<string, Uint8Array>,
+    expectedRows?: ReadonlyMap<string, number>,
+    decodedPhysicalBlocks?: ReadonlyMap<string, DecodedPhysicalBlock>,
   ): Promise<ColumnVector> {
     const validity = new Uint8Array(Math.ceil(rowCount / 8));
     const values =
@@ -3484,12 +3700,32 @@ export class BrowserDatabase {
       for (let start = 0; start < blockIds.length; start += 16) {
         await this.#renewInternalLeaseIfNeeded(snapshot);
         const ids = blockIds.slice(start, start + 16);
-        const blocks = await this.store.getBlocks(ids);
+        let blocks: Array<Uint8Array | undefined>;
+        if (storedBlocks === undefined) {
+          blocks = await this.store.getBlocks(ids);
+        } else {
+          const uncachedIds = ids.filter((id) => !storedBlocks.has(id));
+          const uncachedBlocks =
+            uncachedIds.length === 0 ? [] : await this.store.getBlocks(uncachedIds);
+          for (let index = 0; index < uncachedIds.length; index += 1) {
+            const id = uncachedIds[index] ?? "";
+            const bytes = uncachedBlocks[index];
+            if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+            storedBlocks.set(id, bytes);
+          }
+          blocks = ids.map((id) => storedBlocks.get(id));
+        }
         const decodedBlocks = await Promise.all(
           blocks.map(async (bytes, index) => {
             const blockId = ids[index] ?? "";
             if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-            return decodePhysicalBlock(bytes);
+            const decoded =
+              decodedPhysicalBlocks?.get(blockId) ?? (await decodePhysicalBlock(bytes));
+            const expected = expectedRows?.get(blockId);
+            if (expected !== undefined && decoded.column.rowCount !== expected) {
+              throw new Error(`Column block row count mismatch: ${column.name}`);
+            }
+            return decoded;
           }),
         );
         for (const decoded of decodedBlocks) {
@@ -4104,6 +4340,93 @@ function columnVectorKeyToken(type: SimpleDataType, vector: ColumnVector, row: n
     return keyToken(type, vector.dictionary[vector.codes[row] ?? NULL_STRING_VECTOR_CODE] ?? null);
   }
   throw new Error("Column vector type mismatch");
+}
+
+function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[] {
+  if (plan.joins.length > 0 || plan.base.table !== table.name) return [];
+  const output: ZonePredicate[] = [];
+  const resolveColumn = (reference: string): TableColumnRecord | undefined => {
+    const parts = reference.split(".");
+    if (parts.length === 2 && parts[0] !== plan.base.alias && parts[0] !== table.name) {
+      return undefined;
+    }
+    const name = parts.length === 2 ? parts[1] : parts[0];
+    const column = table.columns.find((candidate) => candidate.name === name);
+    return column?.type === "number" || column?.type === "datetime" ? column : undefined;
+  };
+  for (const predicate of plan.predicates) {
+    const leftColumn =
+      predicate.left.kind === "column" ? resolveColumn(predicate.left.reference) : undefined;
+    const rightColumn =
+      predicate.right.kind === "column" ? resolveColumn(predicate.right.reference) : undefined;
+    const literal = leftColumn === undefined ? predicate.left : predicate.right;
+    const column = leftColumn ?? rightColumn;
+    if (column === undefined || literal.kind !== "literal") continue;
+    const value =
+      column.type === "datetime"
+        ? literal.value instanceof Date
+          ? literal.value.getTime()
+          : undefined
+        : typeof literal.value === "number"
+          ? literal.value
+          : undefined;
+    if (value === undefined || !Number.isFinite(value)) continue;
+    output.push({
+      column,
+      operator:
+        leftColumn === undefined ? reverseComparison(predicate.operator) : predicate.operator,
+      value,
+    });
+  }
+  return output;
+}
+
+function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
+  if (operator === ">") return "<";
+  if (operator === ">=") return "<=";
+  if (operator === "<") return ">";
+  if (operator === "<=") return ">=";
+  return operator;
+}
+
+function zoneMapCanMatch(
+  description: ReturnType<typeof inspectBlock>,
+  predicate: ZonePredicate,
+): boolean {
+  if (description.nullCount === description.rowCount) return false;
+  const zoneMap = description.metadata.zoneMap;
+  if (zoneMap === undefined) return true;
+  if (predicate.operator === "=") {
+    return predicate.value >= zoneMap.min && predicate.value <= zoneMap.max;
+  }
+  if (predicate.operator === "!=" || predicate.operator === "<>") {
+    return zoneMap.min !== predicate.value || zoneMap.max !== predicate.value;
+  }
+  if (predicate.operator === ">") return zoneMap.max > predicate.value;
+  if (predicate.operator === ">=") return zoneMap.max >= predicate.value;
+  if (predicate.operator === "<") return zoneMap.min < predicate.value;
+  return zoneMap.min <= predicate.value;
+}
+
+function vectorPredicateMatches(
+  vector: ColumnVector,
+  row: number,
+  predicate: ZonePredicate,
+): boolean {
+  if (!bitmapHasValue(vector.validity, row)) return false;
+  if (
+    (predicate.column.type !== "number" || vector.kind !== "number") &&
+    (predicate.column.type !== "datetime" || vector.kind !== "datetime")
+  ) {
+    throw new Error("Predicate vector type mismatch");
+  }
+  const value = vector.values[row] ?? Number.NaN;
+  if (predicate.operator === "=") return value === predicate.value;
+  if (predicate.operator === "!=" || predicate.operator === "<>") return value !== predicate.value;
+  if (predicate.operator === ">") return value > predicate.value;
+  if (predicate.operator === ">=") return value >= predicate.value;
+  if (predicate.operator === "<") return value < predicate.value;
+  return value <= predicate.value;
 }
 
 function bitmapHasValue(bitmap: Uint8Array, index: number): boolean {

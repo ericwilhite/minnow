@@ -4776,6 +4776,70 @@ it("answers metadata-only queries without loading a data block", async () => {
   store.close();
 });
 
+it("prunes numeric row groups and late-loads projected blocks after predicate selection", async () => {
+  const store = new CountingMemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw", rowsPerBlock: 2 });
+  await database.createTable({
+    name: "pruned_metrics",
+    columns: [
+      { name: "score", type: "number", nullable: true },
+      { name: "label", type: "string" },
+      { name: "recordedAt", type: "datetime" },
+    ],
+  });
+  await database.insertBatch("pruned_metrics", {
+    columns: {
+      score: [null, 2, 3, 4, 5, 6, 7, 8],
+      label: ["one", "two", "three", "four", "five", "six", "seven", "eight"],
+      recordedAt: Array.from({ length: 8 }, (_, index) => new Date(Date.UTC(2026, 0, index + 1))),
+    },
+  });
+  const table = (await store.listTables()).find((candidate) => candidate.name === "pruned_metrics");
+  if (table === undefined) throw new Error("Expected pruning table metadata");
+  const scoreColumn = table.columns.find((column) => column.name === "score");
+  const labelColumn = table.columns.find((column) => column.name === "label");
+  const recordedAtColumn = table.columns.find((column) => column.name === "recordedAt");
+  if (scoreColumn === undefined || labelColumn === undefined || recordedAtColumn === undefined) {
+    throw new Error("Expected pruning columns");
+  }
+  const segment = (await database.listVisibleSegments("pruned_metrics"))[0];
+  if (segment === undefined) throw new Error("Expected pruning segment");
+
+  store.blockReadCalls = 0;
+  store.blockIdsRead = [];
+  expect(await database.query("SELECT label FROM pruned_metrics WHERE score = 7")).toEqual({
+    columns: ["label"],
+    rows: [{ label: "seven" }],
+  });
+  const firstReadIds = store.blockIdsRead.flat();
+  expect(firstReadIds).toEqual([
+    ...(segment.columnBlockIds[scoreColumn.id] ?? []),
+    (segment.columnBlockIds[labelColumn.id] ?? [])[3],
+  ]);
+  expect(firstReadIds).toHaveLength(5);
+
+  store.blockReadCalls = 0;
+  store.blockIdsRead = [];
+  expect(
+    await database.query(
+      "SELECT label FROM pruned_metrics WHERE DATE '2026-01-07' <= recordedAt ORDER BY label",
+    ),
+  ).toEqual({ columns: ["label"], rows: [{ label: "eight" }, { label: "seven" }] });
+  expect(store.blockIdsRead.flat()).toEqual([
+    ...(segment.columnBlockIds[recordedAtColumn.id] ?? []),
+    (segment.columnBlockIds[labelColumn.id] ?? [])[3],
+  ]);
+
+  store.blockReadCalls = 0;
+  store.blockIdsRead = [];
+  expect(await database.query("SELECT score FROM pruned_metrics WHERE label = 'seven'")).toEqual({
+    columns: ["score"],
+    rows: [{ score: 7 }],
+  });
+  expect(store.blockIdsRead.flat()).toHaveLength(8);
+  store.close();
+});
+
 it("shares one visibility catalog across multi-table query preparation", async () => {
   const store = new CountingMemoryBlockStore();
   const database = new BrowserDatabase(store);
