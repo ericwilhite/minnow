@@ -306,9 +306,16 @@ old and new buffers in the high-water mark while copying, and releases old reser
 Direct and SQL-level tests cover type boundaries, compound-key framing, `-0`, growth, budget failure,
 cleanup, insertion order, and randomized grouping parity.
 
+Phase 7C-B replaces the general hash-join `Map` and boxed duplicate arrays with a scalar byte key
+index and typed build-row chains. Exact encoded bytes resolve hash collisions, typed tags preserve SQL
+key distinctions, duplicate traversal retains build order, and every retained arena/index growth is
+reserved before allocation. Dense unique integer joins keep their direct typed lookup. Tests cover
+hash collisions, typed keys, duplicate order, `-0`, SQL `NaN` behavior, exact budget failure, and
+row/vector parity.
+
 Phase 7 remains open. Preparation still materializes every projected input column in full before the
-modeled reservations take effect. The remaining join map, boxed aggregate/result objects, property and
-JavaScript array-capacity overhead, sort implementation scratch, encoding temporaries, caller-owned
+modeled reservations take effect. Boxed aggregate/result objects, property and JavaScript
+array-capacity overhead, sort implementation scratch, encoding temporaries, caller-owned
 result lifetime, and allocator overhead are not counted; there is no spill path. Configured exhaustion
 fails instead of spilling, while the default remains effectively unbounded. Phase 7A/B/C-A also do not
 perform segment or row-group data skipping. Later Phase 7 work must stream inputs, replace the
@@ -451,6 +458,7 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add the Phase 7B-A modeled query memory context for vector and row-index buffers.
 - [x] Add Phase 7B-B logical group/result payload and ordering/limit workspace accounting.
 - [x] Replace nested grouping maps with a reserved byte-key arena and typed hash index.
+- [x] Replace hash-join maps and duplicate arrays with a reserved byte-key index and typed row chains.
 - [ ] Replace remaining boxed containers, stream projected inputs, and spill under the query budget.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 

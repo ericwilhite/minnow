@@ -431,9 +431,16 @@ are addressed by typed hash, offset, length, and chain arrays. Arena, entry, and
 the full replacement buffer before allocation, copies under the combined peak, then releases the old
 reservation. This removes the unmodeled nested `Map` tree without changing grouped result order.
 
+Phase 7C-B makes the general hash-join lookup physically accountable. Canonical scalar key bytes are
+stored in a collision-checked arena addressed by typed bucket, hash, offset, length, and chain arrays.
+Each build row owns one typed next-row slot, so duplicate keys form insertion-ordered `Int32Array`
+chains without boxed arrays. Null and `NaN` keys are not indexed, `-0` shares the zero key, and scalar
+type tags prevent numeric/string aliasing. Dense declared-unique integer keys continue to use a direct
+typed lookup. Growth follows the same reserve-new, copy, release-old high-water contract as grouping.
+
 This slice still does not satisfy the bounded-memory target. Whole projected columns and their boxed
-preparation values are materialized before vector accounting begins. The model excludes the remaining
-join hash map, boxed aggregate/result objects, property and JavaScript array-capacity overhead,
+preparation values are materialized before vector accounting begins. The model excludes boxed
+aggregate/result objects, property and JavaScript array-capacity overhead,
 sort-implementation scratch, encoding/accounting temporaries, caller-owned result lifetime, and
 browser allocator overhead. Exhaustion throws instead of spilling, and the public result remains
 materialized under the current API contract.
@@ -443,8 +450,8 @@ and release bytes, while sort, hash aggregate, hash join, and distinct spill to 
 reservations fail. Physical compaction already advances by output block under a specialized
 conservative executor-buffer model. Mutation merge planning applies a separate preflight safety
 estimate to its in-memory key and source-reference state, but does not spill or resume that state. The
-general query context now provides the narrower Phase 7B/C-A model above; byte-addressable join and
-result containers, complete physical accounting, and spilling remain future work. As described above,
+general query context now provides the narrower Phase 7B/C-A/C-B model above; byte-addressable result
+containers, complete physical accounting, and spilling remain future work. As described above,
 query and compaction figures are modeled workflow bounds rather than measurements or hard limits on
 all browser heap.
 

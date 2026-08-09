@@ -169,14 +169,21 @@ address typed bucket, chain, offset, length, and hash arrays. Every arena or ind
 new typed capacity before allocation and releases the superseded reservation only after copying.
 Insertion order remains stable for deterministic grouped results.
 
+Phase 7C-B applies the same physical-accounting boundary to hash joins. Non-direct join keys use a
+collision-checked scalar byte arena with typed bucket and entry arrays; duplicate build rows are
+linked through one reserved `Int32Array` rather than boxed `Map` entries and growable row arrays.
+Probe traversal preserves build-row order, canonicalizes `-0`, keeps numeric and string keys
+distinct, and follows SQL null and `NaN` equality semantics. Dense unique integer keys retain their
+direct typed lookup fast path.
+
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
 still materializes each projected input in full before the vector reservation is installed. The model
-does not include boxed preparation values; the remaining join `Map`, aggregate/result objects,
-properties, or JavaScript array-capacity overhead; the sort implementation's internal scratch;
+does not include boxed preparation values; aggregate/result objects, properties, or JavaScript
+array-capacity overhead; the sort implementation's internal scratch;
 encoding/accounting temporaries; the lifetime of returned rows after ownership transfers to the
 caller; or engine/browser allocator overhead. Configured exhaustion fails the query instead of
 spilling. It also performs no statistics-driven segment or row-group data skipping. Phase 7 remains
-open for streaming inputs, byte-addressable join/aggregate/result containers, complete physical
+open for streaming inputs, byte-addressable aggregate/result containers, complete physical
 accounting, and spill; Phase 8 remains open for pruning and late materialization.
 
 The exported row-array helper retains a compatibility oracle for schema-less empty inputs. Because it

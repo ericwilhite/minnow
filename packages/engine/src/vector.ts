@@ -10,6 +10,7 @@ import type {
   SelectItem,
 } from "./query.js";
 import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
+import { ByteJoinIndex } from "./join-index.js";
 import {
   QueryMemoryContext,
   type QueryMemoryReservation,
@@ -160,8 +161,8 @@ interface BatchRows {
 
 interface JoinLookup {
   readonly unique: boolean;
-  uniqueRow(key: unknown): number;
-  matches(key: unknown): readonly number[] | Int32Array;
+  firstRow(key: unknown): number;
+  nextRow(row: number): number;
 }
 
 export function createColumnarTable(
@@ -565,12 +566,7 @@ function createJoinLookup(
     const direct = vector === undefined ? undefined : createDirectLookup(vector, memory);
     if (direct !== undefined) return direct;
   }
-  memory.reserve(
-    safeMemoryProduct(table.rowCount + 1, Int32Array.BYTES_PER_ELEMENT, "Hash join row indexes"),
-    `Hash join ${table.name}`,
-  );
-  const firstRowByKey = new Map<unknown, number>();
-  const duplicateRowsByKey = new Map<unknown, number[]>();
+  const index = new ByteJoinIndex(memory, table.rowCount);
   const buildScratch = memory.reserve(
     safeMemoryProduct(source + 1, Int32Array.BYTES_PER_ELEMENT, "Hash join bind scratch"),
     `Hash join ${table.name} bind scratch`,
@@ -580,35 +576,17 @@ function createJoinLookup(
     rowBySource.fill(-1);
     for (let rowIndex = 0; rowIndex < table.rowCount; rowIndex += 1) {
       rowBySource[source] = rowIndex;
-      const key = comparable(evaluateExpression(expression, rowBySource));
-      if (key === null || key === undefined) continue;
-      const firstRow = firstRowByKey.get(key);
-      if (firstRow === undefined) firstRowByKey.set(key, rowIndex);
-      else {
-        const rows = duplicateRowsByKey.get(key) ?? [firstRow];
-        rows.push(rowIndex);
-        duplicateRowsByKey.set(key, rows);
-      }
+      index.add(evaluateExpression(expression, rowBySource), rowIndex);
     }
   } finally {
     buildScratch.release();
   }
-  const unique = duplicateRowsByKey.size === 0;
-  const singleton = new Int32Array(1);
   return {
-    unique,
-    uniqueRow(key) {
-      return firstRowByKey.get(comparable(key)) ?? -1;
+    get unique() {
+      return index.unique;
     },
-    matches(key) {
-      const comparableKey = comparable(key);
-      const duplicateRows = duplicateRowsByKey.get(comparableKey);
-      if (duplicateRows !== undefined) return duplicateRows;
-      const row = firstRowByKey.get(comparableKey);
-      if (row === undefined) return [];
-      singleton[0] = row;
-      return singleton;
-    },
+    firstRow: (key) => index.firstRow(key),
+    nextRow: (row) => index.nextRow(row),
   };
 }
 
@@ -627,7 +605,7 @@ function createDirectLookup(
     maximum = Math.max(maximum, value);
   }
   if (!Number.isFinite(minimum)) {
-    return { unique: true, uniqueRow: () => -1, matches: () => [] };
+    return { unique: true, firstRow: () => -1, nextRow: () => -1 };
   }
   const range = maximum - minimum + 1;
   if (range > Math.max(1_024, vector.length * 4) || range > 10_000_000) return undefined;
@@ -646,23 +624,14 @@ function createDirectLookup(
     }
     rowByKey[slot] = index;
   }
-  const singleton = new Int32Array(1);
   return {
     unique: true,
-    uniqueRow(key) {
+    firstRow(key) {
       if (typeof key !== "number" || !Number.isSafeInteger(key)) return -1;
       const slot = key - minimum;
       return slot < 0 || slot >= rowByKey.length ? -1 : (rowByKey[slot] ?? -1);
     },
-    matches(key) {
-      if (typeof key !== "number" || !Number.isSafeInteger(key)) return [];
-      const slot = key - minimum;
-      if (slot < 0 || slot >= rowByKey.length) return [];
-      const row = rowByKey[slot] ?? -1;
-      if (row < 0) return [];
-      singleton[0] = row;
-      return singleton;
-    },
+    nextRow: () => -1,
   };
 }
 
@@ -816,16 +785,17 @@ function* joinBatches(
     let outputRows = plan.sourceTables.map(() => [] as number[]);
     for (let row = 0; row < input.length; row += 1) {
       const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
-      const matches = probeKey === null ? [] : join.lookup.matches(probeKey);
-      if (matches.length === 0) {
+      let buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
+      if (buildRow < 0) {
         if (join.kind === "left") appendJoinedRow(outputRows, input, row, join.buildSource, -1);
       } else {
-        for (const buildRow of matches) {
+        while (buildRow >= 0) {
           appendJoinedRow(outputRows, input, row, join.buildSource, buildRow);
           if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
             yield materializeJoinedRows(outputRows, memory);
             outputRows = plan.sourceTables.map(() => [] as number[]);
           }
+          buildRow = join.lookup.nextRow(buildRow);
         }
       }
       if ((outputRows[0]?.length ?? 0) === DEFAULT_BATCH_ROWS) {
@@ -886,7 +856,7 @@ function joinUniqueBatch(
     let outputLength = 0;
     for (let row = 0; row < input.length; row += 1) {
       const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
-      const buildRow = probeKey === null ? -1 : join.lookup.uniqueRow(probeKey);
+      const buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
       if (buildRow < 0 && join.kind === "inner") continue;
       selectedRows[outputLength] = row;
       buildRows[outputLength] = buildRow;

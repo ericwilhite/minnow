@@ -198,6 +198,36 @@ describe("vector query execution", () => {
     exact.close();
   });
 
+  it("uses SQL equality for NaN join keys", () => {
+    const plan = compileQuery(
+      "SELECT l.label AS left_label, r.label AS right_label FROM left_rows l LEFT JOIN right_rows r ON r.value / r.value = l.value / l.value ORDER BY left_label",
+    );
+    const tables = new Map<string, DatabaseRow[]>([
+      [
+        "left_rows",
+        [
+          { label: "finite", value: 1 },
+          { label: "not-a-number", value: 0 },
+        ],
+      ],
+      [
+        "right_rows",
+        [
+          { label: "finite-match", value: 1 },
+          { label: "nan-must-not-match", value: 0 },
+        ],
+      ],
+    ]);
+
+    expect(executeQuery(plan, tables)).toEqual({
+      columns: ["left_label", "right_label"],
+      rows: [
+        { left_label: "finite", right_label: "finite-match" },
+        { left_label: "not-a-number", right_label: null },
+      ],
+    });
+  });
+
   it("builds typed vectors with explicit validity and dictionary contracts", () => {
     const firstDate = new Date("2025-01-01T00:00:00.000Z");
     const secondDate = new Date("2025-01-02T00:00:00.000Z");
