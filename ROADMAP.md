@@ -144,7 +144,8 @@ Exit gate: published benchmark curves for insert, upsert, update, delete, and co
 ## Phase 6 — Compaction
 
 Phase 6A, the Phase 6B physical-rewrite/cancellation slices, Phase 6C mutation merging, Phase 6D
-bounded L0-prefix selection, and lease-aware physical reclamation for known artifacts are implemented:
+bounded L0-prefix selection and lease-aware physical reclamation for known artifacts, and the Phase
+6E-A append-row-range L2 slice are implemented:
 
 - atomic manifest publication can supersede snapshot blocks without deleting historical data;
 - revisioned compaction job records persist in the IndexedDB `gc` store with planned, running,
@@ -180,6 +181,18 @@ bounded L0-prefix selection, and lease-aware physical reclamation for known arti
 - the defaults require two L0 sources and target at most 16 L0 segments or 64 MiB of
   newly promoted stored bytes; the minimum and an equal-`logicalOrder` group may cross those targets
   to preserve progress and replay order, while an explicit minimum of one can drain `L1 + 1 L0`;
+- explicit `targetLevel: 2` starts the append-row-range policy only for non-keyed ordinary inserts
+  with contiguous source row IDs; after one valid L2 partition exists, an omitted target continues
+  L2 automatically, and an explicit minimum of one permits direct one-segment L0-to-L2 promotion;
+- the accepted L2 layout is an optional retained legacy L1 insert, immutable L2 inserts with exact
+  consecutive `partitionOrdinal` values, and an L0 insert suffix; each job promotes only the oldest
+  complete L0 prefix to the next ordinal and never rewrites an existing L2 source;
+- L2 jobs default `maxWriteAmplification` to 16 and persist the ordinal, ratio,
+  `maximumOutputStoredBytes = floor(level0SourceStoredBytes * maxWriteAmplification)`, and a
+  conservative `plannedOutputStoredBytesUpperBound` covering complete serialized block envelopes;
+- a plan whose upper bound exceeds the ceiling returns a `write-amplification-budget` skip before
+  the job or output artifacts are persisted, and execution checks cumulative actual stored full-block
+  bytes against both fields before staging each block;
 - a non-empty mutation merge publishes an explicit full-row `base` segment with ordered
   `rowIdSpans`; updates and matching upserts preserve existing identities, deletes remove them, and
   new keys retain their reserved IDs even when reservation order differs from commit order;
@@ -232,27 +245,34 @@ manifest, aborted transaction journal, or terminal compaction job. An unknown im
 by a crash after `addBlock()` but before journal attachment is deliberately omitted until provenance
 or age tracking can make it safe to collect.
 
-Phase 6 remains open. The current policy incrementally rewrites an oldest L0 prefix plus an optional
-leading L1 anchor into one L1 segment—a `base` for a keyed mutation history—or no segment when no
-selected row survives. It handles append, upsert, update, and delete histories and records the
-incremental rewrite ratio, but the mandatory whole anchor means the policy does not yet enforce a
-hard total write-amplification budget. It does not build clustered/key-range L2 segments, spill
-merge-planning state, or resume an interrupted planner before its immutable plan is created.
-Collection still needs a chunked planner and indexed/chunked root discovery plus broader
-unknown-orphan, catalog, terminal-job, and metadata cleanup. Cancellation remains cooperative: it
-cannot preempt physical transforms or native codec work already in progress, but an in-flight step
-observes it at the next durable boundary and `resumeCompactionJob()` throws
-`CompactionJobCancelledError`. Cancelled records retain their plan, cursor, progress, metrics, and
-completed artifact IDs until a collection pass proves their artifacts unreachable.
+Phase 6 remains open. The L1 policy still rewrites an oldest L0 prefix plus an optional whole L1
+anchor into one L1 segment—a `base` for a keyed mutation history—or no segment when no selected row
+survives, so its incremental ratio is not a hard lifetime bound. Phase 6E-A adds append-row-range L2,
+not clustered/key-range L2: ordinary contiguous insert prefixes on non-keyed tables become immutable
+ordinal partitions and prior L2 sources are retained.
+
+At a common configured cap, disjoint-source accounting proves that successfully published L2 output
+block bytes stay within the cap times their corresponding promoted L0 block bytes. It does not bound
+bytes written by cancelled or aborted attempts, metadata or IndexedDB write overhead, total browser
+disk traffic, garbage collection, or quota recovery. Merge planning still cannot spill or resume
+before its immutable plan is created. Collection still needs a chunked planner and indexed/chunked
+root discovery plus broader unknown-orphan, catalog, terminal-job, and metadata cleanup.
+Cancellation remains cooperative: it cannot preempt physical transforms or native codec work already
+in progress, but an in-flight step observes it at the next durable boundary and
+`resumeCompactionJob()` throws `CompactionJobCancelledError`. Cancelled records retain their plan,
+cursor, progress, metrics, and completed artifact IDs until a collection pass proves their artifacts
+unreachable.
 
 Remaining Phase 6 delivery:
 
-- clustered/key-range L2 selection with an enforceable total write-amplification budget;
+- keyed/clustered multi-range L2 selection;
+- lifetime write-amplification accounting that includes cancelled and aborted attempts;
 - spillable or resumable merge planning before the immutable plan exists;
 - chunked collection planning and indexed root discovery; and
 - broader unknown-orphan, catalog, terminal-job, and metadata cleanup.
 
-Exit gate: interrupted compactions recover safely and sustained ingestion stays within an explicit write-amplification budget.
+Exit gate: interrupted compactions recover safely and sustained append and keyed/clustered ingestion
+stay within their explicitly scoped write-amplification budgets.
 
 ## Phase 7 — Vector execution kernel
 
@@ -344,13 +364,14 @@ Exit gate: representative changing workloads improve without manual indexes and 
 ## Immediate iteration checklist
 
 The current repository slice has completed the Phase 5 storage/write foundation and its planned
-four-way durability matrix. Phase 6A through Phase 6D now provide durable, restart-safe,
+four-way durability matrix. Phase 6A through Phase 6E-A now provide durable, restart-safe,
 output-block-stepped physical rechunking, bounded oldest-prefix L0-to-L1 selection, keyed mutation
-merging with stable row IDs, safe cooperative job cancellation, and lease-aware physical
-reclamation for artifacts with persisted provenance. Phase 6 remains open for clustered L2
-selection and a hard total amplification budget, spillable/resumable merge planning, chunked
-planning/indexed roots, and broader orphan/catalog/job cleanup. The broader Phase
-5 performance curves and larger/repeated benchmark tiers remain outstanding.
+merging with stable row IDs, immutable append-row-range L2 partitions with a hard published-output
+byte budget, safe cooperative job cancellation, and lease-aware physical reclamation for artifacts
+with persisted provenance. Phase 6 remains open for keyed/clustered multi-range L2, failed-attempt
+lifetime amplification accounting, spillable/resumable merge planning, chunked planning/indexed
+roots, and broader orphan/catalog/job cleanup. The broader Phase 5 performance curves and
+larger/repeated benchmark tiers remain outstanding.
 
 - [x] Record architecture and roadmap.
 - [x] Scaffold packages and quality gates.
@@ -381,7 +402,9 @@ planning/indexed roots, and broader orphan/catalog/job cleanup. The broader Phas
 - [x] Rechunk and re-encode append-only inputs under an explicit JavaScript-owned byte memory budget.
 - [x] Merge keyed upsert/update/delete deltas into row-ID-preserving full-row base segments.
 - [x] Add bounded oldest-prefix L0 -> L1 selection with persisted incremental amplification inputs.
-- [ ] Build clustered/key-range L2 selection with a hard total write-amplification budget.
+- [x] Add immutable append-row-range L2 partitions with a hard published-output byte budget.
+- [ ] Build keyed/clustered multi-range L2 selection and failed-attempt lifetime amplification
+      accounting.
 - [x] Add safe compaction-job cancellation.
 - [x] Add lease-aware garbage collection and physical reclamation for superseded blocks.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.

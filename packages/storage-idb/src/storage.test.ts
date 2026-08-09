@@ -8,14 +8,21 @@ import {
   MemoryBlockStore,
   SnapshotManifestMissingError,
   UniqueKeyConflictError,
+  floorWholeNumberProduct,
   type BlockStore,
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
   type CommitTransactionInput,
   type MergeCompactionRewritePlan,
+  type SegmentRecord,
   type TransactionRecord,
   type TransactionRecordUpdate,
 } from "./index.js";
+
+it("floors amplification products without rounding a binary ratio upward", () => {
+  expect(50 * 1.3399999999999999).toBe(67);
+  expect(floorWholeNumberProduct(50, 1.3399999999999999, "Amplification product")).toBe(66);
+});
 
 function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
@@ -119,6 +126,19 @@ function rechunkCompactionJob(id = "rechunk-job"): CompactionJobRecord {
     revision: 0,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function level2CompactionJob(id = "level-two-job"): CompactionJobRecord {
+  return {
+    ...rechunkCompactionJob(id),
+    level0SourceStoredBytes: 360,
+    anchorSourceStoredBytes: 0,
+    outputPartitionOrdinal: 3,
+    maxWriteAmplification: 2,
+    maximumOutputStoredBytes: 720,
+    plannedOutputStoredBytesUpperBound: 600,
+    targetLevel: 2,
   };
 }
 
@@ -623,6 +643,114 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("normalizes append-row-range L2 partition metadata without changing legacy segments", async () => {
+      const store = await implementation.create();
+      const partition: SegmentRecord = {
+        id: "partition-2",
+        tableId: "events",
+        transactionId: "partition-transaction",
+        rowCount: 3,
+        rowIdStart: 7n,
+        rowIdEndExclusive: 10n,
+        columnBlockIds: { value: ["partition-block"] },
+        kind: "insert",
+        level: 2,
+        logicalOrder: 11,
+        partitionOrdinal: 2,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      };
+      await store.addSegment(partition);
+      expect(await store.getSegment(partition.id)).toEqual(partition);
+      expect(await store.listSegments(partition.tableId)).toEqual([partition]);
+
+      const legacy: SegmentRecord = {
+        ...partition,
+        id: "legacy-level-two",
+      };
+      delete (legacy as { partitionOrdinal?: number }).partitionOrdinal;
+      await store.addSegment(legacy);
+      expect(await store.getSegment(legacy.id)).not.toHaveProperty("partitionOrdinal");
+      store.close();
+    });
+
+    it("rejects malformed append-row-range L2 partition metadata", async () => {
+      const store = await implementation.create();
+      const valid: SegmentRecord = {
+        id: "valid-partition",
+        tableId: "events",
+        transactionId: "partition-transaction",
+        rowCount: 2,
+        rowIdStart: 5n,
+        rowIdEndExclusive: 7n,
+        columnBlockIds: { value: ["partition-block"] },
+        kind: "insert",
+        level: 2,
+        logicalOrder: 4,
+        partitionOrdinal: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      };
+      const withoutLogicalOrder = { ...valid };
+      delete (withoutLogicalOrder as { logicalOrder?: number }).logicalOrder;
+      const invalid: Array<{ record: SegmentRecord; message: string }> = [
+        {
+          record: { ...valid, id: "negative-ordinal", partitionOrdinal: -1 },
+          message: "partition ordinal must be a non-negative whole number",
+        },
+        {
+          record: { ...valid, id: "fractional-ordinal", partitionOrdinal: 0.5 },
+          message: "partition ordinal must be a non-negative whole number",
+        },
+        {
+          record: { ...valid, id: "wrong-level", level: 1 },
+          message: "explicit level two",
+        },
+        {
+          record: { ...valid, id: "wrong-kind", kind: "base" },
+          message: "must be an insert",
+        },
+        {
+          record: { ...withoutLogicalOrder, id: "missing-logical-order" },
+          message: "explicit logical order",
+        },
+        {
+          record: { ...valid, id: "negative-logical-order", logicalOrder: -1 },
+          message: "logical order must be a non-negative whole number",
+        },
+        {
+          record: { ...valid, id: "spanned-partition", rowIdSpans: [] },
+          message: "cannot contain row ID spans",
+        },
+        {
+          record: {
+            ...valid,
+            id: "empty-partition",
+            rowCount: 0,
+            rowIdEndExclusive: valid.rowIdStart,
+          },
+          message: "row count must be positive",
+        },
+        {
+          record: {
+            ...valid,
+            id: "zero-row-id",
+            rowIdStart: 0n,
+            rowIdEndExclusive: 2n,
+          },
+          message: "row ID start must be a positive bigint",
+        },
+        {
+          record: { ...valid, id: "gapped-envelope", rowIdEndExclusive: 8n },
+          message: "contiguous positive row ID envelope",
+        },
+      ];
+
+      for (const { record, message } of invalid) {
+        await expect(store.addSegment(record)).rejects.toThrow(message);
+        expect(await store.getSegment(record.id)).toBeUndefined();
+      }
+      store.close();
+    });
+
     it("atomically stamps committed segments with stable logical order", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
@@ -950,6 +1078,170 @@ for (const implementation of stores()) {
         );
       }
       expect((await store.getCompactionJob(accounted.id))?.revision).toBe(0);
+      store.close();
+    });
+
+    it("persists and enforces the append-row-range L2 output byte budget", async () => {
+      const store = await implementation.create();
+      const bounded: CompactionJobRecord = {
+        ...level2CompactionJob("bounded-level-two"),
+        maximumOutputStoredBytes: 720,
+        plannedOutputStoredBytesUpperBound: 720,
+      };
+      await store.createCompactionJob(bounded);
+      expect(await store.getCompactionJob(bounded.id)).toMatchObject({
+        outputPartitionOrdinal: 3,
+        maxWriteAmplification: 2,
+        maximumOutputStoredBytes: 720,
+        plannedOutputStoredBytesUpperBound: 720,
+      });
+
+      const boundary = await store.updateCompactionJob(bounded.id, 0, {
+        state: "running",
+        transactionId: "bounded-level-two-transaction",
+        outputBlockIds: ["bounded-level-two-output-0"],
+        outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+        outputStoredBytes: 720,
+        outputLogicalBytes: 1,
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+      expect(boundary).toMatchObject({ outputStoredBytes: 720, revision: 1 });
+
+      const overflow = {
+        ...bounded,
+        id: "overflow-level-two",
+        maximumOutputStoredBytes: 719,
+        plannedOutputStoredBytesUpperBound: 719,
+      };
+      await store.createCompactionJob(overflow);
+      await expect(
+        store.updateCompactionJob(overflow.id, 0, {
+          state: "running",
+          transactionId: "overflow-level-two-transaction",
+          outputBlockIds: ["overflow-level-two-output-0"],
+          outputCursor: { outputIndex: 0, columnIndex: 1, rowStart: 0 },
+          outputStoredBytes: 720,
+          outputLogicalBytes: 1,
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        }),
+      ).rejects.toThrow("exceed their planned upper bound");
+      expect((await store.getCompactionJob(overflow.id))?.revision).toBe(0);
+      store.close();
+    });
+
+    it("rejects inconsistent append-row-range L2 policy fields", async () => {
+      const store = await implementation.create();
+      const valid = level2CompactionJob("valid-level-two-policy");
+      const invalidRecords: Array<{ record: CompactionJobRecord; message: string }> = [
+        {
+          record: {
+            ...rechunkCompactionJob("partial-level-two-policy"),
+            outputPartitionOrdinal: 0,
+          },
+          message: "must be present together",
+        },
+        {
+          record: { ...valid, id: "wrong-level-two-target", targetLevel: 1 },
+          message: "must target level two",
+        },
+        {
+          record: {
+            ...valid,
+            id: "anchored-level-two-policy",
+            level0SourceStoredBytes: 359,
+            anchorSourceStoredBytes: 1,
+          },
+          message: "requires only level-zero source bytes",
+        },
+        {
+          record: { ...valid, id: "negative-output-partition", outputPartitionOrdinal: -1 },
+          message: "partition ordinal must be a non-negative whole number",
+        },
+        {
+          record: { ...valid, id: "zero-amplification", maxWriteAmplification: 0 },
+          message: "must be a positive finite number",
+        },
+        {
+          record: {
+            ...valid,
+            id: "infinite-amplification",
+            maxWriteAmplification: Number.POSITIVE_INFINITY,
+          },
+          message: "must be a positive finite number",
+        },
+        {
+          record: {
+            ...valid,
+            id: "unsafe-amplification-product",
+            maxWriteAmplification: Number.MAX_SAFE_INTEGER,
+          },
+          message: "product exceeds the safe range",
+        },
+        {
+          record: {
+            ...valid,
+            id: "oversized-output-ceiling",
+            maxWriteAmplification: 1,
+            maximumOutputStoredBytes: 361,
+            plannedOutputStoredBytesUpperBound: 360,
+          },
+          message: "ceiling exceeds its amplification limit",
+        },
+        {
+          record: {
+            ...valid,
+            id: "oversized-output-plan",
+            maximumOutputStoredBytes: 500,
+            plannedOutputStoredBytesUpperBound: 501,
+          },
+          message: "planned output exceeds its stored byte ceiling",
+        },
+      ];
+      const mergePolicy = mergeCompactionJob("merge-level-two-policy");
+      invalidRecords.push({
+        record: {
+          ...mergePolicy,
+          level0SourceStoredBytes: mergePolicy.sourceStoredBytes,
+          anchorSourceStoredBytes: 0,
+          outputPartitionOrdinal: 0,
+          maxWriteAmplification: 2,
+          maximumOutputStoredBytes: 90,
+          plannedOutputStoredBytesUpperBound: 80,
+          targetLevel: 2,
+        },
+        message: "requires a rechunk plan",
+      });
+
+      for (const invalid of invalidRecords) {
+        await expect(store.createCompactionJob(invalid.record)).rejects.toThrow(invalid.message);
+        expect(await store.getCompactionJob(invalid.record.id)).toBeUndefined();
+      }
+
+      const immutable = level2CompactionJob("immutable-level-two-policy");
+      await store.createCompactionJob(immutable);
+      for (const [field, value] of [
+        ["outputPartitionOrdinal", 4],
+        ["maxWriteAmplification", 3],
+        ["maximumOutputStoredBytes", 700],
+        ["plannedOutputStoredBytesUpperBound", 500],
+      ] as const) {
+        const update = {
+          [field]: value,
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        } as unknown as CompactionJobRecordUpdate;
+        await expect(store.updateCompactionJob(immutable.id, 0, update)).rejects.toThrow(
+          `Compaction ${field} is immutable`,
+        );
+      }
+      expect((await store.getCompactionJob(immutable.id))?.revision).toBe(0);
+
+      const legacy = rechunkCompactionJob("legacy-unbounded-level-one");
+      await store.createCompactionJob(legacy);
+      const persistedLegacy = await store.getCompactionJob(legacy.id);
+      expect(persistedLegacy).not.toHaveProperty("outputPartitionOrdinal");
+      expect(persistedLegacy).not.toHaveProperty("maxWriteAmplification");
+      expect(persistedLegacy).not.toHaveProperty("maximumOutputStoredBytes");
+      expect(persistedLegacy).not.toHaveProperty("plannedOutputStoredBytesUpperBound");
       store.close();
     });
 
@@ -2354,6 +2646,44 @@ it("persists rechunk plans and memory accounting across IndexedDB connections", 
     outputStoredBytes: 70,
     outputLogicalBytes: 80,
     revision: 1,
+  });
+  store.close();
+});
+
+it("persists append-row-range L2 segment and budget metadata across IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const segment: SegmentRecord = {
+    id: "reopen-level-two-segment",
+    tableId: "events",
+    transactionId: "reopen-level-two-transaction",
+    rowCount: 2,
+    rowIdStart: 20n,
+    rowIdEndExclusive: 22n,
+    columnBlockIds: { value: ["reopen-level-two-block"] },
+    kind: "insert",
+    level: 2,
+    logicalOrder: 9,
+    partitionOrdinal: 4,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+  const job = {
+    ...level2CompactionJob("reopen-level-two-job"),
+    outputPartitionOrdinal: 4,
+  };
+  await store.addSegment(segment);
+  await store.createCompactionJob(job);
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  expect(await store.getSegment(segment.id)).toEqual(segment);
+  expect(await store.getCompactionJob(job.id)).toMatchObject({
+    targetLevel: 2,
+    outputPartitionOrdinal: 4,
+    maxWriteAmplification: 2,
+    maximumOutputStoredBytes: 720,
+    plannedOutputStoredBytesUpperBound: 600,
   });
   store.close();
 });

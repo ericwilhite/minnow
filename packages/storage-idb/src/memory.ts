@@ -26,6 +26,7 @@ import {
   type TransactionRecordUpdate,
   UniqueKeyConflictError,
   normalizeCompactionJobRecord,
+  normalizeSegmentRecord,
   updateCompactionJobRecord,
   updateTransactionRecord,
   WriteConflictError,
@@ -107,20 +108,23 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   async addSegment(record: SegmentRecord): Promise<void> {
-    if (this.#segments.has(record.id)) throw new Error(`Segment already exists: ${record.id}`);
-    this.#segments.set(record.id, structuredClone(record));
+    const normalized = normalizeSegmentRecord(record);
+    if (this.#segments.has(normalized.id)) {
+      throw new Error(`Segment already exists: ${normalized.id}`);
+    }
+    this.#segments.set(normalized.id, normalized);
   }
 
   async getSegment(id: string): Promise<SegmentRecord | undefined> {
     const record = this.#segments.get(id);
-    return record === undefined ? undefined : structuredClone(record);
+    return record === undefined ? undefined : normalizeSegmentRecord(record);
   }
 
   async listSegments(tableId?: string): Promise<SegmentRecord[]> {
     return [...this.#segments.values()]
       .filter((record) => tableId === undefined || record.tableId === tableId)
       .sort((left, right) => left.id.localeCompare(right.id))
-      .map((record) => structuredClone(record));
+      .map((record) => normalizeSegmentRecord(record));
   }
 
   async removeSegment(id: string): Promise<void> {

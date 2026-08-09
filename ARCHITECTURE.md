@@ -178,15 +178,30 @@ needs it.
 ### Resumable physical compaction
 
 Ordinary write segments are recorded at L0 with a `logicalOrder` derived from their commit version.
-The implemented policy selects a canonical oldest prefix from one leased source snapshot: an
-optional single L1 anchor followed by complete groups of L0 segments. It requires at least two L0
-segments by default and targets at most 16 L0 segments or 64 MiB of newly promoted L0 blocks. The
-minimum and an indivisible equal-`logicalOrder` group can exceed those targets to guarantee progress
-without changing replay order. Contiguous append-only inputs use `rechunk-v1`; keyed histories
-containing upsert, update, delete, a prior base, or noncontiguous row IDs use `merge-v1`. Both publish
-at L1 and inherit the earliest source `logicalOrder`, so an unselected or concurrently committed L0
-suffix remains after the consolidated output. A caller can explicitly lower the minimum to one to
-drain `L1 + 1 L0`; a table without an anchor still requires at least two sources.
+The L1 policy selects a canonical oldest prefix from one leased source snapshot: an optional single
+L1 anchor followed by complete groups of L0 segments. It requires at least two L0 segments by default
+and targets at most 16 L0 segments or 64 MiB of newly promoted L0 blocks. The minimum and an
+indivisible equal-`logicalOrder` group can exceed those targets to guarantee progress without
+changing replay order. Contiguous append-only inputs use `rechunk-v1`; keyed histories containing
+upsert, update, delete, a prior base, or noncontiguous row IDs use `merge-v1`. Both publish at L1 and
+inherit the earliest source `logicalOrder`, so an unselected or concurrently committed L0 suffix
+remains after the consolidated output. A caller can explicitly lower the minimum to one to drain
+`L1 + 1 L0`; a table without an anchor still requires at least two sources.
+
+The Phase 6E-A policy is append-row-range L2, not clustered/key-range L2. A caller explicitly starts
+it with `targetLevel: 2` on a non-keyed table. The visible layout must be one optional retained legacy
+L1 insert, then L2 insert partitions with exact consecutive `partitionOrdinal` values `0..N-1`, then
+ordinary L0 inserts. The planner takes only an oldest complete L0 prefix and emits one new L2
+partition at ordinal `N`; neither the L1 nor any earlier L2 partition is a rewrite source. Once `N`
+is positive, an omitted target automatically continues L2. This policy permits a minimum of one,
+including direct one-segment L0-to-L2 promotion. A unique key, mutation/base segment, row-ID gap in
+the selected sources, or malformed level/ordinal layout makes the policy skip without weakening its
+append-only assumptions.
+
+Ordinal-less level-two jobs persisted by the earlier generic target-level implementation remain
+resumable for durable upgrade compatibility. They lack the four Phase 6E-A policy fields and are
+therefore outside its amplification proof; their output is treated as a legacy unsupported layout,
+not silently adopted as an ordinal partition.
 
 A `rechunk-v1` plan fingerprints each ordered column block's ID, row range, stored/encoded length,
 and checksum. It fixes output windows, schema IDs/types, contiguous row-ID bounds, compression, and
@@ -209,6 +224,16 @@ output blocks;
 publication. `cancelCompactionJob(jobId)` settles an unpublished job in a distinct terminal
 `cancelled` state and returns the terminal state plus any published version. Repeated calls are
 idempotent; terminal `published` and `aborted` jobs keep their existing outcome.
+
+An L2 job adds four immutable policy fields: `outputPartitionOrdinal`,
+`maxWriteAmplification`, `maximumOutputStoredBytes`, and
+`plannedOutputStoredBytesUpperBound`. The ratio defaults to 16, and the exact job ceiling is
+`floor(level0SourceStoredBytes * maxWriteAmplification)`. Planning measures each output payload and
+its canonical metadata, then sums the complete block envelope plus the codec's maximum output to
+obtain a conservative full-plan bound. If that upper bound exceeds the ceiling, planning returns a
+`write-amplification-budget` skip before it persists a job, transaction, block, or segment. Otherwise
+the fields survive restart unchanged, and execution checks cumulative actual stored full-block
+bytes against both bounds before staging or reattaching each output block.
 
 Each output is built directly from validated physical column ranges. The implementation decompresses
 source blocks, slices and concatenates their validity/value buffers, recalculates canonical metadata,
@@ -239,11 +264,26 @@ segments while every planned source remains visible and unchanged; the frozen pl
 them. Otherwise the job aborts. Manifest replacement affects only the new version, so historical
 snapshots continue reading their original segments and blocks.
 
+L2 rebase adds an exact order proof. The active job pins its `sourceManifestVersion`; publication
+reconstructs that manifest's optional L1 plus ordinal L2 retained prefix, verifies the selected IDs
+are exactly its oldest L0 prefix, and compares every retained and selected segment descriptor with
+the current visible prefix. Only ordinary-insert L0 segments ordered strictly after the selected
+sources may appear as a concurrent tail. Publication supersedes exactly the selected L0 block IDs,
+places the new partition after the retained prefix with the earliest selected `logicalOrder`, and
+leaves the tail after it. Any changed prefix, ordinal gap, interleaving, or unsupported concurrent
+segment aborts instead of risking row reordering. The pinned source manifest and active job artifacts
+remain garbage-collection roots until the job settles.
+
 A successful non-empty merge publishes one full-row `base` segment and copies the plan's canonical
 `rowIdSpans` into its descriptor. When replay deletes every row, the job still commits a new manifest
 that supersedes all source blocks, but its output segment ID is null and it publishes no output
 blocks or globally visible empty segment. Both forms remain restart-safe after the immutable plan
 exists.
+
+A successful L2 job instead publishes one non-empty ordinary insert segment with a contiguous hidden
+row-ID envelope and its planned partition ordinal. The ordinal records append partition order; it
+does not claim that separately reserved row-ID ranges are globally gap-free or that numeric row-ID
+order replaces logical/commit order.
 
 Cancellation is cooperative rather than preemptive. Physical transforms and an active native codec
 operation run to their next durable boundary; an in-flight step that then observes cancellation, or
@@ -312,14 +352,22 @@ An unleased `TransactionManager.openSnapshot()` is only an in-process view of on
 not a persistent GC root. Long-lived callers must use `openLeasedSnapshot()`, while
 `BrowserDatabase` creates and renews its own short-lived leases around materialization.
 
-This is still a deliberately narrow Phase 6 policy: it folds an oldest L0 prefix and optional L1
-anchor into one L1 segment—a `base` for a keyed mutation history—or no segment when no selected row
-survives. It rejects multiple/non-leading anchors and levels above L1. Because every mutation merge
-must include the full anchor, its 16-segment/64-MiB L0 targets do not impose a hard bound on total
-rewrite bytes; a clustered/key-range L2 policy is still needed for that. The implementation also
-does not spill or resume merge planning before plan creation, chunk collection planning/root
-discovery, or perform broader orphan, catalog, terminal-job, and metadata cleanup. Known unreachable
-source/output artifacts are physically reclaimable by the separate collector.
+Phase 6 remains deliberately incomplete. The L1 policy folds an oldest L0 prefix and optional whole
+L1 anchor into one L1 segment—a `base` for a keyed mutation history—or no segment when no selected
+row survives. Its 16-segment/64-MiB L0 targets and incremental metric do not hard-bound repeated
+anchor rewrites. The append-row-range L2 slice avoids that rewrite cycle for ordinary contiguous
+inserts on non-keyed tables: each successfully published L2 partition consumes a disjoint L0 source
+prefix and no existing L2 partition is rewritten.
+
+Under a common configured cap, the sum of those successfully published L2 full-block bytes is at
+most the cap times the sum of their promoted L0 block bytes. This is a hard publication invariant,
+not a claim about all physical writes: cancelled or aborted attempts may already have written
+unpublished output, and metadata, IndexedDB internals, garbage collection, browser disk traffic, and
+quota recovery are outside the accounting boundary. Keyed/clustered multi-range L2, lifetime
+accounting for failed attempts, spillable or resumable merge planning, chunked collection
+planning/indexed root discovery, and broader orphan, catalog, terminal-job, and metadata cleanup
+remain future work. Known unreachable source/output artifacts are physically reclaimable by the
+separate collector.
 
 ## Multi-tab correctness
 

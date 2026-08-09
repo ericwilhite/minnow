@@ -1,6 +1,6 @@
 import { crc32 } from "./checksum.js";
 import { decodeColumn, encodeColumn } from "./column.js";
-import { getCodec } from "./codecs.js";
+import { getCodec, getCompressionMemoryBound } from "./codecs.js";
 import { MAX_PHYSICAL_COLUMN_BYTE_LENGTH, validatePhysicalColumn } from "./physical.js";
 import type {
   BlockDescription,
@@ -27,6 +27,38 @@ const codecIds: Record<Compression, number> = { raw: 0, rle: 1, gzip: 2 };
 const codecsById = new Map(
   Object.entries(codecIds).map(([codec, id]) => [id, codec as Compression]),
 );
+
+/**
+ * Returns a conservative bound for the complete persisted block value: the fixed header, the
+ * exact UTF-8 JSON metadata, and the selected codec's maximum stored payload.
+ */
+export function maximumPhysicalBlockByteLength(
+  encodedByteLength: number,
+  metadata: BlockMetadata,
+  compression: Compression,
+): number {
+  assertLength(encodedByteLength, "encoded payload");
+  let serializedMetadata: unknown;
+  try {
+    serializedMetadata = JSON.stringify(metadata);
+  } catch {
+    throw new TypeError("Block metadata must be JSON serializable");
+  }
+  if (typeof serializedMetadata !== "string") {
+    throw new TypeError("Block metadata must be JSON serializable");
+  }
+  const metadataByteLength = textEncoder.encode(serializedMetadata).byteLength;
+  assertLength(metadataByteLength, "metadata");
+  const maximumStoredPayloadBytes = getCompressionMemoryBound(
+    compression,
+    encodedByteLength,
+  ).maximumOutputBytes;
+  const total = HEADER_LENGTH + metadataByteLength + maximumStoredPayloadBytes;
+  if (!Number.isSafeInteger(total)) {
+    throw new RangeError("Stored block byte bound exceeds the safe integer range");
+  }
+  return total;
+}
 
 export async function encodeBlock(
   input: ColumnInput,

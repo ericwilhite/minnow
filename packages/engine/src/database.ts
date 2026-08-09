@@ -6,6 +6,7 @@ import {
   encodePhysicalBlock,
   getCompressionMemoryBound,
   inspectBlock,
+  maximumPhysicalBlockByteLength,
   measurePhysicalColumnRanges,
   slicePhysicalColumn,
   type ColumnInput,
@@ -17,6 +18,7 @@ import {
 } from "@browserdatabase/block-format";
 import {
   simpleDataTypes,
+  floorWholeNumberProduct,
   type BlockStore,
   CompactionJobConflictError,
   type CompactionJobRecord,
@@ -46,10 +48,10 @@ import {
   WriteConflictError,
 } from "@browserdatabase/storage-idb";
 import {
+  Snapshot,
   TransactionManager,
   type DatabaseTransaction,
   type LeasedSnapshot,
-  type Snapshot,
 } from "@browserdatabase/transactions";
 import {
   compileQuery,
@@ -65,6 +67,7 @@ const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
 const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS = 16;
 const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_STORED_BYTES = 64 * 1024 * 1024;
+const DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION = 16;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 const INTERNAL_READ_LEASE_TTL_MS = 60_000;
@@ -191,7 +194,7 @@ export interface DeleteBatchResult {
 export interface CompactTableOptions {
   /** @deprecated Use minimumLevel0Segments. */
   minimumSegments?: number;
-  /** Minimum L0 segments promoted; one drains a tail only when an L1 anchor exists. */
+  /** Minimum L0 segments promoted; one also permits a direct L0 -> L2 promotion. */
   minimumLevel0Segments?: number;
   /** Target maximum L0 segments promoted by one job. Equal-order groups remain indivisible. */
   maxLevel0Segments?: number;
@@ -199,8 +202,10 @@ export interface CompactTableOptions {
   maxLevel0StoredBytes?: number;
   /** Number of immutable output blocks processed before yielding and checkpointing. */
   maxBlocksPerStep?: number;
-  /** Output level. The current bounded-prefix policy supports L1 only. */
+  /** Output level. L2 is the append-only row-range partition policy. */
   targetLevel?: number;
+  /** Hard L2 output-byte limit as a multiple of newly promoted L0 stored bytes. */
+  maxWriteAmplification?: number;
   /** Estimated uncompressed physical bytes per output column block. */
   targetBlockBytes?: number;
   /** Compression used for rewritten output blocks. */
@@ -217,7 +222,8 @@ export type CompactionSkipReason =
   | "below-segment-threshold"
   | "contains-mutation-segments"
   | "non-contiguous-row-ids"
-  | "unsupported-level-layout";
+  | "unsupported-level-layout"
+  | "write-amplification-budget";
 
 export interface CompactTableResult {
   jobId?: string;
@@ -234,6 +240,10 @@ export interface CompactTableResult {
   level0SourceStoredBytes?: number;
   anchorSourceStoredBytes?: number;
   compactionWriteAmplification?: number;
+  outputPartitionOrdinal?: number;
+  maxWriteAmplification?: number;
+  maximumOutputStoredBytes?: number;
+  plannedOutputStoredBytesUpperBound?: number;
   outputLogicalBytes?: number;
   targetBlockBytes?: number;
   outputCompression?: Compression;
@@ -256,6 +266,10 @@ export interface CompactionJobProgress {
   outputBlockCount: number;
   level0SourceStoredBytes?: number;
   anchorSourceStoredBytes?: number;
+  outputPartitionOrdinal?: number;
+  maxWriteAmplification?: number;
+  maximumOutputStoredBytes?: number;
+  plannedOutputStoredBytesUpperBound?: number;
   memoryBudgetBytes?: number;
   minimumMemoryBytes?: number;
   peakWorkingBytes?: number;
@@ -343,6 +357,19 @@ export class CompactionMemoryBudgetError extends Error {
   ) {
     super(
       `Compaction needs at least ${String(minimumBytes)} bytes of working memory; budget is ${String(budgetBytes)} bytes`,
+    );
+  }
+}
+
+export class CompactionWriteAmplificationError extends Error {
+  override readonly name = "CompactionWriteAmplificationError";
+
+  constructor(
+    readonly outputBytes: number,
+    readonly maximumOutputBytes: number,
+  ) {
+    super(
+      `Compaction output would use ${String(outputBytes)} stored bytes; limit is ${String(maximumOutputBytes)} bytes`,
     );
   }
 }
@@ -1272,31 +1299,83 @@ export class BrowserDatabase {
       options.maxLevel0StoredBytes ?? DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_STORED_BYTES,
       "Compaction maximum L0 stored bytes",
     );
-    const targetLevel = positiveWholeNumber(options.targetLevel ?? 1, "Compaction target level");
-    if (targetLevel !== 1) {
-      throw new RangeError("Compaction target level must be 1");
-    }
     const visibleSegments = await this.#visibleSegmentRecords(table, snapshot);
     const visibleBlockIds = uniqueSegmentBlockIds(visibleSegments);
-    const firstLevel = visibleSegments[0]?.level ?? 0;
-    const hasAnchor = firstLevel === 1;
-    const level0Offset = hasAnchor ? 1 : 0;
-    const supportedLevelLayout =
-      firstLevel <= 1 &&
-      visibleSegments.slice(level0Offset).every((segment) => (segment.level ?? 0) === 0);
-    if (!supportedLevelLayout) {
-      return compactTableSkipped(
-        table.name,
-        "unsupported-level-layout",
-        visibleSegments,
-        visibleBlockIds,
-        version,
-      );
+    const inferredLevelTwoLayout = appendLevelTwoLayout(visibleSegments);
+    const inferredTargetLevel =
+      inferredLevelTwoLayout !== null && inferredLevelTwoLayout.levelTwoSegments.length > 0 ? 2 : 1;
+    const targetLevel = positiveWholeNumber(
+      options.targetLevel ?? inferredTargetLevel,
+      "Compaction target level",
+    );
+    if (targetLevel !== 1 && targetLevel !== 2) {
+      throw new RangeError("Compaction target level must be 1 or 2");
     }
-    const level0Segments = visibleSegments.slice(level0Offset);
-    const effectiveMinimumLevel0Segments = hasAnchor
-      ? minimumLevel0Segments
-      : Math.max(2, minimumLevel0Segments);
+    if (targetLevel === 1 && options.maxWriteAmplification !== undefined) {
+      throw new RangeError("Compaction write amplification is only supported for L2 output");
+    }
+    const levelTwoMaxWriteAmplification =
+      targetLevel === 2
+        ? positiveFiniteNumber(
+            options.maxWriteAmplification ?? DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION,
+            "Compaction maximum write amplification",
+          )
+        : undefined;
+
+    let anchor: SegmentRecord | undefined;
+    let level0Segments: readonly SegmentRecord[];
+    let effectiveMinimumLevel0Segments: number;
+    let outputPartitionOrdinal: number | undefined;
+    if (targetLevel === 1) {
+      const firstLevel = visibleSegments[0]?.level ?? 0;
+      const hasAnchor = firstLevel === 1;
+      const level0Offset = hasAnchor ? 1 : 0;
+      const supportedLevelLayout =
+        firstLevel <= 1 &&
+        visibleSegments.slice(level0Offset).every((segment) => (segment.level ?? 0) === 0);
+      if (!supportedLevelLayout) {
+        return compactTableSkipped(
+          table.name,
+          "unsupported-level-layout",
+          visibleSegments,
+          visibleBlockIds,
+          version,
+        );
+      }
+      anchor = hasAnchor ? visibleSegments[0] : undefined;
+      level0Segments = visibleSegments.slice(level0Offset);
+      effectiveMinimumLevel0Segments = hasAnchor
+        ? minimumLevel0Segments
+        : Math.max(2, minimumLevel0Segments);
+    } else {
+      if (
+        table.uniqueKeyColumnId !== undefined ||
+        visibleSegments.some(
+          (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+        )
+      ) {
+        return compactTableSkipped(
+          table.name,
+          "contains-mutation-segments",
+          visibleSegments,
+          visibleBlockIds,
+          version,
+        );
+      }
+      const layout = appendLevelTwoLayout(visibleSegments);
+      if (layout === null) {
+        return compactTableSkipped(
+          table.name,
+          "unsupported-level-layout",
+          visibleSegments,
+          visibleBlockIds,
+          version,
+        );
+      }
+      level0Segments = layout.level0Segments;
+      effectiveMinimumLevel0Segments = minimumLevel0Segments;
+      outputPartitionOrdinal = layout.levelTwoSegments.length;
+    }
     if (level0Segments.length < effectiveMinimumLevel0Segments) {
       return compactTableSkipped(
         table.name,
@@ -1307,7 +1386,7 @@ export class BrowserDatabase {
       );
     }
     const selection = await this.#selectCompactionSources(
-      hasAnchor ? visibleSegments[0] : undefined,
+      anchor,
       level0Segments,
       effectiveMinimumLevel0Segments,
       maxLevel0Segments,
@@ -1317,12 +1396,17 @@ export class BrowserDatabase {
     const sourceSegments = selection.sourceSegments;
     const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
     const hasContiguousSourceRowIds = hasContiguousRowIds(sourceSegments);
+    const hasPositiveSourceRowIds = (sourceSegments[0]?.rowIdStart ?? 0n) > 0n;
     const requiresMerge =
-      sourceSegments.some(
+      targetLevel === 1 &&
+      (sourceSegments.some(
         (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
       ) ||
-      (!hasContiguousSourceRowIds && table.uniqueKeyColumnId !== undefined);
-    if (!requiresMerge && !hasContiguousSourceRowIds) {
+        (!hasContiguousSourceRowIds && table.uniqueKeyColumnId !== undefined));
+    if (
+      !requiresMerge &&
+      (!hasContiguousSourceRowIds || (targetLevel === 2 && !hasPositiveSourceRowIds))
+    ) {
       return compactTableSkipped(
         table.name,
         "non-contiguous-row-ids",
@@ -1387,6 +1471,55 @@ export class BrowserDatabase {
       throw new Error("Compaction source byte accounting differs from its rewrite plan");
     }
 
+    let levelTwoBudget:
+      | {
+          outputPartitionOrdinal: number;
+          maxWriteAmplification: number;
+          maximumOutputStoredBytes: number;
+          plannedOutputStoredBytesUpperBound: number;
+        }
+      | undefined;
+    if (targetLevel === 2) {
+      if (rewritePlan.kind !== "rechunk-v1" || outputPartitionOrdinal === undefined) {
+        throw new Error("L2 compaction requires an append-only physical rewrite");
+      }
+      const maxWriteAmplification = levelTwoMaxWriteAmplification;
+      if (maxWriteAmplification === undefined) {
+        throw new Error("L2 compaction write-amplification policy is missing");
+      }
+      const maximumOutputStoredBytes = floorWholeNumberProduct(
+        selection.level0SourceStoredBytes,
+        maxWriteAmplification,
+        "Compaction maximum output stored bytes",
+      );
+      const plannedOutputStoredBytesUpperBound =
+        await this.#plannedPhysicalOutputStoredBytesUpperBound(rewritePlan, snapshot);
+      levelTwoBudget = {
+        outputPartitionOrdinal,
+        maxWriteAmplification,
+        maximumOutputStoredBytes,
+        plannedOutputStoredBytesUpperBound,
+      };
+      if (plannedOutputStoredBytesUpperBound > maximumOutputStoredBytes) {
+        return compactionWriteAmplificationSkipped({
+          tableName: table.name,
+          sourceSegments,
+          sourceBlockIds,
+          sourceStoredBytes,
+          level0SourceStoredBytes: selection.level0SourceStoredBytes,
+          outputPartitionOrdinal,
+          maxWriteAmplification,
+          maximumOutputStoredBytes,
+          plannedOutputStoredBytesUpperBound,
+          targetBlockBytes,
+          outputCompression,
+          memoryBudgetBytes,
+          minimumMemoryBytes,
+          version,
+        });
+      }
+    }
+
     let id = ["compaction", table.id, "manifest", String(version)].join("/");
     const existing = await this.store.getCompactionJob(id);
     if (existing !== undefined && existing.state !== "aborted" && existing.state !== "cancelled") {
@@ -1416,6 +1549,7 @@ export class BrowserDatabase {
       },
       memoryBudgetBytes,
       minimumMemoryBytes,
+      ...(levelTwoBudget ?? {}),
       peakWorkingBytes: 0,
       outputLogicalBytes: 0,
       targetLevel,
@@ -2064,6 +2198,37 @@ export class BrowserDatabase {
     return measurePhysicalColumnRanges(column.type, loaded.ranges);
   }
 
+  async #plannedPhysicalOutputStoredBytesUpperBound(
+    plan: PhysicalCompactionRewritePlan,
+    snapshot: LeasedSnapshot,
+  ): Promise<number> {
+    const layout = physicalRewriteLayout(plan);
+    let total = 0;
+    for (const output of layout.outputs) {
+      for (const column of layout.columns) {
+        const measurement = await this.#measurePhysicalCompactionOutput(
+          column,
+          output,
+          plan.outputCompression,
+          Number.MAX_SAFE_INTEGER,
+          snapshot,
+        );
+        total = safeWholeNumberSum(
+          [
+            total,
+            maximumPhysicalBlockByteLength(
+              measurement.encodedByteLength,
+              measurement.metadata,
+              plan.outputCompression,
+            ),
+          ],
+          "Compaction planned output stored-byte upper bound",
+        );
+      }
+    }
+    return total;
+  }
+
   async #runCompactionJob(
     table: TableRecord,
     initialJob: CompactionJobRecord,
@@ -2240,6 +2405,9 @@ export class BrowserDatabase {
             ? {}
             : { keyColumnId: table.uniqueKeyColumnId }),
           level: job.targetLevel,
+          ...(job.outputPartitionOrdinal === undefined
+            ? {}
+            : { partitionOrdinal: job.outputPartitionOrdinal }),
           logicalOrder:
             rewritePlan.kind === "copy-v1"
               ? await this.#firstLogicalOrder(sourceSegments)
@@ -2333,6 +2501,17 @@ export class BrowserDatabase {
       if (latest?.state === "cancelled") {
         throw new CompactionJobCancelledError(job.id);
       }
+      if (error instanceof CompactionWriteAmplificationError) {
+        if (transaction.status === "active") await transaction.abort();
+        if (latest !== undefined && latest.state !== "published" && latest.state !== "aborted") {
+          try {
+            await this.#abortCompactionJob(latest, error.message);
+          } catch (updateError) {
+            if (!(updateError instanceof CompactionJobConflictError)) throw updateError;
+          }
+        }
+        throw error;
+      }
       if (
         !(error instanceof CompactionJobConflictError) &&
         !(error instanceof TransactionRecordConflictError) &&
@@ -2384,7 +2563,6 @@ export class BrowserDatabase {
       let outputBytes: Uint8Array;
       if (existing === undefined) {
         outputBytes = await encodePhysicalBlock(built.physical, plan.outputCompression);
-        await transaction.stageBlock(outputBlockId, outputBytes);
       } else {
         const decoded = await decodePhysicalBlock(existing);
         if (
@@ -2396,8 +2574,29 @@ export class BrowserDatabase {
           throw new Error(`A resumed compaction block differs: ${outputBlockId}`);
         }
         outputBytes = existing;
-        await transaction.stageExistingBlocks([outputBlockId]);
       }
+      const nextOutputStoredBytes = safeWholeNumberSum(
+        [job.outputStoredBytes, outputBytes.byteLength],
+        "Compaction output stored bytes",
+      );
+      const maximumOutputStoredBytes = job.maximumOutputStoredBytes;
+      const plannedOutputStoredBytesUpperBound = job.plannedOutputStoredBytesUpperBound;
+      if (
+        (maximumOutputStoredBytes !== undefined &&
+          nextOutputStoredBytes > maximumOutputStoredBytes) ||
+        (plannedOutputStoredBytesUpperBound !== undefined &&
+          nextOutputStoredBytes > plannedOutputStoredBytesUpperBound)
+      ) {
+        throw new CompactionWriteAmplificationError(
+          nextOutputStoredBytes,
+          Math.min(
+            maximumOutputStoredBytes ?? Number.MAX_SAFE_INTEGER,
+            plannedOutputStoredBytesUpperBound ?? Number.MAX_SAFE_INTEGER,
+          ),
+        );
+      }
+      if (existing === undefined) await transaction.stageBlock(outputBlockId, outputBytes);
+      else await transaction.stageExistingBlocks([outputBlockId]);
       const description = inspectBlock(outputBytes);
       const nextColumnIndex = cursor.columnIndex + 1;
       const nextOutputIndex =
@@ -2415,10 +2614,7 @@ export class BrowserDatabase {
           rowStart: nextRowStart,
         },
         processedRows: nextRowStart,
-        outputStoredBytes: safeWholeNumberSum(
-          [job.outputStoredBytes, outputBytes.byteLength],
-          "Compaction output stored bytes",
-        ),
+        outputStoredBytes: nextOutputStoredBytes,
         outputLogicalBytes: safeWholeNumberSum(
           [job.outputLogicalBytes ?? 0, description.encodedLength],
           "Compaction output logical bytes",
@@ -2527,6 +2723,24 @@ export class BrowserDatabase {
         .every((blockId) => snapshot.hasBlock(blockId)),
     );
     const visibleSegments = allVisibleSegments.filter((segment) => segment.tableId === job.tableId);
+    const sourceBlockIds = new Set(job.sourceBlockIds);
+    for (const segment of allVisibleSegments) {
+      if (sourceIds.has(segment.id)) continue;
+      if (
+        Object.values(segment.columnBlockIds)
+          .flat()
+          .some((blockId) => sourceBlockIds.has(blockId))
+      ) {
+        throw new Error(`Concurrent segment shares a compaction source block: ${segment.id}`);
+      }
+    }
+    if (job.outputPartitionOrdinal !== undefined) {
+      if (plan.kind !== "rechunk-v1") {
+        throw new Error("L2 compaction requires a rechunk rewrite plan");
+      }
+      await this.#assertLevelTwoSnapshotOrder(job, plan, snapshot, transactions);
+      return;
+    }
     let latestSource: Pick<
       MergeCompactionSourceSegment,
       "logicalOrder" | "committedVersion" | "segmentId"
@@ -2564,17 +2778,6 @@ export class BrowserDatabase {
     if (latestSource === null || outputLogicalOrder === null) {
       throw new Error("Compaction source order is unavailable");
     }
-    const sourceBlockIds = new Set(job.sourceBlockIds);
-    for (const segment of allVisibleSegments) {
-      if (sourceIds.has(segment.id)) continue;
-      if (
-        Object.values(segment.columnBlockIds)
-          .flat()
-          .some((blockId) => sourceBlockIds.has(blockId))
-      ) {
-        throw new Error(`Concurrent segment shares a compaction source block: ${segment.id}`);
-      }
-    }
     for (const segment of visibleSegments) {
       if (sourceIds.has(segment.id)) continue;
       if ((segment.level ?? 0) !== 0) {
@@ -2592,6 +2795,112 @@ export class BrowserDatabase {
           committedVersion,
           segmentId: segment.id,
         }) >= 0
+      ) {
+        throw new Error(`Concurrent segment would reorder compaction output: ${segment.id}`);
+      }
+    }
+  }
+
+  async #assertLevelTwoSnapshotOrder(
+    job: CompactionJobRecord,
+    plan: RechunkCompactionRewritePlan,
+    snapshot: Snapshot,
+    transactions: ReadonlyMap<string, { status: string; committedVersion: number | null }>,
+  ): Promise<void> {
+    const table = await this.store.getTable(job.tableId);
+    if (table === undefined) throw new Error(`Compaction table is missing: ${job.tableId}`);
+    const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
+    if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
+      throw new Error(
+        `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
+      );
+    }
+    const plannedSnapshot = new Snapshot(
+      this.store,
+      sourceManifest.version,
+      sourceManifest.blockIds,
+    );
+    const plannedVisible = await this.#visibleSegmentRecords(table, plannedSnapshot);
+    const plannedLayout = appendLevelTwoLayout(plannedVisible);
+    if (
+      plannedLayout === null ||
+      plannedLayout.levelTwoSegments.length !== job.outputPartitionOrdinal
+    ) {
+      throw new Error("Compaction retained L2 prefix differs from its plan");
+    }
+    const plannedSources = plannedLayout.level0Segments.slice(0, job.sourceSegmentIds.length);
+    if (
+      plannedSources.length !== job.sourceSegmentIds.length ||
+      plannedSources.some((segment, index) => segment.id !== job.sourceSegmentIds[index])
+    ) {
+      throw new Error("Compaction L2 sources are not the planned oldest L0 prefix");
+    }
+    for (const column of plan.columns) {
+      const plannedBlockIds = column.sourceBlocks.map((block) => block.blockId);
+      const descriptorBlockIds = plannedSources.flatMap(
+        (segment) => segment.columnBlockIds[column.columnId] ?? [],
+      );
+      if (
+        plannedBlockIds.length !== descriptorBlockIds.length ||
+        plannedBlockIds.some((blockId, index) => blockId !== descriptorBlockIds[index])
+      ) {
+        throw new Error(`Compaction L2 source column differs from its plan: ${column.columnId}`);
+      }
+    }
+
+    const currentVisible = await this.#visibleSegmentRecords(table, snapshot);
+    const currentLayout = appendLevelTwoLayout(currentVisible);
+    if (currentLayout?.levelTwoSegments.length !== job.outputPartitionOrdinal) {
+      throw new Error("Concurrent segments violate the planned L2 layout");
+    }
+    const fixedPrefix = [...plannedLayout.retainedPrefix, ...plannedSources];
+    if (currentVisible.length < fixedPrefix.length) {
+      throw new Error("Compaction retained L2 prefix is no longer visible");
+    }
+    for (const [index, planned] of fixedPrefix.entries()) {
+      const actual = currentVisible[index];
+      if (
+        actual?.id !== planned.id ||
+        actual.transactionId !== planned.transactionId ||
+        !sameCompactionSegment(actual, planned)
+      ) {
+        throw new Error(`Compaction retained segment differs from its plan: ${planned.id}`);
+      }
+    }
+    const currentTail = currentVisible.slice(fixedPrefix.length);
+    const earliestSource = sourceOrderTuple(plannedSources[0], transactions, "Compaction source");
+    const latestSource = sourceOrderTuple(
+      plannedSources[plannedSources.length - 1],
+      transactions,
+      "Compaction source",
+    );
+    const outputLogicalOrder = plan.logicalOrder;
+    if (earliestSource.logicalOrder !== outputLogicalOrder) {
+      throw new Error("Compaction L2 output order differs from its source prefix");
+    }
+    const latestRetained = plannedLayout.retainedPrefix.at(-1);
+    if (
+      latestRetained !== undefined &&
+      compareMergeSourceOrder(
+        sourceOrderTuple(latestRetained, transactions, "Retained compaction segment"),
+        earliestSource,
+      ) >= 0
+    ) {
+      throw new Error(`Retained compaction segment would reorder L2 output: ${latestRetained.id}`);
+    }
+    for (const segment of currentTail) {
+      if (
+        (segment.level ?? 0) !== 0 ||
+        segment.partitionOrdinal !== undefined ||
+        (segment.kind ?? "insert") !== "insert" ||
+        segment.rowIdSpans !== undefined
+      ) {
+        throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
+      }
+      const tuple = sourceOrderTuple(segment, transactions, "Concurrent compaction segment");
+      if (
+        tuple.logicalOrder <= outputLogicalOrder ||
+        compareMergeSourceOrder(latestSource, tuple) >= 0
       ) {
         throw new Error(`Concurrent segment would reorder compaction output: ${segment.id}`);
       }
@@ -2730,6 +3039,14 @@ export class BrowserDatabase {
             level0SourceStoredBytes: job.level0SourceStoredBytes,
             anchorSourceStoredBytes: job.anchorSourceStoredBytes,
             compactionWriteAmplification: job.outputStoredBytes / job.level0SourceStoredBytes,
+          }),
+      ...(job.outputPartitionOrdinal === undefined
+        ? {}
+        : {
+            outputPartitionOrdinal: job.outputPartitionOrdinal,
+            maxWriteAmplification: job.maxWriteAmplification ?? 0,
+            maximumOutputStoredBytes: job.maximumOutputStoredBytes ?? 0,
+            plannedOutputStoredBytesUpperBound: job.plannedOutputStoredBytesUpperBound ?? 0,
           }),
       outputLogicalBytes,
       ...(rewritePlan.kind !== "copy-v1"
@@ -3320,6 +3637,13 @@ function positiveWholeNumber(value: number, name: string): number {
   return value;
 }
 
+function positiveFiniteNumber(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${name} must be a positive finite number`);
+  }
+  return value;
+}
+
 function validateCompression(value: unknown, name: string): Compression {
   if (value !== "raw" && value !== "rle" && value !== "gzip") {
     throw new TypeError(`${name} must be raw, rle, or gzip`);
@@ -3469,6 +3793,23 @@ function compareMergeSourceOrder(
     left.committedVersion - right.committedVersion ||
     left.segmentId.localeCompare(right.segmentId)
   );
+}
+
+function sourceOrderTuple(
+  segment: SegmentRecord | undefined,
+  transactions: ReadonlyMap<string, { status: string; committedVersion: number | null }>,
+  label: string,
+): Pick<MergeCompactionSourceSegment, "logicalOrder" | "committedVersion" | "segmentId"> {
+  if (segment === undefined) throw new Error(`${label} is unavailable`);
+  const owner = transactions.get(segment.transactionId);
+  if (owner?.status !== "committed" || owner.committedVersion === null) {
+    throw new Error(`${label} has no committed owner: ${segment.id}`);
+  }
+  return {
+    logicalOrder: segment.logicalOrder ?? owner.committedVersion,
+    committedVersion: owner.committedVersion,
+    segmentId: segment.id,
+  };
 }
 
 function mergePlannerMemoryBound(
@@ -3903,6 +4244,14 @@ function compactionProgress(
           level0SourceStoredBytes: job.level0SourceStoredBytes,
           anchorSourceStoredBytes: job.anchorSourceStoredBytes,
         }),
+    ...(job.outputPartitionOrdinal === undefined
+      ? {}
+      : {
+          outputPartitionOrdinal: job.outputPartitionOrdinal,
+          maxWriteAmplification: job.maxWriteAmplification ?? 0,
+          maximumOutputStoredBytes: job.maximumOutputStoredBytes ?? 0,
+          plannedOutputStoredBytesUpperBound: job.plannedOutputStoredBytesUpperBound ?? 0,
+        }),
     ...(rewritePlan.kind !== "copy-v1"
       ? {
           memoryBudgetBytes: job.memoryBudgetBytes ?? 0,
@@ -3980,6 +4329,7 @@ function sameCompactionSegment(left: SegmentRecord, right: SegmentRecord): boole
     (left.kind ?? "insert") !== (right.kind ?? "insert") ||
     left.keyColumnId !== right.keyColumnId ||
     (left.level ?? 0) !== (right.level ?? 0) ||
+    left.partitionOrdinal !== right.partitionOrdinal ||
     left.logicalOrder !== right.logicalOrder
   ) {
     return false;
@@ -4074,6 +4424,121 @@ function hasContiguousRowIds(segments: readonly SegmentRecord[]): boolean {
     const previous = segments[index - 1];
     return previous === undefined || previous.rowIdEndExclusive === segment.rowIdStart;
   });
+}
+
+interface AppendLevelTwoLayout {
+  retainedPrefix: readonly SegmentRecord[];
+  levelTwoSegments: readonly SegmentRecord[];
+  level0Segments: readonly SegmentRecord[];
+}
+
+function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTwoLayout | null {
+  let index = 0;
+  const retainedPrefix: SegmentRecord[] = [];
+  const levelTwoSegments: SegmentRecord[] = [];
+  const first = segments[0];
+  if (first !== undefined && (first.level ?? 0) === 1) {
+    if (
+      (first.kind ?? "insert") !== "insert" ||
+      first.rowIdSpans !== undefined ||
+      first.partitionOrdinal !== undefined ||
+      (first.logicalOrder !== undefined &&
+        (!Number.isSafeInteger(first.logicalOrder) || first.logicalOrder < 0))
+    ) {
+      return null;
+    }
+    retainedPrefix.push(first);
+    index += 1;
+  }
+  for (;;) {
+    const segment = segments[index];
+    if (segment === undefined || (segment.level ?? 0) !== 2) break;
+    if (
+      (segment.kind ?? "insert") !== "insert" ||
+      segment.rowIdSpans !== undefined ||
+      segment.partitionOrdinal !== levelTwoSegments.length ||
+      !Number.isSafeInteger(segment.logicalOrder) ||
+      (segment.logicalOrder ?? -1) < 0 ||
+      segment.rowIdEndExclusive - segment.rowIdStart !== BigInt(segment.rowCount)
+    ) {
+      return null;
+    }
+    retainedPrefix.push(segment);
+    levelTwoSegments.push(segment);
+    index += 1;
+  }
+  const level0Segments = segments.slice(index);
+  if (
+    level0Segments.some(
+      (segment) =>
+        (segment.level ?? 0) !== 0 ||
+        segment.partitionOrdinal !== undefined ||
+        (segment.kind ?? "insert") !== "insert" ||
+        segment.rowIdSpans !== undefined ||
+        (segment.logicalOrder !== undefined &&
+          (!Number.isSafeInteger(segment.logicalOrder) || segment.logicalOrder < 0)),
+    )
+  ) {
+    return null;
+  }
+  const rowIdIntervals = segments
+    .map((segment) => ({
+      start: segment.rowIdStart,
+      end: segment.rowIdEndExclusive,
+      expectedEnd: segment.rowIdStart + BigInt(segment.rowCount),
+    }))
+    .sort((left, right) => (left.start < right.start ? -1 : left.start > right.start ? 1 : 0));
+  for (const [intervalIndex, interval] of rowIdIntervals.entries()) {
+    if (interval.start <= 0n || interval.end !== interval.expectedEnd) return null;
+    const previous = rowIdIntervals[intervalIndex - 1];
+    if (previous !== undefined && interval.start < previous.end) return null;
+  }
+  return { retainedPrefix, levelTwoSegments, level0Segments };
+}
+
+function compactionWriteAmplificationSkipped(input: {
+  tableName: string;
+  sourceSegments: readonly SegmentRecord[];
+  sourceBlockIds: readonly string[];
+  sourceStoredBytes: number;
+  level0SourceStoredBytes: number;
+  outputPartitionOrdinal: number;
+  maxWriteAmplification: number;
+  maximumOutputStoredBytes: number;
+  plannedOutputStoredBytesUpperBound: number;
+  targetBlockBytes: number;
+  outputCompression: Compression;
+  memoryBudgetBytes: number;
+  minimumMemoryBytes: number;
+  version: number;
+}): CompactTableResult {
+  return {
+    tableName: input.tableName,
+    compacted: false,
+    skipReason: "write-amplification-budget",
+    sourceSegmentCount: input.sourceSegments.length,
+    sourceBlockCount: input.sourceBlockIds.length,
+    outputSegmentId: null,
+    outputBlockCount: 0,
+    rowCount: input.sourceSegments.reduce((total, segment) => total + segment.rowCount, 0),
+    sourceStoredBytes: input.sourceStoredBytes,
+    outputStoredBytes: 0,
+    level0SourceStoredBytes: input.level0SourceStoredBytes,
+    anchorSourceStoredBytes: 0,
+    outputPartitionOrdinal: input.outputPartitionOrdinal,
+    maxWriteAmplification: input.maxWriteAmplification,
+    maximumOutputStoredBytes: input.maximumOutputStoredBytes,
+    plannedOutputStoredBytesUpperBound: input.plannedOutputStoredBytesUpperBound,
+    targetBlockBytes: input.targetBlockBytes,
+    outputCompression: input.outputCompression,
+    memoryBudgetBytes: input.memoryBudgetBytes,
+    minimumMemoryBytes: input.minimumMemoryBytes,
+    peakWorkingBytes: 0,
+    supersededBlockCount: 0,
+    physicallyReclaimedBytes: 0,
+    version: input.version,
+    metrics: null,
+  };
 }
 
 function compactTableSkipped(

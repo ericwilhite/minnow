@@ -584,6 +584,7 @@ async function commitLowLevelNumberSegment(
   input: {
     segmentId: string;
     level: number;
+    partitionOrdinal?: number;
     logicalOrder: number;
     rowId: bigint;
     value: number;
@@ -610,6 +611,7 @@ async function commitLowLevelNumberSegment(
     columnBlockIds: { [column.id]: [blockId] },
     kind: "insert",
     level: input.level,
+    ...(input.partitionOrdinal === undefined ? {} : { partitionOrdinal: input.partitionOrdinal }),
     logicalOrder: input.logicalOrder,
     createdAt: "2026-01-01T00:00:00.000Z",
   });
@@ -3755,7 +3757,7 @@ it("validates bounded compaction options and preserves the deprecated threshold 
     { maxLevel0Segments: 2.5 },
     { maxLevel0StoredBytes: 0 },
     { maxLevel0StoredBytes: 2.5 },
-    { targetLevel: 2 },
+    { targetLevel: 3 },
     { minimumSegments: 2, minimumLevel0Segments: 3 },
   ]) {
     await expect(database.compactTable("bounded_options", options)).rejects.toBeInstanceOf(
@@ -3826,6 +3828,655 @@ it("skips unsupported compaction level layouts without creating jobs", async () 
   }
   expect(await store.listCompactionJobs()).toEqual([]);
   store.close();
+});
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} repeatedly promotes L0 prefixes into immutable ordered L2 partitions`, async () => {
+    const store = await implementation.create();
+    const tableName = `l2_prefix_${implementation.name}`;
+    const database = new BrowserDatabase(store, { compression: "raw" });
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "number" }],
+    });
+    const inserts = [];
+    for (let value = 1; value <= 6; value += 1) {
+      inserts.push(await database.insert(tableName, { value }));
+    }
+    const originalSegmentIds = inserts.map((insert) => insert.segmentId);
+    const expectedRows = inserts.map((_insert, index) => ({ value: index + 1 }));
+    const snapshots = inserts.map((insert, index) => ({
+      version: insert.version,
+      rows: expectedRows.slice(0, index + 1),
+    }));
+    const partitions: Array<{
+      segment: SegmentRecord;
+      blocks: Array<{ id: string; bytes: Uint8Array }>;
+    }> = [];
+
+    for (let partitionOrdinal = 0; partitionOrdinal < 3; partitionOrdinal += 1) {
+      const promotedIds = originalSegmentIds.slice(partitionOrdinal * 2, partitionOrdinal * 2 + 2);
+      const sourceStats = await compactionSourceStats(store, promotedIds);
+      const result = await database.compactTable(tableName, {
+        ...(partitionOrdinal === 0 ? { targetLevel: 2 } : {}),
+        minimumLevel0Segments: 2,
+        maxLevel0Segments: 2,
+        maxLevel0StoredBytes: 1024 * 1024,
+        targetBlockBytes: 1024,
+        outputCompression: "raw",
+        maxBlocksPerStep: 1,
+      });
+      if (result.jobId === undefined || result.outputSegmentId === null) {
+        throw new Error("Expected an L2 output partition");
+      }
+      expect(result).toMatchObject({
+        compacted: true,
+        sourceSegmentCount: 2,
+        sourceBlockCount: sourceStats.blockIds.length,
+        rowCount: 2,
+        sourceStoredBytes: sourceStats.storedBytes,
+        level0SourceStoredBytes: sourceStats.storedBytes,
+        anchorSourceStoredBytes: 0,
+        outputPartitionOrdinal: partitionOrdinal,
+        maxWriteAmplification: 16,
+      });
+      expect(result.maximumOutputStoredBytes).toBe(Math.floor(sourceStats.storedBytes * 16));
+      expect(result.outputStoredBytes).toBeLessThanOrEqual(
+        result.plannedOutputStoredBytesUpperBound ?? -1,
+      );
+      expect(result.plannedOutputStoredBytesUpperBound).toBeLessThanOrEqual(
+        result.maximumOutputStoredBytes ?? -1,
+      );
+
+      const job = await store.getCompactionJob(result.jobId);
+      expect(job).toMatchObject({
+        targetLevel: 2,
+        sourceSegmentIds: promotedIds,
+        sourceStoredBytes: sourceStats.storedBytes,
+        level0SourceStoredBytes: sourceStats.storedBytes,
+        anchorSourceStoredBytes: 0,
+        outputPartitionOrdinal: partitionOrdinal,
+        maxWriteAmplification: 16,
+        maximumOutputStoredBytes: result.maximumOutputStoredBytes,
+        plannedOutputStoredBytesUpperBound: result.plannedOutputStoredBytesUpperBound,
+      });
+      expect([...(job?.sourceBlockIds ?? [])].sort()).toEqual(sourceStats.blockIds);
+
+      const sourceSegments = await Promise.all(
+        promotedIds.map((segmentId) => requiredSegment(store, segmentId)),
+      );
+      const firstSource = requiredItem(sourceSegments, 0, "first L2 source");
+      const lastSource = requiredItem(sourceSegments, 1, "last L2 source");
+      const output = await requiredSegment(store, result.outputSegmentId);
+      expect(output).toMatchObject({
+        kind: "insert",
+        level: 2,
+        partitionOrdinal,
+        rowCount: 2,
+        rowIdStart: firstSource.rowIdStart,
+        rowIdEndExclusive: lastSource.rowIdEndExclusive,
+      });
+
+      for (const preserved of partitions) {
+        expect(await requiredSegment(store, preserved.segment.id)).toEqual(preserved.segment);
+        for (const block of preserved.blocks) {
+          expect(await store.getBlock(block.id)).toEqual(block.bytes);
+        }
+      }
+      const outputBlockIds = Object.values(output.columnBlockIds).flat();
+      const outputBlocks = await Promise.all(
+        outputBlockIds.map(async (id) => {
+          const bytes = await store.getBlock(id);
+          if (bytes === undefined) throw new Error(`Expected L2 output block ${id}`);
+          return { id, bytes: new Uint8Array(bytes) };
+        }),
+      );
+      partitions.push({ segment: output, blocks: outputBlocks });
+
+      expect((await database.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+        ...partitions.map((partition) => partition.segment.id),
+        ...originalSegmentIds.slice((partitionOrdinal + 1) * 2),
+      ]);
+      expect(await database.readTable(tableName)).toEqual(expectedRows);
+      for (const snapshot of snapshots) {
+        expect(await database.readTable(tableName, snapshot.version)).toEqual(snapshot.rows);
+      }
+    }
+
+    for (let index = 1; index < partitions.length; index += 1) {
+      const previous = requiredItem(partitions, index - 1, "previous L2 partition").segment;
+      const current = requiredItem(partitions, index, "current L2 partition").segment;
+      expect(
+        previous.rowIdEndExclusive <= current.rowIdStart ||
+          current.rowIdEndExclusive <= previous.rowIdStart,
+      ).toBe(true);
+      expect(previous.partitionOrdinal).toBe(index - 1);
+      expect(current.partitionOrdinal).toBe(index);
+    }
+    store.close();
+  });
+}
+
+it("retains an optional L1 prefix while omitted targets continue established L2 partitioning", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "l1_l2_transition",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const inserts = [];
+  for (let value = 1; value <= 2; value += 1) {
+    inserts.push(await database.insert("l1_l2_transition", { value }));
+  }
+  const levelOne = await database.compactTable("l1_l2_transition", {
+    outputCompression: "raw",
+  });
+  if (levelOne.outputSegmentId === null) throw new Error("Expected a retained L1 prefix");
+  const retainedSegment = await requiredSegment(store, levelOne.outputSegmentId);
+  const retainedBlockIds = Object.values(retainedSegment.columnBlockIds).flat();
+  const retainedBlocks = await store.getBlocks(retainedBlockIds);
+
+  for (let value = 3; value <= 6; value += 1) {
+    inserts.push(await database.insert("l1_l2_transition", { value }));
+  }
+  const firstL2 = await database.compactTable("l1_l2_transition", {
+    targetLevel: 2,
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    outputCompression: "raw",
+  });
+  const secondL2 = await database.compactTable("l1_l2_transition", {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    outputCompression: "raw",
+  });
+  if (firstL2.outputSegmentId === null || secondL2.outputSegmentId === null) {
+    throw new Error("Expected two L2 transition partitions");
+  }
+  expect(firstL2.outputPartitionOrdinal).toBe(0);
+  expect(secondL2.outputPartitionOrdinal).toBe(1);
+  expect(await requiredSegment(store, retainedSegment.id)).toEqual(retainedSegment);
+  for (const [index, blockId] of retainedBlockIds.entries()) {
+    expect(await store.getBlock(blockId)).toEqual(retainedBlocks[index]);
+  }
+  expect(
+    (await database.listVisibleSegments("l1_l2_transition")).map((segment) => segment.id),
+  ).toEqual([retainedSegment.id, firstL2.outputSegmentId, secondL2.outputSegmentId]);
+  expect(await database.readTable("l1_l2_transition")).toEqual(
+    inserts.map((_insert, index) => ({ value: index + 1 })),
+  );
+  expect(
+    await database.readTable("l1_l2_transition", requiredItem(inserts, 1, "L1 snapshot").version),
+  ).toEqual([{ value: 1 }, { value: 2 }]);
+  store.close();
+});
+
+it("rejects keyed and malformed L2 layouts without creating compaction jobs", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "keyed_l2_rejection",
+    uniqueKey: "key",
+    columns: [
+      { name: "key", type: "string" },
+      { name: "value", type: "number" },
+    ],
+  });
+  await database.insert("keyed_l2_rejection", { key: "a", value: 1 });
+  await database.insert("keyed_l2_rejection", { key: "b", value: 2 });
+  expect(
+    await database.compactTable("keyed_l2_rejection", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+    }),
+  ).toMatchObject({ compacted: false, skipReason: "contains-mutation-segments" });
+
+  await database.createTable({
+    name: "interleaved_l2_layout",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const interleaved = await store.getTableByName("interleaved_l2_layout");
+  if (interleaved === undefined) throw new Error("Expected an interleaved L2 table");
+  await commitLowLevelNumberSegment(store, interleaved, {
+    segmentId: "interleaved-l0-first",
+    level: 0,
+    logicalOrder: 0,
+    rowId: 0n,
+    value: 1,
+  });
+  await commitLowLevelNumberSegment(store, interleaved, {
+    segmentId: "interleaved-l2",
+    level: 2,
+    partitionOrdinal: 0,
+    logicalOrder: 1,
+    rowId: 1n,
+    value: 2,
+  });
+  await commitLowLevelNumberSegment(store, interleaved, {
+    segmentId: "interleaved-l0-tail",
+    level: 0,
+    logicalOrder: 2,
+    rowId: 2n,
+    value: 3,
+  });
+  expect(
+    await database.compactTable("interleaved_l2_layout", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+    }),
+  ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
+
+  await database.createTable({
+    name: "gapped_l2_ordinals",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const gapped = await store.getTableByName("gapped_l2_ordinals");
+  if (gapped === undefined) throw new Error("Expected a gapped L2 table");
+  for (const input of [
+    { segmentId: "gapped-l2-zero", level: 2, partitionOrdinal: 0, logicalOrder: 0, rowId: 1n },
+    { segmentId: "gapped-l2-two", level: 2, partitionOrdinal: 2, logicalOrder: 1, rowId: 2n },
+    { segmentId: "gapped-l0-a", level: 0, logicalOrder: 2, rowId: 3n },
+    { segmentId: "gapped-l0-b", level: 0, logicalOrder: 3, rowId: 4n },
+  ]) {
+    await commitLowLevelNumberSegment(store, gapped, { ...input, value: Number(input.rowId) });
+  }
+  expect(
+    await database.compactTable("gapped_l2_ordinals", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+    }),
+  ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
+
+  await database.createTable({
+    name: "overlapping_l2_ranges",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const overlapping = await store.getTableByName("overlapping_l2_ranges");
+  if (overlapping === undefined) throw new Error("Expected an overlapping L2 table");
+  for (const input of [
+    { segmentId: "overlap-l2-zero", level: 2, partitionOrdinal: 0, logicalOrder: 0, rowId: 1n },
+    { segmentId: "overlap-l2-one", level: 2, partitionOrdinal: 1, logicalOrder: 1, rowId: 1n },
+    { segmentId: "overlap-l0-a", level: 0, logicalOrder: 2, rowId: 3n },
+    { segmentId: "overlap-l0-b", level: 0, logicalOrder: 3, rowId: 4n },
+  ]) {
+    await commitLowLevelNumberSegment(store, overlapping, {
+      ...input,
+      value: Number(input.rowId),
+    });
+  }
+  expect(
+    await database.compactTable("overlapping_l2_ranges", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+    }),
+  ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
+  expect(await store.listCompactionJobs()).toEqual([]);
+  store.close();
+});
+
+it("keeps the implicit L1 default but permits an explicit single-segment L2 promotion", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "single_l2_partition",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const inserted = await database.insert("single_l2_partition", { value: 1 });
+
+  expect(
+    await database.compactTable("single_l2_partition", {
+      minimumLevel0Segments: 1,
+      maxLevel0Segments: 1,
+    }),
+  ).toMatchObject({
+    compacted: false,
+    skipReason: "below-segment-threshold",
+  });
+  expect(await store.listCompactionJobs()).toEqual([]);
+
+  const promoted = await database.compactTable("single_l2_partition", {
+    targetLevel: 2,
+    minimumLevel0Segments: 1,
+    maxLevel0Segments: 1,
+    maxWriteAmplification: 64,
+    outputCompression: "raw",
+  });
+  if (promoted.outputSegmentId === null) throw new Error("Expected one promoted L2 segment");
+  expect(promoted).toMatchObject({
+    compacted: true,
+    sourceSegmentCount: 1,
+    outputPartitionOrdinal: 0,
+  });
+  expect(await requiredSegment(store, promoted.outputSegmentId)).toMatchObject({
+    level: 2,
+    partitionOrdinal: 0,
+    rowCount: 1,
+  });
+  expect(await database.readTable("single_l2_partition")).toEqual([{ value: 1 }]);
+  expect(await database.readTable("single_l2_partition", inserted.version)).toEqual([{ value: 1 }]);
+  store.close();
+});
+
+it("enforces the conservative L2 write-amplification ceiling at an exact byte boundary", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  const seed = async (tableName: string) => {
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "number" }],
+    });
+    const first = await database.insert(tableName, { value: 1 });
+    const second = await database.insert(tableName, { value: 2 });
+    return [first, second] as const;
+  };
+  const options = {
+    targetLevel: 2 as const,
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    targetBlockBytes: 9,
+    outputCompression: "raw" as const,
+  };
+
+  const calibrationSources = await seed("l2_budget_calibration");
+  const calibration = await database.compactTable("l2_budget_calibration", {
+    ...options,
+    maxWriteAmplification: 1024,
+  });
+  if (!calibration.compacted || calibration.plannedOutputStoredBytesUpperBound === undefined) {
+    throw new Error("Expected a calibrated L2 bound");
+  }
+  const calibratedSourceStats = await compactionSourceStats(
+    store,
+    calibrationSources.map((source) => source.segmentId),
+  );
+  const plannedUpperBound = calibration.plannedOutputStoredBytesUpperBound;
+  const exactLimit = (plannedUpperBound + 0.25) / calibratedSourceStats.storedBytes;
+  const belowLimit = (plannedUpperBound - 0.25) / calibratedSourceStats.storedBytes;
+  expect(Math.floor(calibratedSourceStats.storedBytes * exactLimit)).toBe(plannedUpperBound);
+  expect(Math.floor(calibratedSourceStats.storedBytes * belowLimit)).toBe(plannedUpperBound - 1);
+
+  const exactSources = await seed("l2_budget_exact");
+  const exactStats = await compactionSourceStats(
+    store,
+    exactSources.map((source) => source.segmentId),
+  );
+  expect(exactStats.storedBytes).toBe(calibratedSourceStats.storedBytes);
+  const exact = await database.compactTable("l2_budget_exact", {
+    ...options,
+    maxWriteAmplification: exactLimit,
+  });
+  expect(exact).toMatchObject({
+    compacted: true,
+    maxWriteAmplification: exactLimit,
+    maximumOutputStoredBytes: plannedUpperBound,
+    plannedOutputStoredBytesUpperBound: plannedUpperBound,
+  });
+  expect(exact.outputStoredBytes).toBeLessThanOrEqual(plannedUpperBound);
+
+  const belowSources = await seed("l2_budget_below");
+  const belowStats = await compactionSourceStats(
+    store,
+    belowSources.map((source) => source.segmentId),
+  );
+  expect(belowStats.storedBytes).toBe(calibratedSourceStats.storedBytes);
+  const jobsBefore = await store.listCompactionJobs();
+  const blocksBefore = await store.listBlockIds();
+  const segmentsBefore = await store.listSegments();
+  const manifestBefore = await store.getCurrentManifest();
+  const below = await database.compactTable("l2_budget_below", {
+    ...options,
+    maxWriteAmplification: belowLimit,
+  });
+  expect(below).toMatchObject({
+    compacted: false,
+    skipReason: "write-amplification-budget",
+    maxWriteAmplification: belowLimit,
+    maximumOutputStoredBytes: plannedUpperBound - 1,
+    plannedOutputStoredBytesUpperBound: plannedUpperBound,
+  });
+  expect(await store.listCompactionJobs()).toEqual(jobsBefore);
+  expect(await store.listBlockIds()).toEqual(blocksBefore);
+  expect(await store.listSegments()).toEqual(segmentsBefore);
+  expect(await store.getCurrentManifest()).toEqual(manifestBefore);
+  expect(await database.readTable("l2_budget_below")).toEqual([{ value: 1 }, { value: 2 }]);
+
+  expect(
+    await database.compactTable("l2_budget_below", {
+      ...options,
+      maxWriteAmplification: Number.MIN_VALUE,
+    }),
+  ).toMatchObject({
+    compacted: false,
+    skipReason: "write-amplification-budget",
+    maximumOutputStoredBytes: 0,
+  });
+
+  for (const maxWriteAmplification of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await expect(
+      database.compactTable("l2_budget_below", {
+        ...options,
+        maxWriteAmplification,
+      }),
+    ).rejects.toBeInstanceOf(RangeError);
+  }
+  store.close();
+});
+
+it("does not round a binary write-amplification ratio up by one output byte", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store, { compression: "raw" });
+  const seed = async (tableName: string) => {
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "boolean" }],
+    });
+    const inserts = [];
+    for (let index = 0; index < 5; index += 1) {
+      inserts.push(await database.insert(tableName, { value: index % 2 === 0 }));
+    }
+    return compactionSourceStats(
+      store,
+      inserts.map((insert) => insert.segmentId),
+    );
+  };
+  const options = {
+    targetLevel: 2 as const,
+    minimumLevel0Segments: 5,
+    maxLevel0Segments: 5,
+    targetBlockBytes: 1024,
+    outputCompression: "raw" as const,
+  };
+
+  const belowStats = await seed("l2_binary_ratio_below");
+  expect(belowStats.storedBytes).toBe(200);
+  expect(
+    await database.compactTable("l2_binary_ratio_below", {
+      ...options,
+      maxWriteAmplification: 0.19999999999999998,
+    }),
+  ).toMatchObject({
+    compacted: false,
+    skipReason: "write-amplification-budget",
+    maximumOutputStoredBytes: 39,
+    plannedOutputStoredBytesUpperBound: 40,
+  });
+
+  const exactStats = await seed("l2_binary_ratio_exact");
+  expect(exactStats.storedBytes).toBe(200);
+  expect(
+    await database.compactTable("l2_binary_ratio_exact", {
+      ...options,
+      maxWriteAmplification: 0.2,
+    }),
+  ).toMatchObject({
+    compacted: true,
+    maximumOutputStoredBytes: 40,
+    plannedOutputStoredBytesUpperBound: 40,
+    outputStoredBytes: 40,
+  });
+  store.close();
+});
+
+for (const implementation of recoveryImplementations()) {
+  it(`${implementation.name} reopens an L2 checkpoint with its exact prefix, ordinal, and ceiling`, async () => {
+    const harness = await implementation.create();
+    let store = harness.store;
+    const tableName = `l2_reopen_${implementation.name.replaceAll(" ", "_")}`;
+    const database = new BrowserDatabase(store, { compression: "raw" });
+    await database.createTable({
+      name: tableName,
+      columns: [{ name: "value", type: "number" }],
+    });
+    const inserts = [];
+    for (let value = 1; value <= 4; value += 1) {
+      inserts.push(await database.insert(tableName, { value }));
+    }
+    const sourceSegmentIds = inserts.slice(0, 2).map((insert) => insert.segmentId);
+    let progress = await database.compactTableStep(tableName, {
+      targetLevel: 2,
+      minimumLevel0Segments: 2,
+      maxLevel0Segments: 2,
+      maxWriteAmplification: 64,
+      maxBlocks: 1,
+      targetBlockBytes: 9,
+      outputCompression: "raw",
+    });
+    if (progress.jobId === null) throw new Error("Expected a checkpointed L2 job");
+    const jobId = progress.jobId;
+    expect(progress).toMatchObject({
+      state: "running",
+      sourceSegmentCount: 2,
+      outputBlockCount: 1,
+      result: null,
+    });
+    const beforeReopen = await store.getCompactionJob(jobId);
+    expect(beforeReopen).toMatchObject({
+      targetLevel: 2,
+      sourceSegmentIds,
+      outputPartitionOrdinal: 0,
+      maxWriteAmplification: 64,
+    });
+
+    store = await harness.reopen();
+    expect(await store.getCompactionJob(jobId)).toEqual(beforeReopen);
+    const reopened = new BrowserDatabase(store, { compression: "gzip", rowsPerBlock: 2048 });
+    while (progress.result === null) {
+      progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
+    }
+    if (progress.result.outputSegmentId === null) throw new Error("Expected a reopened L2 output");
+    expect(progress.result).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: 2,
+      outputPartitionOrdinal: 0,
+      outputCompression: "raw",
+      maxWriteAmplification: 64,
+      maximumOutputStoredBytes: beforeReopen?.maximumOutputStoredBytes,
+      plannedOutputStoredBytesUpperBound: beforeReopen?.plannedOutputStoredBytesUpperBound,
+    });
+    expect(progress.result.outputStoredBytes).toBeLessThanOrEqual(
+      progress.result.plannedOutputStoredBytesUpperBound ?? -1,
+    );
+    expect(await requiredSegment(store, progress.result.outputSegmentId)).toMatchObject({
+      level: 2,
+      partitionOrdinal: 0,
+    });
+
+    const second = await reopened.compactTable(tableName, {
+      minimumLevel0Segments: 2,
+      maxLevel0Segments: 2,
+      maxWriteAmplification: 64,
+      outputCompression: "raw",
+    });
+    if (second.outputSegmentId === null) throw new Error("Expected a second L2 output");
+    expect(second.outputPartitionOrdinal).toBe(1);
+    expect((await reopened.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+      progress.result.outputSegmentId,
+      second.outputSegmentId,
+    ]);
+    expect(await reopened.readTable(tableName)).toEqual(
+      inserts.map((_insert, index) => ({ value: index + 1 })),
+    );
+    expect(
+      await reopened.readTable(tableName, requiredItem(inserts, 3, "L2 source snapshot").version),
+    ).toEqual(inserts.map((_insert, index) => ({ value: index + 1 })));
+    store.close();
+  });
+}
+
+it("rebases an L2 prefix across a concurrent L0 append while retaining prior partitions", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const compactorStore = await IndexedDbBlockStore.open({ name, indexedDB });
+  const writerStore = await IndexedDbBlockStore.open({ name, indexedDB });
+  const compactor = new BrowserDatabase(compactorStore, { compression: "raw" });
+  const writer = new BrowserDatabase(writerStore, { compression: "raw" });
+  const tableName = "l2_concurrent_append";
+  await compactor.createTable({
+    name: tableName,
+    columns: [{ name: "value", type: "number" }],
+  });
+  const inserts = [];
+  for (let value = 1; value <= 4; value += 1) {
+    inserts.push(await compactor.insert(tableName, { value }));
+  }
+  const first = await compactor.compactTable(tableName, {
+    targetLevel: 2,
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    outputCompression: "raw",
+  });
+  if (first.outputSegmentId === null) throw new Error("Expected an initial L2 partition");
+  const retained = await requiredSegment(compactorStore, first.outputSegmentId);
+  const retainedBlockIds = Object.values(retained.columnBlockIds).flat();
+  const retainedBlocks = await compactorStore.getBlocks(retainedBlockIds);
+  const sourceVersion = requiredItem(inserts, 3, "concurrent L2 source").version;
+
+  let progress = await compactor.compactTableStep(tableName, {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    maxWriteAmplification: 64,
+    maxBlocks: 1,
+    targetBlockBytes: 9,
+    outputCompression: "raw",
+  });
+  if (progress.jobId === null) throw new Error("Expected a concurrent L2 job");
+  const jobId = progress.jobId;
+  expect(await compactorStore.getCompactionJob(jobId)).toMatchObject({
+    targetLevel: 2,
+    sourceSegmentIds: inserts.slice(2).map((insert) => insert.segmentId),
+    outputPartitionOrdinal: 1,
+  });
+  const concurrent = await writer.insert(tableName, { value: 5 });
+
+  while (progress.result === null) {
+    progress = await compactor.resumeCompactionJob(jobId, { maxBlocks: 1 });
+  }
+  if (progress.result.outputSegmentId === null) throw new Error("Expected a rebased L2 output");
+  expect(progress.result.outputPartitionOrdinal).toBe(1);
+  expect(await requiredSegment(compactorStore, retained.id)).toEqual(retained);
+  for (const [index, blockId] of retainedBlockIds.entries()) {
+    expect(await compactorStore.getBlock(blockId)).toEqual(retainedBlocks[index]);
+  }
+  expect((await compactor.listVisibleSegments(tableName)).map((segment) => segment.id)).toEqual([
+    retained.id,
+    progress.result.outputSegmentId,
+    concurrent.segmentId,
+  ]);
+  expect(await compactor.readTable(tableName)).toEqual([
+    { value: 1 },
+    { value: 2 },
+    { value: 3 },
+    { value: 4 },
+    { value: 5 },
+  ]);
+  expect(await compactor.readTable(tableName, sourceVersion)).toEqual([
+    { value: 1 },
+    { value: 2 },
+    { value: 3 },
+    { value: 4 },
+  ]);
+  compactorStore.close();
+  writerStore.close();
 });
 
 it("flushes a buffered writer after its age limit", async () => {

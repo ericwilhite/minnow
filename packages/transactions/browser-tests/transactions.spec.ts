@@ -46,6 +46,16 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
             currentNames: string[];
             historicalRows: number;
           };
+          l2Compaction: {
+            sourceSegments: number[];
+            levels: number[];
+            ordinals: number[];
+            currentValues: number[];
+            historicalRows: number;
+            reopenedRows: number;
+            stablePartitionIds: boolean;
+            budgetWithinBounds: boolean;
+          };
         };
       }>;
     };
@@ -92,6 +102,16 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         visibleSegments: 1,
         currentNames: ["Grace", "Linus", "Katherine"],
         historicalRows: 3,
+      },
+      l2Compaction: {
+        sourceSegments: [2, 2],
+        levels: [2, 2],
+        ordinals: [0, 1],
+        currentValues: [1, 2, 3, 4],
+        historicalRows: 1,
+        reopenedRows: 4,
+        stablePartitionIds: true,
+        budgetWithinBounds: true,
       },
     },
   });

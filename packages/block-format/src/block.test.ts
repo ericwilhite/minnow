@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeBlock, encodeBlock, inspectBlock } from "./index.js";
+import { decodeBlock, encodeBlock, inspectBlock, maximumPhysicalBlockByteLength } from "./index.js";
 import type { ColumnInput, Compression } from "./index.js";
 
 const columns: ColumnInput[] = [
@@ -46,4 +46,46 @@ it("bounds gzip decompression by the validated declared length", async () => {
   const block = await encodeBlock({ type: "string", values: ["x".repeat(10_000)] }, "gzip");
   new DataView(block.buffer).setUint32(24, 1, true);
   await expect(decodeBlock(block)).rejects.toThrow("declared length");
+});
+
+it("bounds the complete stored block including its exact metadata envelope", async () => {
+  const input = { type: "number", values: [3, null, -2, 9] } as const;
+  const metadata = { zoneMap: { min: -2, max: 9 } };
+  const encodedByteLength = 33;
+  const metadataByteLength = new TextEncoder().encode(JSON.stringify(metadata)).byteLength;
+
+  expect(maximumPhysicalBlockByteLength(encodedByteLength, metadata, "raw")).toBe(
+    36 + metadataByteLength + encodedByteLength,
+  );
+  expect(maximumPhysicalBlockByteLength(encodedByteLength, metadata, "rle")).toBe(
+    36 + metadataByteLength + encodedByteLength * 2,
+  );
+  expect(maximumPhysicalBlockByteLength(encodedByteLength, metadata, "gzip")).toBe(
+    36 + metadataByteLength + encodedByteLength * 2 + 64,
+  );
+
+  for (const compression of ["raw", "rle", "gzip"] satisfies Compression[]) {
+    const block = await encodeBlock(input, compression);
+    expect(block.byteLength).toBeLessThanOrEqual(
+      maximumPhysicalBlockByteLength(
+        inspectBlock(block).encodedLength,
+        inspectBlock(block).metadata,
+        compression,
+      ),
+    );
+  }
+});
+
+it("rejects invalid stored-block bound inputs", () => {
+  expect(() => maximumPhysicalBlockByteLength(-1, {}, "raw")).toThrow(
+    "Invalid encoded payload length",
+  );
+  expect(() => maximumPhysicalBlockByteLength(1.5, {}, "raw")).toThrow(
+    "Invalid encoded payload length",
+  );
+  const cyclic: { self?: unknown } = {};
+  cyclic.self = cyclic;
+  expect(() => maximumPhysicalBlockByteLength(1, cyclic as never, "raw")).toThrow(
+    "JSON serializable",
+  );
 });

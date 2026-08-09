@@ -70,6 +70,8 @@ export interface SegmentRecord {
   logicalOrder?: number;
   /** Missing on legacy insert/upsert records, which imply one contiguous row-ID span. */
   rowIdSpans?: readonly RowIdSpan[];
+  /** Monotone policy ordinal for an immutable append-row-range level-two partition. */
+  readonly partitionOrdinal?: number;
   createdAt: string;
 }
 
@@ -249,6 +251,14 @@ export interface CompactionJobRecord {
   readonly level0SourceStoredBytes?: number;
   /** Immutable stored bytes from the retained level-one anchor. Missing on legacy jobs. */
   readonly anchorSourceStoredBytes?: number;
+  /** Output partition assigned by the append-row-range L2 policy. Missing on legacy jobs. */
+  readonly outputPartitionOrdinal?: number;
+  /** Immutable maximum compaction output bytes per newly promoted L0 byte. */
+  readonly maxWriteAmplification?: number;
+  /** Immutable exact ceiling for all stored output blocks produced by this job. */
+  readonly maximumOutputStoredBytes?: number;
+  /** Immutable conservative full-block upper bound for the planned output. */
+  readonly plannedOutputStoredBytesUpperBound?: number;
   peakWorkingBytes?: number;
   outputLogicalBytes?: number;
   targetLevel: number;
@@ -568,6 +578,42 @@ export function createManifest(input: PublishManifestInput): Manifest {
     blockIds: [...new Set(input.blockIds)].sort(),
     createdAt: input.createdAt ?? new Date().toISOString(),
   };
+}
+
+/**
+ * Normalizes the additive L2 partition metadata while preserving legacy segment records verbatim.
+ */
+export function normalizeSegmentRecord(record: SegmentRecord): SegmentRecord {
+  if (record.partitionOrdinal === undefined) return structuredClone(record);
+
+  const partitionOrdinal = nonNegativeWholeNumber(
+    record.partitionOrdinal,
+    "Segment partition ordinal",
+  );
+  if (record.level !== 2) {
+    throw new TypeError("A partitioned segment must have explicit level two");
+  }
+  if ((record.kind ?? "insert") !== "insert") {
+    throw new TypeError("A partitioned segment must be an insert");
+  }
+  if (record.logicalOrder === undefined) {
+    throw new TypeError("A partitioned segment requires an explicit logical order");
+  }
+  nonNegativeWholeNumber(record.logicalOrder, "Segment logical order");
+  if (record.rowIdSpans !== undefined) {
+    throw new TypeError("A partitioned segment cannot contain row ID spans");
+  }
+  const rowCount = positiveWholeNumber(record.rowCount, "Segment row count");
+  if (typeof record.rowIdStart !== "bigint" || record.rowIdStart <= 0n) {
+    throw new RangeError("Segment row ID start must be a positive bigint");
+  }
+  if (
+    typeof record.rowIdEndExclusive !== "bigint" ||
+    record.rowIdEndExclusive !== record.rowIdStart + BigInt(rowCount)
+  ) {
+    throw new RangeError("A partitioned segment must have a contiguous positive row ID envelope");
+  }
+  return structuredClone({ ...record, partitionOrdinal });
 }
 
 export function updateTransactionRecord(
@@ -937,6 +983,10 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
     record.sourceStoredBytes,
     "Compaction source stored bytes",
   );
+  const outputStoredBytes = nonNegativeWholeNumber(
+    record.outputStoredBytes,
+    "Compaction output stored bytes",
+  );
   const hasLevel0SourceStoredBytes = record.level0SourceStoredBytes !== undefined;
   const hasAnchorSourceStoredBytes = record.anchorSourceStoredBytes !== undefined;
   if (hasLevel0SourceStoredBytes !== hasAnchorSourceStoredBytes) {
@@ -966,6 +1016,75 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
   ) {
     throw new TypeError("Compaction source-level stored bytes must equal source stored bytes");
   }
+  const level2PolicyValues = [
+    record.outputPartitionOrdinal,
+    record.maxWriteAmplification,
+    record.maximumOutputStoredBytes,
+    record.plannedOutputStoredBytesUpperBound,
+  ];
+  const level2PolicyFieldCount = level2PolicyValues.filter((value) => value !== undefined).length;
+  if (level2PolicyFieldCount !== 0 && level2PolicyFieldCount !== level2PolicyValues.length) {
+    throw new TypeError("Append-row-range L2 compaction policy fields must be present together");
+  }
+  let level2Policy:
+    | Pick<
+        CompactionJobRecord,
+        | "outputPartitionOrdinal"
+        | "maxWriteAmplification"
+        | "maximumOutputStoredBytes"
+        | "plannedOutputStoredBytesUpperBound"
+      >
+    | undefined;
+  if (level2PolicyFieldCount !== 0) {
+    if (rewritePlan.kind !== "rechunk-v1") {
+      throw new TypeError("Append-row-range L2 compaction requires a rechunk plan");
+    }
+    if (record.targetLevel !== 2) {
+      throw new TypeError("Append-row-range L2 compaction must target level two");
+    }
+    if (
+      sourceLevelStoredBytes?.level0SourceStoredBytes !== sourceStoredBytes ||
+      sourceLevelStoredBytes.anchorSourceStoredBytes !== 0
+    ) {
+      throw new TypeError("Append-row-range L2 compaction requires only level-zero source bytes");
+    }
+    const outputPartitionOrdinal = nonNegativeWholeNumber(
+      record.outputPartitionOrdinal,
+      "Compaction output partition ordinal",
+    );
+    const maxWriteAmplification = positiveFiniteNumber(
+      record.maxWriteAmplification,
+      "Compaction maximum write amplification",
+    );
+    const maximumOutputStoredBytes = positiveWholeNumber(
+      record.maximumOutputStoredBytes,
+      "Compaction maximum output stored bytes",
+    );
+    const plannedOutputStoredBytesUpperBound = positiveWholeNumber(
+      record.plannedOutputStoredBytesUpperBound,
+      "Compaction planned output stored byte upper bound",
+    );
+    const amplificationCeiling = floorWholeNumberProduct(
+      sourceStoredBytes,
+      maxWriteAmplification,
+      "Compaction write amplification product",
+    );
+    if (maximumOutputStoredBytes > amplificationCeiling) {
+      throw new RangeError("Compaction output stored byte ceiling exceeds its amplification limit");
+    }
+    if (plannedOutputStoredBytesUpperBound > maximumOutputStoredBytes) {
+      throw new RangeError("Compaction planned output exceeds its stored byte ceiling");
+    }
+    if (outputStoredBytes > plannedOutputStoredBytesUpperBound) {
+      throw new RangeError("Compaction output stored bytes exceed their planned upper bound");
+    }
+    level2Policy = {
+      outputPartitionOrdinal,
+      maxWriteAmplification,
+      maximumOutputStoredBytes,
+      plannedOutputStoredBytesUpperBound,
+    };
+  }
   const normalized: CompactionJobRecord = {
     ...record,
     id: nonEmptyString(record.id, "Compaction job ID"),
@@ -989,10 +1108,7 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
     cursor: normalizeCompactionJobCursor(record.cursor),
     processedRows: nonNegativeWholeNumber(record.processedRows, "Compaction processed row count"),
     sourceStoredBytes,
-    outputStoredBytes: nonNegativeWholeNumber(
-      record.outputStoredBytes,
-      "Compaction output stored bytes",
-    ),
+    outputStoredBytes,
     logicalBytes,
     rewritePlan,
     outputCursor: normalizeCompactionOutputCursor(record.outputCursor, rewritePlan),
@@ -1005,6 +1121,7 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
       "Compaction minimum memory",
     ),
     ...(sourceLevelStoredBytes ?? {}),
+    ...(level2Policy ?? {}),
     peakWorkingBytes: nonNegativeWholeNumber(
       record.peakWorkingBytes ?? 0,
       "Compaction peak working bytes",
@@ -1053,6 +1170,10 @@ export function updateCompactionJobRecord(
     "minimumMemoryBytes",
     "level0SourceStoredBytes",
     "anchorSourceStoredBytes",
+    "outputPartitionOrdinal",
+    "maxWriteAmplification",
+    "maximumOutputStoredBytes",
+    "plannedOutputStoredBytesUpperBound",
   ] as const) {
     if (Reflect.has(update, field)) {
       throw new TypeError(`Compaction ${field} is immutable`);
@@ -2168,6 +2289,13 @@ function positiveWholeNumber(value: unknown, label: string): number {
   return normalized;
 }
 
+function positiveFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${label} must be a positive finite number`);
+  }
+  return value;
+}
+
 function uint32(value: unknown, label: string): number {
   const normalized = nonNegativeWholeNumber(value, label);
   if (normalized > 0xffff_ffff) throw new RangeError(`${label} must fit in 32 bits`);
@@ -2193,4 +2321,27 @@ function safeProduct(left: number, right: number, label: string): number {
   const product = left * right;
   if (!Number.isSafeInteger(product)) throw new RangeError(`${label} exceeds the safe range`);
   return product;
+}
+
+/** Floors an integer-times-double product without rounding the binary double upward. */
+export function floorWholeNumberProduct(left: number, right: number, label: string): number {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isFinite(right) || right < 0) {
+    throw new RangeError(`${label} exceeds the safe range`);
+  }
+  const bytes = new ArrayBuffer(8);
+  const view = new DataView(bytes);
+  view.setFloat64(0, right, false);
+  const high = view.getUint32(0, false);
+  const low = view.getUint32(4, false);
+  const exponentBits = (high >>> 20) & 0x7ff;
+  const fraction = (BigInt(high & 0x000f_ffff) << 32n) | BigInt(low);
+  const significand = exponentBits === 0 ? fraction : (1n << 52n) | fraction;
+  const binaryExponent = exponentBits === 0 ? -1074 : exponentBits - 1023 - 52;
+  let product = BigInt(left) * significand;
+  if (binaryExponent >= 0) product <<= BigInt(binaryExponent);
+  else product >>= BigInt(-binaryExponent);
+  if (product > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(`${label} exceeds the safe range`);
+  }
+  return Number(product);
 }

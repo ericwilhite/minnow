@@ -28,6 +28,7 @@ import {
   UniqueKeyConflictError,
   normalizeCompactionJobRecord,
   normalizeGarbageCollectionJobRecord,
+  normalizeSegmentRecord,
   updateCompactionJobRecord,
   updateTransactionRecord,
   WriteConflictError,
@@ -190,8 +191,9 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   async addSegment(record: SegmentRecord): Promise<void> {
+    const normalized = normalizeSegmentRecord(record);
     const transaction = this.#transaction("segments", "readwrite");
-    transaction.objectStore("segments").add(structuredClone(record), record.id);
+    transaction.objectStore("segments").add(normalized, normalized.id);
     await transactionDone(transaction);
   }
 
@@ -1141,7 +1143,7 @@ function isTableRecord(value: unknown): value is TableRecord {
 }
 
 function asSegmentRecord(value: unknown): SegmentRecord {
-  return structuredClone(value) as SegmentRecord;
+  return normalizeSegmentRecord(value as SegmentRecord);
 }
 
 function asLeaseRecord(value: unknown): LeaseRecord {

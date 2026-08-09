@@ -44,6 +44,16 @@ interface BrowserTransactionResult {
       currentNames: string[];
       historicalRows: number;
     };
+    l2Compaction: {
+      sourceSegments: number[];
+      levels: number[];
+      ordinals: number[];
+      currentValues: number[];
+      historicalRows: number;
+      reopenedRows: number;
+      stablePartitionIds: boolean;
+      budgetWithinBounds: boolean;
+    };
   };
 }
 
@@ -144,7 +154,55 @@ window.runTransactionBrowserTest = async () => {
   const mutationRows = await database.readTable("people");
   const mutationHistoricalRows = await database.readTable("people", batch.version);
   const mutationVisibleSegments = (await database.listVisibleSegments("people")).length;
+
+  await database.createTable({
+    name: "l2_events",
+    columns: [{ name: "value", type: "number" }],
+  });
+  const l2Inserts = [];
+  for (let value = 1; value <= 4; value += 1) {
+    l2Inserts.push(await database.insert("l2_events", { value }));
+  }
+  const firstL2 = await database.compactTable("l2_events", {
+    targetLevel: 2,
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    maxWriteAmplification: 64,
+    outputCompression: "raw",
+  });
+  const secondL2 = await database.compactTable("l2_events", {
+    minimumLevel0Segments: 2,
+    maxLevel0Segments: 2,
+    maxWriteAmplification: 64,
+    outputCompression: "raw",
+  });
+  const l2VisibleIds = (await database.listVisibleSegments("l2_events")).map(
+    (segment) => segment.id,
+  );
+  const l2Table = await libraryStore.getTableByName("l2_events");
+  if (l2Table === undefined) throw new Error("L2 browser table is missing");
+  const l2VisibleIdSet = new Set(l2VisibleIds);
+  const l2Segments = (await libraryStore.listSegments(l2Table.id))
+    .filter((segment) => l2VisibleIdSet.has(segment.id))
+    .sort((left, right) => (left.partitionOrdinal ?? -1) - (right.partitionOrdinal ?? -1));
+  const l2CurrentRows = await database.readTable("l2_events");
+  const l2HistoricalRows = await database.readTable("l2_events", l2Inserts[0]?.version);
+  const budgetWithinBounds = [firstL2, secondL2].every(
+    (result) =>
+      result.plannedOutputStoredBytesUpperBound !== undefined &&
+      result.maximumOutputStoredBytes !== undefined &&
+      result.outputStoredBytes <= result.plannedOutputStoredBytesUpperBound &&
+      result.plannedOutputStoredBytesUpperBound <= result.maximumOutputStoredBytes,
+  );
   libraryStore.close();
+
+  const reopenedLibraryStore = await IndexedDbBlockStore.open({ name: libraryName });
+  const reopenedDatabase = new BrowserDatabase(reopenedLibraryStore);
+  const reopenedL2Rows = await reopenedDatabase.readTable("l2_events");
+  const reopenedL2Ids = (await reopenedDatabase.listVisibleSegments("l2_events")).map(
+    (segment) => segment.id,
+  );
+  reopenedLibraryStore.close();
   await deleteDatabase(libraryName);
 
   return {
@@ -189,6 +247,18 @@ window.runTransactionBrowserTest = async () => {
         visibleSegments: mutationVisibleSegments,
         currentNames: mutationRows.map((row) => String(row.name)),
         historicalRows: mutationHistoricalRows.length,
+      },
+      l2Compaction: {
+        sourceSegments: [firstL2.sourceSegmentCount, secondL2.sourceSegmentCount],
+        levels: l2Segments.map((segment) => segment.level ?? 0),
+        ordinals: l2Segments.map((segment) => segment.partitionOrdinal ?? -1),
+        currentValues: l2CurrentRows.map((row) => Number(row.value)),
+        historicalRows: l2HistoricalRows.length,
+        reopenedRows: reopenedL2Rows.length,
+        stablePartitionIds:
+          l2VisibleIds.length === reopenedL2Ids.length &&
+          l2VisibleIds.every((id, index) => id === reopenedL2Ids[index]),
+        budgetWithinBounds,
       },
     },
   };
