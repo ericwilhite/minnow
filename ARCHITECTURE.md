@@ -350,9 +350,12 @@ instead of directly removing their pending objects.
 
 `maxItems`/`maxItemsPerStep` bound how many candidate manifests, segments, and blocks one durable
 step examines and thus how many candidate mutations it can apply. `maxPlanningItems` bounds the
-block/segment candidate arrays persisted for a new job. A single large manifest, transaction, or
-compaction record and the complete metadata/root scans currently needed for atomic revalidation are
-still unbounded. The
+block/segment candidate arrays persisted for a new job. Candidate provenance and atomic root
+revalidation use storage cursors rather than database-wide `getAll()` arrays. Their auxiliary root
+sets are restricted to the current candidate slice and at most 4,096 related segment/block
+dependencies; exceeding that dependency envelope conservatively retains the slice. The metadata
+scan work still scales with database history, however, and one large manifest, transaction,
+compaction, or segment record is still cloned as one value. The
 reported `physicallyReclaimedBytes` is the sum of byte lengths for immutable block values actually
 deleted; it excludes descriptor metadata and is not a measurement of browser quota recovery. A
 block written by `addBlock()` before a crash but never attached to a journal or another provenance

@@ -353,8 +353,11 @@ Candidate discovery walks manifests, transactions, and compaction jobs through s
 pages of at most 64 records. It checks block existence in 64-ID windows and defaults each new durable
 job to at most 1,024 block/segment candidates; at most 64 manifest provenance records accompany a
 job. `maxItems` separately bounds the candidates examined and possible mutations in one durable
-step. A single large source record is still cloned by the underlying store, and the full metadata/root
-scans repeated for atomic revalidation are not yet bounded. Collection intentionally
+step. Provenance and atomic root revalidation also stream storage cursors instead of materializing
+database-wide metadata arrays. They retain only the current candidate slice and at most 4,096
+related segment/block dependencies; dependency overflow safely retains that slice. Scan work still
+scales with database history, and a single large source record is still cloned by the underlying
+store. Collection intentionally
 accepts only candidates with persisted provenance in historical manifests, aborted transaction
 journals, or terminal compaction jobs. An otherwise unknown immutable block left by a crash after
 `addBlock()` but before journal attachment is omitted until provenance or conservative age tracking

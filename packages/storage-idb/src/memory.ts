@@ -611,14 +611,16 @@ export class MemoryBlockStore implements BlockStore {
       let reclaimedBlockBytes = 0;
       let remaining = input.maxItems;
 
-      const pinnedManifestVersions = collectPinnedManifestVersions(
+      const leaseCutoff = Date.parse(current.leaseCutoff);
+      assertGarbageCollectionPinsAvailable(
         this.#currentVersion,
-        this.#transactions.values(),
+        this.#transactions,
         this.#leases.values(),
         this.#compactionJobs.values(),
-        Date.parse(current.leaseCutoff),
+        leaseCutoff,
+        this.#manifests,
+        this.#blocks,
       );
-      assertPinnedManifestsAvailable(pinnedManifestVersions, this.#manifests, this.#blocks);
       let manifestIndex = current.cursor.manifestIndex;
       while (remaining > 0 && manifestIndex < current.candidateManifestVersions.length) {
         const version = current.candidateManifestVersions[manifestIndex];
@@ -626,25 +628,51 @@ export class MemoryBlockStore implements BlockStore {
         const manifest = this.#manifests.get(version);
         if (manifest === undefined) missingManifestVersions.push(version);
         else if (manifest.prunedAt !== undefined) alreadyPrunedManifestVersions.push(version);
-        else if (pinnedManifestVersions.has(version)) retainedManifestVersions.push(version);
+        else if (
+          isManifestVersionPinned(
+            version,
+            this.#currentVersion,
+            this.#transactions,
+            this.#leases.values(),
+            this.#compactionJobs.values(),
+            leaseCutoff,
+          )
+        )
+          retainedManifestVersions.push(version);
         else prunedManifestVersions.push(version);
         manifestIndex += 1;
         remaining -= 1;
       }
 
       const prunedManifestVersionSet = new Set(prunedManifestVersions);
-      const remainingManifests = [...this.#manifests.values()].filter(
-        (manifest) =>
-          manifest.prunedAt === undefined && !prunedManifestVersionSet.has(manifest.version),
+      assertRemainingManifestBlocksAvailable(
+        this.#manifests.values(),
+        prunedManifestVersionSet,
+        this.#blocks,
       );
-      const roots = collectPhysicalRoots(
-        remainingManifests,
-        this.#segments.values(),
-        this.#transactions.values(),
+      let segmentIndex = current.cursor.segmentIndex;
+      const segmentIdsToExamine =
+        manifestIndex === current.candidateManifestVersions.length
+          ? current.candidateSegmentIds.slice(segmentIndex, segmentIndex + remaining)
+          : [];
+      const blockCapacity = Math.max(0, remaining - segmentIdsToExamine.length);
+      const blockIdsToExamine =
+        manifestIndex === current.candidateManifestVersions.length &&
+        segmentIndex + segmentIdsToExamine.length === current.candidateSegmentIds.length
+          ? current.candidateBlockIds.slice(
+              current.cursor.blockIndex,
+              current.cursor.blockIndex + blockCapacity,
+            )
+          : [];
+      const roots = collectBoundedPhysicalRoots(
+        segmentIdsToExamine,
+        blockIdsToExamine,
+        this.#manifests.values(),
+        prunedManifestVersionSet,
+        this.#segments,
+        this.#transactions,
         this.#compactionJobs.values(),
       );
-      assertAllManifestBlocksAvailable(remainingManifests, this.#blocks);
-      let segmentIndex = current.cursor.segmentIndex;
       while (
         remaining > 0 &&
         manifestIndex === current.candidateManifestVersions.length &&
@@ -811,12 +839,39 @@ function assertSnapshotAvailable(
   }
 }
 
-function assertPinnedManifestsAvailable(
-  versions: ReadonlySet<number>,
+function assertGarbageCollectionPinsAvailable(
+  currentVersion: number | null,
+  transactions: ReadonlyMap<string, TransactionRecord>,
+  leases: Iterable<LeaseRecord>,
+  compactionJobs: Iterable<CompactionJobRecord>,
+  leaseCutoff: number,
   manifests: ReadonlyMap<number, Manifest>,
   blocks: ReadonlyMap<string, Uint8Array>,
 ): void {
-  for (const version of versions) assertSnapshotAvailable(version, manifests, blocks);
+  if (currentVersion !== null) assertSnapshotAvailable(currentVersion, manifests, blocks);
+  for (const transaction of transactions.values()) {
+    if (transaction.status === "active") {
+      assertSnapshotAvailable(transaction.snapshotVersion, manifests, blocks);
+    }
+  }
+  for (const lease of leases) {
+    const expiresAt = Date.parse(lease.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt > leaseCutoff) {
+      assertSnapshotAvailable(lease.manifestVersion, manifests, blocks);
+    }
+  }
+  for (const job of compactionJobs) {
+    if (isTerminalCompactionJob(job)) continue;
+    assertSnapshotAvailable(job.sourceManifestVersion, manifests, blocks);
+    const linkedTransaction =
+      job.transactionId === null ? undefined : transactions.get(job.transactionId);
+    if (linkedTransaction?.status === "committed") {
+      if (linkedTransaction.committedVersion === null) {
+        throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
+      }
+      assertSnapshotAvailable(linkedTransaction.committedVersion, manifests, blocks);
+    }
+  }
 }
 
 function assertPendingArtifactsAvailable(
@@ -840,11 +895,13 @@ function assertPendingArtifactsAvailable(
   }
 }
 
-function assertAllManifestBlocksAvailable(
+function assertRemainingManifestBlocksAvailable(
   manifests: Iterable<Manifest>,
+  newlyPrunedVersions: ReadonlySet<number>,
   blocks: ReadonlyMap<string, Uint8Array>,
 ): void {
   for (const manifest of manifests) {
+    if (manifest.prunedAt !== undefined || newlyPrunedVersions.has(manifest.version)) continue;
     if (manifest.blockIds.some((id) => !blocks.has(id))) {
       throw new SnapshotManifestMissingError(manifest.version);
     }
@@ -858,40 +915,52 @@ function assertGarbageCollectionCandidateProvenance(
   transactions: ReadonlyMap<string, TransactionRecord>,
   compactionJobs: ReadonlyMap<string, CompactionJobRecord>,
 ): void {
-  const provenBlockIds = new Set<string>();
-  const provenSegmentIds = new Set<string>();
   for (const version of job.candidateManifestVersions) {
-    const manifest = manifests.get(version);
-    if (manifest === undefined) {
+    if (!manifests.has(version)) {
       throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
     }
-    manifest.blockIds.forEach((id) => provenBlockIds.add(id));
   }
-  for (const transaction of transactions.values()) {
-    if (transaction.status !== "aborted") continue;
-    transaction.pendingBlockIds.forEach((id) => provenBlockIds.add(id));
-    transaction.pendingSegmentIds.forEach((id) => provenSegmentIds.add(id));
-  }
-  for (const compaction of compactionJobs.values()) {
-    if (!isTerminalCompactionJob(compaction)) continue;
-    compaction.sourceBlockIds.forEach((id) => provenBlockIds.add(id));
-    compaction.outputBlockIds.forEach((id) => provenBlockIds.add(id));
-    compaction.sourceSegmentIds.forEach((id) => provenSegmentIds.add(id));
-    if (compaction.outputSegmentId !== null) provenSegmentIds.add(compaction.outputSegmentId);
-  }
-  for (const segment of segments.values()) {
-    const blockIds = segmentBlockIds(segment);
-    if (blockIds.length > 0 && blockIds.every((id) => provenBlockIds.has(id))) {
-      provenSegmentIds.add(segment.id);
+  const blockHasProvenance = (id: string): boolean => {
+    for (const version of job.candidateManifestVersions) {
+      if (manifests.get(version)?.blockIds.includes(id)) return true;
     }
-  }
-  const unprovenBlockId = job.candidateBlockIds.find((id) => !provenBlockIds.has(id));
+    for (const transaction of transactions.values()) {
+      if (transaction.status === "aborted" && transaction.pendingBlockIds.includes(id)) return true;
+    }
+    for (const compaction of compactionJobs.values()) {
+      if (
+        isTerminalCompactionJob(compaction) &&
+        (compaction.sourceBlockIds.includes(id) || compaction.outputBlockIds.includes(id))
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const unprovenBlockId = job.candidateBlockIds.find((id) => !blockHasProvenance(id));
   if (unprovenBlockId !== undefined) {
     throw new Error(
       `Garbage collection block candidate has no persisted provenance: ${unprovenBlockId}`,
     );
   }
-  const unprovenSegmentId = job.candidateSegmentIds.find((id) => !provenSegmentIds.has(id));
+  const unprovenSegmentId = job.candidateSegmentIds.find((id) => {
+    for (const transaction of transactions.values()) {
+      if (transaction.status === "aborted" && transaction.pendingSegmentIds.includes(id)) {
+        return false;
+      }
+    }
+    for (const compaction of compactionJobs.values()) {
+      if (
+        isTerminalCompactionJob(compaction) &&
+        (compaction.sourceSegmentIds.includes(id) || compaction.outputSegmentId === id)
+      ) {
+        return false;
+      }
+    }
+    const segment = segments.get(id);
+    const blockIds = segment === undefined ? [] : segmentBlockIds(segment);
+    return blockIds.length === 0 || !blockIds.every(blockHasProvenance);
+  });
   if (unprovenSegmentId !== undefined) {
     throw new Error(
       `Garbage collection segment candidate has no persisted provenance: ${unprovenSegmentId}`,
@@ -899,84 +968,118 @@ function assertGarbageCollectionCandidateProvenance(
   }
 }
 
-function collectPinnedManifestVersions(
+function isManifestVersionPinned(
+  version: number,
   currentVersion: number | null,
-  transactions: Iterable<TransactionRecord>,
+  transactions: ReadonlyMap<string, TransactionRecord>,
   leases: Iterable<LeaseRecord>,
   compactionJobs: Iterable<CompactionJobRecord>,
   leaseCutoff: number,
-): Set<number> {
-  const transactionRecords = [...transactions];
-  const transactionsById = new Map(
-    transactionRecords.map((transaction) => [transaction.id, transaction]),
-  );
-  const versions = new Set<number>();
-  if (currentVersion !== null) versions.add(currentVersion);
-  for (const transaction of transactionRecords) {
-    if (transaction.status === "active" && transaction.snapshotVersion !== null) {
-      versions.add(transaction.snapshotVersion);
-    }
+): boolean {
+  if (currentVersion === version) return true;
+  for (const transaction of transactions.values()) {
+    if (transaction.status === "active" && transaction.snapshotVersion === version) return true;
   }
   for (const lease of leases) {
     const expiresAt = Date.parse(lease.expiresAt);
     if (
-      lease.manifestVersion !== null &&
+      lease.manifestVersion === version &&
       (!Number.isFinite(expiresAt) || expiresAt > leaseCutoff)
     ) {
-      versions.add(lease.manifestVersion);
+      return true;
     }
   }
   for (const job of compactionJobs) {
     if (isTerminalCompactionJob(job)) continue;
-    versions.add(job.sourceManifestVersion);
+    if (job.sourceManifestVersion === version) return true;
     const linkedTransaction =
-      job.transactionId === null ? undefined : transactionsById.get(job.transactionId);
+      job.transactionId === null ? undefined : transactions.get(job.transactionId);
     if (linkedTransaction?.status === "committed") {
       if (linkedTransaction.committedVersion === null) {
         throw new Error(`Committed transaction has no manifest version: ${linkedTransaction.id}`);
       }
-      versions.add(linkedTransaction.committedVersion);
+      if (linkedTransaction.committedVersion === version) return true;
     }
   }
-  return versions;
+  return false;
 }
 
-function collectPhysicalRoots(
+const MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES = 4_096;
+
+function collectBoundedPhysicalRoots(
+  candidateSegmentIds: readonly string[],
+  candidateBlockIds: readonly string[],
   manifests: Iterable<Manifest>,
-  segments: Iterable<SegmentRecord>,
-  transactions: Iterable<TransactionRecord>,
+  newlyPrunedVersions: ReadonlySet<number>,
+  segments: ReadonlyMap<string, SegmentRecord>,
+  transactions: ReadonlyMap<string, TransactionRecord>,
   compactionJobs: Iterable<CompactionJobRecord>,
 ): { blockIds: Set<string>; segmentIds: Set<string> } {
-  const blockIds = new Set<string>();
-  const segmentIds = new Set<string>();
-  const segmentRecords = [...segments];
-  const activeTransactionIds = new Set<string>();
-  for (const manifest of manifests) manifest.blockIds.forEach((id) => blockIds.add(id));
-  for (const transaction of transactions) {
+  const candidateBlocks = new Set(candidateBlockIds);
+  const probeBlockIds = new Set(candidateBlockIds);
+  const probeSegmentIds = new Set(candidateSegmentIds);
+  const relatedSegments = new Map<string, SegmentRecord>();
+  let dependencyOverflow = false;
+  for (const segment of segments.values()) {
+    const ids = segmentBlockIds(segment);
+    if (!candidateSegmentIds.includes(segment.id) && !ids.some((id) => candidateBlocks.has(id))) {
+      continue;
+    }
+    const newBlockIds = new Set(ids.filter((id) => !probeBlockIds.has(id)));
+    if (
+      relatedSegments.size >= MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES ||
+      probeBlockIds.size + newBlockIds.size > MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES
+    ) {
+      dependencyOverflow = true;
+      break;
+    }
+    relatedSegments.set(segment.id, segment);
+    probeSegmentIds.add(segment.id);
+    ids.forEach((id) => probeBlockIds.add(id));
+  }
+  if (dependencyOverflow) {
+    return { blockIds: new Set(candidateBlockIds), segmentIds: new Set(candidateSegmentIds) };
+  }
+
+  const directBlockRoots = new Set<string>();
+  const directSegmentRoots = new Set<string>();
+  for (const manifest of manifests) {
+    if (manifest.prunedAt !== undefined || newlyPrunedVersions.has(manifest.version)) continue;
+    for (const id of manifest.blockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
+  }
+  for (const transaction of transactions.values()) {
     if (transaction.status !== "active") continue;
-    activeTransactionIds.add(transaction.id);
-    transaction.pendingBlockIds.forEach((id) => blockIds.add(id));
-    transaction.pendingSegmentIds.forEach((id) => segmentIds.add(id));
+    for (const id of transaction.pendingBlockIds)
+      if (probeBlockIds.has(id)) directBlockRoots.add(id);
+    for (const id of transaction.pendingSegmentIds)
+      if (probeSegmentIds.has(id)) directSegmentRoots.add(id);
   }
   for (const job of compactionJobs) {
     if (isTerminalCompactionJob(job)) continue;
-    job.sourceBlockIds.forEach((id) => blockIds.add(id));
-    job.outputBlockIds.forEach((id) => blockIds.add(id));
-    job.sourceSegmentIds.forEach((id) => segmentIds.add(id));
-    if (job.outputSegmentId !== null) segmentIds.add(job.outputSegmentId);
-  }
-  for (const segment of segmentRecords) {
-    const ids = segmentBlockIds(segment);
-    if (
-      (ids.length > 0 && ids.every((id) => blockIds.has(id))) ||
-      segmentIds.has(segment.id) ||
-      activeTransactionIds.has(segment.transactionId)
-    ) {
-      segmentIds.add(segment.id);
-      ids.forEach((id) => blockIds.add(id));
+    for (const id of job.sourceBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
+    for (const id of job.outputBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
+    for (const id of job.sourceSegmentIds) if (probeSegmentIds.has(id)) directSegmentRoots.add(id);
+    if (job.outputSegmentId !== null && probeSegmentIds.has(job.outputSegmentId)) {
+      directSegmentRoots.add(job.outputSegmentId);
     }
   }
-  return { blockIds, segmentIds };
+
+  const rootedBlockIds = new Set<string>();
+  const rootedSegmentIds = new Set<string>();
+  for (const segment of relatedSegments.values()) {
+    const ids = segmentBlockIds(segment);
+    if (
+      directSegmentRoots.has(segment.id) ||
+      transactions.get(segment.transactionId)?.status === "active" ||
+      (ids.length > 0 && ids.every((id) => directBlockRoots.has(id)))
+    ) {
+      if (candidateSegmentIds.includes(segment.id)) rootedSegmentIds.add(segment.id);
+      for (const id of ids) if (candidateBlocks.has(id)) rootedBlockIds.add(id);
+    }
+  }
+  for (const id of candidateBlockIds) if (directBlockRoots.has(id)) rootedBlockIds.add(id);
+  for (const id of candidateSegmentIds) if (directSegmentRoots.has(id)) rootedSegmentIds.add(id);
+  return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
 }
 
 function segmentBlockIds(segment: SegmentRecord): string[] {

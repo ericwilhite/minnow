@@ -245,8 +245,10 @@ internals, persisted metadata, or the whole browser process.
 
 `maxItems` bounds candidates examined and possible candidate mutations within a durable collection
 step. `maxPlanningItems` bounds block/segment IDs copied into one job while storage cursors page the
-candidate sources; one large source record and the metadata/root scans used for atomic revalidation
-remain unbounded. Candidate admission currently requires persisted provenance from a historical
+candidate sources. Provenance and root revalidation also stream storage cursors, keep only the
+current candidate/dependency envelope, and conservatively retain on dependency overflow. Their scan
+work still scales with all metadata, and one large source record remains unbounded. Candidate
+admission currently requires persisted provenance from a historical
 manifest, aborted transaction journal, or terminal compaction job. An unknown immutable block left
 by a crash after `addBlock()` but before journal attachment is deliberately omitted until provenance
 or age tracking can make it safe to collect.
@@ -274,7 +276,7 @@ Remaining Phase 6 delivery:
 - keyed/clustered multi-range L2 selection;
 - lifetime write-amplification accounting that includes cancelled and aborted attempts;
 - spillable or resumable merge planning before the immutable plan exists;
-- bounded source-record envelopes and indexed/paged atomic root discovery; and
+- bounded source-record envelopes and indexed root discovery that avoids full metadata scans; and
 - broader unknown-orphan, catalog, terminal-job, and metadata cleanup.
 
 Exit gate: interrupted compactions recover safely and sustained append and keyed/clustered ingestion
