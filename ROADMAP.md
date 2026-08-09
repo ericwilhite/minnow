@@ -63,12 +63,16 @@ Initial matrix:
 - memory budgets to preserve in future query tests: 16, 32, 64, 128, and 256 MiB.
 
 The dashboard automates the raw/RLE/gzip comparison across all five block sizes and can preserve a
-raw result bundle from Playwright. The earlier checked-in 2026-08-08 27-table Chromium and Firefox
-runs cover 1,930,800 rows and about 90 MiB of encoded payload per cell. All 30 cells verified. The decision
-record selects gzip with a provisional 2 MiB target for storage-oriented benchmark and physical
+raw result bundle from Playwright. The checked-in 2026-08-08 27-table scale-100 Chromium and
+Firefox runs cover 1,930,800 rows and about 90 MiB of encoded payload per cell; the 2026-08-09
+50-table scale-10 refresh covers 956,160 rows and about 46 MiB per cell. All cells in both records
+verified, and the refreshed observations remain consistent with the decision
+record, which selects gzip with a provisional 2 MiB target for storage-oriented benchmark and physical
 rewrite work. Phase 6B uses that as its default estimated uncompressed physical target and persists
 the selected byte target with each rewrite job; ordinary row-partitioned writes remain separately
-configurable. Larger quota-dependent tiers and repeated-sample distributions remain open.
+configurable. A 50-table scale-100 capture is currently infeasible because each matrix cell reruns
+the measured per-cell reference suite; bounding that work, larger quota-dependent tiers, and
+repeated-sample distributions remain open.
 
 Later comparison adapters may benchmark SQLite-Wasm and DuckDB-Wasm as opt-in development-only competitors. They must never be imported by engine packages or used for correctness.
 
