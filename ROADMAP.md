@@ -335,16 +335,29 @@ or missing at a fixed cutoff—covering abrupt tab/process loss—while atomical
 renewed concurrently. Synchronous
 prepared execution remains a no-I/O fast path; `executeAsync()` exposes the spill-capable path.
 
-Phase 7 remains open. Preparation still materializes every projected typed input column in full before
+Phase 7E-A adds sliding-window scan streaming for budgeted single-table append/base
+`BrowserDatabase.query()` plans without joins. The executor awaits a window load before every scan
+batch in each asynchronous execution path, bound expressions read through per-vector resident
+windows, and the loader decodes whole blocks forward-only, reserving fixed window bytes before
+allocation and measured per-window dictionary bytes before installation. Grouped-and-ordered plans
+keep materialized input because partitioned hash-aggregate spill revisits scan rows by stored index;
+under a budget, streaming takes precedence over Phase 8A pruning. Tests cover a table too large to
+materialize inside the budget, grouped and order-spilled parity against the materialized path, and
+the keyed-mutation fallback.
+
+Phase 7 remains open. Prepared queries and non-streamed shapes still materialize every projected
+typed input column in full before
 the modeled reservations take effect, and mutation replay can temporarily retain a typed slot
 workspace plus its compacted output. Merge planning updates source slots in place and emits row-ID
 spans and column ranges in one pass, but still retains a whole-plan key map and source slots. Returned
 result objects, group-key and retained aggregate
 reference containers, property and JavaScript array-capacity overhead, spill serialization/native
-IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Grouped joins,
-global aggregates, hash joins, and DISTINCT still have no spill path, while the default remains
-effectively unbounded. Later Phase 7 work must stream inputs, replace the remaining boxed growing
-containers, and cover those operator shapes within a hard working-set budget.
+IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Grouped
+joins, hash joins, and DISTINCT still have no spill path, single-table global aggregates rely on
+streamed input plus bounded accumulator state rather than a spill, and the default remains
+effectively unbounded. Later Phase 7 work must stream joined and mutation inputs, replace the
+remaining boxed growing containers, and cover those operator shapes within a hard working-set
+budget.
 
 The schema-less empty-table row-adapter compatibility path rejects configured budgets rather than
 silently escaping the model; catalog-backed `BrowserDatabase` empty tables stay on the typed path.
@@ -496,7 +509,9 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add durable external sort and single-table partitioned hash-aggregate spill paths.
 - [x] Add numeric/datetime zone-map row-group pruning and predicate-first projected-block loading.
 - [x] Reclaim spill pages abandoned by abrupt tab/process loss through durable spill-owner leases.
-- [ ] Stream projected inputs and add the remaining spill shapes.
+- [x] Stream budgeted single-table append/base scan inputs through block-aligned resident windows.
+- [ ] Stream joined and mutation inputs and add the remaining spill shapes, including
+      grouped-and-ordered plans, grouped joins, hash joins, and DISTINCT.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

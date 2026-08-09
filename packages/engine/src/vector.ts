@@ -28,9 +28,19 @@ const vectorTextEncoder = new TextEncoder();
 
 export type VectorType = "boolean" | "number" | "string" | "datetime";
 
+/**
+ * A resident slice of a logically longer streamed column. Window arrays index rows relative to
+ * `start`; `length` on the vector remains the logical table length.
+ */
+export interface VectorWindow {
+  readonly start: number;
+  readonly length: number;
+}
+
 interface VectorBase {
   readonly validity: Uint8Array;
   readonly length: number;
+  readonly window?: VectorWindow;
 }
 
 export interface BooleanVector extends VectorBase {
@@ -85,6 +95,12 @@ export interface QuerySpillStore {
 export interface AsyncQueryExecutionOptions {
   readonly spillStore?: QuerySpillStore;
   readonly spillPageRows?: number;
+  /**
+   * Makes the scan-source window [start, start + length) resident before each batch. Supplied by
+   * a streaming preparation whose scan-source vectors hold only a sliding window; the executor
+   * awaits it at the top of every scan batch in every asynchronous execution path.
+   */
+  readonly loadScanWindow?: (start: number, length: number) => Promise<void>;
 }
 
 export interface PrepareVectorQueryOptions {
@@ -258,7 +274,13 @@ export function prepareVectorQuery(
           bound.groupBy.length > 0 &&
           bound.joins.length === 0;
         if (executionOptions.spillStore === undefined || (!canSpillSort && !canSpillHash)) {
-          return this.execute();
+          if (executionOptions.loadScanWindow === undefined) return this.execute();
+          const executionMemory = retainedMemory.createChild();
+          try {
+            return await executeBoundPlanAsync(bound, executionMemory, executionOptions);
+          } finally {
+            executionMemory.close();
+          }
         }
         const executionMemory = retainedMemory.createChild();
         try {
@@ -367,11 +389,22 @@ function isValid(bitmap: Uint8Array, index: number): boolean {
 }
 
 function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue {
-  if (rowIndex < 0 || rowIndex >= vector.length || !isValid(vector.validity, rowIndex)) return null;
-  if (vector.kind === "boolean") return vector.values[rowIndex] === 1;
-  if (vector.kind === "number") return vector.values[rowIndex] ?? 0;
-  if (vector.kind === "datetime") return new Date(vector.values[rowIndex] ?? 0);
-  const code = vector.codes[rowIndex] ?? NULL_STRING_CODE;
+  if (rowIndex < 0 || rowIndex >= vector.length) return null;
+  const window = vector.window;
+  let slot = rowIndex;
+  if (window !== undefined) {
+    slot = rowIndex - window.start;
+    if (slot < 0 || slot >= window.length) {
+      throw new RangeError(
+        `Streamed vector row ${String(rowIndex)} is outside the resident window ${String(window.start)}..${String(window.start + window.length)}`,
+      );
+    }
+  }
+  if (!isValid(vector.validity, slot)) return null;
+  if (vector.kind === "boolean") return vector.values[slot] === 1;
+  if (vector.kind === "number") return vector.values[slot] ?? 0;
+  if (vector.kind === "datetime") return new Date(vector.values[slot] ?? 0);
+  const code = vector.codes[slot] ?? NULL_STRING_CODE;
   return code === NULL_STRING_CODE ? null : (vector.dictionary[code] ?? null);
 }
 
@@ -666,6 +699,35 @@ function createDirectLookup(
   };
 }
 
+function runScanBatch(
+  plan: BoundPlan,
+  start: number,
+  length: number,
+  groups: ByteGroupIndex<GroupState>,
+  output: QueryRow[],
+  memory: QueryMemoryContext,
+): boolean {
+  const batchMemory = memory.createChild();
+  try {
+    batchMemory.reserve(
+      safeMemoryProduct(
+        safeMemoryProduct(plan.sourceTables.length, length, "Scan batch row-index count"),
+        Int32Array.BYTES_PER_ELEMENT,
+        "Scan batch row indexes",
+      ),
+      "Scan batch row indexes",
+    );
+    const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
+    const scan = sourceRows[plan.scanSource];
+    if (scan === undefined) return false;
+    for (let index = 0; index < length; index += 1) scan[index] = start + index;
+    const batch: BatchRows = { length, rowsBySource: sourceRows, memory: batchMemory };
+    return consumeJoinedBatches(plan, batch, 0, groups, output, memory);
+  } finally {
+    batchMemory.close();
+  }
+}
+
 function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryResult {
   const metadataCount = executeMetadataCount(plan, memory);
   if (metadataCount !== undefined) return metadataCount;
@@ -677,25 +739,29 @@ function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryRes
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
     const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
-    const batchMemory = memory.createChild();
-    try {
-      batchMemory.reserve(
-        safeMemoryProduct(
-          safeMemoryProduct(plan.sourceTables.length, length, "Scan batch row-index count"),
-          Int32Array.BYTES_PER_ELEMENT,
-          "Scan batch row indexes",
-        ),
-        "Scan batch row indexes",
-      );
-      const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
-      const scan = sourceRows[plan.scanSource];
-      if (scan === undefined) continue;
-      for (let index = 0; index < length; index += 1) scan[index] = start + index;
-      const batch: BatchRows = { length, rowsBySource: sourceRows, memory: batchMemory };
-      if (consumeJoinedBatches(plan, batch, 0, groups, output, memory)) break;
-    } finally {
-      batchMemory.close();
-    }
+    if (runScanBatch(plan, start, length, groups, output, memory)) break;
+  }
+  const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output;
+  return finishResult(plan, rows, memory);
+}
+
+async function executeBoundPlanAsync(
+  plan: BoundPlan,
+  memory: QueryMemoryContext,
+  options: AsyncQueryExecutionOptions,
+): Promise<QueryResult> {
+  const metadataCount = executeMetadataCount(plan, memory);
+  if (metadataCount !== undefined) return metadataCount;
+  const groups = new ByteGroupIndex<GroupState>(memory);
+  if (plan.grouped && plan.groupBy.length === 0) {
+    groups.setEmpty(createGroupState([], plan, memory));
+  }
+  const output: QueryRow[] = [];
+  const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
+  for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
+    const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
+    await options.loadScanWindow?.(start, length);
+    if (runScanBatch(plan, start, length, groups, output, memory)) break;
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output;
   return finishResult(plan, rows, memory);
@@ -729,6 +795,7 @@ async function executeBoundPlanWithSortSpill(
     const scanBatchRows = Math.min(DEFAULT_BATCH_ROWS, pageRows);
     for (let start = 0; start < scanRows; start += scanBatchRows) {
       const length = Math.min(scanBatchRows, scanRows - start);
+      await options.loadScanWindow?.(start, length);
       const batchMemory = memory.createChild();
       try {
         batchMemory.reserve(

@@ -64,8 +64,17 @@ import {
   type PreparedQuery,
   type QueryResult,
 } from "./query.js";
-import { QueryMemoryBudgetError, QueryMemoryContext } from "./memory.js";
-import { type ColumnarTable, type ColumnVector, type QuerySpillStore } from "./vector.js";
+import {
+  QueryMemoryBudgetError,
+  QueryMemoryContext,
+  type QueryMemoryReservation,
+} from "./memory.js";
+import {
+  type ColumnarTable,
+  type ColumnVector,
+  type QuerySpillStore,
+  type VectorWindow,
+} from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
 const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -1131,6 +1140,11 @@ export class BrowserDatabase {
       options.spillPageRows === undefined
         ? undefined
         : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
+    const plan = compileQuery(sql);
+    if (this.#canStreamPlanShape(plan, options)) {
+      const streamed = await this.#queryStreamed(plan, options, spillPageRows);
+      if (streamed !== undefined) return streamed;
+    }
     const prepared = await this.prepareQuery(sql, options);
     try {
       const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
@@ -1233,6 +1247,170 @@ export class BrowserDatabase {
       afterOwnerId = page.nextCursor;
     }
     return result;
+  }
+
+  /**
+   * A plan shape can stream its scan input when it has no joins and cannot take the partitioned
+   * hash-aggregate spill path, which revisits scan rows by stored index after the scan has
+   * advanced. Streaming exists to honor an explicit budget; an unbudgeted or spill-disabled query
+   * keeps the materialized path.
+   */
+  #canStreamPlanShape(plan: CompiledQuery, options: QueryOptions): boolean {
+    return (
+      options.executionMemoryBudgetBytes !== undefined &&
+      options.spillToStorage !== false &&
+      plan.joins.length === 0 &&
+      !(plan.groupBy.length > 0 && plan.orderBy.length > 0)
+    );
+  }
+
+  /**
+   * Executes a single-table plan with a sliding block-aligned scan window instead of fully
+   * materialized input vectors. Returns undefined when the visible table shape is ineligible
+   * (keyed mutation replay or zone-map pruning applies), so the caller falls back to the
+   * materialized path.
+   */
+  async #queryStreamed(
+    plan: CompiledQuery,
+    options: QueryOptions,
+    spillPageRows: number | undefined,
+  ): Promise<QueryResult | undefined> {
+    const table = await this.#findTable(plan.base.table);
+    const schemas = new Map([[table.name, table.columns.map(({ name }) => name)]]);
+    const requestedColumns = referencedColumns(plan, schemas).get(table.name) ?? [];
+    const projectedColumns =
+      requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns);
+    return this.#withLeasedSnapshot(options.version, async (snapshot) => {
+      const segments = await this.#visibleSegmentRecords(table, snapshot);
+      const appendOnly = segments.every((segment) => {
+        const kind = segment.kind ?? "insert";
+        return kind === "insert" || kind === "base";
+      });
+      if (!appendOnly) return undefined;
+      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+      const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
+      let prepared: PreparedQuery | undefined;
+      try {
+        const streamed = this.#createStreamedTable(
+          table,
+          projectedColumns,
+          segments,
+          snapshot,
+          rowCount,
+          memory,
+        );
+        prepared = createPreparedColumnarQuery(
+          plan,
+          new Map([[table.name, streamed.table]]),
+          memory,
+        );
+        return await prepared.executeAsync({
+          ...(spillPageRows === undefined ? {} : { spillPageRows }),
+          spillStore: this.#leasedSpillStore(),
+          loadScanWindow: streamed.load,
+        });
+      } finally {
+        if (prepared === undefined) memory.close();
+        else prepared.close();
+      }
+    });
+  }
+
+  /**
+   * Builds a single-table columnar view whose projected vectors hold one block-aligned resident
+   * window at a time. Each load drops blocks that end before the requested range, decodes forward
+   * as needed, reserves the replacement window before installing it, and releases the superseded
+   * reservation afterward. The scan is forward-only; a backward request is a programming error.
+   */
+  #createStreamedTable(
+    table: TableRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+    rowCount: number,
+    memory: QueryMemoryContext,
+  ): { table: ColumnarTable; load: (start: number, length: number) => Promise<void> } {
+    interface ResidentBlock {
+      column: ValidatedPhysicalColumn;
+      startRow: number;
+    }
+    interface StreamedColumnState {
+      column: TableColumnRecord;
+      vector: ColumnVector;
+      blockIds: readonly string[];
+      nextBlockIndex: number;
+      nextBlockStartRow: number;
+      resident: ResidentBlock[];
+      reservations: QueryMemoryReservation[];
+    }
+    const states: StreamedColumnState[] = projectedColumns.map((column) => ({
+      column,
+      vector: createStreamedColumnVector(column.type, rowCount),
+      blockIds: segments.flatMap((segment) => segment.columnBlockIds[column.id] ?? []),
+      nextBlockIndex: 0,
+      nextBlockStartRow: 0,
+      resident: [],
+      reservations: [],
+    }));
+    const load = async (start: number, length: number): Promise<void> => {
+      const end = Math.min(start + length, rowCount);
+      for (const state of states) {
+        const window = state.vector.window;
+        if (window !== undefined && start >= window.start && end <= window.start + window.length) {
+          continue;
+        }
+        if (window !== undefined && start < window.start) {
+          throw new Error(`Streamed scan moved backward: ${table.name}.${state.column.name}`);
+        }
+        state.resident = state.resident.filter(
+          (block) => block.startRow + block.column.rowCount > start,
+        );
+        while (state.nextBlockStartRow < end && state.nextBlockIndex < state.blockIds.length) {
+          await this.#renewInternalLeaseIfNeeded(snapshot);
+          const blockId = state.blockIds[state.nextBlockIndex] ?? "";
+          const bytes = await this.store.getBlock(blockId);
+          if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+          const decoded = await decodePhysicalBlock(bytes);
+          if (decoded.column.type !== state.column.type) {
+            throw new Error(`Column type mismatch: ${state.column.name}`);
+          }
+          state.resident.push({ column: decoded.column, startRow: state.nextBlockStartRow });
+          state.nextBlockIndex += 1;
+          state.nextBlockStartRow += decoded.column.rowCount;
+        }
+        const first = state.resident[0];
+        if (first === undefined || state.nextBlockStartRow < end) {
+          throw new Error(`Column row count mismatch: ${state.column.name}`);
+        }
+        const windowStart = first.startRow;
+        const windowRows = state.nextBlockStartRow - windowStart;
+        const replacements: QueryMemoryReservation[] = [];
+        try {
+          installStreamedWindow(
+            state.vector,
+            state.resident,
+            windowStart,
+            windowRows,
+            memory,
+            `Streamed window ${state.column.name}`,
+            replacements,
+          );
+        } catch (error) {
+          for (const replacement of replacements) replacement.release();
+          throw error;
+        }
+        for (const previous of state.reservations) previous.release();
+        state.reservations = replacements;
+      }
+    };
+    return {
+      table: {
+        name: table.name,
+        rowCount,
+        columns: new Map(states.map((state) => [state.column.name, state.vector])),
+      },
+      load,
+    };
   }
 
   async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {
@@ -4550,6 +4728,92 @@ function appendPhysicalColumnToVector(
     }
     outputStringCodes[outputRowStart + row] = code;
   }
+}
+
+/**
+ * A streamed vector starts with an empty resident window; its logical length is the full table so
+ * bound plans see the true scan cardinality before the first load.
+ */
+function createStreamedColumnVector(type: SimpleDataType, length: number): ColumnVector {
+  const window: VectorWindow = { start: 0, length: 0 };
+  const validity = new Uint8Array(0);
+  if (type === "boolean") {
+    return { kind: type, length, validity, values: new Uint8Array(0), window };
+  }
+  if (type === "number" || type === "datetime") {
+    return { kind: type, length, validity, values: new Float64Array(0), window };
+  }
+  return { kind: type, length, validity, codes: new Uint32Array(0), dictionary: [], window };
+}
+
+interface MutableStreamedVectorFields {
+  validity: Uint8Array;
+  window: VectorWindow;
+  values?: Uint8Array | Float64Array;
+  codes?: Uint32Array;
+  dictionary?: string[];
+}
+
+/**
+ * Replaces a streamed vector's resident window with freshly decoded rows. Fixed-width bytes are
+ * reserved before allocation; per-window string dictionary bytes are measured during decoding and
+ * reserved before the window is installed. The caller releases the superseded reservations.
+ */
+function installStreamedWindow(
+  vector: ColumnVector,
+  resident: ReadonlyArray<{ column: ValidatedPhysicalColumn; startRow: number }>,
+  windowStart: number,
+  windowRows: number,
+  memory: QueryMemoryContext,
+  label: string,
+  reservations: QueryMemoryReservation[],
+): void {
+  const validityBytes = Math.ceil(windowRows / 8);
+  const typedBytes =
+    validityBytes +
+    (vector.kind === "boolean"
+      ? windowRows
+      : vector.kind === "string"
+        ? windowRows * Uint32Array.BYTES_PER_ELEMENT
+        : windowRows * Float64Array.BYTES_PER_ELEMENT);
+  reservations.push(memory.reserve(typedBytes, label));
+  const validity = new Uint8Array(validityBytes);
+  const values =
+    vector.kind === "boolean"
+      ? new Uint8Array(windowRows)
+      : vector.kind === "number" || vector.kind === "datetime"
+        ? new Float64Array(windowRows)
+        : undefined;
+  const codes = vector.kind === "string" ? new Uint32Array(windowRows) : undefined;
+  codes?.fill(NULL_STRING_VECTOR_CODE);
+  const dictionary: string[] = [];
+  const dictionaryIndex = new Map<string, number>();
+  for (const block of resident) {
+    appendPhysicalColumnToVector(
+      block.column,
+      block.startRow - windowStart,
+      validity,
+      values,
+      codes,
+      dictionary,
+      dictionaryIndex,
+    );
+  }
+  if (dictionary.length > 0) {
+    let dictionaryBytes = 0;
+    for (const value of dictionary) {
+      dictionaryBytes += sizeTextEncoder.encode(value).byteLength;
+    }
+    reservations.push(memory.reserve(dictionaryBytes, label));
+  }
+  const mutable = vector as unknown as MutableStreamedVectorFields;
+  mutable.validity = validity;
+  if (values !== undefined) mutable.values = values;
+  if (codes !== undefined) {
+    mutable.codes = codes;
+    mutable.dictionary = dictionary;
+  }
+  mutable.window = { start: windowStart, length: windowRows };
 }
 
 function createEmptyColumnVector(type: SimpleDataType, length: number): ColumnVector {

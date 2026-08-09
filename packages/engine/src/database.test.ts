@@ -13,6 +13,7 @@ import {
 } from "@browserdatabase/storage-idb";
 import { FaultInjectingBlockStore } from "@browserdatabase/testing";
 import { TransactionManager } from "@browserdatabase/transactions";
+import { QueryMemoryBudgetError } from "./memory.js";
 import {
   attachLifecycleFlush,
   BrowserDatabase,
@@ -4923,6 +4924,96 @@ for (const implementation of implementations()) {
       { id: 4999, count: 1 },
       { id: 4998, count: 1 },
     ]);
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} streams append scans through a budget too small to materialize`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 512, compression: "raw" });
+    await database.createTable({
+      name: "streamed_rows",
+      columns: [
+        { name: "v", type: "number" },
+        { name: "tag", type: "string", nullable: true },
+      ],
+    });
+    const rowCount = 20_000;
+    await database.insertBatch("streamed_rows", {
+      columns: {
+        v: Array.from({ length: rowCount }, (_, index) => index),
+        tag: Array.from({ length: rowCount }, (_, index) =>
+          index % 7 === 0 ? null : `tag-${String(index % 5)}`,
+        ),
+      },
+    });
+    const budget = 64_000;
+
+    await expect(
+      database.prepareQuery("SELECT SUM(v) AS total, COUNT(*) AS rows FROM streamed_rows", {
+        executionMemoryBudgetBytes: budget,
+      }),
+    ).rejects.toThrow(QueryMemoryBudgetError);
+
+    const streamed = await database.query(
+      "SELECT SUM(v) AS total, COUNT(*) AS rows FROM streamed_rows",
+      { executionMemoryBudgetBytes: budget },
+    );
+    expect(streamed.rows).toEqual([{ total: (rowCount * (rowCount - 1)) / 2, rows: rowCount }]);
+
+    const grouped = await database.query(
+      "SELECT tag, COUNT(*) AS count FROM streamed_rows WHERE v >= 10000 GROUP BY tag",
+      { executionMemoryBudgetBytes: budget },
+    );
+    const reference = await database.query(
+      "SELECT tag, COUNT(*) AS count FROM streamed_rows WHERE v >= 10000 GROUP BY tag",
+    );
+    expect(grouped.rows).toEqual(reference.rows);
+
+    const ordered = await database.query(
+      "SELECT v, tag FROM streamed_rows WHERE v < 19000 ORDER BY v DESC LIMIT 23",
+      { executionMemoryBudgetBytes: budget, spillPageRows: 512 },
+    );
+    const orderedReference = await database.query(
+      "SELECT v, tag FROM streamed_rows WHERE v < 19000 ORDER BY v DESC LIMIT 23",
+    );
+    expect(ordered.rows).toEqual(orderedReference.rows);
+
+    expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
+    store.close();
+  }, 30_000);
+}
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} falls back to materialized replay for keyed mutation snapshots`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 128, compression: "raw" });
+    await database.createTable({
+      name: "streamed_keyed",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    await database.insertBatch("streamed_keyed", {
+      columns: {
+        id: Array.from({ length: 600 }, (_, index) => `key-${String(index)}`),
+        score: Array.from({ length: 600 }, (_, index) => index),
+      },
+    });
+    await database.upsertBatch("streamed_keyed", {
+      columns: { id: ["key-1", "key-2"], score: [1_000, 2_000] },
+    });
+    await database.deleteBatch("streamed_keyed", { keys: ["key-0"] });
+
+    const result = await database.query(
+      "SELECT COUNT(*) AS rows, SUM(score) AS total FROM streamed_keyed",
+      { executionMemoryBudgetBytes: 512_000 },
+    );
+    const expectedTotal = (599 * 600) / 2 - 1 - 2 + 1_000 + 2_000;
+    expect(result.rows).toEqual([{ rows: 599, total: expectedTotal }]);
     store.close();
   });
 }

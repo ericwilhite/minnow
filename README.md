@@ -212,18 +212,33 @@ is retained rather than torn down mid-query.
 for callers that want the operator path directly; leases protect only spill stores created by
 `BrowserDatabase.query()`, and a caller-supplied spill store manages its own cleanup.
 
-This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Snapshot preparation
-still materializes each projected typed input in full before the vector reservation is installed;
+Phase 7E-A streams the scan input for one deliberately narrow plan family. A budgeted
+`BrowserDatabase.query()` over a single append/base table with no join executes against a sliding
+block-aligned window instead of fully materialized projected vectors: each scan batch first makes
+its rows resident, forward-only, decoding whole physical blocks, reserving the replacement window's
+typed bytes before allocation and its measured per-window string dictionary bytes before
+installation, and releasing the superseded window afterward. Global aggregates, unordered and
+order-spilled scans, and grouped-unordered plans over tables far larger than the configured budget
+now complete instead of failing at preparation. Grouped-and-ordered plans are excluded because the
+partitioned hash-aggregate spill revisits scan rows by stored index after the scan has advanced;
+they, joins, keyed mutation snapshots, prepared queries, and unbudgeted or spill-disabled queries
+keep the materialized path. Under an explicit budget the streaming path takes precedence over Phase
+8A zone-map pruning, so a pruned-eligible predicate reads more blocks than the pruned path would in
+exchange for the bounded working set.
+
+This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Prepared queries and
+every non-streamed shape still materialize each projected typed input in full before the vector
+reservation is installed;
 mutation replay can temporarily retain both its typed slot workspace and compacted output. Mutation
 merge planning now updates retained source slots in place and emits row-ID spans plus all output
 ranges in one pass, avoiding a second live-row array and per-column source-array copies, but its key
 map and source slots remain whole-plan state. The model
 does not include returned result objects, properties, group-key and retained `MIN`/`MAX` reference
 containers, JavaScript array-capacity overhead, spill serialization/native IndexedDB work, returned
-row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—global aggregates,
-grouped joins, hash joins, and DISTINCT—still fail on budget exhaustion. Phase 7 remains open for
-streaming inputs, byte-addressable aggregate/result containers, complete physical accounting, and
-those remaining spill paths.
+row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—grouped joins, hash
+joins, and DISTINCT—still fail on budget exhaustion, as do grouped-and-ordered streams. Phase 7
+remains open for streamed joined and mutation inputs, byte-addressable aggregate/result containers,
+complete physical accounting, and those remaining spill paths.
 
 Phase 8A adds conservative row-group skipping for a single append/base table with `AND`-combined
 number or datetime column-to-literal comparisons. Preparation checksum-validates and physically
