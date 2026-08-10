@@ -1,0 +1,327 @@
+{
+  "version": 1,
+  "description": "Machine-readable SQL feature matrix for the BrowserDatabase engine. Every entry carries an example; the conformance test executes supported examples through both executors and asserts unsupported examples fail explicitly with the recorded error fragment.",
+  "features": [
+    {
+      "id": "select.projection",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows"
+    },
+    {
+      "id": "select.alias",
+      "status": "supported",
+      "example": "SELECT amount AS total FROM rows"
+    },
+    {
+      "id": "select.wildcard",
+      "status": "supported",
+      "example": "SELECT * FROM rows"
+    },
+    {
+      "id": "select.distinct",
+      "status": "supported",
+      "example": "SELECT DISTINCT region FROM rows"
+    },
+    {
+      "id": "select.scalar-subquery",
+      "status": "supported",
+      "example": "SELECT (SELECT MAX(amount) FROM rows) AS peak FROM rows LIMIT 1"
+    },
+    {
+      "id": "expression.arithmetic",
+      "status": "supported",
+      "example": "SELECT amount * 2 + 1 AS scaled FROM rows"
+    },
+    {
+      "id": "expression.round",
+      "status": "supported",
+      "example": "SELECT ROUND(amount / 3, 2) AS thirds FROM rows"
+    },
+    {
+      "id": "literal.string",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region = 'west'"
+    },
+    {
+      "id": "literal.number",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount >= 10"
+    },
+    {
+      "id": "literal.boolean",
+      "status": "supported",
+      "example": "SELECT active, amount FROM rows WHERE active = TRUE"
+    },
+    {
+      "id": "literal.null-comparison",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region != NULL"
+    },
+    {
+      "id": "literal.date",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE joined >= DATE '2026-01-01'"
+    },
+    {
+      "id": "join.inner-equi",
+      "status": "supported",
+      "example": "SELECT r.region, d.label FROM rows r JOIN dims d ON d.region = r.region"
+    },
+    {
+      "id": "join.left-equi",
+      "status": "supported",
+      "example": "SELECT r.region, d.label FROM rows r LEFT JOIN dims d ON d.region = r.region"
+    },
+    {
+      "id": "where.and",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount > 5 AND region = 'west'"
+    },
+    {
+      "id": "where.in-list",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region IN ('west', 'east')"
+    },
+    {
+      "id": "where.not-in-list",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region NOT IN ('north')"
+    },
+    {
+      "id": "where.in-subquery",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region IN (SELECT region FROM dims)"
+    },
+    {
+      "id": "where.scalar-subquery",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount > (SELECT AVG(amount) FROM rows)"
+    },
+    {
+      "id": "group-by",
+      "status": "supported",
+      "example": "SELECT region, COUNT(*) AS count FROM rows GROUP BY region"
+    },
+    {
+      "id": "having",
+      "status": "supported",
+      "example": "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING COUNT(*) > 1"
+    },
+    {
+      "id": "aggregate.count",
+      "status": "supported",
+      "example": "SELECT COUNT(*) AS count FROM rows"
+    },
+    {
+      "id": "aggregate.sum",
+      "status": "supported",
+      "example": "SELECT SUM(amount) AS total FROM rows"
+    },
+    {
+      "id": "aggregate.avg",
+      "status": "supported",
+      "example": "SELECT AVG(amount) AS mean FROM rows"
+    },
+    {
+      "id": "aggregate.min-max",
+      "status": "supported",
+      "example": "SELECT MIN(amount) AS low, MAX(amount) AS high FROM rows"
+    },
+    {
+      "id": "order-by.multi-column",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows ORDER BY region, amount DESC"
+    },
+    {
+      "id": "order-by.wildcard-reference",
+      "status": "supported",
+      "example": "SELECT * FROM rows ORDER BY amount"
+    },
+    {
+      "id": "limit",
+      "status": "supported",
+      "example": "SELECT amount FROM rows ORDER BY amount LIMIT 2"
+    },
+    {
+      "id": "cte.non-recursive",
+      "status": "supported",
+      "example": "WITH west AS (SELECT amount FROM rows WHERE region = 'west') SELECT COUNT(*) AS count FROM west"
+    },
+    {
+      "id": "cte.chained",
+      "status": "supported",
+      "example": "WITH a AS (SELECT amount FROM rows), b AS (SELECT amount FROM a WHERE amount > 5) SELECT COUNT(*) AS count FROM b"
+    },
+    {
+      "id": "derived-table",
+      "status": "supported",
+      "example": "SELECT d.total FROM (SELECT region, SUM(amount) AS total FROM rows GROUP BY region) d ORDER BY d.total"
+    },
+    {
+      "id": "union.distinct",
+      "status": "supported",
+      "example": "SELECT region FROM rows UNION SELECT region FROM dims ORDER BY region"
+    },
+    {
+      "id": "union.all",
+      "status": "supported",
+      "example": "SELECT region FROM rows UNION ALL SELECT region FROM dims"
+    },
+    {
+      "id": "window.row-number",
+      "status": "supported",
+      "example": "SELECT region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn FROM rows"
+    },
+    {
+      "id": "window.rank",
+      "status": "supported",
+      "example": "SELECT region, RANK() OVER (ORDER BY amount) AS r FROM rows"
+    },
+    {
+      "id": "window.dense-rank",
+      "status": "supported",
+      "example": "SELECT region, DENSE_RANK() OVER (ORDER BY amount) AS dr FROM rows"
+    },
+    {
+      "id": "mutation.insert-values",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('a', 1), ('b', 2)",
+      "notes": "Through execute(); query() stays read-only."
+    },
+    {
+      "id": "mutation.update-keyed",
+      "status": "supported",
+      "example": "UPDATE keyed SET score = score + 1 WHERE score > 0",
+      "notes": "Requires a unique-key table; read-then-mutate, not serializable."
+    },
+    {
+      "id": "mutation.delete-keyed",
+      "status": "supported",
+      "example": "DELETE FROM keyed WHERE score < 0",
+      "notes": "Requires a unique-key table."
+    },
+    {
+      "id": "where.or",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'",
+      "error": "Expected"
+    },
+    {
+      "id": "where.like",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE region LIKE 'w%'",
+      "error": "Expected operator, found LIKE"
+    },
+    {
+      "id": "where.between",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE amount BETWEEN 1 AND 5",
+      "error": "Expected operator, found BETWEEN"
+    },
+    {
+      "id": "where.is-null",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE region IS NULL",
+      "error": "Expected operator, found IS"
+    },
+    {
+      "id": "where.exists",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows WHERE EXISTS (SELECT 1 FROM dims)",
+      "error": "Unsupported function: EXISTS"
+    },
+    {
+      "id": "expression.case",
+      "status": "unsupported",
+      "example": "SELECT CASE WHEN amount > 5 THEN 'big' ELSE 'small' END AS size FROM rows",
+      "error": "Expected FROM, found WHEN"
+    },
+    {
+      "id": "subquery.correlated",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows r WHERE amount > (SELECT AVG(amount) FROM rows q WHERE q.region = r.region)",
+      "error": "Unknown table alias"
+    },
+    {
+      "id": "cte.recursive",
+      "status": "unsupported",
+      "example": "WITH r AS (SELECT amount FROM r) SELECT amount FROM r",
+      "error": "Recursive CTEs are not supported"
+    },
+    {
+      "id": "set.intersect",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows INTERSECT SELECT region FROM dims",
+      "error": "Expected"
+    },
+    {
+      "id": "set.except",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows EXCEPT SELECT region FROM dims",
+      "error": "Expected"
+    },
+    {
+      "id": "aggregate.count-distinct",
+      "status": "unsupported",
+      "example": "SELECT COUNT(DISTINCT region) AS regions FROM rows",
+      "error": "Expected"
+    },
+    {
+      "id": "window.aggregate-over",
+      "status": "unsupported",
+      "example": "SELECT SUM(amount) OVER (PARTITION BY region) AS total FROM rows",
+      "error": "Expected FROM, found OVER"
+    },
+    {
+      "id": "window.frame",
+      "status": "unsupported",
+      "example": "SELECT ROW_NUMBER() OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS rn FROM rows",
+      "error": "Expected"
+    },
+    {
+      "id": "join.right",
+      "status": "unsupported",
+      "example": "SELECT r.region FROM rows r RIGHT JOIN dims d ON d.region = r.region",
+      "error": "Expected"
+    },
+    {
+      "id": "join.non-equi",
+      "status": "unsupported",
+      "example": "SELECT r.region FROM rows r JOIN dims d ON d.amount > r.amount",
+      "error": "Expected ="
+    },
+    {
+      "id": "select.distinct-wildcard",
+      "status": "unsupported",
+      "example": "SELECT DISTINCT * FROM rows",
+      "error": "SELECT DISTINCT * is not supported"
+    },
+    {
+      "id": "limit.offset",
+      "status": "unsupported",
+      "example": "SELECT amount FROM rows LIMIT 5 OFFSET 2",
+      "error": "Expected eof"
+    },
+    {
+      "id": "ddl.create-table",
+      "status": "unsupported",
+      "example": "CREATE TABLE t (id INTEGER)",
+      "error": "Expected SELECT",
+      "notes": "Schema management is a programmatic API."
+    },
+    {
+      "id": "mutation.update-keyless",
+      "status": "unsupported",
+      "example": "UPDATE rows SET amount = 1",
+      "error": "UPDATE requires a table with a unique key",
+      "notes": "Requires execution against a catalog."
+    },
+    {
+      "id": "transaction.begin",
+      "status": "unsupported",
+      "example": "BEGIN",
+      "error": "Expected SELECT",
+      "notes": "Transactions are a programmatic API."
+    }
+  ]
+}

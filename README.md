@@ -139,15 +139,25 @@ the writer's `onError`; a main-thread worker proxy can use `attachLifecycleFlush
 request when the document becomes hidden or the page fires `pagehide`. This is an optimization, not
 an unload-time durability guarantee.
 
-`query()` and `prepareQuery()` are the public read-only SQL API. The current intentionally limited SQL
-surface supports `SELECT` with `DISTINCT`, aliases, inner and left equi-joins, `WHERE` comparisons
-joined by `AND`, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `ROUND`, `GROUP BY`, `HAVING`
-conditions over aggregates, literals, and group keys, multi-column `ORDER BY`,
-and `LIMIT`. `SELECT DISTINCT` compiles into grouping by every selected expression, so it reuses
-the grouped executor, its partitioned spill, and streamed scan inputs; `DISTINCT *`, `DISTINCT`
-with aggregates, and `DISTINCT` with explicit `GROUP BY` or `HAVING` are rejected explicitly.
-It rejects multiple statements, comments, writes, unknown or ambiguous columns, and
-unsupported functions instead of silently interpreting them. A prepared query materializes only
+`query()` and `prepareQuery()` are the public read-only SQL API, and `execute()` additionally
+routes SQL mutations. The SQL surface supports `SELECT` with `DISTINCT`, aliases, inner and left
+equi-joins, `WHERE` comparisons joined by `AND` with `IN`/`NOT IN` lists and uncorrelated scalar
+and membership subqueries, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `ROUND`, `GROUP BY`,
+`HAVING` conditions over aggregates, literals, and group keys, multi-column `ORDER BY`, `LIMIT`,
+non-recursive `WITH` CTEs, derived tables, top-level `UNION`/`UNION ALL`, and
+`ROW_NUMBER`/`RANK`/`DENSE_RANK` window functions over `PARTITION BY`/`ORDER BY`.
+`SELECT DISTINCT` compiles into grouping by every selected expression, so it reuses
+the grouped executor, its partitioned spill, and streamed scan inputs; CTEs, derived tables, set
+operations, and window inputs execute at the same leased snapshot and materialize as typed
+in-memory tables. `INSERT ... VALUES` maps onto one column batch insert, and `UPDATE`/`DELETE` on
+unique-key tables read matching keys at one snapshot and apply the keyed batch mutation — two
+steps, not one serializable transaction, so a competing key change fails the statement explicitly.
+The checked-in machine-readable feature matrix
+(`packages/engine/sql-feature-matrix.json`) records every supported and rejected form with an
+executable example, and a conformance test holds it honest. Unsupported syntax — `OR`, `LIKE`,
+`BETWEEN`, `IS NULL`, `CASE`, `EXISTS`, correlated subqueries, recursive CTEs,
+`INTERSECT`/`EXCEPT`, aggregate windows, non-equi joins, DDL, and more — fails explicitly instead
+of being silently interpreted. A prepared query materializes only
 its referenced columns at one manifest version, remains stable across later commits, and must be
 closed when no longer needed. This is a correctness-first SQL subset, not a claim of full SQL-92
 coverage.

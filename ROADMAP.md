@@ -423,16 +423,21 @@ Exit gate: measured wall-time improvement on large scans/aggregates and no Share
 
 Deliver lexer, parser, AST, binder/type checker, logical plan, physical plan, and a machine-readable SQL feature matrix. Implement relational fundamentals before breadth: SELECT/FROM/WHERE, joins, grouping, ordering, limits, distinct, subqueries, sets, CTEs, windows, and mutations.
 
-Foundation implemented early: a dependency-free read-only lexer/parser and bound projected snapshot
-executor now powers the public `query()` and reusable `prepareQuery()` APIs. It supports SELECT
-with DISTINCT, aliases, inner/left equi-joins, AND comparisons, arithmetic, core aggregates, ROUND,
-GROUP BY, HAVING over aggregates/literals/group keys,
-multi-column ORDER BY, and LIMIT. Unsupported syntax fails explicitly, including `DISTINCT *` and
-`DISTINCT` mixed with aggregates, GROUP BY, or HAVING. `SELECT DISTINCT` compiles into grouping by
-every selected expression, so both executors, the value-carrying spill, and streamed scans cover it
-without dedicated operators; HAVING filters completed groups in the shared group-finishing step of
-the in-memory and spilled paths. Phase 12 remains open: typed logical/physical plans,
-subqueries, sets, CTEs, windows, and SQL mutations remain outstanding.
+Phase 12 is delivered as a breadth-complete correctness-first surface. The dependency-free
+lexer/parser compiles every statement into one shared compiled-plan representation
+(`CompiledQuery`/`CompiledStatement`) consumed identically by the row-reference executor, the
+columnar executor, and the public `query()`/`prepareQuery()`/`execute()` APIs. The surface covers
+SELECT with DISTINCT, aliases, inner/left equi-joins, AND comparisons with IN/NOT IN and
+uncorrelated scalar and membership subqueries, arithmetic, core aggregates, ROUND, GROUP BY,
+HAVING, multi-column ORDER BY, LIMIT, non-recursive CTEs, derived tables, top-level
+UNION/UNION ALL, ROW_NUMBER/RANK/DENSE_RANK windows, INSERT ... VALUES, and keyed UPDATE/DELETE.
+DISTINCT desugars into grouping, windows desugar into windowed sources, unions fold positionally,
+and subqueries resolve post-order at the same leased snapshot. The machine-readable feature matrix
+(`packages/engine/sql-feature-matrix.json`) records each supported and rejected form with an
+executable example verified by a conformance test. A separate optimizer-facing logical/physical
+plan split with plan snapshots is deferred to Phase 13, where it becomes load-bearing;
+OR-predicates, LIKE, BETWEEN, IS NULL, CASE, EXISTS, correlated subqueries, recursive CTEs,
+INTERSECT/EXCEPT, aggregate windows, and DDL remain explicitly rejected future breadth.
 
 Exit gate: SQL compiles into the same logical representation used by all other APIs; unsupported syntax fails explicitly rather than silently changing semantics.
 
@@ -539,6 +544,10 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Spill unordered grouped state through the value-carrying partitions.
 - [x] Add SELECT DISTINCT as compiled grouping and HAVING as shared group-finishing filters.
 - [ ] Stream keyed-mutation scan inputs and spill hash-join build sides.
+- [x] Add SELECT DISTINCT, HAVING, IN, uncorrelated subqueries, CTEs, derived tables,
+      UNION/UNION ALL, and ROW_NUMBER/RANK/DENSE_RANK windows to the SQL surface.
+- [x] Add SQL mutations through execute() with keyed read-then-mutate semantics.
+- [x] Check in the machine-readable SQL feature matrix with a conformance test.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording
