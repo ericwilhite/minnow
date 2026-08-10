@@ -5213,6 +5213,9 @@ for (const implementation of implementations()) {
     await expect(
       database.execute("INSERT INTO sql_people (name, score) VALUES ('Zoe')"),
     ).rejects.toThrow("Each INSERT row must match the column list length");
+    await expect(
+      database.execute("UPDATE sql_people SET score = score / 0 WHERE score > 0"),
+    ).rejects.toThrow("UPDATE assignment produced a non-finite number");
     store.close();
   });
 }

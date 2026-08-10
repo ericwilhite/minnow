@@ -1514,9 +1514,15 @@ export class BrowserDatabase {
     }
     const changes: Record<string, Array<BatchValue | null>> = {};
     for (const assignment of statement.assignments) {
-      changes[assignment.column] = rows.map((row) =>
-        evaluateRowExpression(assignment.expression, table.name, row),
-      );
+      changes[assignment.column] = rows.map((row) => {
+        const value = evaluateRowExpression(assignment.expression, table.name, row);
+        if (typeof value === "number" && !Number.isFinite(value)) {
+          throw new TypeError(
+            `UPDATE assignment produced a non-finite number: ${assignment.column}`,
+          );
+        }
+        return value;
+      });
     }
     const result = await this.updateBatch(table.name, {
       keys: keys as BatchValue[],

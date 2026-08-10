@@ -1161,12 +1161,35 @@ async function readFinalSpillRun(
   return { columns: [...columns], rows };
 }
 
+const hashScratch = new DataView(new ArrayBuffer(8));
+
+/**
+ * Allocation-free FNV-1a over tagged canonical group-key bytes. Only per-execution partition
+ * routing depends on this hash, so it never needs cross-version stability; -0 keeps its sign bit
+ * and hashes apart from 0, matching the group index's key distinction.
+ */
 function hashQueryValues(values: readonly QueryValue[]): number {
   let hash = 0x811c9dc5;
   for (const rawValue of values) {
     const value = groupKey(rawValue);
-    const bytes = vectorTextEncoder.encode(JSON.stringify(encodeSpillValue(value)));
-    for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+    if (value === null) {
+      hash = Math.imul(hash ^ 0x01, 0x01000193) >>> 0;
+    } else if (typeof value === "boolean") {
+      hash = Math.imul(hash ^ (value ? 0x03 : 0x02), 0x01000193) >>> 0;
+    } else if (typeof value === "number") {
+      hash = Math.imul(hash ^ 0x04, 0x01000193) >>> 0;
+      hashScratch.setFloat64(0, value, true);
+      for (let byte = 0; byte < 8; byte += 1) {
+        hash = Math.imul(hash ^ hashScratch.getUint8(byte), 0x01000193) >>> 0;
+      }
+    } else {
+      hash = Math.imul(hash ^ 0x05, 0x01000193) >>> 0;
+      for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        hash = Math.imul(hash ^ (code & 0xff), 0x01000193) >>> 0;
+        hash = Math.imul(hash ^ (code >>> 8), 0x01000193) >>> 0;
+      }
+    }
     hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
   }
   return hash;
