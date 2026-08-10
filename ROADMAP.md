@@ -356,6 +356,12 @@ grouped ordered equi-joins with materialized build sides. Buffered values are re
 flushed in bounded scan chunks sized from the spill page setting. Unordered grouped state,
 hash-join build sides, and DISTINCT remain unspillable.
 
+Phase 7E-C streams the probe side of joined plans: the scanned base table uses the sliding window
+while join build sides, including keyed mutation replay, are materialized at the same leased
+snapshot. Self-joins keep the materialized path. Tests cover ordered, grouped-ordered, and
+left-join parity against the materialized path with an upsert-replayed build table and a base too
+large to materialize inside the budget.
+
 Phase 7 remains open. Prepared queries and non-streamed shapes still materialize every projected
 typed input column in full before
 the modeled reservations take effect, and mutation replay can temporarily retain a typed slot
@@ -523,7 +529,8 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Stream budgeted single-table append/base scan inputs through block-aligned resident windows.
 - [x] Carry evaluated values in hash-aggregate spill partitions, covering grouped-and-ordered
       streams and grouped ordered joins.
-- [ ] Stream joined and mutation inputs and add the remaining spill shapes, including unordered
+- [x] Stream the joined probe side with build sides materialized at the same leased snapshot.
+- [ ] Stream keyed-mutation scan inputs and add the remaining spill shapes, including unordered
       grouped state, hash-join build sides, and DISTINCT.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 

@@ -4995,6 +4995,83 @@ for (const implementation of implementations()) {
 }
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} streams the joined probe side with materialized build sides`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 512, compression: "raw" });
+    await database.createTable({
+      name: "stream_fact",
+      columns: [
+        { name: "v", type: "number" },
+        { name: "code", type: "string" },
+      ],
+    });
+    await database.createTable({
+      name: "stream_dim",
+      uniqueKey: "code",
+      columns: [
+        { name: "code", type: "string" },
+        { name: "segment", type: "string" },
+      ],
+    });
+    const rowCount = 20_000;
+    await database.insertBatch("stream_fact", {
+      columns: {
+        v: Array.from({ length: rowCount }, (_, index) => index),
+        code: Array.from({ length: rowCount }, (_, index) => `c-${String(index % 45)}`),
+      },
+    });
+    await database.insertBatch("stream_dim", {
+      columns: {
+        code: Array.from({ length: 40 }, (_, index) => `c-${String(index)}`),
+        segment: Array.from({ length: 40 }, (_, index) => `seg-${String(index % 6)}`),
+      },
+    });
+    await database.upsertBatch("stream_dim", {
+      columns: { code: ["c-1", "c-2"], segment: ["seg-x", "seg-y"] },
+    });
+    const budget = 96_000;
+
+    await expect(
+      database.prepareQuery(
+        "SELECT d.segment, SUM(o.v) AS total FROM stream_fact o JOIN stream_dim d ON d.code = o.code GROUP BY d.segment",
+        { executionMemoryBudgetBytes: budget },
+      ),
+    ).rejects.toThrow(QueryMemoryBudgetError);
+
+    const orderedSql =
+      "SELECT o.v, d.segment FROM stream_fact o JOIN stream_dim d ON d.code = o.code WHERE o.v < 19000 ORDER BY o.v DESC LIMIT 21";
+    expect(
+      (
+        await database.query(orderedSql, {
+          executionMemoryBudgetBytes: budget,
+          spillPageRows: 512,
+        })
+      ).rows,
+    ).toEqual((await database.query(orderedSql)).rows);
+
+    const groupedSql =
+      "SELECT d.segment, COUNT(*) AS orders, SUM(o.v) AS total FROM stream_fact o JOIN stream_dim d ON d.code = o.code GROUP BY d.segment ORDER BY total DESC LIMIT 4";
+    expect(
+      (
+        await database.query(groupedSql, {
+          executionMemoryBudgetBytes: budget,
+          spillPageRows: 512,
+        })
+      ).rows,
+    ).toEqual((await database.query(groupedSql)).rows);
+
+    const leftSql =
+      "SELECT o.v, d.segment FROM stream_fact o LEFT JOIN stream_dim d ON d.code = o.code WHERE o.v >= 19975 AND o.v < 19985";
+    const left = await database.query(leftSql, { executionMemoryBudgetBytes: budget });
+    expect(left.rows).toEqual((await database.query(leftSql)).rows);
+    expect(left.rows.some((row) => row.segment === null)).toBe(true);
+
+    expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
+    store.close();
+  }, 30_000);
+}
+
+for (const implementation of implementations()) {
   it(`${implementation.name} spills grouped ordered joins through value-carrying partitions`, async () => {
     const store = await implementation.create();
     const database = new BrowserDatabase(store, { rowsPerBlock: 256, compression: "raw" });

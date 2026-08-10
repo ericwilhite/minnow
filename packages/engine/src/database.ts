@@ -1250,59 +1250,95 @@ export class BrowserDatabase {
   }
 
   /**
-   * A plan shape can stream its scan input when it has no joins: every asynchronous execution
-   * path, including both spill paths, consumes scan rows batch-forward and copies values out, so
-   * a sliding resident window can back the scan source. Streaming exists to honor an explicit
-   * budget; an unbudgeted or spill-disabled query keeps the materialized path.
+   * A plan shape can stream its scan input: every asynchronous execution path, including both
+   * spill paths, consumes scan rows batch-forward and copies values out, so a sliding resident
+   * window can back the scan source while join build sides stay fully materialized. A self-join
+   * is excluded because the base table would also be probed as a build side at arbitrary rows.
+   * Streaming exists to honor an explicit budget; an unbudgeted or spill-disabled query keeps the
+   * materialized path.
    */
   #canStreamPlanShape(plan: CompiledQuery, options: QueryOptions): boolean {
     return (
       options.executionMemoryBudgetBytes !== undefined &&
       options.spillToStorage !== false &&
-      plan.joins.length === 0
+      !plan.joins.some((join) => join.table === plan.base.table)
     );
   }
 
   /**
-   * Executes a single-table plan with a sliding block-aligned scan window instead of fully
-   * materialized input vectors. Returns undefined when the visible table shape is ineligible
-   * (keyed mutation replay or zone-map pruning applies), so the caller falls back to the
-   * materialized path.
+   * Executes a plan with a sliding block-aligned scan window over the base table instead of a
+   * fully materialized scan input; join build sides are materialized at the same snapshot.
+   * Returns undefined when the base table's visible shape is ineligible (keyed mutation replay),
+   * so the caller falls back to the materialized path.
    */
   async #queryStreamed(
     plan: CompiledQuery,
     options: QueryOptions,
     spillPageRows: number | undefined,
   ): Promise<QueryResult | undefined> {
-    const table = await this.#findTable(plan.base.table);
-    const schemas = new Map([[table.name, table.columns.map(({ name }) => name)]]);
-    const requestedColumns = referencedColumns(plan, schemas).get(table.name) ?? [];
-    const projectedColumns =
-      requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns);
+    const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
+    const uniqueTableNames = [...new Set(tableNames)];
+    const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
+    const schemas = new Map(
+      tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
+    );
+    const columns = referencedColumns(plan, schemas);
+    const baseTable = tables.find((table) => table.name === plan.base.table);
+    if (baseTable === undefined) throw new TypeError(`Unknown table: ${plan.base.table}`);
+    const requestedBaseColumns = columns.get(baseTable.name) ?? [];
+    const projectedBaseColumns =
+      requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
     return this.#withLeasedSnapshot(options.version, async (snapshot) => {
-      const segments = await this.#visibleSegmentRecords(table, snapshot);
-      const appendOnly = segments.every((segment) => {
+      const tableIds = new Set(tables.map((table) => table.id));
+      const segmentRecords =
+        tables.length === 1
+          ? await this.store.listSegments(baseTable.id)
+          : await this.store.listSegments();
+      const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
+      const segmentsByTable = new Map<string, SegmentRecord[]>();
+      for (const segment of segmentRecords) {
+        if (!tableIds.has(segment.tableId)) continue;
+        const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
+        tableSegments.push(segment);
+        segmentsByTable.set(segment.tableId, tableSegments);
+      }
+      const visibility: SegmentVisibilityCatalog = {
+        transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
+        segmentsByTable,
+      };
+      const baseSegments = await this.#visibleSegmentRecords(baseTable, snapshot, visibility);
+      const appendOnly = baseSegments.every((segment) => {
         const kind = segment.kind ?? "insert";
         return kind === "insert" || kind === "base";
       });
       if (!appendOnly) return undefined;
-      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+      const rowCount = baseSegments.reduce((total, segment) => total + segment.rowCount, 0);
       const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
       let prepared: PreparedQuery | undefined;
       try {
         const streamed = this.#createStreamedTable(
-          table,
-          projectedColumns,
-          segments,
+          baseTable,
+          projectedBaseColumns,
+          baseSegments,
           snapshot,
           rowCount,
           memory,
         );
-        prepared = createPreparedColumnarQuery(
-          plan,
-          new Map([[table.name, streamed.table]]),
-          memory,
-        );
+        const inputTables = new Map<string, ColumnarTable>([[baseTable.name, streamed.table]]);
+        for (const table of tables) {
+          if (table.name === baseTable.name) continue;
+          const requestedColumns = columns.get(table.name) ?? [];
+          inputTables.set(
+            table.name,
+            await this.#materializeColumnarTableAtSnapshot(
+              table,
+              snapshot,
+              requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
+              visibility,
+            ),
+          );
+        }
+        prepared = createPreparedColumnarQuery(plan, inputTables, memory);
         return await prepared.executeAsync({
           ...(spillPageRows === undefined ? {} : { spillPageRows }),
           spillStore: this.#leasedSpillStore(),

@@ -219,11 +219,18 @@ its rows resident, forward-only, decoding whole physical blocks, reserving the r
 typed bytes before allocation and its measured per-window string dictionary bytes before
 installation, and releasing the superseded window afterward. Global aggregates, unordered and
 order-spilled scans, and grouped-unordered plans over tables far larger than the configured budget
-now complete instead of failing at preparation. Joins, keyed mutation snapshots, prepared queries,
-and unbudgeted or spill-disabled queries
+now complete instead of failing at preparation. Keyed mutation snapshots of the scanned base table,
+prepared queries, and unbudgeted or spill-disabled queries
 keep the materialized path. Under an explicit budget the streaming path takes precedence over Phase
 8A zone-map pruning, so a pruned-eligible predicate reads more blocks than the pruned path would in
 exchange for the bounded working set.
+
+Phase 7E-C extends the same scan window to the probe side of joined plans. The base table streams
+while every join build side is materialized in full at the same leased snapshot, including keyed
+mutation replay on a build table. A self-join keeps the materialized path because the base table
+would also be probed as a build side at arbitrary row positions. Build-side bytes are still
+reserved only when the bound plan installs its table payloads, so a large build side fails the
+budget exactly as the materialized path does.
 
 Phase 7E-B rewrites the partitioned hash-aggregate spill to carry values instead of scan-row
 indexes. Each partition page stores the evaluated group keys and aggregate arguments for its
