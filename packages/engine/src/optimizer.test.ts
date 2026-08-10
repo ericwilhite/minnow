@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { type DatabaseRow } from "./database.js";
+import { chooseJoinOrder, type DatabaseRow } from "./database.js";
 import { optimizePlan, renderPlan } from "./optimizer.js";
 import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import { columnarTableFromRows } from "./vector.js";
 
 const rows: DatabaseRow[] = [
   { region: "west", amount: 10, ratio: 1.5 },
@@ -101,6 +102,55 @@ describe("deterministic plan rewrites", () => {
     expect(rendered.match(/limit 2/g)).toHaveLength(2);
     expect(rendered).not.toContain("limit 3");
     expectEquivalent(sql);
+  });
+
+  it("chooses the smaller inner-join input as the build side from exact row counts", () => {
+    const big = Array.from({ length: 100 }, (_, index) => ({
+      region: index % 2 === 0 ? "west" : "east",
+      amount: index,
+    }));
+    const inputs = new Map([
+      ["rows", columnarTableFromRows("rows", big)],
+      ["dims", columnarTableFromRows("dims", dims)],
+    ]);
+    const swapped = chooseJoinOrder(
+      compileQuery("SELECT d.weight, r.amount FROM dims d JOIN rows r ON r.region = d.region"),
+      inputs,
+    );
+    expect(swapped.base.table).toBe("rows");
+    expect(swapped.joins[0]?.table).toBe("dims");
+    expect(swapped.joins[0]?.kind).toBe("inner");
+
+    const keptSmallBuild = chooseJoinOrder(
+      compileQuery("SELECT r.amount, d.weight FROM rows r JOIN dims d ON d.region = r.region"),
+      inputs,
+    );
+    expect(keptSmallBuild.base.table).toBe("rows");
+
+    const keptLeft = chooseJoinOrder(
+      compileQuery("SELECT d.weight FROM dims d LEFT JOIN rows r ON r.region = d.region"),
+      inputs,
+    );
+    expect(keptLeft.base.table).toBe("dims");
+
+    const keptWildcard = chooseJoinOrder(
+      compileQuery("SELECT * FROM dims d JOIN rows r ON r.region = d.region"),
+      inputs,
+    );
+    expect(keptWildcard.base.table).toBe("dims");
+
+    const bigTables = new Map<string, DatabaseRow[]>([
+      ["rows", big],
+      ["dims", dims],
+    ]);
+    const sql = "SELECT d.weight, r.amount FROM dims d JOIN rows r ON r.region = d.region";
+    const byRow = (left: Record<string, unknown>, right: Record<string, unknown>) =>
+      JSON.stringify(left).localeCompare(JSON.stringify(right));
+    const swappedResult = executeQuery(swapped, bigTables);
+    const reference = executeRowQuery(compileQuery(sql, { optimize: false }), bigTables);
+    expect(swappedResult.columns).toEqual(reference.columns);
+    // A swapped scan changes unordered output order, which SQL leaves unspecified.
+    expect([...swappedResult.rows].sort(byRow)).toEqual([...reference.rows].sort(byRow));
   });
 
   it("keeps optimized plans equivalent across representative shapes", () => {

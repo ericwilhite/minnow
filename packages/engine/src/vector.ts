@@ -138,6 +138,16 @@ interface BoundPredicate {
   readonly left: BoundExpression;
   readonly operator: PredicateOperator;
   readonly right: BoundExpression;
+  /** Dictionary-code rewrite for string equality against a literal; codes compare per row. */
+  readonly dictionaryEquality?: DictionaryEquality;
+}
+
+interface DictionaryEquality {
+  readonly source: number;
+  readonly vector: StringVector;
+  readonly value: string;
+  readonly negated: boolean;
+  readonly cache: { dictionary: readonly string[] | undefined; code: number };
 }
 
 interface BoundJoin {
@@ -460,11 +470,15 @@ function bindPlan(
   const groupIndexBySignature = new Map(
     groupBy.map((expression, index) => [expression.signature, index]),
   );
-  const predicates = plan.predicates.map((predicate) => ({
-    left: bind(predicate.left),
-    operator: predicate.operator,
-    right: bind(predicate.right),
-  }));
+  const predicates = plan.predicates.map((predicate) => {
+    const bound: BoundPredicate = {
+      left: bind(predicate.left),
+      operator: predicate.operator,
+      right: bind(predicate.right),
+    };
+    const dictionaryEquality = detectDictionaryEquality(bound);
+    return dictionaryEquality === undefined ? bound : { ...bound, dictionaryEquality };
+  });
   const having = plan.having.map((predicate) => ({
     left: bind(predicate.left),
     operator: predicate.operator,
@@ -1872,12 +1886,66 @@ function wildcardColumnNames(plan: BoundPlan): string[] {
   );
 }
 
+/** Detects `stringColumn = 'literal'` (or !=) so batches compare dictionary codes per row. */
+function detectDictionaryEquality(predicate: BoundPredicate): DictionaryEquality | undefined {
+  if (!["=", "!=", "<>"].includes(predicate.operator)) return undefined;
+  const sides = [
+    { column: predicate.left, literal: predicate.right },
+    { column: predicate.right, literal: predicate.left },
+  ];
+  for (const { column, literal } of sides) {
+    if (
+      column.kind === "column" &&
+      column.vector.kind === "string" &&
+      literal.kind === "literal" &&
+      typeof literal.value === "string"
+    ) {
+      return {
+        source: column.source,
+        vector: column.vector,
+        value: literal.value,
+        negated: predicate.operator !== "=",
+        cache: { dictionary: undefined, code: -1 },
+      };
+    }
+  }
+  return undefined;
+}
+
+function stringCodeAt(vector: StringVector, rowIndex: number): number | undefined {
+  if (rowIndex < 0 || rowIndex >= vector.length) return undefined;
+  const window = vector.window;
+  let slot = rowIndex;
+  if (window !== undefined) {
+    slot = rowIndex - window.start;
+    if (slot < 0 || slot >= window.length) {
+      throw new RangeError(
+        `Streamed vector row ${String(rowIndex)} is outside the resident window ${String(window.start)}..${String(window.start + window.length)}`,
+      );
+    }
+  }
+  if (!isValid(vector.validity, slot)) return undefined;
+  const code = vector.codes[slot] ?? NULL_STRING_CODE;
+  return code === NULL_STRING_CODE ? undefined : code;
+}
+
 function evaluateBatchPredicate(
   plan: BoundPlan,
   predicate: BoundPredicate,
   batch: BatchRows,
   row: number,
 ): boolean {
+  const fast = predicate.dictionaryEquality;
+  if (fast !== undefined) {
+    const code = stringCodeAt(fast.vector, batch.rowsBySource[fast.source]?.[row] ?? -1);
+    if (code === undefined) return false;
+    if (fast.cache.dictionary !== fast.vector.dictionary) {
+      fast.cache.dictionary = fast.vector.dictionary;
+      fast.cache.code = fast.vector.dictionary.indexOf(fast.value);
+    }
+    const matches = fast.cache.code >= 0 && code === fast.cache.code;
+    return fast.negated ? !matches : matches;
+  }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
     return inListHolds(

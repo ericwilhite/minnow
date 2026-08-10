@@ -1145,7 +1145,11 @@ export class BrowserDatabase {
           typedSchemas,
         );
       });
-      return createPreparedColumnarQuery(resolvedPlan, columnarTables, memory);
+      return createPreparedColumnarQuery(
+        chooseJoinOrder(resolvedPlan, columnarTables),
+        columnarTables,
+        memory,
+      );
     } catch (error) {
       memory.close();
       throw error;
@@ -5190,6 +5194,37 @@ function installStreamedWindow(
     mutable.dictionary = dictionary;
   }
   mutable.window = { start: windowStart, length: windowRows };
+}
+
+/**
+ * Cost-based build-side selection using exact prepared row counts: a single inner equi-join
+ * probes from the scanned base into a built index over the joined table, so when the joined
+ * table is much larger than the base the two swap, building over the smaller input instead.
+ * Left joins are asymmetric and wildcard selects expose source order, so both keep the written
+ * order; multi-join reordering remains open.
+ */
+export function chooseJoinOrder(
+  plan: CompiledQuery,
+  inputs: ReadonlyMap<string, ColumnarTable>,
+): CompiledQuery {
+  const join = plan.joins[0];
+  if (
+    plan.joins.length !== 1 ||
+    join?.kind !== "inner" ||
+    plan.select[0]?.expression.kind === "wildcard"
+  ) {
+    return plan;
+  }
+  const baseRows = inputs.get(plan.base.table)?.rowCount ?? 0;
+  const joinRows = inputs.get(join.table)?.rowCount ?? 0;
+  if (joinRows <= baseRows * 2) return plan;
+  const { kind, left, right, ...joinSource } = join;
+  void kind;
+  return {
+    ...plan,
+    base: joinSource,
+    joins: [{ ...plan.base, kind: "inner", left, right }],
+  };
 }
 
 /** Converts an executed derived-block result into a typed columnar input table. */

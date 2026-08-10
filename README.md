@@ -155,7 +155,9 @@ steps, not one serializable transaction, so a competing key change fails the sta
 Every compiled statement passes through a deterministic optimizer:
 constant folding, predicate pushdown into derived and CTE sources (base and inner-join sides
 only; group keys only for grouped inners), projection pruning of plain derived blocks, and LIMIT
-combining. `explain()` renders the optimized plan with physical strategy notes, and the
+combining. Preparation then applies exact-row-count decisions: a single inner equi-join builds
+its index over the smaller input, and string equality predicates compare dictionary codes per
+row. `explain()` renders the optimized plan with physical strategy notes, and the
 differential fuzzer executes optimized plans against the raw-plan row reference. The checked-in
 machine-readable feature matrix
 (`packages/engine/sql-feature-matrix.json`) records every supported and rejected form with an

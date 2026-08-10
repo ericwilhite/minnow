@@ -5002,6 +5002,26 @@ for (const implementation of implementations()) {
     expect([...unorderedGroups.rows].sort(byV)).toEqual([...unorderedReference.rows].sort(byV));
     expect(unorderedGroups.rows).toHaveLength(rowCount);
 
+    const dictionaryFiltered = await database.query(
+      "SELECT COUNT(*) AS count FROM streamed_rows WHERE tag = 'tag-1'",
+      { executionMemoryBudgetBytes: budget },
+    );
+    expect(dictionaryFiltered.rows).toEqual(
+      (await database.query("SELECT COUNT(*) AS count FROM streamed_rows WHERE tag = 'tag-1'"))
+        .rows,
+    );
+    const dictionaryNegated = await database.query(
+      "SELECT COUNT(*) AS count FROM streamed_rows WHERE tag != 'missing-tag'",
+      { executionMemoryBudgetBytes: budget },
+    );
+    expect(dictionaryNegated.rows).toEqual(
+      (
+        await database.query(
+          "SELECT COUNT(*) AS count FROM streamed_rows WHERE tag != 'missing-tag'",
+        )
+      ).rows,
+    );
+
     const distinct = await database.query("SELECT DISTINCT v FROM streamed_rows", {
       executionMemoryBudgetBytes: budget,
       spillPageRows: 512,

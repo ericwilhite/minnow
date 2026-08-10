@@ -455,12 +455,26 @@ per rule, `BrowserDatabase.explain()` reports the optimized plan plus physical s
 the differential fuzzer compares optimized columnar execution against the raw-plan row reference,
 so every rewrite sits inside the correctness net; an 80-seed sweep of 9,600 randomized queries
 passed. Zone-map segment pruning from Phase 8A and streamed/late-loaded scans from Phase 7 remain
-the physical layer these rewrites feed. Phase 13 stays open for aggregate pushdown, pushdown into
-base-table scans beyond zone maps, dictionary rewriting, collected statistics, cost-based join
-order and spill decisions, and the workload benchmarks that demonstrate each rule's measured
-value.
+the physical layer these rewrites feed.
+
+Phase 13B adds the cost-based slice this engine can decide today. Preparation collects exact
+visible row counts for every input — including executed derived tables — and a single inner
+equi-join swaps its scan and build sides when the joined table is more than twice the base, so
+the built index always covers the smaller input; left joins and wildcard selects keep the written
+order, and multi-join reordering waits for a cost model over richer statistics. String equality
+predicates rewrite to per-row dictionary-code comparison with a per-window cached code, and the
+existing optimistic execute-then-spill policy is the shipped spill decision: a budgeted query
+first attempts bounded in-memory execution and takes the durable spill path only on budget
+exhaustion. The checked-in `optimizer-rules-2026-08-10.md` record measures each rule on a
+200,000-row workload: 2.42x for CTE predicate pushdown, 3.87x for derived projection pruning, a
+16% lower accounted peak for build-side selection, and 1.12x for the dictionary rewrite including
+preparation. Partial aggregation and aggregate pushdown belong to Phase 9, parallelism decisions
+require Phase 11's workers, and workload-adaptive statistics beyond exact row counts belong to
+Phase 19.
 
 Exit gate: plan snapshots and workload benchmarks demonstrate each rule's correctness and value.
+Met by the per-rule snapshot tests, the raw-versus-optimized differential net, and the checked-in
+rule-value benchmark record; the explicitly re-scoped items above carry their phase homes.
 
 ## Phase 14 — Schema DSL and migrations
 
@@ -565,6 +579,8 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Check in the machine-readable SQL feature matrix with a conformance test.
 - [x] Add the deterministic optimizer core: folding, derived/CTE predicate pushdown, projection
       pruning, LIMIT combining, plan snapshots, and explain().
+- [x] Add exact-count join build-side selection, the dictionary-equality rewrite, and the
+      checked-in optimizer rule-value benchmark record.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording
