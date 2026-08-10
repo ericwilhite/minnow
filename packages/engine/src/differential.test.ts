@@ -62,7 +62,16 @@ const ALL_COLUMNS = ["region", "label", "amount", "ratio", "joined"];
 const COMPARISONS = ["=", "!=", ">", ">=", "<", "<="];
 
 function generatePredicate(fuzzer: Fuzzer, qualifier: string): string {
-  const kind = fuzzer.int(4);
+  const kind = fuzzer.int(6);
+  if (kind === 4) {
+    const column = fuzzer.pick(ALL_COLUMNS);
+    return `${qualifier}${column} IS ${fuzzer.random() < 0.5 ? "NOT " : ""}NULL`;
+  }
+  if (kind === 5) {
+    const column = fuzzer.pick(NUMERIC_COLUMNS);
+    const low = fuzzer.int(10) - 3;
+    return `${qualifier}${column} BETWEEN ${String(low)} AND ${String(low + fuzzer.int(8))}`;
+  }
   if (kind === 0) {
     const column = fuzzer.pick(NUMERIC_COLUMNS);
     return `${qualifier}${column} ${fuzzer.pick(COMPARISONS)} ${String(fuzzer.int(16) - 4)}`;
@@ -80,7 +89,17 @@ function generatePredicate(fuzzer: Fuzzer, qualifier: string): string {
 }
 
 function generateSql(fuzzer: Fuzzer): string {
-  const family = fuzzer.int(10);
+  const family = fuzzer.int(11);
+  if (family === 10) {
+    const grouped = fuzzer.random() < 0.5;
+    return grouped
+      ? `SELECT region, COUNT(DISTINCT ${fuzzer.pick(ALL_COLUMNS)}) AS distinct_values FROM rows${
+          fuzzer.random() < 0.5 ? ` WHERE ${generatePredicate(fuzzer, "")}` : ""
+        } GROUP BY region`
+      : `SELECT COUNT(DISTINCT ${fuzzer.pick(ALL_COLUMNS)}) AS distinct_values FROM rows${
+          fuzzer.random() < 0.5 ? ` WHERE ${generatePredicate(fuzzer, "")}` : ""
+        }`;
+  }
   const where = () =>
     fuzzer.random() < 0.7
       ? ` WHERE ${Array.from({ length: fuzzer.int(2) + 1 }, () => generatePredicate(fuzzer, "")).join(" AND ")}`

@@ -436,7 +436,7 @@ and subqueries resolve post-order at the same leased snapshot. The machine-reada
 (`packages/engine/sql-feature-matrix.json`) records each supported and rejected form with an
 executable example verified by a conformance test. A separate optimizer-facing logical/physical
 plan split with plan snapshots is deferred to Phase 13, where it becomes load-bearing;
-OR-predicates, LIKE, BETWEEN, IS NULL, CASE, EXISTS, correlated subqueries, recursive CTEs,
+OR-predicates, LIKE, CASE, EXISTS, correlated subqueries, recursive CTEs,
 INTERSECT/EXCEPT, aggregate windows, and DDL remain explicitly rejected future breadth.
 
 Exit gate: SQL compiles into the same logical representation used by all other APIs; unsupported syntax fails explicitly rather than silently changing semantics.
@@ -635,6 +635,9 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add the type-safe ORM builder with plan equivalence to compiled SQL.
 - [x] Add live queries with persisted change sets, digest notifications, and selective
       re-execution.
+- [x] Close SQL gaps for IS [NOT] NULL, inclusive BETWEEN, COUNT(DISTINCT), and constants
+      alongside aggregates; add the aligned bulk decode fast path and version-only manifest
+      reads.
 - [x] Execute the 15 reference queries as SQL through `prepareQuery()`, decide engine support by
       compiling during the run, and verify results against independent JavaScript oracles.
 - [x] Show optimized `explain()` plans and the checked-in SQL feature matrix in the dashboard.

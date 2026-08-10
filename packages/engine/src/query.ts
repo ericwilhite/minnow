@@ -49,7 +49,7 @@ export type Expression =
   | { kind: "column"; reference: string }
   | { kind: "wildcard" }
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
-  | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[] }
+  | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[]; distinct?: boolean }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }
   | {
@@ -90,7 +90,7 @@ export interface JoinPlan extends TableSource {
   right: Expression;
 }
 
-export type PredicateOperator = ComparisonOperator | "IN" | "NOT IN";
+export type PredicateOperator = ComparisonOperator | "IN" | "NOT IN" | "IS NULL" | "IS NOT NULL";
 
 export interface Predicate {
   left: Expression;
@@ -636,6 +636,17 @@ export function combineUnionResults(
   return { columns: [...columns], rows: combined };
 }
 
+function containsDistinctCount(expression: Expression): boolean {
+  if (expression.kind === "call") {
+    return expression.distinct === true || expression.arguments.some(containsDistinctCount);
+  }
+  if (expression.kind === "binary") {
+    return containsDistinctCount(expression.left) || containsDistinctCount(expression.right);
+  }
+  if (expression.kind === "list") return expression.items.some(containsDistinctCount);
+  return false;
+}
+
 function containsWindow(expression: Expression): boolean {
   if (expression.kind === "window") return true;
   if (expression.kind === "binary") {
@@ -1032,6 +1043,8 @@ function comparisonHolds(
   leftValue: unknown,
   rightValue: unknown,
 ): boolean {
+  if (operator === "IS NULL") return leftValue === null || leftValue === undefined;
+  if (operator === "IS NOT NULL") return leftValue !== null && leftValue !== undefined;
   if (operator === "IN" || operator === "NOT IN") {
     throw new TypeError("IN is only supported in WHERE predicates");
   }
@@ -1087,6 +1100,8 @@ function validateGrouping(plan: CompiledQuery): void {
   const groupExpressions = new Set(plan.groupBy.map((expression) => JSON.stringify(expression)));
   for (const item of plan.select) {
     if (hasAggregate(item.expression)) continue;
+    // A constant expression is the same for every group, as standard SQL allows.
+    if (expressionColumns(item.expression).length === 0) continue;
     if (!groupExpressions.has(JSON.stringify(item.expression))) {
       throw new TypeError(`Selected column must appear in GROUP BY: ${item.alias}`);
     }
@@ -1332,11 +1347,12 @@ class Parser {
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
       for (;;) {
-        const predicate = this.#predicate(true);
-        if (hasAggregate(predicate.left) || hasAggregate(predicate.right)) {
-          throw new TypeError("Aggregate functions are not allowed in mutation predicates");
+        for (const predicate of this.#predicates(true)) {
+          if (hasAggregate(predicate.left) || hasAggregate(predicate.right)) {
+            throw new TypeError("Aggregate functions are not allowed in mutation predicates");
+          }
+          predicates.push(predicate);
         }
-        predicates.push(predicate);
         if (!this.#isKeyword("AND")) break;
         this.#keyword("AND");
       }
@@ -1419,7 +1435,7 @@ class Parser {
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
       for (;;) {
-        predicates.push(this.#predicate(true));
+        predicates.push(...this.#predicates(true));
         if (!this.#isKeyword("AND")) break;
         this.#keyword("AND");
       }
@@ -1446,7 +1462,7 @@ class Parser {
       this.#keyword("HAVING");
       if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
       for (;;) {
-        having.push(this.#predicate(false));
+        having.push(...this.#predicates(false));
         if (!this.#isKeyword("AND")) break;
         this.#keyword("AND");
       }
@@ -1475,6 +1491,44 @@ class Parser {
     if (clauseExpressions.some(containsWindow)) {
       throw new TypeError("Window functions are only allowed in the select list");
     }
+    if (
+      clauseExpressions.some(containsDistinctCount) ||
+      select.some(
+        (item) =>
+          containsDistinctCount(item.expression) &&
+          !(item.expression.kind === "call" && item.expression.distinct === true),
+      )
+    ) {
+      throw new TypeError("COUNT(DISTINCT) must be a top-level select item");
+    }
+    const distinctCounts = select.filter(
+      (item) => item.expression.kind === "call" && item.expression.distinct === true,
+    );
+    if (distinctCounts.length > 0) {
+      if (distinctCounts.length > 1) {
+        throw new TypeError("Only one COUNT(DISTINCT) is supported per select");
+      }
+      if (
+        select.some(
+          (item) =>
+            item.expression.kind !== "window" &&
+            !(item.expression.kind === "call" && item.expression.distinct === true) &&
+            hasAggregate(item.expression),
+        )
+      ) {
+        throw new TypeError("COUNT(DISTINCT) cannot be combined with other aggregates yet");
+      }
+      if (select.some((item) => containsWindow(item.expression))) {
+        throw new TypeError("COUNT(DISTINCT) cannot be combined with window functions");
+      }
+      if (having.length > 0) {
+        throw new TypeError("COUNT(DISTINCT) cannot be combined with HAVING yet");
+      }
+      return this.#desugarDistinctCount(sql, base, joins, select, predicates, groupBy, {
+        orderBy,
+        ...(limit === undefined ? {} : { limit }),
+      });
+    }
     if (select.some((item) => containsWindow(item.expression))) {
       return this.#desugarWindows(sql, base, joins, select, predicates, groupBy, having, {
         orderBy,
@@ -1491,6 +1545,73 @@ class Parser {
       having,
       orderBy,
       ...(limit === undefined ? {} : { limit }),
+    };
+  }
+
+  /**
+   * Rewrites `COUNT(DISTINCT e)` as counting the deduplicated inner block: the inner block groups
+   * by every outer group key plus `e` (deduplication through the ordinary grouped machinery,
+   * including its spill), and the wrapper counts the non-null deduplicated values per group. The
+   * output column names and order are preserved exactly.
+   */
+  #desugarDistinctCount(
+    sql: string,
+    base: TableSource,
+    joins: JoinPlan[],
+    select: SelectItem[],
+    predicates: Predicate[],
+    groupBy: Expression[],
+    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number },
+  ): CompiledQuery {
+    const distinctAlias = "(distinct 1)";
+    const innerSelect: SelectItem[] = [];
+    const outerSelect: SelectItem[] = [];
+    for (const item of select) {
+      if (item.expression.kind === "call" && item.expression.distinct === true) {
+        const argument = item.expression.arguments[0];
+        if (argument === undefined) throw new TypeError("COUNT(DISTINCT) argument is missing");
+        innerSelect.push({ expression: argument, alias: distinctAlias });
+        outerSelect.push({
+          expression: {
+            kind: "call",
+            name: "COUNT",
+            arguments: [{ kind: "column", reference: distinctAlias }],
+          },
+          alias: item.alias,
+        });
+        continue;
+      }
+      innerSelect.push(item);
+      outerSelect.push({
+        expression: { kind: "column", reference: item.alias },
+        alias: item.alias,
+      });
+    }
+    const distinctArgument = innerSelect.find(({ alias }) => alias === distinctAlias);
+    if (distinctArgument === undefined) {
+      throw new TypeError("COUNT(DISTINCT) argument is missing");
+    }
+    const inner: CompiledQuery = {
+      sql: "(count distinct input)",
+      base,
+      joins,
+      select: innerSelect,
+      predicates,
+      groupBy: [...groupBy, distinctArgument.expression],
+      having: [],
+      orderBy: [],
+    };
+    return {
+      sql,
+      base: this.#derivedSource(inner, "distinct"),
+      joins: [],
+      select: outerSelect,
+      predicates: [],
+      groupBy: outerSelect
+        .filter(({ expression }) => expression.kind === "column")
+        .map(({ expression }) => expression),
+      having: [],
+      ...tail,
     };
   }
 
@@ -1721,16 +1842,25 @@ class Parser {
       const name = upper as AggregateName | "ROUND";
       if (!aggregateNames.has(name as AggregateName) && name !== "ROUND")
         throw new TypeError(`Unsupported function: ${identifier}`);
+      let distinct = false;
+      if (this.#isKeyword("DISTINCT")) {
+        if (name !== "COUNT") throw new TypeError("DISTINCT is only supported inside COUNT");
+        this.#keyword("DISTINCT");
+        distinct = true;
+      }
       const args: Expression[] = [];
       if (!this.#punctuation(")")) {
         args.push(...this.#expressionList());
         this.#expectPunctuation(")");
       }
+      if (distinct && (args.length !== 1 || args[0]?.kind === "wildcard")) {
+        throw new TypeError("COUNT(DISTINCT) requires exactly one scalar argument");
+      }
       if (aggregateNames.has(name as AggregateName) && args.length !== 1)
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "ROUND" && (args.length < 1 || args.length > 2))
         throw new TypeError("ROUND requires one or two arguments");
-      return { kind: "call", name, arguments: args };
+      return { kind: "call", name, arguments: args, ...(distinct ? { distinct: true } : {}) };
     }
     let reference = identifier;
     if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
@@ -1744,8 +1874,34 @@ class Parser {
     return token.text as ComparisonOperator;
   }
 
-  #predicate(allowIn: boolean): Predicate {
+  #predicates(allowIn: boolean): Predicate[] {
     const left = this.#expression();
+    if (this.#isKeyword("IS")) {
+      this.#keyword("IS");
+      let operator: PredicateOperator = "IS NULL";
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        operator = "IS NOT NULL";
+      }
+      const token = this.#peek();
+      if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
+        throw new TypeError(`Expected NULL, found ${token.text || "end of query"}`);
+      }
+      this.#identifier();
+      return [{ left, operator, right: { kind: "literal", value: null } }];
+    }
+    if (this.#isKeyword("BETWEEN")) {
+      if (!allowIn) throw new TypeError("BETWEEN is not supported in HAVING");
+      this.#keyword("BETWEEN");
+      const lower = this.#expression();
+      this.#keyword("AND");
+      const upper = this.#expression();
+      // BETWEEN is inclusive-range sugar over the existing AND semantics.
+      return [
+        { left, operator: ">=", right: lower },
+        { left: structuredClone(left), operator: "<=", right: upper },
+      ];
+    }
     if (this.#isKeyword("IN") || this.#isKeyword("NOT")) {
       if (!allowIn) throw new TypeError("IN is not supported in HAVING");
       let operator: PredicateOperator = "IN";
@@ -1758,18 +1914,18 @@ class Parser {
       if (this.#isKeyword("SELECT")) {
         const block = this.#selectBlock("(subquery)");
         this.#expectPunctuation(")");
-        return { left, operator, right: { kind: "subquery", block } };
+        return [{ left, operator, right: { kind: "subquery", block } }];
       }
       const items = this.#expressionList();
       this.#expectPunctuation(")");
       if (items.some((item) => item.kind === "wildcard" || item.kind === "subquery")) {
         throw new TypeError("IN lists accept only scalar expressions");
       }
-      return { left, operator, right: { kind: "list", items } };
+      return [{ left, operator, right: { kind: "list", items } }];
     }
     const operator = this.#comparison();
     const right = this.#expression();
-    return { left, operator, right };
+    return [{ left, operator, right }];
   }
 
   #identifier(): string {

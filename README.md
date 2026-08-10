@@ -141,8 +141,10 @@ an unload-time durability guarantee.
 
 `query()` and `prepareQuery()` are the public read-only SQL API, and `execute()` additionally
 routes SQL mutations. The SQL surface supports `SELECT` with `DISTINCT`, aliases, inner and left
-equi-joins, `WHERE` comparisons joined by `AND` with `IN`/`NOT IN` lists and uncorrelated scalar
-and membership subqueries, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `ROUND`, `GROUP BY`,
+equi-joins, `WHERE` comparisons joined by `AND` with `IN`/`NOT IN` lists, `IS [NOT] NULL`,
+inclusive `BETWEEN`, and uncorrelated scalar
+and membership subqueries, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT(DISTINCT)` as the
+sole aggregate of its select, `ROUND`, `GROUP BY`,
 `HAVING` conditions over aggregates, literals, and group keys, multi-column `ORDER BY`, `LIMIT`,
 non-recursive `WITH` CTEs, derived tables, top-level `UNION`/`UNION ALL`, and
 `ROW_NUMBER`/`RANK`/`DENSE_RANK` window functions over `PARTITION BY`/`ORDER BY`.
@@ -162,7 +164,7 @@ differential fuzzer executes optimized plans against the raw-plan row reference.
 machine-readable feature matrix
 (`packages/engine/sql-feature-matrix.json`) records every supported and rejected form with an
 executable example, and a conformance test holds it honest. Unsupported syntax — `OR`, `LIKE`,
-`BETWEEN`, `IS NULL`, `CASE`, `EXISTS`, correlated subqueries, recursive CTEs,
+`CASE`, `EXISTS`, correlated subqueries, recursive CTEs,
 `INTERSECT`/`EXCEPT`, aggregate windows, non-equi joins, DDL, and more — fails explicitly instead
 of being silently interpreted. A prepared query materializes only
 its referenced columns at one manifest version, remains stable across later commits, and must be

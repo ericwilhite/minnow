@@ -564,6 +564,60 @@ describe("public SQL queries", () => {
     ).toThrow("Duplicate CTE name: a");
   });
 
+  it("evaluates IS NULL, BETWEEN, and COUNT(DISTINCT) in both executors", () => {
+    const rows = [
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+      { region: null, amount: 5 },
+      { region: "east", amount: null },
+      { region: "east", amount: 20 },
+      { region: "west", amount: 20 },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT amount FROM rows WHERE region IS NULL",
+      "SELECT region, amount FROM rows WHERE region IS NOT NULL AND amount IS NOT NULL ORDER BY region, amount",
+      "SELECT region FROM rows WHERE amount BETWEEN 10 AND 20 ORDER BY region",
+      "SELECT COUNT(DISTINCT region) AS regions FROM rows",
+      "SELECT region, COUNT(DISTINCT amount) AS amounts FROM rows GROUP BY region ORDER BY region",
+      "SELECT COUNT(DISTINCT amount) AS amounts FROM rows WHERE region IS NOT NULL",
+      "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING MAX(amount) IS NOT NULL",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, input), sql).toEqual(executeRowQuery(plan, input));
+    }
+    const distinctRegions = executeQuery(
+      compileQuery("SELECT COUNT(DISTINCT region) AS regions FROM rows"),
+      input,
+    );
+    expect(distinctRegions.rows).toEqual([{ regions: 2 }]);
+    const grouped = executeQuery(
+      compileQuery(
+        "SELECT region, COUNT(DISTINCT amount) AS amounts FROM rows GROUP BY region ORDER BY region",
+      ),
+      input,
+    );
+    expect(grouped.rows).toEqual([
+      { region: null, amounts: 1 },
+      { region: "east", amounts: 1 },
+      { region: "west", amounts: 2 },
+    ]);
+    const constants = executeQuery(
+      compileQuery("SELECT 'total' AS tag, COUNT(*) AS count FROM rows"),
+      input,
+    );
+    expect(constants.rows).toEqual([{ tag: "total", count: 6 }]);
+    expect(() => compileQuery("SELECT SUM(DISTINCT amount) AS total FROM rows")).toThrow(
+      "DISTINCT is only supported inside COUNT",
+    );
+    expect(() =>
+      compileQuery("SELECT COUNT(DISTINCT region) AS r, SUM(amount) AS total FROM rows"),
+    ).toThrow("COUNT(DISTINCT) cannot be combined with other aggregates yet");
+    expect(() => compileQuery("SELECT region FROM rows WHERE amount NOT BETWEEN 1 AND 5")).toThrow(
+      "Expected IN, found BETWEEN",
+    );
+  });
+
   it("rejects unsupported DISTINCT and HAVING forms explicitly", () => {
     expect(() => compileQuery("SELECT DISTINCT * FROM rows")).toThrow(
       "SELECT DISTINCT * is not supported",

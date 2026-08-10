@@ -97,6 +97,8 @@ import {
 } from "./vector.js";
 
 const sizeTextEncoder = new TextEncoder();
+// The on-disk format is little-endian; the bulk Float64 copy reads platform order.
+const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
 const NULL_STRING_VECTOR_CODE = 0xffffffff;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
@@ -2230,8 +2232,7 @@ export class BrowserDatabase {
     options: CompactTableOptions,
   ): Promise<CompactionJobRecord | CompactTableResult> {
     for (;;) {
-      const manifest = await this.store.getCurrentManifest();
-      const version = manifest?.version ?? null;
+      const version = await this.store.getCurrentManifestVersion();
       try {
         return await this.#withLeasedSnapshot(version, (snapshot) =>
           this.#planCompactionAtSnapshot(table, options, version, snapshot),
@@ -5216,11 +5217,17 @@ function appendPhysicalColumnToVector(
   if (column.type === "number" || column.type === "datetime") {
     if (!(outputValues instanceof Float64Array))
       throw new Error(`${column.type} vector is missing`);
-    const sourceValues = new DataView(
-      column.bytes.buffer,
-      column.bytes.byteOffset + sourceValidityLength,
-      column.rowCount * 8,
-    );
+    const valueOffset = column.bytes.byteOffset + sourceValidityLength;
+    if (PLATFORM_LITTLE_ENDIAN && valueOffset % Float64Array.BYTES_PER_ELEMENT === 0) {
+      // Aligned bulk copy: values at invalid slots are never read (every consumer checks the
+      // validity bitmap first), so copying them is safe and avoids the per-row DataView loop.
+      outputValues.set(
+        new Float64Array(column.bytes.buffer, valueOffset, column.rowCount),
+        outputRowStart,
+      );
+      return;
+    }
+    const sourceValues = new DataView(column.bytes.buffer, valueOffset, column.rowCount * 8);
     for (let row = 0; row < column.rowCount; row += 1) {
       if (bitmapHasValue(sourceValidity, row)) {
         outputValues[outputRowStart + row] = sourceValues.getFloat64(row * 8, true);
@@ -5483,7 +5490,14 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     return column?.type === "number" || column?.type === "datetime" ? column : undefined;
   };
   for (const predicate of plan.predicates) {
-    if (predicate.operator === "IN" || predicate.operator === "NOT IN") continue;
+    if (
+      predicate.operator === "IN" ||
+      predicate.operator === "NOT IN" ||
+      predicate.operator === "IS NULL" ||
+      predicate.operator === "IS NOT NULL"
+    ) {
+      continue;
+    }
     const leftColumn =
       predicate.left.kind === "column" ? resolveColumn(predicate.left.reference) : undefined;
     const rightColumn =

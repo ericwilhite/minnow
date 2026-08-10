@@ -365,11 +365,11 @@ export class TransactionManager {
   async begin(): Promise<DatabaseTransaction> {
     const id = this.#createId();
     for (;;) {
-      const current = await this.store.getCurrentManifest();
+      const currentVersion = await this.store.getCurrentManifestVersion();
       const timestamp = this.#now().toISOString();
       const record: TransactionRecord = {
         id,
-        snapshotVersion: current?.version ?? null,
+        snapshotVersion: currentVersion,
         pendingBlockIds: [],
         pendingSegmentIds: [],
         status: "active",

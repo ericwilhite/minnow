@@ -2068,6 +2068,8 @@ function comparisonValue(
   leftValue: unknown,
   rightValue: unknown,
 ): boolean {
+  if (operator === "IS NULL") return leftValue === null || leftValue === undefined;
+  if (operator === "IS NOT NULL") return leftValue !== null && leftValue !== undefined;
   if (operator === "IN" || operator === "NOT IN") {
     throw new TypeError("IN is only supported in WHERE predicates");
   }
