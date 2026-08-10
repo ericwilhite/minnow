@@ -296,6 +296,88 @@ describe("public SQL queries", () => {
     expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
   });
 
+  it("deduplicates DISTINCT output through the grouped executor", () => {
+    const rows = [
+      { region: "west", tier: 1 },
+      { region: "west", tier: 1 },
+      { region: "east", tier: 1 },
+      { region: "west", tier: 2 },
+      { region: null, tier: 1 },
+      { region: null, tier: 1 },
+      { region: "east", tier: null },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT DISTINCT region FROM rows",
+      "SELECT DISTINCT region, tier FROM rows ORDER BY region, tier LIMIT 4",
+      "SELECT DISTINCT tier + 1 AS bumped FROM rows ORDER BY bumped",
+    ]) {
+      const plan = compileQuery(sql);
+      const columnar = executeQuery(plan, input);
+      expect(columnar).toEqual(executeRowQuery(plan, input));
+    }
+    const distinctPairs = executeQuery(
+      compileQuery("SELECT DISTINCT region, tier FROM rows"),
+      input,
+    );
+    expect(distinctPairs.rows).toHaveLength(5);
+  });
+
+  it("filters groups with HAVING in both executors", () => {
+    const rows = [
+      { category: "a", value: 1 },
+      { category: "a", value: 2 },
+      { category: "b", value: 10 },
+      { category: "b", value: 20 },
+      { category: "b", value: 30 },
+      { category: "c", value: null },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT category, COUNT(*) AS count FROM rows GROUP BY category HAVING COUNT(*) > 1 ORDER BY category",
+      "SELECT category, SUM(value) AS total FROM rows GROUP BY category HAVING SUM(value) >= 3 AND category != 'b' ORDER BY category",
+      "SELECT category, AVG(value) AS mean FROM rows GROUP BY category HAVING MIN(value) > 1 ORDER BY category",
+      "SELECT COUNT(*) AS count FROM rows HAVING COUNT(*) > 100",
+      "SELECT COUNT(*) AS count FROM rows HAVING COUNT(*) > 1",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
+    }
+    const filtered = executeQuery(
+      compileQuery(
+        "SELECT category, COUNT(*) AS count FROM rows GROUP BY category HAVING COUNT(*) > 1 ORDER BY category",
+      ),
+      input,
+    );
+    expect(filtered.rows).toEqual([
+      { category: "a", count: 2 },
+      { category: "b", count: 3 },
+    ]);
+  });
+
+  it("rejects unsupported DISTINCT and HAVING forms explicitly", () => {
+    expect(() => compileQuery("SELECT DISTINCT * FROM rows")).toThrow(
+      "SELECT DISTINCT * is not supported",
+    );
+    expect(() => compileQuery("SELECT DISTINCT COUNT(*) AS count FROM rows")).toThrow(
+      "SELECT DISTINCT cannot be combined with aggregate functions",
+    );
+    expect(() => compileQuery("SELECT DISTINCT category FROM rows GROUP BY category")).toThrow(
+      "SELECT DISTINCT cannot be combined with GROUP BY",
+    );
+    expect(() => compileQuery("SELECT DISTINCT category FROM rows HAVING COUNT(*) > 1")).toThrow(
+      "SELECT DISTINCT cannot be combined with HAVING",
+    );
+    expect(() => compileQuery("SELECT value FROM rows HAVING value > 1")).toThrow(
+      "HAVING requires GROUP BY or aggregate functions",
+    );
+    expect(() =>
+      compileQuery(
+        "SELECT category, COUNT(*) AS count FROM rows GROUP BY category HAVING value > 1",
+      ),
+    ).toThrow("HAVING conditions must use aggregates, literals, or GROUP BY expressions");
+  });
+
   it("matches the row reference for empty and null aggregate groups", () => {
     const rows = [
       { category: null, value: null },

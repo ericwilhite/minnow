@@ -424,11 +424,15 @@ Exit gate: measured wall-time improvement on large scans/aggregates and no Share
 Deliver lexer, parser, AST, binder/type checker, logical plan, physical plan, and a machine-readable SQL feature matrix. Implement relational fundamentals before breadth: SELECT/FROM/WHERE, joins, grouping, ordering, limits, distinct, subqueries, sets, CTEs, windows, and mutations.
 
 Foundation implemented early: a dependency-free read-only lexer/parser and bound projected snapshot
-executor now powers the public `query()` and reusable `prepareQuery()` APIs. It supports SELECT,
-aliases, inner/left equi-joins, AND comparisons, arithmetic, core aggregates, ROUND, GROUP BY,
-multi-column ORDER BY, and LIMIT. Unsupported syntax fails explicitly. Phase 7A routes this subset
-through its initial columnar executor, but does not complete Phase 12: typed logical/physical plans,
-DISTINCT, subqueries, sets, CTEs, windows, and SQL mutations remain outstanding.
+executor now powers the public `query()` and reusable `prepareQuery()` APIs. It supports SELECT
+with DISTINCT, aliases, inner/left equi-joins, AND comparisons, arithmetic, core aggregates, ROUND,
+GROUP BY, HAVING over aggregates/literals/group keys,
+multi-column ORDER BY, and LIMIT. Unsupported syntax fails explicitly, including `DISTINCT *` and
+`DISTINCT` mixed with aggregates, GROUP BY, or HAVING. `SELECT DISTINCT` compiles into grouping by
+every selected expression, so both executors, the value-carrying spill, and streamed scans cover it
+without dedicated operators; HAVING filters completed groups in the shared group-finishing step of
+the in-memory and spilled paths. Phase 12 remains open: typed logical/physical plans,
+subqueries, sets, CTEs, windows, and SQL mutations remain outstanding.
 
 Exit gate: SQL compiles into the same logical representation used by all other APIs; unsupported syntax fails explicitly rather than silently changing semantics.
 
@@ -533,8 +537,8 @@ larger/repeated benchmark tiers remain outstanding.
       streams and grouped ordered joins.
 - [x] Stream the joined probe side with build sides materialized at the same leased snapshot.
 - [x] Spill unordered grouped state through the value-carrying partitions.
-- [ ] Stream keyed-mutation scan inputs and add the remaining spill shapes: hash-join build sides
-      and DISTINCT.
+- [x] Add SELECT DISTINCT as compiled grouping and HAVING as shared group-finishing filters.
+- [ ] Stream keyed-mutation scan inputs and spill hash-join build sides.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

@@ -79,6 +79,7 @@ export interface CompiledQuery {
   select: SelectItem[];
   predicates: Predicate[];
   groupBy: Expression[];
+  having: Predicate[];
   orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
   limit?: number;
 }
@@ -90,7 +91,16 @@ interface Token {
   text: string;
 }
 
-const clauseKeywords = new Set(["WHERE", "GROUP", "ORDER", "LIMIT", "JOIN", "INNER", "LEFT"]);
+const clauseKeywords = new Set([
+  "WHERE",
+  "GROUP",
+  "HAVING",
+  "ORDER",
+  "LIMIT",
+  "JOIN",
+  "INNER",
+  "LEFT",
+]);
 const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
 
 export function compileQuery(sql: string): CompiledQuery {
@@ -119,6 +129,7 @@ export function referencedColumns(
     ...plan.joins.flatMap((join) => [join.left, join.right]),
     ...plan.predicates.flatMap((predicate) => [predicate.left, predicate.right]),
     ...plan.groupBy,
+    ...plan.having.flatMap((predicate) => [predicate.left, predicate.right]),
   ];
   const collect = (expression: Expression, allowOutputAlias: boolean) => {
     for (const reference of expressionColumns(expression)) {
@@ -325,7 +336,17 @@ export function executeRowQuery(
       group.push(context);
       groups.set(key, group);
     }
-    rows = [...groups.values()].map((group) => project(plan.select, group[0] ?? {}, group));
+    rows = [...groups.values()]
+      .filter((group) =>
+        plan.having.every((predicate) =>
+          comparisonHolds(
+            predicate.operator,
+            evaluate(predicate.left, group[0] ?? {}, group),
+            evaluate(predicate.right, group[0] ?? {}, group),
+          ),
+        ),
+      )
+      .map((group) => project(plan.select, group[0] ?? {}, group));
   } else {
     rows = contexts.map((context) => project(plan.select, context));
   }
@@ -488,8 +509,18 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
 }
 
 function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
-  const leftValue = evaluate(predicate.left, context);
-  const rightValue = evaluate(predicate.right, context);
+  return comparisonHolds(
+    predicate.operator,
+    evaluate(predicate.left, context),
+    evaluate(predicate.right, context),
+  );
+}
+
+function comparisonHolds(
+  operator: ComparisonOperator,
+  leftValue: unknown,
+  rightValue: unknown,
+): boolean {
   if (
     leftValue === null ||
     leftValue === undefined ||
@@ -499,12 +530,12 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
     return false;
   const left = comparable(leftValue);
   const right = comparable(rightValue);
-  if (predicate.operator === "=") return left === right;
-  if (predicate.operator === "!=" || predicate.operator === "<>") return left !== right;
+  if (operator === "=") return left === right;
+  if (operator === "!=" || operator === "<>") return left !== right;
   const comparison = compareValues(left, right);
-  if (predicate.operator === ">") return comparison > 0;
-  if (predicate.operator === ">=") return comparison >= 0;
-  if (predicate.operator === "<") return comparison < 0;
+  if (operator === ">") return comparison > 0;
+  if (operator === ">=") return comparison >= 0;
+  if (operator === "<") return comparison < 0;
   return comparison <= 0;
 }
 
@@ -609,6 +640,11 @@ class Parser {
 
   parse(sql: string): CompiledQuery {
     this.#keyword("SELECT");
+    let distinct = false;
+    if (this.#isKeyword("DISTINCT")) {
+      this.#keyword("DISTINCT");
+      distinct = true;
+    }
     const select = this.#selectList();
     this.#keyword("FROM");
     const base = this.#source();
@@ -646,6 +682,43 @@ class Parser {
       this.#keyword("BY");
       groupBy.push(...this.#expressionList());
     }
+    if (distinct) {
+      if (select.some((item) => item.expression.kind === "wildcard"))
+        throw new TypeError("SELECT DISTINCT * is not supported");
+      if (select.some((item) => hasAggregate(item.expression)))
+        throw new TypeError("SELECT DISTINCT cannot be combined with aggregate functions");
+      if (groupBy.length > 0)
+        throw new TypeError("SELECT DISTINCT cannot be combined with GROUP BY");
+      // DISTINCT is grouping by every selected expression, so it reuses the grouped executor,
+      // its value-carrying spill, and streamed scan inputs unchanged.
+      groupBy.push(...select.map((item) => item.expression));
+    }
+    const having: Predicate[] = [];
+    if (this.#isKeyword("HAVING")) {
+      this.#keyword("HAVING");
+      if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
+      for (;;) {
+        const left = this.#expression();
+        const operator = this.#comparison();
+        const right = this.#expression();
+        having.push({ left, operator, right });
+        if (!this.#isKeyword("AND")) break;
+        this.#keyword("AND");
+      }
+      const grouped = groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
+      if (!grouped) throw new TypeError("HAVING requires GROUP BY or aggregate functions");
+      const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
+      for (const predicate of having) {
+        for (const side of [predicate.left, predicate.right]) {
+          if (hasAggregate(side)) continue;
+          if (expressionColumns(side).length === 0) continue;
+          if (groupExpressions.has(JSON.stringify(side))) continue;
+          throw new TypeError(
+            "HAVING conditions must use aggregates, literals, or GROUP BY expressions",
+          );
+        }
+      }
+    }
     const orderBy: CompiledQuery["orderBy"] = [];
     if (this.#isKeyword("ORDER")) {
       this.#keyword("ORDER");
@@ -676,6 +749,7 @@ class Parser {
       select,
       predicates,
       groupBy,
+      having,
       orderBy,
       ...(limit === undefined ? {} : { limit }),
     };

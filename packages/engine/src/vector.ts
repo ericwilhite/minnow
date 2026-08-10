@@ -171,6 +171,7 @@ interface BoundPlan {
   readonly scanSource: number;
   readonly joins: readonly BoundJoin[];
   readonly predicates: readonly BoundPredicate[];
+  readonly having: readonly BoundPredicate[];
   readonly groupBy: readonly BoundExpression[];
   readonly groupIndexBySignature: ReadonlyMap<string, number>;
   readonly aggregates: readonly AggregateSpec[];
@@ -463,6 +464,11 @@ function bindPlan(
     operator: predicate.operator,
     right: bind(predicate.right),
   }));
+  const having = plan.having.map((predicate) => ({
+    left: bind(predicate.left),
+    operator: predicate.operator,
+    right: bind(predicate.right),
+  }));
   const standardJoins = plan.joins.map((join, joinIndex) => {
     const source = joinIndex + 1;
     const left = bind(join.left);
@@ -504,6 +510,7 @@ function bindPlan(
     scanSource: 0,
     joins: standardJoins,
     predicates,
+    having,
     groupBy,
     groupIndexBySignature,
     aggregates: aggregateSpecs,
@@ -1358,6 +1365,7 @@ function executeMetadataCount(
     plan.groupBy.length > 0 ||
     plan.joins.length > 0 ||
     plan.predicates.length > 0 ||
+    plan.having.length > 0 ||
     plan.aggregates.length === 0 ||
     plan.aggregates.some(
       (aggregate) => aggregate.name !== "COUNT" || aggregate.argument.kind !== "wildcard",
@@ -1726,6 +1734,17 @@ function finishGroups(
 ): QueryRow[] {
   const rows: QueryRow[] = [];
   for (const group of groups) {
+    if (
+      !plan.having.every((predicate) =>
+        comparisonValue(
+          predicate.operator,
+          evaluateFinalExpression(plan, predicate.left, group),
+          evaluateFinalExpression(plan, predicate.right, group),
+        ),
+      )
+    ) {
+      continue;
+    }
     const row = Object.fromEntries(
       plan.select.map((item) => [
         item.alias,

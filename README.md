@@ -140,9 +140,13 @@ request when the document becomes hidden or the page fires `pagehide`. This is a
 an unload-time durability guarantee.
 
 `query()` and `prepareQuery()` are the public read-only SQL API. The current intentionally limited SQL
-surface supports `SELECT`, aliases, inner and left equi-joins, `WHERE` comparisons joined by
-`AND`, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `ROUND`, `GROUP BY`, multi-column `ORDER BY`,
-and `LIMIT`. It rejects multiple statements, comments, writes, unknown or ambiguous columns, and
+surface supports `SELECT` with `DISTINCT`, aliases, inner and left equi-joins, `WHERE` comparisons
+joined by `AND`, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `ROUND`, `GROUP BY`, `HAVING`
+conditions over aggregates, literals, and group keys, multi-column `ORDER BY`,
+and `LIMIT`. `SELECT DISTINCT` compiles into grouping by every selected expression, so it reuses
+the grouped executor, its partitioned spill, and streamed scan inputs; `DISTINCT *`, `DISTINCT`
+with aggregates, and `DISTINCT` with explicit `GROUP BY` or `HAVING` are rejected explicitly.
+It rejects multiple statements, comments, writes, unknown or ambiguous columns, and
 unsupported functions instead of silently interpreting them. A prepared query materializes only
 its referenced columns at one manifest version, remains stable across later commits, and must be
 closed when no longer needed. This is a correctness-first SQL subset, not a claim of full SQL-92
@@ -242,7 +246,8 @@ reserved per row and flushed in fixed 512-row scan chunks. Budgeted grouped plan
 concatenation—so peak accounted group state is bounded by one partition rather than the whole
 key space; their group order follows partition processing rather than first-appearance order,
 which SQL leaves unspecified without `ORDER BY`. Global aggregates keep bounded in-memory
-accumulators, and hash-join build sides and DISTINCT still have no spill path.
+accumulators, `DISTINCT` and `HAVING` ride the same grouped machinery, and hash-join build sides
+remain the one operator input with no spill path.
 
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Prepared queries and
 every non-streamed shape still materialize each projected typed input in full before the vector
@@ -253,10 +258,10 @@ ranges in one pass, avoiding a second live-row array and per-column source-array
 map and source slots remain whole-plan state. The model
 does not include returned result objects, properties, group-key and retained `MIN`/`MAX` reference
 containers, JavaScript array-capacity overhead, spill serialization/native IndexedDB work, returned
-row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—hash-join build sides
-and DISTINCT—still fail on budget exhaustion. Phase 7 remains open
+row lifetime, or engine/browser allocator overhead. Hash-join build sides are the remaining
+unspillable operator input and still fail on budget exhaustion. Phase 7 remains open
 for streamed mutation scan inputs, byte-addressable aggregate/result containers, complete
-physical accounting, and those remaining spill paths.
+physical accounting, and that remaining spill path.
 
 Phase 8A adds conservative row-group skipping for a single append/base table with `AND`-combined
 number or datetime column-to-literal comparisons. Preparation checksum-validates and physically

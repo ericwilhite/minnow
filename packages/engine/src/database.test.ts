@@ -5002,6 +5002,32 @@ for (const implementation of implementations()) {
     expect([...unorderedGroups.rows].sort(byV)).toEqual([...unorderedReference.rows].sort(byV));
     expect(unorderedGroups.rows).toHaveLength(rowCount);
 
+    const distinct = await database.query("SELECT DISTINCT v FROM streamed_rows", {
+      executionMemoryBudgetBytes: budget,
+      spillPageRows: 512,
+    });
+    expect(distinct.rows).toHaveLength(rowCount);
+    const distinctTags = await database.query(
+      "SELECT DISTINCT tag FROM streamed_rows ORDER BY tag",
+      { executionMemoryBudgetBytes: budget, spillPageRows: 512 },
+    );
+    expect(distinctTags.rows).toEqual(
+      (await database.query("SELECT DISTINCT tag FROM streamed_rows ORDER BY tag")).rows,
+    );
+
+    const having = await database.query(
+      "SELECT tag, COUNT(*) AS count FROM streamed_rows GROUP BY tag HAVING COUNT(*) > 3000 ORDER BY tag",
+      { executionMemoryBudgetBytes: budget, spillPageRows: 512 },
+    );
+    expect(having.rows).toEqual(
+      (
+        await database.query(
+          "SELECT tag, COUNT(*) AS count FROM streamed_rows GROUP BY tag HAVING COUNT(*) > 3000 ORDER BY tag",
+        )
+      ).rows,
+    );
+    expect(having.rows.length).toBeGreaterThan(0);
+
     expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
     store.close();
   }, 30_000);
