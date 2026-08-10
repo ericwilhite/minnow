@@ -84,6 +84,9 @@ function foldExpression(expression: Expression): Expression {
         ...order,
         expression: foldExpression(order.expression),
       })),
+      ...(expression.argument === undefined
+        ? {}
+        : { argument: foldExpression(expression.argument) }),
     };
   }
   if (expression.kind === "condition" || expression.kind === "logical") {
@@ -352,6 +355,7 @@ function referencedOutputAliases(
       expression.orderBy.forEach((order) => {
         visit(order.expression);
       });
+      if (expression.argument !== undefined) visit(expression.argument);
     }
   };
   for (const item of block.select) visit(item.expression);

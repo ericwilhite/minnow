@@ -66,15 +66,29 @@ export type Expression =
       name: WindowFunctionName;
       partitionBy: Expression[];
       orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
+      argument?: Expression;
     };
 
-export type WindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK";
+export type WindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK" | AggregateName;
 
 export interface WindowSpec {
   alias: string;
   name: WindowFunctionName;
   partitionAliases: string[];
   orderAliases: Array<{ alias: string; direction: "asc" | "desc" }>;
+  /** Hidden inner alias of an aggregate window's argument; absent for COUNT(*) and rankings. */
+  argumentAlias?: string;
+}
+
+/** The output column type of one window: rankings and most aggregates count, MIN/MAX carry. */
+export function windowOutputType(
+  window: WindowSpec,
+  innerSchema: readonly SqlColumnSchema[],
+): SqlColumnType {
+  if ((window.name === "MIN" || window.name === "MAX") && window.argumentAlias !== undefined) {
+    return innerSchema.find(({ name }) => name === window.argumentAlias)?.type ?? "number";
+  }
+  return "number";
 }
 
 export interface SelectItem {
@@ -97,6 +111,8 @@ export interface JoinPlan extends TableSource {
   kind: "inner" | "left";
   left: Expression;
   right: Expression;
+  /** General ON condition for non-equi or multi-key joins; left/right are inert placeholders. */
+  on?: Expression;
 }
 
 export type SetOperator = "union" | "union all" | "intersect" | "except";
@@ -519,7 +535,7 @@ export function referencedColumns(
   const outputAliases = new Set(plan.select.map((item) => item.alias));
   const expressions = [
     ...plan.select.map((item) => item.expression),
-    ...plan.joins.flatMap((join) => [join.left, join.right]),
+    ...plan.joins.flatMap((join) => [join.left, join.right, ...(join.on === undefined ? [] : [join.on])]),
     ...plan.predicates.flatMap((predicate) => [predicate.left, predicate.right]),
     ...plan.groupBy,
     ...plan.having.flatMap((predicate) => [predicate.left, predicate.right]),
@@ -768,6 +784,81 @@ function childExpressions(expression: Expression): Expression[] {
   return [];
 }
 
+/**
+ * Computes one aggregate window over partition-sorted row indexes. The frame is the SQL default:
+ * without OVER ordering every partition row shares the whole-partition aggregate; with ordering
+ * each row sees the running aggregate from the partition start through its ordering peers
+ * (RANGE UNBOUNDED PRECEDING TO CURRENT ROW). State accumulates incrementally, so a partition
+ * costs one pass regardless of peer-group count.
+ */
+function applyAggregateWindow(
+  rows: QueryRow[],
+  indexes: readonly number[],
+  window: WindowSpec,
+  samePartition: (left: number, right: number) => boolean,
+  sameOrderKeys: (left: number, right: number) => boolean,
+): void {
+  let start = 0;
+  while (start < indexes.length) {
+    let end = start + 1;
+    while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
+      end += 1;
+    }
+    let consumed = start;
+    let rowsInFrame = 0;
+    let nonNullCount = 0;
+    let sum = 0;
+    let best: unknown;
+    const advance = (to: number): void => {
+      for (; consumed < to; consumed += 1) {
+        rowsInFrame += 1;
+        if (window.argumentAlias === undefined) continue;
+        const value = rows[indexes[consumed] ?? -1]?.[window.argumentAlias] ?? null;
+        if (value === null) continue;
+        nonNullCount += 1;
+        if (window.name === "SUM" || window.name === "AVG") sum += numeric(value);
+        else if (window.name === "MIN") {
+          if (best === undefined || compareValues(value, best) < 0) best = value;
+        } else if (window.name === "MAX") {
+          if (best === undefined || compareValues(value, best) > 0) best = value;
+        }
+      }
+    };
+    const current = (): unknown => {
+      if (window.name === "COUNT") {
+        return window.argumentAlias === undefined ? rowsInFrame : nonNullCount;
+      }
+      if (nonNullCount === 0) return null;
+      if (window.name === "SUM") return sum;
+      if (window.name === "AVG") return sum / nonNullCount;
+      return best ?? null;
+    };
+    const assign = (from: number, to: number): void => {
+      const value = asQueryValue(current());
+      for (let position = from; position < to; position += 1) {
+        const row = rows[indexes[position] ?? -1];
+        if (row !== undefined) row[window.alias] = value;
+      }
+    };
+    if (window.orderAliases.length === 0) {
+      advance(end);
+      assign(start, end);
+    } else {
+      let groupStart = start;
+      while (groupStart < end) {
+        let groupEnd = groupStart + 1;
+        while (groupEnd < end && sameOrderKeys(indexes[groupStart] ?? 0, indexes[groupEnd] ?? 0)) {
+          groupEnd += 1;
+        }
+        advance(groupEnd);
+        assign(groupStart, groupEnd);
+        groupStart = groupEnd;
+      }
+    }
+    start = end;
+  }
+}
+
 function containsDistinctCount(expression: Expression): boolean {
   if (expression.kind === "call" && expression.distinct === true) return true;
   return childExpressions(expression).some(containsDistinctCount);
@@ -828,6 +919,14 @@ export function applyWindowFunctions(
             comparable(rows[right]?.[alias] ?? null),
           ) === 0,
       );
+    if (
+      window.name !== "ROW_NUMBER" &&
+      window.name !== "RANK" &&
+      window.name !== "DENSE_RANK"
+    ) {
+      applyAggregateWindow(rows, indexes, window, samePartition, sameOrderKeys);
+      continue;
+    }
     let rowNumber = 0;
     let rank = 0;
     let denseRank = 0;
@@ -1003,6 +1102,22 @@ function orderOutputName(
 }
 
 function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]): RowContext[] {
+  if (join.on !== undefined) {
+    const condition = join.on;
+    const joined: RowContext[] = [];
+    for (const context of contexts) {
+      let matched = false;
+      for (const row of rows) {
+        const candidate = { ...context, [join.alias]: row };
+        if (evaluateBooleanExpression(condition, (nested) => evaluate(nested, candidate)) === true) {
+          matched = true;
+          joined.push(candidate);
+        }
+      }
+      if (!matched && join.kind === "left") joined.push({ ...context, [join.alias]: undefined });
+    }
+    return joined;
+  }
   const leftAliases = expressionAliases(join.left);
   const rightAliases = expressionAliases(join.right);
   const rightExpression = rightAliases.has(join.alias) ? join.right : join.left;
@@ -1360,7 +1475,7 @@ function validateGrouping(plan: CompiledQuery): void {
     }
   }
   const forbiddenAggregates = [
-    ...plan.joins.flatMap((join) => [join.left, join.right]),
+    ...plan.joins.flatMap((join) => [join.left, join.right, ...(join.on === undefined ? [] : [join.on])]),
     ...plan.predicates.flatMap((predicate) => [predicate.left, predicate.right]),
     ...plan.groupBy,
   ];
@@ -1701,23 +1816,60 @@ class Parser {
     }
     const select = this.#selectList();
     this.#keyword("FROM");
-    const base = this.#source();
+    let base = this.#source();
     const joins: JoinPlan[] = [];
-    while (this.#isKeyword("JOIN") || this.#isKeyword("INNER") || this.#isKeyword("LEFT")) {
+    let rightJoins = 0;
+    while (
+      this.#isKeyword("JOIN") ||
+      this.#isKeyword("INNER") ||
+      this.#isKeyword("LEFT") ||
+      this.#isKeyword("RIGHT")
+    ) {
       let kind: JoinPlan["kind"] = "inner";
+      let right = false;
       if (this.#isKeyword("INNER")) this.#keyword("INNER");
       else if (this.#isKeyword("LEFT")) {
         this.#keyword("LEFT");
         kind = "left";
+      } else if (this.#isKeyword("RIGHT")) {
+        this.#keyword("RIGHT");
+        right = true;
+        rightJoins += 1;
       }
+      if (this.#isKeyword("OUTER")) this.#keyword("OUTER");
       this.#keyword("JOIN");
       const source = this.#source();
       this.#keyword("ON");
       const condition = this.#expression();
-      if (condition.kind !== "condition" || condition.operator !== "=") {
-        throw new TypeError("Only single-equality JOIN conditions are supported");
+      if (condition.kind === "condition" && condition.operator === "=") {
+        joins.push({ ...source, kind, left: condition.left, right: condition.right });
+      } else {
+        // Any other boolean condition becomes a nested-loop join.
+        joins.push({
+          ...source,
+          kind,
+          left: { kind: "literal", value: null },
+          right: { kind: "literal", value: null },
+          on: condition,
+        });
       }
-      joins.push({ ...source, kind, left: condition.left, right: condition.right });
+      if (right) {
+        // A RIGHT JOIN is the mirrored LEFT JOIN; with a single join the sources just swap.
+        if (joins.length !== 1 || rightJoins !== 1) {
+          throw new TypeError("RIGHT JOIN is only supported as the sole join");
+        }
+        if (select.some((item) => item.expression.kind === "wildcard")) {
+          throw new TypeError("RIGHT JOIN cannot be combined with SELECT *");
+        }
+        const [only] = joins;
+        if (only !== undefined) {
+          const { kind: joinKind, left, right: rightSide, ...joinSource } = only;
+          void joinKind;
+          const previousBase = base;
+          base = joinSource;
+          joins[0] = { ...previousBase, kind: "left", left, right: rightSide, ...(only.on === undefined ? {} : { on: only.on }) };
+        }
+      }
     }
     const predicates: Predicate[] = [];
     if (this.#isKeyword("WHERE")) {
@@ -1947,7 +2099,19 @@ class Parser {
         innerSelect.push({ expression: order.expression, alias });
         return { alias, direction: order.direction };
       });
-      windows.push({ alias: item.alias, name: expression.name, partitionAliases, orderAliases });
+      let argumentAlias: string | undefined;
+      if (expression.argument !== undefined) {
+        hidden += 1;
+        argumentAlias = `(window ${String(hidden)})`;
+        innerSelect.push({ expression: expression.argument, alias: argumentAlias });
+      }
+      windows.push({
+        alias: item.alias,
+        name: expression.name,
+        partitionAliases,
+        orderAliases,
+        ...(argumentAlias === undefined ? {} : { argumentAlias }),
+      });
     }
     if (innerSelect.length === 0) {
       innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });
@@ -2244,15 +2408,7 @@ class Parser {
       if (upper === "ROW_NUMBER" || upper === "RANK" || upper === "DENSE_RANK") {
         this.#expectPunctuation(")");
         this.#keyword("OVER");
-        this.#expectPunctuation("(");
-        const partitionBy: Expression[] = [];
-        if (this.#isKeyword("PARTITION")) {
-          this.#keyword("PARTITION");
-          this.#keyword("BY");
-          partitionBy.push(...this.#expressionList());
-        }
-        const orderBy = this.#orderByClause();
-        this.#expectPunctuation(")");
+        const { partitionBy, orderBy } = this.#overClause();
         return { kind: "window", name: upper, partitionBy, orderBy };
       }
       const name = upper as AggregateName | "ROUND";
@@ -2276,11 +2432,46 @@ class Parser {
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "ROUND" && (args.length < 1 || args.length > 2))
         throw new TypeError("ROUND requires one or two arguments");
+      if (aggregateNames.has(name as AggregateName) && this.#isKeyword("OVER")) {
+        if (distinct) throw new TypeError("DISTINCT window aggregates are not supported");
+        this.#keyword("OVER");
+        const { partitionBy, orderBy } = this.#overClause();
+        const argument = args[0];
+        if (argument !== undefined && hasAggregate(argument)) {
+          throw new TypeError("Window aggregate arguments cannot contain aggregates");
+        }
+        return {
+          kind: "window",
+          name: name as AggregateName,
+          partitionBy,
+          orderBy,
+          ...(argument === undefined || argument.kind === "wildcard" ? {} : { argument }),
+        };
+      }
       return { kind: "call", name, arguments: args, ...(distinct ? { distinct: true } : {}) };
     }
     let reference = identifier;
     if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
     return { kind: "column", reference };
+  }
+
+  #overClause(): {
+    partitionBy: Expression[];
+    orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
+  } {
+    this.#expectPunctuation("(");
+    const partitionBy: Expression[] = [];
+    if (this.#isKeyword("PARTITION")) {
+      this.#keyword("PARTITION");
+      this.#keyword("BY");
+      partitionBy.push(...this.#expressionList());
+    }
+    const orderBy = this.#orderByClause();
+    if (this.#isKeyword("ROWS") || this.#isKeyword("RANGE") || this.#isKeyword("GROUPS")) {
+      throw new TypeError("Window frames are not supported");
+    }
+    this.#expectPunctuation(")");
+    return { partitionBy, orderBy };
   }
 
   #comparison(): ComparisonOperator {

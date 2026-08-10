@@ -461,9 +461,11 @@ describe("public SQL queries", () => {
         "SELECT region, COUNT(*) AS c, ROW_NUMBER() OVER () AS rn FROM rows GROUP BY region",
       ),
     ).toThrow("Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING");
-    expect(() => compileQuery("SELECT SUM(amount) OVER () AS s FROM rows")).toThrow(
-      "Expected FROM, found OVER",
+    const windowTotal = executeQuery(
+      compileQuery("SELECT region, SUM(amount) OVER () AS s FROM rows ORDER BY region"),
+      input,
     );
+    expect(windowTotal.rows.every((row) => row.s === 102)).toBe(true);
   });
 
   it("combines UNION and UNION ALL members in both executors", () => {

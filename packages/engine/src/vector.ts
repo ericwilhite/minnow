@@ -178,6 +178,8 @@ interface BoundJoin {
   readonly probe: BoundExpression;
   readonly build: BoundExpression;
   readonly lookup: JoinLookup;
+  /** Nested-loop fallback for non-equi or multi-key ON conditions; lookup is unused when set. */
+  readonly loop?: { condition: BoundExpression; rowCount: number };
 }
 
 interface BoundSelectItem {
@@ -509,6 +511,22 @@ function bindPlan(
   }));
   const standardJoins = plan.joins.map((join, joinIndex) => {
     const source = joinIndex + 1;
+    if (join.on !== undefined) {
+      const condition = bind(join.on);
+      if ([...expressionSources(condition)].some((used) => used > source)) {
+        throw new TypeError(`JOIN condition for ${join.alias} references a later table`);
+      }
+      const table = required(sourceTables[source], `JOIN table is missing: ${join.table}`);
+      const placeholder: BoundExpression = { kind: "literal", value: null, signature: "" };
+      return {
+        kind: join.kind,
+        buildSource: source,
+        probe: placeholder,
+        build: placeholder,
+        lookup: { unique: false, firstRow: () => -1, nextRow: () => -1 },
+        loop: { condition, rowCount: table.rowCount },
+      };
+    }
     const left = bind(join.left);
     const right = bind(join.right);
     const rightUsesBuild = expressionSources(right).has(source);
@@ -1589,6 +1607,10 @@ function* joinBatches(
   join: BoundJoin,
   memory: QueryMemoryContext,
 ): Generator<BatchRows> {
+  if (join.loop !== undefined) {
+    yield* loopJoinBatches(plan, input, join, join.loop, memory);
+    return;
+  }
   if (join.lookup.unique) {
     yield joinUniqueBatch(plan, input, join, memory);
     return;
@@ -1647,6 +1669,90 @@ function* joinBatches(
     }
     yield* emit();
   } finally {
+    outputMemory?.close();
+  }
+}
+
+/**
+ * Nested-loop join for general ON conditions: every probe row scans the whole build table and
+ * keeps the pairs whose condition evaluates true under three-valued logic. Output batches reuse
+ * the hash-join fan-out format, so downstream consumption is identical; cost is probe x build.
+ */
+function* loopJoinBatches(
+  plan: BoundPlan,
+  input: BatchRows,
+  join: BoundJoin,
+  loop: { condition: BoundExpression; rowCount: number },
+  memory: QueryMemoryContext,
+): Generator<BatchRows> {
+  let outputMemory: QueryMemoryContext | undefined;
+  const scratchReservation = memory.reserve(
+    safeMemoryProduct(
+      plan.sourceTables.length,
+      Int32Array.BYTES_PER_ELEMENT,
+      "Loop join scratch row indexes",
+    ),
+    "Loop join scratch row indexes",
+  );
+  try {
+    const scratch = new Int32Array(plan.sourceTables.length);
+    scratch.fill(-1);
+    let outputRows: Int32Array[] | undefined;
+    let outputLength = 0;
+    const ensureOutput = (): Int32Array[] => {
+      if (outputRows !== undefined) return outputRows;
+      outputMemory = memory.createChild();
+      outputMemory.reserve(
+        safeMemoryProduct(
+          safeMemoryProduct(
+            plan.sourceTables.length,
+            DEFAULT_BATCH_ROWS,
+            "Join fan-out row-index count",
+          ),
+          Int32Array.BYTES_PER_ELEMENT,
+          "Join fan-out row indexes",
+        ),
+        "Join fan-out row indexes",
+      );
+      outputRows = plan.sourceTables.map(() => new Int32Array(DEFAULT_BATCH_ROWS));
+      return outputRows;
+    };
+    const emit = function* (): Generator<BatchRows> {
+      if (outputRows === undefined || outputMemory === undefined || outputLength === 0) return;
+      const batch = {
+        length: outputLength,
+        rowsBySource: outputRows,
+        memory: outputMemory,
+      };
+      outputRows = undefined;
+      outputMemory = undefined;
+      outputLength = 0;
+      yield batch;
+    };
+    for (let row = 0; row < input.length; row += 1) {
+      for (let source = 0; source < join.buildSource; source += 1) {
+        scratch[source] = input.rowsBySource[source]?.[row] ?? -1;
+      }
+      let matched = false;
+      for (let buildRow = 0; buildRow < loop.rowCount; buildRow += 1) {
+        scratch[join.buildSource] = buildRow;
+        const holds =
+          booleanTruth(loop.condition, (nested) => evaluateExpression(nested, scratch)) === true;
+        if (!holds) continue;
+        matched = true;
+        appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, buildRow);
+        outputLength += 1;
+        if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
+      }
+      if (!matched && join.kind === "left") {
+        appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, -1);
+        outputLength += 1;
+        if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
+      }
+    }
+    yield* emit();
+  } finally {
+    scratchReservation.release();
     outputMemory?.close();
   }
 }

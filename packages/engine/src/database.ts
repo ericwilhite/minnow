@@ -67,6 +67,7 @@ import {
   inferBlockSchema,
   referencedColumns,
   subqueryResolutionSteps,
+  windowOutputType,
   type ComparisonOperator,
   type CompiledQuery,
   type Expression,
@@ -1288,7 +1289,7 @@ export class BrowserDatabase {
           ...innerSchema,
           ...source.windowed.windows.map((window) => ({
             name: window.alias,
-            type: "number" as const,
+            type: windowOutputType(window, innerSchema),
           })),
         ];
         typedSchemas.set(source.table, schema);
@@ -5464,6 +5465,7 @@ export function chooseJoinOrder(
   if (
     plan.joins.length !== 1 ||
     join?.kind !== "inner" ||
+    join.on !== undefined ||
     plan.select[0]?.expression.kind === "wildcard"
   ) {
     return plan;
