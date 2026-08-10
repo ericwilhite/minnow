@@ -4980,9 +4980,65 @@ for (const implementation of implementations()) {
     );
     expect(ordered.rows).toEqual(orderedReference.rows);
 
+    const groupedOrdered = await database.query(
+      "SELECT tag, COUNT(*) AS count, MIN(v) AS low, MAX(v) AS high, AVG(v) AS mean FROM streamed_rows GROUP BY tag ORDER BY tag LIMIT 4",
+      { executionMemoryBudgetBytes: budget, spillPageRows: 512 },
+    );
+    const groupedOrderedReference = await database.query(
+      "SELECT tag, COUNT(*) AS count, MIN(v) AS low, MAX(v) AS high, AVG(v) AS mean FROM streamed_rows GROUP BY tag ORDER BY tag LIMIT 4",
+    );
+    expect(groupedOrdered.rows).toEqual(groupedOrderedReference.rows);
+
     expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
     store.close();
   }, 30_000);
+}
+
+for (const implementation of implementations()) {
+  it(`${implementation.name} spills grouped ordered joins through value-carrying partitions`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 256, compression: "raw" });
+    await database.createTable({
+      name: "join_orders",
+      columns: [
+        { name: "customer_id", type: "number" },
+        { name: "total", type: "number" },
+      ],
+    });
+    await database.createTable({
+      name: "join_customers",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "segment", type: "string" },
+      ],
+    });
+    const orderCount = 3_000;
+    await database.insertBatch("join_orders", {
+      columns: {
+        customer_id: Array.from({ length: orderCount }, (_, index) => index % 40),
+        total: Array.from({ length: orderCount }, (_, index) => index),
+      },
+    });
+    await database.insertBatch("join_customers", {
+      columns: {
+        id: Array.from({ length: 40 }, (_, index) => index),
+        segment: Array.from({ length: 40 }, (_, index) => `segment-${String(index % 6)}`),
+      },
+    });
+
+    const sql =
+      "SELECT c.segment, COUNT(*) AS orders, SUM(o.total) AS revenue FROM join_orders o JOIN join_customers c ON c.id = o.customer_id GROUP BY c.segment ORDER BY revenue DESC LIMIT 5";
+    const spilled = await database.query(sql, {
+      executionMemoryBudgetBytes: 400_000,
+      spillToStorage: true,
+      spillPageRows: 256,
+    });
+    const reference = await database.query(sql);
+    expect(spilled.rows).toEqual(reference.rows);
+    expect(spilled.rows).toHaveLength(5);
+    expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
+    store.close();
+  });
 }
 
 for (const implementation of implementations()) {

@@ -268,11 +268,7 @@ export function prepareVectorQuery(
       async executeAsync(executionOptions = {}) {
         if (closed) throw new Error("Prepared vector query is closed");
         const canSpillSort = bound.orderBy.length > 0 && !bound.grouped;
-        const canSpillHash =
-          bound.orderBy.length > 0 &&
-          bound.grouped &&
-          bound.groupBy.length > 0 &&
-          bound.joins.length === 0;
+        const canSpillHash = bound.orderBy.length > 0 && bound.grouped && bound.groupBy.length > 0;
         if (executionOptions.spillStore === undefined || (!canSpillSort && !canSpillHash)) {
           if (executionOptions.loadScanWindow === undefined) return this.execute();
           const executionMemory = retainedMemory.createChild();
@@ -906,43 +902,88 @@ async function executeBoundPlanWithHashSpill(
   }
   const partitionCount = 64;
   const columns = plan.select.map((item) => item.alias);
+  const groupColumnNames = plan.groupBy.map((_, index) => `g${String(index)}`);
+  const aggregateColumnNames = plan.aggregates.map((_, index) => `a${String(index)}`);
+  const spillColumns = [...groupColumnNames, ...aggregateColumnNames];
   const ownerId = createSpillOwnerId();
   const partitionPages = new Uint32Array(partitionCount);
   let runSequence = 0;
   try {
     const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-    if (scanRows > 0xffffffff) throw new RangeError("Hash spill row indexes exceed uint32");
-    for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
-      const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
-      const scanRowsBySource = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
-      const scan = scanRowsBySource[plan.scanSource];
-      if (scan === undefined) continue;
-      for (let index = 0; index < length; index += 1) scan[index] = start + index;
-      const batch: BatchRows = { length, rowsBySource: scanRowsBySource };
-      const partitionRows = new Map<number, number[]>();
-      for (let row = 0; row < length; row += 1) {
-        if (
-          !plan.predicates.every((predicate) => evaluateBatchPredicate(plan, predicate, batch, row))
-        ) {
-          continue;
+    // The chunk bounds buffered evaluated values per flush while keeping partition-page writes
+    // coarse enough for IndexedDB; a floor below the batch size keeps tiny page settings from
+    // multiplying page-write transactions.
+    const scanChunkRows = Math.min(DEFAULT_BATCH_ROWS, Math.max(512, pageRows));
+    for (let start = 0; start < scanRows; start += scanChunkRows) {
+      const length = Math.min(scanChunkRows, scanRows - start);
+      await options.loadScanWindow?.(start, length);
+      const batchMemory = memory.createChild();
+      try {
+        batchMemory.reserve(
+          safeMemoryProduct(
+            safeMemoryProduct(plan.sourceTables.length, length, "Scan batch row-index count"),
+            Int32Array.BYTES_PER_ELEMENT,
+            "Scan batch row indexes",
+          ),
+          "Scan batch row indexes",
+        );
+        const scanRowsBySource = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
+        const scan = scanRowsBySource[plan.scanSource];
+        if (scan === undefined) continue;
+        for (let index = 0; index < length; index += 1) scan[index] = start + index;
+        const partitionBuffers = new Map<number, QueryRow[]>();
+        await spillJoinedBatches(
+          plan,
+          { length, rowsBySource: scanRowsBySource, memory: batchMemory },
+          0,
+          memory,
+          // Each surviving row spills its evaluated group keys and aggregate arguments, so the
+          // partition phase never re-reads source vectors and the scan source may be windowed.
+          async (batch) => {
+            for (let row = 0; row < batch.length; row += 1) {
+              if (
+                !plan.predicates.every((predicate) =>
+                  evaluateBatchPredicate(plan, predicate, batch, row),
+                )
+              ) {
+                continue;
+              }
+              const groupValues = plan.groupBy.map((expression) =>
+                asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
+              );
+              const spillRow: QueryRow = {};
+              for (let index = 0; index < groupValues.length; index += 1) {
+                spillRow[`g${String(index)}`] = groupValues[index] ?? null;
+              }
+              for (let index = 0; index < plan.aggregates.length; index += 1) {
+                const spec = required(plan.aggregates[index], "Aggregate specification is missing");
+                const raw =
+                  spec.argument.kind === "wildcard"
+                    ? 1
+                    : evaluateBatchExpression(plan, spec.argument, batch, row);
+                spillRow[`a${String(index)}`] =
+                  raw === null || raw === undefined ? null : asQueryValue(raw);
+              }
+              batchMemory.reserve(queryRowPayloadBytes(spillRow), "Hash spill value row");
+              const partition = hashQueryValues(groupValues) & (partitionCount - 1);
+              const rows = partitionBuffers.get(partition) ?? [];
+              rows.push(spillRow);
+              partitionBuffers.set(partition, rows);
+            }
+          },
+        );
+        for (const [partition, rows] of partitionBuffers) {
+          const pageIndex = partitionPages[partition] ?? 0;
+          await store.putPage(
+            ownerId,
+            `partition-${String(partition)}`,
+            pageIndex,
+            encodeSpillRows(spillColumns, rows),
+          );
+          partitionPages[partition] = pageIndex + 1;
         }
-        const values = plan.groupBy.map((expression) =>
-          asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
-        );
-        const partition = hashQueryValues(values) & (partitionCount - 1);
-        const indexes = partitionRows.get(partition) ?? [];
-        indexes.push(start + row);
-        partitionRows.set(partition, indexes);
-      }
-      for (const [partition, indexes] of partitionRows) {
-        const pageIndex = partitionPages[partition] ?? 0;
-        await store.putPage(
-          ownerId,
-          `partition-${String(partition)}`,
-          pageIndex,
-          encodeRowIndexes(indexes),
-        );
-        partitionPages[partition] = pageIndex + 1;
+      } finally {
+        batchMemory.close();
       }
     }
 
@@ -958,19 +999,24 @@ async function executeBoundPlanWithHashSpill(
           if (bytes === undefined) throw new Error("Query hash spill page is missing");
           const pageMemory = partitionMemory.createChild();
           try {
-            pageMemory.reserve(bytes.byteLength, "Hash spill row indexes");
-            const rowIndexes = decodeRowIndexes(bytes);
-            const rowsBySource: Int32Array[] = plan.sourceTables.map(() =>
-              new Int32Array(rowIndexes.length).fill(-1),
-            );
-            rowsBySource[plan.scanSource] = rowIndexes;
-            consumeBatch(
-              plan,
-              { length: rowIndexes.length, rowsBySource },
-              groups,
-              [],
-              partitionMemory,
-            );
+            pageMemory.reserve(spillRowsModeledBytes(bytes), "Hash spill value rows");
+            for (const spillRow of decodeSpillRows(spillColumns, bytes)) {
+              const groupValues = groupColumnNames.map((name) => spillRow[name] ?? null);
+              const state =
+                groupValues.length === 1
+                  ? groups.getOrInsertOne(groupKey(groupValues[0] ?? null), () =>
+                      createGroupState([groupValues[0] ?? null], plan, partitionMemory),
+                    )
+                  : groups.getOrInsert(groupValues.map(groupKey), () =>
+                      createGroupState(groupValues, plan, partitionMemory),
+                    );
+              updateAggregatesFromValues(
+                plan,
+                state,
+                aggregateColumnNames.map((name) => spillRow[name] ?? null),
+                partitionMemory,
+              );
+            }
           } finally {
             pageMemory.close();
           }
@@ -1097,24 +1143,6 @@ function hashQueryValues(values: readonly QueryValue[]): number {
     hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
   }
   return hash;
-}
-
-function encodeRowIndexes(indexes: readonly number[]): Uint8Array {
-  const bytes = new Uint8Array(indexes.length * Uint32Array.BYTES_PER_ELEMENT);
-  const view = new DataView(bytes.buffer);
-  indexes.forEach((row, index) => view.setUint32(index * 4, row, true));
-  return bytes;
-}
-
-function decodeRowIndexes(bytes: Uint8Array): Int32Array {
-  if (bytes.byteLength % Uint32Array.BYTES_PER_ELEMENT !== 0) {
-    throw new Error("Query hash spill indexes are invalid");
-  }
-  const rows = new Int32Array(bytes.byteLength / Uint32Array.BYTES_PER_ELEMENT);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  for (let index = 0; index < rows.length; index += 1)
-    rows[index] = view.getUint32(index * 4, true);
-  return rows;
 }
 
 async function spillJoinedBatches(
@@ -1633,35 +1661,57 @@ function updateAggregates(
       spec.argument.kind === "wildcard"
         ? 1
         : evaluateBatchExpression(plan, spec.argument, batch, row);
-    if (value === null || value === undefined) continue;
-    state.counts[index] = (state.counts[index] ?? 0) + 1;
-    if (spec.name === "SUM" || spec.name === "AVG") {
-      state.sums[index] = (state.sums[index] ?? 0) + numeric(value);
-    } else if (
-      spec.name === "MIN" &&
-      (state.values[index] === undefined || compareValues(value, state.values[index]) < 0)
-    ) {
-      const replacementValue = asQueryValue(value);
-      const replacement = memory.reserve(
-        queryValuePayloadBytes(replacementValue),
-        "MIN aggregate value",
-      );
-      state.valueReservations[index]?.release();
-      state.valueReservations[index] = replacement;
-      state.values[index] = replacementValue;
-    } else if (
-      spec.name === "MAX" &&
-      (state.values[index] === undefined || compareValues(value, state.values[index]) > 0)
-    ) {
-      const replacementValue = asQueryValue(value);
-      const replacement = memory.reserve(
-        queryValuePayloadBytes(replacementValue),
-        "MAX aggregate value",
-      );
-      state.valueReservations[index]?.release();
-      state.valueReservations[index] = replacement;
-      state.values[index] = replacementValue;
-    }
+    applyAggregateValue(spec, state, index, value, memory);
+  }
+}
+
+function updateAggregatesFromValues(
+  plan: BoundPlan,
+  state: GroupState,
+  values: readonly unknown[],
+  memory: QueryMemoryContext,
+): void {
+  for (let index = 0; index < plan.aggregates.length; index += 1) {
+    const spec = required(plan.aggregates[index], "Aggregate specification is missing");
+    applyAggregateValue(spec, state, index, values[index], memory);
+  }
+}
+
+function applyAggregateValue(
+  spec: AggregateSpec,
+  state: GroupState,
+  index: number,
+  value: unknown,
+  memory: QueryMemoryContext,
+): void {
+  if (value === null || value === undefined) return;
+  state.counts[index] = (state.counts[index] ?? 0) + 1;
+  if (spec.name === "SUM" || spec.name === "AVG") {
+    state.sums[index] = (state.sums[index] ?? 0) + numeric(value);
+  } else if (
+    spec.name === "MIN" &&
+    (state.values[index] === undefined || compareValues(value, state.values[index]) < 0)
+  ) {
+    const replacementValue = asQueryValue(value);
+    const replacement = memory.reserve(
+      queryValuePayloadBytes(replacementValue),
+      "MIN aggregate value",
+    );
+    state.valueReservations[index]?.release();
+    state.valueReservations[index] = replacement;
+    state.values[index] = replacementValue;
+  } else if (
+    spec.name === "MAX" &&
+    (state.values[index] === undefined || compareValues(value, state.values[index]) > 0)
+  ) {
+    const replacementValue = asQueryValue(value);
+    const replacement = memory.reserve(
+      queryValuePayloadBytes(replacementValue),
+      "MAX aggregate value",
+    );
+    state.valueReservations[index]?.release();
+    state.valueReservations[index] = replacement;
+    state.values[index] = replacementValue;
   }
 }
 

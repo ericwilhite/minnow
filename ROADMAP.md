@@ -343,11 +343,18 @@ Phase 7E-A adds sliding-window scan streaming for budgeted single-table append/b
 `BrowserDatabase.query()` plans without joins. The executor awaits a window load before every scan
 batch in each asynchronous execution path, bound expressions read through per-vector resident
 windows, and the loader decodes whole blocks forward-only, reserving fixed window bytes before
-allocation and measured per-window dictionary bytes before installation. Grouped-and-ordered plans
-keep materialized input because partitioned hash-aggregate spill revisits scan rows by stored index;
-under a budget, streaming takes precedence over Phase 8A pruning. Tests cover a table too large to
+allocation and measured per-window dictionary bytes before installation. Under a budget, streaming
+takes precedence over Phase 8A pruning. Tests cover a table too large to
 materialize inside the budget, grouped and order-spilled parity against the materialized path, and
 the keyed-mutation fallback.
+
+Phase 7E-B makes partitioned hash-aggregate spill value-carrying: partition pages hold each
+surviving row's evaluated group keys and aggregate arguments instead of scan-row indexes, and the
+partition phase accumulates groups from decoded values without re-reading source vectors. This
+removes the streaming exclusion for grouped-and-ordered single-table plans and extends the spill to
+grouped ordered equi-joins with materialized build sides. Buffered values are reserved per row and
+flushed in bounded scan chunks sized from the spill page setting. Unordered grouped state,
+hash-join build sides, and DISTINCT remain unspillable.
 
 Phase 7 remains open. Prepared queries and non-streamed shapes still materialize every projected
 typed input column in full before
@@ -356,12 +363,12 @@ workspace plus its compacted output. Merge planning updates source slots in plac
 spans and column ranges in one pass, but still retains a whole-plan key map and source slots. Returned
 result objects, group-key and retained aggregate
 reference containers, property and JavaScript array-capacity overhead, spill serialization/native
-IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Grouped
-joins, hash joins, and DISTINCT still have no spill path, single-table global aggregates rely on
-streamed input plus bounded accumulator state rather than a spill, and the default remains
-effectively unbounded. Later Phase 7 work must stream joined and mutation inputs, replace the
-remaining boxed growing containers, and cover those operator shapes within a hard working-set
-budget.
+IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Unordered
+grouped state, hash-join build sides, and DISTINCT still have no spill path, single-table global
+aggregates rely on streamed input plus bounded accumulator state rather than a spill, and the
+default remains effectively unbounded. Later Phase 7 work must stream joined and mutation inputs,
+replace the remaining boxed growing containers, and cover those operator shapes within a hard
+working-set budget.
 
 The schema-less empty-table row-adapter compatibility path rejects configured budgets rather than
 silently escaping the model; catalog-backed `BrowserDatabase` empty tables stay on the typed path.
@@ -514,8 +521,10 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Add numeric/datetime zone-map row-group pruning and predicate-first projected-block loading.
 - [x] Reclaim spill pages abandoned by abrupt tab/process loss through durable spill-owner leases.
 - [x] Stream budgeted single-table append/base scan inputs through block-aligned resident windows.
-- [ ] Stream joined and mutation inputs and add the remaining spill shapes, including
-      grouped-and-ordered plans, grouped joins, hash joins, and DISTINCT.
+- [x] Carry evaluated values in hash-aggregate spill partitions, covering grouped-and-ordered
+      streams and grouped ordered joins.
+- [ ] Stream joined and mutation inputs and add the remaining spill shapes, including unordered
+      grouped state, hash-join build sides, and DISTINCT.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

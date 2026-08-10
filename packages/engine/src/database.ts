@@ -1250,17 +1250,16 @@ export class BrowserDatabase {
   }
 
   /**
-   * A plan shape can stream its scan input when it has no joins and cannot take the partitioned
-   * hash-aggregate spill path, which revisits scan rows by stored index after the scan has
-   * advanced. Streaming exists to honor an explicit budget; an unbudgeted or spill-disabled query
-   * keeps the materialized path.
+   * A plan shape can stream its scan input when it has no joins: every asynchronous execution
+   * path, including both spill paths, consumes scan rows batch-forward and copies values out, so
+   * a sliding resident window can back the scan source. Streaming exists to honor an explicit
+   * budget; an unbudgeted or spill-disabled query keeps the materialized path.
    */
   #canStreamPlanShape(plan: CompiledQuery, options: QueryOptions): boolean {
     return (
       options.executionMemoryBudgetBytes !== undefined &&
       options.spillToStorage !== false &&
-      plan.joins.length === 0 &&
-      !(plan.groupBy.length > 0 && plan.orderBy.length > 0)
+      plan.joins.length === 0
     );
   }
 
