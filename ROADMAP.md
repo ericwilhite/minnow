@@ -353,8 +353,10 @@ surviving row's evaluated group keys and aggregate arguments instead of scan-row
 partition phase accumulates groups from decoded values without re-reading source vectors. This
 removes the streaming exclusion for grouped-and-ordered single-table plans and extends the spill to
 grouped ordered equi-joins with materialized build sides. Buffered values are reserved per row and
-flushed in bounded scan chunks sized from the spill page setting. Unordered grouped state,
-hash-join build sides, and DISTINCT remain unspillable.
+flushed in fixed 512-row scan chunks. Budgeted unordered grouped plans reuse the same partitioned
+path—the empty ordering merges as a stable concatenation—bounding peak accounted group state to one
+partition at the cost of partition-order rather than first-appearance group output, which SQL
+leaves unspecified without `ORDER BY`. Hash-join build sides and DISTINCT remain unspillable.
 
 Phase 7E-C streams the probe side of joined plans: the scanned base table uses the sliding window
 while join build sides, including keyed mutation replay, are materialized at the same leased
@@ -530,8 +532,9 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Carry evaluated values in hash-aggregate spill partitions, covering grouped-and-ordered
       streams and grouped ordered joins.
 - [x] Stream the joined probe side with build sides materialized at the same leased snapshot.
-- [ ] Stream keyed-mutation scan inputs and add the remaining spill shapes, including unordered
-      grouped state, hash-join build sides, and DISTINCT.
+- [x] Spill unordered grouped state through the value-carrying partitions.
+- [ ] Stream keyed-mutation scan inputs and add the remaining spill shapes: hash-join build sides
+      and DISTINCT.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

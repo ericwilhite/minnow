@@ -4969,7 +4969,9 @@ for (const implementation of implementations()) {
     const reference = await database.query(
       "SELECT tag, COUNT(*) AS count FROM streamed_rows WHERE v >= 10000 GROUP BY tag",
     );
-    expect(grouped.rows).toEqual(reference.rows);
+    const byTag = (left: { tag?: unknown }, right: { tag?: unknown }) =>
+      String(left.tag).localeCompare(String(right.tag));
+    expect([...grouped.rows].sort(byTag)).toEqual([...reference.rows].sort(byTag));
 
     const ordered = await database.query(
       "SELECT v, tag FROM streamed_rows WHERE v < 19000 ORDER BY v DESC LIMIT 23",
@@ -4988,6 +4990,17 @@ for (const implementation of implementations()) {
       "SELECT tag, COUNT(*) AS count, MIN(v) AS low, MAX(v) AS high, AVG(v) AS mean FROM streamed_rows GROUP BY tag ORDER BY tag LIMIT 4",
     );
     expect(groupedOrdered.rows).toEqual(groupedOrderedReference.rows);
+
+    const unorderedGroups = await database.query(
+      "SELECT v, COUNT(*) AS count FROM streamed_rows GROUP BY v",
+      { executionMemoryBudgetBytes: budget, spillPageRows: 512 },
+    );
+    const unorderedReference = await database.query(
+      "SELECT v, COUNT(*) AS count FROM streamed_rows GROUP BY v",
+    );
+    const byV = (left: { v?: unknown }, right: { v?: unknown }) => Number(left.v) - Number(right.v);
+    expect([...unorderedGroups.rows].sort(byV)).toEqual([...unorderedReference.rows].sort(byV));
+    expect(unorderedGroups.rows).toHaveLength(rowCount);
 
     expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
     store.close();

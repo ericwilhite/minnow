@@ -18,6 +18,7 @@ import {
 } from "./memory.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
+const HASH_SPILL_SCAN_CHUNK_ROWS = 512;
 const NULL_STRING_CODE = 0xffffffff;
 const QUERY_REFERENCE_BYTES = 8;
 const QUERY_VALUE_TAG_BYTES = 1;
@@ -268,7 +269,9 @@ export function prepareVectorQuery(
       async executeAsync(executionOptions = {}) {
         if (closed) throw new Error("Prepared vector query is closed");
         const canSpillSort = bound.orderBy.length > 0 && !bound.grouped;
-        const canSpillHash = bound.orderBy.length > 0 && bound.grouped && bound.groupBy.length > 0;
+        // An unordered grouped plan spills too: the empty ordering makes the pairwise merge a
+        // stable concatenation, and partition-wise accumulation bounds peak group state.
+        const canSpillHash = bound.grouped && bound.groupBy.length > 0;
         if (executionOptions.spillStore === undefined || (!canSpillSort && !canSpillHash)) {
           if (executionOptions.loadScanWindow === undefined) return this.execute();
           const executionMemory = retainedMemory.createChild();
@@ -910,10 +913,9 @@ async function executeBoundPlanWithHashSpill(
   let runSequence = 0;
   try {
     const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-    // The chunk bounds buffered evaluated values per flush while keeping partition-page writes
-    // coarse enough for IndexedDB; a floor below the batch size keeps tiny page settings from
-    // multiplying page-write transactions.
-    const scanChunkRows = Math.min(DEFAULT_BATCH_ROWS, Math.max(512, pageRows));
+    // A fixed chunk bounds buffered evaluated values per flush independently of the configured
+    // page size while staying coarse enough to amortize partition-page write transactions.
+    const scanChunkRows = Math.min(DEFAULT_BATCH_ROWS, HASH_SPILL_SCAN_CHUNK_ROWS);
     for (let start = 0; start < scanRows; start += scanChunkRows) {
       const length = Math.min(scanChunkRows, scanRows - start);
       await options.loadScanWindow?.(start, length);
@@ -1022,18 +1024,20 @@ async function executeBoundPlanWithHashSpill(
           }
         }
         const rows = finishGroups(plan, groups.values(), partitionMemory);
-        const ordering = partitionMemory.reserve(
-          safeMemoryProduct(
-            rows.length,
-            Uint32Array.BYTES_PER_ELEMENT * 2 + Uint8Array.BYTES_PER_ELEMENT,
+        if (plan.orderBy.length > 0) {
+          const ordering = partitionMemory.reserve(
+            safeMemoryProduct(
+              rows.length,
+              Uint32Array.BYTES_PER_ELEMENT * 2 + Uint8Array.BYTES_PER_ELEMENT,
+              "Hash spill ordering typed scratch",
+            ),
             "Hash spill ordering typed scratch",
-          ),
-          "Hash spill ordering typed scratch",
-        );
-        try {
-          stableSortRows(rows, plan.orderBy);
-        } finally {
-          ordering.release();
+          );
+          try {
+            stableSortRows(rows, plan.orderBy);
+          } finally {
+            ordering.release();
+          }
         }
         const runId = `group-${String(runSequence++)}`;
         let outputPage = 0;

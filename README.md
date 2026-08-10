@@ -237,9 +237,12 @@ indexes. Each partition page stores the evaluated group keys and aggregate argum
 surviving rows, so the partition phase accumulates groups without re-reading source vectors. That
 makes grouped-and-ordered single-table plans streamable and extends the same spill to grouped
 ordered equi-joins, whose build sides remain fully materialized. Buffered evaluated values are
-reserved per row and flushed in bounded scan chunks. Grouped plans without `ORDER BY` still hold
-their complete group state in memory, and hash-join build sides and DISTINCT still have no spill
-path.
+reserved per row and flushed in fixed 512-row scan chunks. Budgeted grouped plans without
+`ORDER BY` take the same partitioned path—the empty ordering reduces the run merge to a stable
+concatenation—so peak accounted group state is bounded by one partition rather than the whole
+key space; their group order follows partition processing rather than first-appearance order,
+which SQL leaves unspecified without `ORDER BY`. Global aggregates keep bounded in-memory
+accumulators, and hash-join build sides and DISTINCT still have no spill path.
 
 This is not yet the Phase 7 bounded-memory exit or a hard browser-heap limit. Prepared queries and
 every non-streamed shape still materialize each projected typed input in full before the vector
@@ -250,9 +253,9 @@ ranges in one pass, avoiding a second live-row array and per-column source-array
 map and source slots remain whole-plan state. The model
 does not include returned result objects, properties, group-key and retained `MIN`/`MAX` reference
 containers, JavaScript array-capacity overhead, spill serialization/native IndexedDB work, returned
-row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—unordered grouped
-state, hash-join build sides, and DISTINCT—still fail on budget exhaustion. Phase 7 remains open
-for streamed joined and mutation inputs, byte-addressable aggregate/result containers, complete
+row lifetime, or engine/browser allocator overhead. Unsupported spill shapes—hash-join build sides
+and DISTINCT—still fail on budget exhaustion. Phase 7 remains open
+for streamed mutation scan inputs, byte-addressable aggregate/result containers, complete
 physical accounting, and those remaining spill paths.
 
 Phase 8A adds conservative row-group skipping for a single append/base table with `AND`-combined
