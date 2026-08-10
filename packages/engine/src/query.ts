@@ -119,6 +119,48 @@ export function compileQuery(sql: string): CompiledQuery {
   return parser.parse(normalized);
 }
 
+export type CompiledStatement =
+  | { kind: "select"; sql: string }
+  | { kind: "insert"; table: string; columns: string[]; rows: QueryValue[][] }
+  | {
+      kind: "update";
+      table: string;
+      assignments: Array<{ column: string; expression: Expression }>;
+      predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+    }
+  | {
+      kind: "delete";
+      table: string;
+      predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+    };
+
+/**
+ * Routes one SQL statement: SELECT and WITH compile through the read-only query pipeline, while
+ * INSERT ... VALUES, UPDATE ... SET, and DELETE FROM parse into mutation statements. Any other
+ * leading keyword fails explicitly.
+ */
+export function compileStatement(sql: string): CompiledStatement {
+  const normalized = sql.trim().replace(/;$/, "").trim();
+  if (normalized.length === 0) throw new TypeError("Enter a SQL statement");
+  const tokens = tokenize(normalized);
+  const first = tokens[0];
+  const keyword = first?.kind === "identifier" ? first.text.toUpperCase() : "";
+  if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
+    return new Parser(tokens).parseMutation(keyword);
+  }
+  compileQuery(normalized);
+  return { kind: "select", sql: normalized };
+}
+
+/** Evaluates an expression against one row, for UPDATE SET assignment computation. */
+export function evaluateRowExpression(
+  expression: Expression,
+  alias: string,
+  row: DatabaseRow,
+): QueryValue {
+  return asQueryValue(evaluate(expression, { [alias]: row }));
+}
+
 export interface SubqueryResolutionStep {
   /** The uncorrelated block to execute; earlier steps have already substituted inside it. */
   readonly block: CompiledQuery;
@@ -929,6 +971,11 @@ function validateGrouping(plan: CompiledQuery): void {
     throw new TypeError("Aggregate functions are not allowed in JOIN, WHERE, or GROUP BY");
 }
 
+/** The column references inside one expression; a subquery contributes none (its own scope). */
+export function expressionColumnNames(expression: Expression): string[] {
+  return expressionColumns(expression);
+}
+
 function expressionColumns(expression: Expression): string[] {
   if (expression.kind === "column") return [expression.reference];
   if (expression.kind === "binary")
@@ -1069,6 +1116,111 @@ class Parser {
     }
     this.#take("eof");
     return plan;
+  }
+
+  parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {
+    const statement =
+      keyword === "INSERT"
+        ? this.#insertStatement()
+        : keyword === "UPDATE"
+          ? this.#updateStatement()
+          : this.#deleteStatement();
+    this.#take("eof");
+    return statement;
+  }
+
+  #insertStatement(): CompiledStatement {
+    this.#keyword("INSERT");
+    this.#keyword("INTO");
+    const table = this.#identifier();
+    this.#expectPunctuation("(");
+    const columns: string[] = [];
+    for (;;) {
+      columns.push(this.#identifier());
+      if (!this.#punctuation(",")) break;
+    }
+    this.#expectPunctuation(")");
+    if (new Set(columns).size !== columns.length) {
+      throw new TypeError("INSERT columns must be unique");
+    }
+    this.#keyword("VALUES");
+    const rows: QueryValue[][] = [];
+    for (;;) {
+      this.#expectPunctuation("(");
+      const values: QueryValue[] = [];
+      for (;;) {
+        values.push(this.#constantValue("INSERT values"));
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+      if (values.length !== columns.length) {
+        throw new TypeError("Each INSERT row must match the column list length");
+      }
+      rows.push(values);
+      if (!this.#punctuation(",")) break;
+    }
+    return { kind: "insert", table, columns, rows };
+  }
+
+  #updateStatement(): CompiledStatement {
+    this.#keyword("UPDATE");
+    const table = this.#identifier();
+    this.#keyword("SET");
+    const assignments: Array<{ column: string; expression: Expression }> = [];
+    for (;;) {
+      const column = this.#identifier();
+      this.#operator("=");
+      const expression = this.#expression();
+      if (hasAggregate(expression)) {
+        throw new TypeError("Aggregate functions are not allowed in UPDATE assignments");
+      }
+      assignments.push({ column, expression });
+      if (!this.#punctuation(",")) break;
+    }
+    if (new Set(assignments.map(({ column }) => column)).size !== assignments.length) {
+      throw new TypeError("UPDATE assignments must set each column once");
+    }
+    return { kind: "update", table, assignments, predicates: this.#mutationPredicates() };
+  }
+
+  #deleteStatement(): CompiledStatement {
+    this.#keyword("DELETE");
+    this.#keyword("FROM");
+    const table = this.#identifier();
+    return { kind: "delete", table, predicates: this.#mutationPredicates() };
+  }
+
+  #mutationPredicates(): Array<{
+    left: Expression;
+    operator: PredicateOperator;
+    right: Expression;
+  }> {
+    const predicates: Array<{
+      left: Expression;
+      operator: PredicateOperator;
+      right: Expression;
+    }> = [];
+    if (this.#isKeyword("WHERE")) {
+      this.#keyword("WHERE");
+      for (;;) {
+        const predicate = this.#predicate(true);
+        if (hasAggregate(predicate.left) || hasAggregate(predicate.right)) {
+          throw new TypeError("Aggregate functions are not allowed in mutation predicates");
+        }
+        predicates.push(predicate);
+        if (!this.#isKeyword("AND")) break;
+        this.#keyword("AND");
+      }
+    }
+    return predicates;
+  }
+
+  #constantValue(label: string): QueryValue {
+    const expression = this.#expression();
+    if (hasAggregate(expression) || expressionColumns(expression).length > 0) {
+      throw new TypeError(`${label} must be constant expressions`);
+    }
+    return asQueryValue(evaluate(expression, {}));
   }
 
   #unionMember(sql: string): { block: CompiledQuery; parenthesized: boolean } {

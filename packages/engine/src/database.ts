@@ -59,7 +59,10 @@ import {
   blockHasSubqueries,
   combineUnionResults,
   compileQuery,
+  compileStatement,
   createPreparedColumnarQuery,
+  evaluateRowExpression,
+  expressionColumnNames,
   inferBlockSchema,
   referencedColumns,
   subqueryResolutionSteps,
@@ -461,6 +464,12 @@ export interface QuerySpillCleanupResult {
   ownersReclaimed: number;
   ownersRetained: number;
 }
+
+export type ExecuteResult =
+  | { kind: "rows"; result: QueryResult }
+  | { kind: "insert"; table: string; rowCount: number; version: number }
+  | { kind: "update"; table: string; rowCount: number; version?: number }
+  | { kind: "delete"; table: string; rowCount: number; version?: number | null };
 
 export interface BufferedWriterOptions {
   mode?: "insert" | "upsert";
@@ -1091,7 +1100,13 @@ export class BrowserDatabase {
    * Repeated execute() calls measure query execution without including storage I/O.
    */
   async prepareQuery(sql: string, options: QueryOptions = {}): Promise<PreparedQuery> {
-    const plan = compileQuery(sql);
+    return this.#prepareCompiledPlan(compileQuery(sql), options);
+  }
+
+  async #prepareCompiledPlan(
+    plan: CompiledQuery,
+    options: QueryOptions = {},
+  ): Promise<PreparedQuery> {
     const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
     try {
       const realTables = await this.#findRealBlockTables(plan);
@@ -1392,6 +1407,103 @@ export class BrowserDatabase {
       afterOwnerId = page.nextCursor;
     }
     return result;
+  }
+
+  /**
+   * Executes one SQL statement. SELECT statements run through the read-only query pipeline;
+   * INSERT ... VALUES maps onto a column batch insert, and UPDATE/DELETE on a unique-key table
+   * read the matching keys at one snapshot and then apply the keyed mutation. The read and the
+   * mutation are two steps, not one serializable transaction: a key changed by a competing writer
+   * in between fails the statement explicitly rather than silently mutating other rows.
+   */
+  async execute(sql: string): Promise<ExecuteResult> {
+    const statement = compileStatement(sql);
+    if (statement.kind === "select") {
+      return { kind: "rows", result: await this.query(statement.sql) };
+    }
+    if (statement.kind === "insert") {
+      const columns: Record<string, BatchValue[]> = {};
+      statement.columns.forEach((column, index) => {
+        columns[column] = statement.rows.map((row) => row[index] ?? null);
+      });
+      const result = await this.insertBatch(statement.table, { columns });
+      return {
+        kind: "insert",
+        table: statement.table,
+        rowCount: result.rowCount,
+        version: result.version,
+      };
+    }
+    const table = await this.#findTable(statement.table);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) {
+      throw new TypeError(
+        `${statement.kind === "update" ? "UPDATE" : "DELETE"} requires a table with a unique key: ${statement.table}`,
+      );
+    }
+    const referenced = new Set([keyColumn.name]);
+    if (statement.kind === "update") {
+      for (const assignment of statement.assignments) {
+        for (const column of expressionColumnNames(assignment.expression)) {
+          referenced.add(column.split(".").at(-1) ?? column);
+        }
+      }
+    }
+    const plan: CompiledQuery = {
+      sql: `(${statement.kind})`,
+      base: { table: table.name, alias: table.name },
+      joins: [],
+      select: [...referenced].map((name) => ({
+        expression: { kind: "column", reference: name },
+        alias: name,
+      })),
+      predicates: statement.predicates,
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    };
+    const prepared = await this.#prepareCompiledPlan(plan);
+    let rows: QueryResult["rows"];
+    try {
+      rows = prepared.execute().rows;
+    } finally {
+      prepared.close();
+    }
+    const keys = rows.map((row) => row[keyColumn.name]);
+    if (keys.some((key) => key === null || key === undefined)) {
+      throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
+    }
+    if (statement.kind === "delete") {
+      if (keys.length === 0) {
+        return { kind: "delete", table: table.name, rowCount: 0 };
+      }
+      const result = await this.deleteBatch(table.name, { keys: keys as BatchValue[] });
+      return {
+        kind: "delete",
+        table: table.name,
+        rowCount: result.deletedRowCount,
+        version: result.version,
+      };
+    }
+    if (keys.length === 0) {
+      return { kind: "update", table: table.name, rowCount: 0 };
+    }
+    const changes: Record<string, Array<BatchValue | null>> = {};
+    for (const assignment of statement.assignments) {
+      changes[assignment.column] = rows.map((row) =>
+        evaluateRowExpression(assignment.expression, table.name, row),
+      );
+    }
+    const result = await this.updateBatch(table.name, {
+      keys: keys as BatchValue[],
+      changes,
+    });
+    return {
+      kind: "update",
+      table: table.name,
+      rowCount: result.updatedRowCount,
+      version: result.version,
+    };
   }
 
   /**

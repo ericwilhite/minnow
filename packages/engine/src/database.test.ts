@@ -5158,6 +5158,66 @@ for (const implementation of implementations()) {
 }
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} executes SQL mutations through keyed batches`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 32, compression: "raw" });
+    await database.createTable({
+      name: "sql_people",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+        { name: "joined", type: "datetime", nullable: true },
+      ],
+    });
+
+    const inserted = await database.execute(
+      "INSERT INTO sql_people (name, score, joined) VALUES ('Ada', 10, DATE '2026-01-01'), ('Grace', 20, NULL), ('Katherine', 30, NULL)",
+    );
+    expect(inserted).toMatchObject({ kind: "insert", table: "sql_people", rowCount: 3 });
+
+    const updated = await database.execute(
+      "UPDATE sql_people SET score = score * 2 + 1 WHERE score >= 20",
+    );
+    expect(updated).toMatchObject({ kind: "update", rowCount: 2 });
+    expect((await database.query("SELECT name, score FROM sql_people ORDER BY name")).rows).toEqual(
+      [
+        { name: "Ada", score: 10 },
+        { name: "Grace", score: 41 },
+        { name: "Katherine", score: 61 },
+      ],
+    );
+
+    const noMatch = await database.execute("UPDATE sql_people SET score = 0 WHERE score > 100");
+    expect(noMatch).toMatchObject({ kind: "update", rowCount: 0 });
+
+    const deleted = await database.execute(
+      "DELETE FROM sql_people WHERE name IN ('Ada', 'missing')",
+    );
+    expect(deleted).toMatchObject({ kind: "delete", rowCount: 1 });
+    const remaining = await database.execute("SELECT COUNT(*) AS count FROM sql_people");
+    expect(remaining).toMatchObject({ kind: "rows" });
+    if (remaining.kind === "rows") {
+      expect(remaining.result.rows).toEqual([{ count: 2 }]);
+    }
+
+    await database.createTable({
+      name: "sql_events",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await expect(database.execute("DELETE FROM sql_events")).rejects.toThrow(
+      "DELETE requires a table with a unique key",
+    );
+    await expect(database.execute("DROP TABLE sql_people")).rejects.toThrow("Expected SELECT");
+    await expect(database.query("DELETE FROM sql_people")).rejects.toThrow("Expected SELECT");
+    await expect(
+      database.execute("INSERT INTO sql_people (name, score) VALUES ('Zoe')"),
+    ).rejects.toThrow("Each INSERT row must match the column list length");
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
   it(`${implementation.name} executes CTEs and derived tables through the public API`, async () => {
     const store = await implementation.create();
     const database = new BrowserDatabase(store, { rowsPerBlock: 64, compression: "raw" });
