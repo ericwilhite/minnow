@@ -124,6 +124,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.getExistingUniqueKeys(tableId, keyTokens);
   }
 
+  getCurrentManifestVersion(): Promise<number | null> {
+    return this.inner.getCurrentManifestVersion();
+  }
+
   getCurrentManifest(): Promise<Manifest | undefined> {
     return this.inner.getCurrentManifest();
   }

@@ -520,6 +520,28 @@ structural plan-equality tests enforce that. `nullableRefs()` types left-joined 
 `| null`, `typedTable` covers CRUD and batch writes, and `query()`/`execute()` remain the raw SQL
 escape hatch.
 
+Live queries re-execute selectively when their tables change:
+
+```ts
+const live = database.liveQueries({ channel: new BroadcastChannel("db"), pollIntervalMs: 5_000 });
+const subscription = await live.subscribe(
+  "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status",
+  { onChange: (result) => render(result) },
+);
+// later: subscription.close(); live.close();
+```
+
+Every commit persists its changed table IDs in the manifest (compaction marks itself logically
+unchanged), and every hint path — a local commit, a cross-tab channel message, a poll tick, or an
+explicit `refresh()` — converges on the durable manifest version, so missed messages and
+suspended tabs delay a refresh but cannot produce stale results. Sweeps read change sets in
+bounded pages and skip subscriptions whose tables did not change; commits without a change set
+widen conservatively to every subscription. A subscription retains only its SQL, dependency table
+IDs, and a numeric result digest — never rows — and reruns whose digest is unchanged suppress
+their notification. `live.stats` reports hints, sweeps, reruns, avoided reruns, suppressed
+notifications, and sweep latency. Incremental maintenance remains future work; re-execution is
+the correctness baseline it will always retain.
+
 ## Storage laboratory
 
 The browser dashboard currently supports:
@@ -560,7 +582,10 @@ The browser dashboard currently supports:
   checks;
 - 15 relational reference queries ranging from a point lookup and date filter to joins,
   aggregates, anti-joins, cohort analysis, revenue matrices, tax, fulfillment, payment-funnel,
-  supplier-ledger, and adjustment analysis;
+  supplier-ledger, and adjustment analysis, each executed as SQL through the public query API and
+  verified against an independent JavaScript oracle;
+- whole-agent memory from `performance.measureUserAgentSpecificMemory()` beside the JavaScript
+  heap, so the WebAssembly memory the comparison engines actually live in is counted;
 - a read-only ad-hoc SQL console over the latest generated snapshot, with hash joins, filters,
   grouping, aggregates, ordering, a bounded preview, and parse/median/p95/row-flow metrics.
 
@@ -568,19 +593,29 @@ Transaction probe time is reported separately and excluded from storage throughp
 rankings. Each probe uses a throwaway IndexedDB database and does not send data over the network.
 
 Each data group is also created as a persistent table for the public-API write workload. The
-lower-level storage baseline still decodes blocks directly to verify every value. The 15 catalog
-relational cards use a separate reference-workload implementation, so their timings are not public
-SQL API timings. `readTable` loads one shared snapshot, reusable JavaScript hash indexes are built
-once, and each optimized query reports a seven-sample total plus median and p95 per execution. Fast
-queries are batched within each sample to exceed coarse browser timer resolution, and the actual
-execution count plus measurement wall time are disclosed. A separate implementation acts as a
-result oracle; row counts and normalized checksums must agree. The suite also validates all 50 table
-counts, primary-key uniqueness, 81 foreign-key paths, dates, statuses, quantities, discounts,
+lower-level storage baseline still decodes blocks directly to verify every value. Every catalog
+query carries its complete statement and is submitted to `prepareQuery()`, so the headline timing
+is the engine executing its own SQL; whether a statement is supported is decided by compiling it
+during the run rather than by a checked-in assumption, and a statement the engine refuses records
+that refusal verbatim instead of disappearing. Thirteen of the fifteen compile today: a monthly
+cohort needs date truncation and an adjustment rollup needs `COALESCE`, and both are shown as
+named surface gaps. A hand-written JavaScript implementation over already-materialized rows runs
+beside each query as a baseline, batched within each sample to exceed coarse browser timer
+resolution. A second, independent implementation acts as the result oracle: engine and JavaScript
+results are compared tuple for tuple in select-list order, with numbers compared inside a relative
+tolerance because aggregates accumulate in a different row order. The suite also validates all 50
+table counts, primary-key uniqueness, 81 foreign-key paths, dates, statuses, quantities, discounts,
 monetary values, and transaction/ledger coverage. The dashboard reports snapshot loading and index
-construction separately and shows the reference SQL for every catalog query.
+construction separately and shows the optimized plan from `explain()` for every catalog query.
+
+The query workspace renders the checked-in SQL feature matrix, so the accepted and rejected surface
+is visible without reading the source, and a conformance test keeps that list honest by executing
+every supported example and asserting every unsupported one still fails with its recorded error.
 
 The ad-hoc console reopens the latest persisted IndexedDB dataset and prepares only columns referenced
-by the query. It supports one read-only `SELECT` with equi-joins, `WHERE` predicates joined by `AND`, grouping,
+by the query, reports the optimized plan alongside the result, and accepts the documented read-only
+surface: equi-joins, `WHERE` predicates joined by `AND`, `IN` and scalar subqueries, `DISTINCT`,
+`HAVING`, CTEs, derived tables, `UNION`, `ROW_NUMBER`/`RANK`/`DENSE_RANK`, grouping,
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, ordering, and a limit. It rejects mutations and unsupported SQL.
 Catalog-query and ad-hoc timings are correctness and workload-shape measurements, not native query
 engine performance claims. They remain separate from the public vector-backed SQL subset; the full

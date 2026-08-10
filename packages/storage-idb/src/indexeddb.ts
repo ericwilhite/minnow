@@ -416,6 +416,15 @@ export class IndexedDbBlockStore implements BlockStore {
     return tokens.filter((_, index) => keys[index] !== undefined).sort();
   }
 
+  async getCurrentManifestVersion(): Promise<number | null> {
+    const transaction = this.#transaction("catalog", "readonly");
+    const value: unknown = await requestResult(
+      transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY),
+    );
+    await transactionDone(transaction);
+    return typeof value === "number" ? value : null;
+  }
+
   async getCurrentManifest(): Promise<Manifest | undefined> {
     const transaction = this.#transaction(["catalog", "manifests"], "readonly");
     const version = (await requestResult(
@@ -736,6 +745,7 @@ export class IndexedDbBlockStore implements BlockStore {
       expectedVersion: input.expectedManifestVersion,
       blockIds: input.blockIds,
       createdAt: input.committedAt,
+      ...(input.changedTableIds === undefined ? {} : { changedTableIds: input.changedTableIds }),
     });
     const committed = updateTransactionRecord(record, {
       status: "committed",

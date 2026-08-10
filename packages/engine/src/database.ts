@@ -79,6 +79,7 @@ import {
   QueryMemoryContext,
   type QueryMemoryReservation,
 } from "./memory.js";
+import { LiveQuerySet, type LiveQuerySetOptions } from "./live.js";
 import { renderPlan } from "./optimizer.js";
 import {
   applyColumnSteps,
@@ -525,6 +526,7 @@ export class BrowserDatabase {
   readonly #spillOwnerLeaseMs: number;
   readonly #createId: () => string;
   readonly #internalLeaseOwnerId = `browserdatabase/${crypto.randomUUID()}`;
+  readonly #liveSets = new Set<LiveQuerySet>();
   #internalLeaseSequence = 0;
 
   constructor(
@@ -779,6 +781,7 @@ export class BrowserDatabase {
         try {
           const manifest = await transaction.commit();
           commitMs += performance.now() - commitStarted;
+          this.#notifyLiveCommit();
           return {
             tableName: table.name,
             segmentId,
@@ -905,6 +908,7 @@ export class BrowserDatabase {
         try {
           const manifest = await transaction.commit();
           commitMs += performance.now() - commitStarted;
+          this.#notifyLiveCommit();
           return {
             tableName: table.name,
             segmentId,
@@ -1046,6 +1050,7 @@ export class BrowserDatabase {
         try {
           const manifest = await transaction.commit();
           commitMs += performance.now() - commitStarted;
+          this.#notifyLiveCommit();
           return {
             tableName: table.name,
             segmentId,
@@ -1443,6 +1448,33 @@ export class BrowserDatabase {
       afterOwnerId = page.nextCursor;
     }
     return result;
+  }
+
+  /**
+   * Creates a live-query set over this database. Local commits hint it directly, an optional
+   * channel carries cross-tab hints, and an optional poll interval bounds staleness without any
+   * hint; every hint path converges on the durable manifest version, so missed messages delay a
+   * refresh but never produce a stale result. Subscriptions retain a result digest, not rows.
+   */
+  liveQueries(options: LiveQuerySetOptions = {}): LiveQuerySet {
+    const set = new LiveQuerySet(
+      {
+        currentVersion: () => this.store.getCurrentManifestVersion(),
+        manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
+        dependencyTableIds: async (sql) => {
+          const tables = await this.#findRealBlockTables(compileQuery(sql));
+          return new Set([...tables.values()].map((record) => record.id));
+        },
+        execute: (sql) => this.query(sql),
+      },
+      options,
+    );
+    this.#liveSets.add(set);
+    return set;
+  }
+
+  #notifyLiveCommit(): void {
+    for (const set of this.#liveSets) set.notifyLocalCommit();
   }
 
   /** Executes a built ORM query through the same preparation pipeline as compiled SQL. */
@@ -3409,6 +3441,7 @@ export class BrowserDatabase {
       }
 
       transaction.supersedeBlocks(job.sourceBlockIds);
+      transaction.markLogicallyUnchanged();
       let manifest;
       try {
         manifest = await transaction.commit();
@@ -3442,6 +3475,7 @@ export class BrowserDatabase {
           throw new Error(job.error);
         }
         transaction.supersedeBlocks(job.sourceBlockIds);
+        transaction.markLogicallyUnchanged();
         manifest = await transaction.commit();
       }
       job = await this.#markCompactionPublished(job, manifest.version);

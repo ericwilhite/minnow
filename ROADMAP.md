@@ -525,7 +525,23 @@ Exit gate: ORM and equivalent SQL produce equivalent bound logical plans and res
 
 Deliver persisted change sets, dependency extraction, cross-tab hints, version reconciliation, and correctness-first selective re-execution. Add incremental maintenance gradually for filters and core aggregates, always retaining re-execution fallback.
 
-Exit gate: missed BroadcastChannel messages, suspended tabs, and unrelated commits cannot create stale results; latency and avoided reruns are measured.
+Phase 16 delivers correctness-first selective re-execution. Every transaction commit persists its
+changed table IDs in the manifest — derived automatically from staged segments, with compaction
+marking itself logically unchanged so supersession never triggers reruns — and
+`BrowserDatabase.liveQueries()` builds subscription sets whose every hint path (local commit,
+injected cross-tab channel message, poll tick, or explicit `refresh()`) converges on one
+authoritative check: read the durable manifest version through a version-only store read, and when
+it moved, union the change sets of the intervening manifests in bounded 64-record pages. A missing
+version or a manifest without a change set widens conservatively to every subscription, so missed
+channel messages and suspended tabs delay a refresh but cannot produce stale results.
+Subscriptions retain their SQL, dependency table IDs extracted from the full plan (including CTEs,
+derived tables, and subqueries), and a numeric result digest — never rows — and a rerun whose
+digest is unchanged suppresses its notification. Stats expose hints, version checks, sweeps,
+reruns, avoided reruns, suppressed notifications, and sweep latency. Incremental maintenance for
+filters and core aggregates remains the planned follow-on, always retaining this re-execution
+fallback.
+
+Exit gate: missed BroadcastChannel messages, suspended tabs, and unrelated commits cannot create stale results; latency and avoided reruns are measured. Met.
 
 ## Phase 17 — Backup and restore
 
@@ -616,6 +632,16 @@ larger/repeated benchmark tiers remain outstanding.
       checked-in optimizer rule-value benchmark record.
 - [x] Add the typed schema DSL, Standard Schema validators, and crash-safe metadata-only
       migrations with catalog compare-and-swap.
+- [x] Add the type-safe ORM builder with plan equivalence to compiled SQL.
+- [x] Add live queries with persisted change sets, digest notifications, and selective
+      re-execution.
+- [x] Execute the 15 reference queries as SQL through `prepareQuery()`, decide engine support by
+      compiling during the run, and verify results against independent JavaScript oracles.
+- [x] Show optimized `explain()` plans and the checked-in SQL feature matrix in the dashboard.
+- [x] Record whole-agent memory and JavaScript heap for the storage run and for all four compared
+      engines, sampled on the main thread.
+- [ ] Add date truncation and `COALESCE` so the monthly cohort and adjustment-burden reference
+      queries compile; they are the only two the current surface cannot express.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

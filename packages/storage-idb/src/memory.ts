@@ -279,6 +279,10 @@ export class MemoryBlockStore implements BlockStore {
     return [...new Set(keyTokens)].filter((token) => existing.has(token)).sort();
   }
 
+  async getCurrentManifestVersion(): Promise<number | null> {
+    return this.#currentVersion;
+  }
+
   async getCurrentManifest(): Promise<Manifest | undefined> {
     const manifest =
       this.#currentVersion === null ? undefined : this.#manifests.get(this.#currentVersion);
@@ -479,6 +483,9 @@ export class MemoryBlockStore implements BlockStore {
           expectedVersion: input.expectedManifestVersion,
           blockIds: input.blockIds,
           createdAt: input.committedAt,
+          ...(input.changedTableIds === undefined
+            ? {}
+            : { changedTableIds: input.changedTableIds }),
         });
         const committed = updateTransactionRecord(transaction, {
           status: "committed",

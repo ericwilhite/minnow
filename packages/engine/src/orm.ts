@@ -85,7 +85,7 @@ export function nullableRefs<TTable extends AnyTable>(
   tableSchema: TTable,
   alias?: string,
 ): NullableTableRefs<TTable> {
-  return refs(tableSchema, alias) as NullableTableRefs<TTable>;
+  return refs(tableSchema, alias);
 }
 
 // --- Expression builders ------------------------------------------------------------------------
@@ -371,10 +371,7 @@ export class QueryBuilder<TRow> {
 }
 
 /** Starts a query over one table, optionally under an alias. */
-export function from<TTable extends AnyTable>(
-  tableSchema: TTable,
-  alias?: string,
-): QueryBuilder<never> {
+export function from(tableSchema: AnyTable, alias?: string): QueryBuilder<never> {
   return new QueryBuilder(
     {
       base: { table: tableSchema.name, alias: alias ?? tableSchema.name },

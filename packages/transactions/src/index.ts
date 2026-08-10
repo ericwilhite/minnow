@@ -128,6 +128,8 @@ export class DatabaseTransaction {
   #record: TransactionRecord;
   #uniqueKeyChanges: UniqueKeyChanges | undefined;
   readonly #supersededBlockIds = new Set<string>();
+  readonly #changedTableIds = new Set<string>();
+  #logicallyUnchanged = false;
 
   constructor(
     private readonly store: BlockStore,
@@ -216,6 +218,7 @@ export class DatabaseTransaction {
     if (record.transactionId !== this.id) {
       throw new Error(`Segment ${record.id} belongs to another transaction`);
     }
+    this.#changedTableIds.add(record.tableId);
     await this.store.addSegment(record);
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingSegmentIds: [...this.#record.pendingSegmentIds, record.id],
@@ -233,10 +236,20 @@ export class DatabaseTransaction {
     if (record.transactionId !== this.id) {
       throw new Error(`Segment ${segmentId} belongs to another transaction`);
     }
+    this.#changedTableIds.add(record.tableId);
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingSegmentIds: [...this.#record.pendingSegmentIds, segmentId],
       updatedAt: this.now().toISOString(),
     });
+  }
+
+  /**
+   * Marks this commit as logically content-preserving (for example a compaction rewrite), so
+   * change-driven readers such as live queries skip it even though it stages segments.
+   */
+  markLogicallyUnchanged(): void {
+    this.#assertActive();
+    this.#logicallyUnchanged = true;
   }
 
   setUniqueKeyChanges(changes: UniqueKeyChanges): void {
@@ -275,6 +288,7 @@ export class DatabaseTransaction {
         expectedTransactionRevision: this.#record.revision,
         expectedManifestVersion: this.#record.snapshotVersion,
         blockIds,
+        changedTableIds: this.#logicallyUnchanged ? [] : [...this.#changedTableIds],
         ...(this.#supersededBlockIds.size === 0
           ? {}
           : { removedBlockIds: [...this.#supersededBlockIds] }),

@@ -15,11 +15,18 @@ export interface Manifest {
   previousVersion: number | null;
   blockIds: string[];
   createdAt: string;
+  /**
+   * Table IDs whose logical content this commit changed; empty means a logical no-change such as
+   * compaction. Absent on manifests written before change tracking, which readers treat as
+   * potentially changing every table.
+   */
+  changedTableIds?: string[];
   /** A pruned descriptor remains readable for commit reconciliation but cannot be pinned. */
   prunedAt?: string;
 }
 
 export interface PublishManifestInput {
+  changedTableIds?: readonly string[];
   expectedVersion: number | null;
   blockIds: readonly string[];
   createdAt?: string;
@@ -469,6 +476,7 @@ export interface TransactionRecordUpdate {
 
 export interface CommitTransactionInput {
   transactionId: string;
+  changedTableIds?: readonly string[];
   expectedTransactionRevision: number;
   expectedManifestVersion: number | null;
   blockIds: readonly string[];
@@ -576,6 +584,8 @@ export interface BlockStore {
   reserveRowIds(tableId: string, count: number): Promise<RowIdRange>;
   getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]>;
   getCurrentManifest(): Promise<Manifest | undefined>;
+  /** The current version alone, without materializing the manifest's block list. */
+  getCurrentManifestVersion(): Promise<number | null>;
   getManifest(version: number): Promise<Manifest | undefined>;
   listManifests(): Promise<Manifest[]>;
   listManifestPage(
@@ -663,6 +673,7 @@ export function createManifest(input: PublishManifestInput): Manifest {
     previousVersion: input.expectedVersion,
     blockIds: [...new Set(input.blockIds)].sort(),
     createdAt: input.createdAt ?? new Date().toISOString(),
+    ...(input.changedTableIds === undefined ? {} : { changedTableIds: [...input.changedTableIds] }),
   };
 }
 
