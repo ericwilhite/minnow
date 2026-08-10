@@ -21,7 +21,9 @@ import {
   type SegmentRecord,
   SnapshotManifestMissingError,
   type StoragePage,
+  type TableColumnRecord,
   type TableRecord,
+  TableRecordConflictError,
   type TempOwnerRecord,
   TempOwnerConflictError,
   type TempRunPage,
@@ -204,6 +206,28 @@ export class MemoryBlockStore implements BlockStore {
   async getTable(id: string): Promise<TableRecord | undefined> {
     const record = this.#tables.get(id);
     return record === undefined ? undefined : structuredClone(record);
+  }
+
+  async updateTable(
+    id: string,
+    expectedRevision: number,
+    update: { columns: TableColumnRecord[] },
+  ): Promise<TableRecord> {
+    return this.#runAtomic(() => {
+      const record = this.#tables.get(id);
+      const actualRevision = record === undefined ? null : (record.revision ?? 0);
+      if (record === undefined || actualRevision !== expectedRevision) {
+        throw new TableRecordConflictError(id, expectedRevision, actualRevision);
+      }
+      validateTableColumns(update.columns);
+      const updated: TableRecord = {
+        ...record,
+        columns: structuredClone(update.columns),
+        revision: expectedRevision + 1,
+      };
+      this.#tables.set(id, updated);
+      return structuredClone(updated);
+    });
   }
 
   async getTableByName(name: string): Promise<TableRecord | undefined> {
@@ -1234,6 +1258,15 @@ function validateTempRunPageIdentity(ownerId: string, runId: string, pageIndex: 
   validateId(runId);
   if (!Number.isSafeInteger(pageIndex) || pageIndex < 0) {
     throw new RangeError("Temp run page index must be a non-negative whole number");
+  }
+}
+
+function validateTableColumns(columns: readonly TableColumnRecord[]): void {
+  if (columns.length === 0) throw new TypeError("A table needs at least one column");
+  const ids = new Set(columns.map(({ id }) => id));
+  const names = new Set(columns.map(({ name }) => name));
+  if (ids.size !== columns.length || names.size !== columns.length) {
+    throw new TypeError("Table columns must have unique IDs and names");
   }
 }
 

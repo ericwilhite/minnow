@@ -22,7 +22,9 @@ import {
   type SegmentRecord,
   SnapshotManifestMissingError,
   type StoragePage,
+  type TableColumnRecord,
   type TableRecord,
+  TableRecordConflictError,
   type TempOwnerRecord,
   TempOwnerConflictError,
   type TempRunPage,
@@ -301,6 +303,33 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     await transactionDone(transaction);
     return value === undefined ? undefined : asTableRecord(value);
+  }
+
+  async updateTable(
+    id: string,
+    expectedRevision: number,
+    update: { columns: TableColumnRecord[] },
+  ): Promise<TableRecord> {
+    validateTableColumns(update.columns);
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const idKey = `${TABLE_ID_PREFIX}${id}`;
+    const value: unknown = await requestResult(store.get(idKey));
+    const record = value === undefined ? undefined : (structuredClone(value) as TableRecord);
+    const actualRevision = record === undefined ? null : (record.revision ?? 0);
+    if (record === undefined || actualRevision !== expectedRevision) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new TableRecordConflictError(id, expectedRevision, actualRevision);
+    }
+    const updated: TableRecord = {
+      ...record,
+      columns: structuredClone(update.columns),
+      revision: expectedRevision + 1,
+    };
+    store.put(structuredClone(updated), idKey);
+    await transactionDone(transaction);
+    return updated;
   }
 
   async getTableByName(name: string): Promise<TableRecord | undefined> {
@@ -1868,6 +1897,15 @@ function isTempRunPageKey(key: IDBValidKey, ownerId: string, runId?: string): bo
 
 function tempOwnerKey(ownerId: string): IDBValidKey {
   return ["owner", ownerId];
+}
+
+function validateTableColumns(columns: readonly TableColumnRecord[]): void {
+  if (columns.length === 0) throw new TypeError("A table needs at least one column");
+  const ids = new Set(columns.map(({ id }) => id));
+  const names = new Set(columns.map(({ name }) => name));
+  if (ids.size !== columns.length || names.size !== columns.length) {
+    throw new TypeError("Table columns must have unique IDs and names");
+  }
 }
 
 function validateTempOwnerRecord(record: TempOwnerRecord): void {

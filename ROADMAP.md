@@ -480,7 +480,25 @@ rule-value benchmark record; the explicitly re-scoped items above carry their ph
 
 Deliver stable table/column IDs, relational type constructors, catalog compiler, Standard Schema-compatible runtime metadata, relations, and automatic migration planning. Prefer metadata-only compatible evolution and piggyback rewrites on compaction.
 
-Exit gate: compile-time select/insert/update types and crash-safe migration tests across supported schema changes.
+Phase 14 is delivered as metadata-only evolution over the existing stable column IDs. The typed
+DSL builds tables from `column.boolean/number/string/datetime` constructors with `.nullable()`,
+`.unique()`, `.renamedFrom()`, and `.references()`; `InferRow`, `InferInsertRow`, and
+`InferUpdateChanges` provide the compile-time select/insert/update types, verified by type-level
+tests, and `typedTable()` wraps the batch APIs in those types. Each table definition carries a
+Standard Schema-compatible `~standard` validator, and declared relations validate against the
+schema at definition time (they are catalog metadata, not write-time constraints).
+`planMigration` diffs the live catalog into deterministic steps — create table, add nullable
+column, rename column through its stable ID, widen nullability — and rejects everything else
+explicitly: type changes, drops, unique-key changes, non-null tightening, and non-nullable
+additions. `BrowserDatabase.migrate()` executes the plan idempotently with one atomic
+compare-and-swap per catalog alteration on a new revisioned `updateTable`, so an interrupted
+migration completes by re-running and a concurrent migrator fails with a typed conflict. Because
+every supported step is catalog-only, no rewrite piggybacking is needed yet: columns added after a
+segment was written read as NULL through every path (append scans, keyed replay, row reads), and
+the streamed and pruned paths conservatively fall back for such segments. Physical rewrites, and
+compaction-time normalization of evolved segments, arrive with future incompatible-change support.
+
+Exit gate: compile-time select/insert/update types and crash-safe migration tests across supported schema changes. Met.
 
 ## Phase 15 — Type-safe ORM
 
@@ -581,6 +599,8 @@ larger/repeated benchmark tiers remain outstanding.
       pruning, LIMIT combining, plan snapshots, and explain().
 - [x] Add exact-count join build-side selection, the dictionary-equality rewrite, and the
       checked-in optimizer rule-value benchmark record.
+- [x] Add the typed schema DSL, Standard Schema validators, and crash-safe metadata-only
+      migrations with catalog compare-and-swap.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

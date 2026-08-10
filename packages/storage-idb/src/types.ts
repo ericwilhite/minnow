@@ -43,6 +43,22 @@ export interface TableRecord {
   uniqueKeyLookupReady?: boolean;
   uniqueKeyStorage?: "chunks-v1";
   createdAt: string;
+  /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
+  revision?: number;
+}
+
+export class TableRecordConflictError extends Error {
+  override readonly name = "TableRecordConflictError";
+
+  constructor(
+    readonly tableId: string,
+    readonly expectedRevision: number,
+    readonly actualRevision: number | null,
+  ) {
+    super(
+      `Table ${tableId} changed: expected revision ${String(expectedRevision)}, found ${String(actualRevision)}`,
+    );
+  }
 }
 
 export type SegmentKind = "insert" | "upsert" | "update" | "delete" | "base";
@@ -548,6 +564,11 @@ export interface BlockStore {
   getTable(id: string): Promise<TableRecord | undefined>;
   getTableByName(name: string): Promise<TableRecord | undefined>;
   listTables(): Promise<TableRecord[]>;
+  updateTable(
+    id: string,
+    expectedRevision: number,
+    update: { columns: TableColumnRecord[] },
+  ): Promise<TableRecord>;
   addSegment(record: SegmentRecord): Promise<void>;
   getSegment(id: string): Promise<SegmentRecord | undefined>;
   listSegments(tableId?: string): Promise<SegmentRecord[]>;

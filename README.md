@@ -466,6 +466,37 @@ An unleased `TransactionManager.openSnapshot()` handle is not a durable collecti
 keeps a snapshot across asynchronous work or an explicit collection pass must use
 `openLeasedSnapshot()` and renew or release that lease explicitly.
 
+## Typed schema and migrations
+
+The schema DSL defines tables with compile-time row types and migrates the catalog through
+metadata-only steps:
+
+```ts
+import { BrowserDatabase, column, schema, table, typedTable } from "@browserdatabase/engine";
+
+const people = table("people", {
+  name: column.string().unique(),
+  score: column.number(),
+  joined: column.datetime().nullable(),
+});
+
+await database.migrate(schema([people]));
+const handle = typedTable(database, people);
+await handle.insert([{ name: "Ada", score: 10 }]); // joined may be omitted; it reads as null
+const rows = await handle.rows(); // Array<{ name: string; score: number; joined: Date | null }>
+```
+
+`InferRow`, `InferInsertRow`, and `InferUpdateChanges` expose the select/insert/update types, and
+each table definition carries a Standard Schema-compatible `~standard` validator. `migrate()`
+diffs the live catalog into deterministic metadata-only steps — create table, add nullable column,
+rename a column through its stable ID with `.renamedFrom()`, widen nullability — executed
+idempotently with one atomic compare-and-swap per catalog change, so an interrupted migration
+completes by re-running and a concurrent migrator fails with a typed conflict. Type changes,
+drops, unique-key changes, non-null tightening, and non-nullable additions are rejected
+explicitly. Columns added after a segment was written read as NULL everywhere without rewriting
+stored data; declared `.references()` relations validate at definition time and live in catalog
+metadata rather than being enforced per write.
+
 ## Storage laboratory
 
 The browser dashboard currently supports:

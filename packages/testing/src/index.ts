@@ -14,6 +14,7 @@ import type {
   RunGarbageCollectionStepInput,
   SegmentRecord,
   StoragePage,
+  TableColumnRecord,
   TableRecord,
   TempOwnerRecord,
   TempRunPage,
@@ -89,6 +90,14 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   listTables(): Promise<TableRecord[]> {
     return this.inner.listTables();
+  }
+
+  updateTable(
+    id: string,
+    expectedRevision: number,
+    update: { columns: TableColumnRecord[] },
+  ): Promise<TableRecord> {
+    return this.inner.updateTable(id, expectedRevision, update);
   }
 
   addSegment(record: SegmentRecord): Promise<void> {

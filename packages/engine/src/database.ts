@@ -81,6 +81,13 @@ import {
 } from "./memory.js";
 import { renderPlan } from "./optimizer.js";
 import {
+  applyColumnSteps,
+  planMigration,
+  type AnyTable,
+  type MigrationStep,
+  type SchemaDefinition,
+} from "./schema.js";
+import {
   createColumnarTable,
   type ColumnarTable,
   type ColumnVector,
@@ -1439,6 +1446,48 @@ export class BrowserDatabase {
   }
 
   /**
+   * Applies a schema definition to the catalog through metadata-only steps: creating missing
+   * tables, adding nullable columns, renaming columns via their stable IDs, and widening
+   * nullability. The pass is idempotent — re-running after a crash completes the remaining
+   * steps — and every catalog alteration is one atomic compare-and-swap, so a concurrent
+   * migrator fails explicitly with a conflict instead of interleaving.
+   */
+  async migrate(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+  ): Promise<{ createdTables: string[]; alteredTables: string[]; steps: MigrationStep[] }> {
+    const plan = planMigration(await this.store.listTables(), definition);
+    const createdTables: string[] = [];
+    const alteredTables = new Set<string>();
+    for (const step of plan.steps) {
+      if (step.kind === "create-table") {
+        if ((await this.store.getTableByName(step.table.name)) !== undefined) continue;
+        const entries = Object.entries(step.table.columns);
+        const uniqueEntry = entries.find(([, columnDefinition]) => columnDefinition.isUnique);
+        await this.createTable({
+          name: step.table.name,
+          ...(uniqueEntry === undefined ? {} : { uniqueKey: uniqueEntry[0] }),
+          columns: entries.map(([name, columnDefinition]) => ({
+            name,
+            type: columnDefinition.type,
+            ...(columnDefinition.isNullable ? { nullable: true } : {}),
+          })),
+        });
+        createdTables.push(step.table.name);
+        continue;
+      }
+      const record = await this.store.getTableByName(step.tableName);
+      if (record === undefined) {
+        throw new Error(`Migration target table is missing: ${step.tableName}`);
+      }
+      const columns = applyColumnSteps(record, [step], this.#createId);
+      if (JSON.stringify(columns) === JSON.stringify(record.columns)) continue;
+      await this.store.updateTable(record.id, record.revision ?? 0, { columns });
+      alteredTables.add(step.tableName);
+    }
+    return { createdTables, alteredTables: [...alteredTables], steps: plan.steps };
+  }
+
+  /**
    * Renders the optimized logical plan for a SELECT statement plus the physical strategy notes
    * the prepared execution would choose, without executing it.
    */
@@ -1632,6 +1681,12 @@ export class BrowserDatabase {
         return kind === "insert" || kind === "base";
       });
       if (!appendOnly) return undefined;
+      // A projected column absent from an older segment reads as NULL through the materialized
+      // null-fill; the streaming loader is block-driven, so those plans keep the materialized path.
+      const columnsPresent = projectedBaseColumns.every((column) =>
+        baseSegments.every((segment) => segment.columnBlockIds[column.id] !== undefined),
+      );
+      if (!columnsPresent) return undefined;
       const rowCount = baseSegments.reduce((total, segment) => total + segment.rowCount, 0);
       const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
       let prepared: PreparedQuery | undefined;
@@ -4252,6 +4307,10 @@ export class BrowserDatabase {
         }
         if (segment.kind === "upsert" && existingIndex !== undefined) {
           for (const column of neededColumns) {
+            // A column absent from this segment joined the catalog later; the replayed slot
+            // keeps its NULL default. Older segments always replay before newer ones, so an
+            // absent-column segment can never overwrite a value written with the column.
+            if (segment.columnBlockIds[column.id] === undefined) continue;
             copyColumnVectorValue(
               requiredColumnVector(segmentVectors, column, segment),
               segmentRow,
@@ -4268,6 +4327,7 @@ export class BrowserDatabase {
         }
         const outputIndex = slotCount;
         for (const column of neededColumns) {
+          if (segment.columnBlockIds[column.id] === undefined) continue;
           copyColumnVectorValue(
             requiredColumnVector(segmentVectors, column, segment),
             segmentRow,
@@ -4323,6 +4383,16 @@ export class BrowserDatabase {
     const predicateColumns = [
       ...new Map(predicates.map((predicate) => [predicate.column.id, predicate.column])).values(),
     ];
+    // Row-group alignment assumes every involved column stored blocks in every segment; a column
+    // added after a segment was written reads as NULL through the full-scan path instead.
+    const involvedColumns = [...projectedColumns, ...predicateColumns];
+    if (
+      involvedColumns.some((column) =>
+        segments.some((segment) => segment.columnBlockIds[column.id] === undefined),
+      )
+    ) {
+      return undefined;
+    }
     const storedBlocks = new Map<string, Uint8Array>();
     const decodedPredicateBlocks = new Map<string, DecodedPhysicalBlock>();
     const predicateBlockIds = [
@@ -4521,7 +4591,14 @@ export class BrowserDatabase {
     let outputRow = 0;
 
     for (const segment of segments) {
-      const blockIds = segment.columnBlockIds[column.id] ?? [];
+      const blockIds = segment.columnBlockIds[column.id];
+      if (blockIds === undefined) {
+        // The column joined the catalog after this segment was written; its rows read as NULL
+        // through the preallocated validity default. A present-but-empty block list still fails
+        // the row-count check below, preserving the corruption guard.
+        outputRow += segment.rowCount;
+        continue;
+      }
       let segmentRows = 0;
       for (let start = 0; start < blockIds.length; start += 16) {
         await this.#renewInternalLeaseIfNeeded(snapshot);
@@ -4626,7 +4703,11 @@ export class BrowserDatabase {
     segment: SegmentRecord,
     decodedColumns: ReadonlyMap<string, DecodedColumn>,
   ): BatchValue[] {
-    const blockIds = segment.columnBlockIds[column.id] ?? [];
+    const blockIds = segment.columnBlockIds[column.id];
+    if (blockIds === undefined) {
+      // The column joined the catalog after this segment was written; its rows read as NULL.
+      return Array.from({ length: segment.rowCount }, () => null);
+    }
     const values: BatchValue[] = [];
     for (const blockId of blockIds) {
       const decoded = decodedColumns.get(blockId);
