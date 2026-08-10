@@ -548,9 +548,7 @@ describe("public SQL queries", () => {
     const havingIn = compileQuery(
       "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING region IN ('west')",
     );
-    expect(executeRowQuery(havingIn, input).rows).toEqual(
-      executeQuery(havingIn, input).rows,
-    );
+    expect(executeRowQuery(havingIn, input).rows).toEqual(executeQuery(havingIn, input).rows);
   });
 
   it("rejects unsupported derived table and CTE forms explicitly", () => {
@@ -558,7 +556,7 @@ describe("public SQL queries", () => {
       "A derived table requires an alias",
     );
     expect(() => compileQuery("WITH r AS (SELECT value FROM r) SELECT value FROM r")).toThrow(
-      "Recursive CTEs are not supported: r",
+      "Recursive CTE references require WITH RECURSIVE: r",
     );
     expect(() =>
       compileQuery(
@@ -831,4 +829,147 @@ describe("public SQL queries", () => {
       }
     });
   }
+
+  it("evaluates OR, NOT, LIKE, and CASE with SQL null semantics in both executors", () => {
+    const rows = [
+      { region: "west", amount: 10, active: true },
+      { region: "west coast", amount: null, active: false },
+      { region: null, amount: 5, active: null },
+      { region: "east", amount: -2, active: true },
+      { region: "least", amount: 7, active: false },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT region FROM rows WHERE amount > 6 OR region = 'east'",
+      "SELECT region FROM rows WHERE NOT amount > 6",
+      "SELECT region FROM rows WHERE NOT (region = 'west' OR amount < 0)",
+      "SELECT region FROM rows WHERE region LIKE 'w%'",
+      "SELECT region FROM rows WHERE region LIKE '%east%' OR region NOT LIKE '_est%'",
+      "SELECT region FROM rows WHERE region LIKE '%st' AND (active OR amount > 4)",
+      "SELECT region FROM rows WHERE amount NOT BETWEEN 0 AND 6",
+      "SELECT region, CASE WHEN amount > 6 THEN 'big' WHEN amount > 0 THEN 'small' ELSE 'other' END AS size FROM rows",
+      "SELECT region, CASE region WHEN 'west' THEN 1 WHEN 'east' THEN 2 END AS code FROM rows",
+      "SELECT region, amount > 5 AS high FROM rows",
+      "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING COUNT(*) > 1 OR MAX(amount) >= 7",
+    ]) {
+      const plan = compileQuery(sql);
+      const raw = compileQuery(sql, { optimize: false });
+      expect(executeQuery(plan, input), sql).toEqual(executeRowQuery(raw, input));
+    }
+    // NULL region: LIKE is unknown, so the row filters out; NOT does not resurrect it.
+    const notLike = executeQuery(
+      compileQuery("SELECT amount FROM rows WHERE region NOT LIKE 'w%'"),
+      input,
+    );
+    expect(notLike.rows).toEqual([{ amount: -2 }, { amount: 7 }]);
+    const orNull = executeQuery(
+      compileQuery("SELECT region FROM rows WHERE active OR amount > 4"),
+      input,
+    );
+    expect(orNull.rows).toEqual([
+      { region: "west" },
+      { region: null },
+      { region: "east" },
+      { region: "least" },
+    ]);
+  });
+
+  it("evaluates EXISTS, set operations, and OFFSET in both executors", () => {
+    const rows = [
+      { region: "west", amount: 4 },
+      { region: "east", amount: 2 },
+      { region: "east", amount: 2 },
+      { region: "north", amount: 9 },
+    ];
+    const dims = [{ region: "east" }, { region: "south" }];
+    const input = new Map<string, DatabaseRow[]>([
+      ["rows", rows],
+      ["dims", dims],
+    ]);
+    for (const sql of [
+      "SELECT region FROM rows WHERE EXISTS (SELECT region FROM dims WHERE region = 'east')",
+      "SELECT region FROM rows WHERE NOT EXISTS (SELECT region FROM dims WHERE region = 'missing')",
+      "SELECT region FROM rows INTERSECT SELECT region FROM dims",
+      "SELECT region FROM rows EXCEPT SELECT region FROM dims",
+      "SELECT region FROM rows EXCEPT SELECT region FROM dims UNION SELECT region FROM dims INTERSECT SELECT region FROM rows",
+      "SELECT region, amount FROM rows ORDER BY amount, region LIMIT 2 OFFSET 1",
+    ]) {
+      const plan = compileQuery(sql);
+      const raw = compileQuery(sql, { optimize: false });
+      expect(executeQuery(plan, input), sql).toEqual(executeRowQuery(raw, input));
+    }
+    const intersect = executeQuery(
+      compileQuery("SELECT region FROM rows INTERSECT SELECT region FROM dims"),
+      input,
+    );
+    expect(intersect.rows).toEqual([{ region: "east" }]);
+    const except = executeQuery(
+      compileQuery("SELECT region FROM rows EXCEPT SELECT region FROM dims"),
+      input,
+    );
+    expect(except.rows).toEqual([{ region: "west" }, { region: "north" }]);
+    const offset = executeQuery(
+      compileQuery("SELECT amount FROM rows ORDER BY amount DESC LIMIT 2 OFFSET 1"),
+      input,
+    );
+    expect(offset.rows).toEqual([{ amount: 4 }, { amount: 2 }]);
+  });
+
+  it("computes aggregate windows, general joins, and recursive CTEs in both executors", () => {
+    const rows = [
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+      { region: "west", amount: 20 },
+      { region: "east", amount: 5 },
+      { region: "east", amount: null },
+    ];
+    const dims = [
+      { region: "west", weight: 3 },
+      { region: "east", weight: 12 },
+    ];
+    const input = new Map<string, DatabaseRow[]>([
+      ["rows", rows],
+      ["dims", dims],
+    ]);
+    for (const sql of [
+      "SELECT region, amount, SUM(amount) OVER (PARTITION BY region) AS total FROM rows ORDER BY region, amount",
+      "SELECT region, amount, SUM(amount) OVER (PARTITION BY region ORDER BY amount) AS running FROM rows ORDER BY region, amount",
+      "SELECT region, COUNT(*) OVER (PARTITION BY region) AS size, MIN(amount) OVER (PARTITION BY region) AS low FROM rows ORDER BY region",
+      "SELECT r.region, d.weight FROM rows r JOIN dims d ON d.weight > r.amount",
+      "SELECT r.region, r.amount, d.weight FROM rows r LEFT JOIN dims d ON d.region = r.region AND d.weight > r.amount ORDER BY region, amount",
+      "SELECT r.region, d.weight FROM rows r RIGHT JOIN dims d ON d.region = r.region ORDER BY weight",
+      "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM rows UNION ALL SELECT v + 5 FROM n WHERE v < 20) SELECT v FROM n",
+      "WITH RECURSIVE n AS (SELECT region FROM dims UNION SELECT region FROM rows WHERE region IN (SELECT region FROM n)) SELECT region FROM n",
+    ]) {
+      const plan = compileQuery(sql);
+      const raw = compileQuery(sql, { optimize: false });
+      expect(executeQuery(plan, input), sql).toEqual(executeRowQuery(raw, input));
+    }
+    const running = executeQuery(
+      compileQuery(
+        "SELECT region, amount, SUM(amount) OVER (PARTITION BY region ORDER BY amount) AS running FROM rows WHERE region = 'west' ORDER BY amount",
+      ),
+      input,
+    );
+    expect(running.rows).toEqual([
+      { region: "west", amount: 10, running: 10 },
+      { region: "west", amount: 20, running: 50 },
+      { region: "west", amount: 20, running: 50 },
+    ]);
+    const counts = executeQuery(
+      compileQuery(
+        "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM rows UNION ALL SELECT v * 2 FROM n WHERE v < 30) SELECT v FROM n ORDER BY v",
+      ),
+      input,
+    );
+    expect(counts.rows).toEqual([{ v: 5 }, { v: 10 }, { v: 20 }, { v: 40 }]);
+    expect(() =>
+      executeRowQuery(
+        compileQuery(
+          "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM rows UNION ALL SELECT v FROM n) SELECT v FROM n",
+        ),
+        input,
+      ),
+    ).toThrow("Recursive CTE exceeded");
+  });
 });

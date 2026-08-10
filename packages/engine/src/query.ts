@@ -103,6 +103,7 @@ export interface TableSource {
   derived?: CompiledQuery;
   /** A top-level set operation; members combine positionally under the first member's schema. */
   union?: { blocks: CompiledQuery[]; ops: SetOperator[] };
+  recursive?: RecursiveCte;
   /** A window-function desugar: the inner block executes, then window columns append. */
   windowed?: { block: CompiledQuery; windows: WindowSpec[] };
 }
@@ -116,6 +117,21 @@ export interface JoinPlan extends TableSource {
 }
 
 export type SetOperator = "union" | "union all" | "intersect" | "except";
+
+/**
+ * A WITH RECURSIVE source: the base block seeds the working set, then the step block re-executes
+ * with `reference` bound to the previous iteration's new rows (linear delta recursion) until no
+ * new rows appear. UNION deduplicates against everything seen; UNION ALL appends raw.
+ */
+export interface RecursiveCte {
+  reference: string;
+  base: CompiledQuery;
+  step: CompiledQuery;
+  all: boolean;
+}
+
+const MAX_RECURSIVE_ITERATIONS = 10_000;
+const MAX_RECURSIVE_ROWS = 1_000_000;
 
 export type PredicateOperator =
   | ComparisonOperator
@@ -347,6 +363,10 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
       if (source.derived !== undefined) collectBlock(source.derived);
       source.union?.blocks.forEach(collectBlock);
       if (source.windowed !== undefined) collectBlock(source.windowed.block);
+      if (source.recursive !== undefined) {
+        collectBlock(source.recursive.base);
+        collectBlock(source.recursive.step);
+      }
     }
     for (const item of block.select) {
       rewrite(item.expression, (next) => (item.expression = next));
@@ -405,7 +425,9 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
       (source) =>
         (source.derived !== undefined && blockHas(source.derived)) ||
         source.union?.blocks.some(blockHas) === true ||
-        (source.windowed !== undefined && blockHas(source.windowed.block)),
+        (source.windowed !== undefined && blockHas(source.windowed.block)) ||
+        (source.recursive !== undefined &&
+          (blockHas(source.recursive.base) || blockHas(source.recursive.step))),
     );
   return blockHas(plan);
 }
@@ -535,7 +557,11 @@ export function referencedColumns(
   const outputAliases = new Set(plan.select.map((item) => item.alias));
   const expressions = [
     ...plan.select.map((item) => item.expression),
-    ...plan.joins.flatMap((join) => [join.left, join.right, ...(join.on === undefined ? [] : [join.on])]),
+    ...plan.joins.flatMap((join) => [
+      join.left,
+      join.right,
+      ...(join.on === undefined ? [] : [join.on]),
+    ]),
     ...plan.predicates.flatMap((predicate) => [predicate.left, predicate.right]),
     ...plan.groupBy,
     ...plan.having.flatMap((predicate) => [predicate.left, predicate.right]),
@@ -766,6 +792,81 @@ export function combineUnionResults(
   return { columns: [...columns], rows: combined };
 }
 
+function encodeRowKey(columns: readonly string[]): (row: QueryRow) => string {
+  return (row) =>
+    JSON.stringify(
+      columns.map((name) => {
+        const value = row[name] ?? null;
+        if (value === null) return [0];
+        if (typeof value === "boolean") return [1, value];
+        if (typeof value === "number") return [2, Object.is(value, -0) ? "-0" : String(value)];
+        if (typeof value === "string") return [3, value];
+        return [4, value.getTime()];
+      }),
+    );
+}
+
+interface RecursiveCteState {
+  readonly columns: readonly string[];
+  readonly rows: QueryRow[];
+  frontier: QueryRow[];
+  iterations: number;
+  absorb(step: QueryResult): void;
+}
+
+/**
+ * Drives one recursive CTE to its fixpoint: absorb() renames a step result positionally onto the
+ * base columns, appends what is new (all rows for UNION ALL, unseen rows for UNION), and refreshes
+ * the frontier. Hard caps bound runaway recursions explicitly instead of exhausting memory.
+ */
+export function createRecursiveCteState(base: QueryResult, all: boolean): RecursiveCteState {
+  const columns = base.columns;
+  const encode = encodeRowKey(columns);
+  const seen = new Set<string>();
+  const admit = (candidates: readonly QueryRow[]): QueryRow[] => {
+    if (all) return [...candidates];
+    const fresh: QueryRow[] = [];
+    for (const row of candidates) {
+      const key = encode(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      fresh.push(row);
+    }
+    return fresh;
+  };
+  const state: RecursiveCteState = {
+    columns,
+    rows: [],
+    frontier: [],
+    iterations: 0,
+    absorb(step: QueryResult): void {
+      state.iterations += 1;
+      if (state.iterations > MAX_RECURSIVE_ITERATIONS) {
+        throw new RangeError(
+          `Recursive CTE exceeded ${String(MAX_RECURSIVE_ITERATIONS)} iterations`,
+        );
+      }
+      if (step.columns.length !== columns.length) {
+        throw new TypeError("Recursive CTE members must select the same number of columns");
+      }
+      const renamed = step.rows.map((row) =>
+        Object.fromEntries(
+          columns.map((name, column) => [name, row[step.columns[column] ?? ""] ?? null]),
+        ),
+      );
+      state.frontier = admit(renamed);
+      state.rows.push(...state.frontier);
+      if (state.rows.length > MAX_RECURSIVE_ROWS) {
+        throw new RangeError(`Recursive CTE exceeded ${String(MAX_RECURSIVE_ROWS)} rows`);
+      }
+    },
+  };
+  const seeded = admit(base.rows);
+  state.rows.push(...seeded);
+  state.frontier = seeded;
+  return state;
+}
+
 /** The direct child expressions of a node; subqueries and EXISTS scope their own blocks. */
 function childExpressions(expression: Expression): Expression[] {
   if (expression.kind === "binary") return [expression.left, expression.right];
@@ -919,11 +1020,7 @@ export function applyWindowFunctions(
             comparable(rows[right]?.[alias] ?? null),
           ) === 0,
       );
-    if (
-      window.name !== "ROW_NUMBER" &&
-      window.name !== "RANK" &&
-      window.name !== "DENSE_RANK"
-    ) {
+    if (window.name !== "ROW_NUMBER" && window.name !== "RANK" && window.name !== "DENSE_RANK") {
       applyAggregateWindow(rows, indexes, window, samePartition, sameOrderKeys);
       continue;
     }
@@ -964,13 +1061,27 @@ function resolveDerivedRowTables(
   if (
     !sources.some(
       (source) =>
-        source.derived !== undefined || source.union !== undefined || source.windowed !== undefined,
+        source.derived !== undefined ||
+        source.union !== undefined ||
+        source.windowed !== undefined ||
+        source.recursive !== undefined,
     )
   ) {
     return tables;
   }
   const resolved = new Map(tables);
   for (const source of sources) {
+    if (source.recursive !== undefined) {
+      const { reference, base, step, all } = source.recursive;
+      const state = createRecursiveCteState(executeRowQuery(base, tables), all);
+      while (state.frontier.length > 0) {
+        const stepTables = new Map(tables);
+        stepTables.set(reference, state.frontier);
+        state.absorb(executeRowQuery(step, stepTables));
+      }
+      resolved.set(source.table, state.rows);
+      continue;
+    }
     if (source.union !== undefined) {
       const results = source.union.blocks.map((block) => executeRowQuery(block, tables));
       resolved.set(source.table, combineUnionResults(results, source.union.ops).rows);
@@ -1109,7 +1220,9 @@ function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]
       let matched = false;
       for (const row of rows) {
         const candidate = { ...context, [join.alias]: row };
-        if (evaluateBooleanExpression(condition, (nested) => evaluate(nested, candidate)) === true) {
+        if (
+          evaluateBooleanExpression(condition, (nested) => evaluate(nested, candidate)) === true
+        ) {
           matched = true;
           joined.push(candidate);
         }
@@ -1264,12 +1377,19 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
 
 function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
   if (predicate.operator === "IS TRUE") {
-    return evaluateBooleanExpression(predicate.left, (nested) => evaluate(nested, context)) === true;
+    return (
+      evaluateBooleanExpression(predicate.left, (nested) => evaluate(nested, context)) === true
+    );
   }
   if (predicate.operator === "LIKE" || predicate.operator === "NOT LIKE") {
     return (
       evaluateBooleanExpression(
-        { kind: "condition", operator: predicate.operator, left: predicate.left, right: predicate.right },
+        {
+          kind: "condition",
+          operator: predicate.operator,
+          left: predicate.left,
+          right: predicate.right,
+        },
         (nested) => evaluate(nested, context),
       ) === true
     );
@@ -1475,7 +1595,11 @@ function validateGrouping(plan: CompiledQuery): void {
     }
   }
   const forbiddenAggregates = [
-    ...plan.joins.flatMap((join) => [join.left, join.right, ...(join.on === undefined ? [] : [join.on])]),
+    ...plan.joins.flatMap((join) => [
+      join.left,
+      join.right,
+      ...(join.on === undefined ? [] : [join.on]),
+    ]),
     ...plan.predicates.flatMap((predicate) => [predicate.left, predicate.right]),
     ...plan.groupBy,
   ];
@@ -1546,24 +1670,40 @@ class Parser {
   #derivedSequence = 0;
   readonly #ctes = new Map<string, CompiledQuery>();
   readonly #ctesInProgress = new Set<string>();
+  readonly #recursiveCtes = new Map<string, RecursiveCte>();
+  readonly #recursiveUses = new Set<string>();
+  #recursiveCandidate: { name: string; reference: string } | undefined;
 
   constructor(private readonly tokens: Token[]) {}
 
   parse(sql: string): CompiledQuery {
     if (this.#isKeyword("WITH")) {
       this.#keyword("WITH");
+      let recursive = false;
+      if (this.#isKeyword("RECURSIVE")) {
+        this.#keyword("RECURSIVE");
+        recursive = true;
+      }
       for (;;) {
         const name = this.#identifier();
-        if (this.#ctes.has(name) || this.#ctesInProgress.has(name)) {
+        if (
+          this.#ctes.has(name) ||
+          this.#ctesInProgress.has(name) ||
+          this.#recursiveCtes.has(name)
+        ) {
           throw new TypeError(`Duplicate CTE name: ${name}`);
         }
         this.#keyword("AS");
         this.#expectPunctuation("(");
-        this.#ctesInProgress.add(name);
-        const block = this.#selectBlock("(cte)");
-        this.#ctesInProgress.delete(name);
-        this.#expectPunctuation(")");
-        this.#ctes.set(name, block);
+        if (recursive) {
+          this.#recursiveCte(name);
+        } else {
+          this.#ctesInProgress.add(name);
+          const block = this.#selectBlock("(cte)");
+          this.#ctesInProgress.delete(name);
+          this.#expectPunctuation(")");
+          this.#ctes.set(name, block);
+        }
         if (!this.#punctuation(",")) break;
       }
     }
@@ -1867,7 +2007,13 @@ class Parser {
           void joinKind;
           const previousBase = base;
           base = joinSource;
-          joins[0] = { ...previousBase, kind: "left", left, right: rightSide, ...(only.on === undefined ? {} : { on: only.on }) };
+          joins[0] = {
+            ...previousBase,
+            kind: "left",
+            left,
+            right: rightSide,
+            ...(only.on === undefined ? {} : { on: only.on }),
+          };
         }
       }
     }
@@ -2168,6 +2314,62 @@ class Parser {
     return items;
   }
 
+  /**
+   * Parses one WITH RECURSIVE body: `base UNION [ALL] step`, where only the step may reference
+   * the CTE's own name. A body without a self-reference or UNION registers as a plain CTE.
+   */
+  #recursiveCte(name: string): void {
+    const candidate = { name, reference: `(recursive ${name})` };
+    this.#recursiveCandidate = candidate;
+    try {
+      const base = this.#selectBlock("(cte)");
+      if (this.#recursiveUses.has(name)) {
+        throw new TypeError("A recursive CTE may only reference itself in its step member");
+      }
+      if (!this.#isKeyword("UNION")) {
+        this.#expectPunctuation(")");
+        this.#ctes.set(name, base);
+        return;
+      }
+      this.#keyword("UNION");
+      let all = false;
+      if (this.#isKeyword("ALL")) {
+        this.#keyword("ALL");
+        all = true;
+      }
+      const step = this.#selectBlock("(cte step)");
+      if (this.#isKeyword("UNION") || this.#isKeyword("INTERSECT") || this.#isKeyword("EXCEPT")) {
+        throw new TypeError("A recursive CTE takes exactly one UNION between base and step");
+      }
+      this.#expectPunctuation(")");
+      if (!this.#recursiveUses.has(name)) {
+        // No self-reference: the body is an ordinary two-member compound.
+        this.#derivedSequence += 1;
+        this.#ctes.set(name, {
+          sql: "(cte)",
+          base: {
+            table: `(union ${String(this.#derivedSequence)})`,
+            alias: "union",
+            union: {
+              blocks: [base, step],
+              ops: [all ? "union all" : "union"],
+            },
+          },
+          joins: [],
+          select: [{ expression: { kind: "wildcard" }, alias: "*" }],
+          predicates: [],
+          groupBy: [],
+          having: [],
+          orderBy: [],
+        });
+        return;
+      }
+      this.#recursiveCtes.set(name, { reference: candidate.reference, base, step, all });
+    } finally {
+      this.#recursiveCandidate = undefined;
+    }
+  }
+
   #source(): TableSource {
     if (this.#punctuation("(")) {
       const derived = this.#selectBlock("(derived)");
@@ -2177,12 +2379,26 @@ class Parser {
       return this.#derivedSource(derived, alias);
     }
     const table = this.#identifier();
+    const candidate = this.#recursiveCandidate;
+    if (candidate?.name === table) {
+      this.#recursiveUses.add(table);
+      return { table: candidate.reference, alias: this.#sourceAlias() ?? table };
+    }
     if (this.#ctesInProgress.has(table)) {
-      throw new TypeError(`Recursive CTEs are not supported: ${table}`);
+      throw new TypeError(`Recursive CTE references require WITH RECURSIVE: ${table}`);
     }
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
     if (cte !== undefined) return this.#derivedSource(structuredClone(cte), alias);
+    const recursive = this.#recursiveCtes.get(table);
+    if (recursive !== undefined) {
+      this.#derivedSequence += 1;
+      return {
+        table: `(recursive ${String(this.#derivedSequence)}) ${table}`,
+        alias,
+        recursive: structuredClone(recursive),
+      };
+    }
     return { table, alias };
   }
 
@@ -2302,10 +2518,7 @@ class Parser {
       return { kind: "condition", operator, left, right: this.#additive() };
     }
     const token = this.#peek();
-    if (
-      token.kind === "operator" &&
-      ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)
-    ) {
+    if (token.kind === "operator" && ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)) {
       const operator = this.#comparison();
       return { kind: "condition", operator, left, right: this.#additive() };
     }
@@ -2396,7 +2609,7 @@ class Parser {
       const block = this.#selectBlock("(subquery)");
       this.#expectPunctuation(")");
       // Existence needs at most one row, so cap the subquery unless it already limits itself.
-      if (block.limit === undefined) block.limit = 1;
+      block.limit ??= 1;
       return { kind: "exists", block, negated: false };
     }
     if (upper === "DATE" && this.#peek().kind === "string") {
@@ -2480,7 +2693,6 @@ class Parser {
       throw new TypeError(`Expected comparison operator, found ${token.text}`);
     return token.text as ComparisonOperator;
   }
-
 
   #identifier(): string {
     return this.#take("identifier").text;

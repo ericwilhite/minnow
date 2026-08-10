@@ -140,14 +140,19 @@ request when the document becomes hidden or the page fires `pagehide`. This is a
 an unload-time durability guarantee.
 
 `query()` and `prepareQuery()` are the public read-only SQL API, and `execute()` additionally
-routes SQL mutations. The SQL surface supports `SELECT` with `DISTINCT`, aliases, inner and left
-equi-joins, `WHERE` comparisons joined by `AND` with `IN`/`NOT IN` lists, `IS [NOT] NULL`,
-inclusive `BETWEEN`, and uncorrelated scalar
-and membership subqueries, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT(DISTINCT)` as the
+routes SQL mutations. The SQL surface supports `SELECT` with `DISTINCT`, aliases, inner, left, and
+sole-join `RIGHT` joins over equality, multi-key, or non-equi `ON` conditions (equalities keep the
+hash path; anything else runs a nested-loop join), full boolean `WHERE`/`HAVING` conditions —
+`AND`/`OR`/`NOT` with parentheses under SQL three-valued logic — with comparisons,
+`IN`/`NOT IN` lists, `IS [NOT] NULL`, inclusive `[NOT] BETWEEN`, `[NOT] LIKE`, uncorrelated
+`EXISTS`, and uncorrelated scalar and membership subqueries, `CASE` expressions in searched and
+simple forms, arithmetic, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT(DISTINCT)` as the
 sole aggregate of its select, `ROUND`, `GROUP BY`,
-`HAVING` conditions over aggregates, literals, and group keys, multi-column `ORDER BY`, `LIMIT`,
-non-recursive `WITH` CTEs, derived tables, top-level `UNION`/`UNION ALL`, and
-`ROW_NUMBER`/`RANK`/`DENSE_RANK` window functions over `PARTITION BY`/`ORDER BY`.
+`HAVING`, multi-column `ORDER BY`, `LIMIT` with `OFFSET`,
+`WITH` CTEs including `WITH RECURSIVE` (linear delta recursion with explicit iteration and row
+caps), derived tables, top-level `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` with standard
+precedence, and `ROW_NUMBER`/`RANK`/`DENSE_RANK` plus aggregate window functions over
+`PARTITION BY`/`ORDER BY` with the SQL default frame.
 `SELECT DISTINCT` compiles into grouping by every selected expression, so it reuses
 the grouped executor, its partitioned spill, and streamed scan inputs; CTEs, derived tables, set
 operations, and window inputs execute at the same leased snapshot and materialize as typed
@@ -163,9 +168,8 @@ row. `explain()` renders the optimized plan with physical strategy notes, and th
 differential fuzzer executes optimized plans against the raw-plan row reference. The checked-in
 machine-readable feature matrix
 (`packages/engine/sql-feature-matrix.json`) records every supported and rejected form with an
-executable example, and a conformance test holds it honest. Unsupported syntax — `OR`, `LIKE`,
-`CASE`, `EXISTS`, correlated subqueries, recursive CTEs,
-`INTERSECT`/`EXCEPT`, aggregate windows, non-equi joins, DDL, and more — fails explicitly instead
+executable example, and a conformance test holds it honest. Unsupported syntax — correlated
+subqueries, `FULL OUTER` joins, explicit window frames, DDL, and more — fails explicitly instead
 of being silently interpreted. A prepared query materializes only
 its referenced columns at one manifest version, remains stable across later commits, and must be
 closed when no longer needed. This is a correctness-first SQL subset, not a claim of full SQL-92

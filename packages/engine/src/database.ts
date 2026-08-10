@@ -60,6 +60,7 @@ import {
   blockHasSubqueries,
   combineUnionResults,
   compileQuery,
+  createRecursiveCteState,
   compileStatement,
   createPreparedColumnarQuery,
   evaluateRowExpression,
@@ -1174,11 +1175,25 @@ export class BrowserDatabase {
   /** Collects every real table referenced by a block, its derived sources, or its subqueries. */
   async #findRealBlockTables(plan: CompiledQuery): Promise<Map<string, TableRecord>> {
     const names = new Set<string>();
+    const excluded = new Set<string>();
     const walkExpression = (expression: Expression): void => {
-      if (expression.kind === "subquery") walk(expression.block);
-      else if (expression.kind === "binary") {
+      if (expression.kind === "subquery" || expression.kind === "exists") {
+        walk(expression.block);
+        return;
+      }
+      if (expression.kind === "binary" || expression.kind === "condition") {
         walkExpression(expression.left);
         walkExpression(expression.right);
+      } else if (expression.kind === "logical") {
+        walkExpression(expression.left);
+        walkExpression(expression.right);
+      } else if (expression.kind === "not") walkExpression(expression.operand);
+      else if (expression.kind === "case") {
+        for (const branch of expression.branches) {
+          walkExpression(branch.when);
+          walkExpression(branch.then);
+        }
+        if (expression.otherwise !== undefined) walkExpression(expression.otherwise);
       } else if (expression.kind === "call") expression.arguments.forEach(walkExpression);
       else if (expression.kind === "list") expression.items.forEach(walkExpression);
     };
@@ -1186,11 +1201,19 @@ export class BrowserDatabase {
       for (const source of [block.base, ...block.joins]) {
         if (source.union !== undefined) source.union.blocks.forEach(walk);
         else if (source.windowed !== undefined) walk(source.windowed.block);
-        else if (source.derived === undefined) names.add(source.table);
+        else if (source.recursive !== undefined) {
+          // The self-reference is bound per iteration, never loaded from storage.
+          excluded.add(source.recursive.reference);
+          walk(source.recursive.base);
+          walk(source.recursive.step);
+        } else if (source.derived === undefined) names.add(source.table);
         else walk(source.derived);
       }
       for (const item of block.select) walkExpression(item.expression);
       block.groupBy.forEach(walkExpression);
+      for (const join of block.joins) {
+        if (join.on !== undefined) walkExpression(join.on);
+      }
       for (const predicate of [...block.predicates, ...block.having]) {
         walkExpression(predicate.left);
         walkExpression(predicate.right);
@@ -1198,6 +1221,7 @@ export class BrowserDatabase {
       for (const order of block.orderBy) walkExpression(order.expression);
     };
     walk(plan);
+    for (const name of excluded) names.delete(name);
     const tables = await Promise.all([...names].map((name) => this.#findTable(name)));
     return new Map(tables.map((table) => [table.name, table]));
   }
@@ -1238,10 +1262,61 @@ export class BrowserDatabase {
     memory: QueryMemoryContext,
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
+    extraInputs?: ReadonlyMap<string, ColumnarTable>,
   ): Promise<Map<string, ColumnarTable>> {
-    const inputs = new Map<string, ColumnarTable>();
+    const inputs = new Map<string, ColumnarTable>(extraInputs ?? []);
     const sources = [block.base, ...block.joins];
     for (const source of sources) {
+      if (inputs.has(source.table)) continue;
+      if (source.recursive !== undefined) {
+        const { reference, base, step, all } = source.recursive;
+        const baseResult = await this.#executeBlock(
+          base,
+          snapshot,
+          visibility,
+          memory,
+          realTables,
+          typedSchemas,
+        );
+        const schema = inferBlockSchema(base, typedSchemas);
+        typedSchemas.set(reference, schema);
+        const state = createRecursiveCteState(baseResult, all);
+        while (state.frontier.length > 0) {
+          // Each iteration's inputs release with its own context, so only the accumulated rows
+          // and the final columnar table hold memory across the fixpoint loop.
+          const iterationMemory = memory.createChild();
+          try {
+            const frontierTable = derivedColumnarTable(
+              reference,
+              { columns: [...state.columns], rows: state.frontier },
+              schema,
+            );
+            state.absorb(
+              await this.#executeBlock(
+                step,
+                snapshot,
+                visibility,
+                iterationMemory,
+                realTables,
+                typedSchemas,
+                new Map([[reference, frontierTable]]),
+              ),
+            );
+          } finally {
+            iterationMemory.close();
+          }
+        }
+        typedSchemas.set(source.table, schema);
+        inputs.set(
+          source.table,
+          derivedColumnarTable(
+            source.table,
+            { columns: [...state.columns], rows: state.rows },
+            schema,
+          ),
+        );
+        continue;
+      }
       if (source.union !== undefined) {
         const results: QueryResult[] = [];
         let schema: SqlColumnSchema[] | undefined;
@@ -1689,7 +1764,8 @@ export class BrowserDatabase {
       plan.base.derived === undefined &&
       plan.base.union === undefined &&
       plan.base.windowed === undefined &&
-      plan.joins.every((join) => join.derived === undefined) &&
+      plan.base.recursive === undefined &&
+      plan.joins.every((join) => join.derived === undefined && join.recursive === undefined) &&
       !plan.joins.some((join) => join.table === plan.base.table) &&
       !blockHasSubqueries(plan)
     );
@@ -1892,6 +1968,7 @@ export class BrowserDatabase {
     memory: QueryMemoryContext,
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
+    extraInputs?: ReadonlyMap<string, ColumnarTable>,
   ): Promise<QueryResult> {
     const inputs = await this.#prepareBlockInputs(
       block,
@@ -1900,6 +1977,7 @@ export class BrowserDatabase {
       memory,
       realTables,
       typedSchemas,
+      extraInputs,
     );
     const prepared = createPreparedColumnarQuery(block, inputs, memory.createChild());
     try {
@@ -5053,11 +5131,16 @@ function validateBatch(table: TableRecord, input: InsertBatchInput): number {
   if (first === undefined) throw new Error("Table has no columns");
   const rowCount = input.columns[first.name]?.length ?? 0;
   if (rowCount === 0) throw new TypeError("A batch needs at least one row");
-  table.columns.forEach((column) => {
+  for (const column of table.columns) {
     const values = input.columns[column.name] ?? [];
     if (values.length !== rowCount) throw new TypeError("All columns must have the same row count");
-    values.forEach((value, index) => validateValue(column, value, index));
-  });
+    // An index loop rather than forEach: forEach skips holes in sparse arrays, which would let an
+    // undefined value reach the block encoder and persist a corrupt block that only fails at read
+    // time. Every slot is validated, holes included.
+    for (let index = 0; index < values.length; index += 1) {
+      validateValue(column, values[index] as BatchValue, index);
+    }
+  }
   return rowCount;
 }
 

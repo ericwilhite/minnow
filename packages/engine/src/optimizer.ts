@@ -23,6 +23,10 @@ function optimizeBlock(block: CompiledQuery): void {
     if (source.derived !== undefined) optimizeBlock(source.derived);
     source.union?.blocks.forEach(optimizeBlock);
     if (source.windowed !== undefined) optimizeBlock(source.windowed.block);
+    if (source.recursive !== undefined) {
+      optimizeBlock(source.recursive.base);
+      optimizeBlock(source.recursive.step);
+    }
   }
   foldBlockConstants(block);
   pushPredicatesIntoDerived(block);
@@ -258,9 +262,8 @@ function rewriteForInner(
     }
     return { ...expression, branches, ...(otherwise === undefined ? {} : { otherwise }) };
   }
-  // An EXISTS block is self-contained (no correlation), so it moves unchanged.
-  if (expression.kind === "exists") return expression;
-  return undefined;
+  // An EXISTS block (the only remaining kind) is self-contained, so it moves unchanged.
+  return expression;
 }
 
 function containsAggregateOrWindow(expression: Expression): boolean {
@@ -462,6 +465,15 @@ function renderSource(source: TableSource, label: string, depth: number, lines: 
         .join(", ")}]`,
     );
     renderBlock(source.windowed.block, depth + 2, lines);
+    return;
+  }
+  if (source.recursive !== undefined) {
+    lines.push(
+      `${pad}  ${label} recursive [${source.alias}] ${source.recursive.all ? "union all" : "union"}`,
+    );
+    renderBlock(source.recursive.base, depth + 2, lines);
+    lines.push(`${pad}    step`);
+    renderBlock(source.recursive.step, depth + 2, lines);
     return;
   }
   if (source.derived !== undefined) {

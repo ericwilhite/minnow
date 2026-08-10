@@ -61,8 +61,19 @@ const NUMERIC_COLUMNS = ["amount", "ratio"];
 const ALL_COLUMNS = ["region", "label", "amount", "ratio", "joined"];
 const COMPARISONS = ["=", "!=", ">", ">=", "<", "<="];
 
-function generatePredicate(fuzzer: Fuzzer, qualifier: string): string {
-  const kind = fuzzer.int(6);
+const LIKE_PATTERNS = ["w%", "%st", "_est", "%e%", "north", "%nowhere%"];
+
+function generatePredicate(fuzzer: Fuzzer, qualifier: string, compound = true): string {
+  const kind = fuzzer.int(compound ? 9 : 6);
+  if (kind === 6) {
+    return `(${generatePredicate(fuzzer, qualifier, false)} OR ${generatePredicate(fuzzer, qualifier, false)})`;
+  }
+  if (kind === 7) {
+    return `NOT (${generatePredicate(fuzzer, qualifier, false)})`;
+  }
+  if (kind === 8) {
+    return `${qualifier}region ${fuzzer.random() < 0.5 ? "LIKE" : "NOT LIKE"} '${fuzzer.pick(LIKE_PATTERNS)}'`;
+  }
   if (kind === 4) {
     const column = fuzzer.pick(ALL_COLUMNS);
     return `${qualifier}${column} IS ${fuzzer.random() < 0.5 ? "NOT " : ""}NULL`;
@@ -89,7 +100,7 @@ function generatePredicate(fuzzer: Fuzzer, qualifier: string): string {
 }
 
 function generateSql(fuzzer: Fuzzer): string {
-  const family = fuzzer.int(11);
+  const family = fuzzer.int(13);
   if (family === 10) {
     const grouped = fuzzer.random() < 0.5;
     return grouped
@@ -110,7 +121,8 @@ function generateSql(fuzzer: Fuzzer): string {
     return `SELECT ${columns.join(", ")} FROM rows${where()}`;
   }
   if (family === 1) {
-    return `SELECT region, amount * 2 + 1 AS scaled, ROUND(ratio, 1) AS rounded FROM rows${where()} ORDER BY region, scaled, rounded LIMIT ${String(fuzzer.int(20) + 1)}`;
+    const offset = fuzzer.random() < 0.5 ? ` OFFSET ${String(fuzzer.int(10))}` : "";
+    return `SELECT region, amount * 2 + 1 AS scaled, ROUND(ratio, 1) AS rounded FROM rows${where()} ORDER BY region, scaled, rounded LIMIT ${String(fuzzer.int(20) + 1)}${offset}`;
   }
   if (family === 2) {
     return `SELECT region, COUNT(*) AS count, SUM(amount) AS total, AVG(ratio) AS mean, MIN(joined) AS first, MAX(label) AS top FROM rows${where()} GROUP BY region`;
@@ -127,7 +139,13 @@ function generateSql(fuzzer: Fuzzer): string {
     return `SELECT DISTINCT region, label FROM rows${where()}`;
   }
   if (family === 5) {
-    return `SELECT r.region, r.amount, d.weight FROM rows r ${fuzzer.pick(["JOIN", "LEFT JOIN"])} dims d ON d.region = r.region${
+    const condition = fuzzer.pick([
+      "d.region = r.region",
+      "d.weight > r.amount",
+      "d.region = r.region AND d.weight >= r.amount",
+      "d.weight >= r.amount AND d.weight <= r.amount + 4",
+    ]);
+    return `SELECT r.region, r.amount, d.weight FROM rows r ${fuzzer.pick(["JOIN", "LEFT JOIN"])} dims d ON ${condition}${
       fuzzer.random() < 0.5 ? ` WHERE ${generatePredicate(fuzzer, "r.")}` : ""
     }`;
   }
@@ -140,11 +158,17 @@ function generateSql(fuzzer: Fuzzer): string {
     }`;
   }
   if (family === 8) {
-    return `SELECT region, amount FROM rows WHERE amount > ${String(fuzzer.int(6) - 2)} UNION${
-      fuzzer.random() < 0.5 ? " ALL" : ""
-    } SELECT region, amount FROM rows WHERE ratio > ${String(fuzzer.int(5))}`;
+    const op = fuzzer.pick(["UNION", "UNION ALL", "INTERSECT", "EXCEPT"]);
+    return `SELECT region, amount FROM rows WHERE amount > ${String(fuzzer.int(6) - 2)} ${op} SELECT region, amount FROM rows WHERE ratio > ${String(fuzzer.int(5))}`;
   }
-  return `SELECT region, amount, ${fuzzer.pick(["ROW_NUMBER()", "RANK()", "DENSE_RANK()"])} OVER (PARTITION BY region ORDER BY amount ${fuzzer.pick(["ASC", "DESC"])}) AS position FROM rows${where()}`;
+  if (family === 9) {
+    return `SELECT region, amount, ${fuzzer.pick(["ROW_NUMBER()", "RANK()", "DENSE_RANK()"])} OVER (PARTITION BY region ORDER BY amount ${fuzzer.pick(["ASC", "DESC"])}) AS position FROM rows${where()}`;
+  }
+  if (family === 11) {
+    const ordered = fuzzer.random() < 0.5 ? " ORDER BY amount" : "";
+    return `SELECT region, amount, ${fuzzer.pick(["SUM(amount)", "COUNT(*)", "COUNT(ratio)", "AVG(ratio)", "MIN(amount)", "MAX(joined)"])} OVER (PARTITION BY region${ordered}) AS windowed FROM rows${where()}`;
+  }
+  return `SELECT region, CASE WHEN amount > ${String(fuzzer.int(8))} THEN 'big' WHEN ratio > ${String(fuzzer.int(4))} THEN 'mid' ELSE 'small' END AS band FROM rows${where()}`;
 }
 
 function canonicalRows(rows: readonly QueryRow[], columns: readonly string[]): string[] {

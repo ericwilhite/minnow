@@ -435,9 +435,15 @@ DISTINCT desugars into grouping, windows desugar into windowed sources, unions f
 and subqueries resolve post-order at the same leased snapshot. The machine-readable feature matrix
 (`packages/engine/sql-feature-matrix.json`) records each supported and rejected form with an
 executable example verified by a conformance test. A separate optimizer-facing logical/physical
-plan split with plan snapshots is deferred to Phase 13, where it becomes load-bearing;
-OR-predicates, LIKE, CASE, EXISTS, correlated subqueries, recursive CTEs,
-INTERSECT/EXCEPT, aggregate windows, and DDL remain explicitly rejected future breadth.
+plan split with plan snapshots is deferred to Phase 13, where it becomes load-bearing. A later
+completeness pass closed the remaining breadth: full boolean WHERE/HAVING trees (OR/NOT/parens
+under three-valued logic, with top-level ANDs still split into the classic predicate list so
+pushdown, zone maps, and the dictionary fast path are unchanged), LIKE, CASE, uncorrelated
+EXISTS, NOT BETWEEN, LIMIT OFFSET, INTERSECT/EXCEPT with standard precedence, aggregate window
+functions with the SQL default frame, RIGHT JOIN as the mirrored sole join, non-equi and
+multi-key joins via a nested-loop fallback, and WITH RECURSIVE with linear delta recursion under
+explicit iteration and row caps. Correlated subqueries, FULL OUTER joins, explicit window
+frames, and DDL remain explicitly rejected.
 
 Exit gate: SQL compiles into the same logical representation used by all other APIs; unsupported syntax fails explicitly rather than silently changing semantics.
 

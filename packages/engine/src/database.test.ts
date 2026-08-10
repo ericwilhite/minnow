@@ -5675,3 +5675,84 @@ for (const implementation of recoveryImplementations()) {
     store.close();
   });
 }
+
+it("executes the extended SQL surface through the stored query path", async () => {
+  const store = new MemoryBlockStore();
+  const database = new BrowserDatabase(store);
+  await database.createTable({
+    name: "orders",
+    columns: [
+      { name: "region", type: "string", nullable: true },
+      { name: "amount", type: "number", nullable: true },
+    ],
+  });
+  await database.insertBatch("orders", {
+    columns: {
+      region: ["west", "west", "east", null],
+      amount: [10, 3, 8, 5],
+    },
+  });
+  await database.createTable({
+    name: "targets",
+    columns: [
+      { name: "region", type: "string" },
+      { name: "goal", type: "number" },
+    ],
+  });
+  await database.insertBatch("targets", {
+    columns: { region: ["west", "south"], goal: [9, 1] },
+  });
+
+  expect(
+    await database.query(
+      "SELECT region, amount FROM orders WHERE amount > 9 OR region = 'east' ORDER BY amount",
+    ),
+  ).toEqual({
+    columns: ["region", "amount"],
+    rows: [
+      { region: "east", amount: 8 },
+      { region: "west", amount: 10 },
+    ],
+  });
+  expect(
+    await database.query(
+      "SELECT region FROM orders WHERE region LIKE 'w%' AND EXISTS (SELECT region FROM targets WHERE goal > 5)",
+    ),
+  ).toEqual({ columns: ["region"], rows: [{ region: "west" }, { region: "west" }] });
+  expect(
+    await database.query(
+      "SELECT region, amount, CASE WHEN amount >= 8 THEN 'high' ELSE 'low' END AS band FROM orders ORDER BY amount LIMIT 2 OFFSET 1",
+    ),
+  ).toEqual({
+    columns: ["region", "amount", "band"],
+    rows: [
+      { region: null, amount: 5, band: "low" },
+      { region: "east", amount: 8, band: "high" },
+    ],
+  });
+  expect(
+    await database.query("SELECT region FROM orders INTERSECT SELECT region FROM targets"),
+  ).toEqual({ columns: ["region"], rows: [{ region: "west" }] });
+  expect(
+    await database.query(
+      "SELECT o.region, t.goal FROM orders o JOIN targets t ON t.region = o.region AND t.goal > o.amount",
+    ),
+  ).toEqual({ columns: ["region", "goal"], rows: [{ region: "west", goal: 9 }] });
+  expect(
+    await database.query(
+      "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM orders UNION ALL SELECT v * 2 FROM n WHERE v < 20) SELECT v FROM n ORDER BY v",
+    ),
+  ).toEqual({ columns: ["v"], rows: [{ v: 3 }, { v: 6 }, { v: 12 }, { v: 24 }] });
+  expect(
+    await database.query(
+      "SELECT region, amount, SUM(amount) OVER (PARTITION BY region) AS total FROM orders WHERE region = 'west' ORDER BY amount",
+    ),
+  ).toEqual({
+    columns: ["region", "amount", "total"],
+    rows: [
+      { region: "west", amount: 3, total: 13 },
+      { region: "west", amount: 10, total: 13 },
+    ],
+  });
+  store.close();
+});

@@ -1003,8 +1003,7 @@ async function executeBoundPlanWithSortSpill(
     const finalRun = required(active[0], "Final spill run is missing");
     const rows: QueryRow[] = [];
     const offset = plan.offset ?? 0;
-    const limit =
-      plan.limit === undefined ? Number.MAX_SAFE_INTEGER : plan.limit + offset;
+    const limit = plan.limit === undefined ? Number.MAX_SAFE_INTEGER : plan.limit + offset;
     for (let pageIndex = 0; pageIndex < finalRun.pageCount && rows.length < limit; pageIndex += 1) {
       const bytes = await store.getPage(ownerId, finalRun.id, pageIndex);
       if (bytes === undefined) throw new Error("Query spill page is missing");
@@ -2263,9 +2262,7 @@ function evaluateBatchPredicate(
     predicate.operator === "LIKE" ||
     predicate.operator === "NOT LIKE"
   ) {
-    return predicateTruth(predicate, (nested) =>
-      evaluateBatchExpression(plan, nested, batch, row),
-    );
+    return predicateTruth(predicate, (nested) => evaluateBatchExpression(plan, nested, batch, row));
   }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
