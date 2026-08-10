@@ -2,7 +2,7 @@ import type { DatabaseRow } from "./database.js";
 import type {
   AggregateName,
   CompiledQuery,
-  ComparisonOperator,
+  PredicateOperator,
   Expression,
   QueryResult,
   QueryRow,
@@ -131,11 +131,12 @@ type BoundExpression =
       arguments: BoundExpression[];
       aggregateIndex?: number;
       signature: string;
-    };
+    }
+  | { kind: "list"; items: BoundExpression[]; signature: string };
 
 interface BoundPredicate {
   readonly left: BoundExpression;
-  readonly operator: ComparisonOperator;
+  readonly operator: PredicateOperator;
   readonly right: BoundExpression;
 }
 
@@ -529,6 +530,18 @@ function bindExpression(
   aggregateIndexes: Map<string, number>,
 ): BoundExpression {
   const signature = JSON.stringify(expression);
+  if (expression.kind === "subquery") {
+    throw new TypeError("Subqueries are only supported in WHERE, HAVING, SELECT, and IN");
+  }
+  if (expression.kind === "list") {
+    return {
+      kind: "list",
+      items: expression.items.map((item) =>
+        bindExpression(item, sources, aggregateSpecs, aggregateIndexes),
+      ),
+      signature,
+    };
+  }
   if (expression.kind === "literal" || expression.kind === "wildcard") {
     return { ...expression, signature };
   }
@@ -1766,6 +1779,7 @@ function evaluateFinalExpression(
   if (groupIndex !== undefined) return group.groupValues[groupIndex] ?? null;
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
+  if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
   if (expression.kind === "column") {
     throw new TypeError("Selected column must appear in GROUP BY");
   }
@@ -1838,11 +1852,40 @@ function evaluateBatchPredicate(
   batch: BatchRows,
   row: number,
 ): boolean {
+  if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
+    if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
+    return inListHolds(
+      predicate.operator,
+      evaluateBatchExpression(plan, predicate.left, batch, row),
+      predicate.right.items.map((item) => evaluateBatchExpression(plan, item, batch, row)),
+    );
+  }
   return comparisonValue(
     predicate.operator,
     evaluateBatchExpression(plan, predicate.left, batch, row),
     evaluateBatchExpression(plan, predicate.right, batch, row),
   );
+}
+
+/**
+ * SQL membership semantics: a NULL probe never matches, and NOT IN cannot be satisfied when the
+ * list contains NULL because the comparison is unknown rather than false.
+ */
+function inListHolds(
+  operator: "IN" | "NOT IN",
+  value: unknown,
+  items: readonly unknown[],
+): boolean {
+  if (value === null || value === undefined) return false;
+  let hasNull = false;
+  for (const item of items) {
+    if (item === null || item === undefined) {
+      hasNull = true;
+      continue;
+    }
+    if (comparable(value) === comparable(item)) return operator === "IN";
+  }
+  return operator === "NOT IN" && !hasNull;
 }
 
 function evaluateBatchExpression(
@@ -1853,6 +1896,7 @@ function evaluateBatchExpression(
 ): unknown {
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
+  if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
   if (expression.kind === "column") {
     return vectorValue(expression.vector, batch.rowsBySource[expression.source]?.[row] ?? -1);
   }
@@ -1881,6 +1925,7 @@ function evaluateBatchExpression(
 function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Array): unknown {
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
+  if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
   if (expression.kind === "column") {
     return vectorValue(expression.vector, rowsBySource[expression.source] ?? -1);
   }
@@ -1925,10 +1970,13 @@ function roundValue(value: unknown, digits: number): number | null {
 }
 
 function comparisonValue(
-  operator: ComparisonOperator,
+  operator: PredicateOperator,
   leftValue: unknown,
   rightValue: unknown,
 ): boolean {
+  if (operator === "IN" || operator === "NOT IN") {
+    throw new TypeError("IN is only supported in WHERE predicates");
+  }
   if (
     leftValue === null ||
     leftValue === undefined ||

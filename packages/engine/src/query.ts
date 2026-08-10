@@ -48,7 +48,9 @@ export type Expression =
   | { kind: "column"; reference: string }
   | { kind: "wildcard" }
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
-  | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[] };
+  | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[] }
+  | { kind: "list"; items: Expression[] }
+  | { kind: "subquery"; block: CompiledQuery };
 
 export interface SelectItem {
   expression: Expression;
@@ -68,9 +70,11 @@ interface JoinPlan extends TableSource {
   right: Expression;
 }
 
+export type PredicateOperator = ComparisonOperator | "IN" | "NOT IN";
+
 interface Predicate {
   left: Expression;
-  operator: ComparisonOperator;
+  operator: PredicateOperator;
   right: Expression;
 }
 
@@ -110,6 +114,132 @@ export function compileQuery(sql: string): CompiledQuery {
   if (normalized.length === 0) throw new TypeError("Enter a SELECT query");
   const parser = new Parser(tokenize(normalized));
   return parser.parse(normalized);
+}
+
+export interface SubqueryResolutionStep {
+  /** The uncorrelated block to execute; earlier steps have already substituted inside it. */
+  readonly block: CompiledQuery;
+  /** Replaces the subquery node with the executed result as literals. */
+  substitute(result: QueryResult): void;
+}
+
+/**
+ * Clones a plan and returns its subquery sites in post-order: executing each step's block and
+ * substituting its result leaves the returned plan free of subquery nodes. A scalar subquery must
+ * select one column and return at most one row (empty is NULL); an IN subquery must select one
+ * column and becomes a literal membership list. Correlated references fail inside the subquery's
+ * own scope as unknown aliases.
+ */
+export function subqueryResolutionSteps(plan: CompiledQuery): {
+  plan: CompiledQuery;
+  steps: SubqueryResolutionStep[];
+} {
+  if (!blockHasSubqueries(plan)) return { plan, steps: [] };
+  const clone = structuredClone(plan);
+  const steps: SubqueryResolutionStep[] = [];
+  const rewrite = (expression: Expression, replace: (next: Expression) => void): void => {
+    if (expression.kind === "subquery") {
+      collectBlock(expression.block);
+      steps.push({
+        block: expression.block,
+        substitute(result) {
+          if (result.columns.length !== 1) {
+            throw new TypeError("A scalar subquery must select exactly one column");
+          }
+          if (result.rows.length > 1) {
+            throw new TypeError(`A scalar subquery returned ${String(result.rows.length)} rows`);
+          }
+          replace({
+            kind: "literal",
+            value: result.rows[0]?.[result.columns[0] ?? ""] ?? null,
+          });
+        },
+      });
+      return;
+    }
+    if (expression.kind === "binary") {
+      rewrite(expression.left, (next) => (expression.left = next));
+      rewrite(expression.right, (next) => (expression.right = next));
+      return;
+    }
+    if (expression.kind === "call") {
+      expression.arguments.forEach((argument, index) => {
+        rewrite(argument, (next) => (expression.arguments[index] = next));
+      });
+      return;
+    }
+    if (expression.kind === "list") {
+      expression.items.forEach((item, index) => {
+        rewrite(item, (next) => (expression.items[index] = next));
+      });
+    }
+  };
+  const collectBlock = (block: CompiledQuery): void => {
+    for (const source of [block.base, ...block.joins]) {
+      if (source.derived !== undefined) collectBlock(source.derived);
+    }
+    for (const item of block.select) {
+      rewrite(item.expression, (next) => (item.expression = next));
+    }
+    block.groupBy.forEach((expression, index) => {
+      rewrite(expression, (next) => (block.groupBy[index] = next));
+    });
+    for (const predicate of [...block.predicates, ...block.having]) {
+      rewrite(predicate.left, (next) => (predicate.left = next));
+      const right = predicate.right;
+      if (
+        (predicate.operator === "IN" || predicate.operator === "NOT IN") &&
+        right.kind === "subquery"
+      ) {
+        collectBlock(right.block);
+        steps.push({
+          block: right.block,
+          substitute(result) {
+            if (result.columns.length !== 1) {
+              throw new TypeError("An IN subquery must select exactly one column");
+            }
+            predicate.right = {
+              kind: "list",
+              items: result.rows.map((row) => ({
+                kind: "literal",
+                value: row[result.columns[0] ?? ""] ?? null,
+              })),
+            };
+          },
+        });
+        continue;
+      }
+      rewrite(predicate.right, (next) => (predicate.right = next));
+    }
+    for (const order of block.orderBy) {
+      rewrite(order.expression, (next) => (order.expression = next));
+    }
+  };
+  collectBlock(clone);
+  return { plan: clone, steps };
+}
+
+export function blockHasSubqueries(plan: CompiledQuery): boolean {
+  const expressionHas = (expression: Expression): boolean => {
+    if (expression.kind === "subquery") return true;
+    if (expression.kind === "binary") {
+      return expressionHas(expression.left) || expressionHas(expression.right);
+    }
+    if (expression.kind === "call") return expression.arguments.some(expressionHas);
+    if (expression.kind === "list") return expression.items.some(expressionHas);
+    return false;
+  };
+  const blockHas = (block: CompiledQuery): boolean =>
+    block.select.some((item) => expressionHas(item.expression)) ||
+    block.groupBy.some(expressionHas) ||
+    [...block.predicates, ...block.having].some(
+      (predicate) => expressionHas(predicate.left) || expressionHas(predicate.right),
+    ) ||
+    block.orderBy.some((order) => expressionHas(order.expression)) ||
+    [block.base, ...block.joins].some(
+      (source) => source.derived !== undefined && blockHas(source.derived),
+    );
+  return blockHas(plan);
 }
 
 export type SqlColumnType = "boolean" | "number" | "string" | "datetime";
@@ -156,6 +286,9 @@ export function inferBlockSchema(
     return matches[0] ?? "string";
   };
   const infer = (expression: Expression): SqlColumnType | "null" => {
+    if (expression.kind === "subquery" || expression.kind === "list") {
+      throw new TypeError("Subqueries must be resolved before schema inference");
+    }
     if (expression.kind === "literal") {
       const value = expression.value;
       if (value === null) return "null";
@@ -251,6 +384,9 @@ export function createPreparedQuery(
   options: QueryExecutionOptions = {},
 ): PreparedQuery {
   validateGrouping(plan);
+  const resolution = subqueryResolutionSteps(plan);
+  for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
+  plan = resolution.plan;
   tables = resolveDerivedRowTables(plan, tables);
   const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
   if ([...tables.values()].some((rows) => rows.length === 0)) {
@@ -411,6 +547,9 @@ export function executeRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {
+  const resolution = subqueryResolutionSteps(plan);
+  for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
+  plan = resolution.plan;
   tables = resolveDerivedRowTables(plan, tables);
   let contexts: RowContext[] = (tables.get(plan.base.table) ?? []).map((row) => ({
     [plan.base.alias]: row,
@@ -547,6 +686,10 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       return expression.value;
     case "wildcard":
       return 1;
+    case "subquery":
+      throw new TypeError("Subqueries are only supported in WHERE, HAVING, SELECT, and IN");
+    case "list":
+      throw new TypeError("Value lists are only supported with IN");
     case "column":
       return resolveColumn(context, expression.reference);
     case "binary": {
@@ -607,6 +750,14 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
 }
 
 function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
+  if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
+    if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
+    return inListHolds(
+      predicate.operator,
+      evaluate(predicate.left, context),
+      predicate.right.items.map((item) => evaluate(item, context)),
+    );
+  }
   return comparisonHolds(
     predicate.operator,
     evaluate(predicate.left, context),
@@ -614,11 +765,35 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
   );
 }
 
+/**
+ * SQL membership semantics: a NULL probe never matches, and NOT IN cannot be satisfied when the
+ * list contains NULL because the comparison is unknown rather than false.
+ */
+function inListHolds(
+  operator: "IN" | "NOT IN",
+  value: unknown,
+  items: readonly unknown[],
+): boolean {
+  if (value === null || value === undefined) return false;
+  let hasNull = false;
+  for (const item of items) {
+    if (item === null || item === undefined) {
+      hasNull = true;
+      continue;
+    }
+    if (comparable(value) === comparable(item)) return operator === "IN";
+  }
+  return operator === "NOT IN" && !hasNull;
+}
+
 function comparisonHolds(
-  operator: ComparisonOperator,
+  operator: PredicateOperator,
   leftValue: unknown,
   rightValue: unknown,
 ): boolean {
+  if (operator === "IN" || operator === "NOT IN") {
+    throw new TypeError("IN is only supported in WHERE predicates");
+  }
   if (
     leftValue === null ||
     leftValue === undefined ||
@@ -639,7 +814,11 @@ function comparisonHolds(
 
 function resolveColumn(context: RowContext, reference: string): unknown {
   const parts = reference.split(".");
-  if (parts.length === 2) return context[parts[0] ?? ""]?.[parts[1] ?? ""];
+  if (parts.length === 2) {
+    const alias = parts[0] ?? "";
+    if (!(alias in context)) throw new TypeError(`Unknown table alias: ${alias}`);
+    return context[alias]?.[parts[1] ?? ""];
+  }
   const name = parts[0] ?? "";
   const matches = Object.values(context).filter((row) => row !== undefined && name in row);
   if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
@@ -647,13 +826,17 @@ function resolveColumn(context: RowContext, reference: string): unknown {
 }
 
 function hasAggregate(expression: Expression): boolean {
-  return expression.kind === "call" && aggregateNames.has(expression.name as AggregateName)
-    ? true
-    : expression.kind === "call"
-      ? expression.arguments.some(hasAggregate)
-      : expression.kind === "binary"
-        ? hasAggregate(expression.left) || hasAggregate(expression.right)
-        : false;
+  if (expression.kind === "call") {
+    return (
+      aggregateNames.has(expression.name as AggregateName) ||
+      expression.arguments.some(hasAggregate)
+    );
+  }
+  if (expression.kind === "binary") {
+    return hasAggregate(expression.left) || hasAggregate(expression.right);
+  }
+  if (expression.kind === "list") return expression.items.some(hasAggregate);
+  return false;
 }
 
 function validateGrouping(plan: CompiledQuery): void {
@@ -681,6 +864,8 @@ function expressionColumns(expression: Expression): string[] {
   if (expression.kind === "binary")
     return [...expressionColumns(expression.left), ...expressionColumns(expression.right)];
   if (expression.kind === "call") return expression.arguments.flatMap(expressionColumns);
+  if (expression.kind === "list") return expression.items.flatMap(expressionColumns);
+  // A subquery resolves inside its own scope before the enclosing block binds.
   return [];
 }
 
@@ -792,10 +977,7 @@ class Parser {
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
       for (;;) {
-        const left = this.#expression();
-        const operator = this.#comparison();
-        const right = this.#expression();
-        predicates.push({ left, operator, right });
+        predicates.push(this.#predicate(true));
         if (!this.#isKeyword("AND")) break;
         this.#keyword("AND");
       }
@@ -822,10 +1004,7 @@ class Parser {
       this.#keyword("HAVING");
       if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
       for (;;) {
-        const left = this.#expression();
-        const operator = this.#comparison();
-        const right = this.#expression();
-        having.push({ left, operator, right });
+        having.push(this.#predicate(false));
         if (!this.#isKeyword("AND")) break;
         this.#keyword("AND");
       }
@@ -986,6 +1165,11 @@ class Parser {
       return { kind: "wildcard" };
     }
     if (this.#punctuation("(")) {
+      if (this.#isKeyword("SELECT")) {
+        const block = this.#selectBlock("(subquery)");
+        this.#expectPunctuation(")");
+        return { kind: "subquery", block };
+      }
       const expression = this.#expression();
       this.#expectPunctuation(")");
       return expression;
@@ -1024,6 +1208,34 @@ class Parser {
     if (!["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text))
       throw new TypeError(`Expected comparison operator, found ${token.text}`);
     return token.text as ComparisonOperator;
+  }
+
+  #predicate(allowIn: boolean): Predicate {
+    const left = this.#expression();
+    if (this.#isKeyword("IN") || this.#isKeyword("NOT")) {
+      if (!allowIn) throw new TypeError("IN is not supported in HAVING");
+      let operator: PredicateOperator = "IN";
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        operator = "NOT IN";
+      }
+      this.#keyword("IN");
+      this.#expectPunctuation("(");
+      if (this.#isKeyword("SELECT")) {
+        const block = this.#selectBlock("(subquery)");
+        this.#expectPunctuation(")");
+        return { left, operator, right: { kind: "subquery", block } };
+      }
+      const items = this.#expressionList();
+      this.#expectPunctuation(")");
+      if (items.some((item) => item.kind === "wildcard" || item.kind === "subquery")) {
+        throw new TypeError("IN lists accept only scalar expressions");
+      }
+      return { left, operator, right: { kind: "list", items } };
+    }
+    const operator = this.#comparison();
+    const right = this.#expression();
+    return { left, operator, right };
   }
 
   #identifier(): string {

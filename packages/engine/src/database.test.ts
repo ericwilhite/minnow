@@ -5196,6 +5196,20 @@ for (const implementation of implementations()) {
       { executionMemoryBudgetBytes: 512_000 },
     );
     expect(emptyDerived.rows).toEqual([{ count: 0, peak: null }]);
+
+    const aboveAverage = await database.query(
+      "SELECT COUNT(*) AS count FROM cte_sales WHERE amount > (SELECT AVG(amount) FROM cte_sales)",
+      { executionMemoryBudgetBytes: 512_000 },
+    );
+    const average = 299 / 2;
+    expect(aboveAverage.rows).toEqual([
+      { count: Array.from({ length: 300 }, (_, index) => index).filter((v) => v > average).length },
+    ]);
+
+    const membership = await database.query(
+      "SELECT region, COUNT(*) AS count FROM cte_sales WHERE region IN (SELECT region FROM cte_sales WHERE amount = 1) GROUP BY region",
+    );
+    expect(membership.rows).toHaveLength(1);
     store.close();
   });
 }

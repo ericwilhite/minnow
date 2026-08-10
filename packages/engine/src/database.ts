@@ -56,12 +56,15 @@ import {
   type LeasedSnapshot,
 } from "@browserdatabase/transactions";
 import {
+  blockHasSubqueries,
   compileQuery,
   createPreparedColumnarQuery,
   inferBlockSchema,
   referencedColumns,
+  subqueryResolutionSteps,
   type ComparisonOperator,
   type CompiledQuery,
+  type Expression,
   type PreparedQuery,
   type QueryResult,
   type SqlColumnSchema,
@@ -1098,10 +1101,33 @@ export class BrowserDatabase {
         ]),
       );
       let columnarTables = new Map<string, ColumnarTable>();
+      let resolvedPlan = plan;
       await this.#withLeasedSnapshot(options.version, async (snapshot) => {
         const visibility = await this.#blockSegmentVisibility(realTables);
+        const resolution = subqueryResolutionSteps(plan);
+        for (const step of resolution.steps) {
+          const innerInputs = await this.#prepareBlockInputs(
+            step.block,
+            snapshot,
+            visibility,
+            memory,
+            realTables,
+            typedSchemas,
+          );
+          const prepared = createPreparedColumnarQuery(
+            step.block,
+            innerInputs,
+            memory.createChild(),
+          );
+          try {
+            step.substitute(prepared.execute());
+          } finally {
+            prepared.close();
+          }
+        }
+        resolvedPlan = resolution.plan;
         columnarTables = await this.#prepareBlockInputs(
-          plan,
+          resolvedPlan,
           snapshot,
           visibility,
           memory,
@@ -1109,21 +1135,36 @@ export class BrowserDatabase {
           typedSchemas,
         );
       });
-      return createPreparedColumnarQuery(plan, columnarTables, memory);
+      return createPreparedColumnarQuery(resolvedPlan, columnarTables, memory);
     } catch (error) {
       memory.close();
       throw error;
     }
   }
 
-  /** Collects every real table referenced by a block or its derived sources, by name. */
+  /** Collects every real table referenced by a block, its derived sources, or its subqueries. */
   async #findRealBlockTables(plan: CompiledQuery): Promise<Map<string, TableRecord>> {
     const names = new Set<string>();
+    const walkExpression = (expression: Expression): void => {
+      if (expression.kind === "subquery") walk(expression.block);
+      else if (expression.kind === "binary") {
+        walkExpression(expression.left);
+        walkExpression(expression.right);
+      } else if (expression.kind === "call") expression.arguments.forEach(walkExpression);
+      else if (expression.kind === "list") expression.items.forEach(walkExpression);
+    };
     const walk = (block: CompiledQuery): void => {
       for (const source of [block.base, ...block.joins]) {
         if (source.derived === undefined) names.add(source.table);
         else walk(source.derived);
       }
+      for (const item of block.select) walkExpression(item.expression);
+      block.groupBy.forEach(walkExpression);
+      for (const predicate of [...block.predicates, ...block.having]) {
+        walkExpression(predicate.left);
+        walkExpression(predicate.right);
+      }
+      for (const order of block.orderBy) walkExpression(order.expression);
     };
     walk(plan);
     const tables = await Promise.all([...names].map((name) => this.#findTable(name)));
@@ -1348,7 +1389,8 @@ export class BrowserDatabase {
       options.spillToStorage !== false &&
       plan.base.derived === undefined &&
       plan.joins.every((join) => join.derived === undefined) &&
-      !plan.joins.some((join) => join.table === plan.base.table)
+      !plan.joins.some((join) => join.table === plan.base.table) &&
+      !blockHasSubqueries(plan)
     );
   }
 
@@ -5053,6 +5095,7 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     return column?.type === "number" || column?.type === "datetime" ? column : undefined;
   };
   for (const predicate of plan.predicates) {
+    if (predicate.operator === "IN" || predicate.operator === "NOT IN") continue;
     const leftColumn =
       predicate.left.kind === "column" ? resolveColumn(predicate.left.reference) : undefined;
     const rightColumn =

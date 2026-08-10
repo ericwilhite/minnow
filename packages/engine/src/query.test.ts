@@ -383,6 +383,76 @@ describe("public SQL queries", () => {
     expect(nested.rows).toEqual([{ regions: 3, peak: 45 }]);
   });
 
+  it("evaluates IN lists and uncorrelated subqueries in both executors", () => {
+    const rows = [
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+      { region: "east", amount: 5 },
+      { region: "east", amount: 40 },
+      { region: "north", amount: 15 },
+      { region: null, amount: 7 },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT region, amount FROM rows WHERE region IN ('west', 'north') ORDER BY amount",
+      "SELECT region, amount FROM rows WHERE amount NOT IN (5, 40) ORDER BY amount",
+      "SELECT region, amount FROM rows WHERE amount IN (5, 10, 15, 100) ORDER BY amount",
+      "SELECT region FROM rows WHERE amount > (SELECT AVG(amount) FROM rows) ORDER BY region",
+      "SELECT region, amount FROM rows WHERE region IN (SELECT region FROM rows WHERE amount > 15) ORDER BY amount",
+      "SELECT (SELECT MAX(amount) FROM rows) AS peak FROM rows LIMIT 1",
+      "SELECT region FROM rows WHERE amount > (SELECT MIN(amount) FROM rows WHERE amount > 100) ORDER BY region",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
+    }
+
+    const notInWithNull = executeQuery(
+      compileQuery("SELECT amount FROM rows WHERE region NOT IN ('west', NULL)"),
+      input,
+    );
+    expect(notInWithNull.rows).toEqual([]);
+    const emptyScalar = executeQuery(
+      compileQuery(
+        "SELECT region FROM rows WHERE amount > (SELECT MAX(amount) FROM rows WHERE amount > 100)",
+      ),
+      input,
+    );
+    expect(emptyScalar.rows).toEqual([]);
+  });
+
+  it("rejects unsupported subquery forms explicitly", () => {
+    const rows = [{ region: "west", amount: 10 }];
+    const input = new Map([["rows", rows]]);
+    expect(() =>
+      executeRowQuery(
+        compileQuery("SELECT region FROM rows WHERE amount > (SELECT amount FROM rows)"),
+        new Map([["rows", [...rows, { region: "east", amount: 4 }]]]),
+      ),
+    ).toThrow("A scalar subquery returned 2 rows");
+    expect(() =>
+      executeRowQuery(
+        compileQuery("SELECT region FROM rows WHERE amount > (SELECT region, amount FROM rows)"),
+        input,
+      ),
+    ).toThrow("A scalar subquery must select exactly one column");
+    expect(() =>
+      executeRowQuery(
+        compileQuery(
+          "SELECT region FROM rows r WHERE amount IN (SELECT amount FROM rows q WHERE q.amount = r.amount)",
+        ),
+        input,
+      ),
+    ).toThrow("Unknown table alias: r");
+    expect(() => compileQuery("SELECT region FROM rows WHERE region IN (*)")).toThrow(
+      "IN lists accept only scalar expressions",
+    );
+    expect(() =>
+      compileQuery(
+        "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING region IN ('west')",
+      ),
+    ).toThrow("IN is not supported in HAVING");
+  });
+
   it("rejects unsupported derived table and CTE forms explicitly", () => {
     expect(() => compileQuery("SELECT * FROM (SELECT value FROM rows)")).toThrow(
       "A derived table requires an alias",
