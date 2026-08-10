@@ -79,6 +79,7 @@ import {
   QueryMemoryContext,
   type QueryMemoryReservation,
 } from "./memory.js";
+import { renderPlan } from "./optimizer.js";
 import {
   createColumnarTable,
   type ColumnarTable,
@@ -1431,6 +1432,29 @@ export class BrowserDatabase {
       afterOwnerId = page.nextCursor;
     }
     return result;
+  }
+
+  /**
+   * Renders the optimized logical plan for a SELECT statement plus the physical strategy notes
+   * the prepared execution would choose, without executing it.
+   */
+  async explain(sql: string): Promise<string> {
+    const plan = compileQuery(sql);
+    const notes: string[] = [];
+    if (this.#canStreamPlanShape(plan, { executionMemoryBudgetBytes: 1 })) {
+      notes.push("eligible to stream the base scan through resident block windows under a budget");
+    } else {
+      notes.push("materializes inputs at preparation");
+    }
+    const table = plan.base.derived ?? plan.base.union ?? plan.base.windowed;
+    if (table === undefined && plan.joins.length === 0) {
+      const record = await this.#findTable(plan.base.table);
+      if (zonePredicates(plan, record).length > 0) {
+        notes.push("zone-map pruning applies to the unbudgeted scan");
+      }
+    }
+    if (blockHasSubqueries(plan)) notes.push("resolves uncorrelated subqueries at one snapshot");
+    return `${renderPlan(plan)}\n${notes.map((note) => `-- ${note}`).join("\n")}`;
   }
 
   /**

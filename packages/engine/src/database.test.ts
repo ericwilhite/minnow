@@ -5274,6 +5274,15 @@ for (const implementation of implementations()) {
     );
     expect(membership.rows).toHaveLength(1);
 
+    const explained = await database.explain(
+      "WITH scaled AS (SELECT region, amount * 2 AS doubled FROM cte_sales) SELECT doubled FROM scaled WHERE doubled > 10",
+    );
+    expect(explained).toContain("where (amount * 2) > 10");
+    expect(explained).toContain("-- materializes inputs at preparation");
+    expect(
+      await database.explain("SELECT SUM(amount) AS total FROM cte_sales WHERE amount > 5"),
+    ).toContain("-- eligible to stream");
+
     const union = await database.query(
       "SELECT region, amount FROM cte_sales WHERE amount < 3 UNION SELECT region, amount FROM cte_sales WHERE amount < 5 ORDER BY amount",
     );

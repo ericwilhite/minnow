@@ -1,5 +1,6 @@
 import type { DatabaseRow } from "./database.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
+import { optimizePlan } from "./optimizer.js";
 import {
   columnarTableFromRows,
   prepareVectorQuery,
@@ -72,7 +73,7 @@ export interface SelectItem {
   alias: string;
 }
 
-interface TableSource {
+export interface TableSource {
   table: string;
   alias: string;
   /** A parenthesized SELECT or expanded CTE body; `table` is then a unique synthetic name. */
@@ -83,7 +84,7 @@ interface TableSource {
   windowed?: { block: CompiledQuery; windows: WindowSpec[] };
 }
 
-interface JoinPlan extends TableSource {
+export interface JoinPlan extends TableSource {
   kind: "inner" | "left";
   left: Expression;
   right: Expression;
@@ -91,7 +92,7 @@ interface JoinPlan extends TableSource {
 
 export type PredicateOperator = ComparisonOperator | "IN" | "NOT IN";
 
-interface Predicate {
+export interface Predicate {
   left: Expression;
   operator: PredicateOperator;
   right: Expression;
@@ -129,11 +130,17 @@ const clauseKeywords = new Set([
 ]);
 const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
 
-export function compileQuery(sql: string): CompiledQuery {
+export interface CompileQueryOptions {
+  /** Set false to skip deterministic plan rewrites, for example to snapshot the raw plan. */
+  readonly optimize?: boolean;
+}
+
+export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
   const normalized = sql.trim().replace(/;$/, "").trim();
   if (normalized.length === 0) throw new TypeError("Enter a SELECT query");
   const parser = new Parser(tokenize(normalized));
-  return parser.parse(normalized);
+  const plan = parser.parse(normalized);
+  return options.optimize === false ? plan : optimizePlan(plan);
 }
 
 export type CompiledStatement =

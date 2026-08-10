@@ -17,4 +17,5 @@ export {
   type SqlColumnType,
 } from "./query.js";
 export { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
+export { optimizePlan, renderPlan } from "./optimizer.js";
 export type { AsyncQueryExecutionOptions, QuerySpillStore } from "./vector.js";

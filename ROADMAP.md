@@ -445,6 +445,21 @@ Exit gate: SQL compiles into the same logical representation used by all other A
 
 Deliver deterministic rewrites first: constant folding, projection pruning, predicate/limit/aggregate pushdown, segment pruning, late materialization, and dictionary rewriting. Then add collected statistics and cost-based join order, strategies, parallelism, and spill decisions.
 
+Phase 13A implements the deterministic core. Every compiled statement passes through one
+plan-to-plan rewrite pass: constant arithmetic and ROUND fold when the result stays finite,
+predicates push into derived and CTE sources on the base and inner-join sides (group-key outputs
+only for grouped inners, never across a left join), unreferenced projections prune out of plain
+derived blocks (grouped and DISTINCT blocks keep their semantics-bearing select lists), and outer
+LIMIT combines into an unordered derived base. `renderPlan()` produces stable snapshots verified
+per rule, `BrowserDatabase.explain()` reports the optimized plan plus physical strategy notes, and
+the differential fuzzer compares optimized columnar execution against the raw-plan row reference,
+so every rewrite sits inside the correctness net; an 80-seed sweep of 9,600 randomized queries
+passed. Zone-map segment pruning from Phase 8A and streamed/late-loaded scans from Phase 7 remain
+the physical layer these rewrites feed. Phase 13 stays open for aggregate pushdown, pushdown into
+base-table scans beyond zone maps, dictionary rewriting, collected statistics, cost-based join
+order and spill decisions, and the workload benchmarks that demonstrate each rule's measured
+value.
+
 Exit gate: plan snapshots and workload benchmarks demonstrate each rule's correctness and value.
 
 ## Phase 14 — Schema DSL and migrations
@@ -548,6 +563,8 @@ larger/repeated benchmark tiers remain outstanding.
       UNION/UNION ALL, and ROW_NUMBER/RANK/DENSE_RANK windows to the SQL surface.
 - [x] Add SQL mutations through execute() with keyed read-then-mutate semantics.
 - [x] Check in the machine-readable SQL feature matrix with a conformance test.
+- [x] Add the deterministic optimizer core: folding, derived/CTE predicate pushdown, projection
+      pruning, LIMIT combining, plan snapshots, and explain().
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 
 ## Result recording

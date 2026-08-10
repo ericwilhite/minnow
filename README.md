@@ -152,7 +152,12 @@ operations, and window inputs execute at the same leased snapshot and materializ
 in-memory tables. `INSERT ... VALUES` maps onto one column batch insert, and `UPDATE`/`DELETE` on
 unique-key tables read matching keys at one snapshot and apply the keyed batch mutation — two
 steps, not one serializable transaction, so a competing key change fails the statement explicitly.
-The checked-in machine-readable feature matrix
+Every compiled statement passes through a deterministic optimizer:
+constant folding, predicate pushdown into derived and CTE sources (base and inner-join sides
+only; group keys only for grouped inners), projection pruning of plain derived blocks, and LIMIT
+combining. `explain()` renders the optimized plan with physical strategy notes, and the
+differential fuzzer executes optimized plans against the raw-plan row reference. The checked-in
+machine-readable feature matrix
 (`packages/engine/sql-feature-matrix.json`) records every supported and rejected form with an
 executable example, and a conformance test holds it honest. Unsupported syntax — `OR`, `LIKE`,
 `BETWEEN`, `IS NULL`, `CASE`, `EXISTS`, correlated subqueries, recursive CTEs,

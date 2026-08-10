@@ -157,15 +157,19 @@ describe("differential executor fuzzing", () => {
       for (let index = 0; index < 120; index += 1) {
         const sql = generateSql(fuzzer);
         let plan;
+        let rawPlan;
         try {
           plan = compileQuery(sql);
+          rawPlan = compileQuery(sql, { optimize: false });
         } catch (error) {
           throw new Error(`seed ${String(seed)} #${String(index)} failed to compile: ${sql}`, {
             cause: error,
           });
         }
+        // The optimized columnar execution must match the raw-plan row reference, so every
+        // deterministic rewrite is inside the differential net.
         const columnar = executeQuery(plan, tables);
-        const reference = executeRowQuery(plan, tables);
+        const reference = executeRowQuery(rawPlan, tables);
         expect(columnar.columns, `seed ${String(seed)} #${String(index)}: ${sql}`).toEqual(
           reference.columns,
         );
