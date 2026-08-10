@@ -58,11 +58,13 @@ import {
 import {
   compileQuery,
   createPreparedColumnarQuery,
+  inferBlockSchema,
   referencedColumns,
   type ComparisonOperator,
   type CompiledQuery,
   type PreparedQuery,
   type QueryResult,
+  type SqlColumnSchema,
 } from "./query.js";
 import {
   QueryMemoryBudgetError,
@@ -70,6 +72,7 @@ import {
   type QueryMemoryReservation,
 } from "./memory.js";
 import {
+  createColumnarTable,
   type ColumnarTable,
   type ColumnVector,
   type QuerySpillStore,
@@ -1087,51 +1090,133 @@ export class BrowserDatabase {
     const plan = compileQuery(sql);
     const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
     try {
-      const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
-      const uniqueTableNames = [...new Set(tableNames)];
-      const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
-      const schemas = new Map(
-        tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
+      const realTables = await this.#findRealBlockTables(plan);
+      const typedSchemas = new Map<string, SqlColumnSchema[]>(
+        [...realTables.values()].map((table) => [
+          table.name,
+          table.columns.map(({ name, type }) => ({ name, type })),
+        ]),
       );
-      const columns = referencedColumns(plan, schemas);
-      const columnarTables = new Map<string, ColumnarTable>();
+      let columnarTables = new Map<string, ColumnarTable>();
       await this.#withLeasedSnapshot(options.version, async (snapshot) => {
-        const tableIds = new Set(tables.map((table) => table.id));
-        const segmentRecords =
-          tables.length === 1
-            ? await this.store.listSegments(tables[0]?.id)
-            : await this.store.listSegments();
-        const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
-        const segmentsByTable = new Map<string, SegmentRecord[]>();
-        for (const segment of segmentRecords) {
-          if (!tableIds.has(segment.tableId)) continue;
-          const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
-          tableSegments.push(segment);
-          segmentsByTable.set(segment.tableId, tableSegments);
-        }
-        const visibility: SegmentVisibilityCatalog = {
-          transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
-          segmentsByTable,
-        };
-        for (const table of tables) {
-          const requestedColumns = columns.get(table.name) ?? [];
-          columnarTables.set(
-            table.name,
-            await this.#materializeColumnarTableAtSnapshot(
-              table,
-              snapshot,
-              requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
-              visibility,
-              tables.length === 1 ? plan : undefined,
-            ),
-          );
-        }
+        const visibility = await this.#blockSegmentVisibility(realTables);
+        columnarTables = await this.#prepareBlockInputs(
+          plan,
+          snapshot,
+          visibility,
+          memory,
+          realTables,
+          typedSchemas,
+        );
       });
       return createPreparedColumnarQuery(plan, columnarTables, memory);
     } catch (error) {
       memory.close();
       throw error;
     }
+  }
+
+  /** Collects every real table referenced by a block or its derived sources, by name. */
+  async #findRealBlockTables(plan: CompiledQuery): Promise<Map<string, TableRecord>> {
+    const names = new Set<string>();
+    const walk = (block: CompiledQuery): void => {
+      for (const source of [block.base, ...block.joins]) {
+        if (source.derived === undefined) names.add(source.table);
+        else walk(source.derived);
+      }
+    };
+    walk(plan);
+    const tables = await Promise.all([...names].map((name) => this.#findTable(name)));
+    return new Map(tables.map((table) => [table.name, table]));
+  }
+
+  async #blockSegmentVisibility(
+    realTables: ReadonlyMap<string, TableRecord>,
+  ): Promise<SegmentVisibilityCatalog> {
+    const tableIds = new Set([...realTables.values()].map((table) => table.id));
+    const onlyTable = realTables.size === 1 ? [...realTables.values()][0] : undefined;
+    const segmentRecords =
+      onlyTable !== undefined
+        ? await this.store.listSegments(onlyTable.id)
+        : await this.store.listSegments();
+    const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
+    const segmentsByTable = new Map<string, SegmentRecord[]>();
+    for (const segment of segmentRecords) {
+      if (!tableIds.has(segment.tableId)) continue;
+      const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
+      tableSegments.push(segment);
+      segmentsByTable.set(segment.tableId, tableSegments);
+    }
+    return {
+      transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
+      segmentsByTable,
+    };
+  }
+
+  /**
+   * Builds one block's columnar inputs: derived sources execute first at the same snapshot and
+   * become typed in-memory tables under their synthetic names, then the block's real tables
+   * materialize their referenced columns. Each block resolves its own inputs, so one real table
+   * projected differently by two blocks never collides.
+   */
+  async #prepareBlockInputs(
+    block: CompiledQuery,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    memory: QueryMemoryContext,
+    realTables: ReadonlyMap<string, TableRecord>,
+    typedSchemas: Map<string, SqlColumnSchema[]>,
+  ): Promise<Map<string, ColumnarTable>> {
+    const inputs = new Map<string, ColumnarTable>();
+    const sources = [block.base, ...block.joins];
+    for (const source of sources) {
+      const derived = source.derived;
+      if (derived === undefined) continue;
+      const innerInputs = await this.#prepareBlockInputs(
+        derived,
+        snapshot,
+        visibility,
+        memory,
+        realTables,
+        typedSchemas,
+      );
+      const schema = inferBlockSchema(derived, typedSchemas);
+      typedSchemas.set(source.table, schema);
+      const prepared = createPreparedColumnarQuery(derived, innerInputs, memory.createChild());
+      let result: QueryResult;
+      try {
+        result = prepared.execute();
+      } finally {
+        prepared.close();
+      }
+      inputs.set(source.table, derivedColumnarTable(source.table, result, schema));
+    }
+    const nameSchemas = new Map(
+      sources.map((source) => [
+        source.table,
+        (typedSchemas.get(source.table) ?? []).map(({ name }) => name),
+      ]),
+    );
+    const columns = referencedColumns(block, nameSchemas);
+    const onlyRealSource =
+      sources.length === 1 && sources[0]?.derived === undefined ? block : undefined;
+    for (const source of sources) {
+      if (source.derived !== undefined || inputs.has(source.table)) continue;
+      const table = realTables.get(source.table);
+      if (table === undefined) throw new TypeError(`Unknown table: ${source.table}`);
+      const requestedColumns = columns.get(table.name) ?? [];
+      inputs.set(
+        table.name,
+        await this.#materializeColumnarTableAtSnapshot(
+          table,
+          snapshot,
+          requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
+          visibility,
+          onlyRealSource,
+        ),
+      );
+    }
+    return inputs;
   }
 
   /** Executes a read-only SELECT statement through the public query API. */
@@ -1261,6 +1346,8 @@ export class BrowserDatabase {
     return (
       options.executionMemoryBudgetBytes !== undefined &&
       options.spillToStorage !== false &&
+      plan.base.derived === undefined &&
+      plan.joins.every((join) => join.derived === undefined) &&
       !plan.joins.some((join) => join.table === plan.base.table)
     );
   }
@@ -4849,6 +4936,21 @@ function installStreamedWindow(
     mutable.dictionary = dictionary;
   }
   mutable.window = { start: windowStart, length: windowRows };
+}
+
+/** Converts an executed derived-block result into a typed columnar input table. */
+function derivedColumnarTable(
+  name: string,
+  result: QueryResult,
+  schema: readonly SqlColumnSchema[],
+): ColumnarTable {
+  const columns = new Map(
+    schema.map(({ name: columnName, type }) => [
+      columnName,
+      { type, values: result.rows.map((row) => row[columnName] ?? null) },
+    ]),
+  );
+  return createColumnarTable(name, columns);
 }
 
 function createEmptyColumnVector(type: SimpleDataType, length: number): ColumnVector {

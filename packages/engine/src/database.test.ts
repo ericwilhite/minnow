@@ -5158,6 +5158,49 @@ for (const implementation of implementations()) {
 }
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} executes CTEs and derived tables through the public API`, async () => {
+    const store = await implementation.create();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 64, compression: "raw" });
+    await database.createTable({
+      name: "cte_sales",
+      columns: [
+        { name: "region", type: "string", nullable: true },
+        { name: "amount", type: "number" },
+      ],
+    });
+    await database.insertBatch("cte_sales", {
+      columns: {
+        region: Array.from({ length: 300 }, (_, index) =>
+          index % 11 === 0 ? null : `region-${String(index % 4)}`,
+        ),
+        amount: Array.from({ length: 300 }, (_, index) => index),
+      },
+    });
+
+    const nested = await database.query(
+      "WITH totals AS (SELECT region, SUM(amount) AS total, COUNT(*) AS orders FROM cte_sales GROUP BY region) SELECT COUNT(*) AS regions, MAX(total) AS peak FROM totals",
+    );
+    const flat = await database.query(
+      "SELECT region, SUM(amount) AS total FROM cte_sales GROUP BY region",
+    );
+    expect(nested.rows[0]?.regions).toBe(flat.rows.length);
+    expect(nested.rows[0]?.peak).toBe(Math.max(...flat.rows.map((row) => Number(row.total))));
+
+    const joined = await database.query(
+      "WITH hot AS (SELECT region, SUM(amount) AS total FROM cte_sales GROUP BY region) SELECT s.amount, h.total FROM cte_sales s JOIN hot h ON h.region = s.region WHERE s.amount < 5 ORDER BY s.amount",
+    );
+    expect(joined.rows.length).toBeGreaterThan(0);
+
+    const emptyDerived = await database.query(
+      "WITH none AS (SELECT region, amount FROM cte_sales WHERE amount < 0) SELECT COUNT(*) AS count, MAX(amount) AS peak FROM none",
+      { executionMemoryBudgetBytes: 512_000 },
+    );
+    expect(emptyDerived.rows).toEqual([{ count: 0, peak: null }]);
+    store.close();
+  });
+}
+
+for (const implementation of implementations()) {
   it(`${implementation.name} falls back to materialized replay for keyed mutation snapshots`, async () => {
     const store = await implementation.create();
     const database = new BrowserDatabase(store, { rowsPerBlock: 128, compression: "raw" });

@@ -355,6 +355,48 @@ describe("public SQL queries", () => {
     ]);
   });
 
+  it("executes derived tables and non-recursive CTEs in both executors", () => {
+    const rows = [
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+      { region: "east", amount: 5 },
+      { region: "east", amount: 40 },
+      { region: null, amount: 7 },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT d.doubled FROM (SELECT amount * 2 AS doubled FROM rows) d WHERE d.doubled > 10 ORDER BY d.doubled",
+      "SELECT t.region, t.total FROM (SELECT region, SUM(amount) AS total FROM rows GROUP BY region) t ORDER BY t.total DESC",
+      "WITH totals AS (SELECT region, SUM(amount) AS total FROM rows GROUP BY region) SELECT COUNT(*) AS regions, MAX(total) AS peak FROM totals",
+      "WITH big AS (SELECT amount FROM rows WHERE amount >= 10), bigger AS (SELECT amount FROM big WHERE amount >= 20) SELECT COUNT(*) AS count FROM bigger",
+      "WITH west AS (SELECT region, amount FROM rows WHERE region = 'west') SELECT r.amount, w.amount AS west_amount FROM rows r JOIN west w ON w.amount = r.amount ORDER BY r.amount",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
+    }
+    const nested = executeQuery(
+      compileQuery(
+        "WITH totals AS (SELECT region, SUM(amount) AS total FROM rows GROUP BY region) SELECT COUNT(*) AS regions, MAX(total) AS peak FROM totals",
+      ),
+      input,
+    );
+    expect(nested.rows).toEqual([{ regions: 3, peak: 45 }]);
+  });
+
+  it("rejects unsupported derived table and CTE forms explicitly", () => {
+    expect(() => compileQuery("SELECT * FROM (SELECT value FROM rows)")).toThrow(
+      "A derived table requires an alias",
+    );
+    expect(() => compileQuery("WITH r AS (SELECT value FROM r) SELECT value FROM r")).toThrow(
+      "Recursive CTEs are not supported: r",
+    );
+    expect(() =>
+      compileQuery(
+        "WITH a AS (SELECT value FROM rows), a AS (SELECT value FROM rows) SELECT value FROM a",
+      ),
+    ).toThrow("Duplicate CTE name: a");
+  });
+
   it("rejects unsupported DISTINCT and HAVING forms explicitly", () => {
     expect(() => compileQuery("SELECT DISTINCT * FROM rows")).toThrow(
       "SELECT DISTINCT * is not supported",

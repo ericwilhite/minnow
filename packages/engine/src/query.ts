@@ -58,6 +58,8 @@ export interface SelectItem {
 interface TableSource {
   table: string;
   alias: string;
+  /** A parenthesized SELECT or expanded CTE body; `table` is then a unique synthetic name. */
+  derived?: CompiledQuery;
 }
 
 interface JoinPlan extends TableSource {
@@ -108,6 +110,85 @@ export function compileQuery(sql: string): CompiledQuery {
   if (normalized.length === 0) throw new TypeError("Enter a SELECT query");
   const parser = new Parser(tokenize(normalized));
   return parser.parse(normalized);
+}
+
+export type SqlColumnType = "boolean" | "number" | "string" | "datetime";
+
+export interface SqlColumnSchema {
+  name: string;
+  type: SqlColumnType;
+}
+
+/**
+ * Infers the typed output schema of one select block from typed source schemas. A column whose
+ * type cannot be established (for example a bare NULL literal) is rejected explicitly, so a
+ * derived table always has concrete column types even when its result is empty.
+ */
+export function inferBlockSchema(
+  plan: CompiledQuery,
+  schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
+): SqlColumnSchema[] {
+  const sources = [plan.base, ...plan.joins];
+  if (plan.select[0]?.expression.kind === "wildcard") {
+    const multiple = sources.length > 1;
+    return sources.flatMap((source) =>
+      (schemas.get(source.table) ?? []).map((column) => ({
+        name: multiple ? `${source.alias}.${column.name}` : column.name,
+        type: column.type,
+      })),
+    );
+  }
+  const resolveColumnType = (reference: string): SqlColumnType | "null" => {
+    const parts = reference.split(".");
+    if (parts.length === 2) {
+      const source = sources.find(({ alias }) => alias === parts[0]);
+      if (source === undefined) throw new TypeError(`Unknown table alias: ${parts[0] ?? ""}`);
+      const column = (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1]);
+      if (column === undefined) throw new TypeError(`Unknown column: ${reference}`);
+      return column.type;
+    }
+    const matches = sources.flatMap((source) =>
+      (schemas.get(source.table) ?? [])
+        .filter(({ name }) => name === parts[0])
+        .map((column) => column.type),
+    );
+    if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
+    return matches[0] ?? "string";
+  };
+  const infer = (expression: Expression): SqlColumnType | "null" => {
+    if (expression.kind === "literal") {
+      const value = expression.value;
+      if (value === null) return "null";
+      if (typeof value === "boolean") return "boolean";
+      if (typeof value === "number") return "number";
+      if (typeof value === "string") return "string";
+      return "datetime";
+    }
+    if (expression.kind === "wildcard") return "number";
+    if (expression.kind === "column") return resolveColumnType(expression.reference);
+    if (expression.kind === "binary") {
+      for (const side of [expression.left, expression.right]) {
+        const type = infer(side);
+        if (type === "string" || type === "boolean") {
+          throw new TypeError(`Arithmetic requires numeric operands: ${plan.sql}`);
+        }
+      }
+      return "number";
+    }
+    if (expression.name === "COUNT" || expression.name === "SUM" || expression.name === "AVG") {
+      return "number";
+    }
+    if (expression.name === "ROUND") return "number";
+    const argument = expression.arguments[0];
+    return argument === undefined ? "null" : infer(argument);
+  };
+  return plan.select.map((item) => {
+    const type = infer(item.expression);
+    if (type === "null") {
+      throw new TypeError(`Cannot infer a column type for output ${item.alias}`);
+    }
+    return { name: item.alias, type };
+  });
 }
 
 export function referencedColumns(
@@ -170,6 +251,7 @@ export function createPreparedQuery(
   options: QueryExecutionOptions = {},
 ): PreparedQuery {
   validateGrouping(plan);
+  tables = resolveDerivedRowTables(plan, tables);
   const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
   if ([...tables.values()].some((rows) => rows.length === 0)) {
     if (options.executionMemoryBudgetBytes !== undefined) {
@@ -287,6 +369,21 @@ export function executeQuery(
   }
 }
 
+/** Executes each derived source with the row reference and registers its synthetic table. */
+function resolveDerivedRowTables(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): ReadonlyMap<string, DatabaseRow[]> {
+  const sources = [plan.base, ...plan.joins];
+  if (!sources.some((source) => source.derived !== undefined)) return tables;
+  const resolved = new Map(tables);
+  for (const source of sources) {
+    if (source.derived === undefined) continue;
+    resolved.set(source.table, executeRowQuery(source.derived, tables).rows);
+  }
+  return resolved;
+}
+
 function normalizeColumnarTables(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
@@ -314,6 +411,7 @@ export function executeRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {
+  tables = resolveDerivedRowTables(plan, tables);
   let contexts: RowContext[] = (tables.get(plan.base.table) ?? []).map((row) => ({
     [plan.base.alias]: row,
   }));
@@ -635,10 +733,36 @@ function asQueryValue(value: unknown): QueryValue {
 
 class Parser {
   #index = 0;
+  #derivedSequence = 0;
+  readonly #ctes = new Map<string, CompiledQuery>();
+  readonly #ctesInProgress = new Set<string>();
 
   constructor(private readonly tokens: Token[]) {}
 
   parse(sql: string): CompiledQuery {
+    if (this.#isKeyword("WITH")) {
+      this.#keyword("WITH");
+      for (;;) {
+        const name = this.#identifier();
+        if (this.#ctes.has(name) || this.#ctesInProgress.has(name)) {
+          throw new TypeError(`Duplicate CTE name: ${name}`);
+        }
+        this.#keyword("AS");
+        this.#expectPunctuation("(");
+        this.#ctesInProgress.add(name);
+        const block = this.#selectBlock("(cte)");
+        this.#ctesInProgress.delete(name);
+        this.#expectPunctuation(")");
+        this.#ctes.set(name, block);
+        if (!this.#punctuation(",")) break;
+      }
+    }
+    const plan = this.#selectBlock(sql);
+    this.#take("eof");
+    return plan;
+  }
+
+  #selectBlock(sql: string): CompiledQuery {
     this.#keyword("SELECT");
     let distinct = false;
     if (this.#isKeyword("DISTINCT")) {
@@ -741,7 +865,6 @@ class Parser {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100_000)
         throw new RangeError("LIMIT must be between 1 and 100,000");
     }
-    this.#take("eof");
     return {
       sql,
       base,
@@ -778,19 +901,41 @@ class Parser {
   }
 
   #source(): TableSource {
+    if (this.#punctuation("(")) {
+      const derived = this.#selectBlock("(derived)");
+      this.#expectPunctuation(")");
+      const alias = this.#sourceAlias();
+      if (alias === undefined) throw new TypeError("A derived table requires an alias");
+      return this.#derivedSource(derived, alias);
+    }
     const table = this.#identifier();
-    let alias = table;
+    if (this.#ctesInProgress.has(table)) {
+      throw new TypeError(`Recursive CTEs are not supported: ${table}`);
+    }
+    const alias = this.#sourceAlias() ?? table;
+    const cte = this.#ctes.get(table);
+    if (cte !== undefined) return this.#derivedSource(structuredClone(cte), alias);
+    return { table, alias };
+  }
+
+  #sourceAlias(): string | undefined {
     if (this.#isKeyword("AS")) {
       this.#keyword("AS");
-      alias = this.#identifier();
-    } else if (
+      return this.#identifier();
+    }
+    if (
       this.#peek().kind === "identifier" &&
       !clauseKeywords.has(this.#peek().text.toUpperCase()) &&
       !this.#isKeyword("ON")
     ) {
-      alias = this.#identifier();
+      return this.#identifier();
     }
-    return { table, alias };
+    return undefined;
+  }
+
+  #derivedSource(derived: CompiledQuery, alias: string): TableSource {
+    this.#derivedSequence += 1;
+    return { table: `(derived ${String(this.#derivedSequence)}) ${alias}`, alias, derived };
   }
 
   #expressionList(): Expression[] {
