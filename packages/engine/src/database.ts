@@ -1268,7 +1268,7 @@ export class BrowserDatabase {
           }
           results.push(result);
         }
-        const combined = combineUnionResults(results, source.union.alls);
+        const combined = combineUnionResults(results, source.union.ops);
         typedSchemas.set(source.table, schema ?? []);
         inputs.set(source.table, derivedColumnarTable(source.table, combined, schema ?? []));
         continue;
@@ -4647,8 +4647,7 @@ export class BrowserDatabase {
           : undefined;
     const stringCodes = column.type === "string" ? new Uint32Array(rowCount) : undefined;
     stringCodes?.fill(NULL_STRING_VECTOR_CODE);
-    const stringDictionary: string[] = [];
-    const stringDictionaryIndex = new Map<string, number>();
+    const stringDictionary = new StringDictionaryBuilder();
     let outputRow = 0;
 
     for (const segment of segments) {
@@ -4706,7 +4705,6 @@ export class BrowserDatabase {
             values,
             stringCodes,
             stringDictionary,
-            stringDictionaryIndex,
           );
           outputRow += decoded.column.rowCount;
           segmentRows += decoded.column.rowCount;
@@ -4723,7 +4721,7 @@ export class BrowserDatabase {
         length: rowCount,
         validity,
         codes: stringCodes ?? new Uint32Array(),
-        dictionary: stringDictionary,
+        dictionary: stringDictionary.dictionary,
       };
     }
     if (column.type === "boolean") {
@@ -5191,14 +5189,133 @@ function positiveFiniteNumber(value: number, name: string): number {
   return value;
 }
 
+const INITIAL_DICTIONARY_CAPACITY = 8;
+const INITIAL_DICTIONARY_ARENA_BYTES = 256;
+
+/**
+ * Interns decoded strings by their raw UTF-8 bytes. The columns that grouping and filtering
+ * target repeat the same byte ranges across millions of rows, so probing an owned byte arena
+ * holds `TextDecoder` calls to one per distinct value rather than one per row. Entries live in
+ * flat typed arrays so a high-cardinality column pays no per-value object overhead.
+ */
+class StringDictionaryBuilder {
+  readonly dictionary: string[] = [];
+  #buckets = filledInt32Array(INITIAL_DICTIONARY_CAPACITY);
+  #next = filledInt32Array(INITIAL_DICTIONARY_CAPACITY);
+  #hashes = new Uint32Array(INITIAL_DICTIONARY_CAPACITY);
+  #offsets = new Uint32Array(INITIAL_DICTIONARY_CAPACITY);
+  #lengths = new Uint32Array(INITIAL_DICTIONARY_CAPACITY);
+  #arena = new Uint8Array(INITIAL_DICTIONARY_ARENA_BYTES);
+  #arenaLength = 0;
+
+  /** UTF-8 bytes held by the distinct values, tracked so callers skip a re-encoding pass. */
+  get byteLength(): number {
+    return this.#arenaLength;
+  }
+
+  codeForBytes(content: Uint8Array, start: number, end: number): number {
+    const length = end - start;
+    const hash = hashByteRange(content, start, end);
+    let index = this.#buckets[hash & (this.#buckets.length - 1)] ?? -1;
+    while (index >= 0) {
+      if (
+        this.#hashes[index] === hash &&
+        this.#lengths[index] === length &&
+        equalByteRange(this.#arena, this.#offsets[index] ?? 0, content, start, length)
+      ) {
+        return index;
+      }
+      index = this.#next[index] ?? -1;
+    }
+    return this.#insert(content, start, end, hash);
+  }
+
+  #insert(content: Uint8Array, start: number, end: number, hash: number): number {
+    const code = this.dictionary.length;
+    const length = end - start;
+    this.#growEntries(code + 1);
+    this.#growArena(this.#arenaLength + length);
+    this.#arena.set(content.subarray(start, end), this.#arenaLength);
+    this.#hashes[code] = hash;
+    this.#offsets[code] = this.#arenaLength;
+    this.#lengths[code] = length;
+    this.#arenaLength += length;
+    const bucket = hash & (this.#buckets.length - 1);
+    this.#next[code] = this.#buckets[bucket] ?? -1;
+    this.#buckets[bucket] = code;
+    this.dictionary.push(vectorTextDecoder.decode(content.subarray(start, end)));
+    return code;
+  }
+
+  #growEntries(required: number): void {
+    if (required <= this.#hashes.length) return;
+    let capacity = this.#hashes.length;
+    while (capacity < required)
+      capacity = safeWholeNumberProduct(capacity, 2, "String dictionary entries");
+    const hashes = new Uint32Array(capacity);
+    const offsets = new Uint32Array(capacity);
+    const lengths = new Uint32Array(capacity);
+    hashes.set(this.#hashes);
+    offsets.set(this.#offsets);
+    lengths.set(this.#lengths);
+    this.#hashes = hashes;
+    this.#offsets = offsets;
+    this.#lengths = lengths;
+    // Buckets track entry capacity, so chains stay short as the distinct-value count grows.
+    this.#buckets = filledInt32Array(capacity);
+    this.#next = filledInt32Array(capacity);
+    for (let code = 0; code < this.dictionary.length; code += 1) {
+      const bucket = (this.#hashes[code] ?? 0) & (capacity - 1);
+      this.#next[code] = this.#buckets[bucket] ?? -1;
+      this.#buckets[bucket] = code;
+    }
+  }
+
+  #growArena(required: number): void {
+    if (required <= this.#arena.byteLength) return;
+    let capacity = this.#arena.byteLength;
+    while (capacity < required)
+      capacity = safeWholeNumberProduct(capacity, 2, "String dictionary arena");
+    const arena = new Uint8Array(capacity);
+    arena.set(this.#arena.subarray(0, this.#arenaLength));
+    this.#arena = arena;
+  }
+}
+
+function filledInt32Array(length: number): Int32Array {
+  const array = new Int32Array(length);
+  array.fill(-1);
+  return array;
+}
+
+function hashByteRange(bytes: Uint8Array, start: number, end: number): number {
+  let hash = 0x811c9dc5;
+  for (let index = start; index < end; index += 1) {
+    hash = Math.imul(hash ^ (bytes[index] ?? 0), 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+function equalByteRange(
+  arena: Uint8Array,
+  arenaOffset: number,
+  content: Uint8Array,
+  contentStart: number,
+  length: number,
+): boolean {
+  for (let index = 0; index < length; index += 1) {
+    if (arena[arenaOffset + index] !== content[contentStart + index]) return false;
+  }
+  return true;
+}
+
 function appendPhysicalColumnToVector(
   column: ValidatedPhysicalColumn,
   outputRowStart: number,
   outputValidity: Uint8Array,
   outputValues: Uint8Array | Float64Array | undefined,
   outputStringCodes: Uint32Array | undefined,
-  stringDictionary: string[],
-  stringDictionaryIndex: Map<string, number>,
+  stringDictionary: StringDictionaryBuilder,
 ): void {
   const sourceValidityLength = Math.ceil(column.rowCount / 8);
   const sourceValidity = column.bytes.subarray(0, sourceValidityLength);
@@ -5247,14 +5364,7 @@ function appendPhysicalColumnToVector(
     if (!bitmapHasValue(sourceValidity, row)) continue;
     const start = offsets.getUint32(row * 4, true);
     const end = offsets.getUint32((row + 1) * 4, true);
-    const value = vectorTextDecoder.decode(content.subarray(start, end));
-    let code = stringDictionaryIndex.get(value);
-    if (code === undefined) {
-      code = stringDictionary.length;
-      stringDictionary.push(value);
-      stringDictionaryIndex.set(value, code);
-    }
-    outputStringCodes[outputRowStart + row] = code;
+    outputStringCodes[outputRowStart + row] = stringDictionary.codeForBytes(content, start, end);
   }
 }
 
@@ -5314,8 +5424,7 @@ function installStreamedWindow(
         : undefined;
   const codes = vector.kind === "string" ? new Uint32Array(windowRows) : undefined;
   codes?.fill(NULL_STRING_VECTOR_CODE);
-  const dictionary: string[] = [];
-  const dictionaryIndex = new Map<string, number>();
+  const builder = new StringDictionaryBuilder();
   for (const block of resident) {
     appendPhysicalColumnToVector(
       block.column,
@@ -5323,17 +5432,13 @@ function installStreamedWindow(
       validity,
       values,
       codes,
-      dictionary,
-      dictionaryIndex,
+      builder,
     );
   }
-  if (dictionary.length > 0) {
-    let dictionaryBytes = 0;
-    for (const value of dictionary) {
-      dictionaryBytes += sizeTextEncoder.encode(value).byteLength;
-    }
-    reservations.push(memory.reserve(dictionaryBytes, label));
-  }
+  const dictionary = builder.dictionary;
+  // The builder already retains each distinct value's UTF-8 bytes, so the window's dictionary
+  // footprint is known without re-encoding every entry.
+  if (dictionary.length > 0) reservations.push(memory.reserve(builder.byteLength, label));
   const mutable = vector as unknown as MutableStreamedVectorFields;
   mutable.validity = validity;
   if (values !== undefined) mutable.values = values;
@@ -5494,7 +5599,10 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
       predicate.operator === "IN" ||
       predicate.operator === "NOT IN" ||
       predicate.operator === "IS NULL" ||
-      predicate.operator === "IS NOT NULL"
+      predicate.operator === "IS NOT NULL" ||
+      predicate.operator === "LIKE" ||
+      predicate.operator === "NOT LIKE" ||
+      predicate.operator === "IS TRUE"
     ) {
       continue;
     }

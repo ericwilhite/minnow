@@ -9,6 +9,7 @@ import type {
   QueryValue,
   SelectItem,
 } from "./query.js";
+import { likeRegExp } from "./query.js";
 import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
 import { ByteJoinIndex } from "./join-index.js";
 import {
@@ -132,7 +133,28 @@ type BoundExpression =
       aggregateIndex?: number;
       signature: string;
     }
-  | { kind: "list"; items: BoundExpression[]; signature: string };
+  | { kind: "list"; items: BoundExpression[]; signature: string }
+  | {
+      kind: "condition";
+      operator: PredicateOperator;
+      left: BoundExpression;
+      right: BoundExpression;
+      signature: string;
+    }
+  | {
+      kind: "logical";
+      operator: "and" | "or";
+      left: BoundExpression;
+      right: BoundExpression;
+      signature: string;
+    }
+  | { kind: "not"; operand: BoundExpression; signature: string }
+  | {
+      kind: "case";
+      branches: Array<{ when: BoundExpression; then: BoundExpression }>;
+      otherwise?: BoundExpression;
+      signature: string;
+    };
 
 interface BoundPredicate {
   readonly left: BoundExpression;
@@ -191,6 +213,7 @@ interface BoundPlan {
   readonly grouped: boolean;
   readonly wildcard: boolean;
   readonly limit?: number;
+  readonly offset?: number;
 }
 
 interface BatchRows {
@@ -534,6 +557,7 @@ function bindPlan(
     grouped,
     wildcard: plan.select[0]?.expression.kind === "wildcard",
     ...(plan.limit === undefined ? {} : { limit: plan.limit }),
+    ...(plan.offset === undefined ? {} : { offset: plan.offset }),
   };
 }
 
@@ -590,12 +614,46 @@ function bindExpression(
       signature,
     };
   }
-  if (expression.kind === "binary") {
+  if (expression.kind === "exists") {
+    throw new TypeError("EXISTS subqueries must be resolved before execution");
+  }
+  if (expression.kind === "binary" || expression.kind === "condition") {
     return {
-      kind: "binary",
+      kind: expression.kind,
       operator: expression.operator,
       left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes),
       right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes),
+      signature,
+    } as BoundExpression;
+  }
+  if (expression.kind === "logical") {
+    return {
+      kind: "logical",
+      operator: expression.operator,
+      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes),
+      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes),
+      signature,
+    };
+  }
+  if (expression.kind === "not") {
+    return {
+      kind: "not",
+      operand: bindExpression(expression.operand, sources, aggregateSpecs, aggregateIndexes),
+      signature,
+    };
+  }
+  if (expression.kind === "case") {
+    const otherwise =
+      expression.otherwise === undefined
+        ? undefined
+        : bindExpression(expression.otherwise, sources, aggregateSpecs, aggregateIndexes);
+    return {
+      kind: "case",
+      branches: expression.branches.map((branch) => ({
+        when: bindExpression(branch.when, sources, aggregateSpecs, aggregateIndexes),
+        then: bindExpression(branch.then, sources, aggregateSpecs, aggregateIndexes),
+      })),
+      ...(otherwise === undefined ? {} : { otherwise }),
       signature,
     };
   }
@@ -623,15 +681,26 @@ function bindExpression(
   };
 }
 
+function boundChildren(expression: BoundExpression): BoundExpression[] {
+  if (expression.kind === "binary" || expression.kind === "condition") {
+    return [expression.left, expression.right];
+  }
+  if (expression.kind === "logical") return [expression.left, expression.right];
+  if (expression.kind === "not") return [expression.operand];
+  if (expression.kind === "call") return [...expression.arguments];
+  if (expression.kind === "list") return [...expression.items];
+  if (expression.kind === "case") {
+    return [
+      ...expression.branches.flatMap((branch) => [branch.when, branch.then]),
+      ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+    ];
+  }
+  return [];
+}
+
 function expressionSources(expression: BoundExpression): Set<number> {
   if (expression.kind === "column") return new Set([expression.source]);
-  if (expression.kind === "binary") {
-    return new Set([...expressionSources(expression.left), ...expressionSources(expression.right)]);
-  }
-  if (expression.kind === "call") {
-    return new Set(expression.arguments.flatMap((argument) => [...expressionSources(argument)]));
-  }
-  return new Set();
+  return new Set(boundChildren(expression).flatMap((child) => [...expressionSources(child)]));
 }
 
 function createBoundJoin(
@@ -915,7 +984,9 @@ async function executeBoundPlanWithSortSpill(
     }
     const finalRun = required(active[0], "Final spill run is missing");
     const rows: QueryRow[] = [];
-    const limit = plan.limit ?? Number.MAX_SAFE_INTEGER;
+    const offset = plan.offset ?? 0;
+    const limit =
+      plan.limit === undefined ? Number.MAX_SAFE_INTEGER : plan.limit + offset;
     for (let pageIndex = 0; pageIndex < finalRun.pageCount && rows.length < limit; pageIndex += 1) {
       const bytes = await store.getPage(ownerId, finalRun.id, pageIndex);
       if (bytes === undefined) throw new Error("Query spill page is missing");
@@ -924,6 +995,7 @@ async function executeBoundPlanWithSortSpill(
         rows.push(row);
       }
     }
+    if (offset > 0) rows.splice(0, Math.min(offset, rows.length));
     return { columns, rows };
   } finally {
     await store.removeOwner(ownerId);
@@ -1105,7 +1177,16 @@ async function executeBoundPlanWithHashSpill(
       () => `merge-${String(runSequence++)}`,
       memory,
     );
-    return await readFinalSpillRun(store, ownerId, finalRun, columns, plan.limit);
+    const spillOffset = plan.offset ?? 0;
+    const result = await readFinalSpillRun(
+      store,
+      ownerId,
+      finalRun,
+      columns,
+      plan.limit === undefined ? undefined : plan.limit + spillOffset,
+    );
+    if (spillOffset > 0) result.rows.splice(0, Math.min(spillOffset, result.rows.length));
+    return result;
   } finally {
     await store.removeOwner(ownerId);
   }
@@ -1237,15 +1318,22 @@ function projectFilteredBatch(
   memory: QueryMemoryContext,
 ): void {
   for (let row = 0; row < batch.length; row += 1) {
-    if (
-      !plan.predicates.every((predicate) => evaluateBatchPredicate(plan, predicate, batch, row))
-    ) {
-      continue;
-    }
+    if (!passesPredicates(plan, batch, row)) continue;
     const resultRow = projectBatchRow(plan, batch, row);
     memory.reserve(queryRowPayloadBytes(resultRow), "Spill result row");
     output.push(resultRow);
   }
+}
+
+/**
+ * Applies a plan's WHERE predicates to one row. This runs once per scanned row, so it iterates
+ * directly rather than through `every`, which allocates a capturing closure per call.
+ */
+function passesPredicates(plan: BoundPlan, batch: BatchRows, row: number): boolean {
+  for (const predicate of plan.predicates) {
+    if (!evaluateBatchPredicate(plan, predicate, batch, row)) return false;
+  }
+  return true;
 }
 
 async function mergeSpillRuns(
@@ -1453,6 +1541,8 @@ function finishResult(
       ordering.release();
     }
   }
+  const start = plan.offset ?? 0;
+  if (start > 0) rows.splice(0, Math.min(start, rows.length));
   if (plan.limit !== undefined) {
     rows.length = Math.min(plan.limit, rows.length);
   }
@@ -1484,11 +1574,12 @@ function consumeJoinedBatches(
 }
 
 function reachedEarlyLimit(plan: BoundPlan, outputRows: number): boolean {
+  // Early termination must still produce the rows the trailing OFFSET will discard.
   return (
     !plan.grouped &&
     plan.orderBy.length === 0 &&
     plan.limit !== undefined &&
-    outputRows >= plan.limit
+    outputRows >= plan.limit + (plan.offset ?? 0)
   );
 }
 
@@ -1645,11 +1736,7 @@ function consumeBatch(
   memory: QueryMemoryContext,
 ): void {
   for (let row = 0; row < batch.length; row += 1) {
-    if (
-      !plan.predicates.every((predicate) => evaluateBatchPredicate(plan, predicate, batch, row))
-    ) {
-      continue;
-    }
+    if (!passesPredicates(plan, batch, row)) continue;
     if (plan.grouped) {
       let state: GroupState | undefined;
       if (plan.groupBy.length === 0) state = groups.getEmpty();
@@ -1679,7 +1766,11 @@ function consumeBatch(
       const resultRow = projectBatchRow(plan, batch, row);
       memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
       output.push(resultRow);
-      if (plan.orderBy.length === 0 && plan.limit !== undefined && output.length >= plan.limit)
+      if (
+        plan.orderBy.length === 0 &&
+        plan.limit !== undefined &&
+        output.length >= plan.limit + (plan.offset ?? 0)
+      )
         return;
     }
   }
@@ -1789,11 +1880,7 @@ function finishGroups(
   for (const group of groups) {
     if (
       !plan.having.every((predicate) =>
-        comparisonValue(
-          predicate.operator,
-          evaluateFinalExpression(plan, predicate.left, group),
-          evaluateFinalExpression(plan, predicate.right, group),
-        ),
+        predicateTruth(predicate, (nested) => evaluateFinalExpression(plan, nested, group)),
       )
     ) {
       continue;
@@ -1820,6 +1907,24 @@ function evaluateFinalExpression(
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
   if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
+  if (
+    expression.kind === "condition" ||
+    expression.kind === "logical" ||
+    expression.kind === "not"
+  ) {
+    return booleanTruth(expression, (nested) => evaluateFinalExpression(plan, nested, group));
+  }
+  if (expression.kind === "case") {
+    for (const branch of expression.branches) {
+      const matched = booleanTruth(branch.when, (nested) =>
+        evaluateFinalExpression(plan, nested, group),
+      );
+      if (matched === true) return evaluateFinalExpression(plan, branch.then, group);
+    }
+    return expression.otherwise === undefined
+      ? null
+      : evaluateFinalExpression(plan, expression.otherwise, group);
+  }
   if (expression.kind === "column") {
     throw new TypeError("Selected column must appear in GROUP BY");
   }
@@ -1929,6 +2034,107 @@ function stringCodeAt(vector: StringVector, rowIndex: number): number | undefine
   return code === NULL_STRING_CODE ? undefined : code;
 }
 
+/**
+ * SQL three-valued logic over bound boolean trees; mirrors evaluateBooleanExpression in query.ts
+ * with bound leaves. Only the caller collapses unknown (null) to false.
+ */
+function booleanTruth(
+  expression: BoundExpression,
+  evaluateValue: (expression: BoundExpression) => unknown,
+): boolean | null {
+  if (expression.kind === "logical") {
+    const left = booleanTruth(expression.left, evaluateValue);
+    if (expression.operator === "and") {
+      if (left === false) return false;
+      const right = booleanTruth(expression.right, evaluateValue);
+      if (right === false) return false;
+      return left === null || right === null ? null : true;
+    }
+    if (left === true) return true;
+    const right = booleanTruth(expression.right, evaluateValue);
+    if (right === true) return true;
+    return left === null || right === null ? null : false;
+  }
+  if (expression.kind === "not") {
+    const value = booleanTruth(expression.operand, evaluateValue);
+    return value === null ? null : !value;
+  }
+  if (expression.kind === "condition") {
+    const operator = expression.operator;
+    if (operator === "IS TRUE") return booleanTruth(expression.left, evaluateValue);
+    if (operator === "IS NULL" || operator === "IS NOT NULL") {
+      const value = evaluateValue(expression.left);
+      const isNull = value === null || value === undefined;
+      return operator === "IS NULL" ? isNull : !isNull;
+    }
+    if (operator === "IN" || operator === "NOT IN") {
+      if (expression.right.kind !== "list") throw new TypeError("IN requires a value list");
+      const probe = evaluateValue(expression.left);
+      if (probe === null || probe === undefined) return null;
+      let sawNull = false;
+      for (const item of expression.right.items) {
+        const value = evaluateValue(item);
+        if (value === null || value === undefined) {
+          sawNull = true;
+          continue;
+        }
+        if (comparable(value) === comparable(probe)) return operator === "IN";
+      }
+      if (sawNull) return null;
+      return operator === "NOT IN";
+    }
+    if (operator === "LIKE" || operator === "NOT LIKE") {
+      const value = evaluateValue(expression.left);
+      const pattern = evaluateValue(expression.right);
+      if (value === null || value === undefined || pattern === null || pattern === undefined) {
+        return null;
+      }
+      if (typeof value !== "string" || typeof pattern !== "string") {
+        throw new TypeError("LIKE requires string operands");
+      }
+      const matched = likeRegExp(pattern).test(value);
+      return operator === "LIKE" ? matched : !matched;
+    }
+    const left = evaluateValue(expression.left);
+    const right = evaluateValue(expression.right);
+    if (left === null || left === undefined || right === null || right === undefined) return null;
+    const a = comparable(left);
+    const b = comparable(right);
+    if (operator === "=") return a === b;
+    if (operator === "!=" || operator === "<>") return a !== b;
+    const comparison = compareValues(a, b);
+    if (operator === ">") return comparison > 0;
+    if (operator === ">=") return comparison >= 0;
+    if (operator === "<") return comparison < 0;
+    return comparison <= 0;
+  }
+  const value = evaluateValue(expression);
+  if (value === null || value === undefined) return null;
+  if (typeof value === "boolean") return value;
+  throw new TypeError("Boolean conditions require boolean operands");
+}
+
+function predicateTruth(
+  predicate: { left: BoundExpression; operator: PredicateOperator; right: BoundExpression },
+  evaluateValue: (expression: BoundExpression) => unknown,
+): boolean {
+  if (predicate.operator === "IS TRUE") {
+    return booleanTruth(predicate.left, evaluateValue) === true;
+  }
+  return (
+    booleanTruth(
+      {
+        kind: "condition",
+        operator: predicate.operator,
+        left: predicate.left,
+        right: predicate.right,
+        signature: "",
+      },
+      evaluateValue,
+    ) === true
+  );
+}
+
 function evaluateBatchPredicate(
   plan: BoundPlan,
   predicate: BoundPredicate,
@@ -1945,6 +2151,15 @@ function evaluateBatchPredicate(
     }
     const matches = fast.cache.code >= 0 && code === fast.cache.code;
     return fast.negated ? !matches : matches;
+  }
+  if (
+    predicate.operator === "IS TRUE" ||
+    predicate.operator === "LIKE" ||
+    predicate.operator === "NOT LIKE"
+  ) {
+    return predicateTruth(predicate, (nested) =>
+      evaluateBatchExpression(plan, nested, batch, row),
+    );
   }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
@@ -1991,6 +2206,24 @@ function evaluateBatchExpression(
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
   if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
+  if (
+    expression.kind === "condition" ||
+    expression.kind === "logical" ||
+    expression.kind === "not"
+  ) {
+    return booleanTruth(expression, (nested) => evaluateBatchExpression(plan, nested, batch, row));
+  }
+  if (expression.kind === "case") {
+    for (const branch of expression.branches) {
+      const matched = booleanTruth(branch.when, (nested) =>
+        evaluateBatchExpression(plan, nested, batch, row),
+      );
+      if (matched === true) return evaluateBatchExpression(plan, branch.then, batch, row);
+    }
+    return expression.otherwise === undefined
+      ? null
+      : evaluateBatchExpression(plan, expression.otherwise, batch, row);
+  }
   if (expression.kind === "column") {
     return vectorValue(expression.vector, batch.rowsBySource[expression.source]?.[row] ?? -1);
   }
@@ -2020,6 +2253,24 @@ function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Arra
   if (expression.kind === "literal") return expression.value;
   if (expression.kind === "wildcard") return 1;
   if (expression.kind === "list") throw new TypeError("Value lists are only supported with IN");
+  if (
+    expression.kind === "condition" ||
+    expression.kind === "logical" ||
+    expression.kind === "not"
+  ) {
+    return booleanTruth(expression, (nested) => evaluateExpression(nested, rowsBySource));
+  }
+  if (expression.kind === "case") {
+    for (const branch of expression.branches) {
+      const matched = booleanTruth(branch.when, (nested) =>
+        evaluateExpression(nested, rowsBySource),
+      );
+      if (matched === true) return evaluateExpression(branch.then, rowsBySource);
+    }
+    return expression.otherwise === undefined
+      ? null
+      : evaluateExpression(expression.otherwise, rowsBySource);
+  }
   if (expression.kind === "column") {
     return vectorValue(expression.vector, rowsBySource[expression.source] ?? -1);
   }

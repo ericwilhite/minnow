@@ -86,6 +86,28 @@ function foldExpression(expression: Expression): Expression {
       })),
     };
   }
+  if (expression.kind === "condition" || expression.kind === "logical") {
+    return {
+      ...expression,
+      left: foldExpression(expression.left),
+      right: foldExpression(expression.right),
+    };
+  }
+  if (expression.kind === "not") {
+    return { ...expression, operand: foldExpression(expression.operand) };
+  }
+  if (expression.kind === "case") {
+    const otherwise =
+      expression.otherwise === undefined ? undefined : foldExpression(expression.otherwise);
+    return {
+      ...expression,
+      branches: expression.branches.map((branch) => ({
+        when: foldExpression(branch.when),
+        then: foldExpression(branch.then),
+      })),
+      ...(otherwise === undefined ? {} : { otherwise }),
+    };
+  }
   return expression;
 }
 
@@ -198,13 +220,44 @@ function rewriteForInner(
     }
     return { ...expression, arguments: rewrittenArguments };
   }
-  const rewrittenItems: Expression[] = [];
-  for (const item of expression.items) {
-    const rewritten = rewriteForInner(item, source, derived, singleSource);
-    if (rewritten === undefined) return undefined;
-    rewrittenItems.push(rewritten);
+  if (expression.kind === "list") {
+    const rewrittenItems: Expression[] = [];
+    for (const item of expression.items) {
+      const rewritten = rewriteForInner(item, source, derived, singleSource);
+      if (rewritten === undefined) return undefined;
+      rewrittenItems.push(rewritten);
+    }
+    return { ...expression, items: rewrittenItems };
   }
-  return { ...expression, items: rewrittenItems };
+  if (expression.kind === "condition" || expression.kind === "logical") {
+    const left = rewriteForInner(expression.left, source, derived, singleSource);
+    if (left === undefined) return undefined;
+    const right = rewriteForInner(expression.right, source, derived, singleSource);
+    if (right === undefined) return undefined;
+    return { ...expression, left, right };
+  }
+  if (expression.kind === "not") {
+    const operand = rewriteForInner(expression.operand, source, derived, singleSource);
+    return operand === undefined ? undefined : { ...expression, operand };
+  }
+  if (expression.kind === "case") {
+    const branches: Array<{ when: Expression; then: Expression }> = [];
+    for (const branch of expression.branches) {
+      const when = rewriteForInner(branch.when, source, derived, singleSource);
+      const then = rewriteForInner(branch.then, source, derived, singleSource);
+      if (when === undefined || then === undefined) return undefined;
+      branches.push({ when, then });
+    }
+    let otherwise: Expression | undefined;
+    if (expression.otherwise !== undefined) {
+      otherwise = rewriteForInner(expression.otherwise, source, derived, singleSource);
+      if (otherwise === undefined) return undefined;
+    }
+    return { ...expression, branches, ...(otherwise === undefined ? {} : { otherwise }) };
+  }
+  // An EXISTS block is self-contained (no correlation), so it moves unchanged.
+  if (expression.kind === "exists") return expression;
+  return undefined;
 }
 
 function containsAggregateOrWindow(expression: Expression): boolean {
@@ -219,6 +272,21 @@ function containsAggregateOrWindow(expression: Expression): boolean {
     );
   }
   if (expression.kind === "list") return expression.items.some(containsAggregateOrWindow);
+  if (expression.kind === "condition" || expression.kind === "logical") {
+    return (
+      containsAggregateOrWindow(expression.left) || containsAggregateOrWindow(expression.right)
+    );
+  }
+  if (expression.kind === "not") return containsAggregateOrWindow(expression.operand);
+  if (expression.kind === "case") {
+    return (
+      expression.branches.some(
+        (branch) =>
+          containsAggregateOrWindow(branch.when) || containsAggregateOrWindow(branch.then),
+      ) ||
+      (expression.otherwise !== undefined && containsAggregateOrWindow(expression.otherwise))
+    );
+  }
   return false;
 }
 
@@ -264,9 +332,19 @@ function referencedOutputAliases(
       else state.provable = false;
       return;
     }
-    if (expression.kind === "binary") {
+    if (expression.kind === "binary" || expression.kind === "condition") {
       visit(expression.left);
       visit(expression.right);
+    } else if (expression.kind === "logical") {
+      visit(expression.left);
+      visit(expression.right);
+    } else if (expression.kind === "not") visit(expression.operand);
+    else if (expression.kind === "case") {
+      for (const branch of expression.branches) {
+        visit(branch.when);
+        visit(branch.then);
+      }
+      if (expression.otherwise !== undefined) visit(expression.otherwise);
     } else if (expression.kind === "call") expression.arguments.forEach(visit);
     else if (expression.kind === "list") expression.items.forEach(visit);
     else if (expression.kind === "window") {
@@ -306,7 +384,10 @@ function combineDerivedLimit(block: CompiledQuery): void {
     block.groupBy.length > 0 ||
     block.having.length > 0 ||
     block.orderBy.length > 0 ||
-    block.limit === undefined
+    block.limit === undefined ||
+    // An OFFSET at either level changes which rows survive, so the limits cannot merge.
+    block.offset !== undefined ||
+    derived.offset !== undefined
   ) {
     return;
   }
@@ -355,6 +436,7 @@ function renderBlock(block: CompiledQuery, depth: number, lines: string[]): void
     );
   }
   if (block.limit !== undefined) lines.push(`${pad}  limit ${String(block.limit)}`);
+  if (block.offset !== undefined) lines.push(`${pad}  offset ${String(block.offset)}`);
 }
 
 function renderSource(source: TableSource, label: string, depth: number, lines: string[]): void {
@@ -363,7 +445,7 @@ function renderSource(source: TableSource, label: string, depth: number, lines: 
     lines.push(`${pad}  ${label} union [${source.alias}]`);
     source.union.blocks.forEach((member, index) => {
       if (index > 0) {
-        lines.push(`${pad}    ${source.union?.alls[index - 1] === true ? "union all" : "union"}`);
+        lines.push(`${pad}    ${source.union?.ops[index - 1] ?? "union"}`);
       }
       renderBlock(member, depth + 2, lines);
     });
@@ -412,5 +494,16 @@ function renderExpression(expression: Expression): string {
     return `(${expression.items.map(renderExpression).join(", ")})`;
   }
   if (expression.kind === "subquery") return "(subquery)";
+  if (expression.kind === "condition") {
+    return `(${renderExpression(expression.left)} ${expression.operator} ${renderExpression(expression.right)})`;
+  }
+  if (expression.kind === "logical") {
+    return `(${renderExpression(expression.left)} ${expression.operator} ${renderExpression(expression.right)})`;
+  }
+  if (expression.kind === "not") return `(not ${renderExpression(expression.operand)})`;
+  if (expression.kind === "exists") return "exists (subquery)";
+  if (expression.kind === "case") {
+    return `case [${String(expression.branches.length)} branches]`;
+  }
   return `${expression.name}(...) over (...)`;
 }

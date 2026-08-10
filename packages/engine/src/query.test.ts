@@ -543,11 +543,12 @@ describe("public SQL queries", () => {
     expect(() => compileQuery("SELECT region FROM rows WHERE region IN (*)")).toThrow(
       "IN lists accept only scalar expressions",
     );
-    expect(() =>
-      compileQuery(
-        "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING region IN ('west')",
-      ),
-    ).toThrow("IN is not supported in HAVING");
+    const havingIn = compileQuery(
+      "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING region IN ('west')",
+    );
+    expect(executeRowQuery(havingIn, input).rows).toEqual(
+      executeQuery(havingIn, input).rows,
+    );
   });
 
   it("rejects unsupported derived table and CTE forms explicitly", () => {
@@ -613,9 +614,14 @@ describe("public SQL queries", () => {
     expect(() =>
       compileQuery("SELECT COUNT(DISTINCT region) AS r, SUM(amount) AS total FROM rows"),
     ).toThrow("COUNT(DISTINCT) cannot be combined with other aggregates yet");
-    expect(() => compileQuery("SELECT region FROM rows WHERE amount NOT BETWEEN 1 AND 5")).toThrow(
-      "Expected IN, found BETWEEN",
-    );
+    const notBetween = compileQuery("SELECT region FROM rows WHERE amount NOT BETWEEN 1 AND 5");
+    expect(executeQuery(notBetween, input)).toEqual(executeRowQuery(notBetween, input));
+    expect(executeQuery(notBetween, input).rows).toEqual([
+      { region: "west" },
+      { region: "west" },
+      { region: "east" },
+      { region: "west" },
+    ]);
   });
 
   it("rejects unsupported DISTINCT and HAVING forms explicitly", () => {

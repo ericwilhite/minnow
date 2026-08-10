@@ -52,6 +52,15 @@ export type Expression =
   | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[]; distinct?: boolean }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }
+  | { kind: "condition"; operator: PredicateOperator; left: Expression; right: Expression }
+  | { kind: "logical"; operator: "and" | "or"; left: Expression; right: Expression }
+  | { kind: "not"; operand: Expression }
+  | { kind: "exists"; block: CompiledQuery; negated: boolean }
+  | {
+      kind: "case";
+      branches: Array<{ when: Expression; then: Expression }>;
+      otherwise?: Expression;
+    }
   | {
       kind: "window";
       name: WindowFunctionName;
@@ -79,7 +88,7 @@ export interface TableSource {
   /** A parenthesized SELECT or expanded CTE body; `table` is then a unique synthetic name. */
   derived?: CompiledQuery;
   /** A top-level set operation; members combine positionally under the first member's schema. */
-  union?: { blocks: CompiledQuery[]; alls: boolean[] };
+  union?: { blocks: CompiledQuery[]; ops: SetOperator[] };
   /** A window-function desugar: the inner block executes, then window columns append. */
   windowed?: { block: CompiledQuery; windows: WindowSpec[] };
 }
@@ -90,7 +99,17 @@ export interface JoinPlan extends TableSource {
   right: Expression;
 }
 
-export type PredicateOperator = ComparisonOperator | "IN" | "NOT IN" | "IS NULL" | "IS NOT NULL";
+export type SetOperator = "union" | "union all" | "intersect" | "except";
+
+export type PredicateOperator =
+  | ComparisonOperator
+  | "IN"
+  | "NOT IN"
+  | "IS NULL"
+  | "IS NOT NULL"
+  | "LIKE"
+  | "NOT LIKE"
+  | "IS TRUE";
 
 export interface Predicate {
   left: Expression;
@@ -108,6 +127,7 @@ export interface CompiledQuery {
   having: Predicate[];
   orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
   limit?: number;
+  offset?: number;
 }
 
 type RowContext = Record<string, DatabaseRow | undefined>;
@@ -123,6 +143,9 @@ const clauseKeywords = new Set([
   "HAVING",
   "ORDER",
   "LIMIT",
+  "OFFSET",
+  "INTERSECT",
+  "EXCEPT",
   "JOIN",
   "INNER",
   "LEFT",
@@ -241,6 +264,66 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
       expression.items.forEach((item, index) => {
         rewrite(item, (next) => (expression.items[index] = next));
       });
+      return;
+    }
+    if (expression.kind === "logical") {
+      rewrite(expression.left, (next) => (expression.left = next));
+      rewrite(expression.right, (next) => (expression.right = next));
+      return;
+    }
+    if (expression.kind === "not") {
+      rewrite(expression.operand, (next) => (expression.operand = next));
+      return;
+    }
+    if (expression.kind === "case") {
+      for (const branch of expression.branches) {
+        rewrite(branch.when, (next) => (branch.when = next));
+        rewrite(branch.then, (next) => (branch.then = next));
+      }
+      const otherwise = expression.otherwise;
+      if (otherwise !== undefined) rewrite(otherwise, (next) => (expression.otherwise = next));
+      return;
+    }
+    if (expression.kind === "exists") {
+      collectBlock(expression.block);
+      const negated = expression.negated;
+      steps.push({
+        block: expression.block,
+        substitute(result) {
+          replace({
+            kind: "literal",
+            value: negated ? result.rows.length === 0 : result.rows.length > 0,
+          });
+        },
+      });
+      return;
+    }
+    if (expression.kind === "condition") {
+      rewrite(expression.left, (next) => (expression.left = next));
+      const right = expression.right;
+      if (
+        (expression.operator === "IN" || expression.operator === "NOT IN") &&
+        right.kind === "subquery"
+      ) {
+        collectBlock(right.block);
+        steps.push({
+          block: right.block,
+          substitute(result) {
+            if (result.columns.length !== 1) {
+              throw new TypeError("An IN subquery must select exactly one column");
+            }
+            expression.right = {
+              kind: "list",
+              items: result.rows.map((row) => ({
+                kind: "literal",
+                value: row[result.columns[0] ?? ""] ?? null,
+              })),
+            };
+          },
+        });
+        return;
+      }
+      rewrite(expression.right, (next) => (expression.right = next));
     }
   };
   const collectBlock = (block: CompiledQuery): void => {
@@ -292,13 +375,8 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
 
 export function blockHasSubqueries(plan: CompiledQuery): boolean {
   const expressionHas = (expression: Expression): boolean => {
-    if (expression.kind === "subquery") return true;
-    if (expression.kind === "binary") {
-      return expressionHas(expression.left) || expressionHas(expression.right);
-    }
-    if (expression.kind === "call") return expression.arguments.some(expressionHas);
-    if (expression.kind === "list") return expression.items.some(expressionHas);
-    return false;
+    if (expression.kind === "subquery" || expression.kind === "exists") return true;
+    return childExpressions(expression).some(expressionHas);
   };
   const blockHas = (block: CompiledQuery): boolean =>
     block.select.some((item) => expressionHas(item.expression)) ||
@@ -365,6 +443,30 @@ export function inferBlockSchema(
     }
     if (expression.kind === "window") {
       throw new TypeError("Window functions must be desugared before schema inference");
+    }
+    if (
+      expression.kind === "condition" ||
+      expression.kind === "logical" ||
+      expression.kind === "not" ||
+      expression.kind === "exists"
+    ) {
+      return "boolean";
+    }
+    if (expression.kind === "case") {
+      const outcomes = [
+        ...expression.branches.map((branch) => branch.then),
+        ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+      ];
+      let resolved: SqlColumnType | "null" = "null";
+      for (const outcome of outcomes) {
+        const type = infer(outcome);
+        if (type === "null") continue;
+        if (resolved !== "null" && resolved !== type) {
+          throw new TypeError("CASE branches must produce one value type");
+        }
+        resolved = type;
+      }
+      return resolved;
     }
     if (expression.kind === "literal") {
       const value = expression.value;
@@ -589,7 +691,7 @@ export function executeQuery(
  */
 export function combineUnionResults(
   results: readonly QueryResult[],
-  alls: readonly boolean[],
+  ops: readonly SetOperator[],
 ): QueryResult {
   const first = results[0];
   if (first === undefined) throw new TypeError("A UNION requires at least one member");
@@ -616,45 +718,64 @@ export function combineUnionResults(
         return [4, value.getTime()];
       }),
     );
-  let combined = renamed[0] ?? [];
-  for (let index = 1; index < renamed.length; index += 1) {
-    const next = renamed[index] ?? [];
-    if (alls[index - 1] === true) {
-      combined = [...combined, ...next];
-      continue;
-    }
+  const dedupe = (rows: readonly QueryRow[]): QueryRow[] => {
     const seen = new Set<string>();
     const deduplicated: QueryRow[] = [];
-    for (const row of [...combined, ...next]) {
+    for (const row of rows) {
       const key = encode(row);
       if (seen.has(key)) continue;
       seen.add(key);
       deduplicated.push(row);
     }
-    combined = deduplicated;
+    return deduplicated;
+  };
+  let combined = renamed[0] ?? [];
+  for (let index = 1; index < renamed.length; index += 1) {
+    const next = renamed[index] ?? [];
+    const op = ops[index - 1] ?? "union";
+    if (op === "union all") {
+      combined = [...combined, ...next];
+      continue;
+    }
+    if (op === "union") {
+      combined = dedupe([...combined, ...next]);
+      continue;
+    }
+    // INTERSECT and EXCEPT return distinct left-side rows filtered by right-side membership.
+    const membership = new Set(next.map(encode));
+    combined = dedupe(combined).filter((row) =>
+      op === "intersect" ? membership.has(encode(row)) : !membership.has(encode(row)),
+    );
   }
   return { columns: [...columns], rows: combined };
 }
 
+/** The direct child expressions of a node; subqueries and EXISTS scope their own blocks. */
+function childExpressions(expression: Expression): Expression[] {
+  if (expression.kind === "binary") return [expression.left, expression.right];
+  if (expression.kind === "call") return [...expression.arguments];
+  if (expression.kind === "list") return [...expression.items];
+  if (expression.kind === "condition" || expression.kind === "logical") {
+    return [expression.left, expression.right];
+  }
+  if (expression.kind === "not") return [expression.operand];
+  if (expression.kind === "case") {
+    return [
+      ...expression.branches.flatMap((branch) => [branch.when, branch.then]),
+      ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+    ];
+  }
+  return [];
+}
+
 function containsDistinctCount(expression: Expression): boolean {
-  if (expression.kind === "call") {
-    return expression.distinct === true || expression.arguments.some(containsDistinctCount);
-  }
-  if (expression.kind === "binary") {
-    return containsDistinctCount(expression.left) || containsDistinctCount(expression.right);
-  }
-  if (expression.kind === "list") return expression.items.some(containsDistinctCount);
-  return false;
+  if (expression.kind === "call" && expression.distinct === true) return true;
+  return childExpressions(expression).some(containsDistinctCount);
 }
 
 function containsWindow(expression: Expression): boolean {
   if (expression.kind === "window") return true;
-  if (expression.kind === "binary") {
-    return containsWindow(expression.left) || containsWindow(expression.right);
-  }
-  if (expression.kind === "call") return expression.arguments.some(containsWindow);
-  if (expression.kind === "list") return expression.items.some(containsWindow);
-  return false;
+  return childExpressions(expression).some(containsWindow);
 }
 
 /**
@@ -753,7 +874,7 @@ function resolveDerivedRowTables(
   for (const source of sources) {
     if (source.union !== undefined) {
       const results = source.union.blocks.map((block) => executeRowQuery(block, tables));
-      resolved.set(source.table, combineUnionResults(results, source.union.alls).rows);
+      resolved.set(source.table, combineUnionResults(results, source.union.ops).rows);
       continue;
     }
     if (source.windowed !== undefined) {
@@ -822,12 +943,17 @@ export function executeRowQuery(
     }
     rows = [...groups.values()]
       .filter((group) =>
-        plan.having.every((predicate) =>
-          comparisonHolds(
-            predicate.operator,
-            evaluate(predicate.left, group[0] ?? {}, group),
-            evaluate(predicate.right, group[0] ?? {}, group),
-          ),
+        plan.having.every(
+          (predicate) =>
+            evaluateBooleanExpression(
+              {
+                kind: "condition",
+                operator: predicate.operator,
+                left: predicate.left,
+                right: predicate.right,
+              },
+              (nested) => evaluate(nested, group[0] ?? {}, group),
+            ) === true,
         ),
       )
       .map((group) => project(plan.select, group[0] ?? {}, group));
@@ -849,7 +975,10 @@ export function executeRowQuery(
       return 0;
     });
   }
-  if (plan.limit !== undefined) rows = rows.slice(0, plan.limit);
+  if (plan.limit !== undefined || plan.offset !== undefined) {
+    const start = plan.offset ?? 0;
+    rows = rows.slice(start, plan.limit === undefined ? undefined : start + plan.limit);
+  }
   const columns =
     plan.select[0]?.expression.kind === "wildcard"
       ? Object.keys(rows[0] ?? {})
@@ -944,6 +1073,23 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       throw new TypeError("Window functions are only allowed in the select list");
     case "column":
       return resolveColumn(context, expression.reference);
+    case "condition":
+    case "logical":
+    case "not":
+      return evaluateBooleanExpression(expression, (nested) => evaluate(nested, context, group));
+    case "exists":
+      throw new TypeError("EXISTS subqueries must be resolved before evaluation");
+    case "case": {
+      for (const branch of expression.branches) {
+        const matched = evaluateBooleanExpression(branch.when, (nested) =>
+          evaluate(nested, context, group),
+        );
+        if (matched === true) return evaluate(branch.then, context, group);
+      }
+      return expression.otherwise === undefined
+        ? null
+        : evaluate(expression.otherwise, context, group);
+    }
     case "binary": {
       const left = evaluate(expression.left, context, group);
       const right = evaluate(expression.right, context, group);
@@ -1002,6 +1148,17 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
 }
 
 function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
+  if (predicate.operator === "IS TRUE") {
+    return evaluateBooleanExpression(predicate.left, (nested) => evaluate(nested, context)) === true;
+  }
+  if (predicate.operator === "LIKE" || predicate.operator === "NOT LIKE") {
+    return (
+      evaluateBooleanExpression(
+        { kind: "condition", operator: predicate.operator, left: predicate.left, right: predicate.right },
+        (nested) => evaluate(nested, context),
+      ) === true
+    );
+  }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
     return inListHolds(
@@ -1036,6 +1193,109 @@ function inListHolds(
     if (comparable(value) === comparable(item)) return operator === "IN";
   }
   return operator === "NOT IN" && !hasNull;
+}
+
+const likeCache = new Map<string, RegExp>();
+
+/** Compiles a LIKE pattern (% = any run, _ = any character) to an anchored RegExp, cached. */
+export function likeRegExp(pattern: string): RegExp {
+  const cached = likeCache.get(pattern);
+  if (cached !== undefined) return cached;
+  let source = "^";
+  for (const character of pattern) {
+    if (character === "%") source += "[\\s\\S]*";
+    else if (character === "_") source += "[\\s\\S]";
+    else source += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  source += "$";
+  const regExp = new RegExp(source);
+  if (likeCache.size >= 128) likeCache.clear();
+  likeCache.set(pattern, regExp);
+  return regExp;
+}
+
+/**
+ * Evaluates a boolean expression tree with SQL three-valued logic: comparisons over NULL are
+ * unknown (null), AND/OR/NOT propagate unknown, and only the caller collapses unknown to false.
+ * Leaf values come from the executor-specific callback so both executors share these semantics.
+ */
+export function evaluateBooleanExpression(
+  expression: Expression,
+  evaluateValue: (expression: Expression) => unknown,
+): boolean | null {
+  if (expression.kind === "logical") {
+    const left = evaluateBooleanExpression(expression.left, evaluateValue);
+    if (expression.operator === "and") {
+      if (left === false) return false;
+      const right = evaluateBooleanExpression(expression.right, evaluateValue);
+      if (right === false) return false;
+      return left === null || right === null ? null : true;
+    }
+    if (left === true) return true;
+    const right = evaluateBooleanExpression(expression.right, evaluateValue);
+    if (right === true) return true;
+    return left === null || right === null ? null : false;
+  }
+  if (expression.kind === "not") {
+    const value = evaluateBooleanExpression(expression.operand, evaluateValue);
+    return value === null ? null : !value;
+  }
+  if (expression.kind === "exists") {
+    throw new TypeError("EXISTS subqueries must be resolved before evaluation");
+  }
+  if (expression.kind === "condition") {
+    const operator = expression.operator;
+    if (operator === "IS TRUE") return evaluateBooleanExpression(expression.left, evaluateValue);
+    if (operator === "IS NULL" || operator === "IS NOT NULL") {
+      const value = evaluateValue(expression.left);
+      const isNull = value === null || value === undefined;
+      return operator === "IS NULL" ? isNull : !isNull;
+    }
+    if (operator === "IN" || operator === "NOT IN") {
+      if (expression.right.kind !== "list") throw new TypeError("IN requires a value list");
+      const probe = evaluateValue(expression.left);
+      if (probe === null || probe === undefined) return null;
+      let sawNull = false;
+      for (const item of expression.right.items) {
+        const value = evaluateValue(item);
+        if (value === null || value === undefined) {
+          sawNull = true;
+          continue;
+        }
+        if (comparable(value) === comparable(probe)) return operator === "IN";
+      }
+      if (sawNull) return null;
+      return operator === "NOT IN";
+    }
+    if (operator === "LIKE" || operator === "NOT LIKE") {
+      const value = evaluateValue(expression.left);
+      const pattern = evaluateValue(expression.right);
+      if (value === null || value === undefined || pattern === null || pattern === undefined) {
+        return null;
+      }
+      if (typeof value !== "string" || typeof pattern !== "string") {
+        throw new TypeError("LIKE requires string operands");
+      }
+      const matched = likeRegExp(pattern).test(value);
+      return operator === "LIKE" ? matched : !matched;
+    }
+    const left = evaluateValue(expression.left);
+    const right = evaluateValue(expression.right);
+    if (left === null || left === undefined || right === null || right === undefined) return null;
+    const a = comparable(left);
+    const b = comparable(right);
+    if (operator === "=") return a === b;
+    if (operator === "!=" || operator === "<>") return a !== b;
+    const comparison = compareValues(a, b);
+    if (operator === ">") return comparison > 0;
+    if (operator === ">=") return comparison >= 0;
+    if (operator === "<") return comparison < 0;
+    return comparison <= 0;
+  }
+  const value = evaluateValue(expression);
+  if (value === null || value === undefined) return null;
+  if (typeof value === "boolean") return value;
+  throw new TypeError("Boolean conditions require boolean operands");
 }
 
 function comparisonHolds(
@@ -1080,17 +1340,10 @@ function resolveColumn(context: RowContext, reference: string): unknown {
 }
 
 function hasAggregate(expression: Expression): boolean {
-  if (expression.kind === "call") {
-    return (
-      aggregateNames.has(expression.name as AggregateName) ||
-      expression.arguments.some(hasAggregate)
-    );
+  if (expression.kind === "call" && aggregateNames.has(expression.name as AggregateName)) {
+    return true;
   }
-  if (expression.kind === "binary") {
-    return hasAggregate(expression.left) || hasAggregate(expression.right);
-  }
-  if (expression.kind === "list") return expression.items.some(hasAggregate);
-  return false;
+  return childExpressions(expression).some(hasAggregate);
 }
 
 function validateGrouping(plan: CompiledQuery): void {
@@ -1122,12 +1375,8 @@ export function expressionColumnNames(expression: Expression): string[] {
 
 function expressionColumns(expression: Expression): string[] {
   if (expression.kind === "column") return [expression.reference];
-  if (expression.kind === "binary")
-    return [...expressionColumns(expression.left), ...expressionColumns(expression.right)];
-  if (expression.kind === "call") return expression.arguments.flatMap(expressionColumns);
-  if (expression.kind === "list") return expression.items.flatMap(expressionColumns);
-  // A subquery resolves inside its own scope before the enclosing block binds.
-  return [];
+  // A subquery or EXISTS resolves inside its own scope before the enclosing block binds.
+  return childExpressions(expression).flatMap(expressionColumns);
 }
 
 function expressionAliases(expression: Expression): Set<string> {
@@ -1203,63 +1452,95 @@ class Parser {
         if (!this.#punctuation(",")) break;
       }
     }
-    const firstMember = this.#unionMember(sql);
-    let plan = firstMember.block;
-    if (this.#isKeyword("UNION")) {
-      const members = [firstMember];
-      const alls: boolean[] = [];
-      while (this.#isKeyword("UNION")) {
-        this.#keyword("UNION");
-        if (this.#isKeyword("ALL")) {
-          this.#keyword("ALL");
-          alls.push(true);
-        } else alls.push(false);
-        members.push(this.#unionMember("(union member)"));
-      }
-      for (const [index, member] of members.entries()) {
-        const last = index === members.length - 1;
-        if (
-          !member.parenthesized &&
-          !last &&
-          (member.block.orderBy.length > 0 || member.block.limit !== undefined)
-        ) {
-          throw new TypeError("ORDER BY or LIMIT in a UNION member requires parentheses");
+    // INTERSECT binds tighter than UNION and EXCEPT, per the SQL standard.
+    const firstTerm = this.#setTerm(sql);
+    let plan = firstTerm.block;
+    if (this.#isKeyword("UNION") || this.#isKeyword("EXCEPT")) {
+      const members = [firstTerm];
+      const ops: SetOperator[] = [];
+      while (this.#isKeyword("UNION") || this.#isKeyword("EXCEPT")) {
+        if (this.#isKeyword("UNION")) {
+          this.#keyword("UNION");
+          if (this.#isKeyword("ALL")) {
+            this.#keyword("ALL");
+            ops.push("union all");
+          } else ops.push("union");
+        } else {
+          this.#keyword("EXCEPT");
+          ops.push("except");
         }
+        members.push(this.#setTerm("(union member)"));
       }
-      // Standard SQL assigns a trailing ORDER BY or LIMIT to the whole compound. After an
-      // unparenthesized last member the clause was greedily parsed into that member and lifts
-      // out; after a parenthesized member it is still unparsed.
-      const last = members[members.length - 1];
-      let orderBy: CompiledQuery["orderBy"] = [];
-      let limit: number | undefined;
-      if (last !== undefined && !last.parenthesized) {
-        orderBy = last.block.orderBy;
-        limit = last.block.limit;
-        last.block.orderBy = [];
-        delete last.block.limit;
-      } else {
-        orderBy = this.#orderByClause();
-        limit = this.#limitClause();
-      }
-      this.#derivedSequence += 1;
-      plan = {
-        sql,
-        base: {
-          table: `(union ${String(this.#derivedSequence)})`,
-          alias: "union",
-          union: { blocks: members.map((member) => member.block), alls },
-        },
-        joins: [],
-        select: [{ expression: { kind: "wildcard" }, alias: "*" }],
-        predicates: [],
-        groupBy: [],
-        having: [],
-        orderBy,
-        ...(limit === undefined ? {} : { limit }),
-      };
+      plan = this.#compoundBlock(sql, members, ops);
     }
     this.#take("eof");
     return plan;
+  }
+
+  #setTerm(sql: string): { block: CompiledQuery; parenthesized: boolean } {
+    const first = this.#unionMember(sql);
+    if (!this.#isKeyword("INTERSECT")) return first;
+    const members = [first];
+    const ops: SetOperator[] = [];
+    while (this.#isKeyword("INTERSECT")) {
+      this.#keyword("INTERSECT");
+      ops.push("intersect");
+      members.push(this.#unionMember("(intersect member)"));
+    }
+    return { block: this.#compoundBlock(sql, members, ops), parenthesized: false };
+  }
+
+  #compoundBlock(
+    sql: string,
+    members: ReadonlyArray<{ block: CompiledQuery; parenthesized: boolean }>,
+    ops: SetOperator[],
+  ): CompiledQuery {
+    for (const [index, member] of members.entries()) {
+      const last = index === members.length - 1;
+      if (
+        !member.parenthesized &&
+        !last &&
+        (member.block.orderBy.length > 0 || member.block.limit !== undefined)
+      ) {
+        throw new TypeError("ORDER BY or LIMIT in a UNION member requires parentheses");
+      }
+    }
+    // Standard SQL assigns a trailing ORDER BY or LIMIT to the whole compound. After an
+    // unparenthesized last member the clause was greedily parsed into that member and lifts
+    // out; after a parenthesized member it is still unparsed.
+    const last = members[members.length - 1];
+    let orderBy: CompiledQuery["orderBy"] = [];
+    let limit: number | undefined;
+    let offset: number | undefined;
+    if (last !== undefined && !last.parenthesized) {
+      orderBy = last.block.orderBy;
+      limit = last.block.limit;
+      offset = last.block.offset;
+      last.block.orderBy = [];
+      delete last.block.limit;
+      delete last.block.offset;
+    } else {
+      orderBy = this.#orderByClause();
+      limit = this.#limitClause();
+      offset = this.#offsetClause(limit);
+    }
+    this.#derivedSequence += 1;
+    return {
+      sql,
+      base: {
+        table: `(union ${String(this.#derivedSequence)})`,
+        alias: "union",
+        union: { blocks: members.map((member) => member.block), ops },
+      },
+      joins: [],
+      select: [{ expression: { kind: "wildcard" }, alias: "*" }],
+      predicates: [],
+      groupBy: [],
+      having: [],
+      orderBy,
+      ...(limit === undefined ? {} : { limit }),
+      ...(offset === undefined ? {} : { offset }),
+    };
   }
 
   parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {
@@ -1346,15 +1627,11 @@ class Parser {
     }> = [];
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
-      for (;;) {
-        for (const predicate of this.#predicates(true)) {
-          if (hasAggregate(predicate.left) || hasAggregate(predicate.right)) {
-            throw new TypeError("Aggregate functions are not allowed in mutation predicates");
-          }
-          predicates.push(predicate);
+      for (const predicate of splitCondition(this.#expression())) {
+        if (hasAggregate(predicate.left) || hasAggregate(predicate.right)) {
+          throw new TypeError("Aggregate functions are not allowed in mutation predicates");
         }
-        if (!this.#isKeyword("AND")) break;
-        this.#keyword("AND");
+        predicates.push(predicate);
       }
     }
     return predicates;
@@ -1405,6 +1682,16 @@ class Parser {
     return limit;
   }
 
+  /** OFFSET is only accepted directly after LIMIT, matching the LIMIT n OFFSET m dialect form. */
+  #offsetClause(limit: number | undefined): number | undefined {
+    if (limit === undefined || !this.#isKeyword("OFFSET")) return undefined;
+    this.#keyword("OFFSET");
+    const offset = Number(this.#take("number").text);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)
+      throw new RangeError("OFFSET must be between 0 and 100,000,000");
+    return offset;
+  }
+
   #selectBlock(sql: string): CompiledQuery {
     this.#keyword("SELECT");
     let distinct = false;
@@ -1426,19 +1713,16 @@ class Parser {
       this.#keyword("JOIN");
       const source = this.#source();
       this.#keyword("ON");
-      const left = this.#expression();
-      this.#operator("=");
-      const right = this.#expression();
-      joins.push({ ...source, kind, left, right });
+      const condition = this.#expression();
+      if (condition.kind !== "condition" || condition.operator !== "=") {
+        throw new TypeError("Only single-equality JOIN conditions are supported");
+      }
+      joins.push({ ...source, kind, left: condition.left, right: condition.right });
     }
     const predicates: Predicate[] = [];
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
-      for (;;) {
-        predicates.push(...this.#predicates(true));
-        if (!this.#isKeyword("AND")) break;
-        this.#keyword("AND");
-      }
+      predicates.push(...splitCondition(this.#expression()));
     }
     const groupBy: Expression[] = [];
     if (this.#isKeyword("GROUP")) {
@@ -1461,11 +1745,7 @@ class Parser {
     if (this.#isKeyword("HAVING")) {
       this.#keyword("HAVING");
       if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
-      for (;;) {
-        having.push(...this.#predicates(false));
-        if (!this.#isKeyword("AND")) break;
-        this.#keyword("AND");
-      }
+      having.push(...splitCondition(this.#expression()));
       const grouped = groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
       if (!grouped) throw new TypeError("HAVING requires GROUP BY or aggregate functions");
       const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
@@ -1482,6 +1762,7 @@ class Parser {
     }
     const orderBy = this.#orderByClause();
     const limit = this.#limitClause();
+    const offset = this.#offsetClause(limit);
     const clauseExpressions = [
       ...predicates.flatMap((predicate) => [predicate.left, predicate.right]),
       ...groupBy,
@@ -1527,12 +1808,14 @@ class Parser {
       return this.#desugarDistinctCount(sql, base, joins, select, predicates, groupBy, {
         orderBy,
         ...(limit === undefined ? {} : { limit }),
+        ...(offset === undefined ? {} : { offset }),
       });
     }
     if (select.some((item) => containsWindow(item.expression))) {
       return this.#desugarWindows(sql, base, joins, select, predicates, groupBy, having, {
         orderBy,
         ...(limit === undefined ? {} : { limit }),
+        ...(offset === undefined ? {} : { offset }),
       });
     }
     return {
@@ -1545,6 +1828,7 @@ class Parser {
       having,
       orderBy,
       ...(limit === undefined ? {} : { limit }),
+      ...(offset === undefined ? {} : { offset }),
     };
   }
 
@@ -1561,7 +1845,7 @@ class Parser {
     select: SelectItem[],
     predicates: Predicate[],
     groupBy: Expression[],
-    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number },
+    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
   ): CompiledQuery {
     const distinctAlias = "(distinct 1)";
     const innerSelect: SelectItem[] = [];
@@ -1629,7 +1913,7 @@ class Parser {
     predicates: Predicate[],
     groupBy: Expression[],
     having: Predicate[],
-    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number },
+    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
   ): CompiledQuery {
     if (
       groupBy.length > 0 ||
@@ -1764,7 +2048,107 @@ class Parser {
     return values;
   }
 
-  #expression(minimumPrecedence = 0): Expression {
+  // Full-precedence expression grammar: OR < AND < NOT < comparison < additive < multiplicative.
+  // Comparisons are ordinary boolean-valued expressions, so parenthesized conditions, boolean
+  // select items, and NOT/OR trees all share one parse path.
+  #expression(): Expression {
+    let left = this.#andExpression();
+    while (this.#isKeyword("OR")) {
+      this.#keyword("OR");
+      left = { kind: "logical", operator: "or", left, right: this.#andExpression() };
+    }
+    return left;
+  }
+
+  #andExpression(): Expression {
+    let left = this.#notExpression();
+    while (this.#isKeyword("AND")) {
+      this.#keyword("AND");
+      left = { kind: "logical", operator: "and", left, right: this.#notExpression() };
+    }
+    return left;
+  }
+
+  #notExpression(): Expression {
+    if (this.#isKeyword("NOT")) {
+      this.#keyword("NOT");
+      return { kind: "not", operand: this.#notExpression() };
+    }
+    return this.#comparisonExpression();
+  }
+
+  #comparisonExpression(): Expression {
+    const left = this.#additive();
+    if (this.#isKeyword("IS")) {
+      this.#keyword("IS");
+      let operator: PredicateOperator = "IS NULL";
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        operator = "IS NOT NULL";
+      }
+      const token = this.#peek();
+      if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
+        throw new TypeError(`Expected NULL, found ${token.text || "end of query"}`);
+      }
+      this.#identifier();
+      return { kind: "condition", operator, left, right: { kind: "literal", value: null } };
+    }
+    // After a value expression, NOT can only introduce NOT BETWEEN / NOT IN / NOT LIKE.
+    let negated = false;
+    if (this.#isKeyword("NOT")) {
+      this.#keyword("NOT");
+      negated = true;
+      if (!this.#isKeyword("BETWEEN") && !this.#isKeyword("IN") && !this.#isKeyword("LIKE")) {
+        throw new TypeError(`Expected BETWEEN, IN, or LIKE after NOT`);
+      }
+    }
+    if (this.#isKeyword("BETWEEN")) {
+      this.#keyword("BETWEEN");
+      const lower = this.#additive();
+      this.#keyword("AND");
+      const upper = this.#additive();
+      // BETWEEN is inclusive-range sugar; the AND here binds at comparison level by the grammar.
+      const range: Expression = {
+        kind: "logical",
+        operator: "and",
+        left: { kind: "condition", operator: ">=", left, right: lower },
+        right: { kind: "condition", operator: "<=", left: structuredClone(left), right: upper },
+      };
+      return negated ? { kind: "not", operand: range } : range;
+    }
+    if (this.#isKeyword("IN")) {
+      this.#keyword("IN");
+      const operator: PredicateOperator = negated ? "NOT IN" : "IN";
+      this.#expectPunctuation("(");
+      if (this.#isKeyword("SELECT")) {
+        const block = this.#selectBlock("(subquery)");
+        this.#expectPunctuation(")");
+        return { kind: "condition", operator, left, right: { kind: "subquery", block } };
+      }
+      const items = this.#expressionList();
+      this.#expectPunctuation(")");
+      if (items.some((item) => item.kind === "wildcard" || item.kind === "subquery")) {
+        throw new TypeError("IN lists accept only scalar expressions");
+      }
+      return { kind: "condition", operator, left, right: { kind: "list", items } };
+    }
+    if (this.#isKeyword("LIKE")) {
+      this.#keyword("LIKE");
+      const operator: PredicateOperator = negated ? "NOT LIKE" : "LIKE";
+      return { kind: "condition", operator, left, right: this.#additive() };
+    }
+    const token = this.#peek();
+    if (
+      token.kind === "operator" &&
+      ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)
+    ) {
+      const operator = this.#comparison();
+      return { kind: "condition", operator, left, right: this.#additive() };
+    }
+    return left;
+  }
+
+  #additive(minimumPrecedence = 0): Expression {
     let left = this.#primary();
     for (;;) {
       const operator = this.#peek().text;
@@ -1776,7 +2160,7 @@ class Parser {
         kind: "binary",
         operator: operator as BinaryOperator,
         left,
-        right: this.#expression(precedence + 1),
+        right: this.#additive(precedence + 1),
       };
     }
     return left;
@@ -1819,6 +2203,38 @@ class Parser {
     const upper = identifier.toUpperCase();
     if (upper === "TRUE" || upper === "FALSE" || upper === "NULL")
       return { kind: "literal", value: upper === "NULL" ? null : upper === "TRUE" };
+    if (upper === "CASE") {
+      let operand: Expression | undefined;
+      if (!this.#isKeyword("WHEN")) operand = this.#expression();
+      const branches: Array<{ when: Expression; then: Expression }> = [];
+      while (this.#isKeyword("WHEN")) {
+        this.#keyword("WHEN");
+        let when = this.#expression();
+        // The simple form CASE x WHEN v desugars to searched equality comparisons.
+        if (operand !== undefined) {
+          when = { kind: "condition", operator: "=", left: structuredClone(operand), right: when };
+        }
+        this.#keyword("THEN");
+        branches.push({ when, then: this.#expression() });
+      }
+      if (branches.length === 0) throw new TypeError("CASE requires at least one WHEN branch");
+      let otherwise: Expression | undefined;
+      if (this.#isKeyword("ELSE")) {
+        this.#keyword("ELSE");
+        otherwise = this.#expression();
+      }
+      this.#keyword("END");
+      return { kind: "case", branches, ...(otherwise === undefined ? {} : { otherwise }) };
+    }
+    if (upper === "EXISTS" && this.#peek().text === "(") {
+      this.#expectPunctuation("(");
+      if (!this.#isKeyword("SELECT")) throw new TypeError("EXISTS requires a subquery");
+      const block = this.#selectBlock("(subquery)");
+      this.#expectPunctuation(")");
+      // Existence needs at most one row, so cap the subquery unless it already limits itself.
+      if (block.limit === undefined) block.limit = 1;
+      return { kind: "exists", block, negated: false };
+    }
     if (upper === "DATE" && this.#peek().kind === "string") {
       const date = new Date(`${this.#take("string").text}T00:00:00.000Z`);
       if (!Number.isFinite(date.getTime())) throw new TypeError("Invalid DATE literal");
@@ -1874,59 +2290,6 @@ class Parser {
     return token.text as ComparisonOperator;
   }
 
-  #predicates(allowIn: boolean): Predicate[] {
-    const left = this.#expression();
-    if (this.#isKeyword("IS")) {
-      this.#keyword("IS");
-      let operator: PredicateOperator = "IS NULL";
-      if (this.#isKeyword("NOT")) {
-        this.#keyword("NOT");
-        operator = "IS NOT NULL";
-      }
-      const token = this.#peek();
-      if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
-        throw new TypeError(`Expected NULL, found ${token.text || "end of query"}`);
-      }
-      this.#identifier();
-      return [{ left, operator, right: { kind: "literal", value: null } }];
-    }
-    if (this.#isKeyword("BETWEEN")) {
-      if (!allowIn) throw new TypeError("BETWEEN is not supported in HAVING");
-      this.#keyword("BETWEEN");
-      const lower = this.#expression();
-      this.#keyword("AND");
-      const upper = this.#expression();
-      // BETWEEN is inclusive-range sugar over the existing AND semantics.
-      return [
-        { left, operator: ">=", right: lower },
-        { left: structuredClone(left), operator: "<=", right: upper },
-      ];
-    }
-    if (this.#isKeyword("IN") || this.#isKeyword("NOT")) {
-      if (!allowIn) throw new TypeError("IN is not supported in HAVING");
-      let operator: PredicateOperator = "IN";
-      if (this.#isKeyword("NOT")) {
-        this.#keyword("NOT");
-        operator = "NOT IN";
-      }
-      this.#keyword("IN");
-      this.#expectPunctuation("(");
-      if (this.#isKeyword("SELECT")) {
-        const block = this.#selectBlock("(subquery)");
-        this.#expectPunctuation(")");
-        return [{ left, operator, right: { kind: "subquery", block } }];
-      }
-      const items = this.#expressionList();
-      this.#expectPunctuation(")");
-      if (items.some((item) => item.kind === "wildcard" || item.kind === "subquery")) {
-        throw new TypeError("IN lists accept only scalar expressions");
-      }
-      return [{ left, operator, right: { kind: "list", items } }];
-    }
-    const operator = this.#comparison();
-    const right = this.#expression();
-    return [{ left, operator, right }];
-  }
 
   #identifier(): string {
     return this.#take("identifier").text;
@@ -1970,6 +2333,22 @@ class Parser {
   #peek(): Token {
     return this.tokens[this.#index] ?? { kind: "eof", text: "" };
   }
+}
+
+/**
+ * Splits a parsed boolean expression into the plan's AND-list of predicates. Top-level ANDs and
+ * plain comparisons keep the classic {left, operator, right} shape (so predicate pushdown, zone
+ * maps, and the dictionary fast path see exactly what they always saw); any OR/NOT subtree or bare
+ * boolean expression becomes a single IS TRUE predicate evaluated with three-valued logic.
+ */
+function splitCondition(expression: Expression): Predicate[] {
+  if (expression.kind === "logical" && expression.operator === "and") {
+    return [...splitCondition(expression.left), ...splitCondition(expression.right)];
+  }
+  if (expression.kind === "condition") {
+    return [{ left: expression.left, operator: expression.operator, right: expression.right }];
+  }
+  return [{ left: expression, operator: "IS TRUE", right: { kind: "literal", value: null } }];
 }
 
 function defaultAlias(expression: Expression): string {
