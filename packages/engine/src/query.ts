@@ -62,6 +62,8 @@ interface TableSource {
   alias: string;
   /** A parenthesized SELECT or expanded CTE body; `table` is then a unique synthetic name. */
   derived?: CompiledQuery;
+  /** A top-level set operation; members combine positionally under the first member's schema. */
+  union?: { blocks: CompiledQuery[]; alls: boolean[] };
 }
 
 interface JoinPlan extends TableSource {
@@ -106,6 +108,7 @@ const clauseKeywords = new Set([
   "JOIN",
   "INNER",
   "LEFT",
+  "UNION",
 ]);
 const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
 
@@ -177,6 +180,7 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
   const collectBlock = (block: CompiledQuery): void => {
     for (const source of [block.base, ...block.joins]) {
       if (source.derived !== undefined) collectBlock(source.derived);
+      source.union?.blocks.forEach(collectBlock);
     }
     for (const item of block.select) {
       rewrite(item.expression, (next) => (item.expression = next));
@@ -237,7 +241,9 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
     ) ||
     block.orderBy.some((order) => expressionHas(order.expression)) ||
     [block.base, ...block.joins].some(
-      (source) => source.derived !== undefined && blockHas(source.derived),
+      (source) =>
+        (source.derived !== undefined && blockHas(source.derived)) ||
+        source.union?.blocks.some(blockHas) === true,
     );
   return blockHas(plan);
 }
@@ -505,15 +511,76 @@ export function executeQuery(
   }
 }
 
-/** Executes each derived source with the row reference and registers its synthetic table. */
+/**
+ * Combines set-operation member results positionally under the first member's column names,
+ * folding left: UNION deduplicates the entire accumulated set, UNION ALL concatenates. Values
+ * compare with SQL grouping semantics (NULLs equal, dates by instant, -0 distinct from 0).
+ */
+export function combineUnionResults(
+  results: readonly QueryResult[],
+  alls: readonly boolean[],
+): QueryResult {
+  const first = results[0];
+  if (first === undefined) throw new TypeError("A UNION requires at least one member");
+  const columns = first.columns;
+  const renamed = results.map((result, index) => {
+    if (result.columns.length !== columns.length) {
+      throw new TypeError("UNION members must select the same number of columns");
+    }
+    if (index === 0) return result.rows;
+    return result.rows.map((row) =>
+      Object.fromEntries(
+        columns.map((name, column) => [name, row[result.columns[column] ?? ""] ?? null]),
+      ),
+    );
+  });
+  const encode = (row: QueryRow): string =>
+    JSON.stringify(
+      columns.map((name) => {
+        const value = row[name] ?? null;
+        if (value === null) return [0];
+        if (typeof value === "boolean") return [1, value];
+        if (typeof value === "number") return [2, Object.is(value, -0) ? "-0" : String(value)];
+        if (typeof value === "string") return [3, value];
+        return [4, value.getTime()];
+      }),
+    );
+  let combined = renamed[0] ?? [];
+  for (let index = 1; index < renamed.length; index += 1) {
+    const next = renamed[index] ?? [];
+    if (alls[index - 1] === true) {
+      combined = [...combined, ...next];
+      continue;
+    }
+    const seen = new Set<string>();
+    const deduplicated: QueryRow[] = [];
+    for (const row of [...combined, ...next]) {
+      const key = encode(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduplicated.push(row);
+    }
+    combined = deduplicated;
+  }
+  return { columns: [...columns], rows: combined };
+}
+
+/** Executes each derived or set-operation source with the row reference. */
 function resolveDerivedRowTables(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): ReadonlyMap<string, DatabaseRow[]> {
   const sources = [plan.base, ...plan.joins];
-  if (!sources.some((source) => source.derived !== undefined)) return tables;
+  if (!sources.some((source) => source.derived !== undefined || source.union !== undefined)) {
+    return tables;
+  }
   const resolved = new Map(tables);
   for (const source of sources) {
+    if (source.union !== undefined) {
+      const results = source.union.blocks.map((block) => executeRowQuery(block, tables));
+      resolved.set(source.table, combineUnionResults(results, source.union.alls).rows);
+      continue;
+    }
     if (source.derived === undefined) continue;
     resolved.set(source.table, executeRowQuery(source.derived, tables).rows);
   }
@@ -615,6 +682,9 @@ function orderOutputName(
   select: readonly SelectItem[],
 ): string | undefined {
   if (expression.kind !== "column") return undefined;
+  // A wildcard select exposes source columns under their own names, so bare references order by
+  // the matching output column directly.
+  if (select[0]?.expression.kind === "wildcard") return expression.reference;
   const selected = select.find(
     (item) =>
       (item.expression.kind === "column" && item.expression.reference === expression.reference) ||
@@ -942,9 +1012,100 @@ class Parser {
         if (!this.#punctuation(",")) break;
       }
     }
-    const plan = this.#selectBlock(sql);
+    const firstMember = this.#unionMember(sql);
+    let plan = firstMember.block;
+    if (this.#isKeyword("UNION")) {
+      const members = [firstMember];
+      const alls: boolean[] = [];
+      while (this.#isKeyword("UNION")) {
+        this.#keyword("UNION");
+        if (this.#isKeyword("ALL")) {
+          this.#keyword("ALL");
+          alls.push(true);
+        } else alls.push(false);
+        members.push(this.#unionMember("(union member)"));
+      }
+      for (const [index, member] of members.entries()) {
+        const last = index === members.length - 1;
+        if (
+          !member.parenthesized &&
+          !last &&
+          (member.block.orderBy.length > 0 || member.block.limit !== undefined)
+        ) {
+          throw new TypeError("ORDER BY or LIMIT in a UNION member requires parentheses");
+        }
+      }
+      // Standard SQL assigns a trailing ORDER BY or LIMIT to the whole compound. After an
+      // unparenthesized last member the clause was greedily parsed into that member and lifts
+      // out; after a parenthesized member it is still unparsed.
+      const last = members[members.length - 1];
+      let orderBy: CompiledQuery["orderBy"] = [];
+      let limit: number | undefined;
+      if (last !== undefined && !last.parenthesized) {
+        orderBy = last.block.orderBy;
+        limit = last.block.limit;
+        last.block.orderBy = [];
+        delete last.block.limit;
+      } else {
+        orderBy = this.#orderByClause();
+        limit = this.#limitClause();
+      }
+      this.#derivedSequence += 1;
+      plan = {
+        sql,
+        base: {
+          table: `(union ${String(this.#derivedSequence)})`,
+          alias: "union",
+          union: { blocks: members.map((member) => member.block), alls },
+        },
+        joins: [],
+        select: [{ expression: { kind: "wildcard" }, alias: "*" }],
+        predicates: [],
+        groupBy: [],
+        having: [],
+        orderBy,
+        ...(limit === undefined ? {} : { limit }),
+      };
+    }
     this.#take("eof");
     return plan;
+  }
+
+  #unionMember(sql: string): { block: CompiledQuery; parenthesized: boolean } {
+    if (this.#punctuation("(")) {
+      const block = this.#selectBlock(sql);
+      this.#expectPunctuation(")");
+      return { block, parenthesized: true };
+    }
+    return { block: this.#selectBlock(sql), parenthesized: false };
+  }
+
+  #orderByClause(): CompiledQuery["orderBy"] {
+    const orderBy: CompiledQuery["orderBy"] = [];
+    if (this.#isKeyword("ORDER")) {
+      this.#keyword("ORDER");
+      this.#keyword("BY");
+      for (;;) {
+        const expression = this.#expression();
+        let direction: "asc" | "desc" = "asc";
+        if (this.#isKeyword("DESC")) {
+          this.#keyword("DESC");
+          direction = "desc";
+        } else if (this.#isKeyword("ASC")) this.#keyword("ASC");
+        orderBy.push({ expression, direction });
+        if (!this.#punctuation(",")) break;
+      }
+    }
+    return orderBy;
+  }
+
+  #limitClause(): number | undefined {
+    if (!this.#isKeyword("LIMIT")) return undefined;
+    this.#keyword("LIMIT");
+    const limit = Number(this.#take("number").text);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100_000)
+      throw new RangeError("LIMIT must be between 1 and 100,000");
+    return limit;
   }
 
   #selectBlock(sql: string): CompiledQuery {
@@ -1022,28 +1183,8 @@ class Parser {
         }
       }
     }
-    const orderBy: CompiledQuery["orderBy"] = [];
-    if (this.#isKeyword("ORDER")) {
-      this.#keyword("ORDER");
-      this.#keyword("BY");
-      for (;;) {
-        const expression = this.#expression();
-        let direction: "asc" | "desc" = "asc";
-        if (this.#isKeyword("DESC")) {
-          this.#keyword("DESC");
-          direction = "desc";
-        } else if (this.#isKeyword("ASC")) this.#keyword("ASC");
-        orderBy.push({ expression, direction });
-        if (!this.#punctuation(",")) break;
-      }
-    }
-    let limit: number | undefined;
-    if (this.#isKeyword("LIMIT")) {
-      this.#keyword("LIMIT");
-      limit = Number(this.#take("number").text);
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100_000)
-        throw new RangeError("LIMIT must be between 1 and 100,000");
-    }
+    const orderBy = this.#orderByClause();
+    const limit = this.#limitClause();
     return {
       sql,
       base,

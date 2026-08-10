@@ -420,6 +420,57 @@ describe("public SQL queries", () => {
     expect(emptyScalar.rows).toEqual([]);
   });
 
+  it("combines UNION and UNION ALL members in both executors", () => {
+    const west = [
+      { region: "west", amount: 10 },
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+    ];
+    const east = [
+      { region: "east", amount: 10 },
+      { region: "west", amount: 10 },
+    ];
+    const input = new Map([
+      ["west", west],
+      ["east", east],
+    ]);
+    for (const sql of [
+      "SELECT region, amount FROM west UNION SELECT region, amount FROM east ORDER BY region, amount",
+      "SELECT region, amount FROM west UNION ALL SELECT region, amount FROM east ORDER BY amount, region",
+      "SELECT region, amount FROM west UNION SELECT region, amount FROM east UNION ALL SELECT region, amount FROM east ORDER BY region, amount LIMIT 4",
+      "(SELECT region, amount FROM west ORDER BY amount DESC LIMIT 1) UNION (SELECT region, amount FROM east LIMIT 1) ORDER BY region",
+      "SELECT amount FROM west WHERE amount IN (SELECT amount FROM east) UNION SELECT amount FROM east ORDER BY amount",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
+    }
+    const distinctUnion = executeQuery(
+      compileQuery(
+        "SELECT region, amount FROM west UNION SELECT region, amount FROM east ORDER BY region, amount",
+      ),
+      input,
+    );
+    expect(distinctUnion.rows).toEqual([
+      { region: "east", amount: 10 },
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+    ]);
+    const allUnion = executeQuery(
+      compileQuery("SELECT region, amount FROM west UNION ALL SELECT region, amount FROM east"),
+      input,
+    );
+    expect(allUnion.rows).toHaveLength(5);
+    expect(() =>
+      compileQuery("SELECT region FROM west ORDER BY region UNION SELECT region FROM east"),
+    ).toThrow("ORDER BY or LIMIT in a UNION member requires parentheses");
+    expect(() =>
+      executeRowQuery(
+        compileQuery("SELECT region, amount FROM west UNION SELECT region FROM east"),
+        input,
+      ),
+    ).toThrow("UNION members must select the same number of columns");
+  });
+
   it("rejects unsupported subquery forms explicitly", () => {
     const rows = [{ region: "west", amount: 10 }];
     const input = new Map([["rows", rows]]);

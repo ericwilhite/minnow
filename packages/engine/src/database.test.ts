@@ -5210,6 +5210,19 @@ for (const implementation of implementations()) {
       "SELECT region, COUNT(*) AS count FROM cte_sales WHERE region IN (SELECT region FROM cte_sales WHERE amount = 1) GROUP BY region",
     );
     expect(membership.rows).toHaveLength(1);
+
+    const union = await database.query(
+      "SELECT region, amount FROM cte_sales WHERE amount < 3 UNION SELECT region, amount FROM cte_sales WHERE amount < 5 ORDER BY amount",
+    );
+    expect(union.rows).toHaveLength(5);
+    const unionAll = await database.query(
+      "SELECT amount FROM cte_sales WHERE amount < 3 UNION ALL SELECT amount FROM cte_sales WHERE amount < 5 ORDER BY amount LIMIT 6",
+      { executionMemoryBudgetBytes: 512_000 },
+    );
+    expect(unionAll.rows.map((row) => row.amount)).toEqual([0, 0, 1, 1, 2, 2]);
+    await expect(
+      database.query("SELECT region FROM cte_sales UNION SELECT amount FROM cte_sales"),
+    ).rejects.toThrow("UNION member column types must match");
     store.close();
   });
 }

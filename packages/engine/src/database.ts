@@ -57,6 +57,7 @@ import {
 } from "@browserdatabase/transactions";
 import {
   blockHasSubqueries,
+  combineUnionResults,
   compileQuery,
   createPreparedColumnarQuery,
   inferBlockSchema,
@@ -1106,24 +1107,16 @@ export class BrowserDatabase {
         const visibility = await this.#blockSegmentVisibility(realTables);
         const resolution = subqueryResolutionSteps(plan);
         for (const step of resolution.steps) {
-          const innerInputs = await this.#prepareBlockInputs(
-            step.block,
-            snapshot,
-            visibility,
-            memory,
-            realTables,
-            typedSchemas,
+          step.substitute(
+            await this.#executeBlock(
+              step.block,
+              snapshot,
+              visibility,
+              memory,
+              realTables,
+              typedSchemas,
+            ),
           );
-          const prepared = createPreparedColumnarQuery(
-            step.block,
-            innerInputs,
-            memory.createChild(),
-          );
-          try {
-            step.substitute(prepared.execute());
-          } finally {
-            prepared.close();
-          }
         }
         resolvedPlan = resolution.plan;
         columnarTables = await this.#prepareBlockInputs(
@@ -1155,7 +1148,8 @@ export class BrowserDatabase {
     };
     const walk = (block: CompiledQuery): void => {
       for (const source of [block.base, ...block.joins]) {
-        if (source.derived === undefined) names.add(source.table);
+        if (source.union !== undefined) source.union.blocks.forEach(walk);
+        else if (source.derived === undefined) names.add(source.table);
         else walk(source.derived);
       }
       for (const item of block.select) walkExpression(item.expression);
@@ -1211,9 +1205,41 @@ export class BrowserDatabase {
     const inputs = new Map<string, ColumnarTable>();
     const sources = [block.base, ...block.joins];
     for (const source of sources) {
+      if (source.union !== undefined) {
+        const results: QueryResult[] = [];
+        let schema: SqlColumnSchema[] | undefined;
+        for (const member of source.union.blocks) {
+          const result = await this.#executeBlock(
+            member,
+            snapshot,
+            visibility,
+            memory,
+            realTables,
+            typedSchemas,
+          );
+          const memberSchema = inferBlockSchema(member, typedSchemas);
+          if (schema === undefined) schema = memberSchema;
+          else {
+            if (memberSchema.length !== schema.length) {
+              throw new TypeError("UNION members must select the same number of columns");
+            }
+            memberSchema.forEach((column, index) => {
+              const expected = schema?.[index];
+              if (expected !== undefined && column.type !== expected.type) {
+                throw new TypeError(`UNION member column types must match: ${expected.name}`);
+              }
+            });
+          }
+          results.push(result);
+        }
+        const combined = combineUnionResults(results, source.union.alls);
+        typedSchemas.set(source.table, schema ?? []);
+        inputs.set(source.table, derivedColumnarTable(source.table, combined, schema ?? []));
+        continue;
+      }
       const derived = source.derived;
       if (derived === undefined) continue;
-      const innerInputs = await this.#prepareBlockInputs(
+      const result = await this.#executeBlock(
         derived,
         snapshot,
         visibility,
@@ -1223,13 +1249,6 @@ export class BrowserDatabase {
       );
       const schema = inferBlockSchema(derived, typedSchemas);
       typedSchemas.set(source.table, schema);
-      const prepared = createPreparedColumnarQuery(derived, innerInputs, memory.createChild());
-      let result: QueryResult;
-      try {
-        result = prepared.execute();
-      } finally {
-        prepared.close();
-      }
       inputs.set(source.table, derivedColumnarTable(source.table, result, schema));
     }
     const nameSchemas = new Map(
@@ -1388,6 +1407,7 @@ export class BrowserDatabase {
       options.executionMemoryBudgetBytes !== undefined &&
       options.spillToStorage !== false &&
       plan.base.derived === undefined &&
+      plan.base.union === undefined &&
       plan.joins.every((join) => join.derived === undefined) &&
       !plan.joins.some((join) => join.table === plan.base.table) &&
       !blockHasSubqueries(plan)
@@ -1575,6 +1595,31 @@ export class BrowserDatabase {
       },
       load,
     };
+  }
+
+  /** Prepares one block's inputs and executes it, returning the caller-owned result. */
+  async #executeBlock(
+    block: CompiledQuery,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    memory: QueryMemoryContext,
+    realTables: ReadonlyMap<string, TableRecord>,
+    typedSchemas: Map<string, SqlColumnSchema[]>,
+  ): Promise<QueryResult> {
+    const inputs = await this.#prepareBlockInputs(
+      block,
+      snapshot,
+      visibility,
+      memory,
+      realTables,
+      typedSchemas,
+    );
+    const prepared = createPreparedColumnarQuery(block, inputs, memory.createChild());
+    try {
+      return prepared.execute();
+    } finally {
+      prepared.close();
+    }
   }
 
   async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {

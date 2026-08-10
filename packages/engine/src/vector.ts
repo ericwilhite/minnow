@@ -2001,6 +2001,9 @@ function orderOutputName(
   select: readonly SelectItem[],
 ): string | undefined {
   if (expression.kind !== "column") return undefined;
+  // A wildcard select exposes source columns under their own names, so bare references order by
+  // the matching output column directly.
+  if (select[0]?.expression.kind === "wildcard") return expression.reference;
   const selected = select.find(
     (item) =>
       (item.expression.kind === "column" && item.expression.reference === expression.reference) ||
