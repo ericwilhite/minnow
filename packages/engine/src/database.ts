@@ -56,6 +56,7 @@ import {
   type LeasedSnapshot,
 } from "@browserdatabase/transactions";
 import {
+  applyWindowFunctions,
   blockHasSubqueries,
   combineUnionResults,
   compileQuery,
@@ -1164,6 +1165,7 @@ export class BrowserDatabase {
     const walk = (block: CompiledQuery): void => {
       for (const source of [block.base, ...block.joins]) {
         if (source.union !== undefined) source.union.blocks.forEach(walk);
+        else if (source.windowed !== undefined) walk(source.windowed.block);
         else if (source.derived === undefined) names.add(source.table);
         else walk(source.derived);
       }
@@ -1250,6 +1252,28 @@ export class BrowserDatabase {
         const combined = combineUnionResults(results, source.union.alls);
         typedSchemas.set(source.table, schema ?? []);
         inputs.set(source.table, derivedColumnarTable(source.table, combined, schema ?? []));
+        continue;
+      }
+      if (source.windowed !== undefined) {
+        const inner = await this.#executeBlock(
+          source.windowed.block,
+          snapshot,
+          visibility,
+          memory,
+          realTables,
+          typedSchemas,
+        );
+        const innerSchema = inferBlockSchema(source.windowed.block, typedSchemas);
+        const windowed = applyWindowFunctions(inner, source.windowed.windows);
+        const schema = [
+          ...innerSchema,
+          ...source.windowed.windows.map((window) => ({
+            name: window.alias,
+            type: "number" as const,
+          })),
+        ];
+        typedSchemas.set(source.table, schema);
+        inputs.set(source.table, derivedColumnarTable(source.table, windowed, schema));
         continue;
       }
       const derived = source.derived;
@@ -1520,6 +1544,7 @@ export class BrowserDatabase {
       options.spillToStorage !== false &&
       plan.base.derived === undefined &&
       plan.base.union === undefined &&
+      plan.base.windowed === undefined &&
       plan.joins.every((join) => join.derived === undefined) &&
       !plan.joins.some((join) => join.table === plan.base.table) &&
       !blockHasSubqueries(plan)

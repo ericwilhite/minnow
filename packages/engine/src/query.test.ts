@@ -420,6 +420,52 @@ describe("public SQL queries", () => {
     expect(emptyScalar.rows).toEqual([]);
   });
 
+  it("computes ROW_NUMBER, RANK, and DENSE_RANK windows in both executors", () => {
+    const rows = [
+      { region: "west", amount: 10 },
+      { region: "west", amount: 20 },
+      { region: "west", amount: 20 },
+      { region: "east", amount: 5 },
+      { region: "east", amount: 40 },
+      { region: null, amount: 7 },
+    ];
+    const input = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT region, amount, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn FROM rows ORDER BY region, rn",
+      "SELECT region, amount, RANK() OVER (PARTITION BY region ORDER BY amount) AS r, DENSE_RANK() OVER (PARTITION BY region ORDER BY amount) AS dr FROM rows ORDER BY region, amount",
+      "SELECT amount, ROW_NUMBER() OVER (ORDER BY amount) AS rn FROM rows WHERE amount > 5 ORDER BY rn LIMIT 3",
+      "SELECT region, ROW_NUMBER() OVER () AS rn FROM rows ORDER BY rn",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
+    }
+    const ranked = executeQuery(
+      compileQuery(
+        "SELECT region, amount, RANK() OVER (PARTITION BY region ORDER BY amount) AS r, DENSE_RANK() OVER (PARTITION BY region ORDER BY amount) AS dr FROM rows WHERE region = 'west' ORDER BY amount",
+      ),
+      input,
+    );
+    expect(ranked.rows).toEqual([
+      { region: "west", amount: 10, r: 1, dr: 1 },
+      { region: "west", amount: 20, r: 2, dr: 2 },
+      { region: "west", amount: 20, r: 2, dr: 2 },
+    ]);
+    expect(() => compileQuery("SELECT region FROM rows WHERE ROW_NUMBER() OVER () > 1")).toThrow(
+      "Window functions are only allowed in the select list",
+    );
+    expect(() => compileQuery("SELECT ROW_NUMBER() OVER () + 1 AS rn FROM rows")).toThrow(
+      "Window functions must be top-level select items",
+    );
+    expect(() =>
+      compileQuery(
+        "SELECT region, COUNT(*) AS c, ROW_NUMBER() OVER () AS rn FROM rows GROUP BY region",
+      ),
+    ).toThrow("Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING");
+    expect(() => compileQuery("SELECT SUM(amount) OVER () AS s FROM rows")).toThrow(
+      "Expected FROM, found OVER",
+    );
+  });
+
   it("combines UNION and UNION ALL members in both executors", () => {
     const west = [
       { region: "west", amount: 10 },

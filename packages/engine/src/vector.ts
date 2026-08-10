@@ -533,6 +533,9 @@ function bindExpression(
   if (expression.kind === "subquery") {
     throw new TypeError("Subqueries are only supported in WHERE, HAVING, SELECT, and IN");
   }
+  if (expression.kind === "window") {
+    throw new TypeError("Window functions are only allowed in the select list");
+  }
   if (expression.kind === "list") {
     return {
       kind: "list",

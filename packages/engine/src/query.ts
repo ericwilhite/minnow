@@ -50,7 +50,22 @@ export type Expression =
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
   | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[] }
   | { kind: "list"; items: Expression[] }
-  | { kind: "subquery"; block: CompiledQuery };
+  | { kind: "subquery"; block: CompiledQuery }
+  | {
+      kind: "window";
+      name: WindowFunctionName;
+      partitionBy: Expression[];
+      orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
+    };
+
+export type WindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK";
+
+export interface WindowSpec {
+  alias: string;
+  name: WindowFunctionName;
+  partitionAliases: string[];
+  orderAliases: Array<{ alias: string; direction: "asc" | "desc" }>;
+}
 
 export interface SelectItem {
   expression: Expression;
@@ -64,6 +79,8 @@ interface TableSource {
   derived?: CompiledQuery;
   /** A top-level set operation; members combine positionally under the first member's schema. */
   union?: { blocks: CompiledQuery[]; alls: boolean[] };
+  /** A window-function desugar: the inner block executes, then window columns append. */
+  windowed?: { block: CompiledQuery; windows: WindowSpec[] };
 }
 
 interface JoinPlan extends TableSource {
@@ -223,6 +240,7 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
     for (const source of [block.base, ...block.joins]) {
       if (source.derived !== undefined) collectBlock(source.derived);
       source.union?.blocks.forEach(collectBlock);
+      if (source.windowed !== undefined) collectBlock(source.windowed.block);
     }
     for (const item of block.select) {
       rewrite(item.expression, (next) => (item.expression = next));
@@ -285,7 +303,8 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
     [block.base, ...block.joins].some(
       (source) =>
         (source.derived !== undefined && blockHas(source.derived)) ||
-        source.union?.blocks.some(blockHas) === true,
+        source.union?.blocks.some(blockHas) === true ||
+        (source.windowed !== undefined && blockHas(source.windowed.block)),
     );
   return blockHas(plan);
 }
@@ -336,6 +355,9 @@ export function inferBlockSchema(
   const infer = (expression: Expression): SqlColumnType | "null" => {
     if (expression.kind === "subquery" || expression.kind === "list") {
       throw new TypeError("Subqueries must be resolved before schema inference");
+    }
+    if (expression.kind === "window") {
+      throw new TypeError("Window functions must be desugared before schema inference");
     }
     if (expression.kind === "literal") {
       const value = expression.value;
@@ -607,13 +629,106 @@ export function combineUnionResults(
   return { columns: [...columns], rows: combined };
 }
 
+function containsWindow(expression: Expression): boolean {
+  if (expression.kind === "window") return true;
+  if (expression.kind === "binary") {
+    return containsWindow(expression.left) || containsWindow(expression.right);
+  }
+  if (expression.kind === "call") return expression.arguments.some(containsWindow);
+  if (expression.kind === "list") return expression.items.some(containsWindow);
+  return false;
+}
+
+/**
+ * Appends window-function columns to an executed inner-block result. Rows sort stably by the
+ * hidden partition and ordering aliases with the same comparison semantics as ORDER BY;
+ * ROW_NUMBER numbers rows per partition, RANK shares ranks across ordering ties with gaps, and
+ * DENSE_RANK shares without gaps. Without OVER ordering every partition row is a peer.
+ */
+export function applyWindowFunctions(
+  result: QueryResult,
+  windows: readonly WindowSpec[],
+): QueryResult {
+  const rows = result.rows.map((row) => ({ ...row }));
+  for (const window of windows) {
+    const indexes = rows.map((_, index) => index);
+    const compare = (left: number, right: number): number => {
+      const leftRow = rows[left];
+      const rightRow = rows[right];
+      if (leftRow === undefined || rightRow === undefined) return 0;
+      for (const alias of window.partitionAliases) {
+        const comparison = compareValues(
+          comparable(leftRow[alias] ?? null),
+          comparable(rightRow[alias] ?? null),
+        );
+        if (comparison !== 0) return comparison;
+      }
+      for (const { alias, direction } of window.orderAliases) {
+        const comparison = compareValues(
+          comparable(leftRow[alias] ?? null),
+          comparable(rightRow[alias] ?? null),
+        );
+        if (comparison !== 0) return direction === "desc" ? -comparison : comparison;
+      }
+      return left - right;
+    };
+    indexes.sort(compare);
+    const samePartition = (left: number, right: number): boolean =>
+      window.partitionAliases.every(
+        (alias) =>
+          compareValues(
+            comparable(rows[left]?.[alias] ?? null),
+            comparable(rows[right]?.[alias] ?? null),
+          ) === 0,
+      );
+    const sameOrderKeys = (left: number, right: number): boolean =>
+      window.orderAliases.every(
+        ({ alias }) =>
+          compareValues(
+            comparable(rows[left]?.[alias] ?? null),
+            comparable(rows[right]?.[alias] ?? null),
+          ) === 0,
+      );
+    let rowNumber = 0;
+    let rank = 0;
+    let denseRank = 0;
+    for (const [position, index] of indexes.entries()) {
+      const previous = position > 0 ? indexes[position - 1] : undefined;
+      if (previous === undefined || !samePartition(previous, index)) {
+        rowNumber = 1;
+        rank = 1;
+        denseRank = 1;
+      } else {
+        rowNumber += 1;
+        if (!sameOrderKeys(previous, index)) {
+          rank = rowNumber;
+          denseRank += 1;
+        }
+      }
+      const row = rows[index];
+      if (row === undefined) continue;
+      row[window.alias] =
+        window.name === "ROW_NUMBER" ? rowNumber : window.name === "RANK" ? rank : denseRank;
+    }
+  }
+  return {
+    columns: [...result.columns, ...windows.map((window) => window.alias)],
+    rows,
+  };
+}
+
 /** Executes each derived or set-operation source with the row reference. */
 function resolveDerivedRowTables(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): ReadonlyMap<string, DatabaseRow[]> {
   const sources = [plan.base, ...plan.joins];
-  if (!sources.some((source) => source.derived !== undefined || source.union !== undefined)) {
+  if (
+    !sources.some(
+      (source) =>
+        source.derived !== undefined || source.union !== undefined || source.windowed !== undefined,
+    )
+  ) {
     return tables;
   }
   const resolved = new Map(tables);
@@ -621,6 +736,11 @@ function resolveDerivedRowTables(
     if (source.union !== undefined) {
       const results = source.union.blocks.map((block) => executeRowQuery(block, tables));
       resolved.set(source.table, combineUnionResults(results, source.union.alls).rows);
+      continue;
+    }
+    if (source.windowed !== undefined) {
+      const inner = executeRowQuery(source.windowed.block, tables);
+      resolved.set(source.table, applyWindowFunctions(inner, source.windowed.windows).rows);
       continue;
     }
     if (source.derived === undefined) continue;
@@ -802,6 +922,8 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       throw new TypeError("Subqueries are only supported in WHERE, HAVING, SELECT, and IN");
     case "list":
       throw new TypeError("Value lists are only supported with IN");
+    case "window":
+      throw new TypeError("Window functions are only allowed in the select list");
     case "column":
       return resolveColumn(context, expression.reference);
     case "binary": {
@@ -1337,6 +1459,21 @@ class Parser {
     }
     const orderBy = this.#orderByClause();
     const limit = this.#limitClause();
+    const clauseExpressions = [
+      ...predicates.flatMap((predicate) => [predicate.left, predicate.right]),
+      ...groupBy,
+      ...having.flatMap((predicate) => [predicate.left, predicate.right]),
+      ...orderBy.map((order) => order.expression),
+    ];
+    if (clauseExpressions.some(containsWindow)) {
+      throw new TypeError("Window functions are only allowed in the select list");
+    }
+    if (select.some((item) => containsWindow(item.expression))) {
+      return this.#desugarWindows(sql, base, joins, select, predicates, groupBy, having, {
+        orderBy,
+        ...(limit === undefined ? {} : { limit }),
+      });
+    }
     return {
       sql,
       base,
@@ -1347,6 +1484,89 @@ class Parser {
       having,
       orderBy,
       ...(limit === undefined ? {} : { limit }),
+    };
+  }
+
+  /**
+   * Rewrites a block with window select items into a wrapper over a windowed source: the inner
+   * block computes every non-window item plus hidden partition and ordering columns, the window
+   * columns append after execution, and the wrapper projects the visible aliases and applies the
+   * block's ORDER BY and LIMIT after window computation, as SQL requires.
+   */
+  #desugarWindows(
+    sql: string,
+    base: TableSource,
+    joins: JoinPlan[],
+    select: SelectItem[],
+    predicates: Predicate[],
+    groupBy: Expression[],
+    having: Predicate[],
+    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number },
+  ): CompiledQuery {
+    if (
+      groupBy.length > 0 ||
+      having.length > 0 ||
+      select.some((item) => hasAggregate(item.expression))
+    ) {
+      throw new TypeError(
+        "Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING",
+      );
+    }
+    for (const item of select) {
+      if (item.expression.kind !== "window" && containsWindow(item.expression)) {
+        throw new TypeError("Window functions must be top-level select items");
+      }
+    }
+    const innerSelect: SelectItem[] = select.filter((item) => item.expression.kind !== "window");
+    const windows: WindowSpec[] = [];
+    let hidden = 0;
+    for (const item of select) {
+      const expression = item.expression;
+      if (expression.kind !== "window") continue;
+      const partitionAliases = expression.partitionBy.map((partition) => {
+        hidden += 1;
+        const alias = `(window ${String(hidden)})`;
+        innerSelect.push({ expression: partition, alias });
+        return alias;
+      });
+      const orderAliases = expression.orderBy.map((order) => {
+        hidden += 1;
+        const alias = `(window ${String(hidden)})`;
+        innerSelect.push({ expression: order.expression, alias });
+        return { alias, direction: order.direction };
+      });
+      windows.push({ alias: item.alias, name: expression.name, partitionAliases, orderAliases });
+    }
+    if (innerSelect.length === 0) {
+      innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });
+    }
+    const inner: CompiledQuery = {
+      sql: "(window input)",
+      base,
+      joins,
+      select: innerSelect,
+      predicates,
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    };
+    this.#derivedSequence += 1;
+    return {
+      sql,
+      base: {
+        table: `(window ${String(this.#derivedSequence)})`,
+        alias: "window",
+        windowed: { block: inner, windows },
+      },
+      joins: [],
+      select: select.map((item) => ({
+        expression: { kind: "column", reference: item.alias },
+        alias: item.alias,
+      })),
+      predicates: [],
+      groupBy: [],
+      having: [],
+      ...tail,
     };
   }
 
@@ -1477,6 +1697,20 @@ class Parser {
       return { kind: "literal", value: date };
     }
     if (this.#punctuation("(")) {
+      if (upper === "ROW_NUMBER" || upper === "RANK" || upper === "DENSE_RANK") {
+        this.#expectPunctuation(")");
+        this.#keyword("OVER");
+        this.#expectPunctuation("(");
+        const partitionBy: Expression[] = [];
+        if (this.#isKeyword("PARTITION")) {
+          this.#keyword("PARTITION");
+          this.#keyword("BY");
+          partitionBy.push(...this.#expressionList());
+        }
+        const orderBy = this.#orderByClause();
+        this.#expectPunctuation(")");
+        return { kind: "window", name: upper, partitionBy, orderBy };
+      }
       const name = upper as AggregateName | "ROUND";
       if (!aggregateNames.has(name as AggregateName) && name !== "ROUND")
         throw new TypeError(`Unsupported function: ${identifier}`);
