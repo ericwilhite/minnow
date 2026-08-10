@@ -497,6 +497,29 @@ explicitly. Columns added after a segment was written read as NULL everywhere wi
 stored data; declared `.references()` relations validate at definition time and live in catalog
 metadata rather than being enforced per write.
 
+The ORM query builder constructs the same compiled plans as SQL, with typed results:
+
+```ts
+import { count, eq, from, refs, sum } from "@browserdatabase/engine";
+
+const p = refs(people, "p");
+const o = refs(orders, "o");
+const rows = await database.run(
+  from(people, "p")
+    .innerJoin(orders, "o", eq(o.person, p.name))
+    .groupBy(p.name)
+    .select({ name: p.name, orders: count(), revenue: sum(o.total) })
+    .orderBy("revenue", "desc")
+    .build(),
+); // Array<{ name: string; orders: number; revenue: number | null }>
+```
+
+Builder expressions assemble plan nodes directly — never SQL strings — and `build()` runs the
+same deterministic optimizer, so an ORM query and its equivalent SQL bind to identical plans;
+structural plan-equality tests enforce that. `nullableRefs()` types left-joined columns with
+`| null`, `typedTable` covers CRUD and batch writes, and `query()`/`execute()` remain the raw SQL
+escape hatch.
+
 ## Storage laboratory
 
 The browser dashboard currently supports:

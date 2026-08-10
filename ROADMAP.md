@@ -504,7 +504,22 @@ Exit gate: compile-time select/insert/update types and crash-safe migration test
 
 Deliver CRUD, relational query builder, typed results/nullability, batch APIs, and raw SQL escape hatch. ORM expressions construct logical plans directly; they do not generate SQL strings.
 
-Exit gate: ORM and equivalent SQL produce equivalent bound logical plans and results.
+Phase 15 is delivered on the shared compiled-plan representation. `refs()` produces typed column
+references from schema tables, expression builders (`eq`/`gt`/`inList`/arithmetic/aggregates/
+`round`) assemble the same expression nodes the SQL parser emits, and `from().join().where()
+.groupBy().having().select().distinct().orderBy().limit().build()` constructs a `CompiledQuery`
+directly — never SQL text — then runs the same deterministic optimizer, including the parser's
+DISTINCT-to-grouping desugaring. `select()` shapes infer the result row type, `nullableRefs()`
+carries explicit `| null` typing for left-joined columns, and `BrowserDatabase.run()` executes
+built queries through the same preparation pipeline as SQL. CRUD and batch writes are the Phase 14
+`typedTable` handles, and `query()`/`execute()` remain the raw SQL escape hatch. The exit gate is
+met by structural plan-equality tests — ORM plans compare deeply equal to compiled SQL across
+filtered projections, grouped joins with HAVING, DISTINCT, left joins, and expression shapes —
+plus result-equality execution tests and compile-time row-type assertions. Correlated builder
+subqueries, relation-aware join sugar from `.references()`, and set operations in the builder
+remain open follow-ups.
+
+Exit gate: ORM and equivalent SQL produce equivalent bound logical plans and results. Met.
 
 ## Phase 16 — Live queries
 

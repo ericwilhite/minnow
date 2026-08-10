@@ -1445,6 +1445,20 @@ export class BrowserDatabase {
     return result;
   }
 
+  /** Executes a built ORM query through the same preparation pipeline as compiled SQL. */
+  async run<TRow>(query: {
+    kind: "typed-query";
+    plan: CompiledQuery;
+    __row?: TRow;
+  }): Promise<TRow[]> {
+    const prepared = await this.#prepareCompiledPlan(query.plan);
+    try {
+      return prepared.execute().rows as TRow[];
+    } finally {
+      prepared.close();
+    }
+  }
+
   /**
    * Applies a schema definition to the catalog through metadata-only steps: creating missing
    * tables, adding nullable columns, renaming columns via their stable IDs, and widening
