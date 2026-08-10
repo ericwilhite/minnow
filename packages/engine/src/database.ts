@@ -1455,12 +1455,18 @@ export class BrowserDatabase {
   async migrate(
     definition: SchemaDefinition<readonly AnyTable[]>,
   ): Promise<{ createdTables: string[]; alteredTables: string[]; steps: MigrationStep[] }> {
-    const plan = planMigration(await this.store.listTables(), definition);
+    // One listTables pass drives planning and execution: a create step exists only because the
+    // table was absent from this snapshot, and each altered table applies all of its steps in a
+    // single compare-and-swap, so a migration costs one catalog write per changed table however
+    // many tables or steps the schema carries. A concurrent creator or migrator still fails
+    // explicitly through createTable's uniqueness check or the revision conflict.
+    const records = await this.store.listTables();
+    const recordsByName = new Map(records.map((record) => [record.name, record]));
+    const plan = planMigration(records, definition);
     const createdTables: string[] = [];
-    const alteredTables = new Set<string>();
+    const alterationsByTable = new Map<string, MigrationStep[]>();
     for (const step of plan.steps) {
       if (step.kind === "create-table") {
-        if ((await this.store.getTableByName(step.table.name)) !== undefined) continue;
         const entries = Object.entries(step.table.columns);
         const uniqueEntry = entries.find(([, columnDefinition]) => columnDefinition.isUnique);
         await this.createTable({
@@ -1475,16 +1481,22 @@ export class BrowserDatabase {
         createdTables.push(step.table.name);
         continue;
       }
-      const record = await this.store.getTableByName(step.tableName);
+      const steps = alterationsByTable.get(step.tableName) ?? [];
+      steps.push(step);
+      alterationsByTable.set(step.tableName, steps);
+    }
+    const alteredTables: string[] = [];
+    for (const [tableName, steps] of alterationsByTable) {
+      const record = recordsByName.get(tableName);
       if (record === undefined) {
-        throw new Error(`Migration target table is missing: ${step.tableName}`);
+        throw new Error(`Migration target table is missing: ${tableName}`);
       }
-      const columns = applyColumnSteps(record, [step], this.#createId);
+      const columns = applyColumnSteps(record, steps, this.#createId);
       if (JSON.stringify(columns) === JSON.stringify(record.columns)) continue;
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
-      alteredTables.add(step.tableName);
+      alteredTables.push(tableName);
     }
-    return { createdTables, alteredTables: [...alteredTables], steps: plan.steps };
+    return { createdTables, alteredTables, steps: plan.steps };
   }
 
   /**
