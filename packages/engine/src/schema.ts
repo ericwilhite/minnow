@@ -75,9 +75,12 @@ export const column = {
   datetime: () => createColumn("datetime"),
 };
 
-export interface TableSchema<TColumns extends Record<string, AnyColumn>> {
+export interface TableSchema<
+  TColumns extends Record<string, AnyColumn>,
+  TName extends string = string,
+> {
   readonly kind: "table";
-  readonly name: string;
+  readonly name: TName;
   readonly columns: TColumns;
   /** Standard Schema-compatible runtime validator for one insert row. */
   readonly "~standard": {
@@ -93,10 +96,10 @@ export interface TableSchema<TColumns extends Record<string, AnyColumn>> {
 
 export type AnyTable = TableSchema<Record<string, AnyColumn>>;
 
-export function table<TColumns extends Record<string, AnyColumn>>(
-  name: string,
+export function table<const TName extends string, TColumns extends Record<string, AnyColumn>>(
+  name: TName,
   columns: TColumns,
-): TableSchema<TColumns> {
+): TableSchema<TColumns, TName> {
   const entries = Object.entries(columns);
   if (entries.length === 0) throw new TypeError(`Table ${name} needs at least one column`);
   const uniqueColumns = entries.filter(([, definition]) => definition.isUnique);

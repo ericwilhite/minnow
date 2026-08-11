@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Benchmarks — BrowserDatabase</title>
+    <script type="module" src="/src/pages/suites.ts"></script>
+  </head>
+  <body data-page="suites">
+    <main>
+      <h1>Benchmarks &amp; test suites</h1>
+      <p class="lead">
+        Three independent suites. Reference queries verify results against hand-written JavaScript
+        oracles; the storage matrix measures BrowserDatabase's own configuration space; the
+        conformance run executes the documented SQL surface live.
+      </p>
+
+      <h2 id="reference">Reference query suite</h2>
+      <p class="note">
+        15 relational queries over a persisted dataset. Each engine prepares once and executes seven
+        measured iterations per query; every result is compared tuple-for-tuple against an
+        independent JavaScript oracle computed from the deterministic generator. A query an engine
+        cannot compile is reported as outside that engine's surface, with the engine's own error.
+      </p>
+      <fieldset>
+        <div>
+          <label for="ref-dataset">Dataset</label>
+          <select id="ref-dataset"></select>
+        </div>
+      </fieldset>
+      <div class="checkbox-row" id="ref-engines"></div>
+      <div class="actions">
+        <button class="primary" id="ref-run">Run reference suite</button>
+      </div>
+      <div class="progress" id="ref-progress" hidden>
+        <span id="ref-progress-label"></span>
+        <div class="progress-track"><i id="ref-progress-bar"></i></div>
+      </div>
+      <p class="status" id="ref-status"></p>
+      <div id="ref-results"></div>
+
+      <hr />
+
+      <h2 id="storage">Storage configuration benchmark</h2>
+      <p class="note">
+        BrowserDatabase only: writes and reads back the full dataset through the block store,
+        verifies every value, probes transaction conflicts and recovery, benchmarks the write API,
+        and runs the reference queries with JavaScript baselines. Uses throwaway databases; nothing
+        is retained. “Full matrix” runs raw/rle/gzip across five block sizes.
+      </p>
+      <fieldset>
+        <div>
+          <label for="storage-scale">Scale</label>
+          <select id="storage-scale">
+            <option value="0.1" selected>0.1×</option>
+            <option value="0.25">0.25×</option>
+            <option value="1">1×</option>
+            <option value="5">5×</option>
+            <option value="10">10×</option>
+          </select>
+        </div>
+        <div>
+          <label for="storage-compression">Compression</label>
+          <select id="storage-compression">
+            <option value="raw">raw</option>
+            <option value="rle">rle</option>
+            <option value="gzip" selected>gzip</option>
+          </select>
+        </div>
+        <div>
+          <label for="storage-block-size">Target block size</label>
+          <select id="storage-block-size">
+            <option value="262144">256 KB</option>
+            <option value="524288">512 KB</option>
+            <option value="1048576" selected>1 MB</option>
+            <option value="2097152">2 MB</option>
+            <option value="4194304">4 MB</option>
+          </select>
+        </div>
+        <div>
+          <label for="storage-durability">Durability</label>
+          <select id="storage-durability">
+            <option value="relaxed" selected>relaxed</option>
+            <option value="strict">strict</option>
+          </select>
+        </div>
+        <div>
+          <label for="storage-focus">Headline timing</label>
+          <select id="storage-focus">
+            <option value="roundtrip" selected>whole roundtrip</option>
+            <option value="write">write path</option>
+            <option value="read">read path</option>
+          </select>
+        </div>
+      </fieldset>
+      <div class="actions">
+        <button class="primary" id="storage-run">Run once</button>
+        <button id="storage-matrix">Run full matrix (15 runs)</button>
+        <button id="storage-cancel" hidden>Cancel</button>
+      </div>
+      <div class="progress" id="storage-progress" hidden>
+        <span id="storage-progress-label"></span>
+        <div class="progress-track"><i id="storage-progress-bar"></i></div>
+      </div>
+      <p class="status" id="storage-status"></p>
+      <div id="storage-results"></div>
+      <div id="storage-history"></div>
+
+      <hr />
+
+      <h2 id="feature-matrix">SQL conformance run</h2>
+      <p class="note">
+        Executes every example from the shipped feature matrix live. Supported examples must run on
+        BrowserDatabase; unsupported examples must still fail with the recorded error (drift
+        detection). SQLite Wasm and PGlite run the same statements against an identical in-memory
+        fixture, so the table also shows honestly where other engines support something this engine
+        does not.
+      </p>
+      <div class="checkbox-row" id="fm-engines">
+        <label><input type="checkbox" value="browserdatabase" checked /> BrowserDatabase</label>
+        <label><input type="checkbox" value="sqlite" checked /> SQLite Wasm</label>
+        <label><input type="checkbox" value="pglite" checked /> PGlite</label>
+      </div>
+      <div class="actions">
+        <button class="primary" id="fm-run">Run conformance suite</button>
+      </div>
+      <div class="progress" id="fm-progress" hidden>
+        <span id="fm-progress-label"></span>
+        <div class="progress-track"><i id="fm-progress-bar"></i></div>
+      </div>
+      <p class="status" id="fm-status"></p>
+      <div id="fm-results"></div>
+    </main>
+  </body>
+</html>

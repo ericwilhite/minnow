@@ -1,4 +1,11 @@
 import {
+  CompactionJobCancelledError,
+  CompactionMemoryBudgetError,
+  CompactionWriteAmplificationError,
+  MissingKeyError,
+  UniqueConstraintError,
+} from "./errors.js";
+import {
   buildPhysicalColumnFromRanges,
   decodeBlock,
   decodePhysicalBlock,
@@ -60,6 +67,7 @@ import {
   blockHasSubqueries,
   combineUnionResults,
   compileQuery,
+  hasAggregate,
   createRecursiveCteState,
   compileStatement,
   createPreparedColumnarQuery,
@@ -71,9 +79,11 @@ import {
   windowOutputType,
   type ComparisonOperator,
   type CompiledQuery,
+  type CompiledStatement,
   type Expression,
   type PreparedQuery,
   type QueryResult,
+  type QueryRow,
   type SqlColumnSchema,
 } from "./query.js";
 import {
@@ -400,63 +410,13 @@ export interface TableDefinition {
 
 export type DatabaseRow = Record<string, Exclude<BatchValue, null> | null>;
 
-export class UniqueConstraintError extends Error {
-  override readonly name = "UniqueConstraintError";
-
-  constructor(
-    readonly tableName: string,
-    readonly columnName: string,
-    readonly value: Exclude<BatchValue, null>,
-  ) {
-    super(`Duplicate value for ${tableName}.${columnName}: ${formatValue(value)}`);
-  }
-}
-
-export class MissingKeyError extends Error {
-  override readonly name = "MissingKeyError";
-
-  constructor(
-    readonly tableName: string,
-    readonly columnName: string,
-    readonly value: Exclude<BatchValue, null>,
-  ) {
-    super(`Missing value for ${tableName}.${columnName}: ${formatValue(value)}`);
-  }
-}
-
-export class CompactionMemoryBudgetError extends Error {
-  override readonly name = "CompactionMemoryBudgetError";
-
-  constructor(
-    readonly budgetBytes: number,
-    readonly minimumBytes: number,
-  ) {
-    super(
-      `Compaction needs at least ${String(minimumBytes)} bytes of working memory; budget is ${String(budgetBytes)} bytes`,
-    );
-  }
-}
-
-export class CompactionWriteAmplificationError extends Error {
-  override readonly name = "CompactionWriteAmplificationError";
-
-  constructor(
-    readonly outputBytes: number,
-    readonly maximumOutputBytes: number,
-  ) {
-    super(
-      `Compaction output would use ${String(outputBytes)} stored bytes; limit is ${String(maximumOutputBytes)} bytes`,
-    );
-  }
-}
-
-export class CompactionJobCancelledError extends Error {
-  override readonly name = "CompactionJobCancelledError";
-
-  constructor(readonly jobId: string) {
-    super(`Compaction job cancelled: ${jobId}`);
-  }
-}
+export {
+  CompactionJobCancelledError,
+  CompactionMemoryBudgetError,
+  CompactionWriteAmplificationError,
+  MissingKeyError,
+  UniqueConstraintError,
+};
 
 export interface BrowserDatabaseOptions {
   compression?: Compression;
@@ -481,9 +441,23 @@ export interface QuerySpillCleanupResult {
 
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
-  | { kind: "insert"; table: string; rowCount: number; version: number }
-  | { kind: "update"; table: string; rowCount: number; version?: number }
-  | { kind: "delete"; table: string; rowCount: number; version?: number | null };
+  | { kind: "insert"; table: string; rowCount: number; version: number; returnedRows?: QueryRow[] }
+  | { kind: "update"; table: string; rowCount: number; version?: number; returnedRows?: QueryRow[] }
+  | {
+      kind: "delete";
+      table: string;
+      rowCount: number;
+      version?: number | null;
+      returnedRows?: QueryRow[];
+    };
+
+export interface RunStatementOptions {
+  /**
+   * Projects the affected rows back: column names, or "*" for every table column. Inserts echo
+   * the written values; updates return post-update values; deletes return the rows as read.
+   */
+  readonly returning?: readonly string[] | "*";
+}
 
 export interface BufferedWriterOptions {
   mode?: "insert" | "upsert";
@@ -1539,13 +1513,28 @@ export class BrowserDatabase {
       {
         currentVersion: () => this.store.getCurrentManifestVersion(),
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
-        dependencyTableIds: async (sql) => {
-          const tables = await this.#findRealBlockTables(compileQuery(sql));
+        dependencyTableIds: async (query) => {
+          const plan = typeof query === "string" ? compileQuery(query) : query.plan;
+          const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
-        execute: (sql) => this.query(sql),
+        execute: async (query) => {
+          if (typeof query === "string") return this.query(query);
+          const prepared = await this.#prepareCompiledPlan(query.plan);
+          try {
+            return prepared.execute();
+          } finally {
+            prepared.close();
+          }
+        },
       },
-      options,
+      {
+        ...options,
+        onClosed: () => {
+          this.#liveSets.delete(set);
+          options.onClosed?.();
+        },
+      },
     );
     this.#liveSets.add(set);
     return set;
@@ -1654,7 +1643,20 @@ export class BrowserDatabase {
    * in between fails the statement explicitly rather than silently mutating other rows.
    */
   async execute(sql: string): Promise<ExecuteResult> {
-    const statement = compileStatement(sql);
+    return this.runStatement(compileStatement(sql));
+  }
+
+  /**
+   * Executes an already-compiled statement — the typed mutation builders call this directly with
+   * the same statement structures SQL parses into, sharing every validation and conflict rule.
+   * With `returning`, the affected rows project back: inserts echo the written values, deletes
+   * return the rows as read at the statement's snapshot, and updates return post-update values
+   * (the snapshot row with assignments applied — the exact values the mutation wrote).
+   */
+  async runStatement(
+    statement: CompiledStatement,
+    options: RunStatementOptions = {},
+  ): Promise<ExecuteResult> {
     if (statement.kind === "select") {
       return { kind: "rows", result: await this.query(statement.sql) };
     }
@@ -1664,11 +1666,34 @@ export class BrowserDatabase {
         columns[column] = statement.rows.map((row) => row[index] ?? null);
       });
       const result = await this.insertBatch(statement.table, { columns });
+      const returningColumns =
+        options.returning === undefined
+          ? undefined
+          : options.returning === "*"
+            ? statement.columns
+            : options.returning;
+      for (const name of returningColumns ?? []) {
+        if (!statement.columns.includes(name)) {
+          throw new TypeError(`INSERT returning column is not in the column list: ${name}`);
+        }
+      }
       return {
         kind: "insert",
         table: statement.table,
         rowCount: result.rowCount,
         version: result.version,
+        ...(returningColumns === undefined
+          ? {}
+          : {
+              returnedRows: statement.rows.map((row) =>
+                Object.fromEntries(
+                  returningColumns.map((name) => [
+                    name,
+                    row[statement.columns.indexOf(name)] ?? null,
+                  ]),
+                ),
+              ),
+            }),
       };
     }
     const table = await this.#findTable(statement.table);
@@ -1678,7 +1703,13 @@ export class BrowserDatabase {
         `${statement.kind === "update" ? "UPDATE" : "DELETE"} requires a table with a unique key: ${statement.table}`,
       );
     }
-    const referenced = new Set([keyColumn.name]);
+    const returningColumns =
+      options.returning === undefined
+        ? undefined
+        : options.returning === "*"
+          ? table.columns.map(({ name }) => name)
+          : [...options.returning];
+    const referenced = new Set([keyColumn.name, ...(returningColumns ?? [])]);
     if (statement.kind === "update") {
       for (const assignment of statement.assignments) {
         for (const column of expressionColumnNames(assignment.expression)) {
@@ -1711,8 +1742,19 @@ export class BrowserDatabase {
       throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
     }
     if (statement.kind === "delete") {
+      const returnedRows =
+        returningColumns === undefined
+          ? undefined
+          : rows.map((row) =>
+              Object.fromEntries(returningColumns.map((name) => [name, row[name] ?? null])),
+            );
       if (keys.length === 0) {
-        return { kind: "delete", table: table.name, rowCount: 0 };
+        return {
+          kind: "delete",
+          table: table.name,
+          rowCount: 0,
+          ...(returnedRows === undefined ? {} : { returnedRows }),
+        };
       }
       const result = await this.deleteBatch(table.name, { keys: keys as BatchValue[] });
       return {
@@ -1720,10 +1762,16 @@ export class BrowserDatabase {
         table: table.name,
         rowCount: result.deletedRowCount,
         version: result.version,
+        ...(returnedRows === undefined ? {} : { returnedRows }),
       };
     }
     if (keys.length === 0) {
-      return { kind: "update", table: table.name, rowCount: 0 };
+      return {
+        kind: "update",
+        table: table.name,
+        rowCount: 0,
+        ...(returningColumns === undefined ? {} : { returnedRows: [] }),
+      };
     }
     const changes: Record<string, Array<BatchValue | null>> = {};
     for (const assignment of statement.assignments) {
@@ -1741,11 +1789,23 @@ export class BrowserDatabase {
       keys: keys as BatchValue[],
       changes,
     });
+    const returnedRows =
+      returningColumns === undefined
+        ? undefined
+        : rows.map((row, index) =>
+            Object.fromEntries(
+              returningColumns.map((name) => [
+                name,
+                name in changes ? (changes[name]?.[index] ?? null) : (row[name] ?? null),
+              ]),
+            ),
+          );
     return {
       kind: "update",
       table: table.name,
       rowCount: result.updatedRowCount,
       version: result.version,
+      ...(returnedRows === undefined ? {} : { returnedRows }),
     };
   }
 
@@ -1825,41 +1885,65 @@ export class BrowserDatabase {
       );
       if (!columnsPresent) return undefined;
       const rowCount = baseSegments.reduce((total, segment) => total + segment.rowCount, 0);
-      const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
-      let prepared: PreparedQuery | undefined;
-      try {
-        const streamed = this.#createStreamedTable(
-          baseTable,
-          projectedBaseColumns,
-          baseSegments,
-          snapshot,
-          rowCount,
-          memory,
-        );
-        const inputTables = new Map<string, ColumnarTable>([[baseTable.name, streamed.table]]);
-        for (const table of tables) {
-          if (table.name === baseTable.name) continue;
-          const requestedColumns = columns.get(table.name) ?? [];
-          inputTables.set(
-            table.name,
-            await this.#materializeColumnarTableAtSnapshot(
-              table,
-              snapshot,
-              requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
-              visibility,
-            ),
+      const runStreamedExecution = async (attempt: {
+        spill: boolean;
+      }): Promise<QueryResult | undefined> => {
+        const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
+        let prepared: PreparedQuery | undefined;
+        try {
+          const streamed = this.#createStreamedTable(
+            baseTable,
+            projectedBaseColumns,
+            baseSegments,
+            snapshot,
+            rowCount,
+            memory,
           );
+          const inputTables = new Map<string, ColumnarTable>([[baseTable.name, streamed.table]]);
+          for (const table of tables) {
+            if (table.name === baseTable.name) continue;
+            const requestedColumns = columns.get(table.name) ?? [];
+            inputTables.set(
+              table.name,
+              await this.#materializeColumnarTableAtSnapshot(
+                table,
+                snapshot,
+                requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
+                visibility,
+              ),
+            );
+          }
+          prepared = createPreparedColumnarQuery(plan, inputTables, memory);
+          if (!attempt.spill) {
+            try {
+              return await prepared.executeAsync({ loadScanWindow: streamed.load });
+            } catch (error) {
+              if (error instanceof QueryMemoryBudgetError) return undefined;
+              throw error;
+            }
+          }
+          return await prepared.executeAsync({
+            ...(spillPageRows === undefined ? {} : { spillPageRows }),
+            spillStore: this.#leasedSpillStore(),
+            loadScanWindow: streamed.load,
+          });
+        } finally {
+          if (prepared === undefined) memory.close();
+          else prepared.close();
         }
-        prepared = createPreparedColumnarQuery(plan, inputTables, memory);
-        return await prepared.executeAsync({
-          ...(spillPageRows === undefined ? {} : { spillPageRows }),
-          spillStore: this.#leasedSpillStore(),
-          loadScanWindow: streamed.load,
-        });
-      } finally {
-        if (prepared === undefined) memory.close();
-        else prepared.close();
+      };
+      // Retained state is usually far smaller than the scan: a limited ORDER BY keeps only its
+      // top rows and a grouped plan keeps one state per distinct group. Try the in-memory
+      // execution before committing to a spill of every scanned row; only a genuine budget
+      // overflow falls through. The streamed loader is forward-only, so the fallback rebuilds
+      // the stream rather than rewinding it.
+      const boundedStateShape =
+        compiledPlanIsGrouped(plan) || (plan.limit !== undefined && plan.orderBy.length > 0);
+      if (boundedStateShape) {
+        const bounded = await runStreamedExecution({ spill: false });
+        if (bounded !== undefined) return bounded;
       }
+      return runStreamedExecution({ spill: true });
     });
   }
 
@@ -5113,6 +5197,11 @@ export function attachLifecycleFlush(
   };
 }
 
+/** True when a compiled block groups rows, either explicitly or through select aggregates. */
+function compiledPlanIsGrouped(plan: CompiledQuery): boolean {
+  return plan.groupBy.length > 0 || plan.select.some((item) => hasAggregate(item.expression));
+}
+
 function validateName(name: string, kind: string): string {
   const trimmed = name.trim();
   if (trimmed.length === 0) throw new TypeError(`${kind} name cannot be empty`);
@@ -5393,6 +5482,9 @@ function equalByteRange(
   return true;
 }
 
+/** Reusable copy arena that realigns misaligned float64 payloads for one bulk typed copy. */
+let alignmentScratch = new ArrayBuffer(0);
+
 function appendPhysicalColumnToVector(
   column: ValidatedPhysicalColumn,
   outputRowStart: number,
@@ -5403,8 +5495,17 @@ function appendPhysicalColumnToVector(
 ): void {
   const sourceValidityLength = Math.ceil(column.rowCount / 8);
   const sourceValidity = column.bytes.subarray(0, sourceValidityLength);
-  for (let row = 0; row < column.rowCount; row += 1) {
-    if (bitmapHasValue(sourceValidity, row)) setBitmapValue(outputValidity, outputRowStart + row);
+  if (outputRowStart % 8 === 0) {
+    // Byte-aligned append: the physical format zeroes every padding bit past rowCount (enforced
+    // by validatePhysicalColumn), so copying whole bytes cannot leak stray validity into rows a
+    // later block will own.
+    outputValidity.set(sourceValidity, outputRowStart / 8);
+  } else {
+    for (let row = 0; row < column.rowCount; row += 1) {
+      if (bitmapHasValue(sourceValidity, row)) {
+        setBitmapValue(outputValidity, outputRowStart + row);
+      }
+    }
   }
 
   if (column.type === "boolean") {
@@ -5419,13 +5520,25 @@ function appendPhysicalColumnToVector(
     if (!(outputValues instanceof Float64Array))
       throw new Error(`${column.type} vector is missing`);
     const valueOffset = column.bytes.byteOffset + sourceValidityLength;
-    if (PLATFORM_LITTLE_ENDIAN && valueOffset % Float64Array.BYTES_PER_ELEMENT === 0) {
-      // Aligned bulk copy: values at invalid slots are never read (every consumer checks the
-      // validity bitmap first), so copying them is safe and avoids the per-row DataView loop.
-      outputValues.set(
-        new Float64Array(column.bytes.buffer, valueOffset, column.rowCount),
-        outputRowStart,
-      );
+    if (PLATFORM_LITTLE_ENDIAN) {
+      // Values at invalid slots are never read (every consumer checks the validity bitmap
+      // first), so bulk-copying them is safe. A misaligned payload — the common case, since the
+      // validity prefix rarely ends on an 8-byte boundary — realigns through a reusable scratch
+      // buffer: two memcpys still beat a per-row DataView loop by a wide margin.
+      if (valueOffset % Float64Array.BYTES_PER_ELEMENT === 0) {
+        outputValues.set(
+          new Float64Array(column.bytes.buffer, valueOffset, column.rowCount),
+          outputRowStart,
+        );
+        return;
+      }
+      const byteLength = column.rowCount * Float64Array.BYTES_PER_ELEMENT;
+      if (alignmentScratch.byteLength < byteLength) {
+        alignmentScratch = new ArrayBuffer(byteLength);
+      }
+      const scratchBytes = new Uint8Array(alignmentScratch, 0, byteLength);
+      scratchBytes.set(new Uint8Array(column.bytes.buffer, valueOffset, byteLength));
+      outputValues.set(new Float64Array(alignmentScratch, 0, column.rowCount), outputRowStart);
       return;
     }
     const sourceValues = new DataView(column.bytes.buffer, valueOffset, column.rowCount * 8);

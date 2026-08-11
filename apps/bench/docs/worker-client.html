@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Run it in a worker — BrowserDatabase</title>
+    <script type="module" src="/src/pages/doc.ts"></script>
+  </head>
+  <body data-page="docs/worker-client">
+    <main>
+      <h1>Run it in a worker</h1>
+      <p class="lead">
+        The library ships both sides of the worker channel: a ready-made worker entry
+        (<code>@browserdatabase/engine/worker</code>) and a main-thread client
+        (<code>@browserdatabase/engine/client</code>). Your application contributes exactly one line
+        — constructing the <code>Worker</code> — because that is the only line your bundler must be
+        able to see.
+      </p>
+
+      <h2>Quick start</h2>
+      <pre><code data-lang="ts">import { BrowserDatabaseClient } from "@browserdatabase/engine/client";
+import { BrowserDb, column, schema, table, type InferDatabase } from "@browserdatabase/engine";
+
+const people = table("people", {
+  name: column.string().unique(),
+  score: column.number(),
+});
+const appSchema = schema([people]);
+
+const client = new BrowserDatabaseClient(
+  new Worker(new URL("@browserdatabase/engine/worker", import.meta.url), { type: "module" }),
+  { store: { kind: "indexeddb", name: "app-db" } },
+);
+await client.migrate(appSchema);
+
+// The typed facade wraps the client exactly as it wraps an in-worker database.
+const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(client, { schema: appSchema });
+await db
+  .insertInto("people")
+  .values([
+    { name: "Ada", score: 10 },
+    { name: "Grace", score: 20 },
+  ])
+  .execute();
+const rows = await db
+  .selectFrom("people")
+  .select(["name", "score"])
+  .orderBy("score", "desc")
+  .execute(); // Array&lt;{ name: string; score: number }&gt;</code></pre>
+      <p>
+        The client sends its configuration to the worker in an init frame, so the stock entry needs
+        no configuration of its own. Because the channel is ordered you may issue calls immediately;
+        <code>await client.ready()</code> exists when you want to surface store-open failures
+        eagerly. IndexedDB access, block decoding, planning, and query execution all run in the
+        worker; the main thread holds only this proxy. The client also exposes the raw layer
+        directly — <code>client.query(sql)</code>, <code>client.insertBatch(...)</code>,
+        <code>client.createTable(...)</code> — mirroring the full database API.
+      </p>
+
+      <h2>Why you construct the Worker</h2>
+      <p>
+        A worker needs a script URL at runtime, and
+        <code>new Worker(new URL("…", import.meta.url), { type: "module" })</code> is only rewritten
+        correctly when your bundler sees that exact expression in your build graph. Buried inside a
+        published library it degrades differently under every bundler — which is why the one
+        bundler-sensitive line lives in your code. It also keeps lifecycle ownership honest: you
+        decide when the worker is created, shared, and terminated, and content-security policies
+        (<code>worker-src</code>) are satisfied by your origin rather than worked around with blob
+        URLs.
+      </p>
+
+      <h2>What changes across the boundary</h2>
+      <ul>
+        <li>
+          Every member is asynchronous. Members that are synchronous in the worker
+          (<code>PreparedQuery.execute()</code>, stats getters, <code>close()</code>) return
+          promises on the client, and getter pairs become methods — <code>writer.stats()</code>,
+          <code>prepared.memoryUsage()</code>.
+        </li>
+        <li>
+          <code>prepareQuery()</code> still pins one leased snapshot in the worker until
+          <code>close()</code>, but a client-side <code>execute()</code> measures execution plus one
+          channel round trip — benchmark inside the worker when isolating executor time.
+        </li>
+        <li>
+          <code>migrate()</code> accepts the same schema DSL (serialized over the wire
+          automatically) and reports its steps in a data-only wire form.
+        </li>
+        <li>
+          Typed errors are rehydrated on the client: <code>instanceof UniqueConstraintError</code>
+          works and carries its fields; stack traces point into the worker.
+        </li>
+        <li>
+          Construction options that are functions (<code>now</code>, <code>createId</code>, a custom
+          store) cannot cross the channel — use a custom entry (below).
+        </li>
+      </ul>
+
+      <p>
+        The typed facade is unaffected by all of this: compiled plans and statements cross the
+        channel by structured clone, so <code>selectFrom</code>, the typed
+        <a href="write-api.html">writes</a> with <code>returning</code>, and
+        <code>.live()</code> behave identically on the main thread.
+      </p>
+
+      <h2>Buffered writers and live queries</h2>
+      <p>
+        Stateful handles proxy transparently: the writer's age timer runs on the worker's clock, and
+        live-query callbacks arrive as events. Cross-tab commit hints work by naming a
+        BroadcastChannel the worker should join.
+      </p>
+      <pre><code data-lang="ts">const writer = client.bufferedWriter("people", {
+  maxRows: 500,
+  onError: (error) =&gt; console.error("background flush failed", error),
+});
+await writer.add({ name: "Edsger", score: 30 });
+await writer.close();
+
+const live = client.liveQueries({ channelName: "app-db-commits" });
+const subscription = await live.subscribe(
+  "SELECT name, score FROM people ORDER BY score DESC",
+  { onChange: (result) =&gt; render(result.rows) },
+);
+// … later
+await subscription.close();
+await live.close();
+await client.close({ terminateWorker: true });</code></pre>
+
+      <h2>Bundler setups</h2>
+      <p>
+        <strong>Vite and webpack 5</strong> both understand the quick-start pattern as written —
+        they see the <code>new URL("@browserdatabase/engine/worker", import.meta.url)</code>
+        expression, resolve the package subpath, and emit a separate worker chunk. Nothing else is
+        required.
+      </p>
+      <p>
+        <strong>esbuild</strong> (and Parcel 2 with default settings) does not rewrite
+        <code>new URL</code> worker expressions. Build the worker entry as its own bundle and point
+        the Worker at the emitted file:
+      </p>
+      <pre><code data-lang="ts">// worker.ts — your one-line worker entry, bundled separately:
+import "@browserdatabase/engine/worker";
+
+// esbuild app.ts worker.ts --bundle --format=esm --outdir=dist --splitting
+
+// app.ts:
+const client = new BrowserDatabaseClient(
+  new Worker(new URL("./worker.js", import.meta.url), { type: "module" }),
+);</code></pre>
+      <p>
+        <strong>No bundler</strong> — module workers cannot resolve bare specifiers (import maps do
+        not apply inside workers in all engines yet), so use full URLs from your chosen CDN or
+        vendored files:
+      </p>
+      <pre><code data-lang="ts">// db-worker.js — served from your origin:
+import "https://cdn.example.com/@browserdatabase/engine/dist/worker.js";
+
+// main page:
+import { BrowserDatabaseClient } from "https://cdn.example.com/@browserdatabase/engine/dist/client.js";
+const client = new BrowserDatabaseClient(
+  new Worker(new URL("./db-worker.js", import.meta.url), { type: "module" }),
+);</code></pre>
+
+      <h2>Custom worker entries</h2>
+      <p>
+        The stock entry covers the cloneable configuration surface: the store descriptor (<code
+          >indexeddb</code
+        >
+        or <code>memory</code>) plus <code>compression</code>, <code>rowsPerBlock</code>,
+        <code>maxCommitRetries</code>, and <code>spillOwnerLeaseMs</code>. When construction needs
+        things a message cannot carry — a custom <code>BlockStore</code>, deterministic
+        <code>now</code>/<code>createId</code> seams — write your own entry and expose the database
+        you built:
+      </p>
+      <pre><code data-lang="ts">// my-worker.ts
+import { BrowserDatabase, exposeDatabase } from "@browserdatabase/engine";
+import { IndexedDbBlockStore } from "@browserdatabase/storage-idb";
+
+const store = await IndexedDbBlockStore.open({ name: "app-db", durability: "strict" });
+exposeDatabase(new BrowserDatabase(store, { compression: "gzip" }), self, {
+  onDispose: () =&gt; store.close(),
+});</code></pre>
+      <p>
+        <code>exposeDatabase()</code> answers the same client frames, acknowledging the client's
+        init without reconstructing anything, so the main-thread code is unchanged. Underneath both
+        entries sits <code>@browserdatabase/worker-protocol</code>: versioned, structured-clone-safe
+        RPC frames with method whitelists per handle — the worker never dispatches arbitrary
+        property access.
+      </p>
+
+      <p class="note">
+        The worker changes where work runs, not the durability contract: correctness never depends
+        on BroadcastChannel, Web Locks, page-close handlers, or successful background work.
+        IndexedDB is authoritative, and the contract still ends at a successfully committed
+        IndexedDB transaction.
+      </p>
+    </main>
+  </body>
+</html>

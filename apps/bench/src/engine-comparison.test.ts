@@ -1,7 +1,7 @@
 import { compileQuery, executeQuery, type DatabaseRow } from "@browserdatabase/engine";
 import { describe, expect, it } from "vitest";
 import { generateEntityBatch, getScenario } from "./benchmark.js";
-import { comparisonQueries } from "./engine-comparison.js";
+import { comparisonQueries } from "./engines/shared.js";
 
 function generatedRows(table: string): DatabaseRow[] {
   const entity = getScenario("commerce").entities.find((candidate) => candidate.name === table);

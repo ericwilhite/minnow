@@ -1,4 +1,5 @@
 import {
+  scalarFunctionNames,
   type CompiledQuery,
   type Expression,
   type Predicate,
@@ -269,7 +270,7 @@ function rewriteForInner(
 function containsAggregateOrWindow(expression: Expression): boolean {
   if (expression.kind === "window") return true;
   if (expression.kind === "call") {
-    if (expression.name !== "ROUND") return true;
+    if (!scalarFunctionNames.has(expression.name)) return true;
     return expression.arguments.some(containsAggregateOrWindow);
   }
   if (expression.kind === "binary") {

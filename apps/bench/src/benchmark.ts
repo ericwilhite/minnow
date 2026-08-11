@@ -200,12 +200,29 @@ export interface LibraryWriteBenchmarkMeasurement {
   passed: boolean;
 }
 
-export interface ReferenceQueryMeasurement {
-  id: string;
-  name: string;
-  complexity: "simple" | "moderate" | "complex";
-  sql: string;
-  tables: string[];
+/**
+ * The library executing the query's own SQL. `supported` is decided by actually
+ * compiling the SQL against the engine during the run, never by a checked-in
+ * assumption, so this measurement cannot drift from the shipped SQL surface.
+ */
+export interface ReferenceQueryEngineMeasurement {
+  supported: boolean;
+  /** Compile or execution error reported by the engine when `supported` is false. */
+  error?: string;
+  /** Optimized plan from BrowserDatabase.explain(), absent when the SQL does not compile. */
+  plan?: string;
+  prepareMs: number;
+  medianMs: number;
+  p95Ms: number;
+  iterations: number;
+  resultRows: number;
+  checksum: number;
+  /** The engine result matches the independent JavaScript oracle tuple for tuple. */
+  verified: boolean;
+}
+
+/** A hand-written JavaScript implementation kept as a baseline to compare the engine against. */
+export interface ReferenceQueryJavascriptMeasurement {
   sampleCount: number;
   iterations: number;
   executionsPerSample: number;
@@ -215,10 +232,42 @@ export interface ReferenceQueryMeasurement {
   totalMs: number;
   measurementMs: number;
   resultRows: number;
-  expectedRows: number;
   checksum: number;
   oracleChecksum: number;
   verified: boolean;
+}
+
+export interface ReferenceQueryMeasurement {
+  id: string;
+  name: string;
+  complexity: "simple" | "moderate" | "complex";
+  /** The exact SQL submitted to the engine. Never an abbreviation of a longer statement. */
+  sql: string;
+  tables: string[];
+  expectedRows: number;
+  /** Set when the query is knowingly outside the current SQL surface, explaining what is missing. */
+  surfaceGap?: string;
+  engine: ReferenceQueryEngineMeasurement;
+  javascript: ReferenceQueryJavascriptMeasurement;
+  verified: boolean;
+}
+
+/**
+ * Memory around one benchmark run, measured in the worker that owns the database. Whole-agent
+ * bytes count WebAssembly and everything else the agent holds; the JavaScript heap counts only
+ * the JS garbage collector's share. Whole-agent numbers are null on browsers that refuse the
+ * measurement, and `agentDetail` then says why.
+ */
+export interface MemoryMeasurement {
+  agentStatus: "measured" | "unsupported" | "not-isolated" | "refused";
+  agentDetail: string;
+  agentBytesBefore: number | null;
+  agentBytesAfter: number | null;
+  agentDeltaBytes: number | null;
+  agentByType: Record<string, number> | null;
+  heapBytesBefore: number | null;
+  heapBytesAfter: number | null;
+  heapDeltaBytes: number | null;
 }
 
 export interface ReferenceIntegrityCheckMeasurement {
@@ -236,6 +285,9 @@ export interface ReferenceQueryBenchmarkMeasurement {
   loadMs: number;
   indexMs: number;
   totalMs: number;
+  /** Sum of the engine's median execution across every query it can compile. */
+  engineTotalMs: number;
+  engineSupportedQueries: number;
   sampleCount: number;
   tables: Array<{ name: string; rows: number; loadMs: number; relationship: string }>;
   integrityChecks: ReferenceIntegrityCheckMeasurement[];
@@ -258,6 +310,8 @@ export interface AdHocQueryMetrics {
 export interface AdHocQueryResult {
   runId: string;
   sql: string;
+  /** Optimized logical plan and physical strategy notes from BrowserDatabase.explain(). */
+  plan: string;
   tables: string[];
   columns: string[];
   rowCount: number;
@@ -294,6 +348,7 @@ export interface BenchmarkResult {
     measuredDelta?: number;
     note: string;
   };
+  memory: MemoryMeasurement;
   totals: {
     rows: number;
     entities: number;

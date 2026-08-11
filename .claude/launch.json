@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bench",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--workspace", "@browserdatabase/bench"],
+      "port": 4173,
+      "autoPort": true
+    }
+  ]
+}

@@ -38,7 +38,8 @@ describe("vector query execution", () => {
       id: index,
       bucket: index % 11,
     }));
-    const plan = compileQuery("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 137");
+    // No LIMIT: a limited ORDER BY retains only the top rows and fits the budget without spilling.
+    const plan = compileQuery("SELECT id, bucket FROM rows ORDER BY bucket, id DESC");
     const prepared = createPreparedQuery(plan, new Map([["rows", rows]]), {
       executionMemoryBudgetBytes: 150_000,
     });
@@ -47,6 +48,23 @@ describe("vector query execution", () => {
     const result = await prepared.executeAsync({ spillStore: spill, spillPageRows: 64 });
     expect(result).toEqual(executeRowQuery(plan, new Map([["rows", rows]])));
     expect(spill.pages.size).toBe(0);
+    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(150_000);
+    prepared.close();
+  });
+
+  it("keeps a limited ORDER BY within budget by retaining only the top rows", () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
+      id: index,
+      bucket: index % 11,
+    }));
+    const plan = compileQuery(
+      "SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 137 OFFSET 3",
+    );
+    const prepared = createPreparedQuery(plan, new Map([["rows", rows]]), {
+      executionMemoryBudgetBytes: 150_000,
+    });
+    // The full sort would not fit (the unlimited variant above proves it); the bounded top-N does.
+    expect(prepared.execute()).toEqual(executeRowQuery(plan, new Map([["rows", rows]])));
     expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(150_000);
     prepared.close();
   });
@@ -123,13 +141,13 @@ describe("vector query execution", () => {
       ],
     };
 
-    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 454 });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 454, usedBytes: 40, peakBytes: 40 });
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 358 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 358, usedBytes: 40, peakBytes: 40 });
     expect(exact.execute()).toEqual(expected);
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 454, usedBytes: 40, peakBytes: 454 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 358, usedBytes: 40, peakBytes: 358 });
     exact.close();
 
-    const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 367 });
+    const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 271 });
     let groupFailure: unknown;
     try {
       groupBelow.execute();
@@ -140,10 +158,10 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "MAX aggregate value",
     });
-    expect(groupBelow.memoryUsage).toEqual({ budgetBytes: 367, usedBytes: 40, peakBytes: 362 });
+    expect(groupBelow.memoryUsage).toEqual({ budgetBytes: 271, usedBytes: 40, peakBytes: 266 });
     groupBelow.close();
 
-    const resultBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 378 });
+    const resultBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 330 });
     let resultFailure: unknown;
     try {
       resultBelow.execute();
@@ -154,10 +172,10 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "Accumulated grouped result row",
     });
-    expect(resultBelow.memoryUsage).toEqual({ budgetBytes: 378, usedBytes: 40, peakBytes: 368 });
+    expect(resultBelow.memoryUsage).toEqual({ budgetBytes: 330, usedBytes: 40, peakBytes: 306 });
     resultBelow.close();
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 453 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 357 });
     let orderingFailure: unknown;
     try {
       below.execute();
@@ -168,7 +186,7 @@ describe("vector query execution", () => {
       name: "QueryMemoryBudgetError",
       label: "Ordering typed scratch",
     });
-    expect(below.memoryUsage).toEqual({ budgetBytes: 453, usedBytes: 40, peakBytes: 427 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 357, usedBytes: 40, peakBytes: 331 });
     below.close();
   });
 

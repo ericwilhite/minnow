@@ -17,64 +17,80 @@ function hasBit(bitmap: Uint8Array, index: number): boolean {
 }
 
 export function encodeColumn(input: ColumnInput): { bytes: Uint8Array; metadata: BlockMetadata } {
-  const validity = new Uint8Array(bitmapLength(input.values.length));
-  input.values.forEach((value, index) => {
+  // Index loops throughout: forEach/map skip holes in sparse arrays, which would desynchronize
+  // the validity bitmap from the value payload and persist a corrupt block. A hole reads as
+  // undefined and is rejected like any other non-value.
+  const rowCount = input.values.length;
+  const validity = new Uint8Array(bitmapLength(rowCount));
+  for (let index = 0; index < rowCount; index += 1) {
+    const value = input.values[index];
+    if (value === undefined) throw new TypeError("Column values cannot be undefined");
     if (value !== null) setBit(validity, index);
-  });
+  }
 
   switch (input.type) {
     case "boolean": {
-      const values = new Uint8Array(bitmapLength(input.values.length));
-      input.values.forEach((value, index) => {
-        if (value === true) setBit(values, index);
-      });
+      const values = new Uint8Array(bitmapLength(rowCount));
+      for (let index = 0; index < rowCount; index += 1) {
+        if (input.values[index] === true) setBit(values, index);
+      }
       return { bytes: join(validity, values), metadata: {} };
     }
     case "number": {
-      const buffer = new ArrayBuffer(input.values.length * Float64Array.BYTES_PER_ELEMENT);
+      const buffer = new ArrayBuffer(rowCount * Float64Array.BYTES_PER_ELEMENT);
       const view = new DataView(buffer);
       let min = Number.POSITIVE_INFINITY;
       let max = Number.NEGATIVE_INFINITY;
-      input.values.forEach((value, index) => {
-        if (value !== null) {
-          if (!Number.isFinite(value)) throw new TypeError("Number values must be finite");
-          view.setFloat64(index * 8, value, true);
-          min = Math.min(min, value);
-          max = Math.max(max, value);
-        }
-      });
+      for (let index = 0; index < rowCount; index += 1) {
+        const value = input.values[index];
+        if (value === null || value === undefined) continue;
+        if (!Number.isFinite(value)) throw new TypeError("Number values must be finite");
+        view.setFloat64(index * 8, value, true);
+        min = Math.min(min, value);
+        max = Math.max(max, value);
+      }
       const metadata = min === Number.POSITIVE_INFINITY ? {} : { zoneMap: { min, max } };
       return { bytes: join(validity, new Uint8Array(buffer)), metadata };
     }
     case "datetime": {
-      const buffer = new ArrayBuffer(input.values.length * Float64Array.BYTES_PER_ELEMENT);
+      const buffer = new ArrayBuffer(rowCount * Float64Array.BYTES_PER_ELEMENT);
       const view = new DataView(buffer);
       let min = Number.POSITIVE_INFINITY;
       let max = Number.NEGATIVE_INFINITY;
-      input.values.forEach((value, index) => {
-        if (value !== null) {
-          const milliseconds = value.getTime();
-          if (!Number.isFinite(milliseconds))
-            throw new TypeError("Datetime values must be valid Dates");
-          view.setFloat64(index * 8, milliseconds, true);
-          min = Math.min(min, milliseconds);
-          max = Math.max(max, milliseconds);
-        }
-      });
+      for (let index = 0; index < rowCount; index += 1) {
+        const value = input.values[index];
+        if (value === null || value === undefined) continue;
+        const milliseconds = value.getTime();
+        if (!Number.isFinite(milliseconds))
+          throw new TypeError("Datetime values must be valid Dates");
+        view.setFloat64(index * 8, milliseconds, true);
+        min = Math.min(min, milliseconds);
+        max = Math.max(max, milliseconds);
+      }
       const metadata = min === Number.POSITIVE_INFINITY ? {} : { zoneMap: { min, max } };
       return { bytes: join(validity, new Uint8Array(buffer)), metadata };
     }
     case "string": {
-      const encoded = input.values.map((value) => textEncoder.encode(value ?? ""));
-      const contentLength = encoded.reduce((total, bytes) => total + bytes.byteLength, 0);
-      const offsets = new Uint32Array(input.values.length + 1);
+      const encoded: Array<Uint8Array | null> = new Array<Uint8Array | null>(rowCount).fill(null);
+      let contentLength = 0;
+      for (let index = 0; index < rowCount; index += 1) {
+        const value = input.values[index];
+        if (value === null || value === undefined) continue;
+        const bytes = textEncoder.encode(value);
+        encoded[index] = bytes;
+        contentLength += bytes.byteLength;
+      }
+      const offsets = new Uint32Array(rowCount + 1);
       const content = new Uint8Array(contentLength);
       let offset = 0;
-      encoded.forEach((bytes, index) => {
-        content.set(bytes, offset);
-        offset += bytes.byteLength;
+      for (let index = 0; index < rowCount; index += 1) {
+        const bytes = encoded[index];
+        if (bytes !== null && bytes !== undefined) {
+          content.set(bytes, offset);
+          offset += bytes.byteLength;
+        }
         offsets[index + 1] = offset;
-      });
+      }
       return {
         bytes: join(validity, new Uint8Array(offsets.buffer), content),
         metadata: {},

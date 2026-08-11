@@ -23,10 +23,24 @@ competing commits. Mutation results include encoding, staging, commit, retry, ro
 write-amplification metrics. It also verifies conservative append-only compaction without presenting
 retained historical blocks as reclaimed space.
 
-The generated graph is checked across 41 foreign-key paths and exercised by 15 oracle-checked
-reference queries. The dashboard also exposes a bounded read-only ad-hoc reference SQL runner with
-parse, median, p95, and row-flow metrics. These timings describe JavaScript execution over a loaded
-snapshot; they are not public `query()`/`prepareQuery()` measurements.
+The generated graph is checked across 81 foreign-key paths and exercised by 15 oracle-checked
+reference queries. Those queries are now submitted to `prepareQuery()` and executed by the engine,
+so their headline timings are public query API measurements; support is decided by compiling each
+statement during the run, and the two statements the current surface cannot express — a monthly
+cohort needing date truncation and an adjustment rollup needing `COALESCE` — record the engine's
+own error rather than being quietly reworded. A hand-written JavaScript implementation runs beside
+each query as a labeled baseline. The dashboard also exposes a bounded read-only ad-hoc SQL console
+that reports the optimized plan from `explain()` with prepare, median, p95, and row-flow metrics.
+
+Memory is recorded two ways. `performance.measureUserAgentSpecificMemory()` gives whole-agent bytes
+including WebAssembly memories, which is the only figure that sees where SQLite, DuckDB, and PGlite
+keep their data; `performance.memory.usedJSHeapSize` gives the JavaScript heap alone. Both are
+sampled on the main thread, because a worker exposes neither API, and both are taken outside every
+timed region because the whole-agent measurement waits for a garbage collection. Whole-agent bytes
+require a Chromium browser on a cross-origin-isolated page with site isolation active; where that is
+not met the dashboard records the reason instead of a zero. Engines run one after another in the
+same agent and WebAssembly memories are never returned to the operating system, so per-engine growth
+is the attributable number and the running total is not.
 
 The dated 2026-08-08 codec/block-size bundle records the complete raw/RLE/gzip × five-target matrix
 in Chromium and Firefox over 1,930,800 rows and about 90 MiB of encoded column payload. All 30 cells

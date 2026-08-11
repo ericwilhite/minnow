@@ -1,3 +1,9 @@
+import {
+  copyScratchKey,
+  encodeSingleScalarKey,
+  equalsScratch,
+  hashScratch,
+} from "./group-index.js";
 import { QueryMemoryContext, type QueryMemoryReservation } from "./memory.js";
 
 const INITIAL_ENTRY_CAPACITY = 4;
@@ -5,7 +11,6 @@ const INITIAL_BUCKET_CAPACITY = 8;
 const INITIAL_KEY_CAPACITY = 32;
 const ENTRY_FIELDS = 6;
 const UINT32_BYTES = Uint32Array.BYTES_PER_ELEMENT;
-const joinKeyEncoder = new TextEncoder();
 
 export type JoinIndexKey = boolean | number | string | Date;
 
@@ -49,10 +54,10 @@ export class ByteJoinIndex {
     if (!Number.isSafeInteger(row) || row < 0 || row >= this.#rowNext.length) {
       throw new RangeError("Join index row is outside its declared capacity");
     }
-    const encoded = encodeJoinKey(value);
-    if (encoded === undefined) return;
-    const hash = hashBytes(encoded);
-    const existing = this.#find(encoded, hash);
+    const length = encodeJoinKey(value);
+    if (length < 0) return;
+    const hash = hashScratch(length);
+    const existing = this.#find(length, hash);
     if (existing >= 0) {
       const tail = this.#rowTails[existing] ?? -1;
       if (tail < 0) throw new Error("Join index row chain is corrupt");
@@ -62,6 +67,7 @@ export class ByteJoinIndex {
       return;
     }
 
+    const encoded = copyScratchKey(length);
     const index = this.#entryCount;
     this.#ensureEntryCapacity(index + 1);
     this.#ensureBucketCapacity(index + 1);
@@ -81,9 +87,9 @@ export class ByteJoinIndex {
   }
 
   firstRow(value: unknown): number {
-    const encoded = encodeJoinKey(value);
-    if (encoded === undefined) return -1;
-    const index = this.#find(encoded, hashBytes(encoded));
+    const length = encodeJoinKey(value);
+    if (length < 0) return -1;
+    const index = this.#find(length, hashScratch(length));
     return index < 0 ? -1 : (this.#rowHeads[index] ?? -1);
   }
 
@@ -91,14 +97,15 @@ export class ByteJoinIndex {
     return row < 0 || row >= this.#rowNext.length ? -1 : (this.#rowNext[row] ?? -1);
   }
 
-  #find(encoded: Uint8Array, hash: number): number {
+  /** Matches the scratch arena's first `length` bytes against stored keys without copying them. */
+  #find(length: number, hash: number): number {
     if (this.#buckets.length === 0) return -1;
     let index = this.#buckets[hash & (this.#buckets.length - 1)] ?? -1;
     while (index >= 0) {
       if (
         this.#hashes[index] === hash &&
-        this.#lengths[index] === encoded.byteLength &&
-        equalBytes(this.#keys, this.#offsets[index] ?? 0, encoded)
+        this.#lengths[index] === length &&
+        equalsScratch(this.#keys, this.#offsets[index] ?? 0, length)
       ) {
         return index;
       }
@@ -194,40 +201,19 @@ export class ByteJoinIndex {
   }
 }
 
-function encodeJoinKey(value: unknown): Uint8Array | undefined {
+/**
+ * Encodes one join key into the shared scratch arena and returns its byte length, or -1 for keys
+ * SQL equality can never match (null, undefined, NaN). Dates coerce to their epoch milliseconds,
+ * so a Date and its number representation join as the same key.
+ */
+function encodeJoinKey(value: unknown): number {
   const key = value instanceof Date ? value.getTime() : value;
-  if (key === null || key === undefined) return undefined;
-  if (typeof key === "boolean") return Uint8Array.of(key ? 2 : 1);
-  if (typeof key === "number") {
-    if (Number.isNaN(key)) return undefined;
-    const encoded = new Uint8Array(1 + Float64Array.BYTES_PER_ELEMENT);
-    encoded[0] = 3;
-    new DataView(encoded.buffer).setFloat64(1, key === 0 ? 0 : key, true);
-    return encoded;
-  }
-  if (typeof key === "string") {
-    const payload = joinKeyEncoder.encode(key);
-    if (payload.byteLength > 0xffff_ffff) throw new RangeError("Join index string is too large");
-    const encoded = new Uint8Array(5 + payload.byteLength);
-    encoded[0] = 4;
-    new DataView(encoded.buffer).setUint32(1, payload.byteLength, true);
-    encoded.set(payload, 5);
-    return encoded;
+  if (key === null || key === undefined) return -1;
+  if (typeof key === "number" && Number.isNaN(key)) return -1;
+  if (typeof key === "boolean" || typeof key === "number" || typeof key === "string") {
+    return encodeSingleScalarKey(key);
   }
   throw new TypeError("Join keys must be SQL scalar values");
-}
-
-function hashBytes(bytes: Uint8Array): number {
-  let hash = 0x811c9dc5;
-  for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
-  return hash;
-}
-
-function equalBytes(arena: Uint8Array, offset: number, value: Uint8Array): boolean {
-  for (let index = 0; index < value.byteLength; index += 1) {
-    if (arena[offset + index] !== value[index]) return false;
-  }
-  return true;
 }
 
 function safeDouble(value: number, label: string): number {

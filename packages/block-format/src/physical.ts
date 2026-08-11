@@ -105,13 +105,34 @@ export function validatePhysicalColumn<T extends LogicalType>(
       const expectedLength = physicalColumnByteLength(input.type, input.rowCount);
       if (input.bytes.byteLength !== expectedLength)
         throw new Error(`Invalid ${input.type} payload`);
+      let min = Number.POSITIVE_INFINITY;
+      let max = Number.NEGATIVE_INFINITY;
+      if (nullCount === 0 && PLATFORM_LITTLE_ENDIAN) {
+        // Every slot is a live value, so validate through a typed float view — realigned through
+        // the reusable scratch when the validity prefix leaves the payload off an 8-byte boundary.
+        const typedValues = alignedFloat64View(input.bytes, validityByteLength, input.rowCount);
+        for (let index = 0; index < input.rowCount; index += 1) {
+          const value = typedValues[index] ?? Number.NaN;
+          if (!Number.isFinite(value)) {
+            throw new Error(`Invalid ${input.type} physical value`);
+          }
+          if (
+            input.type === "datetime" &&
+            (!Number.isInteger(value) || Math.abs(value) > MAX_DATETIME_MILLISECONDS)
+          ) {
+            throw new Error("Invalid datetime physical value");
+          }
+          if (value < min) min = value;
+          if (value > max) max = value;
+        }
+        metadata = zoneMapMetadata(min, max);
+        break;
+      }
       const values = new DataView(
         input.bytes.buffer,
         input.bytes.byteOffset + validityByteLength,
         input.rowCount * 8,
       );
-      let min = Number.POSITIVE_INFINITY;
-      let max = Number.NEGATIVE_INFINITY;
       for (let index = 0; index < input.rowCount; index += 1) {
         if (!hasBit(validity, index)) {
           assertZeroFixedWidthNullSlot(input.bytes, validityByteLength + index * 8, input.type);
@@ -389,9 +410,41 @@ function zoneMapMetadata(min: number, max: number): BlockMetadata {
   return min === Number.POSITIVE_INFINITY ? {} : { zoneMap: { min, max } };
 }
 
+const PLATFORM_LITTLE_ENDIAN = new Uint8Array(Float64Array.of(1).buffer)[7] === 0x3f;
+let float64AlignmentScratch = new ArrayBuffer(0);
+
+/**
+ * Returns a Float64Array over `rowCount` values starting at `byteOffset` within `bytes`,
+ * realigning through a reusable scratch copy when the source is not 8-byte aligned.
+ */
+function alignedFloat64View(bytes: Uint8Array, byteOffset: number, rowCount: number): Float64Array {
+  const start = bytes.byteOffset + byteOffset;
+  if (start % Float64Array.BYTES_PER_ELEMENT === 0) {
+    return new Float64Array(bytes.buffer, start, rowCount);
+  }
+  const byteLength = rowCount * Float64Array.BYTES_PER_ELEMENT;
+  if (float64AlignmentScratch.byteLength < byteLength) {
+    float64AlignmentScratch = new ArrayBuffer(byteLength);
+  }
+  new Uint8Array(float64AlignmentScratch, 0, byteLength).set(
+    new Uint8Array(bytes.buffer, start, byteLength),
+  );
+  return new Float64Array(float64AlignmentScratch, 0, rowCount);
+}
+
+const POPCOUNT = new Uint8Array(256);
+for (let value = 0; value < 256; value += 1) {
+  POPCOUNT[value] = (POPCOUNT[value >> 1] ?? 0) + (value & 1);
+}
+
 function countSetBits(bytes: Uint8Array, rowCount: number): number {
+  // Padding bits past rowCount are validated to be zero, so whole bytes count via table lookup.
+  const wholeBytes = rowCount >>> 3;
   let count = 0;
-  for (let index = 0; index < rowCount; index += 1) {
+  for (let index = 0; index < wholeBytes; index += 1) {
+    count += POPCOUNT[bytes[index] ?? 0] ?? 0;
+  }
+  for (let index = wholeBytes * 8; index < rowCount; index += 1) {
     if (hasBit(bytes, index)) count += 1;
   }
   return count;

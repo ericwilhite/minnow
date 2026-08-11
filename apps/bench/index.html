@@ -4,514 +4,107 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>BrowserDatabase Test Lab</title>
-    <script type="module" src="/src/main.ts"></script>
+    <title>BrowserDatabase</title>
+    <script type="module" src="/src/pages/home.ts"></script>
   </head>
-  <body>
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="BrowserDatabase Test Lab home">
-        <span class="brand-mark" aria-hidden="true">B</span>
-        <span>BrowserDatabase <small>Test lab</small></span>
-      </a>
-      <nav class="topnav" aria-label="Page sections">
-        <a href="#workbench">Run</a>
-        <a href="#results">Results</a>
-        <a href="#query-workspace">Query</a>
-        <a href="#history">History</a>
-      </nav>
-      <div class="engine-state"><span class="status-dot"></span> Runs locally</div>
-    </header>
-
+  <body data-page="index">
     <main>
-      <section class="intro">
-        <div class="intro-content">
-          <p class="eyebrow">Browser-native testing</p>
-          <h1>Measure what matters.<br />Trust what you save.</h1>
-          <p class="intro-copy">
-            Run a repeatable relational workload against IndexedDB, verify every write, and compare
-            database engines without sending benchmark data anywhere.
+      <h1>BrowserDatabase</h1>
+      <p class="lead">
+        A persistent columnar SQL database that runs entirely in the browser. Data lives in
+        IndexedDB as immutable compressed column blocks; queries run through a vectorized executor
+        with bounded memory. No server, no sync layer, no build-time codegen.
+      </p>
+      <p>
+        This site is the library's documentation and its measurement bench. Every number shown
+        anywhere here is produced live in your browser, and the same deterministic datasets can be
+        loaded into SQLite Wasm and PGlite for comparison.
+      </p>
+
+      <h2>What it does</h2>
+      <div class="feature-grid">
+        <article>
+          <h3>SQL</h3>
+          <p>
+            Prepared queries over immutable snapshots: joins, grouping, CTEs (including recursive),
+            window functions, set operations. The exact surface is documented and executable on the
+            <a href="sql.html">SQL support</a> page.
           </p>
-          <div class="intro-facts" aria-label="Benchmark coverage">
-            <span><strong>50</strong> related tables</span>
-            <span><strong>15</strong> verified queries</span>
-            <span><strong>4</strong> browser engines</span>
-          </div>
-        </div>
-        <aside class="local-card">
-          <span class="status-dot"></span>
-          <div>
-            <strong>Ready in this browser</strong>
-            <small>Web Worker · IndexedDB · no upload</small>
-          </div>
-        </aside>
-      </section>
-
-      <section id="workbench" class="workbench" aria-labelledby="configuration-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">New run</p>
-            <h2 id="configuration-title">Run a benchmark</h2>
-          </div>
-          <p class="section-note">The standard profile is a good place to start.</p>
-        </div>
-
-        <form id="controls" class="configuration-card">
-          <div class="control-grid">
-            <label class="field">
-              <span class="field-label">Dataset scale <code>scale</code></span>
-              <select id="scale" name="scale">
-                <option value="0.1">0.1× — quick check</option>
-                <option value="0.25">0.25× — small</option>
-                <option value="1" selected>1× — standard</option>
-                <option value="5">5× — substantial</option>
-                <option value="10">10× — stress</option>
-                <option value="100">100× — millions</option>
-              </select>
-              <small id="scale-description"></small>
-            </label>
-            <label class="field">
-              <span class="field-label">Compression <code>compression</code></span>
-              <select id="compression" name="compression">
-                <option value="raw">raw — no compression</option>
-                <option value="rle">rle — run-length encoding</option>
-                <option value="gzip" selected>gzip — CompressionStream</option>
-              </select>
-              <small>The codec applied before blocks are stored.</small>
-            </label>
-            <label class="field">
-              <span class="field-label">Target block size <code>targetBlockBytes</code></span>
-              <select id="block-size" name="blockSize">
-                <option value="262144">256 KiB — 262,144 bytes</option>
-                <option value="524288">512 KiB — 524,288 bytes</option>
-                <option value="1048576">1 MiB — 1,048,576 bytes</option>
-                <option value="2097152" selected>2 MiB — 2,097,152 bytes</option>
-                <option value="4194304">4 MiB — 4,194,304 bytes</option>
-              </select>
-              <small>Maximum target size before compression.</small>
-            </label>
-          </div>
-
-          <details class="advanced-settings">
-            <summary>
-              <span>
-                <strong>Advanced settings</strong>
-                <small>Timing focus, durability, and repetitions</small>
-              </span>
-              <span class="disclosure-icon" aria-hidden="true">+</span>
-            </summary>
-            <div class="control-grid advanced-control-grid">
-              <label class="field">
-                <span class="field-label">Primary timing <code>focus</code></span>
-                <select id="focus" name="focus">
-                  <option value="roundtrip">roundtrip — total elapsed time</option>
-                  <option value="write">write — encode and save</option>
-                  <option value="read">read — load and decode</option>
-                </select>
-                <small>Changes the highlighted result, not the work performed.</small>
-              </label>
-              <label class="field">
-                <span class="field-label">IndexedDB durability <code>durability</code></span>
-                <select id="durability" name="durability">
-                  <option value="relaxed" selected>relaxed — browser may defer flush</option>
-                  <option value="strict">strict — request durable flush</option>
-                </select>
-                <small>Passed to the IndexedDB transaction.</small>
-              </label>
-              <label class="field">
-                <span class="field-label">Repetitions <code>repetitions</code></span>
-                <select id="repetitions" name="repetitions">
-                  <option value="1" selected>1 run</option>
-                  <option value="3">3 runs</option>
-                  <option value="5">5 runs</option>
-                </select>
-                <small>Runs sequentially; each result is kept below.</small>
-              </label>
-            </div>
-          </details>
-
-          <aside class="run-summary" aria-labelledby="run-summary-title">
-            <span class="run-summary-icon" aria-hidden="true">↳</span>
-            <div>
-              <h3 id="run-summary-title">Run brief</h3>
-              <p id="run-summary-copy"></p>
-            </div>
-          </aside>
-
-          <details class="dataset-plan">
-            <summary>
-              <span>
-                <strong id="dataset-plan-title">Preview the 50-table dataset</strong>
-                <small id="dataset-plan-summary"></small>
-              </span>
-              <span class="disclosure-icon" aria-hidden="true">+</span>
-            </summary>
-            <div id="dataset-plan-tables" class="dataset-plan-tables"></div>
-          </details>
-
-          <div class="actions">
-            <button id="run" class="primary-button" type="submit">
-              <span>Run benchmark</span><span aria-hidden="true">→</span>
-            </button>
-            <button id="compare" class="compare-button" type="button">
-              Compare all 15 settings
-            </button>
-            <button id="compare-engines" class="compare-button" type="button">
-              Compare database engines
-            </button>
-            <button id="cancel" class="secondary-button" type="button" hidden>Cancel</button>
-            <p class="compare-note">
-              Compare settings runs 3 codecs × 5 block sizes. Compare engines uses the same dataset
-              and public APIs across BrowserDatabase, SQLite, DuckDB, and PGlite.
-            </p>
-          </div>
-        </form>
-
-        <div id="progress-panel" class="progress-panel" aria-live="polite">
-          <div class="progress-copy">
-            <span id="progress-label">Ready</span>
-            <span id="progress-value">0%</span>
-          </div>
-          <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
-        </div>
-
-        <article class="panel engine-comparison-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="eyebrow">Engine comparison</p>
-              <h3>One workload, four browser databases</h3>
-            </div>
-            <strong id="engine-comparison-state">Not run</strong>
-          </div>
-          <p id="engine-comparison-note" class="transaction-summary">
-            BrowserDatabase · SQLite Wasm · DuckDB-Wasm · PGlite. Results appear here after a run.
+        </article>
+        <article>
+          <h3>Columnar storage</h3>
+          <p>
+            Typed column blocks (boolean, number, string, datetime) encoded raw, run-length, or
+            gzip, stored in IndexedDB with checksums and exact size accounting.
           </p>
-          <div id="engine-comparison-results" hidden></div>
         </article>
-      </section>
-
-      <section id="results" class="results" aria-labelledby="results-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Output</p>
-            <h2 id="results-title">Latest result</h2>
-          </div>
-          <div id="verification-badge" class="verification-badge muted">No test yet</div>
-        </div>
-
-        <div id="empty-state" class="empty-state">
-          <span>↳</span>
-          <p>Run a test to see speed, space used, and saved blocks.</p>
-        </div>
-
-        <div id="result-content" hidden>
-          <div id="metric-cards" class="metric-grid"></div>
-
-          <div class="detail-grid">
-            <article class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Steps</p>
-                  <h3>Time spent on each step</h3>
-                </div>
-                <strong id="primary-timing"></strong>
-              </div>
-              <div id="timing-chart" class="timing-chart"></div>
-            </article>
-            <article class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Browser storage</p>
-                  <h3>Space used</h3>
-                </div>
-              </div>
-              <div id="storage-metrics" class="storage-metrics"></div>
-              <p class="fine-print">
-                The browser gives an estimate for total site storage. The sizes listed for each
-                block are exact.
-              </p>
-            </article>
-          </div>
-
-          <details class="deep-dive">
-            <summary>
-              <span>
-                <strong>Detailed diagnostics</strong>
-                <small>Transactions, public API writes, reference SQL, and physical blocks</small>
-              </span>
-              <span class="disclosure-icon" aria-hidden="true">+</span>
-            </summary>
-            <div class="deep-dive-content">
-              <article class="panel transaction-panel">
-                <div class="panel-heading">
-                  <div>
-                    <p class="eyebrow">Transactions</p>
-                    <h3>Commit, contention, and recovery checks</h3>
-                  </div>
-                  <strong id="transaction-total"></strong>
-                </div>
-                <p id="transaction-summary" class="transaction-summary"></p>
-                <div id="transaction-checks" class="transaction-checks"></div>
-                <p class="fine-print">
-                  The fixed probe uses a separate throwaway IndexedDB database. Its time is reported
-                  here and excluded from main time, throughput, and comparison rankings.
-                </p>
-              </article>
-
-              <article class="panel library-panel">
-                <div class="panel-heading">
-                  <div>
-                    <p class="eyebrow">Public write API</p>
-                    <h3>Insert, upsert, partial update, projection, and delete</h3>
-                  </div>
-                  <strong id="library-total"></strong>
-                </div>
-                <p id="library-summary" class="transaction-summary"></p>
-                <div id="library-metrics" class="metric-grid library-metric-grid"></div>
-                <div class="library-detail-grid">
-                  <div>
-                    <h4>Measured API time</h4>
-                    <div id="library-timings" class="timing-chart"></div>
-                  </div>
-                  <div>
-                    <h4>Correctness probes</h4>
-                    <div id="library-checks" class="transaction-checks library-checks"></div>
-                  </div>
-                </div>
-                <div class="table-scroll library-table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Table</th>
-                        <th>Rows</th>
-                        <th>Segments</th>
-                        <th>Blocks</th>
-                        <th>Saved size</th>
-                      </tr>
-                    </thead>
-                    <tbody id="library-table-rows"></tbody>
-                  </table>
-                </div>
-                <p class="fine-print">
-                  insertBatch uses chunks of at most 100,000 rows. Keyed mutation probes are capped
-                  at 1,000 saved keys; they use the persistent lookup and report encoding, staging,
-                  commit, retry, rows/s, and write-amplification metrics. Concurrent probes are
-                  excluded from API throughput.
-                </p>
-              </article>
-
-              <article class="panel query-panel">
-                <div class="panel-heading">
-                  <div>
-                    <p class="eyebrow">Relational reference workload</p>
-                    <h3>Simple filters through multi-table analysis</h3>
-                  </div>
-                  <strong id="query-total"></strong>
-                </div>
-                <aside class="query-disclosure" aria-label="Query benchmark disclosure">
-                  <strong>What these numbers mean</strong>
-                  <p id="query-note"></p>
-                </aside>
-                <p id="query-summary" class="transaction-summary"></p>
-                <h4 class="subsection-title">Dataset and relationships</h4>
-                <div id="query-dataset" class="query-dataset"></div>
-                <h4 class="subsection-title">Dataset integrity</h4>
-                <div id="query-checks" class="transaction-checks query-checks"></div>
-                <h4 class="subsection-title">Query catalog</h4>
-                <div id="query-results" class="query-results"></div>
-              </article>
-
-              <article class="panel table-panel">
-                <div class="panel-heading">
-                  <div>
-                    <p class="eyebrow">Sample data</p>
-                    <h3>Data groups</h3>
-                  </div>
-                </div>
-                <div class="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Group</th>
-                        <th>Rows</th>
-                        <th>Columns</th>
-                        <th>Blocks</th>
-                        <th>Before compression</th>
-                        <th>Saved size</th>
-                        <th>Size change</th>
-                      </tr>
-                    </thead>
-                    <tbody id="entity-rows"></tbody>
-                  </table>
-                </div>
-              </article>
-
-              <article class="panel table-panel">
-                <div class="panel-heading">
-                  <div>
-                    <p class="eyebrow">Saved data</p>
-                    <h3>Blocks</h3>
-                  </div>
-                  <span id="block-count" class="table-meta"></span>
-                </div>
-                <div class="table-scroll block-table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Block</th>
-                        <th>Type</th>
-                        <th>Rows</th>
-                        <th>Before compression</th>
-                        <th>Saved size</th>
-                        <th>Size change</th>
-                        <th>Check</th>
-                      </tr>
-                    </thead>
-                    <tbody id="block-rows"></tbody>
-                  </table>
-                </div>
-              </article>
-            </div>
-          </details>
-        </div>
-      </section>
-
-      <section id="query-workspace" class="query-workspace" aria-labelledby="query-workspace-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Measured SQL workspace</p>
-            <h2 id="query-workspace-title">Query the generated dataset</h2>
-          </div>
-          <div class="dataset-lifecycle">
-            <span id="ad-hoc-dataset-state" class="dataset-status"
-              >Checking persisted datasets…</span
-            >
-            <button id="wipe-datasets" class="wipe-button" type="button" disabled>
-              Wipe stored datasets
-            </button>
-          </div>
-        </div>
-
-        <article id="query-console" class="panel query-console">
-          <div class="query-workspace-intro">
-            <p>
-              Load an example or write a read-only query. The dataset remains in IndexedDB across
-              reloads. Each query prepares only its referenced columns, runs seven measured
-              iterations, releases the prepared snapshot, and reports preparation, median, and p95.
-            </p>
-            <span>SELECT · JOIN · WHERE · GROUP BY · ORDER BY · LIMIT</span>
-          </div>
-          <div class="query-example-row" aria-label="Query examples">
-            <span>Load example</span>
-            <button type="button" class="query-example" data-query-example="revenue">
-              Revenue by segment
-            </button>
-            <button type="button" class="query-example" data-query-example="orders">
-              Orders by status
-            </button>
-            <button type="button" class="query-example" data-query-example="tax">
-              Tax by jurisdiction
-            </button>
-            <button type="button" class="query-example" data-query-example="inventory">
-              Supplier inventory
-            </button>
-            <button type="button" class="query-example" data-query-example="returns">
-              Returns by segment
-            </button>
-            <button type="button" class="query-example" data-query-example="events">
-              High-volume events
-            </button>
-          </div>
-          <label class="query-editor-label" for="ad-hoc-sql">
-            SQL editor
-            <textarea id="ad-hoc-sql" spellcheck="false">
-SELECT c.segment, COUNT(*) AS orders, SUM(o.total) AS revenue
-FROM customers c
-JOIN orders o ON o.customer_id = c.customer_id
-WHERE o.status = 'paid'
-GROUP BY c.segment
-ORDER BY revenue DESC
-LIMIT 20</textarea>
-          </label>
-          <div class="query-console-actions">
-            <button id="run-ad-hoc" class="primary-button" type="button" disabled>
-              <span>Run measured query</span><span aria-hidden="true">→</span>
-            </button>
-            <p id="ad-hoc-status" role="status">Run a benchmark to generate the dataset first.</p>
-          </div>
-          <div id="ad-hoc-result" hidden>
-            <div id="ad-hoc-metrics" class="metric-grid ad-hoc-metrics"></div>
-            <div class="table-scroll ad-hoc-table-scroll">
-              <table>
-                <thead id="ad-hoc-result-head"></thead>
-                <tbody id="ad-hoc-result-rows"></tbody>
-              </table>
-            </div>
-            <p id="ad-hoc-result-note" class="fine-print"></p>
-          </div>
-          <h4 class="subsection-title">Query history</h4>
-          <div id="ad-hoc-history-empty" class="history-empty">No ad-hoc queries yet.</div>
-          <div id="ad-hoc-history" class="table-scroll" hidden>
-            <table>
-              <thead>
-                <tr>
-                  <th>Query</th>
-                  <th>Tables</th>
-                  <th>Rows</th>
-                  <th>Median</th>
-                  <th>p95</th>
-                  <th>Prepared</th>
-                </tr>
-              </thead>
-              <tbody id="ad-hoc-history-rows"></tbody>
-            </table>
-          </div>
+        <article>
+          <h3>MVCC writes</h3>
+          <p>
+            Journaled transactions publish atomically; readers keep stable snapshots; competing
+            writers conflict, rebase, and retry through the public API.
+          </p>
         </article>
-      </section>
+        <article>
+          <h3>Typed schema &amp; migrations</h3>
+          <p>
+            A schema DSL with inferred row types, planned idempotent migrations, and optional
+            Standard Schema validators at the write boundary.
+          </p>
+        </article>
+        <article>
+          <h3>Query builder</h3>
+          <p>
+            A typed builder that compiles to the same plans as the SQL text front end — one
+            executor, two front ends.
+          </p>
+        </article>
+        <article>
+          <h3>Live queries</h3>
+          <p>
+            Registered queries re-execute selectively when the tables they reference change, driven
+            by persisted change sets and digest notifications across tabs.
+          </p>
+        </article>
+        <article>
+          <h3>Bounded memory</h3>
+          <p>
+            The vectorized executor works in batches under an explicit memory budget and can spill;
+            whole tables are never required to be resident.
+          </p>
+        </article>
+        <article>
+          <h3>Maintenance</h3>
+          <p>
+            Compaction, garbage collection, and backup run as stepped, cancellable jobs with the
+            same snapshot guarantees as everything else.
+          </p>
+        </article>
+      </div>
 
-      <section id="history" class="history-section" aria-labelledby="history-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Session history</p>
-            <h2 id="history-title">Past runs</h2>
-          </div>
-          <button id="export" class="text-button" type="button" disabled>Download results ↓</button>
-        </div>
-        <div id="comparison-summary" class="comparison-summary" hidden></div>
-        <div class="panel table-panel">
-          <div id="history-empty" class="history-empty">
-            Results stay here until you close this page.
-          </div>
-          <div id="history-table" class="table-scroll" hidden>
-            <table>
-              <thead>
-                <tr>
-                  <th>Run</th>
-                  <th>Dataset</th>
-                  <th>Scale</th>
-                  <th>Compression</th>
-                  <th>Block size</th>
-                  <th>Blocks</th>
-                  <th>Saved size</th>
-                  <th>Size change</th>
-                  <th>Main time</th>
-                  <th>insertBatch</th>
-                  <th>upsertBatch</th>
-                  <th>updateBatch</th>
-                  <th>deleteBatch</th>
-                  <th>Reference queries</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody id="history-rows"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
+      <h2>Try it</h2>
+      <p class="note">
+        Each example below runs in this page against a throwaway in-memory store. The code shown is
+        the code executed.
+      </p>
+      <div id="showcase"></div>
+
+      <h2>Tools on this site</h2>
+      <ul>
+        <li>
+          <a href="datasets.html">Datasets</a> — generate the deterministic 50-table commerce
+          dataset at a chosen scale and persist it into BrowserDatabase, SQLite Wasm, and PGlite.
+        </li>
+        <li>
+          <a href="query.html">Query</a> — run any SQL against a persisted dataset on all three
+          engines, with prepare/median/p95 timings and cross-engine result checksums.
+        </li>
+        <li>
+          <a href="suites.html">Benchmarks</a> — the 15-query reference suite with correctness
+          oracles, the storage-configuration matrix, and a live SQL conformance run.
+        </li>
+        <li><a href="docs/getting-started.html">Docs</a> — condensed library documentation.</li>
+      </ul>
     </main>
-
-    <footer>
-      <span>BrowserDatabase storage &amp; relational workload benchmark</span>
-      <span>Local execution · no benchmark data is sent over the network</span>
-    </footer>
   </body>
 </html>

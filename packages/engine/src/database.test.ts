@@ -718,6 +718,19 @@ for (const implementation of implementations()) {
       await expect(
         database.insertBatch("events", { columns: { value: [1, "wrong"] } }),
       ).rejects.toThrow("must be number");
+      // Sparse arrays and explicit undefined must be rejected up front: forEach-style validation
+      // skips holes, which once let a hole reach the encoder and persist a corrupt block.
+      const sparse = new Array<number>(3);
+      sparse[0] = 1;
+      sparse[2] = 3;
+      await expect(database.insertBatch("events", { columns: { value: sparse } })).rejects.toThrow(
+        "must be number",
+      );
+      await expect(
+        database.insertBatch("events", {
+          columns: { value: [1, undefined] as unknown as number[] },
+        }),
+      ).rejects.toThrow("must be number");
       expect(await store.listBlockIds()).toEqual([]);
       store.close();
     });

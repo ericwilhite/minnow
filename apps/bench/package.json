@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "dev": "vite --port 4173"
+    "dev": "vite"
   },
   "dependencies": {
     "@browserdatabase/block-format": "0.0.0",
@@ -14,10 +14,12 @@
     "@browserdatabase/testing": "0.0.0",
     "@browserdatabase/transactions": "0.0.0",
     "@browserdatabase/worker-protocol": "0.0.0",
-    "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
     "@electric-sql/pglite": "^0.5.4",
-    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
-    "apache-arrow": "^17.0.0"
+    "@shikijs/core": "^3.0.0",
+    "@shikijs/engine-javascript": "^3.0.0",
+    "@shikijs/langs": "^3.0.0",
+    "@shikijs/themes": "^3.0.0",
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
   },
   "devDependencies": {
     "vite": "^7.1.1"

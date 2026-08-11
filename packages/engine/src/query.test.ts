@@ -973,3 +973,94 @@ describe("public SQL queries", () => {
     ).toThrow("Recursive CTE exceeded");
   });
 });
+
+describe("scalar functions", () => {
+  const rows: DatabaseRow[] = [
+    { region: "west", amount: 10, joined: new Date("2026-02-14T13:45:30.500Z") },
+    { region: null, amount: 6, joined: new Date("2025-12-30T00:00:00.000Z") },
+    { region: "east", amount: 3, joined: null },
+  ];
+  const tables = new Map([["rows", rows]]);
+
+  function both(sql: string): unknown[] {
+    const plan = compileQuery(sql);
+    const vectorized = executeQuery(plan, tables);
+    expect(vectorized.rows, sql).toEqual(executeRowQuery(compileQuery(sql), tables).rows);
+    return vectorized.rows;
+  }
+
+  it("COALESCE returns the first non-null argument and stays lazy over nulls", () => {
+    expect(
+      both("SELECT COALESCE(region, 'unknown') AS label, amount FROM rows ORDER BY amount"),
+    ).toEqual([
+      { label: "east", amount: 3 },
+      { label: "unknown", amount: 6 },
+      { label: "west", amount: 10 },
+    ]);
+    expect(both("SELECT COALESCE(NULL, NULL) AS value, amount FROM rows ORDER BY amount")).toEqual([
+      { value: null, amount: 3 },
+      { value: null, amount: 6 },
+      { value: null, amount: 10 },
+    ]);
+    expect(both("SELECT SUM(COALESCE(NULL, amount, 0)) AS total FROM rows")).toEqual([
+      { total: 19 },
+    ]);
+    expect(() => compileQuery("SELECT COALESCE() AS value FROM rows")).toThrow(
+      "COALESCE requires at least one argument",
+    );
+  });
+
+  it("DATE_TRUNC truncates in UTC for every supported unit and propagates NULL", () => {
+    const truncated = both(
+      "SELECT DATE_TRUNC('month', joined) AS month, DATE_TRUNC('year', joined) AS year, DATE_TRUNC('quarter', joined) AS quarter, DATE_TRUNC('week', joined) AS week, DATE_TRUNC('day', joined) AS day, DATE_TRUNC('hour', joined) AS hour, amount FROM rows ORDER BY amount",
+    );
+    expect(truncated[2]).toEqual({
+      month: new Date("2026-02-01T00:00:00.000Z"),
+      year: new Date("2026-01-01T00:00:00.000Z"),
+      quarter: new Date("2026-01-01T00:00:00.000Z"),
+      // 2026-02-14 is a Saturday; the Monday of that week is 2026-02-09.
+      week: new Date("2026-02-09T00:00:00.000Z"),
+      day: new Date("2026-02-14T00:00:00.000Z"),
+      hour: new Date("2026-02-14T13:00:00.000Z"),
+      amount: 10,
+    });
+    expect(truncated[0]).toEqual({
+      month: null,
+      year: null,
+      quarter: null,
+      week: null,
+      day: null,
+      hour: null,
+      amount: 3,
+    });
+    expect(() => compileQuery("SELECT DATE_TRUNC('fortnight', joined) FROM rows")).toThrow(
+      "Unsupported DATE_TRUNC unit: fortnight",
+    );
+    expect(() => compileQuery("SELECT DATE_TRUNC(joined) FROM rows")).toThrow(
+      "DATE_TRUNC requires a unit and a datetime argument",
+    );
+    expect(() =>
+      executeRowQuery(compileQuery("SELECT DATE_TRUNC('day', amount) AS d FROM rows"), tables),
+    ).toThrow("DATE_TRUNC requires a datetime value");
+  });
+
+  it("keeps SQL NULL semantics for literal IN lists on the hashed membership path", () => {
+    // Large enough literal lists take the cached-set path in both executors; semantics
+    // must not change: a NULL probe never matches, and NOT IN over a list containing
+    // NULL matches nothing.
+    expect(both("SELECT amount FROM rows WHERE amount IN (3, 10, 99) ORDER BY amount")).toEqual([
+      { amount: 3 },
+      { amount: 10 },
+    ]);
+    expect(both("SELECT amount FROM rows WHERE amount NOT IN (3, NULL) ORDER BY amount")).toEqual(
+      [],
+    );
+    expect(
+      both("SELECT amount FROM rows WHERE region IN ('west', 'east') ORDER BY amount"),
+    ).toEqual([{ amount: 3 }, { amount: 10 }]);
+    expect(both("SELECT amount FROM rows WHERE amount NOT IN (10, 99) ORDER BY amount")).toEqual([
+      { amount: 3 },
+      { amount: 6 },
+    ]);
+  });
+});

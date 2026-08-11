@@ -1,7 +1,12 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
+
+const page = (path: string): string => fileURLToPath(new URL(path, import.meta.url));
 
 export default defineConfig({
   server: {
+    // Default dev port, overridable by the environment (session previews) or --port (Playwright).
+    port: Number(process.env.PORT ?? 4173),
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
@@ -22,5 +27,23 @@ export default defineConfig({
   },
   worker: {
     format: "es",
+  },
+  build: {
+    rollupOptions: {
+      input: {
+        index: page("index.html"),
+        datasets: page("datasets.html"),
+        query: page("query.html"),
+        suites: page("suites.html"),
+        sql: page("sql.html"),
+        docsGettingStarted: page("docs/getting-started.html"),
+        docsWorkerClient: page("docs/worker-client.html"),
+        docsWriteApi: page("docs/write-api.html"),
+        docsSchemaMigrations: page("docs/schema-migrations.html"),
+        docsOrm: page("docs/orm.html"),
+        docsLiveQueries: page("docs/live-queries.html"),
+        docsArchitecture: page("docs/architecture.html"),
+      },
+    },
   },
 });

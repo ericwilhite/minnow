@@ -7,9 +7,10 @@ import type {
   QueryResult,
   QueryRow,
   QueryValue,
+  ScalarFunctionName,
   SelectItem,
 } from "./query.js";
-import { likeRegExp } from "./query.js";
+import { cachedListMembership, dateTruncValue, isScalarFunctionName, likeRegExp } from "./query.js";
 import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
 import { ByteJoinIndex } from "./join-index.js";
 import {
@@ -128,7 +129,7 @@ type BoundExpression =
     }
   | {
       kind: "call";
-      name: AggregateName | "ROUND";
+      name: AggregateName | ScalarFunctionName;
       arguments: BoundExpression[];
       aggregateIndex?: number;
       signature: string;
@@ -190,6 +191,8 @@ interface BoundSelectItem {
 interface AggregateSpec {
   readonly name: AggregateName;
   readonly argument: BoundExpression;
+  /** Set for MIN/MAX/COUNT over a bare datetime column: aggregate on raw epoch milliseconds. */
+  readonly rawDatetime?: { source: number; vector: DateTimeVector };
 }
 
 interface GroupState {
@@ -198,6 +201,7 @@ interface GroupState {
   readonly sums: Float64Array;
   readonly values: Array<QueryValue | undefined>;
   readonly valueReservations: Array<QueryMemoryReservation | undefined>;
+  readonly valueReservationBytes: Float64Array;
 }
 
 interface BoundPlan {
@@ -213,6 +217,7 @@ interface BoundPlan {
   readonly select: readonly BoundSelectItem[];
   readonly orderBy: ReadonlyArray<{ outputName: string; direction: "asc" | "desc" }>;
   readonly grouped: boolean;
+  readonly codeGrouping?: { source: number; vector: StringVector };
   readonly wildcard: boolean;
   readonly limit?: number;
   readonly offset?: number;
@@ -560,6 +565,17 @@ function bindPlan(
     return { outputName, direction };
   });
   const grouped = groupBy.length > 0 || aggregateSpecs.length > 0;
+  // A single bare string-column GROUP BY can group on dictionary codes: identical values share a
+  // code within one materialized vector, so a code-indexed slot table replaces per-row hashing.
+  // Streamed vectors rebuild their dictionary per window, so a windowed vector never qualifies.
+  const groupColumn = groupBy.length === 1 ? groupBy[0] : undefined;
+  const codeGrouping =
+    grouped &&
+    groupColumn?.kind === "column" &&
+    groupColumn.vector.kind === "string" &&
+    groupColumn.vector.window === undefined
+      ? { source: groupColumn.source, vector: groupColumn.vector }
+      : undefined;
   return {
     sourceTables,
     sourceAliases,
@@ -573,6 +589,7 @@ function bindPlan(
     select,
     orderBy,
     grouped,
+    ...(codeGrouping === undefined ? {} : { codeGrouping }),
     wildcard: plan.select[0]?.expression.kind === "wildcard",
     ...(plan.limit === undefined ? {} : { limit: plan.limit }),
     ...(plan.offset === undefined ? {} : { offset: plan.offset }),
@@ -678,16 +695,24 @@ function bindExpression(
   const arguments_ = expression.arguments.map((argument) =>
     bindExpression(argument, sources, aggregateSpecs, aggregateIndexes),
   );
-  if (expression.name === "ROUND") {
+  if (isScalarFunctionName(expression.name)) {
     return { kind: "call", name: expression.name, arguments: arguments_, signature };
   }
   let aggregateIndex = aggregateIndexes.get(signature);
   if (aggregateIndex === undefined) {
     aggregateIndex = aggregateSpecs.length;
     aggregateIndexes.set(signature, aggregateIndex);
+    const argument = required(arguments_[0], `${expression.name} argument is missing`);
+    const rawDatetime =
+      (expression.name === "MIN" || expression.name === "MAX" || expression.name === "COUNT") &&
+      argument.kind === "column" &&
+      argument.vector.kind === "datetime"
+        ? { source: argument.source, vector: argument.vector }
+        : undefined;
     aggregateSpecs.push({
       name: expression.name,
-      argument: required(arguments_[0], `${expression.name} argument is missing`),
+      argument,
+      ...(rawDatetime === undefined ? {} : { rawDatetime }),
     });
   }
   return {
@@ -826,8 +851,8 @@ function runScanBatch(
   plan: BoundPlan,
   start: number,
   length: number,
-  groups: ByteGroupIndex<GroupState>,
-  output: QueryRow[],
+  groups: GroupAccumulator,
+  output: ResultSink,
   memory: QueryMemoryContext,
 ): boolean {
   const batchMemory = memory.createChild();
@@ -854,17 +879,14 @@ function runScanBatch(
 function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryResult {
   const metadataCount = executeMetadataCount(plan, memory);
   if (metadataCount !== undefined) return metadataCount;
-  const groups = new ByteGroupIndex<GroupState>(memory);
-  if (plan.grouped && plan.groupBy.length === 0) {
-    groups.setEmpty(createGroupState([], plan, memory));
-  }
-  const output: QueryRow[] = [];
+  const groups = new GroupAccumulator(plan, memory);
+  const output = new ResultSink(plan, memory, true);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
     const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
     if (runScanBatch(plan, start, length, groups, output, memory)) break;
   }
-  const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output;
+  const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
 }
 
@@ -875,18 +897,15 @@ async function executeBoundPlanAsync(
 ): Promise<QueryResult> {
   const metadataCount = executeMetadataCount(plan, memory);
   if (metadataCount !== undefined) return metadataCount;
-  const groups = new ByteGroupIndex<GroupState>(memory);
-  if (plan.grouped && plan.groupBy.length === 0) {
-    groups.setEmpty(createGroupState([], plan, memory));
-  }
-  const output: QueryRow[] = [];
+  const groups = new GroupAccumulator(plan, memory);
+  const output = new ResultSink(plan, memory, options.loadScanWindow === undefined);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
     const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
     await options.loadScanWindow?.(start, length);
     if (runScanBatch(plan, start, length, groups, output, memory)) break;
   }
-  const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output;
+  const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
 }
 
@@ -1571,14 +1590,14 @@ function consumeJoinedBatches(
   plan: BoundPlan,
   batch: BatchRows,
   joinIndex: number,
-  groups: ByteGroupIndex<GroupState>,
-  output: QueryRow[],
+  groups: GroupAccumulator,
+  output: ResultSink,
   memory: QueryMemoryContext,
 ): boolean {
   const join = plan.joins[joinIndex];
   if (join === undefined) {
     consumeBatch(plan, batch, groups, output, memory);
-    return reachedEarlyLimit(plan, output.length);
+    return reachedEarlyLimit(plan, output.size);
   }
   for (const joined of joinBatches(plan, batch, join, memory)) {
     try {
@@ -1833,50 +1852,436 @@ function appendJoinedRow(
   }
 }
 
+interface RetainedTopRow {
+  row: QueryRow;
+  keys: QueryValue[];
+  seq: number;
+  reservation: QueryMemoryReservation;
+}
+
+interface DeferredTopRow {
+  keys: QueryValue[];
+  seq: number;
+  sourceRow: number;
+  bytes: number;
+}
+
+const DEFERRED_SELECTION_BYTES = 2 * QUERY_REFERENCE_BYTES;
+
+/**
+ * Accumulates ungrouped result rows. With ORDER BY and LIMIT the sink keeps only the best
+ * `limit + offset` rows instead of materializing every scanned row for one full sort, so memory
+ * stays bounded by the limit rather than the table. Retention matches a stable sort exactly:
+ * ties resolve by arrival order, so the retained set is precisely the slice a full stable sort
+ * would have produced.
+ *
+ * Two bounded strategies:
+ * - Deferred selection (single-source plans whose order keys resolve to select expressions and
+ *   whose scan vectors outlive the scan): rows are tracked as (keys, arrival, source row) and
+ *   compacted by sort once the selection buffer reaches twice the capacity; only the final
+ *   survivors are projected. A losing row never allocates a result object, so even the
+ *   adversarial ascending-input/descending-order case stays allocation-free per row.
+ * - Eager heap (joins, wildcard selects, or windowed scans): each retained row is projected into
+ *   a worst-at-root heap; a candidate that cannot beat the current worst is rejected before
+ *   projection whenever the order keys are resolvable.
+ */
+class ResultSink {
+  readonly #plan: BoundPlan;
+  readonly #memory: QueryMemoryContext;
+  readonly #capacity: number | undefined;
+  readonly #keyExpressions: readonly BoundExpression[] | undefined;
+  readonly #deferred: boolean;
+  readonly #rows: QueryRow[] = [];
+  readonly #heap: RetainedTopRow[] = [];
+  readonly #selection: DeferredTopRow[] = [];
+  readonly #keyScratch: QueryValue[] = [];
+  #threshold: DeferredTopRow | undefined;
+  #selectionBytes = 0;
+  #selectionReservedBytes = 0;
+  #seq = 0;
+
+  constructor(plan: BoundPlan, memory: QueryMemoryContext, stableScan: boolean) {
+    this.#plan = plan;
+    this.#memory = memory;
+    const bounded = !plan.grouped && plan.orderBy.length > 0 && plan.limit !== undefined;
+    this.#capacity = bounded ? (plan.limit ?? 0) + (plan.offset ?? 0) : undefined;
+    let keyExpressions: BoundExpression[] | undefined;
+    if (bounded && !plan.wildcard) {
+      keyExpressions = [];
+      for (const order of plan.orderBy) {
+        const item = plan.select.find((selected) => selected.alias === order.outputName);
+        if (item === undefined) {
+          keyExpressions = undefined;
+          break;
+        }
+        keyExpressions.push(item.expression);
+      }
+    }
+    this.#keyExpressions = keyExpressions;
+    this.#deferred =
+      bounded && keyExpressions !== undefined && plan.joins.length === 0 && stableScan;
+  }
+
+  /** Rows accepted so far; only meaningful for the unbounded early-limit check. */
+  get size(): number {
+    return this.#capacity === undefined ? this.#rows.length : 0;
+  }
+
+  add(batch: BatchRows, row: number): void {
+    if (this.#capacity === undefined) {
+      const resultRow = projectBatchRow(this.#plan, batch, row);
+      this.#memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
+      this.#rows.push(resultRow);
+      return;
+    }
+    if (this.#capacity === 0) return;
+    if (this.#deferred) {
+      this.#addDeferred(batch, row);
+      return;
+    }
+    this.#addEager(batch, row);
+  }
+
+  /** Returns accepted rows in arrival order, ready for the shared stable sort and trim. */
+  finish(): QueryRow[] {
+    if (this.#capacity === undefined) return this.#rows;
+    if (!this.#deferred) {
+      return this.#heap.sort((left, right) => left.seq - right.seq).map((entry) => entry.row);
+    }
+    this.#compactSelection();
+    this.#selection.sort((left, right) => left.seq - right.seq);
+    const scanIndex = new Int32Array(1);
+    const rowsBySource = [scanIndex];
+    const batch: BatchRows = { length: 1, rowsBySource };
+    const rows: QueryRow[] = [];
+    for (const entry of this.#selection) {
+      scanIndex[0] = entry.sourceRow;
+      const resultRow = projectBatchRow(this.#plan, batch, 0);
+      this.#memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
+      rows.push(resultRow);
+    }
+    return rows;
+  }
+
+  #addDeferred(batch: BatchRows, row: number): void {
+    this.#evaluateKeys(batch, row);
+    const seq = this.#seq;
+    this.#seq += 1;
+    // The candidate arrived after every retained row, so an order-key tie keeps the retained
+    // row — only a strictly better key survives the current cut line.
+    if (
+      this.#threshold !== undefined &&
+      this.#compareKeys(this.#keyScratch, this.#threshold.keys) >= 0
+    ) {
+      return;
+    }
+    let bytes = DEFERRED_SELECTION_BYTES;
+    for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
+      bytes = safeMemorySum(
+        bytes,
+        queryValuePayloadBytes(this.#keyScratch[index] ?? null),
+        "Top-N selection entry",
+      );
+    }
+    this.#selection.push({
+      keys: this.#keyScratch.slice(0, this.#plan.orderBy.length),
+      seq,
+      sourceRow: batch.rowsBySource[this.#plan.scanSource]?.[row] ?? -1,
+      bytes,
+    });
+    this.#reserveSelectionBytes(bytes);
+    if (this.#selection.length >= (this.#capacity ?? 0) * 2) this.#compactSelection();
+  }
+
+  /**
+   * Reserves selection-buffer growth at its high-water mark: the buffer is bounded by twice the
+   * limit, so reservations grow monotonically instead of churning a release per evicted entry.
+   */
+  #reserveSelectionBytes(bytes: number): void {
+    this.#selectionBytes += bytes;
+    if (this.#selectionBytes <= this.#selectionReservedBytes) return;
+    this.#memory.reserve(this.#selectionBytes - this.#selectionReservedBytes, "Top-N selection");
+    this.#selectionReservedBytes = this.#selectionBytes;
+  }
+
+  /** Sorts the selection, keeps the best `capacity` entries, and advances the cut line. */
+  #compactSelection(): void {
+    const capacity = this.#capacity ?? 0;
+    if (this.#selection.length <= capacity) return;
+    this.#selection.sort((left, right) => {
+      const comparison = this.#compareKeys(left.keys, right.keys);
+      return comparison !== 0 ? comparison : left.seq - right.seq;
+    });
+    this.#selection.length = capacity;
+    let retainedBytes = 0;
+    for (const entry of this.#selection) retainedBytes += entry.bytes;
+    this.#selectionBytes = retainedBytes;
+    this.#threshold = this.#selection[capacity - 1];
+  }
+
+  #addEager(batch: BatchRows, row: number): void {
+    let projected: QueryRow | undefined;
+    if (this.#keyExpressions === undefined) {
+      projected = projectBatchRow(this.#plan, batch, row);
+      for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
+        const order = required(this.#plan.orderBy[index], "Order term is missing");
+        this.#keyScratch[index] = projected[order.outputName] ?? null;
+      }
+    } else {
+      this.#evaluateKeys(batch, row);
+    }
+    const seq = this.#seq;
+    this.#seq += 1;
+    const capacity = this.#capacity ?? 0;
+    if (this.#heap.length >= capacity) {
+      const worst = required(this.#heap[0], "Top-N heap root is missing");
+      // An order-key tie keeps the earlier-arriving retained row.
+      if (this.#compareKeys(this.#keyScratch, worst.keys) >= 0) return;
+      const resultRow = projected ?? projectBatchRow(this.#plan, batch, row);
+      const reservation = this.#memory.reserve(
+        this.#entryPayloadBytes(resultRow),
+        "Top-N result row",
+      );
+      worst.reservation.release();
+      this.#heap[0] = {
+        row: resultRow,
+        keys: this.#keyScratch.slice(0, this.#plan.orderBy.length),
+        seq,
+        reservation,
+      };
+      this.#siftDown(0);
+      return;
+    }
+    const resultRow = projected ?? projectBatchRow(this.#plan, batch, row);
+    const reservation = this.#memory.reserve(
+      this.#entryPayloadBytes(resultRow),
+      "Top-N result row",
+    );
+    this.#heap.push({
+      row: resultRow,
+      keys: this.#keyScratch.slice(0, this.#plan.orderBy.length),
+      seq,
+      reservation,
+    });
+    this.#siftUp(this.#heap.length - 1);
+  }
+
+  #evaluateKeys(batch: BatchRows, row: number): void {
+    const expressions = required(this.#keyExpressions, "Order keys are missing");
+    for (let index = 0; index < expressions.length; index += 1) {
+      const expression = required(expressions[index], "Order key is missing");
+      this.#keyScratch[index] = asQueryValue(
+        evaluateBatchExpression(this.#plan, expression, batch, row),
+      );
+    }
+  }
+
+  #entryPayloadBytes(row: QueryRow): number {
+    let bytes = queryRowPayloadBytes(row);
+    for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
+      bytes = safeMemorySum(
+        bytes,
+        queryValuePayloadBytes(this.#keyScratch[index] ?? null),
+        "Top-N order keys",
+      );
+    }
+    return bytes;
+  }
+
+  #compareKeys(left: readonly QueryValue[], right: readonly QueryValue[]): number {
+    const orderBy = this.#plan.orderBy;
+    for (let index = 0; index < orderBy.length; index += 1) {
+      const order = required(orderBy[index], "Order term is missing");
+      const comparison = compareValues(left[index], right[index]);
+      if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
+    }
+    return 0;
+  }
+
+  /** Entry `left` loses to `right` when it sorts later under (keys, arrival). */
+  #isWorse(left: RetainedTopRow, right: RetainedTopRow): boolean {
+    const comparison = this.#compareKeys(left.keys, right.keys);
+    if (comparison !== 0) return comparison > 0;
+    return left.seq > right.seq;
+  }
+
+  #siftUp(index: number): void {
+    let child = index;
+    while (child > 0) {
+      const parent = (child - 1) >> 1;
+      const childEntry = required(this.#heap[child], "Heap entry is missing");
+      const parentEntry = required(this.#heap[parent], "Heap entry is missing");
+      if (!this.#isWorse(childEntry, parentEntry)) break;
+      this.#heap[child] = parentEntry;
+      this.#heap[parent] = childEntry;
+      child = parent;
+    }
+  }
+
+  #siftDown(index: number): void {
+    let parent = index;
+    for (;;) {
+      let worst = parent;
+      let worstEntry = required(this.#heap[worst], "Heap entry is missing");
+      const left = parent * 2 + 1;
+      const right = left + 1;
+      const leftEntry = this.#heap[left];
+      if (leftEntry !== undefined && this.#isWorse(leftEntry, worstEntry)) {
+        worst = left;
+        worstEntry = leftEntry;
+      }
+      const rightEntry = this.#heap[right];
+      if (rightEntry !== undefined && this.#isWorse(rightEntry, worstEntry)) {
+        worst = right;
+        worstEntry = rightEntry;
+      }
+      if (worst === parent) return;
+      const parentEntry = required(this.#heap[parent], "Heap entry is missing");
+      this.#heap[parent] = worstEntry;
+      this.#heap[worst] = parentEntry;
+      parent = worst;
+    }
+  }
+}
+
+/**
+ * Insertion-ordered group-state store. A single bare string-column GROUP BY resolves each row
+ * through a slot table indexed by the column's dictionary code — no key bytes, no hashing —
+ * while every other shape goes through the byte-keyed group index. Both modes surface states in
+ * first-seen order, matching the row oracle's grouping order.
+ */
+class GroupAccumulator {
+  readonly #plan: BoundPlan;
+  readonly #memory: QueryMemoryContext;
+  readonly #index: ByteGroupIndex<GroupState>;
+  readonly #codeStates: Array<GroupState | undefined> | undefined;
+  readonly #ordered: GroupState[] | undefined;
+  readonly #codeColumns: ReadonlyArray<{ source: number; vector: StringVector } | undefined>;
+  readonly #keyScratch: GroupIndexKey[] = [];
+
+  constructor(plan: BoundPlan, memory: QueryMemoryContext) {
+    this.#plan = plan;
+    this.#memory = memory;
+    this.#index = new ByteGroupIndex<GroupState>(memory);
+    if (plan.grouped && plan.groupBy.length === 0) {
+      this.#index.setEmpty(createGroupState([], plan, memory));
+    }
+    if (plan.codeGrouping !== undefined) {
+      const slots = plan.codeGrouping.vector.dictionary.length + 1;
+      memory.reserve(
+        safeMemoryProduct(slots, QUERY_REFERENCE_BYTES, "Group code slots"),
+        "Group code slots",
+      );
+      this.#codeStates = new Array<GroupState | undefined>(slots).fill(undefined);
+      this.#ordered = [];
+    }
+    // Compound keys substitute the dictionary code for each bare unwindowed string column: codes
+    // are stable and value-unique within one execution, so the key encodes a fixed-width number
+    // instead of re-encoding the string's UTF-8 on every row. Types are stable per position, so
+    // a code can never collide with a genuine number from the same expression.
+    this.#codeColumns =
+      plan.groupBy.length > 1
+        ? plan.groupBy.map((expression) =>
+            expression.kind === "column" &&
+            expression.vector.kind === "string" &&
+            expression.vector.window === undefined
+              ? { source: expression.source, vector: expression.vector }
+              : undefined,
+          )
+        : [];
+  }
+
+  /** Resolves the group state for one row, creating it on first touch. */
+  stateFor(batch: BatchRows, row: number): GroupState {
+    const plan = this.#plan;
+    const codeGrouping = plan.codeGrouping;
+    if (codeGrouping !== undefined && this.#codeStates !== undefined) {
+      const sourceRow = batch.rowsBySource[codeGrouping.source]?.[row] ?? -1;
+      const vector = codeGrouping.vector;
+      let code = vector.dictionary.length;
+      if (sourceRow >= 0 && sourceRow < vector.length && isValid(vector.validity, sourceRow)) {
+        const rawCode = vector.codes[sourceRow] ?? NULL_STRING_CODE;
+        if (rawCode !== NULL_STRING_CODE) code = rawCode;
+      }
+      let state = this.#codeStates[code];
+      if (state === undefined) {
+        const value = code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null);
+        state = createGroupState([value], plan, this.#memory);
+        this.#codeStates[code] = state;
+        this.#ordered?.push(state);
+      }
+      return state;
+    }
+    if (plan.groupBy.length === 0) {
+      return required(this.#index.getEmpty(), "Grouped query state is missing");
+    }
+    if (plan.groupBy.length === 1) {
+      const groupValue = asQueryValue(
+        evaluateBatchExpression(
+          plan,
+          required(plan.groupBy[0], "Group expression is missing"),
+          batch,
+          row,
+        ),
+      );
+      return this.#index.getOrInsertOne(groupKey(groupValue), () =>
+        createGroupState([groupValue], plan, this.#memory),
+      );
+    }
+    // The scratch array carries this row's keys without a per-row allocation; the create callback
+    // re-evaluates the group expressions, which runs once per distinct group.
+    for (let index = 0; index < plan.groupBy.length; index += 1) {
+      const codeColumn = this.#codeColumns[index];
+      if (codeColumn !== undefined) {
+        const sourceRow = batch.rowsBySource[codeColumn.source]?.[row] ?? -1;
+        let key: GroupIndexKey = null;
+        if (
+          sourceRow >= 0 &&
+          sourceRow < codeColumn.vector.length &&
+          isValid(codeColumn.vector.validity, sourceRow)
+        ) {
+          const rawCode = codeColumn.vector.codes[sourceRow] ?? NULL_STRING_CODE;
+          if (rawCode !== NULL_STRING_CODE) key = rawCode;
+        }
+        this.#keyScratch[index] = key;
+        continue;
+      }
+      const expression = required(plan.groupBy[index], "Group expression is missing");
+      this.#keyScratch[index] = groupKey(
+        asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
+      );
+    }
+    this.#keyScratch.length = plan.groupBy.length;
+    return this.#index.getOrInsert(this.#keyScratch, () =>
+      createGroupState(
+        plan.groupBy.map((expression) =>
+          asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
+        ),
+        plan,
+        this.#memory,
+      ),
+    );
+  }
+
+  values(): readonly GroupState[] {
+    return this.#ordered ?? this.#index.values();
+  }
+}
+
 function consumeBatch(
   plan: BoundPlan,
   batch: BatchRows,
-  groups: ByteGroupIndex<GroupState>,
-  output: QueryRow[],
+  groups: GroupAccumulator,
+  output: ResultSink,
   memory: QueryMemoryContext,
 ): void {
   for (let row = 0; row < batch.length; row += 1) {
     if (!passesPredicates(plan, batch, row)) continue;
     if (plan.grouped) {
-      let state: GroupState | undefined;
-      if (plan.groupBy.length === 0) state = groups.getEmpty();
-      else if (plan.groupBy.length === 1) {
-        const groupValue = asQueryValue(
-          evaluateBatchExpression(
-            plan,
-            required(plan.groupBy[0], "Group expression is missing"),
-            batch,
-            row,
-          ),
-        );
-        state = groups.getOrInsertOne(groupKey(groupValue), () =>
-          createGroupState([groupValue], plan, memory),
-        );
-      } else {
-        const groupValues = plan.groupBy.map((expression) =>
-          asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
-        );
-        state = groups.getOrInsert(groupValues.map(groupKey), () =>
-          createGroupState(groupValues, plan, memory),
-        );
-      }
-      if (state === undefined) throw new Error("Grouped query state is missing");
-      updateAggregates(plan, state, batch, row, memory);
+      updateAggregates(plan, groups.stateFor(batch, row), batch, row, memory);
     } else {
-      const resultRow = projectBatchRow(plan, batch, row);
-      memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
-      output.push(resultRow);
-      if (
-        plan.orderBy.length === 0 &&
-        plan.limit !== undefined &&
-        output.length >= plan.limit + (plan.offset ?? 0)
-      )
-        return;
+      output.add(batch, row);
+      if (reachedEarlyLimit(plan, output.size)) return;
     }
   }
 }
@@ -1906,6 +2311,7 @@ function createGroupState(
     sums: new Float64Array(plan.aggregates.length),
     values: new Array<QueryValue | undefined>(plan.aggregates.length),
     valueReservations: new Array<QueryMemoryReservation | undefined>(plan.aggregates.length),
+    valueReservationBytes: new Float64Array(plan.aggregates.length),
   };
 }
 
@@ -1918,12 +2324,41 @@ function updateAggregates(
 ): void {
   for (let index = 0; index < plan.aggregates.length; index += 1) {
     const spec = required(plan.aggregates[index], "Aggregate specification is missing");
+    // MIN/MAX/COUNT over a bare datetime column track raw epoch milliseconds: boxing a Date per
+    // row only to unbox it in the comparison would dominate the scan. The final read re-boxes
+    // the single surviving value.
+    if (spec.rawDatetime !== undefined) {
+      const sourceRow = batch.rowsBySource[spec.rawDatetime.source]?.[row] ?? -1;
+      applyAggregateValue(
+        spec,
+        state,
+        index,
+        rawDatetimeValue(spec.rawDatetime.vector, sourceRow),
+        memory,
+      );
+      continue;
+    }
     const value =
       spec.argument.kind === "wildcard"
         ? 1
         : evaluateBatchExpression(plan, spec.argument, batch, row);
     applyAggregateValue(spec, state, index, value, memory);
   }
+}
+
+/** Reads a datetime slot as its raw epoch milliseconds without boxing, or null when invalid. */
+function rawDatetimeValue(vector: DateTimeVector, rowIndex: number): number | null {
+  if (rowIndex < 0 || rowIndex >= vector.length) return null;
+  const window = vector.window;
+  let slot = rowIndex;
+  if (window !== undefined) {
+    slot = rowIndex - window.start;
+    if (slot < 0 || slot >= window.length) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+  }
+  if (!isValid(vector.validity, slot)) return null;
+  return vector.values[slot] ?? 0;
 }
 
 function updateAggregatesFromValues(
@@ -1953,27 +2388,35 @@ function applyAggregateValue(
     spec.name === "MIN" &&
     (state.values[index] === undefined || compareValues(value, state.values[index]) < 0)
   ) {
-    const replacementValue = asQueryValue(value);
-    const replacement = memory.reserve(
-      queryValuePayloadBytes(replacementValue),
-      "MIN aggregate value",
-    );
-    state.valueReservations[index]?.release();
-    state.valueReservations[index] = replacement;
-    state.values[index] = replacementValue;
+    replaceAggregateValue(state, index, asQueryValue(value), "MIN aggregate value", memory);
   } else if (
     spec.name === "MAX" &&
     (state.values[index] === undefined || compareValues(value, state.values[index]) > 0)
   ) {
-    const replacementValue = asQueryValue(value);
-    const replacement = memory.reserve(
-      queryValuePayloadBytes(replacementValue),
-      "MAX aggregate value",
-    );
+    replaceAggregateValue(state, index, asQueryValue(value), "MAX aggregate value", memory);
+  }
+}
+
+/**
+ * Installs a MIN/MAX replacement value. The retained reservation only changes when the payload
+ * size does: monotone inputs replace the extreme on nearly every row, and fixed-width values
+ * (numbers, datetimes) would otherwise churn a reserve/release pair per row for the same bytes.
+ */
+function replaceAggregateValue(
+  state: GroupState,
+  index: number,
+  value: QueryValue,
+  label: string,
+  memory: QueryMemoryContext,
+): void {
+  const bytes = queryValuePayloadBytes(value);
+  if (bytes !== state.valueReservationBytes[index]) {
+    const replacement = memory.reserve(bytes, label);
     state.valueReservations[index]?.release();
     state.valueReservations[index] = replacement;
-    state.values[index] = replacementValue;
+    state.valueReservationBytes[index] = bytes;
   }
+  state.values[index] = value;
 }
 
 function finishGroups(
@@ -2052,6 +2495,27 @@ function evaluateFinalExpression(
         : numeric(evaluateFinalExpression(plan, expression.arguments[1], group)),
     );
   }
+  if (expression.name === "COALESCE") {
+    for (const argument of expression.arguments) {
+      const candidate = evaluateFinalExpression(plan, argument, group);
+      if (candidate !== null && candidate !== undefined) return candidate;
+    }
+    return null;
+  }
+  if (expression.name === "DATE_TRUNC") {
+    return dateTruncValue(
+      evaluateFinalExpression(
+        plan,
+        required(expression.arguments[0], "DATE_TRUNC unit is missing"),
+        group,
+      ),
+      evaluateFinalExpression(
+        plan,
+        required(expression.arguments[1], "DATE_TRUNC argument is missing"),
+        group,
+      ),
+    );
+  }
   const aggregateIndex = expression.aggregateIndex ?? -1;
   const count = group.counts[aggregateIndex];
   if (count === undefined) throw new Error("Aggregate state is missing");
@@ -2060,7 +2524,12 @@ function evaluateFinalExpression(
   const sum = group.sums[aggregateIndex] ?? 0;
   if (expression.name === "SUM") return sum;
   if (expression.name === "AVG") return sum / count;
-  return group.values[aggregateIndex] ?? null;
+  const value = group.values[aggregateIndex] ?? null;
+  // Raw-millisecond datetime extremes re-box into a Date only here, once per surviving group.
+  if (typeof value === "number" && plan.aggregates[aggregateIndex]?.rawDatetime !== undefined) {
+    return new Date(value);
+  }
+  return value;
 }
 
 function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryRow {
@@ -2176,6 +2645,12 @@ function booleanTruth(
       if (expression.right.kind !== "list") throw new TypeError("IN requires a value list");
       const probe = evaluateValue(expression.left);
       if (probe === null || probe === undefined) return null;
+      const membership = cachedListMembership(expression.right, expression.right.items);
+      if (membership !== null) {
+        if (membership.set.has(comparable(probe))) return operator === "IN";
+        if (membership.hasNull) return null;
+        return operator === "NOT IN";
+      }
       let sawNull = false;
       for (const item of expression.right.items) {
         const value = evaluateValue(item);
@@ -2266,6 +2741,13 @@ function evaluateBatchPredicate(
   }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
+    const membership = cachedListMembership(predicate.right, predicate.right.items);
+    if (membership !== null) {
+      const value = evaluateBatchExpression(plan, predicate.left, batch, row);
+      if (value === null || value === undefined) return false;
+      if (membership.set.has(comparable(value))) return predicate.operator === "IN";
+      return predicate.operator === "NOT IN" && !membership.hasNull;
+    }
     return inListHolds(
       predicate.operator,
       evaluateBatchExpression(plan, predicate.left, batch, row),
@@ -2337,6 +2819,29 @@ function evaluateBatchExpression(
       evaluateBatchExpression(plan, expression.right, batch, row),
     );
   }
+  if (expression.name === "COALESCE") {
+    for (const argument of expression.arguments) {
+      const candidate = evaluateBatchExpression(plan, argument, batch, row);
+      if (candidate !== null && candidate !== undefined) return candidate;
+    }
+    return null;
+  }
+  if (expression.name === "DATE_TRUNC") {
+    return dateTruncValue(
+      evaluateBatchExpression(
+        plan,
+        required(expression.arguments[0], "DATE_TRUNC unit is missing"),
+        batch,
+        row,
+      ),
+      evaluateBatchExpression(
+        plan,
+        required(expression.arguments[1], "DATE_TRUNC argument is missing"),
+        batch,
+        row,
+      ),
+    );
+  }
   if (expression.name !== "ROUND")
     throw new TypeError(`${expression.name} requires grouped execution`);
   return roundValue(
@@ -2382,6 +2887,25 @@ function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Arra
       expression.operator,
       evaluateExpression(expression.left, rowsBySource),
       evaluateExpression(expression.right, rowsBySource),
+    );
+  }
+  if (expression.name === "COALESCE") {
+    for (const argument of expression.arguments) {
+      const candidate = evaluateExpression(argument, rowsBySource);
+      if (candidate !== null && candidate !== undefined) return candidate;
+    }
+    return null;
+  }
+  if (expression.name === "DATE_TRUNC") {
+    return dateTruncValue(
+      evaluateExpression(
+        required(expression.arguments[0], "DATE_TRUNC unit is missing"),
+        rowsBySource,
+      ),
+      evaluateExpression(
+        required(expression.arguments[1], "DATE_TRUNC argument is missing"),
+        rowsBySource,
+      ),
     );
   }
   if (expression.name !== "ROUND")

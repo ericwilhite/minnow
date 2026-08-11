@@ -1,4 +1,10 @@
-/// <reference lib="webworker" />
+/**
+ * The BrowserDatabase storage-configuration benchmark, moved nearly verbatim from the
+ * old dashboard worker: block write/readback with full value verification, transaction
+ * conflict and recovery probes, write-API measurements, and the reference queries with
+ * JavaScript baselines. Every database it opens is throwaway — dataset persistence is
+ * the datasets page's job now, not a benchmark side effect.
+ */
 import {
   decodeBlock,
   encodeBlock,
@@ -16,30 +22,41 @@ import { IndexedDbBlockStore, WriteConflictError } from "@browserdatabase/storag
 import { FaultInjectingBlockStore } from "@browserdatabase/testing";
 import { TransactionManager } from "@browserdatabase/transactions";
 import {
-  failure,
-  parseRequest,
-  protocolVersion,
-  success,
-  type ProgressResponse,
-} from "@browserdatabase/worker-protocol";
-import {
   benchmarkFocuses,
   durabilityModes,
   getScenario,
   scenarioIds,
-  type AdHocQueryResult,
   type BenchmarkConfig,
-  type BenchmarkProgress,
   type BenchmarkResult,
   type BlockMeasurement,
   type ColumnDefinition,
-  type EntityMeasurement,
   type EntityDefinition,
+  type EntityMeasurement,
   type LibraryCheckMeasurement,
   type LibraryTableMeasurement,
-  type PersistedDatasetStatus,
   type TransactionCheckMeasurement,
-} from "./benchmark.js";
+} from "../benchmark.js";
+import { canonicalTuples, referenceChecksum, tuplesMatch } from "./canonical.js";
+import {
+  buildReferenceQueryContext,
+  dateField,
+  numberField,
+  referenceQueryDefinitions,
+  stringField,
+  type ReferenceQueryDefinition,
+} from "./reference-suite.js";
+import {
+  assertNotCancelled,
+  cancelledRuns,
+  deleteDatabase,
+  describePlatform,
+  difference,
+  formatRate,
+  progress,
+  requestMemorySample,
+  storageEstimate,
+  sum,
+} from "./support.js";
 
 interface PendingBlock {
   measurement: BlockMeasurement;
@@ -48,108 +65,16 @@ interface PendingBlock {
   entityRows: number;
   scale: number;
 }
-
-const cancelledRuns = new Set<string>();
-const DATASET_REGISTRY_NAME = "browserdatabase-dashboard-datasets-v1";
-const DATASET_REGISTRY_STORE = "datasets";
-const DATASET_DATABASE_PREFIX = "browserdatabase-dashboard-dataset-";
-
-interface PersistedDatasetRecord {
-  runId: string;
-  databaseName: string;
-  createdAt: string;
-  scale: number;
-  compression: BenchmarkConfig["compression"];
-  targetBlockBytes: number;
-  durability: BenchmarkConfig["durability"];
-  totalRows: number;
-  storedBytes: number;
-  tableRows: Record<string, number>;
-}
-
-self.addEventListener("message", (event: MessageEvent<unknown>) => {
-  void runRequest(event.data);
-});
-
-async function runRequest(raw: unknown): Promise<void> {
-  let request: ReturnType<typeof parseRequest>;
-  try {
-    request = parseRequest(raw);
-    if (request.operation === "cancelBenchmark") {
-      const payload = request.payload as { requestId?: unknown };
-      if (typeof payload.requestId === "string") cancelledRuns.add(payload.requestId);
-      self.postMessage(success(request.requestId, { cancelled: payload.requestId }));
-      return;
-    }
-    if (request.operation === "datasetStatus") {
-      self.postMessage(success(request.requestId, await persistedDatasetStatus()));
-      return;
-    }
-    if (request.operation === "wipeDatasets") {
-      self.postMessage(success(request.requestId, await wipePersistedDatasets()));
-      return;
-    }
-    if (request.operation === "adHocQuery") {
-      const payload = request.payload as { sql?: unknown };
-      if (typeof payload.sql !== "string") throw new TypeError("Query SQL must be a string");
-      self.postMessage(success(request.requestId, await executePersistedAdHocQuery(payload.sql)));
-      return;
-    }
-    if (request.operation === "compareEngines") {
-      const { runEngineComparison } = await import("./engine-comparison.js");
-      const payload = request.payload as {
-        scale?: unknown;
-        compression?: unknown;
-        targetBlockBytes?: unknown;
-        durability?: unknown;
-        batchRows?: unknown;
-      };
-      if (typeof payload.scale !== "number" || payload.scale <= 0) {
-        throw new TypeError("Comparison scale must be a positive number");
-      }
-      if (!["raw", "rle", "gzip"].includes(String(payload.compression))) {
-        throw new TypeError("Invalid comparison compression");
-      }
-      if (typeof payload.targetBlockBytes !== "number" || payload.targetBlockBytes <= 0) {
-        throw new TypeError("Invalid comparison target block size");
-      }
-      if (!durabilityModes.includes(payload.durability as never)) {
-        throw new TypeError("Invalid comparison durability");
-      }
-      const result = await runEngineComparison(
-        {
-          scale: payload.scale,
-          compression: payload.compression as "raw" | "rle" | "gzip",
-          targetBlockBytes: payload.targetBlockBytes,
-          durability: payload.durability as "relaxed" | "strict",
-          ...(typeof payload.batchRows === "number" ? { batchRows: payload.batchRows } : {}),
-        },
-        (message, progressCompleted, progressTotal) => {
-          progress(request.requestId, {
-            phase: "library",
-            completed: progressCompleted,
-            total: progressTotal,
-            message,
-          });
-        },
-      );
-      self.postMessage(success(request.requestId, result));
-      return;
-    }
-    if (request.operation !== "benchmark") throw new Error("Unsupported benchmark operation");
-    const config = validateConfig(request.payload);
-    const result = await benchmark(request.requestId, config);
-    self.postMessage(success(request.requestId, result));
-  } catch (error) {
-    self.postMessage(failure(getRequestId(raw), error));
-  }
-}
-
-async function benchmark(requestId: string, config: BenchmarkConfig): Promise<BenchmarkResult> {
+export async function runStorageBenchmark(
+  requestId: string,
+  config: BenchmarkConfig,
+): Promise<BenchmarkResult> {
   const scenario = getScenario(config.scenario);
   const runId = crypto.randomUUID();
   const databaseName = `browserdatabase-bench-${runId}`;
   const estimateBefore = await storageEstimate();
+  // Sampled before any timer starts; the measurement waits for the next garbage collection.
+  const memoryBefore = await requestMemorySample(requestId, "Measuring memory before the run");
   const store = await IndexedDbBlockStore.open({
     name: databaseName,
     durability: config.durability,
@@ -300,6 +225,7 @@ async function benchmark(requestId: string, config: BenchmarkConfig): Promise<Be
     }
 
     const estimateAfter = await storageEstimate();
+    const memoryAfter = await requestMemorySample(requestId, "Measuring memory after the run");
     timings.total = performance.now() - started;
     assertNotCancelled(requestId);
     progress(requestId, {
@@ -370,6 +296,17 @@ async function benchmark(requestId: string, config: BenchmarkConfig): Promise<Be
           : { measuredDelta: estimateAfter.usage - estimateBefore.usage }),
         note: "The browser estimates total site storage. The size of each saved block is exact.",
       },
+      memory: {
+        agentStatus: memoryAfter.agentStatus,
+        agentDetail: memoryAfter.agentDetail,
+        agentBytesBefore: memoryBefore.agentBytes,
+        agentBytesAfter: memoryAfter.agentBytes,
+        agentDeltaBytes: difference(memoryAfter.agentBytes, memoryBefore.agentBytes),
+        agentByType: memoryAfter.agentByType,
+        heapBytesBefore: memoryBefore.heapBytes,
+        heapBytesAfter: memoryAfter.heapBytes,
+        heapDeltaBytes: difference(memoryAfter.heapBytes, memoryBefore.heapBytes),
+      },
       totals: {
         rows: sum(entityMeasurements.map((entity) => entity.rows)),
         entities: entityMeasurements.length,
@@ -416,7 +353,6 @@ async function benchmark(requestId: string, config: BenchmarkConfig): Promise<Be
     await deleteDatabase(databaseName);
   }
 }
-
 async function benchmarkTransactions(
   durability: IDBTransactionDurability,
   runId: string,
@@ -617,7 +553,6 @@ async function benchmarkTransactions(
 
   return { durationMs: performance.now() - started, checks };
 }
-
 async function benchmarkLibraryWrites(
   config: BenchmarkConfig,
   runId: string,
@@ -1109,33 +1044,11 @@ async function benchmarkLibraryWrites(
     passed: checks.every((check) => check.passed),
   };
 }
-
-interface ReferenceQueryDefinition {
-  id: string;
-  name: string;
-  complexity: "simple" | "moderate" | "complex";
-  sql: string;
-  tables: string[];
-  expectedRows: number;
-  execute: (context: ReferenceQueryContext) => unknown[];
-  oracle: (tables: ReadonlyMap<string, DatabaseRow[]>) => unknown[];
-}
-
-interface ReferenceQueryContext {
-  tables: ReadonlyMap<string, DatabaseRow[]>;
-  regionsById: ReadonlyMap<number, DatabaseRow>;
-  customersById: ReadonlyMap<number, DatabaseRow>;
-  productsById: ReadonlyMap<number, DatabaseRow>;
-  ordersById: ReadonlyMap<number, DatabaseRow>;
-  returnedItemIds: ReadonlySet<number>;
-  returnedOrderIds: ReadonlySet<number>;
-}
-
 async function benchmarkReferenceQueries(
   config: BenchmarkConfig,
   runId: string,
 ): Promise<BenchmarkResult["referenceQueries"]> {
-  const databaseName = `${DATASET_DATABASE_PREFIX}${Date.now().toString(36)}-${runId}`;
+  const databaseName = `bdb-storage-suite-reference-${runId}`;
   const store = await IndexedDbBlockStore.open({
     name: databaseName,
     durability: config.durability,
@@ -1159,7 +1072,6 @@ async function benchmarkReferenceQueries(
     relationship: entity.relationship ?? "supporting relation",
   }));
   const setupStarted = performance.now();
-  let retained = false;
 
   try {
     await createReferenceTables(database, relationalScenario.entities);
@@ -1180,26 +1092,16 @@ async function benchmarkReferenceQueries(
       measurements.push(measured.measurement);
     }
 
-    await registerPersistedDataset({
-      runId,
-      databaseName,
-      createdAt: new Date().toISOString(),
-      scale: config.scale,
-      compression: config.compression,
-      targetBlockBytes: config.targetBlockBytes,
-      durability: config.durability,
-      totalRows: sum(tableMetadata.map((table) => table.rows)),
-      storedBytes: await store.getLogicalStorageBytes(),
-      tableRows: Object.fromEntries(tableMetadata.map((table) => [table.name, table.rows])),
-    });
-    retained = true;
+    const engineSupportedQueries = measurements.filter((query) => query.engine.supported).length;
     return {
       orderRows,
       totalRows: sum(tableMetadata.map((table) => table.rows)),
       setupMs,
       loadMs,
       indexMs,
-      totalMs: loadMs + indexMs + sum(measurements.map((query) => query.measurementMs)),
+      totalMs: loadMs + indexMs + sum(measurements.map((query) => query.javascript.measurementMs)),
+      engineTotalMs: sum(measurements.map((query) => query.engine.medianMs)),
+      engineSupportedQueries,
       sampleCount,
       tables: tableMetadata,
       integrityChecks,
@@ -1207,14 +1109,13 @@ async function benchmarkReferenceQueries(
       passed:
         integrityChecks.every((check) => check.passed) &&
         measurements.every((query) => query.verified),
-      note: "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings.",
+      note: `Each query is submitted to BrowserDatabase as SQL and executed through the public prepareQuery()/execute() API; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it excludes the storage read the engine timing also excludes, but it does no planning and keeps whole tables resident. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
     };
   } finally {
     store.close();
-    if (!retained) await deleteDatabase(databaseName);
+    await deleteDatabase(databaseName);
   }
 }
-
 async function measureReferenceQueryFromStorage(
   database: BrowserDatabase,
   query: ReferenceQueryDefinition,
@@ -1233,7 +1134,7 @@ async function measureReferenceQueryFromStorage(
   const context = buildReferenceQueryContext(materialized);
   const indexMs = performance.now() - indexStarted;
   const warmupStarted = performance.now();
-  let result = query.execute(context);
+  let result = query.baseline(context);
   const warmupMs = performance.now() - warmupStarted;
   const executionsPerSample = Math.min(
     5_000,
@@ -1244,7 +1145,7 @@ async function measureReferenceQueryFromStorage(
   for (let sample = 0; sample < sampleCount; sample += 1) {
     const computeStarted = performance.now();
     for (let execution = 0; execution < executionsPerSample; execution += 1) {
-      result = query.execute(context);
+      result = query.baseline(context);
     }
     const elapsed = performance.now() - computeStarted;
     measurementMs += elapsed;
@@ -1253,11 +1154,29 @@ async function measureReferenceQueryFromStorage(
   samples.sort((left, right) => left - right);
   const medianMs = samples[Math.floor(samples.length / 2)] ?? 0;
   const p95Ms = samples[Math.ceil(samples.length * 0.95) - 1] ?? medianMs;
-  const checksum = referenceChecksum(result);
   const oracleStarted = performance.now();
   const oracleResult = query.oracle(materialized);
   const oracleMs = performance.now() - oracleStarted;
-  const oracleChecksum = referenceChecksum(oracleResult);
+  const baselineTuples = canonicalTuples(result, query.project);
+  const oracleTuples = canonicalTuples(oracleResult, query.project);
+  const engine = await measureReferenceQueryOnEngine(database, query, oracleTuples, sampleCount);
+  const javascript = {
+    sampleCount,
+    iterations: sampleCount * executionsPerSample,
+    executionsPerSample,
+    medianMs,
+    p95Ms,
+    oracleMs,
+    totalMs: sum(samples),
+    measurementMs,
+    resultRows: result.length,
+    checksum: referenceChecksum(baselineTuples),
+    oracleChecksum: referenceChecksum(oracleTuples),
+    verified:
+      result.length === query.expectedRows &&
+      oracleResult.length === query.expectedRows &&
+      tuplesMatch(baselineTuples, oracleTuples),
+  };
   return {
     loadMs,
     indexMs,
@@ -1267,26 +1186,72 @@ async function measureReferenceQueryFromStorage(
       complexity: query.complexity,
       sql: query.sql,
       tables: query.tables,
-      sampleCount,
-      iterations: sampleCount * executionsPerSample,
-      executionsPerSample,
-      medianMs,
-      p95Ms,
-      oracleMs,
-      totalMs: sum(samples),
-      measurementMs,
-      resultRows: result.length,
       expectedRows: query.expectedRows,
-      checksum,
-      oracleChecksum,
-      verified:
-        result.length === query.expectedRows &&
-        oracleResult.length === query.expectedRows &&
-        checksum === oracleChecksum,
+      ...(query.surfaceGap === undefined ? {} : { surfaceGap: query.surfaceGap }),
+      engine,
+      javascript,
+      // A query the engine cannot compile is a recorded gap, not a failure: the JavaScript
+      // reference still has to agree with its oracle for the run to pass.
+      verified: javascript.verified && (!engine.supported || engine.verified),
     },
   };
 }
 
+/**
+ * Runs the query's own SQL through the public prepare/execute API. Support is decided here,
+ * by compiling against the shipped engine, so a widened SQL surface shows up on the next run
+ * without anyone editing the catalog.
+ */
+async function measureReferenceQueryOnEngine(
+  database: BrowserDatabase,
+  query: ReferenceQueryDefinition,
+  oracleTuples: readonly unknown[][],
+  sampleCount: number,
+): Promise<BenchmarkResult["referenceQueries"]["queries"][number]["engine"]> {
+  let prepared: Awaited<ReturnType<BrowserDatabase["prepareQuery"]>> | undefined;
+  try {
+    const prepareStarted = performance.now();
+    prepared = await database.prepareQuery(query.sql);
+    const prepareMs = performance.now() - prepareStarted;
+    prepared.execute();
+    const samples: number[] = [];
+    let result = prepared.execute();
+    for (let sample = 0; sample < sampleCount; sample += 1) {
+      const started = performance.now();
+      result = prepared.execute();
+      samples.push(performance.now() - started);
+    }
+    samples.sort((left, right) => left - right);
+    const tuples = canonicalTuples(result.rows, (row) =>
+      query.columns.map((column) => row[column]),
+    );
+    return {
+      supported: true,
+      plan: await database.explain(query.sql),
+      prepareMs,
+      medianMs: samples[Math.floor(samples.length / 2)] ?? 0,
+      p95Ms: samples[Math.ceil(samples.length * 0.95) - 1] ?? 0,
+      iterations: samples.length,
+      resultRows: result.rows.length,
+      checksum: referenceChecksum(tuples),
+      verified: tuplesMatch(tuples, oracleTuples),
+    };
+  } catch (error) {
+    return {
+      supported: false,
+      error: error instanceof Error ? error.message : String(error),
+      prepareMs: 0,
+      medianMs: 0,
+      p95Ms: 0,
+      iterations: 0,
+      resultRows: 0,
+      checksum: 0,
+      verified: false,
+    };
+  } finally {
+    prepared?.close();
+  }
+}
 async function createReferenceTables(
   database: BrowserDatabase,
   entities: readonly EntityDefinition[],
@@ -1543,964 +1508,6 @@ async function validatePersistedReferenceDataset(
   });
   return checks;
 }
-
-function numericKeySet(
-  tables: ReadonlyMap<string, DatabaseRow[]>,
-  table: string,
-  column: string,
-): Set<number> {
-  return new Set(rows(tables, table).map((row) => numberField(row, column)));
-}
-
-function buildReferenceQueryContext(
-  tables: ReadonlyMap<string, DatabaseRow[]>,
-): ReferenceQueryContext {
-  const regionsById = indexRows(tables, "regions", "region_id");
-  const customersById = indexRows(tables, "customers", "customer_id");
-  const productsById = indexRows(tables, "products", "product_id");
-  const ordersById = indexRows(tables, "orders", "order_id");
-  const returnedItemIds = numericKeySet(tables, "returns", "item_id");
-  const returnedOrderIds = new Set<number>();
-  for (const item of rows(tables, "order_items")) {
-    if (returnedItemIds.has(numberField(item, "item_id"))) {
-      returnedOrderIds.add(numberField(item, "order_id"));
-    }
-  }
-  return {
-    tables,
-    regionsById,
-    customersById,
-    productsById,
-    ordersById,
-    returnedItemIds,
-    returnedOrderIds,
-  };
-}
-
-function indexRows(
-  tables: ReadonlyMap<string, DatabaseRow[]>,
-  table: string,
-  key: string,
-): Map<number, DatabaseRow> {
-  return new Map(rows(tables, table).map((row) => [numberField(row, key), row]));
-}
-
-function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefinition[] {
-  const pointId = Math.max(1, Math.floor(orderRows / 2));
-  const dateRangeRows = Math.min(
-    25,
-    Array.from({ length: orderRows }, (_, index) => index).filter(
-      (index) => index % 4 === 1 && index % 365 >= 90 && index % 365 < 181,
-    ).length,
-  );
-  return [
-    {
-      id: "q1",
-      name: "Order point lookup",
-      complexity: "simple",
-      tables: ["orders"],
-      expectedRows: 1,
-      sql: `SELECT * FROM orders WHERE order_id = ${String(pointId)};`,
-      execute: (context) => {
-        const row = context.ordersById.get(pointId);
-        return row === undefined ? [] : [row];
-      },
-      oracle: (tables) =>
-        rows(tables, "orders").filter((row) => numberField(row, "order_id") === pointId),
-    },
-    {
-      id: "q2",
-      name: "Paid orders in a date range",
-      complexity: "simple",
-      tables: ["orders"],
-      expectedRows: dateRangeRows,
-      sql: "SELECT order_id, customer_id, total FROM orders WHERE status = 'paid' AND placed_at >= DATE '2025-04-01' AND placed_at < DATE '2025-07-01' ORDER BY total DESC LIMIT 25;",
-      execute: (context) =>
-        rows(context.tables, "orders")
-          .filter((row) => {
-            const placed = dateField(row, "placed_at").getTime();
-            return (
-              stringField(row, "status") === "paid" &&
-              placed >= Date.UTC(2025, 3, 1) &&
-              placed < Date.UTC(2025, 6, 1)
-            );
-          })
-          .sort((left, right) => numberField(right, "total") - numberField(left, "total"))
-          .slice(0, 25),
-      oracle: (tables) =>
-        rows(tables, "orders")
-          .filter((row) => {
-            const placed = dateField(row, "placed_at").getTime();
-            return (
-              stringField(row, "status") === "paid" &&
-              placed >= Date.UTC(2025, 3, 1) &&
-              placed < Date.UTC(2025, 6, 1)
-            );
-          })
-          .sort((left, right) => numberField(right, "total") - numberField(left, "total"))
-          .slice(0, 25),
-    },
-    {
-      id: "q3",
-      name: "Revenue by order status",
-      complexity: "moderate",
-      tables: ["orders"],
-      expectedRows: 4,
-      sql: "SELECT status, COUNT(*) AS orders, SUM(total) AS revenue, AVG(total) AS avg_order FROM orders GROUP BY status ORDER BY revenue DESC;",
-      execute: (context) => groupRevenue(rows(context.tables, "orders"), "status", "total"),
-      oracle: groupRevenueOracle,
-    },
-    {
-      id: "q4",
-      name: "Top customers by captured revenue",
-      complexity: "moderate",
-      tables: ["customers", "orders", "payments"],
-      expectedRows: 20,
-      sql: "SELECT c.customer_id, c.segment, SUM(p.captured_amount) AS revenue FROM customers c JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY c.customer_id, c.segment ORDER BY revenue DESC LIMIT 20;",
-      execute: topCustomersIndexed,
-      oracle: topCustomers,
-    },
-    {
-      id: "q5",
-      name: "Category revenue after discounts",
-      complexity: "moderate",
-      tables: ["order_items", "products"],
-      expectedRows: 5,
-      sql: "SELECT p.category, SUM(i.quantity * i.unit_price * (1 - i.discount_pct)) AS net_revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category ORDER BY net_revenue DESC;",
-      execute: categoryRevenueIndexed,
-      oracle: categoryRevenue,
-    },
-    {
-      id: "q6",
-      name: "Repeat customers without returns",
-      complexity: "complex",
-      tables: ["customers", "orders", "order_items", "returns"],
-      expectedRows: expectedRepeatCustomerRows(orderRows),
-      sql: "SELECT c.customer_id, COUNT(DISTINCT o.order_id) AS orders FROM customers c JOIN orders o ON o.customer_id = c.customer_id WHERE NOT EXISTS (SELECT 1 FROM order_items i JOIN returns r ON r.item_id = i.item_id WHERE i.order_id = o.order_id) GROUP BY c.customer_id HAVING COUNT(DISTINCT o.order_id) >= 2;",
-      execute: repeatCustomersWithoutReturnsIndexed,
-      oracle: repeatCustomersWithoutReturns,
-    },
-    {
-      id: "q7",
-      name: "Top products within each category",
-      complexity: "complex",
-      tables: ["order_items", "products"],
-      expectedRows: 15,
-      sql: "WITH product_revenue AS (...) SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY revenue DESC) AS rank FROM product_revenue QUALIFY rank <= 3;",
-      execute: rankedProductsIndexed,
-      oracle: rankedProducts,
-    },
-    {
-      id: "q8",
-      name: "Monthly cohort revenue and return rate",
-      complexity: "complex",
-      tables: ["customers", "orders", "order_items", "returns", "payments"],
-      expectedRows: 12,
-      sql: "WITH cohorts AS (...), customer_revenue AS (...), returned_orders AS (...) SELECT cohort_month, COUNT(DISTINCT customer_id), SUM(revenue), AVG(has_return) FROM ... GROUP BY cohort_month ORDER BY cohort_month;",
-      execute: cohortAnalysisIndexed,
-      oracle: cohortAnalysis,
-    },
-    {
-      id: "q9",
-      name: "Region and segment revenue matrix",
-      complexity: "complex",
-      tables: ["regions", "customers", "orders", "payments"],
-      expectedRows: expectedRegionSegmentRows(orderRows),
-      sql: "SELECT r.name AS region, c.segment, COUNT(DISTINCT c.customer_id) AS customers, SUM(p.captured_amount) AS revenue FROM regions r JOIN customers c ON c.region_id = r.region_id JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY r.name, c.segment ORDER BY r.name, c.segment;",
-      execute: regionSegmentRevenueIndexed,
-      oracle: regionSegmentRevenue,
-    },
-    {
-      id: "q10",
-      name: "Return rate by product category",
-      complexity: "complex",
-      tables: ["products", "order_items", "returns"],
-      expectedRows: 5,
-      sql: "SELECT p.category, COUNT(*) AS items, SUM(CASE WHEN r.return_id IS NOT NULL THEN 1 ELSE 0 END) AS returns, AVG(CASE WHEN r.return_id IS NOT NULL THEN 1.0 ELSE 0.0 END) AS return_rate FROM products p JOIN order_items i ON i.product_id = p.product_id LEFT JOIN returns r ON r.item_id = i.item_id GROUP BY p.category ORDER BY p.category;",
-      execute: categoryReturnRateIndexed,
-      oracle: categoryReturnRate,
-    },
-    {
-      id: "q11",
-      name: "Tax collected by jurisdiction",
-      complexity: "complex",
-      tables: ["order_taxes", "tax_rates", "tax_jurisdictions"],
-      expectedRows: Math.max(1, Math.ceil((orderRows * 24) / 1_000)),
-      sql: "SELECT j.name, SUM(t.tax_amount) AS tax_collected FROM order_taxes t JOIN tax_rates r ON r.tax_rate_id = t.tax_rate_id JOIN tax_jurisdictions j ON j.jurisdiction_id = r.jurisdiction_id GROUP BY j.name ORDER BY tax_collected DESC;",
-      execute: taxByJurisdictionIndexed,
-      oracle: taxByJurisdiction,
-    },
-    {
-      id: "q12",
-      name: "Fulfillment volume by warehouse",
-      complexity: "moderate",
-      tables: ["shipments", "shipment_items", "warehouses"],
-      expectedRows: Math.max(1, Math.ceil((orderRows * 8) / 1_000)),
-      sql: "SELECT w.name, COUNT(DISTINCT s.shipment_id) AS shipments, SUM(si.quantity) AS units FROM warehouses w JOIN shipments s ON s.warehouse_id = w.warehouse_id JOIN shipment_items si ON si.shipment_id = s.shipment_id GROUP BY w.name ORDER BY units DESC;",
-      execute: fulfillmentByWarehouseIndexed,
-      oracle: fulfillmentByWarehouse,
-    },
-    {
-      id: "q13",
-      name: "Supplier inventory ledger",
-      complexity: "moderate",
-      tables: ["inventory_movements", "suppliers"],
-      expectedRows: Math.max(1, Math.ceil((orderRows * 40) / 1_000)),
-      sql: "SELECT s.name, COUNT(*) AS movements, SUM(m.quantity_delta) AS net_units FROM suppliers s JOIN inventory_movements m ON m.supplier_id = s.supplier_id GROUP BY s.name ORDER BY movements DESC;",
-      execute: supplierInventoryIndexed,
-      oracle: supplierInventory,
-    },
-    {
-      id: "q14",
-      name: "Payment transaction funnel",
-      complexity: "simple",
-      tables: ["payment_transactions"],
-      expectedRows: 4,
-      sql: "SELECT kind, status, COUNT(*) AS transactions, SUM(amount) AS amount FROM payment_transactions GROUP BY kind, status ORDER BY kind, status;",
-      execute: paymentFunnelIndexed,
-      oracle: paymentFunnel,
-    },
-    {
-      id: "q15",
-      name: "Discount and tax burden by order status",
-      complexity: "complex",
-      tables: ["orders", "order_discounts", "order_taxes"],
-      expectedRows: 4,
-      sql: "WITH discounts AS (SELECT order_id, SUM(amount) AS amount FROM order_discounts GROUP BY order_id), taxes AS (SELECT order_id, SUM(tax_amount) AS amount FROM order_taxes GROUP BY order_id) SELECT o.status, SUM(COALESCE(d.amount, 0)) AS discounts, SUM(COALESCE(t.amount, 0)) AS taxes FROM orders o LEFT JOIN discounts d ON d.order_id = o.order_id LEFT JOIN taxes t ON t.order_id = o.order_id GROUP BY o.status ORDER BY o.status;",
-      execute: orderAdjustmentsIndexed,
-      oracle: orderAdjustments,
-    },
-  ];
-}
-
-function expectedRegionSegmentRows(orderRows: number): number {
-  const customerRows = Math.max(1, Math.ceil(orderRows / 5));
-  const regionRows = Math.max(1, Math.ceil((orderRows * 16) / 1_000));
-  const groups = new Set<string>();
-  for (let index = 0; index < orderRows; index += 1) {
-    if (index % 7 === 0) continue;
-    const customerIndex = index % customerRows;
-    groups.add(`${String(customerIndex % regionRows)}:${String(customerIndex % 3)}`);
-  }
-  return groups.size;
-}
-
-function expectedRepeatCustomerRows(orderRows: number): number {
-  const customerRows = Math.max(20, Math.ceil(orderRows / 5));
-  const returnRows = Math.max(1, Math.floor(orderRows / 10));
-  const returnedOrders = new Set(Array.from({ length: returnRows }, (_, index) => index * 10 + 1));
-  const counts = new Map<number, number>();
-  for (let orderId = 1; orderId <= orderRows; orderId += 1) {
-    if (returnedOrders.has(orderId)) continue;
-    const customerId = ((orderId - 1) % customerRows) + 1;
-    counts.set(customerId, (counts.get(customerId) ?? 0) + 1);
-  }
-  return [...counts.values()].filter((count) => count >= 2).length;
-}
-
-function rows(tables: ReadonlyMap<string, DatabaseRow[]>, name: string): DatabaseRow[] {
-  return tables.get(name) ?? [];
-}
-
-function numberField(row: DatabaseRow, name: string): number {
-  const value = row[name];
-  if (typeof value !== "number") throw new Error(`Expected numeric field: ${name}`);
-  return value;
-}
-
-function stringField(row: DatabaseRow, name: string): string {
-  const value = row[name];
-  if (typeof value !== "string") throw new Error(`Expected string field: ${name}`);
-  return value;
-}
-
-function dateField(row: DatabaseRow, name: string): Date {
-  const value = row[name];
-  if (!(value instanceof Date)) throw new Error(`Expected datetime field: ${name}`);
-  return value;
-}
-
-function groupRevenue(input: DatabaseRow[], group: string, amount: string): unknown[] {
-  const groups = new Map<string, { count: number; total: number }>();
-  for (const row of input) {
-    const key = stringField(row, group);
-    const current = groups.get(key) ?? { count: 0, total: 0 };
-    current.count += 1;
-    current.total += numberField(row, amount);
-    groups.set(key, current);
-  }
-  return [...groups]
-    .map(([key, value]) => ({
-      key,
-      count: value.count,
-      total: value.total,
-      average: value.total / value.count,
-    }))
-    .sort((left, right) => right.total - left.total);
-}
-
-function groupRevenueOracle(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const statuses: Record<string, { count: number; total: number }> = {};
-  for (const order of rows(tables, "orders")) {
-    const status = stringField(order, "status");
-    const current = statuses[status] ?? { count: 0, total: 0 };
-    statuses[status] = {
-      count: current.count + 1,
-      total: current.total + numberField(order, "total"),
-    };
-  }
-  return Object.entries(statuses)
-    .map(([key, value]) => ({
-      key,
-      count: value.count,
-      total: value.total,
-      average: value.total / value.count,
-    }))
-    .sort((left, right) => right.total - left.total);
-}
-
-function topCustomers(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const customers = new Map(
-    rows(tables, "customers").map((row) => [numberField(row, "customer_id"), row]),
-  );
-  const ordersById = new Map(
-    rows(tables, "orders").map((row) => [numberField(row, "order_id"), row]),
-  );
-  const revenue = new Map<number, number>();
-  for (const payment of rows(tables, "payments")) {
-    if (stringField(payment, "status") !== "captured") continue;
-    const order = ordersById.get(numberField(payment, "order_id"));
-    if (order === undefined) continue;
-    const customerId = numberField(order, "customer_id");
-    revenue.set(
-      customerId,
-      (revenue.get(customerId) ?? 0) + numberField(payment, "captured_amount"),
-    );
-  }
-  return [...revenue]
-    .map(([customerId, total]) => ({
-      customerId,
-      segment: stringField(customers.get(customerId) ?? {}, "segment"),
-      total,
-    }))
-    .sort((left, right) => right.total - left.total)
-    .slice(0, 20);
-}
-
-function categoryRevenue(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const products = new Map(
-    rows(tables, "products").map((row) => [numberField(row, "product_id"), row]),
-  );
-  const totals = new Map<string, number>();
-  for (const item of rows(tables, "order_items")) {
-    const product = products.get(numberField(item, "product_id"));
-    if (product === undefined) continue;
-    const category = stringField(product, "category");
-    const net =
-      numberField(item, "quantity") *
-      numberField(item, "unit_price") *
-      (1 - numberField(item, "discount_pct"));
-    totals.set(category, (totals.get(category) ?? 0) + net);
-  }
-  return [...totals]
-    .map(([category, revenue]) => ({ category, revenue }))
-    .sort((left, right) => right.revenue - left.revenue);
-}
-
-function repeatCustomersWithoutReturns(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const returnedItems = new Set(rows(tables, "returns").map((row) => numberField(row, "item_id")));
-  const returnedOrders = new Set<number>();
-  for (const item of rows(tables, "order_items")) {
-    if (returnedItems.has(numberField(item, "item_id")))
-      returnedOrders.add(numberField(item, "order_id"));
-  }
-  const counts = new Map<number, number>();
-  for (const order of rows(tables, "orders")) {
-    if (returnedOrders.has(numberField(order, "order_id"))) continue;
-    const customerId = numberField(order, "customer_id");
-    counts.set(customerId, (counts.get(customerId) ?? 0) + 1);
-  }
-  return [...counts]
-    .filter(([, count]) => count >= 2)
-    .map(([customerId, count]) => ({ customerId, count }));
-}
-
-function rankedProducts(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const products = new Map(
-    rows(tables, "products").map((row) => [numberField(row, "product_id"), row]),
-  );
-  const totals = new Map<number, number>();
-  for (const item of rows(tables, "order_items")) {
-    const productId = numberField(item, "product_id");
-    totals.set(
-      productId,
-      (totals.get(productId) ?? 0) +
-        numberField(item, "quantity") * numberField(item, "unit_price"),
-    );
-  }
-  const byCategory = new Map<string, Array<{ productId: number; revenue: number }>>();
-  for (const [productId, revenue] of totals) {
-    const product = products.get(productId);
-    if (product === undefined) continue;
-    const category = stringField(product, "category");
-    const list = byCategory.get(category) ?? [];
-    list.push({ productId, revenue });
-    byCategory.set(category, list);
-  }
-  return [...byCategory].flatMap(([category, values]) =>
-    values
-      .sort((left, right) => right.revenue - left.revenue)
-      .slice(0, 3)
-      .map((value, index) => ({ category, ...value, rank: index + 1 })),
-  );
-}
-
-function cohortAnalysis(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const customers = new Map(
-    rows(tables, "customers").map((row) => [numberField(row, "customer_id"), row]),
-  );
-  const orders = new Map(rows(tables, "orders").map((row) => [numberField(row, "order_id"), row]));
-  const returnedItems = new Set(rows(tables, "returns").map((row) => numberField(row, "item_id")));
-  const returnedOrders = new Set<number>();
-  for (const item of rows(tables, "order_items"))
-    if (returnedItems.has(numberField(item, "item_id")))
-      returnedOrders.add(numberField(item, "order_id"));
-  const cohorts = new Map<
-    string,
-    { customers: Set<number>; revenue: number; orders: number; returned: number }
-  >();
-  for (const payment of rows(tables, "payments")) {
-    if (stringField(payment, "status") !== "captured") continue;
-    const orderId = numberField(payment, "order_id");
-    const order = orders.get(orderId);
-    if (order === undefined) continue;
-    const customerId = numberField(order, "customer_id");
-    const customer = customers.get(customerId);
-    if (customer === undefined) continue;
-    const joined = dateField(customer, "joined_at");
-    const cohort = `${String(joined.getUTCFullYear())}-${String(joined.getUTCMonth() + 1).padStart(2, "0")}`;
-    const value = cohorts.get(cohort) ?? {
-      customers: new Set<number>(),
-      revenue: 0,
-      orders: 0,
-      returned: 0,
-    };
-    value.customers.add(customerId);
-    value.revenue += numberField(payment, "captured_amount");
-    value.orders += 1;
-    if (returnedOrders.has(orderId)) value.returned += 1;
-    cohorts.set(cohort, value);
-  }
-  return [...cohorts]
-    .map(([cohort, value]) => ({
-      cohort,
-      customers: value.customers.size,
-      revenue: value.revenue,
-      returnRate: value.returned / value.orders,
-    }))
-    .sort((left, right) => left.cohort.localeCompare(right.cohort));
-}
-
-function topCustomersIndexed(context: ReferenceQueryContext): unknown[] {
-  const revenue = new Map<number, number>();
-  for (const payment of rows(context.tables, "payments")) {
-    if (stringField(payment, "status") !== "captured") continue;
-    const order = context.ordersById.get(numberField(payment, "order_id"));
-    if (order === undefined) continue;
-    const customerId = numberField(order, "customer_id");
-    revenue.set(
-      customerId,
-      (revenue.get(customerId) ?? 0) + numberField(payment, "captured_amount"),
-    );
-  }
-  return [...revenue]
-    .map(([customerId, total]) => ({
-      customerId,
-      segment: stringField(context.customersById.get(customerId) ?? {}, "segment"),
-      total,
-    }))
-    .sort((left, right) => right.total - left.total)
-    .slice(0, 20);
-}
-
-function categoryRevenueIndexed(context: ReferenceQueryContext): unknown[] {
-  const totals = new Map<string, number>();
-  for (const item of rows(context.tables, "order_items")) {
-    const product = context.productsById.get(numberField(item, "product_id"));
-    if (product === undefined) continue;
-    const category = stringField(product, "category");
-    const net =
-      numberField(item, "quantity") *
-      numberField(item, "unit_price") *
-      (1 - numberField(item, "discount_pct"));
-    totals.set(category, (totals.get(category) ?? 0) + net);
-  }
-  return [...totals]
-    .map(([category, revenue]) => ({ category, revenue }))
-    .sort((left, right) => right.revenue - left.revenue);
-}
-
-function repeatCustomersWithoutReturnsIndexed(context: ReferenceQueryContext): unknown[] {
-  const counts = new Map<number, number>();
-  for (const order of rows(context.tables, "orders")) {
-    if (context.returnedOrderIds.has(numberField(order, "order_id"))) continue;
-    const customerId = numberField(order, "customer_id");
-    counts.set(customerId, (counts.get(customerId) ?? 0) + 1);
-  }
-  return [...counts]
-    .filter(([, count]) => count >= 2)
-    .map(([customerId, count]) => ({ customerId, count }));
-}
-
-function rankedProductsIndexed(context: ReferenceQueryContext): unknown[] {
-  const totals = new Map<number, number>();
-  for (const item of rows(context.tables, "order_items")) {
-    const productId = numberField(item, "product_id");
-    totals.set(
-      productId,
-      (totals.get(productId) ?? 0) +
-        numberField(item, "quantity") * numberField(item, "unit_price"),
-    );
-  }
-  const byCategory = new Map<string, Array<{ productId: number; revenue: number }>>();
-  for (const [productId, revenue] of totals) {
-    const product = context.productsById.get(productId);
-    if (product === undefined) continue;
-    const category = stringField(product, "category");
-    const list = byCategory.get(category) ?? [];
-    list.push({ productId, revenue });
-    byCategory.set(category, list);
-  }
-  return [...byCategory].flatMap(([category, values]) =>
-    values
-      .sort((left, right) => right.revenue - left.revenue)
-      .slice(0, 3)
-      .map((value, index) => ({ category, ...value, rank: index + 1 })),
-  );
-}
-
-function cohortAnalysisIndexed(context: ReferenceQueryContext): unknown[] {
-  const cohorts = new Map<
-    string,
-    { customers: Set<number>; revenue: number; orders: number; returned: number }
-  >();
-  for (const payment of rows(context.tables, "payments")) {
-    if (stringField(payment, "status") !== "captured") continue;
-    const orderId = numberField(payment, "order_id");
-    const order = context.ordersById.get(orderId);
-    if (order === undefined) continue;
-    const customerId = numberField(order, "customer_id");
-    const customer = context.customersById.get(customerId);
-    if (customer === undefined) continue;
-    const joined = dateField(customer, "joined_at");
-    const cohort = `${String(joined.getUTCFullYear())}-${String(joined.getUTCMonth() + 1).padStart(2, "0")}`;
-    const value = cohorts.get(cohort) ?? {
-      customers: new Set<number>(),
-      revenue: 0,
-      orders: 0,
-      returned: 0,
-    };
-    value.customers.add(customerId);
-    value.revenue += numberField(payment, "captured_amount");
-    value.orders += 1;
-    if (context.returnedOrderIds.has(orderId)) value.returned += 1;
-    cohorts.set(cohort, value);
-  }
-  return [...cohorts]
-    .map(([cohort, value]) => ({
-      cohort,
-      customers: value.customers.size,
-      revenue: value.revenue,
-      returnRate: value.returned / value.orders,
-    }))
-    .sort((left, right) => left.cohort.localeCompare(right.cohort));
-}
-
-function regionSegmentRevenueIndexed(context: ReferenceQueryContext): unknown[] {
-  return collectRegionSegmentRevenue(
-    rows(context.tables, "payments"),
-    context.ordersById,
-    context.customersById,
-    context.regionsById,
-  );
-}
-
-function regionSegmentRevenue(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const ordersById = indexRows(tables, "orders", "order_id");
-  const customersById = indexRows(tables, "customers", "customer_id");
-  const regionsById = indexRows(tables, "regions", "region_id");
-  const groups: Record<
-    string,
-    { region: string; segment: string; customers: Set<number>; revenue: number }
-  > = {};
-  for (const payment of rows(tables, "payments")) {
-    if (stringField(payment, "status") !== "captured") continue;
-    const order = ordersById.get(numberField(payment, "order_id"));
-    if (order === undefined) continue;
-    const customerId = numberField(order, "customer_id");
-    const customer = customersById.get(customerId);
-    if (customer === undefined) continue;
-    const region = regionsById.get(numberField(customer, "region_id"));
-    if (region === undefined) continue;
-    const regionName = stringField(region, "name");
-    const segment = stringField(customer, "segment");
-    const key = `${regionName}\u0000${segment}`;
-    const current = groups[key] ?? {
-      region: regionName,
-      segment,
-      customers: new Set<number>(),
-      revenue: 0,
-    };
-    current.customers.add(customerId);
-    current.revenue += numberField(payment, "captured_amount");
-    groups[key] = current;
-  }
-  return Object.values(groups)
-    .map((value) => ({
-      region: value.region,
-      segment: value.segment,
-      customers: value.customers.size,
-      revenue: value.revenue,
-    }))
-    .sort(
-      (left, right) =>
-        left.region.localeCompare(right.region) || left.segment.localeCompare(right.segment),
-    );
-}
-
-function collectRegionSegmentRevenue(
-  payments: DatabaseRow[],
-  ordersById: ReadonlyMap<number, DatabaseRow>,
-  customersById: ReadonlyMap<number, DatabaseRow>,
-  regionsById: ReadonlyMap<number, DatabaseRow>,
-): unknown[] {
-  const groups = new Map<
-    string,
-    { region: string; segment: string; customers: Set<number>; revenue: number }
-  >();
-  for (const payment of payments) {
-    if (stringField(payment, "status") !== "captured") continue;
-    const order = ordersById.get(numberField(payment, "order_id"));
-    if (order === undefined) continue;
-    const customerId = numberField(order, "customer_id");
-    const customer = customersById.get(customerId);
-    if (customer === undefined) continue;
-    const region = regionsById.get(numberField(customer, "region_id"));
-    if (region === undefined) continue;
-    const regionName = stringField(region, "name");
-    const segment = stringField(customer, "segment");
-    const key = `${regionName}\u0000${segment}`;
-    const value = groups.get(key) ?? {
-      region: regionName,
-      segment,
-      customers: new Set<number>(),
-      revenue: 0,
-    };
-    value.customers.add(customerId);
-    value.revenue += numberField(payment, "captured_amount");
-    groups.set(key, value);
-  }
-  return [...groups.values()]
-    .map((value) => ({
-      region: value.region,
-      segment: value.segment,
-      customers: value.customers.size,
-      revenue: value.revenue,
-    }))
-    .sort(
-      (left, right) =>
-        left.region.localeCompare(right.region) || left.segment.localeCompare(right.segment),
-    );
-}
-
-function categoryReturnRateIndexed(context: ReferenceQueryContext): unknown[] {
-  return collectCategoryReturnRate(
-    rows(context.tables, "order_items"),
-    context.productsById,
-    context.returnedItemIds,
-  );
-}
-
-function categoryReturnRate(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const productsById = indexRows(tables, "products", "product_id");
-  const returnedItemIds = numericKeySet(tables, "returns", "item_id");
-  const groups: Record<string, { items: number; returns: number }> = {};
-  for (const item of rows(tables, "order_items")) {
-    const product = productsById.get(numberField(item, "product_id"));
-    if (product === undefined) continue;
-    const category = stringField(product, "category");
-    const current = groups[category] ?? { items: 0, returns: 0 };
-    current.items += 1;
-    if (returnedItemIds.has(numberField(item, "item_id"))) current.returns += 1;
-    groups[category] = current;
-  }
-  return Object.entries(groups)
-    .map(([category, value]) => ({
-      category,
-      items: value.items,
-      returns: value.returns,
-      returnRate: value.returns / value.items,
-    }))
-    .sort((left, right) => left.category.localeCompare(right.category));
-}
-
-function collectCategoryReturnRate(
-  items: DatabaseRow[],
-  productsById: ReadonlyMap<number, DatabaseRow>,
-  returnedItemIds: ReadonlySet<number>,
-): unknown[] {
-  const groups = new Map<string, { items: number; returns: number }>();
-  for (const item of items) {
-    const product = productsById.get(numberField(item, "product_id"));
-    if (product === undefined) continue;
-    const category = stringField(product, "category");
-    const value = groups.get(category) ?? { items: 0, returns: 0 };
-    value.items += 1;
-    if (returnedItemIds.has(numberField(item, "item_id"))) value.returns += 1;
-    groups.set(category, value);
-  }
-  return [...groups]
-    .map(([category, value]) => ({
-      category,
-      items: value.items,
-      returns: value.returns,
-      returnRate: value.returns / value.items,
-    }))
-    .sort((left, right) => left.category.localeCompare(right.category));
-}
-
-function taxByJurisdictionIndexed(context: ReferenceQueryContext): unknown[] {
-  const rates = indexRows(context.tables, "tax_rates", "tax_rate_id");
-  const jurisdictions = indexRows(context.tables, "tax_jurisdictions", "jurisdiction_id");
-  const totals = new Map<string, number>();
-  for (const tax of rows(context.tables, "order_taxes")) {
-    const rate = rates.get(numberField(tax, "tax_rate_id"));
-    const jurisdiction =
-      rate === undefined ? undefined : jurisdictions.get(numberField(rate, "jurisdiction_id"));
-    if (jurisdiction === undefined) continue;
-    const name = stringField(jurisdiction, "name");
-    totals.set(name, (totals.get(name) ?? 0) + numberField(tax, "tax_amount"));
-  }
-  return [...totals]
-    .map(([name, tax]) => ({ name, tax }))
-    .sort((left, right) => right.tax - left.tax || left.name.localeCompare(right.name));
-}
-
-function taxByJurisdiction(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const rateToJurisdiction: Record<string, number> = {};
-  for (const rate of rows(tables, "tax_rates")) {
-    rateToJurisdiction[String(numberField(rate, "tax_rate_id"))] = numberField(
-      rate,
-      "jurisdiction_id",
-    );
-  }
-  const names = Object.fromEntries(
-    rows(tables, "tax_jurisdictions").map((row) => [
-      String(numberField(row, "jurisdiction_id")),
-      stringField(row, "name"),
-    ]),
-  );
-  const totals: Record<string, number> = {};
-  for (const tax of rows(tables, "order_taxes")) {
-    const jurisdictionId = rateToJurisdiction[String(numberField(tax, "tax_rate_id"))];
-    const name = jurisdictionId === undefined ? undefined : names[String(jurisdictionId)];
-    if (name === undefined) continue;
-    totals[name] = (totals[name] ?? 0) + numberField(tax, "tax_amount");
-  }
-  return Object.entries(totals)
-    .map(([name, tax]) => ({ name, tax }))
-    .sort((left, right) => right.tax - left.tax || left.name.localeCompare(right.name));
-}
-
-function fulfillmentByWarehouseIndexed(context: ReferenceQueryContext): unknown[] {
-  const shipments = indexRows(context.tables, "shipments", "shipment_id");
-  const warehouses = indexRows(context.tables, "warehouses", "warehouse_id");
-  const groups = new Map<string, { shipments: Set<number>; units: number }>();
-  for (const item of rows(context.tables, "shipment_items")) {
-    const shipment = shipments.get(numberField(item, "shipment_id"));
-    const warehouse =
-      shipment === undefined ? undefined : warehouses.get(numberField(shipment, "warehouse_id"));
-    if (warehouse === undefined) continue;
-    const name = stringField(warehouse, "name");
-    const value = groups.get(name) ?? { shipments: new Set<number>(), units: 0 };
-    value.shipments.add(numberField(item, "shipment_id"));
-    value.units += numberField(item, "quantity");
-    groups.set(name, value);
-  }
-  return [...groups]
-    .map(([name, value]) => ({ name, shipments: value.shipments.size, units: value.units }))
-    .sort((left, right) => right.units - left.units || left.name.localeCompare(right.name));
-}
-
-function fulfillmentByWarehouse(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const warehouseNames = Object.fromEntries(
-    rows(tables, "warehouses").map((row) => [
-      String(numberField(row, "warehouse_id")),
-      stringField(row, "name"),
-    ]),
-  );
-  const shipmentWarehouses = Object.fromEntries(
-    rows(tables, "shipments").map((row) => [
-      String(numberField(row, "shipment_id")),
-      numberField(row, "warehouse_id"),
-    ]),
-  );
-  const groups: Record<string, { shipments: Set<number>; units: number }> = {};
-  for (const item of rows(tables, "shipment_items")) {
-    const shipmentId = numberField(item, "shipment_id");
-    const warehouseId = shipmentWarehouses[String(shipmentId)];
-    const name = warehouseId === undefined ? undefined : warehouseNames[String(warehouseId)];
-    if (name === undefined) continue;
-    const value = groups[name] ?? { shipments: new Set<number>(), units: 0 };
-    value.shipments.add(shipmentId);
-    value.units += numberField(item, "quantity");
-    groups[name] = value;
-  }
-  return Object.entries(groups)
-    .map(([name, value]) => ({ name, shipments: value.shipments.size, units: value.units }))
-    .sort((left, right) => right.units - left.units || left.name.localeCompare(right.name));
-}
-
-function supplierInventoryIndexed(context: ReferenceQueryContext): unknown[] {
-  const suppliers = indexRows(context.tables, "suppliers", "supplier_id");
-  const groups = new Map<string, { movements: number; netUnits: number }>();
-  for (const movement of rows(context.tables, "inventory_movements")) {
-    const supplier = suppliers.get(numberField(movement, "supplier_id"));
-    if (supplier === undefined) continue;
-    const name = stringField(supplier, "name");
-    const value = groups.get(name) ?? { movements: 0, netUnits: 0 };
-    value.movements += 1;
-    value.netUnits += numberField(movement, "quantity_delta");
-    groups.set(name, value);
-  }
-  return [...groups]
-    .map(([name, value]) => ({ name, ...value }))
-    .sort((left, right) => right.movements - left.movements || left.name.localeCompare(right.name));
-}
-
-function supplierInventory(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const names = Object.fromEntries(
-    rows(tables, "suppliers").map((row) => [
-      String(numberField(row, "supplier_id")),
-      stringField(row, "name"),
-    ]),
-  );
-  const groups: Record<string, { movements: number; netUnits: number }> = {};
-  for (const movement of rows(tables, "inventory_movements")) {
-    const name = names[String(numberField(movement, "supplier_id"))];
-    if (name === undefined) continue;
-    const value = groups[name] ?? { movements: 0, netUnits: 0 };
-    value.movements += 1;
-    value.netUnits += numberField(movement, "quantity_delta");
-    groups[name] = value;
-  }
-  return Object.entries(groups)
-    .map(([name, value]) => ({ name, ...value }))
-    .sort((left, right) => right.movements - left.movements || left.name.localeCompare(right.name));
-}
-
-function paymentFunnelIndexed(context: ReferenceQueryContext): unknown[] {
-  const groups = new Map<string, { kind: string; status: string; count: number; amount: number }>();
-  for (const transaction of rows(context.tables, "payment_transactions")) {
-    const kind = stringField(transaction, "kind");
-    const status = stringField(transaction, "status");
-    const key = `${kind}\u0000${status}`;
-    const value = groups.get(key) ?? { kind, status, count: 0, amount: 0 };
-    value.count += 1;
-    value.amount += numberField(transaction, "amount");
-    groups.set(key, value);
-  }
-  return [...groups.values()].sort(
-    (left, right) => left.kind.localeCompare(right.kind) || left.status.localeCompare(right.status),
-  );
-}
-
-function paymentFunnel(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  const groups: Record<string, { kind: string; status: string; count: number; amount: number }> =
-    {};
-  for (const transaction of rows(tables, "payment_transactions")) {
-    const kind = stringField(transaction, "kind");
-    const status = stringField(transaction, "status");
-    const key = `${kind}\u0000${status}`;
-    const value = groups[key] ?? { kind, status, count: 0, amount: 0 };
-    value.count += 1;
-    value.amount += numberField(transaction, "amount");
-    groups[key] = value;
-  }
-  return Object.values(groups).sort(
-    (left, right) => left.kind.localeCompare(right.kind) || left.status.localeCompare(right.status),
-  );
-}
-
-function orderAdjustmentsIndexed(context: ReferenceQueryContext): unknown[] {
-  return collectOrderAdjustments(
-    rows(context.tables, "orders"),
-    rows(context.tables, "order_discounts"),
-    rows(context.tables, "order_taxes"),
-    true,
-  );
-}
-
-function orderAdjustments(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
-  return collectOrderAdjustments(
-    rows(tables, "orders"),
-    rows(tables, "order_discounts"),
-    rows(tables, "order_taxes"),
-    false,
-  );
-}
-
-function collectOrderAdjustments(
-  orderRows: DatabaseRow[],
-  discounts: DatabaseRow[],
-  taxes: DatabaseRow[],
-  useMaps: boolean,
-): unknown[] {
-  const discountByOrder = new Map<number, number>();
-  const taxByOrder = new Map<number, number>();
-  for (const discount of discounts) {
-    const orderId = numberField(discount, "order_id");
-    discountByOrder.set(
-      orderId,
-      (discountByOrder.get(orderId) ?? 0) + numberField(discount, "amount"),
-    );
-  }
-  for (const tax of taxes) {
-    const orderId = numberField(tax, "order_id");
-    taxByOrder.set(orderId, (taxByOrder.get(orderId) ?? 0) + numberField(tax, "tax_amount"));
-  }
-  const groups = new Map<string, { discounts: number; taxes: number }>();
-  for (const order of useMaps ? orderRows : [...orderRows].reverse()) {
-    const status = stringField(order, "status");
-    const orderId = numberField(order, "order_id");
-    const value = groups.get(status) ?? { discounts: 0, taxes: 0 };
-    value.discounts += discountByOrder.get(orderId) ?? 0;
-    value.taxes += taxByOrder.get(orderId) ?? 0;
-    groups.set(status, value);
-  }
-  return [...groups]
-    .map(([status, value]) => ({ status, ...value }))
-    .sort((left, right) => left.status.localeCompare(right.status));
-}
-
-function referenceChecksum(value: unknown): number {
-  const text = JSON.stringify(value, (_key, item: unknown) => {
-    if (item instanceof Date) return item.toISOString();
-    // Equivalent aggregates can differ by sub-cent floating-point noise when
-    // their independent oracles visit rows in a different order.
-    if (typeof item === "number" && Number.isFinite(item)) {
-      return Math.round(item * 1_000_000_000) / 1_000_000_000;
-    }
-    return item;
-  });
-  let hash = 2_166_136_261;
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16_777_619);
-  }
-  return hash >>> 0;
-}
-
 function generateBatchColumns(
   entity: EntityDefinition,
   startRow: number,
@@ -2531,7 +1538,7 @@ function generateUpsertColumns(
   };
 }
 
-function validateConfig(value: unknown): BenchmarkConfig {
+export function validateConfig(value: unknown): BenchmarkConfig {
   if (typeof value !== "object" || value === null) throw new Error("Invalid benchmark config");
   const config = value as Partial<BenchmarkConfig>;
   if (!scenarioIds.includes(config.scenario as never)) throw new Error("Invalid scenario");
@@ -2564,7 +1571,6 @@ function validateConfig(value: unknown): BenchmarkConfig {
   }
   return config as BenchmarkConfig;
 }
-
 function generateInput(
   definition: ColumnDefinition,
   startRow: number,
@@ -2638,247 +1644,4 @@ function estimateBlockCount(config: BenchmarkConfig): number {
 
 function blockRows(definition: ColumnDefinition, targetBytes: number): number {
   return Math.max(1, Math.floor(targetBytes / definition.estimatedBytesPerRow));
-}
-
-function progress(requestId: string, value: BenchmarkProgress): void {
-  const response: ProgressResponse<BenchmarkProgress> = {
-    version: protocolVersion,
-    requestId,
-    kind: "progress",
-    progress: value,
-  };
-  self.postMessage(response);
-}
-
-function assertNotCancelled(requestId: string): void {
-  if (cancelledRuns.has(requestId)) throw new DOMException("Benchmark cancelled", "AbortError");
-}
-
-async function storageEstimate(): Promise<StorageEstimate> {
-  try {
-    return await navigator.storage.estimate();
-  } catch {
-    return {};
-  }
-}
-
-async function executePersistedAdHocQuery(sql: string): Promise<AdHocQueryResult> {
-  const dataset = (await listPersistedDatasets())[0];
-  if (dataset === undefined) {
-    throw new Error("Run the relational benchmark before executing an ad-hoc query");
-  }
-  const totalStarted = performance.now();
-  const store = await IndexedDbBlockStore.open({
-    name: dataset.databaseName,
-    durability: dataset.durability,
-  });
-  const database = new BrowserDatabase(store, {
-    compression: dataset.compression,
-    rowsPerBlock: Math.max(1, Math.min(50_000, Math.floor(dataset.targetBlockBytes / 16))),
-  });
-  let prepared: Awaited<ReturnType<BrowserDatabase["prepareQuery"]>> | undefined;
-  try {
-    const prepareStarted = performance.now();
-    prepared = await database.prepareQuery(sql);
-    const prepareMs = performance.now() - prepareStarted;
-    prepared.execute();
-    const samples: number[] = [];
-    let result = prepared.execute();
-    for (let index = 0; index < 7; index += 1) {
-      const started = performance.now();
-      result = prepared.execute();
-      samples.push(performance.now() - started);
-    }
-    samples.sort((left, right) => left - right);
-    const median = samples[Math.floor(samples.length / 2)] ?? 0;
-    const p95 = samples[Math.ceil(samples.length * 0.95) - 1] ?? median;
-    const previewRows = result.rows.slice(0, 100);
-    const sourceRows = [...new Set(prepared.tables)].reduce(
-      (total, table) => total + (dataset.tableRows[table] ?? 0),
-      0,
-    );
-    return {
-      runId: dataset.runId,
-      sql: sql.trim(),
-      tables: prepared.tables,
-      columns: result.columns,
-      rowCount: result.rows.length,
-      previewRows,
-      truncated: result.rows.length > previewRows.length,
-      metrics: {
-        prepareMs,
-        executeMedianMs: median,
-        executeP95Ms: p95,
-        totalMs: performance.now() - totalStarted,
-        iterations: samples.length,
-        sourceRows,
-        datasetRows: dataset.totalRows,
-        storedBytes: dataset.storedBytes,
-      },
-    };
-  } finally {
-    prepared?.close();
-    store.close();
-  }
-}
-
-async function persistedDatasetStatus(): Promise<PersistedDatasetStatus> {
-  const datasets = await listPersistedDatasets();
-  const active = datasets[0];
-  if (active === undefined) {
-    return { kind: "persisted-dataset-status", available: false, datasetCount: 0 };
-  }
-  return {
-    kind: "persisted-dataset-status",
-    available: true,
-    datasetCount: datasets.length,
-    runId: active.runId,
-    databaseName: active.databaseName,
-    createdAt: active.createdAt,
-    scale: active.scale,
-    totalRows: active.totalRows,
-    storedBytes: active.storedBytes,
-  };
-}
-
-async function wipePersistedDatasets(): Promise<PersistedDatasetStatus> {
-  const datasets = await listPersistedDatasets();
-  for (const dataset of datasets) await deleteDatabase(dataset.databaseName);
-  const registry = await openDatasetRegistry();
-  try {
-    const transaction = registry.transaction(DATASET_REGISTRY_STORE, "readwrite");
-    transaction.objectStore(DATASET_REGISTRY_STORE).clear();
-    await indexedDbTransactionDone(transaction);
-  } finally {
-    registry.close();
-  }
-  return { kind: "persisted-dataset-status", available: false, datasetCount: 0 };
-}
-
-async function registerPersistedDataset(record: PersistedDatasetRecord): Promise<void> {
-  const registry = await openDatasetRegistry();
-  try {
-    const transaction = registry.transaction(DATASET_REGISTRY_STORE, "readwrite");
-    transaction.objectStore(DATASET_REGISTRY_STORE).put(record);
-    await indexedDbTransactionDone(transaction);
-  } finally {
-    registry.close();
-  }
-}
-
-async function listPersistedDatasets(): Promise<PersistedDatasetRecord[]> {
-  const registry = await openDatasetRegistry();
-  try {
-    const transaction = registry.transaction(DATASET_REGISTRY_STORE, "readonly");
-    const request = transaction.objectStore(DATASET_REGISTRY_STORE).getAll();
-    const records = (await indexedDbRequest<unknown[]>(request as IDBRequest<unknown[]>)).filter(
-      isPersistedDatasetRecord,
-    );
-    await indexedDbTransactionDone(transaction);
-    return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-  } finally {
-    registry.close();
-  }
-}
-
-function isPersistedDatasetRecord(value: unknown): value is PersistedDatasetRecord {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record.runId === "string" &&
-    typeof record.databaseName === "string" &&
-    record.databaseName.startsWith(DATASET_DATABASE_PREFIX) &&
-    typeof record.createdAt === "string" &&
-    typeof record.scale === "number" &&
-    typeof record.totalRows === "number" &&
-    typeof record.storedBytes === "number" &&
-    typeof record.tableRows === "object" &&
-    record.tableRows !== null &&
-    ["raw", "rle", "gzip"].includes(String(record.compression)) &&
-    typeof record.targetBlockBytes === "number" &&
-    ["relaxed", "strict"].includes(String(record.durability))
-  );
-}
-
-function openDatasetRegistry(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATASET_REGISTRY_NAME, 1);
-    request.addEventListener("upgradeneeded", () => {
-      if (!request.result.objectStoreNames.contains(DATASET_REGISTRY_STORE)) {
-        request.result.createObjectStore(DATASET_REGISTRY_STORE, { keyPath: "runId" });
-      }
-    });
-    request.addEventListener("success", () => resolve(request.result), { once: true });
-    request.addEventListener(
-      "error",
-      () => reject(request.error ?? new Error("Dataset registry could not be opened")),
-      { once: true },
-    );
-  });
-}
-
-function indexedDbRequest<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.addEventListener("success", () => resolve(request.result), { once: true });
-    request.addEventListener(
-      "error",
-      () => reject(request.error ?? new Error("IndexedDB request failed")),
-      { once: true },
-    );
-  });
-}
-
-function indexedDbTransactionDone(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.addEventListener("complete", () => resolve(), { once: true });
-    transaction.addEventListener(
-      "error",
-      () => reject(transaction.error ?? new Error("IndexedDB transaction failed")),
-      { once: true },
-    );
-    transaction.addEventListener(
-      "abort",
-      () => reject(transaction.error ?? new Error("IndexedDB transaction aborted")),
-      { once: true },
-    );
-  });
-}
-
-async function deleteDatabase(name: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const request = indexedDB.deleteDatabase(name);
-    request.addEventListener("success", () => resolve(), { once: true });
-    request.addEventListener(
-      "error",
-      () => reject(request.error ?? new Error("Database deletion failed")),
-      { once: true },
-    );
-    request.addEventListener("blocked", () => reject(new Error("Database deletion was blocked")), {
-      once: true,
-    });
-  });
-}
-
-function sum(values: number[]): number {
-  return values.reduce((total, value) => total + value, 0);
-}
-
-function formatRate(rowsPerSecond: number): string {
-  return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(rowsPerSecond)} rows/s`;
-}
-
-function getRequestId(value: unknown): string {
-  if (typeof value === "object" && value !== null && "requestId" in value) {
-    const requestId = value.requestId;
-    if (typeof requestId === "string") return requestId;
-  }
-  return "unknown";
-}
-
-function describePlatform(userAgent: string): string {
-  if (userAgent.includes("Mac OS X") || userAgent.includes("Macintosh")) return "macOS";
-  if (userAgent.includes("Windows")) return "Windows";
-  if (userAgent.includes("Android")) return "Android";
-  if (userAgent.includes("Linux")) return "Linux";
-  return "Unknown";
 }

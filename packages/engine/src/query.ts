@@ -43,13 +43,91 @@ export interface QueryExecutionOptions {
 export type BinaryOperator = "+" | "-" | "*" | "/";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
 export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+export type ScalarFunctionName = "ROUND" | "COALESCE" | "DATE_TRUNC";
+
+export const scalarFunctionNames: ReadonlySet<string> = new Set([
+  "ROUND",
+  "COALESCE",
+  "DATE_TRUNC",
+] satisfies ScalarFunctionName[]);
+
+export function isScalarFunctionName(
+  name: AggregateName | ScalarFunctionName,
+): name is ScalarFunctionName {
+  return scalarFunctionNames.has(name);
+}
+
+export const dateTruncUnits: ReadonlySet<string> = new Set([
+  "year",
+  "quarter",
+  "month",
+  "week",
+  "day",
+  "hour",
+  "minute",
+  "second",
+]);
+
+/**
+ * Truncates a datetime to the start of the given unit, in UTC — the engine stores and
+ * compares datetimes by instant and has no session time zone. Weeks start on Monday,
+ * matching Postgres.
+ */
+export function dateTruncValue(unit: unknown, value: unknown): Date | null {
+  if (typeof unit !== "string" || !dateTruncUnits.has(unit.toLowerCase())) {
+    throw new TypeError(
+      "DATE_TRUNC requires a unit of year, quarter, month, week, day, hour, minute, or second",
+    );
+  }
+  if (value === null || value === undefined) return null;
+  if (!(value instanceof Date)) throw new TypeError("DATE_TRUNC requires a datetime value");
+  const normalized = unit.toLowerCase();
+  const year = value.getUTCFullYear();
+  const month = value.getUTCMonth();
+  const day = value.getUTCDate();
+  switch (normalized) {
+    case "year":
+      return new Date(Date.UTC(year, 0, 1));
+    case "quarter":
+      return new Date(Date.UTC(year, Math.floor(month / 3) * 3, 1));
+    case "month":
+      return new Date(Date.UTC(year, month, 1));
+    case "week": {
+      const start = new Date(Date.UTC(year, month, day));
+      start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+      return start;
+    }
+    case "day":
+      return new Date(Date.UTC(year, month, day));
+    case "hour":
+      return new Date(Date.UTC(year, month, day, value.getUTCHours()));
+    case "minute":
+      return new Date(Date.UTC(year, month, day, value.getUTCHours(), value.getUTCMinutes()));
+    default:
+      return new Date(
+        Date.UTC(
+          year,
+          month,
+          day,
+          value.getUTCHours(),
+          value.getUTCMinutes(),
+          value.getUTCSeconds(),
+        ),
+      );
+  }
+}
 
 export type Expression =
   | { kind: "literal"; value: QueryValue }
   | { kind: "column"; reference: string }
   | { kind: "wildcard" }
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
-  | { kind: "call"; name: AggregateName | "ROUND"; arguments: Expression[]; distinct?: boolean }
+  | {
+      kind: "call";
+      name: AggregateName | ScalarFunctionName;
+      arguments: Expression[];
+      distinct?: boolean;
+    }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }
   | { kind: "condition"; operator: PredicateOperator; left: Expression; right: Expression }
@@ -529,6 +607,19 @@ export function inferBlockSchema(
       return "number";
     }
     if (expression.name === "ROUND") return "number";
+    if (expression.name === "DATE_TRUNC") return "datetime";
+    if (expression.name === "COALESCE") {
+      let resolved: SqlColumnType | "null" = "null";
+      for (const argument of expression.arguments) {
+        const type = infer(argument);
+        if (type === "null") continue;
+        if (resolved !== "null" && resolved !== type) {
+          throw new TypeError("COALESCE arguments must produce one value type");
+        }
+        resolved = type;
+      }
+      return resolved;
+    }
     const argument = expression.arguments[0];
     return argument === undefined ? "null" : infer(argument);
   };
@@ -1359,6 +1450,19 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
           undefined,
         );
       }
+      if (expression.name === "COALESCE") {
+        for (const argument of expression.arguments) {
+          const candidate = evaluate(argument, context, group);
+          if (candidate !== null && candidate !== undefined) return candidate;
+        }
+        return null;
+      }
+      if (expression.name === "DATE_TRUNC") {
+        return dateTruncValue(
+          evaluate(expression.arguments[0] ?? { kind: "literal", value: null }, context, group),
+          evaluate(expression.arguments[1] ?? { kind: "literal", value: null }, context, group),
+        );
+      }
       const value = evaluate(
         expression.arguments[0] ?? { kind: "literal", value: 0 },
         context,
@@ -1396,6 +1500,13 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
   }
   if (predicate.operator === "IN" || predicate.operator === "NOT IN") {
     if (predicate.right.kind !== "list") throw new TypeError("IN requires a value list");
+    const membership = cachedListMembership(predicate.right, predicate.right.items);
+    if (membership !== null) {
+      const value = evaluate(predicate.left, context);
+      if (value === null || value === undefined) return false;
+      if (membership.set.has(comparable(value))) return predicate.operator === "IN";
+      return predicate.operator === "NOT IN" && !membership.hasNull;
+    }
     return inListHolds(
       predicate.operator,
       evaluate(predicate.left, context),
@@ -1428,6 +1539,42 @@ function inListHolds(
     if (comparable(value) === comparable(item)) return operator === "IN";
   }
   return operator === "NOT IN" && !hasNull;
+}
+
+export interface ListMembership {
+  set: ReadonlySet<unknown>;
+  hasNull: boolean;
+}
+
+const listMembershipCache = new WeakMap<object, ListMembership | null>();
+
+/**
+ * IN lists produced by subquery materialization can hold many thousands of literals, and
+ * probing them per row makes membership quadratic. A list whose items are all literals
+ * gets one hash set of comparable values (plus a null flag), cached weakly on the list
+ * node so repeated executions of a prepared plan reuse it. Lists with non-literal items
+ * return null and take the general per-row path.
+ */
+export function cachedListMembership(
+  node: object,
+  items: ReadonlyArray<{ kind: string }>,
+): ListMembership | null {
+  let cached = listMembershipCache.get(node);
+  if (cached === undefined) {
+    if (items.every((item) => item.kind === "literal")) {
+      const set = new Set<unknown>();
+      let hasNull = false;
+      for (const item of items as ReadonlyArray<{ kind: "literal"; value: unknown }>) {
+        if (item.value === null || item.value === undefined) hasNull = true;
+        else set.add(comparable(item.value));
+      }
+      cached = { set, hasNull };
+    } else {
+      cached = null;
+    }
+    listMembershipCache.set(node, cached);
+  }
+  return cached;
 }
 
 const likeCache = new Map<string, RegExp>();
@@ -1574,7 +1721,7 @@ function resolveColumn(context: RowContext, reference: string): unknown {
   return matches[0]?.[name];
 }
 
-function hasAggregate(expression: Expression): boolean {
+export function hasAggregate(expression: Expression): boolean {
   if (expression.kind === "call" && aggregateNames.has(expression.name as AggregateName)) {
     return true;
   }
@@ -1668,6 +1815,11 @@ function asQueryValue(value: unknown): QueryValue {
 class Parser {
   #index = 0;
   #derivedSequence = 0;
+  /** Shared with the assembly helpers so parser plans and builder plans number sources alike. */
+  readonly nextDerivedSequence = (): number => {
+    this.#derivedSequence += 1;
+    return this.#derivedSequence;
+  };
   readonly #ctes = new Map<string, CompiledQuery>();
   readonly #ctesInProgress = new Set<string>();
   readonly #recursiveCtes = new Map<string, RecursiveCte>();
@@ -1779,23 +1931,17 @@ class Parser {
       limit = this.#limitClause();
       offset = this.#offsetClause(limit);
     }
-    this.#derivedSequence += 1;
-    return {
+    return compoundSelectBlock(
       sql,
-      base: {
-        table: `(union ${String(this.#derivedSequence)})`,
-        alias: "union",
-        union: { blocks: members.map((member) => member.block), ops },
+      members.map((member) => member.block),
+      ops,
+      {
+        orderBy,
+        ...(limit === undefined ? {} : { limit }),
+        ...(offset === undefined ? {} : { offset }),
       },
-      joins: [],
-      select: [{ expression: { kind: "wildcard" }, alias: "*" }],
-      predicates: [],
-      groupBy: [],
-      having: [],
-      orderBy,
-      ...(limit === undefined ? {} : { limit }),
-      ...(offset === undefined ? {} : { offset }),
-    };
+      this.nextDerivedSequence,
+    );
   }
 
   parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {
@@ -1931,20 +2077,14 @@ class Parser {
   #limitClause(): number | undefined {
     if (!this.#isKeyword("LIMIT")) return undefined;
     this.#keyword("LIMIT");
-    const limit = Number(this.#take("number").text);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100_000)
-      throw new RangeError("LIMIT must be between 1 and 100,000");
-    return limit;
+    return validateLimit(Number(this.#take("number").text));
   }
 
   /** OFFSET is only accepted directly after LIMIT, matching the LIMIT n OFFSET m dialect form. */
   #offsetClause(limit: number | undefined): number | undefined {
     if (limit === undefined || !this.#isKeyword("OFFSET")) return undefined;
     this.#keyword("OFFSET");
-    const offset = Number(this.#take("number").text);
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)
-      throw new RangeError("OFFSET must be between 0 and 100,000,000");
-    return offset;
+    return validateOffset(Number(this.#take("number").text));
   }
 
   #selectBlock(sql: string): CompiledQuery {
@@ -2028,268 +2168,31 @@ class Parser {
       this.#keyword("BY");
       groupBy.push(...this.#expressionList());
     }
-    if (distinct) {
-      if (select.some((item) => item.expression.kind === "wildcard"))
-        throw new TypeError("SELECT DISTINCT * is not supported");
-      if (select.some((item) => hasAggregate(item.expression)))
-        throw new TypeError("SELECT DISTINCT cannot be combined with aggregate functions");
-      if (groupBy.length > 0)
-        throw new TypeError("SELECT DISTINCT cannot be combined with GROUP BY");
-      // DISTINCT is grouping by every selected expression, so it reuses the grouped executor,
-      // its value-carrying spill, and streamed scan inputs unchanged.
-      groupBy.push(...select.map((item) => item.expression));
-    }
     const having: Predicate[] = [];
     if (this.#isKeyword("HAVING")) {
       this.#keyword("HAVING");
       if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
       having.push(...splitCondition(this.#expression()));
-      const grouped = groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
-      if (!grouped) throw new TypeError("HAVING requires GROUP BY or aggregate functions");
-      const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
-      for (const predicate of having) {
-        for (const side of [predicate.left, predicate.right]) {
-          if (hasAggregate(side)) continue;
-          if (expressionColumns(side).length === 0) continue;
-          if (groupExpressions.has(JSON.stringify(side))) continue;
-          throw new TypeError(
-            "HAVING conditions must use aggregates, literals, or GROUP BY expressions",
-          );
-        }
-      }
     }
     const orderBy = this.#orderByClause();
     const limit = this.#limitClause();
     const offset = this.#offsetClause(limit);
-    const clauseExpressions = [
-      ...predicates.flatMap((predicate) => [predicate.left, predicate.right]),
-      ...groupBy,
-      ...having.flatMap((predicate) => [predicate.left, predicate.right]),
-      ...orderBy.map((order) => order.expression),
-    ];
-    if (clauseExpressions.some(containsWindow)) {
-      throw new TypeError("Window functions are only allowed in the select list");
-    }
-    if (
-      clauseExpressions.some(containsDistinctCount) ||
-      select.some(
-        (item) =>
-          containsDistinctCount(item.expression) &&
-          !(item.expression.kind === "call" && item.expression.distinct === true),
-      )
-    ) {
-      throw new TypeError("COUNT(DISTINCT) must be a top-level select item");
-    }
-    const distinctCounts = select.filter(
-      (item) => item.expression.kind === "call" && item.expression.distinct === true,
-    );
-    if (distinctCounts.length > 0) {
-      if (distinctCounts.length > 1) {
-        throw new TypeError("Only one COUNT(DISTINCT) is supported per select");
-      }
-      if (
-        select.some(
-          (item) =>
-            item.expression.kind !== "window" &&
-            !(item.expression.kind === "call" && item.expression.distinct === true) &&
-            hasAggregate(item.expression),
-        )
-      ) {
-        throw new TypeError("COUNT(DISTINCT) cannot be combined with other aggregates yet");
-      }
-      if (select.some((item) => containsWindow(item.expression))) {
-        throw new TypeError("COUNT(DISTINCT) cannot be combined with window functions");
-      }
-      if (having.length > 0) {
-        throw new TypeError("COUNT(DISTINCT) cannot be combined with HAVING yet");
-      }
-      return this.#desugarDistinctCount(sql, base, joins, select, predicates, groupBy, {
+    return assembleSelectBlock(
+      {
+        sql,
+        base,
+        joins,
+        select,
+        distinct,
+        predicates,
+        groupBy,
+        having,
         orderBy,
         ...(limit === undefined ? {} : { limit }),
         ...(offset === undefined ? {} : { offset }),
-      });
-    }
-    if (select.some((item) => containsWindow(item.expression))) {
-      return this.#desugarWindows(sql, base, joins, select, predicates, groupBy, having, {
-        orderBy,
-        ...(limit === undefined ? {} : { limit }),
-        ...(offset === undefined ? {} : { offset }),
-      });
-    }
-    return {
-      sql,
-      base,
-      joins,
-      select,
-      predicates,
-      groupBy,
-      having,
-      orderBy,
-      ...(limit === undefined ? {} : { limit }),
-      ...(offset === undefined ? {} : { offset }),
-    };
-  }
-
-  /**
-   * Rewrites `COUNT(DISTINCT e)` as counting the deduplicated inner block: the inner block groups
-   * by every outer group key plus `e` (deduplication through the ordinary grouped machinery,
-   * including its spill), and the wrapper counts the non-null deduplicated values per group. The
-   * output column names and order are preserved exactly.
-   */
-  #desugarDistinctCount(
-    sql: string,
-    base: TableSource,
-    joins: JoinPlan[],
-    select: SelectItem[],
-    predicates: Predicate[],
-    groupBy: Expression[],
-    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
-  ): CompiledQuery {
-    const distinctAlias = "(distinct 1)";
-    const innerSelect: SelectItem[] = [];
-    const outerSelect: SelectItem[] = [];
-    for (const item of select) {
-      if (item.expression.kind === "call" && item.expression.distinct === true) {
-        const argument = item.expression.arguments[0];
-        if (argument === undefined) throw new TypeError("COUNT(DISTINCT) argument is missing");
-        innerSelect.push({ expression: argument, alias: distinctAlias });
-        outerSelect.push({
-          expression: {
-            kind: "call",
-            name: "COUNT",
-            arguments: [{ kind: "column", reference: distinctAlias }],
-          },
-          alias: item.alias,
-        });
-        continue;
-      }
-      innerSelect.push(item);
-      outerSelect.push({
-        expression: { kind: "column", reference: item.alias },
-        alias: item.alias,
-      });
-    }
-    const distinctArgument = innerSelect.find(({ alias }) => alias === distinctAlias);
-    if (distinctArgument === undefined) {
-      throw new TypeError("COUNT(DISTINCT) argument is missing");
-    }
-    const inner: CompiledQuery = {
-      sql: "(count distinct input)",
-      base,
-      joins,
-      select: innerSelect,
-      predicates,
-      groupBy: [...groupBy, distinctArgument.expression],
-      having: [],
-      orderBy: [],
-    };
-    return {
-      sql,
-      base: this.#derivedSource(inner, "distinct"),
-      joins: [],
-      select: outerSelect,
-      predicates: [],
-      groupBy: outerSelect
-        .filter(({ expression }) => expression.kind === "column")
-        .map(({ expression }) => expression),
-      having: [],
-      ...tail,
-    };
-  }
-
-  /**
-   * Rewrites a block with window select items into a wrapper over a windowed source: the inner
-   * block computes every non-window item plus hidden partition and ordering columns, the window
-   * columns append after execution, and the wrapper projects the visible aliases and applies the
-   * block's ORDER BY and LIMIT after window computation, as SQL requires.
-   */
-  #desugarWindows(
-    sql: string,
-    base: TableSource,
-    joins: JoinPlan[],
-    select: SelectItem[],
-    predicates: Predicate[],
-    groupBy: Expression[],
-    having: Predicate[],
-    tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
-  ): CompiledQuery {
-    if (
-      groupBy.length > 0 ||
-      having.length > 0 ||
-      select.some((item) => hasAggregate(item.expression))
-    ) {
-      throw new TypeError(
-        "Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING",
-      );
-    }
-    for (const item of select) {
-      if (item.expression.kind !== "window" && containsWindow(item.expression)) {
-        throw new TypeError("Window functions must be top-level select items");
-      }
-    }
-    const innerSelect: SelectItem[] = select.filter((item) => item.expression.kind !== "window");
-    const windows: WindowSpec[] = [];
-    let hidden = 0;
-    for (const item of select) {
-      const expression = item.expression;
-      if (expression.kind !== "window") continue;
-      const partitionAliases = expression.partitionBy.map((partition) => {
-        hidden += 1;
-        const alias = `(window ${String(hidden)})`;
-        innerSelect.push({ expression: partition, alias });
-        return alias;
-      });
-      const orderAliases = expression.orderBy.map((order) => {
-        hidden += 1;
-        const alias = `(window ${String(hidden)})`;
-        innerSelect.push({ expression: order.expression, alias });
-        return { alias, direction: order.direction };
-      });
-      let argumentAlias: string | undefined;
-      if (expression.argument !== undefined) {
-        hidden += 1;
-        argumentAlias = `(window ${String(hidden)})`;
-        innerSelect.push({ expression: expression.argument, alias: argumentAlias });
-      }
-      windows.push({
-        alias: item.alias,
-        name: expression.name,
-        partitionAliases,
-        orderAliases,
-        ...(argumentAlias === undefined ? {} : { argumentAlias }),
-      });
-    }
-    if (innerSelect.length === 0) {
-      innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });
-    }
-    const inner: CompiledQuery = {
-      sql: "(window input)",
-      base,
-      joins,
-      select: innerSelect,
-      predicates,
-      groupBy: [],
-      having: [],
-      orderBy: [],
-    };
-    this.#derivedSequence += 1;
-    return {
-      sql,
-      base: {
-        table: `(window ${String(this.#derivedSequence)})`,
-        alias: "window",
-        windowed: { block: inner, windows },
       },
-      joins: [],
-      select: select.map((item) => ({
-        expression: { kind: "column", reference: item.alias },
-        alias: item.alias,
-      })),
-      predicates: [],
-      groupBy: [],
-      having: [],
-      ...tail,
-    };
+      this.nextDerivedSequence,
+    );
   }
 
   #selectList(): SelectItem[] {
@@ -2344,24 +2247,16 @@ class Parser {
       this.#expectPunctuation(")");
       if (!this.#recursiveUses.has(name)) {
         // No self-reference: the body is an ordinary two-member compound.
-        this.#derivedSequence += 1;
-        this.#ctes.set(name, {
-          sql: "(cte)",
-          base: {
-            table: `(union ${String(this.#derivedSequence)})`,
-            alias: "union",
-            union: {
-              blocks: [base, step],
-              ops: [all ? "union all" : "union"],
-            },
-          },
-          joins: [],
-          select: [{ expression: { kind: "wildcard" }, alias: "*" }],
-          predicates: [],
-          groupBy: [],
-          having: [],
-          orderBy: [],
-        });
+        this.#ctes.set(
+          name,
+          compoundSelectBlock(
+            "(cte)",
+            [base, step],
+            [all ? "union all" : "union"],
+            { orderBy: [] },
+            this.nextDerivedSequence,
+          ),
+        );
         return;
       }
       this.#recursiveCtes.set(name, { reference: candidate.reference, base, step, all });
@@ -2392,9 +2287,8 @@ class Parser {
     if (cte !== undefined) return this.#derivedSource(structuredClone(cte), alias);
     const recursive = this.#recursiveCtes.get(table);
     if (recursive !== undefined) {
-      this.#derivedSequence += 1;
       return {
-        table: `(recursive ${String(this.#derivedSequence)}) ${table}`,
+        table: `(recursive ${String(this.nextDerivedSequence())}) ${table}`,
         alias,
         recursive: structuredClone(recursive),
       };
@@ -2418,8 +2312,7 @@ class Parser {
   }
 
   #derivedSource(derived: CompiledQuery, alias: string): TableSource {
-    this.#derivedSequence += 1;
-    return { table: `(derived ${String(this.#derivedSequence)}) ${alias}`, alias, derived };
+    return derivedTableSource(derived, alias, this.nextDerivedSequence);
   }
 
   #expressionList(): Expression[] {
@@ -2624,8 +2517,8 @@ class Parser {
         const { partitionBy, orderBy } = this.#overClause();
         return { kind: "window", name: upper, partitionBy, orderBy };
       }
-      const name = upper as AggregateName | "ROUND";
-      if (!aggregateNames.has(name as AggregateName) && name !== "ROUND")
+      const name = upper as AggregateName | ScalarFunctionName;
+      if (!aggregateNames.has(name as AggregateName) && !scalarFunctionNames.has(name))
         throw new TypeError(`Unsupported function: ${identifier}`);
       let distinct = false;
       if (this.#isKeyword("DISTINCT")) {
@@ -2645,6 +2538,20 @@ class Parser {
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "ROUND" && (args.length < 1 || args.length > 2))
         throw new TypeError("ROUND requires one or two arguments");
+      if (name === "COALESCE" && args.length < 1)
+        throw new TypeError("COALESCE requires at least one argument");
+      if (name === "DATE_TRUNC") {
+        if (args.length !== 2)
+          throw new TypeError("DATE_TRUNC requires a unit and a datetime argument");
+        const unit = args[0];
+        if (
+          unit?.kind === "literal" &&
+          typeof unit.value === "string" &&
+          !dateTruncUnits.has(unit.value.toLowerCase())
+        ) {
+          throw new TypeError(`Unsupported DATE_TRUNC unit: ${unit.value}`);
+        }
+      }
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("OVER")) {
         if (distinct) throw new TypeError("DISTINCT window aggregates are not supported");
         this.#keyword("OVER");
@@ -2738,13 +2645,355 @@ class Parser {
   }
 }
 
+// --- Shared select-block assembly ---------------------------------------------------------------
+//
+// The SQL parser and the typed query builder both end at these functions, so a builder query and
+// its equivalent SQL produce byte-identical plans: the same validation errors, the same DISTINCT /
+// COUNT(DISTINCT) / window desugars, and the same derived-source numbering (callers thread one
+// sequence counter through every source they create, in parse order).
+
+export interface SelectBlockParts {
+  sql: string;
+  base: TableSource;
+  joins: JoinPlan[];
+  select: SelectItem[];
+  distinct: boolean;
+  predicates: Predicate[];
+  /** Raw GROUP BY expressions; DISTINCT desugaring appends to a copy here. */
+  groupBy: Expression[];
+  having: Predicate[];
+  orderBy: CompiledQuery["orderBy"];
+  limit?: number;
+  offset?: number;
+}
+
+/** Validates and assembles one select block, applying every parser desugar. */
+export function assembleSelectBlock(
+  parts: SelectBlockParts,
+  nextSequence: () => number,
+): CompiledQuery {
+  const { sql, base, joins, select, distinct, predicates, having, orderBy, limit, offset } = parts;
+  const groupBy = [...parts.groupBy];
+  if (distinct) {
+    if (select.some((item) => item.expression.kind === "wildcard"))
+      throw new TypeError("SELECT DISTINCT * is not supported");
+    if (select.some((item) => hasAggregate(item.expression)))
+      throw new TypeError("SELECT DISTINCT cannot be combined with aggregate functions");
+    if (groupBy.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with GROUP BY");
+    if (having.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
+    // DISTINCT is grouping by every selected expression, so it reuses the grouped executor,
+    // its value-carrying spill, and streamed scan inputs unchanged.
+    groupBy.push(...select.map((item) => item.expression));
+  }
+  if (having.length > 0) {
+    const grouped =
+      parts.groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
+    if (!grouped) throw new TypeError("HAVING requires GROUP BY or aggregate functions");
+    const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
+    for (const predicate of having) {
+      for (const side of [predicate.left, predicate.right]) {
+        if (hasAggregate(side)) continue;
+        if (expressionColumns(side).length === 0) continue;
+        if (groupExpressions.has(JSON.stringify(side))) continue;
+        throw new TypeError(
+          "HAVING conditions must use aggregates, literals, or GROUP BY expressions",
+        );
+      }
+    }
+  }
+  const clauseExpressions = [
+    ...predicates.flatMap((predicate) => [predicate.left, predicate.right]),
+    ...groupBy,
+    ...having.flatMap((predicate) => [predicate.left, predicate.right]),
+    ...orderBy.map((order) => order.expression),
+  ];
+  if (clauseExpressions.some(containsWindow)) {
+    throw new TypeError("Window functions are only allowed in the select list");
+  }
+  if (
+    clauseExpressions.some(containsDistinctCount) ||
+    select.some(
+      (item) =>
+        containsDistinctCount(item.expression) &&
+        !(item.expression.kind === "call" && item.expression.distinct === true),
+    )
+  ) {
+    throw new TypeError("COUNT(DISTINCT) must be a top-level select item");
+  }
+  const tail = {
+    orderBy,
+    ...(limit === undefined ? {} : { limit }),
+    ...(offset === undefined ? {} : { offset }),
+  };
+  const distinctCounts = select.filter(
+    (item) => item.expression.kind === "call" && item.expression.distinct === true,
+  );
+  if (distinctCounts.length > 0) {
+    if (distinctCounts.length > 1) {
+      throw new TypeError("Only one COUNT(DISTINCT) is supported per select");
+    }
+    if (
+      select.some(
+        (item) =>
+          item.expression.kind !== "window" &&
+          !(item.expression.kind === "call" && item.expression.distinct === true) &&
+          hasAggregate(item.expression),
+      )
+    ) {
+      throw new TypeError("COUNT(DISTINCT) cannot be combined with other aggregates yet");
+    }
+    if (select.some((item) => containsWindow(item.expression))) {
+      throw new TypeError("COUNT(DISTINCT) cannot be combined with window functions");
+    }
+    if (having.length > 0) {
+      throw new TypeError("COUNT(DISTINCT) cannot be combined with HAVING yet");
+    }
+    return desugarDistinctCount(sql, base, joins, select, predicates, groupBy, tail, nextSequence);
+  }
+  if (select.some((item) => containsWindow(item.expression))) {
+    return desugarWindows(
+      sql,
+      base,
+      joins,
+      select,
+      predicates,
+      groupBy,
+      having,
+      tail,
+      nextSequence,
+    );
+  }
+  return {
+    sql,
+    base,
+    joins,
+    select,
+    predicates,
+    groupBy,
+    having,
+    ...tail,
+  };
+}
+
+/** Wraps compound members into the set-operation source the executor folds left to right. */
+export function compoundSelectBlock(
+  sql: string,
+  blocks: CompiledQuery[],
+  ops: SetOperator[],
+  tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
+  nextSequence: () => number,
+): CompiledQuery {
+  return {
+    sql,
+    base: {
+      table: `(union ${String(nextSequence())})`,
+      alias: "union",
+      union: { blocks, ops },
+    },
+    joins: [],
+    select: [{ expression: { kind: "wildcard" }, alias: "*" }],
+    predicates: [],
+    groupBy: [],
+    having: [],
+    orderBy: tail.orderBy,
+    ...(tail.limit === undefined ? {} : { limit: tail.limit }),
+    ...(tail.offset === undefined ? {} : { offset: tail.offset }),
+  };
+}
+
+/** Names a derived (subquery or expanded CTE) source under the shared sequence. */
+export function derivedTableSource(
+  derived: CompiledQuery,
+  alias: string,
+  nextSequence: () => number,
+): TableSource {
+  return { table: `(derived ${String(nextSequence())}) ${alias}`, alias, derived };
+}
+
+/** The parser's LIMIT range contract, shared with the typed builder. */
+export function validateLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100_000)
+    throw new RangeError("LIMIT must be between 1 and 100,000");
+  return limit;
+}
+
+/** The parser's OFFSET range contract, shared with the typed builder. */
+export function validateOffset(offset: number): number {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)
+    throw new RangeError("OFFSET must be between 0 and 100,000,000");
+  return offset;
+}
+
+/**
+ * Rewrites `COUNT(DISTINCT e)` as counting the deduplicated inner block: the inner block groups
+ * by every outer group key plus `e` (deduplication through the ordinary grouped machinery,
+ * including its spill), and the wrapper counts the non-null deduplicated values per group. The
+ * output column names and order are preserved exactly.
+ */
+function desugarDistinctCount(
+  sql: string,
+  base: TableSource,
+  joins: JoinPlan[],
+  select: SelectItem[],
+  predicates: Predicate[],
+  groupBy: Expression[],
+  tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
+  nextSequence: () => number,
+): CompiledQuery {
+  const distinctAlias = "(distinct 1)";
+  const innerSelect: SelectItem[] = [];
+  const outerSelect: SelectItem[] = [];
+  for (const item of select) {
+    if (item.expression.kind === "call" && item.expression.distinct === true) {
+      const argument = item.expression.arguments[0];
+      if (argument === undefined) throw new TypeError("COUNT(DISTINCT) argument is missing");
+      innerSelect.push({ expression: argument, alias: distinctAlias });
+      outerSelect.push({
+        expression: {
+          kind: "call",
+          name: "COUNT",
+          arguments: [{ kind: "column", reference: distinctAlias }],
+        },
+        alias: item.alias,
+      });
+      continue;
+    }
+    innerSelect.push(item);
+    outerSelect.push({
+      expression: { kind: "column", reference: item.alias },
+      alias: item.alias,
+    });
+  }
+  const distinctArgument = innerSelect.find(({ alias }) => alias === distinctAlias);
+  if (distinctArgument === undefined) {
+    throw new TypeError("COUNT(DISTINCT) argument is missing");
+  }
+  const inner: CompiledQuery = {
+    sql: "(count distinct input)",
+    base,
+    joins,
+    select: innerSelect,
+    predicates,
+    groupBy: [...groupBy, distinctArgument.expression],
+    having: [],
+    orderBy: [],
+  };
+  return {
+    sql,
+    base: derivedTableSource(inner, "distinct", nextSequence),
+    joins: [],
+    select: outerSelect,
+    predicates: [],
+    groupBy: outerSelect
+      .filter(({ expression }) => expression.kind === "column")
+      .map(({ expression }) => expression),
+    having: [],
+    ...tail,
+  };
+}
+
+/**
+ * Rewrites a block with window select items into a wrapper over a windowed source: the inner
+ * block computes every non-window item plus hidden partition and ordering columns, the window
+ * columns append after execution, and the wrapper projects the visible aliases and applies the
+ * block's ORDER BY and LIMIT after window computation, as SQL requires.
+ */
+function desugarWindows(
+  sql: string,
+  base: TableSource,
+  joins: JoinPlan[],
+  select: SelectItem[],
+  predicates: Predicate[],
+  groupBy: Expression[],
+  having: Predicate[],
+  tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
+  nextSequence: () => number,
+): CompiledQuery {
+  if (
+    groupBy.length > 0 ||
+    having.length > 0 ||
+    select.some((item) => hasAggregate(item.expression))
+  ) {
+    throw new TypeError(
+      "Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING",
+    );
+  }
+  for (const item of select) {
+    if (item.expression.kind !== "window" && containsWindow(item.expression)) {
+      throw new TypeError("Window functions must be top-level select items");
+    }
+  }
+  const innerSelect: SelectItem[] = select.filter((item) => item.expression.kind !== "window");
+  const windows: WindowSpec[] = [];
+  let hidden = 0;
+  for (const item of select) {
+    const expression = item.expression;
+    if (expression.kind !== "window") continue;
+    const partitionAliases = expression.partitionBy.map((partition) => {
+      hidden += 1;
+      const alias = `(window ${String(hidden)})`;
+      innerSelect.push({ expression: partition, alias });
+      return alias;
+    });
+    const orderAliases = expression.orderBy.map((order) => {
+      hidden += 1;
+      const alias = `(window ${String(hidden)})`;
+      innerSelect.push({ expression: order.expression, alias });
+      return { alias, direction: order.direction };
+    });
+    let argumentAlias: string | undefined;
+    if (expression.argument !== undefined) {
+      hidden += 1;
+      argumentAlias = `(window ${String(hidden)})`;
+      innerSelect.push({ expression: expression.argument, alias: argumentAlias });
+    }
+    windows.push({
+      alias: item.alias,
+      name: expression.name,
+      partitionAliases,
+      orderAliases,
+      ...(argumentAlias === undefined ? {} : { argumentAlias }),
+    });
+  }
+  if (innerSelect.length === 0) {
+    innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });
+  }
+  const inner: CompiledQuery = {
+    sql: "(window input)",
+    base,
+    joins,
+    select: innerSelect,
+    predicates,
+    groupBy: [],
+    having: [],
+    orderBy: [],
+  };
+  return {
+    sql,
+    base: {
+      table: `(window ${String(nextSequence())})`,
+      alias: "window",
+      windowed: { block: inner, windows },
+    },
+    joins: [],
+    select: select.map((item) => ({
+      expression: { kind: "column", reference: item.alias },
+      alias: item.alias,
+    })),
+    predicates: [],
+    groupBy: [],
+    having: [],
+    ...tail,
+  };
+}
+
 /**
  * Splits a parsed boolean expression into the plan's AND-list of predicates. Top-level ANDs and
  * plain comparisons keep the classic {left, operator, right} shape (so predicate pushdown, zone
  * maps, and the dictionary fast path see exactly what they always saw); any OR/NOT subtree or bare
  * boolean expression becomes a single IS TRUE predicate evaluated with three-valued logic.
  */
-function splitCondition(expression: Expression): Predicate[] {
+export function splitCondition(expression: Expression): Predicate[] {
   if (expression.kind === "logical" && expression.operator === "and") {
     return [...splitCondition(expression.left), ...splitCondition(expression.right)];
   }

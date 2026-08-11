@@ -76,6 +76,54 @@ describe("byte group index", () => {
     memory.close();
   });
 
+  it("keys strings by their UTF-8 bytes across every code point width", () => {
+    const memory = new QueryMemoryContext();
+    const index = new ByteGroupIndex<string>(memory);
+    // One representative per UTF-8 width, plus a key long enough to grow the scratch arena.
+    const distinct = ["a", "é", "€", "\u{1D11E}", "日本語", "\u{1F389}".repeat(400)];
+    distinct.forEach((key) => index.setOne(key, key));
+
+    distinct.forEach((key) => expect(index.getOne(key)).toBe(key));
+    expect(index.size).toBe(distinct.length);
+
+    // A compound key must not collide with the concatenation of its parts.
+    index.set(["a", "bc"], "split-left");
+    index.set(["ab", "c"], "split-right");
+    expect(index.get(["a", "bc"])).toBe("split-left");
+    expect(index.get(["ab", "c"])).toBe("split-right");
+    memory.close();
+  });
+
+  it("folds unpaired surrogates to U+FFFD the way TextEncoder does", () => {
+    const memory = new QueryMemoryContext();
+    const index = new ByteGroupIndex<string>(memory);
+    // A lone high or low surrogate encodes as the replacement character, so each is the same key.
+    index.setOne("\uD800", "high");
+    expect(index.getOne("\uDFFF")).toBe("high");
+    expect(index.getOne("�")).toBe("high");
+    expect(index.size).toBe(1);
+
+    // A well-formed pair stays distinct from the replacement character it surrounds.
+    index.setOne("𝄞", "paired");
+    expect(index.getOne("\u{1D11E}")).toBe("paired");
+    expect(index.size).toBe(2);
+    memory.close();
+  });
+
+  it("sheds oversized scratch capacity after a pathological key", () => {
+    const memory = new QueryMemoryContext();
+    const index = new ByteGroupIndex<string>(memory);
+    // A multi-megabyte key grows the shared scratch arena past its retention cap; the next
+    // encoding reclaims it, and both keys must remain resolvable afterwards.
+    const huge = "k".repeat(2 * 1024 * 1024);
+    index.setOne(huge, "huge");
+    index.setOne("small", "small");
+    expect(index.getOne(huge)).toBe("huge");
+    expect(index.getOne("small")).toBe("small");
+    expect(index.size).toBe(2);
+    memory.close();
+  });
+
   it("creates a missing value once and returns it without replacing insertion order", () => {
     const memory = new QueryMemoryContext(512);
     const index = new ByteGroupIndex<object>(memory);

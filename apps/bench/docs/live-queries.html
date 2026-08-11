@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Live queries — BrowserDatabase</title>
+    <script type="module" src="/src/pages/doc.ts"></script>
+  </head>
+  <body data-page="docs/live-queries">
+    <main>
+      <h1>Live queries</h1>
+      <p class="lead">
+        Live queries re-execute selectively when their tables change. Re-execution is the
+        correctness baseline; every notification path converges on the durable manifest version, so
+        a missed message can delay a refresh but cannot produce a stale result.
+      </p>
+
+      <h2>Typed live queries</h2>
+      <p>
+        Any <a href="orm.html">built query</a> becomes a live query with <code>.live()</code>.
+        Subscribers get the current typed rows immediately, then a fresh result after any commit
+        that may have changed them; dependency tables come from the compiled plan, with no SQL
+        re-parse.
+      </p>
+      <pre><code data-lang="ts">const live = db.selectFrom("people").select(["name"]).where("score", "&gt;", 15).live();
+
+const sub = await live.subscribe({
+  onChange: (rows) =&gt; render(rows), // rows: Array&lt;{ name: string }&gt;
+  onComplete: () =&gt; {}, // optional: the live set closed
+});
+// or, latest-wins async iteration:
+for await (const rows of live) render(rows);
+
+await sub.close();
+await db.close(); // closes the shared live set; open iterators end cleanly</code></pre>
+      <p>
+        Iteration ends promptly on <code>break</code>, <code>iterator.return()</code> (so
+        <code>Promise.race</code> timeouts work), or when the live set closes — a cancelled iterator
+        never waits for the next commit. Async iteration coalesces to the latest result: every
+        yielded value is a true snapshot, but a slow consumer may skip intermediates. Configure
+        cross-tab hints and polling once, on the facade:
+        <code
+          >new BrowserDb(driver, { live: { channelName: "app-commits", pollIntervalMs: 5000 }
+          })</code
+        >.
+      </p>
+
+      <h2>Subscribing with SQL</h2>
+      <p>The underlying live-query set also accepts raw SQL text:</p>
+      <pre><code data-lang="ts">const live = database.liveQueries({ channelName: "db", pollIntervalMs: 5_000 });
+const subscription = await live.subscribe(
+  "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status",
+  { onChange: (result) =&gt; render(result) },
+);
+// later: subscription.close(); live.close();</code></pre>
+
+      <h2>How convergence works</h2>
+      <p>
+        Every commit persists its changed table IDs in the manifest before any notification
+        (compaction marks itself logically unchanged). Four hint paths can trigger a sweep:
+      </p>
+      <ul>
+        <li>a local commit in the same database instance;</li>
+        <li>a cross-tab BroadcastChannel message;</li>
+        <li>a poll tick;</li>
+        <li>an explicit <code>refresh()</code>.</li>
+      </ul>
+      <p>
+        All four converge on the same durable manifest version. Hints are only accelerants — the
+        change sets in the manifest are authoritative, so missed messages and suspended tabs delay a
+        refresh but cannot produce stale results. This matches the architectural rule that
+        correctness never depends on BroadcastChannel delivery.
+      </p>
+
+      <h2>Sweeps and suppression</h2>
+      <p>
+        Sweeps read change sets in bounded pages and skip subscriptions whose tables did not change;
+        a commit without a change set widens conservatively to every subscription. A subscription
+        retains only its query (SQL text or compiled plan), its dependency table IDs, and a numeric
+        result digest — never rows. When a rerun produces an unchanged digest, the notification is
+        suppressed, so <code>onChange</code> fires only when the result actually differs.
+      </p>
+
+      <h2>Observability</h2>
+      <p><code>live.stats</code> reports counters for the mechanism itself:</p>
+      <ul>
+        <li>hints received and sweeps performed;</li>
+        <li>reruns executed and reruns avoided by change-set filtering;</li>
+        <li>notifications suppressed by an unchanged digest;</li>
+        <li>sweep latency.</li>
+      </ul>
+
+      <h2>Limitations</h2>
+      <p class="note">
+        Incremental maintenance remains future work. When it arrives it will be introduced only for
+        proven-safe operator shapes, and full re-execution stays as the correctness baseline it is
+        checked against. Subscriptions accept anything the read surface executes — built queries or
+        the same read-only SQL subset as <code>query()</code>; see
+        <a href="../sql.html">the SQL surface</a>.
+      </p>
+
+      <p>
+        Related: <a href="orm.html">the query builder</a> compiles to the same plans these
+        subscriptions execute (its <code>.live()</code> is this mechanism), and
+        <a href="architecture.html">the architecture page</a> covers manifests, change sets, and
+        multi-tab coordination in more depth.
+      </p>
+    </main>
+  </body>
+</html>

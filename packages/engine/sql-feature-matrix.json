@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Machine-readable SQL feature matrix for the BrowserDatabase engine. Every entry carries an example; the conformance test executes supported examples through both executors and asserts unsupported examples fail explicitly with the recorded error fragment.",
+  "description": "Machine-readable SQL feature matrix for the BrowserDatabase engine. Every entry carries an example; the conformance test executes supported examples through both executors and asserts that each unsupported example still fails with the recorded error fragment. Entries marked unsupported describe the SQL surface only: some carry a note explaining that the capability exists through a typed API instead, or that the restriction is deliberate.",
   "features": [
     {
       "id": "select.projection",
@@ -202,39 +202,39 @@
     },
     {
       "id": "where.or",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'",
-      "error": "Expected"
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'"
     },
     {
       "id": "where.like",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows WHERE region LIKE 'w%'",
-      "error": "Expected operator, found LIKE"
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region LIKE 'w%'"
     },
     {
       "id": "where.between",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows WHERE amount BETWEEN 1 AND 5",
-      "error": "Expected operator, found BETWEEN"
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount BETWEEN 1 AND 5"
     },
     {
       "id": "where.is-null",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows WHERE region IS NULL",
-      "error": "Expected operator, found IS"
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region IS NULL"
+    },
+    {
+      "id": "where.is-not-null",
+      "status": "supported",
+      "example": "SELECT amount FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "where.exists",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT region FROM rows WHERE EXISTS (SELECT 1 FROM dims)",
-      "error": "Unsupported function: EXISTS"
+      "notes": "Uncorrelated EXISTS only; correlated references still fail as unknown aliases."
     },
     {
       "id": "expression.case",
-      "status": "unsupported",
-      "example": "SELECT CASE WHEN amount > 5 THEN 'big' ELSE 'small' END AS size FROM rows",
-      "error": "Expected FROM, found WHEN"
+      "status": "supported",
+      "example": "SELECT CASE WHEN amount > 5 THEN 'big' ELSE 'small' END AS size FROM rows"
     },
     {
       "id": "subquery.correlated",
@@ -244,51 +244,49 @@
     },
     {
       "id": "cte.recursive",
-      "status": "unsupported",
-      "example": "WITH r AS (SELECT amount FROM r) SELECT amount FROM r",
-      "error": "Recursive CTEs are not supported"
+      "status": "supported",
+      "example": "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM rows UNION ALL SELECT v + 1 FROM n WHERE v < 6) SELECT v FROM n",
+      "notes": "Linear delta recursion with UNION or UNION ALL, capped at 10,000 iterations and 1,000,000 rows. Plain WITH still rejects self-references."
     },
     {
       "id": "set.intersect",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT region FROM rows INTERSECT SELECT region FROM dims",
-      "error": "Expected"
+      "notes": "INTERSECT binds tighter than UNION and EXCEPT, per the SQL standard."
     },
     {
       "id": "set.except",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows EXCEPT SELECT region FROM dims",
-      "error": "Expected"
+      "status": "supported",
+      "example": "SELECT region FROM rows EXCEPT SELECT region FROM dims"
     },
     {
       "id": "aggregate.count-distinct",
-      "status": "unsupported",
-      "example": "SELECT COUNT(DISTINCT region) AS regions FROM rows",
-      "error": "Expected"
+      "status": "supported",
+      "example": "SELECT COUNT(DISTINCT region) AS regions FROM rows"
     },
     {
       "id": "window.aggregate-over",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT SUM(amount) OVER (PARTITION BY region) AS total FROM rows",
-      "error": "Expected FROM, found OVER"
+      "notes": "Default frame only: whole partition without OVER ordering, running with peers when ordered."
     },
     {
       "id": "window.frame",
       "status": "unsupported",
       "example": "SELECT ROW_NUMBER() OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS rn FROM rows",
-      "error": "Expected"
+      "error": "Window frames are not supported"
     },
     {
       "id": "join.right",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT r.region FROM rows r RIGHT JOIN dims d ON d.region = r.region",
-      "error": "Expected"
+      "notes": "Desugars to the mirrored LEFT JOIN; supported as the sole join of a block."
     },
     {
       "id": "join.non-equi",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT r.region FROM rows r JOIN dims d ON d.amount > r.amount",
-      "error": "Expected ="
+      "notes": "Executes as a nested-loop join (probe x build); equalities keep the hash path."
     },
     {
       "id": "select.distinct-wildcard",
@@ -298,9 +296,9 @@
     },
     {
       "id": "limit.offset",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT amount FROM rows LIMIT 5 OFFSET 2",
-      "error": "Expected eof"
+      "notes": "OFFSET is accepted directly after LIMIT."
     },
     {
       "id": "ddl.create-table",
@@ -322,6 +320,85 @@
       "example": "BEGIN",
       "error": "Expected SELECT",
       "notes": "Transactions are a programmatic API."
+    },
+    {
+      "id": "where.parenthesized",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE (amount > 5 AND region = 'west')"
+    },
+    {
+      "id": "where.not",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE NOT active = TRUE"
+    },
+    {
+      "id": "expression.concat",
+      "status": "unsupported",
+      "example": "SELECT region || region AS doubled FROM rows",
+      "error": "Unsupported SQL character: |"
+    },
+    {
+      "id": "expression.coalesce",
+      "status": "supported",
+      "example": "SELECT COALESCE(region, 'unknown') AS region_label FROM rows",
+      "notes": "Arguments evaluate left to right; the first non-NULL value wins. All non-NULL arguments must share one type."
+    },
+    {
+      "id": "expression.date-trunc",
+      "status": "supported",
+      "example": "SELECT DATE_TRUNC('month', joined) AS joined_month FROM rows",
+      "notes": "Units: year, quarter, month, week (Monday start), day, hour, minute, second. Truncation is in UTC; the engine has no session time zone."
+    },
+    {
+      "id": "aggregate.distinct-argument",
+      "status": "unsupported",
+      "example": "SELECT SUM(DISTINCT amount) AS total FROM rows",
+      "error": "DISTINCT is only supported inside COUNT",
+      "notes": "DISTINCT is accepted as a COUNT argument only; the other aggregates reject it."
+    },
+    {
+      "id": "join.multi-key",
+      "status": "supported",
+      "example": "SELECT r.region FROM rows r JOIN dims d ON d.region = r.region AND d.amount = r.amount",
+      "notes": "Multi-key conditions execute as a nested-loop join; single equalities keep the hash path."
+    },
+    {
+      "id": "join.cross",
+      "status": "unsupported",
+      "example": "SELECT r.region FROM rows r CROSS JOIN dims d",
+      "error": "Expected eof, found CROSS"
+    },
+    {
+      "id": "join.full",
+      "status": "unsupported",
+      "example": "SELECT r.region FROM rows r FULL JOIN dims d ON d.region = r.region",
+      "error": "Expected eof, found FULL"
+    },
+    {
+      "id": "order-by.expression",
+      "status": "unsupported",
+      "example": "SELECT region, amount FROM rows ORDER BY amount * 2",
+      "error": "ORDER BY requires a selected column or output alias"
+    },
+    {
+      "id": "order-by.ordinal",
+      "status": "unsupported",
+      "example": "SELECT region, amount FROM rows ORDER BY 2",
+      "error": "ORDER BY requires a selected column or output alias"
+    },
+    {
+      "id": "window.lag-lead",
+      "status": "unsupported",
+      "example": "SELECT LAG(amount) OVER (ORDER BY amount) AS previous FROM rows",
+      "error": "Unsupported function: LAG",
+      "notes": "ROW_NUMBER, RANK, and DENSE_RANK are the only window functions."
+    },
+    {
+      "id": "mutation.insert-select",
+      "status": "unsupported",
+      "example": "INSERT INTO keyed (name, score) SELECT name, score FROM keyed",
+      "error": "Expected VALUES, found SELECT",
+      "notes": "INSERT takes a VALUES list only; it cannot read from a query."
     }
   ]
 }

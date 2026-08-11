@@ -36,7 +36,7 @@ export default tseslint.config(
     extends: [tseslint.configs.disableTypeChecked],
   },
   {
-    files: ["apps/bench/src/engine-adapters/**/*.ts"],
+    files: ["apps/bench/src/engines/**/*.ts", "apps/bench/vite.config.ts"],
     rules: { "no-restricted-imports": "off" },
   },
 );

@@ -43,18 +43,10 @@ export function createCoordinator(store: BlockStore) {
           const manifest = await store.publishManifest(request.payload as PublishManifestInput);
           return { message: success(request.requestId, manifest) };
         }
-        case "benchmark":
-          throw new Error("Benchmark operation must be supplied by the benchmark worker");
-        case "compareEngines":
-          throw new Error("Engine comparison must be supplied by the benchmark worker");
-        case "cancelBenchmark":
-          throw new Error("Cancellation must be supplied by the benchmark worker");
-        case "adHocQuery":
-          throw new Error("Ad-hoc queries must be supplied by the benchmark worker");
-        case "datasetStatus":
-          throw new Error("Dataset status must be supplied by the benchmark worker");
-        case "wipeDatasets":
-          throw new Error("Dataset wiping must be supplied by the benchmark worker");
+        default:
+          throw new Error(
+            `Operation "${request.operation}" must be supplied by the benchmark worker`,
+          );
       }
     } catch (error) {
       return { message: failure(request.requestId, error) };

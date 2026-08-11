@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Query builder — BrowserDatabase</title>
+    <script type="module" src="/src/pages/doc.ts"></script>
+  </head>
+  <body data-page="docs/orm">
+    <main>
+      <h1>Query builder</h1>
+      <p class="lead">
+        A Kysely-style typed query builder. String column references with autocomplete, an
+        expression builder for everything beyond comparisons, and inferred row types — compiling to
+        the same plans as SQL, never to SQL strings.
+      </p>
+
+      <h2>Setup</h2>
+      <p>
+        <code>BrowserDb&lt;DB&gt;</code> wraps a database (or the
+        <a href="worker-client.html">worker client</a> — the API is identical over both). The
+        <code>DB</code> type derives from the runtime schema, so one declaration drives migrations,
+        autocomplete, and row types:
+      </p>
+      <pre><code data-lang="ts">import { BrowserDb, column, schema, table, type InferDatabase } from "@browserdatabase/engine";
+
+const people = table("people", {
+  name: column.string().unique(),
+  score: column.number(),
+  city: column.string().nullable(),
+});
+const orders = table("orders", {
+  order_id: column.number().unique(),
+  person: column.string().references("people", "name"),
+  total: column.number(),
+});
+const appSchema = schema([people, orders]);
+
+await database.migrate(appSchema);
+const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });</code></pre>
+
+      <h2>Selects</h2>
+      <pre><code data-lang="ts">const rows = await db
+  .selectFrom("people as p")
+  .innerJoin("orders as o", "o.person", "p.name")
+  .where("p.score", "&gt;", 10)
+  .where((eb) =&gt; eb.or([eb("p.city", "=", "London"), eb("p.city", "is", null)]))
+  .groupBy("p.name")
+  .having((eb) =&gt; eb(eb.fn.countAll(), "&gt;", 1))
+  .select(["p.name"])
+  .select((eb) =&gt; [eb.fn.sum("o.total").as("revenue")])
+  .orderBy("revenue", "desc")
+  .limit(10)
+  .execute(); // Array&lt;{ name: string; revenue: number | null }&gt;</code></pre>
+      <ul>
+        <li>
+          String left-hand sides are <strong>column references</strong>; right-hand sides are
+          <strong>values</strong>. Compare two columns with <code>eb.ref("a.x")</code> or a join's
+          <code>onRef</code>.
+        </li>
+        <li>
+          <code>select()</code> takes strings (<code>"p.name"</code>,
+          <code>"p.name as owner"</code>), an expression callback, or both across repeated calls;
+          <code>selectAll()</code> is <code>SELECT *</code>.
+        </li>
+        <li>
+          Left-joined columns widen to <code>| null</code> in the row type, matching what a left
+          join actually returns.
+        </li>
+        <li>
+          <code>execute()</code>, <code>executeTakeFirst()</code>,
+          <code>executeTakeFirstOrThrow()</code>, <code>compile()</code>, and
+          <a href="live-queries.html"><code>.live()</code></a
+          >.
+        </li>
+      </ul>
+
+      <h2>Expression vocabulary</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Forms</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Comparisons</td>
+            <td>
+              <code>eb(lhs, op, rhs)</code> with <code>=</code>, <code>!=</code>, <code>&lt;</code>,
+              <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>like</code>,
+              <code>not like</code>, <code>in</code>, <code>not in</code>, <code>is</code>,
+              <code>is not</code>; <code>eb.between</code>, <code>eb.notBetween</code>
+            </td>
+          </tr>
+          <tr>
+            <td>Boolean logic</td>
+            <td><code>eb.and([...])</code>, <code>eb.or([...])</code>, <code>eb.not(...)</code></td>
+          </tr>
+          <tr>
+            <td>Arithmetic</td>
+            <td><code>eb(lhs, "+" | "-" | "*" | "/", rhs)</code>, <code>eb.neg(...)</code></td>
+          </tr>
+          <tr>
+            <td>Aggregates</td>
+            <td>
+              <code>eb.fn.count</code>, <code>countAll</code>, <code>sum</code>, <code>avg</code>,
+              <code>min</code>, <code>max</code>; <code>fn.count(x).distinct()</code>
+            </td>
+          </tr>
+          <tr>
+            <td>Scalar functions</td>
+            <td><code>eb.fn.round</code>, <code>coalesce</code>, <code>dateTrunc</code></td>
+          </tr>
+          <tr>
+            <td>Windows</td>
+            <td>
+              <code>eb.rowNumber() / rank() / denseRank()</code> and aggregate
+              <code>.over((o) =&gt; o.partitionBy(...).orderBy(...))</code>
+            </td>
+          </tr>
+          <tr>
+            <td>Conditionals</td>
+            <td><code>eb.case().when(...).then(...).else(...).end()</code></td>
+          </tr>
+          <tr>
+            <td>Subqueries</td>
+            <td>
+              <code>eb.selectFrom(...)</code>, <code>eb.exists(...)</code>, and builders as
+              <code>in</code> / comparison operands
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        Aggregate results are typed honestly: <code>sum</code> over an empty group is
+        <code>null</code>, so its result type is <code>number | null</code>.
+      </p>
+
+      <h2>Derived tables, CTEs, set operations</h2>
+      <pre><code data-lang="ts">const spend = db
+  .selectFrom("orders")
+  .groupBy("person")
+  .select((eb) =&gt; [eb.ref("person").as("person"), eb.fn.sum("total").as("total")]);
+
+// As a derived table…
+await db.selectFrom(spend.as("t")).where("t.total", "&gt;", 10).select(["t.person"]).execute();
+
+// …or as a CTE, joinable by name.
+await db
+  .with("spend", () =&gt; spend)
+  .selectFrom("people as p")
+  .innerJoin("spend", "spend.person", "p.name")
+  .select(["p.name", "spend.total"])
+  .execute();
+
+// Set operations chain left to right; member row types must match.
+await db
+  .selectFrom("people").select(["name"])
+  .unionAll(db.selectFrom("orders").select(["person as name"]))
+  .orderBy("name")
+  .execute();</code></pre>
+      <p>
+        Derived and CTE columns stay fully type-checked — an unknown column on
+        <code>"t."</code> is a compile error, exactly like a real table.
+      </p>
+
+      <h2>One plan, two front ends</h2>
+      <p>
+        <code>compile()</code> ends in the same assembly functions the SQL parser ends in, with a
+        shared derived-source numbering sequence, so a builder query and its equivalent SQL produce
+        <em>identical</em> optimized plans — the same validation errors, the same
+        DISTINCT/COUNT(DISTINCT)/window desugars, the same execution strategy. This is not an
+        aspiration: structural plan-equality tests enforce it shape by shape.
+      </p>
+      <pre><code data-lang="ts">SQL -&gt; lexer -&gt; parser ----------------+
+                                      +-&gt; shared assembly -&gt; optimizer -&gt; physical plan
+Typed builder -&gt; compile() ------------+</code></pre>
+
+      <h2>The SQL escape hatch</h2>
+      <p>
+        The <code>sql</code> template tag renders interpolations as SQL literals (strings escape
+        their quotes, arrays become IN lists, nested fragments splice), and <code>query()</code> /
+        <code>prepareQuery()</code> remain the raw read-only SQL API. Anything the builder does not
+        express can be written as SQL against the same optimizer and executor.
+      </p>
+      <pre><code data-lang="ts">import { sql } from "@browserdatabase/engine";
+
+const rows = await sql&lt;{ n: number }&gt;`
+  SELECT COUNT(*) AS n FROM people WHERE city IN ${["London", "DC"]}
+`.execute(db);</code></pre>
+
+      <p class="note">
+        Writes have the same treatment — see <a href="write-api.html">the write API</a> for
+        <code>insertInto</code> / <code>updateTable</code> / <code>deleteFrom</code> with
+        <code>returning</code>. The supported and rejected SQL forms are recorded in a checked-in
+        feature matrix; see <a href="../sql.html">the SQL surface</a>, and
+        <a href="live-queries.html">live queries</a> for re-executing any built query when its
+        tables change. Known limits: correlated subqueries compile but the engine resolves
+        subqueries at one snapshot, so they fail at execution; ORDER BY must name a selected column
+        or output alias.
+      </p>
+    </main>
+  </body>
+</html>

@@ -5,7 +5,26 @@ const INITIAL_BUCKET_CAPACITY = 8;
 const INITIAL_KEY_CAPACITY = 32;
 const INDEX_FIELDS = 4;
 const UINT32_BYTES = Uint32Array.BYTES_PER_ELEMENT;
-const groupKeyEncoder = new TextEncoder();
+const INITIAL_SCRATCH_CAPACITY = 64;
+const REPLACEMENT_CHARACTER_BYTES = [0xef, 0xbf, 0xbd] as const;
+
+// Every probe encodes its key into this shared scratch arena instead of allocating a fresh buffer
+// per row. Encoding is synchronous and the bytes are consumed before the next probe begins, so a
+// single arena serves every index; the miss path copies out of it before any caller code runs.
+let scratch = new Uint8Array(INITIAL_SCRATCH_CAPACITY);
+let scratchView = new DataView(scratch.buffer);
+
+// The arena grows to fit the largest key ever encoded, so a single pathological key (a
+// multi-megabyte string) would otherwise pin that memory for the life of the process — hostile
+// to low-end devices. Each fresh encoding starts by shedding anything beyond the retention cap;
+// ordinary keys never reach it, so the check is one branch per operation.
+const SCRATCH_RETAIN_BYTES = 1024 * 1024;
+
+function reclaimScratch(): void {
+  if (scratch.byteLength <= SCRATCH_RETAIN_BYTES) return;
+  scratch = new Uint8Array(SCRATCH_RETAIN_BYTES);
+  scratchView = new DataView(scratch.buffer);
+}
 
 export type GroupIndexKey = null | boolean | number | string;
 
@@ -33,8 +52,8 @@ export class ByteGroupIndex<T> {
   }
 
   get(keys: readonly GroupIndexKey[]): T | undefined {
-    const encoded = encodeGroupKey(keys);
-    const index = this.#find(encoded, hashBytes(encoded));
+    const length = encodeGroupKey(keys);
+    const index = this.#find(length, hashScratch(length));
     return index < 0 ? undefined : this.#values[index];
   }
 
@@ -43,32 +62,45 @@ export class ByteGroupIndex<T> {
   }
 
   getOne(key: GroupIndexKey): T | undefined {
-    return this.get([key]);
+    const length = encodeSingleGroupKey(key);
+    const index = this.#find(length, hashScratch(length));
+    return index < 0 ? undefined : this.#values[index];
   }
 
   set(keys: readonly GroupIndexKey[], value: T): void {
-    const encoded = encodeGroupKey(keys);
-    const hash = hashBytes(encoded);
-    const existing = this.#find(encoded, hash);
+    const length = encodeGroupKey(keys);
+    const hash = hashScratch(length);
+    const existing = this.#find(length, hash);
     if (existing >= 0) {
       this.#values[existing] = value;
       return;
     }
-    this.#insert(encoded, hash, value);
+    this.#insert(scratch.slice(0, length), hash, value);
   }
 
   getOrInsert(keys: readonly GroupIndexKey[], create: () => T): T {
-    const encoded = encodeGroupKey(keys);
-    const hash = hashBytes(encoded);
-    const existing = this.#find(encoded, hash);
-    if (existing >= 0) return this.#values[existing] as T;
-    const value = create();
-    this.#insert(encoded, hash, value);
-    return value;
+    const length = encodeGroupKey(keys);
+    return this.#getOrInsertScratch(length, create);
   }
 
   getOrInsertOne(key: GroupIndexKey, create: () => T): T {
-    return this.getOrInsert([key], create);
+    const length = encodeSingleGroupKey(key);
+    return this.#getOrInsertScratch(length, create);
+  }
+
+  /**
+   * Resolves the key currently held in the scratch arena. A hit touches no allocation at all; a
+   * miss — at most one per distinct group — copies the key out before `create` runs, so caller
+   * code can never observe or disturb the shared arena.
+   */
+  #getOrInsertScratch(length: number, create: () => T): T {
+    const hash = hashScratch(length);
+    const existing = this.#find(length, hash);
+    if (existing >= 0) return this.#values[existing] as T;
+    const encoded = scratch.slice(0, length);
+    const value = create();
+    this.#insert(encoded, hash, value);
+    return value;
   }
 
   #insert(encoded: Uint8Array, hash: number, value: T): void {
@@ -100,14 +132,15 @@ export class ByteGroupIndex<T> {
     return this.#values;
   }
 
-  #find(encoded: Uint8Array, hash: number): number {
+  /** Matches the scratch arena's first `length` bytes against stored keys without copying them. */
+  #find(length: number, hash: number): number {
     if (this.#buckets.length === 0) return -1;
     let index = this.#buckets[hash & (this.#buckets.length - 1)] ?? -1;
     while (index >= 0) {
       if (
         this.#hashes[index] === hash &&
-        this.#lengths[index] === encoded.byteLength &&
-        equalBytes(this.#keys, this.#offsets[index] ?? 0, encoded)
+        this.#lengths[index] === length &&
+        equalsScratch(this.#keys, this.#offsets[index] ?? 0, length)
       ) {
         return index;
       }
@@ -195,63 +228,148 @@ export class ByteGroupIndex<T> {
   }
 }
 
-function encodeGroupKey(keys: readonly GroupIndexKey[]): Uint8Array {
-  const stringPayloads = new Map<number, Uint8Array>();
-  let byteLength = 0;
-  for (let index = 0; index < keys.length; index += 1) {
-    const key = keys[index];
-    if (key === null || typeof key === "boolean") {
-      byteLength = safeSum(byteLength, 1, "Encoded group key");
-    } else if (typeof key === "number") {
-      if (!Number.isFinite(key)) throw new TypeError("Group index numbers must be finite");
-      byteLength = safeSum(byteLength, 1 + Float64Array.BYTES_PER_ELEMENT, "Encoded group key");
-    } else {
-      const payload = groupKeyEncoder.encode(key);
-      if (payload.byteLength > 0xffff_ffff) throw new RangeError("Group index string is too large");
-      stringPayloads.set(index, payload);
-      byteLength = safeSum(byteLength, 5 + payload.byteLength, "Encoded group key");
-    }
-  }
-  if (byteLength > 0xffff_ffff) throw new RangeError("Encoded group key is too large");
-
-  const encoded = new Uint8Array(byteLength);
-  const view = new DataView(encoded.buffer);
+/**
+ * Writes the canonical tagged encoding of `keys` into the scratch arena and returns its byte
+ * length. The byte layout is unchanged from the allocating encoder it replaces — a one-byte tag
+ * per key, little-endian float64 numbers, and length-prefixed UTF-8 strings — so stored keys and
+ * their hashes stay comparable across both paths.
+ */
+function encodeGroupKey(keys: readonly GroupIndexKey[]): number {
+  reclaimScratch();
   let offset = 0;
-  for (let index = 0; index < keys.length; index += 1) {
-    const key = keys[index];
-    if (key === null) {
-      encoded[offset] = 0;
-      offset += 1;
-    } else if (typeof key === "boolean") {
-      encoded[offset] = key ? 2 : 1;
-      offset += 1;
-    } else if (typeof key === "number") {
-      encoded[offset] = 3;
-      view.setFloat64(offset + 1, key === 0 ? 0 : key, true);
-      offset += 1 + Float64Array.BYTES_PER_ELEMENT;
-    } else {
-      const payload = stringPayloads.get(index);
-      if (payload === undefined) throw new Error("Encoded group string is missing");
-      encoded[offset] = 4;
-      view.setUint32(offset + 1, payload.byteLength, true);
-      encoded.set(payload, offset + 5);
-      offset += 5 + payload.byteLength;
-    }
-  }
-  return encoded;
+  for (const key of keys) offset = writeGroupKey(key, offset);
+  return offset;
 }
 
-function hashBytes(bytes: Uint8Array): number {
+/**
+ * Encodes one scalar key into the shared scratch arena and returns its byte length. Exported for
+ * the join index, which shares the arena and byte layout: both consume the encoding synchronously
+ * before any other key operation can run, so a single arena serves every index. NaN is the one
+ * excluded number — group callers canonicalize non-finite to null, join callers skip NaN keys —
+ * while ±Infinity encodes as an ordinary float64 so computed join keys can overflow and still match.
+ */
+export function encodeSingleScalarKey(key: GroupIndexKey): number {
+  reclaimScratch();
+  return writeGroupKey(key, 0);
+}
+
+function encodeSingleGroupKey(key: GroupIndexKey): number {
+  reclaimScratch();
+  return writeGroupKey(key, 0);
+}
+
+function writeGroupKey(key: GroupIndexKey, offset: number): number {
+  if (key === null) {
+    ensureScratchCapacity(offset + 1);
+    scratch[offset] = 0;
+    return offset + 1;
+  }
+  if (typeof key === "boolean") {
+    ensureScratchCapacity(offset + 1);
+    scratch[offset] = key ? 2 : 1;
+    return offset + 1;
+  }
+  if (typeof key === "number") {
+    if (Number.isNaN(key)) throw new TypeError("Scalar index keys cannot be NaN");
+    ensureScratchCapacity(offset + 1 + Float64Array.BYTES_PER_ELEMENT);
+    scratch[offset] = 3;
+    scratchView.setFloat64(offset + 1, key === 0 ? 0 : key, true);
+    return offset + 1 + Float64Array.BYTES_PER_ELEMENT;
+  }
+  // A UTF-16 code unit never expands past three UTF-8 bytes, and a surrogate pair yields four
+  // across two units, so reserving three bytes per unit lets the encode loop skip bounds checks.
+  const bound = safeSum(
+    offset + 5,
+    safeProduct(key.length, 3, "Encoded group key"),
+    "Encoded group key",
+  );
+  if (bound > 0xffff_ffff) throw new RangeError("Encoded group key is too large");
+  ensureScratchCapacity(bound);
+  scratch[offset] = 4;
+  const payloadStart = offset + 5;
+  const payloadEnd = writeUtf8(key, payloadStart);
+  scratchView.setUint32(offset + 1, payloadEnd - payloadStart, true);
+  return payloadEnd;
+}
+
+/**
+ * Encodes `value` as UTF-8 at `offset`, which the caller has already sized. Unpaired surrogates
+ * become U+FFFD, matching `TextEncoder` so two distinct strings never collapse to one key.
+ */
+function writeUtf8(value: string, offset: number): number {
+  let write = offset;
+  for (let index = 0; index < value.length; index += 1) {
+    let code = value.charCodeAt(index);
+    if (code < 0x80) {
+      scratch[write] = code;
+      write += 1;
+      continue;
+    }
+    if (code < 0x800) {
+      scratch[write] = 0xc0 | (code >>> 6);
+      scratch[write + 1] = 0x80 | (code & 0x3f);
+      write += 2;
+      continue;
+    }
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = index + 1 < value.length ? value.charCodeAt(index + 1) : 0;
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+        index += 1;
+        scratch[write] = 0xf0 | (code >>> 18);
+        scratch[write + 1] = 0x80 | ((code >>> 12) & 0x3f);
+        scratch[write + 2] = 0x80 | ((code >>> 6) & 0x3f);
+        scratch[write + 3] = 0x80 | (code & 0x3f);
+        write += 4;
+        continue;
+      }
+    }
+    if (code >= 0xd800 && code <= 0xdfff) {
+      scratch[write] = REPLACEMENT_CHARACTER_BYTES[0];
+      scratch[write + 1] = REPLACEMENT_CHARACTER_BYTES[1];
+      scratch[write + 2] = REPLACEMENT_CHARACTER_BYTES[2];
+      write += 3;
+      continue;
+    }
+    scratch[write] = 0xe0 | (code >>> 12);
+    scratch[write + 1] = 0x80 | ((code >>> 6) & 0x3f);
+    scratch[write + 2] = 0x80 | (code & 0x3f);
+    write += 3;
+  }
+  return write;
+}
+
+function ensureScratchCapacity(required: number): void {
+  if (required <= scratch.byteLength) return;
+  let capacity = scratch.byteLength;
+  while (capacity < required) capacity = safeDouble(capacity, "Group key scratch arena");
+  const grown = new Uint8Array(capacity);
+  // Earlier keys of a compound encoding already occupy the arena, so growth carries them over.
+  grown.set(scratch);
+  scratch = grown;
+  scratchView = new DataView(scratch.buffer);
+}
+
+/** FNV-1a over the scratch arena's first `length` bytes. Exported for the join index. */
+export function hashScratch(length: number): number {
   let hash = 0x811c9dc5;
-  for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  for (let index = 0; index < length; index += 1) {
+    hash = Math.imul(hash ^ (scratch[index] ?? 0), 0x01000193) >>> 0;
+  }
   return hash;
 }
 
-function equalBytes(arena: Uint8Array, offset: number, value: Uint8Array): boolean {
-  for (let index = 0; index < value.byteLength; index += 1) {
-    if (arena[offset + index] !== value[index]) return false;
+/** Matches `arena[offset..offset+length)` against the scratch arena. Exported for the join index. */
+export function equalsScratch(arena: Uint8Array, offset: number, length: number): boolean {
+  for (let index = 0; index < length; index += 1) {
+    if (arena[offset + index] !== scratch[index]) return false;
   }
   return true;
+}
+
+/** Copies the scratch arena's first `length` bytes into owned storage. Exported for the join index. */
+export function copyScratchKey(length: number): Uint8Array {
+  return scratch.slice(0, length);
 }
 
 function safeDouble(value: number, label: string): number {
