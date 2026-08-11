@@ -16,7 +16,14 @@ subscriptions. Underneath sits an engine with MVCC snapshots, atomic multi-tab p
 vectorized execution with explicit memory budgets, and background compaction.
 
 ```ts
-import { createMinnow, MinnowDatabase, column, schema, table } from "@minnowdb/core";
+import {
+  createMinnow,
+  MinnowDatabase,
+  column,
+  schema,
+  table,
+  type InferDatabase,
+} from "@minnowdb/core";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage";
 
 const people = table("people", {
@@ -25,11 +32,12 @@ const people = table("people", {
   joined: column.datetime().nullable(),
 });
 const appSchema = schema([people]);
+interface DB extends InferDatabase<typeof appSchema> {}
 
 const database = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "app-db" }));
 await database.migrate(appSchema);
 
-const db = createMinnow(database, { schema: appSchema });
+const db = createMinnow<DB>(database, { schema: appSchema });
 const rows = await db
   .selectFrom("people")
   .where("score", ">=", 10)

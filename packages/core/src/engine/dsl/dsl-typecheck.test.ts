@@ -178,6 +178,21 @@ describe("infers precise row types", () => {
     expectTypeOf(inferred).toEqualTypeOf<Minnow<DB>>();
   });
 
+  it("accepts an explicit named database type so tooling prints Minnow<DB>", () => {
+    // The documented standard: a named interface keeps hovers and declaration emit compact.
+    interface NamedDB extends InferDatabase<typeof appSchema> {}
+    const named = createMinnow<NamedDB>(new MinnowDatabase(new MemoryBlockStore()), {
+      schema: appSchema,
+    });
+    expectTypeOf(named).toEqualTypeOf<Minnow<NamedDB>>();
+    const q = named.selectFrom("people").select(["name", "city"]);
+    expectTypeOf(q.execute).returns.resolves.toEqualTypeOf<
+      Array<{ name: string; city: string | null }>
+    >();
+    // @ts-expect-error -- the named form stays fully checked: unknown column
+    void named.selectFrom("people").select(["nope"]);
+  });
+
   it("accepts a single selection without an array and keeps its type", () => {
     const db = createDb();
     const scalar = db.selectFrom("people").select("name");

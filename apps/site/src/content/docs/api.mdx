@@ -45,16 +45,16 @@ From `@minnowdb/core`. See [Schema & migrations](/docs/schema/).
 
 From `@minnowdb/core`. See [Typed queries](/docs/queries/) and [Writes](/docs/writes/).
 
-| Export                                     | Description                                                                                        |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `createMinnow(driver, { schema })`         | Builds the facade with `DB` inferred from the schema value — the recommended constructor.          |
-| `class Minnow<DB>`                         | The facade itself; wraps a `MinnowDatabase` or `MinnowDatabaseClient` (any `DslDriver`).           |
-| `.selectFrom(table \| derived)`            | Starts a `SelectQueryBuilder`; accepts `"people"`, `"people as p"`, or an aliased subquery.        |
-| `.insertInto / .updateTable / .deleteFrom` | Start the mutation builders.                                                                       |
-| `.with(name, () => query)`                 | Adds a CTE usable as a from/join source in the following query.                                    |
-| `.close()`                                 | Closes the shared live set (and any driver-owned resources the facade created).                    |
-| `MinnowOptions`                            | Facade options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`. |
-| `DslDriver, DriverLiveSet, DslLiveOptions` | The driver contract, implemented by both the database and the worker client.                       |
+| Export                                     | Description                                                                                                                                                                                                         |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createMinnow<DB>(driver, { schema })`     | Builds the facade. The standard form passes a named `interface DB extends InferDatabase<typeof appSchema> {}` so tooling prints `Minnow<DB>`; omitting the type argument infers `DB` from the schema value instead. |
+| `class Minnow<DB>`                         | The facade itself; wraps a `MinnowDatabase` or `MinnowDatabaseClient` (any `DslDriver`).                                                                                                                            |
+| `.selectFrom(table \| derived)`            | Starts a `SelectQueryBuilder`; accepts `"people"`, `"people as p"`, or an aliased subquery.                                                                                                                         |
+| `.insertInto / .updateTable / .deleteFrom` | Start the mutation builders.                                                                                                                                                                                        |
+| `.with(name, () => query)`                 | Adds a CTE usable as a from/join source in the following query.                                                                                                                                                     |
+| `.close()`                                 | Closes the shared live set (and any driver-owned resources the facade created).                                                                                                                                     |
+| `MinnowOptions`                            | Facade options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`.                                                                                                                  |
+| `DslDriver, DriverLiveSet, DslLiveOptions` | The driver contract, implemented by both the database and the worker client.                                                                                                                                        |
 
 ### SelectQueryBuilder
 

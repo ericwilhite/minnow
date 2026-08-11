@@ -89,27 +89,29 @@ export interface MinnowOptions {
 type EmptyContext = Record<never, AnyRow>;
 
 /**
- * Creates the typed facade with `DB` inferred from the runtime schema: one `schema(...)` value
- * drives migrations, insert padding, and every builder's column types, with no generic passing
- * and no way for the type-level database to drift from the schema the driver migrated with.
- *
- * ```ts
- * const db = createMinnow(database, { schema: appSchema });
- * ```
- *
- * When builders are exported across module boundaries, prefer a named interface so declaration
- * emit and hovers print `DB` instead of the expanded schema:
+ * Creates the typed facade. The recommended form names the database type once, so every hover,
+ * error, and emitted declaration prints `Minnow<DB>` instead of the fully expanded schema —
+ * which matters as soon as the schema has more than a table or two:
  *
  * ```ts
  * interface DB extends InferDatabase<typeof appSchema> {}
- * const db = new Minnow<DB>(database, { schema: appSchema });
+ * const db = createMinnow<DB>(database, { schema: appSchema });
+ * ```
+ *
+ * Without the type argument, `DB` is inferred from the runtime schema value — fine for
+ * scratch code and small scripts, at the cost of expanded types in tooling:
+ *
+ * ```ts
+ * const db = createMinnow(database, { schema: appSchema });
  * ```
  */
 export function createMinnow<TTables extends readonly AnyTable[]>(
   driver: DslDriver,
   options: Omit<MinnowOptions, "schema"> & { schema: SchemaDefinition<TTables> },
-): Minnow<InferDatabase<SchemaDefinition<TTables>>> {
-  return new Minnow(driver, options);
+): Minnow<InferDatabase<SchemaDefinition<TTables>>>;
+export function createMinnow<DB>(driver: DslDriver, options?: MinnowOptions): Minnow<DB>;
+export function createMinnow<DB>(driver: DslDriver, options: MinnowOptions = {}): Minnow<DB> {
+  return new Minnow<DB>(driver, options);
 }
 
 interface SharedLiveSet {

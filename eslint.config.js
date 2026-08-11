@@ -27,6 +27,13 @@ export default tseslint.config(
       ],
       "@typescript-eslint/array-type": ["error", { default: "array-simple" }],
       "@typescript-eslint/consistent-type-definitions": ["error", "interface"],
+      // `interface DB extends InferDatabase<typeof appSchema> {}` is the documented standard:
+      // the empty extending interface names the database type so hovers and declaration emit
+      // print `Minnow<DB>` instead of the expanded schema.
+      "@typescript-eslint/no-empty-object-type": [
+        "error",
+        { allowInterfaces: "with-single-extends" },
+      ],
       "@typescript-eslint/no-confusing-void-expression": "off",
       "@typescript-eslint/require-await": "off",
     },

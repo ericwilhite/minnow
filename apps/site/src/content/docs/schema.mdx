@@ -13,7 +13,7 @@ description: The typed schema DSL and deterministic, metadata-only migrations.
 ## Defining a schema
 
 ```ts
-import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
+import { createMinnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -21,11 +21,12 @@ const people = table("people", {
   joined: column.datetime().nullable(),
 });
 const appSchema = schema([people]);
+interface DB extends InferDatabase<typeof appSchema> {}
 
 await database.migrate(appSchema);
 
 // The same declaration drives the query builder's types end to end:
-const db = new Minnow<InferDatabase<typeof appSchema>>(database, { schema: appSchema });
+const db = createMinnow<DB>(database, { schema: appSchema });
 await db.insertInto("people").values({ name: "Ada", score: 10 }).execute(); // joined pads to null
 const rows = await db.selectFrom("people").selectAll().execute();
 // Array<{ name: string; score: number; joined: Date | null }>

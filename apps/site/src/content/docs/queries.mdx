@@ -13,12 +13,13 @@ description: The Kysely-style query builder — autocomplete, inferred row types
 
 ## Setup
 
-`Minnow<DB>` wraps a database (or the [worker client](/docs/workers/) — the API is identical over
-both). The `DB` type derives from the runtime schema, so one declaration drives migrations,
-autocomplete, and row types:
+The facade wraps a database (or the [worker client](/docs/workers/) — the API is identical over
+both). One schema declaration drives migrations, autocomplete, and row types. Naming the database
+type `DB` keeps every hover and error message printing `Minnow<DB>` instead of the expanded
+schema:
 
 ```ts
-import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
+import { createMinnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -31,13 +32,11 @@ const orders = table("orders", {
   total: column.number(),
 });
 const appSchema = schema([people, orders]);
+interface DB extends InferDatabase<typeof appSchema> {}
 
 await database.migrate(appSchema);
-const db = new Minnow<InferDatabase<typeof appSchema>>(database, { schema: appSchema });
+const db = createMinnow<DB>(database, { schema: appSchema });
 ```
-
-`createMinnow(database, { schema: appSchema })` does the same with the `DB` type inferred from the
-schema value — no generic passing.
 
 ## Selects
 

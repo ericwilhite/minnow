@@ -159,27 +159,22 @@ references autocomplete as bare and alias-qualified names, value positions are t
 referenced column, and the result row type is assembled from the selections. A few conventions
 keep large apps fast and the emitted types small:
 
-**Small apps: let the factory infer.**
+**The standard construction: declare `DB` as an interface and pass it to the factory.**
 
 ```ts
-const db = createMinnow(driver, { schema: appSchema });
-```
-
-**Apps that export builders or share a `db` across modules: declare `DB` as an interface.**
-
-```ts
-import { Minnow, type InferDatabase } from "@minnowdb/core";
+import { createMinnow, type InferDatabase } from "@minnowdb/core";
 
 interface DB extends InferDatabase<typeof appSchema> {}
-const db = new Minnow<DB>(driver, { schema: appSchema });
+const db = createMinnow<DB>(driver, { schema: appSchema });
 ```
 
 An interface gives the database type a _name_ that survives into hovers, error messages, and
-declaration emit. With a plain `type DB = InferDatabase<...>` alias, every exported query prints
-the whole database structurally; in a 40-table/240-query stress project that was **22 MB** of
-`.d.ts` and 947k type instantiations, versus **77 KB** and 423k with the interface — same
-queries, ~2× faster consumer type-checking. If you never export builders, the alias (or the
-factory's anonymous inference) is fine.
+declaration emit. With a plain `type DB = InferDatabase<...>` alias or the factory's anonymous
+inference, every exported query prints the whole database structurally; in a 40-table/240-query
+stress project that was **22 MB** of `.d.ts` and 947k type instantiations, versus **77 KB** and
+423k with the interface — same queries, ~2× faster consumer type-checking.
+`createMinnow(driver, { schema })` without the type argument still infers `DB` from the schema
+value, which is fine for scratch code that never exports a builder.
 
 **Extracting row types.** Every select builder, live query, mutation builder, and `sql` fragment
 carries a type-only accessor — no `Awaited<ReturnType<...>>` gymnastics:

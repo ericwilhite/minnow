@@ -36,12 +36,12 @@ const people = table("people", {
   joined: column.datetime().nullable(),
 });
 const appSchema = schema([people]);
-type DB = InferDatabase<typeof appSchema>;
+interface DB extends InferDatabase<typeof appSchema> {}
 
 async function typedDb(): Promise<{ database: MinnowDatabase; db: Minnow<DB> }> {
   const database = freshDatabase();
   await database.migrate(appSchema);
-  return { database, db: createMinnow(database, { schema: appSchema }) };
+  return { database, db: createMinnow<DB>(database, { schema: appSchema }) };
 }
 
 const entries: ShowcaseExample[] = [
@@ -110,8 +110,8 @@ const result = await database.query(\`
 const appSchema = schema([people]);
 await database.migrate(appSchema);
 
-// DB is inferred from the schema — no generic passing.
-const db = createMinnow(database, { schema: appSchema });
+interface DB extends InferDatabase<typeof appSchema> {}
+const db = createMinnow<DB>(database, { schema: appSchema });
 const written = await db
   .insertInto("people")
   .values({ name: "Ada", score: 10 }) // joined may be omitted; it pads to null

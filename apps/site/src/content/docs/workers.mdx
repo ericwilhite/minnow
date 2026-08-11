@@ -16,13 +16,14 @@ description: The shipped worker entry, the main-thread client, bundler setups, a
 
 ```ts
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
-import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
+import { createMinnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
   score: column.number(),
 });
 const appSchema = schema([people]);
+interface DB extends InferDatabase<typeof appSchema> {}
 
 const client = new MinnowDatabaseClient(
   new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
@@ -31,7 +32,7 @@ const client = new MinnowDatabaseClient(
 await client.migrate(appSchema);
 
 // The typed facade wraps the client exactly as it wraps an in-worker database.
-const db = new Minnow<InferDatabase<typeof appSchema>>(client, { schema: appSchema });
+const db = createMinnow<DB>(client, { schema: appSchema });
 await db
   .insertInto("people")
   .values([

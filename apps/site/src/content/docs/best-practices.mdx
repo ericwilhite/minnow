@@ -22,12 +22,17 @@ behaves identically over both. Reserve main-thread construction for tests and pr
 ## Declare the schema once, work typed
 
 One `schema([...])` declaration drives migrations, autocomplete, row types, typed writes, and live
-queries. Prefer `createMinnow(database, { schema })` — it infers the `DB` type from the schema
-value, so there is no generic to keep in sync:
+queries. Name the database type once and pass it to the factory:
 
 ```ts
-const db = createMinnow(database, { schema: appSchema });
+interface DB extends InferDatabase<typeof appSchema> {}
+const db = createMinnow<DB>(database, { schema: appSchema });
 ```
+
+The named interface is what keeps the editor pleasant: hovers, errors, and generated declarations
+print `Minnow<DB>` instead of the fully expanded schema, which grows with every table you add.
+(`createMinnow(database, { schema })` without the type argument also works and infers `DB` from
+the schema value — fine for scratch code, at the cost of expanded types in tooling.)
 
 Drop to the raw layer (`database.query()`, `insertBatch()`, the `sql` tag) for bulk ingestion and
 ad-hoc SQL — it is the same pipeline, not a second engine. Builder queries compile to the exact

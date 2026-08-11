@@ -503,13 +503,16 @@ explicitly. Columns added after a segment was written read as NULL everywhere wi
 stored data; declared `.references()` relations validate at definition time and live in catalog
 metadata rather than being enforced per write.
 
-The Kysely-style query builder constructs the same compiled plans as SQL, with typed results and
-no generic passing — `createMinnow` infers the database type from the schema value:
+The Kysely-style query builder constructs the same compiled plans as SQL, with typed results. The
+standard construction names the database type once so hovers and declaration emit print
+`Minnow<DB>` instead of the expanded schema (`createMinnow` without the type argument infers `DB`
+from the schema value instead):
 
 ```ts
-import { createMinnow } from "@minnowdb/core";
+import { createMinnow, type InferDatabase } from "@minnowdb/core";
 
-const db = createMinnow(database, { schema: appSchema });
+interface DB extends InferDatabase<typeof appSchema> {}
+const db = createMinnow<DB>(database, { schema: appSchema });
 const rows = await db
   .selectFrom("people as p")
   .innerJoin("orders as o", "o.person", "p.name")
@@ -527,11 +530,8 @@ Builder queries compile through the same assembly pipeline as the SQL parser —
 strings — so a builder query and its equivalent SQL bind to identical optimized plans;
 structural plan-equality tests enforce that. Left-joined columns type as `| null`, mutations
 (`insertInto`/`updateTable`/`deleteFrom`) follow Kysely conventions with typed `returning`, and
-`query()`/`execute()`/`sql` remain the raw SQL escape hatch. When builders are exported across
-module boundaries, declare the database type as an interface
-(`interface DB extends InferDatabase<typeof appSchema> {}` with `new Minnow<DB>(...)`) so
-hovers and declaration emit print `DB` by name — see `packages/engine/README.md` for the typed
-API guide and TypeScript best practices.
+`query()`/`execute()`/`sql` remain the raw SQL escape hatch. See `packages/core/README.md` for
+the typed API guide and TypeScript best practices.
 
 Live queries re-execute selectively when their tables change:
 
