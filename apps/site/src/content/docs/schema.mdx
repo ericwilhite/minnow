@@ -1,13 +1,13 @@
 ---
 title: Schema & migrations
-description: The typed schema DSL and deterministic, metadata-only migrations.
+description: Define tables once in TypeScript; migrate with safe, metadata-only steps.
 ---
 
 # Schema & migrations
 
 <p class="lede">
-  The schema DSL defines tables with compile-time row types and migrates the catalog through
-  deterministic, metadata-only steps. No stored data is rewritten by a migration.
+  Define tables once in TypeScript. The same declaration drives migrations, row types, and every
+  query builder — and `migrate()` never rewrites stored data.
 </p>
 
 ## Defining a schema
@@ -32,25 +32,28 @@ const rows = await db.selectFrom("people").selectAll().execute();
 // Array<{ name: string; score: number; joined: Date | null }>
 ```
 
-Column builders exist for the four logical types — `column.boolean()`, `column.number()`,
-`column.string()`, `column.datetime()` — with modifiers:
+There's a builder per column type — `column.boolean()`, `column.number()`, `column.string()`,
+`column.datetime()` — and four modifiers:
 
-- `.unique()` — marks the table's unique key (one non-null column).
-- `.nullable()` — permits NULL and widens the inferred type.
-- `.renamedFrom()` — renames a column through its stable ID, so a rename is a metadata step rather
-  than a drop-and-add.
-- `.references()` — declares a relation. It validates at definition time and lives in catalog
-  metadata; it is not enforced per write.
+- **`.unique()`** — marks the table's unique key (one non-null column).
+- **`.nullable()`** — permits NULL and widens the inferred type.
+- **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
+  rather than a drop-and-add.
+- **`.references()`** — declares a relation. Checked when the schema is defined, stored as
+  metadata; not enforced per write.
 
-## Migration semantics
+## What migrate() does
 
-`migrate()` diffs the live catalog into deterministic metadata-only steps: create table, add
-nullable column, rename through the stable column ID, widen nullability. Each catalog change
-executes with one atomic compare-and-swap, and the whole sequence is idempotent — an interrupted
-migration completes by re-running. A concurrent migrator fails with a typed conflict instead of
-interleaving.
+`migrate()` compares the live catalog with your declaration and applies the difference as
+deterministic, metadata-only steps: create table, add nullable column, rename, widen nullability.
 
-Rejected explicitly, rather than attempted:
+- **Each step is atomic**, and the whole run is idempotent — an interrupted migration completes by
+  re-running.
+- **Concurrent migrators can't interleave** — the loser fails with a typed conflict.
+- **Nothing is rewritten.** A column added later reads as NULL in old data without touching it;
+  physical rewrites are [compaction](/docs/writes/)'s job.
+
+Rejected outright, rather than attempted:
 
 - type changes
 - column or table drops
@@ -58,14 +61,12 @@ Rejected explicitly, rather than attempted:
 - non-null tightening
 - non-nullable column additions
 
-Columns added after a segment was written read as NULL everywhere without rewriting stored data.
-Physical rewrites are deferred to [compaction](/docs/writes/) where possible.
+If you need one of those, that's a new table plus a deliberate application-level copy.
 
 ## Inferred shapes
 
-`InferDatabase<typeof appSchema>` maps table names to row types for `Minnow`. Lower-level helpers
-expose the per-table shapes (used by `typedTable()`, the thin schema-typed handle over the batch
-APIs):
+`InferDatabase<typeof appSchema>` maps table names to row types — it's what `DB` extends. The
+per-table helpers (used by `typedTable()`, the schema-typed handle over the batch APIs):
 
 | Type                 | Meaning                                             |
 | -------------------- | --------------------------------------------------- |
@@ -73,10 +74,8 @@ APIs):
 | `InferInsertRow`     | The insert shape; nullable columns may be omitted.  |
 | `InferUpdateChanges` | The partial-update shape accepted by keyed updates. |
 
-Each table definition also carries a Standard Schema-compatible `~standard` validator, so a
-definition can be handed to any library that consumes the Standard Schema interface for runtime row
-validation.
+Each table definition also carries a Standard Schema-compatible `~standard` validator, so any
+library that speaks that interface can validate rows at runtime with your definitions.
 
-> The same definitions feed the [query builder](/docs/queries/) and the typed
-> [write API](/docs/writes/), which derive every reference and row type from these column
-> declarations. Raw `createTable` remains available when compile-time types are not needed.
+> Raw `createTable` (see [Writes](/docs/writes/)) remains available when compile-time types aren't
+> needed.

@@ -1,41 +1,39 @@
 ---
 title: Getting started
-description: Install Minnow, declare a schema, and run typed queries in your first session.
+description: From npm install to typed queries, workers, and tests.
 ---
 
 # Getting started
 
 <p class="lede">
-  Minnow is a browser-only relational database built around immutable compressed columnar blocks and
-  IndexedDB. It includes persistent writes and snapshots, a deliberately limited read-only SQL API
-  with a columnar executor, resumable compaction, lease-aware garbage collection, and deterministic
-  fault injection.
+  Install the package, declare a schema, and you have a typed SQL database running in the browser —
+  no server, no WASM file, no build step. This page takes you from install to queries, workers, and
+  tests.
 </p>
 
 ```bash
 npm install @minnowdb/core
 ```
 
-> Experimental. The version-zero block format carries no compatibility promise, and the SQL surface
-> is a correctness-first subset, not full SQL-92 coverage.
+> Minnow is experimental. The storage format may still change, and the SQL surface is a
+> correctness-first subset — every supported form is listed in the [feature matrix](/docs/sql/).
 
-## Logical types
+## Column types
 
-The public type system is intentionally small. A table column is one of:
+There are four, on purpose:
 
 - `boolean`
 - `number`
 - `string`
 - `datetime`
 
-Numeric widths and physical encodings are storage details, not schema choices exposed to callers.
-Row IDs are assigned internally; callers do not choose an integer size.
+Storage details like numeric width and encoding are the engine's problem, not schema choices. Row
+IDs are assigned internally.
 
 ## First session
 
-Declare a schema, open a block store, migrate, and work through the typed facade — one declaration
-drives migrations, autocomplete, row types, typed writes with `returning`, and
-[live queries](/docs/live-queries/):
+Declare a schema, open a store, migrate, and query. One declaration drives migrations,
+autocomplete, row types, typed writes, and [live queries](/docs/live-queries/):
 
 ```ts
 import {
@@ -79,15 +77,16 @@ const rows = await db
   .execute(); // Array<{ name: string; joined: Date | null }>
 ```
 
-Every write validates before it stores anything and publishes immutable columnar blocks through an
-atomic manifest compare-and-swap, so a reader in another tab sees either the old version or the new
-one, never a partial write. Builder queries compile to the exact plans their SQL equivalents
-produce — see [Typed queries](/docs/queries/).
+Two things are true of every write:
+
+- It **validates before storing anything** — column names, types, nulls, row counts.
+- It **publishes atomically** — a reader in another tab sees the old version or the new one,
+  never a partial write.
 
 ## The SQL and batch layer
 
-Underneath the facade sit raw SQL and column-based batches — the layer the builders compile onto.
-Reach for it for bulk ingestion, ad-hoc SQL, or when compile-time types are not needed:
+The builders compile onto raw SQL and column batches. Use that layer directly for bulk loads and
+ad-hoc SQL:
 
 ```ts
 await database.insertBatch("people", {
@@ -107,20 +106,17 @@ const resultSet = await database.query(`
 `);
 ```
 
-Tables can also be created without the schema DSL via `createTable` — see
-[Writes & transactions](/docs/writes/).
+Same engine, same plans — a builder query and its SQL equivalent execute identically. See
+[Writes & transactions](/docs/writes/) for the full batch API.
 
 ## Run it in a worker
 
-`MinnowDatabase` runs wherever you construct it — the examples on the [home page](/) run it on the
-main thread against an in-memory store, and the calling code is identical either way because the
-public API is asynchronous throughout.
+The engine runs wherever you construct it. The examples on the [home page](/) run it on the main
+thread against an in-memory store, and the code is identical either way because the whole API is
+async.
 
-For real datasets, run it in a dedicated worker: IndexedDB access, block decoding, and query
-execution are heavy enough to jank the main thread. The library ships both sides of that channel —
-`@minnowdb/core/worker` is a ready-made worker entry, and `MinnowDatabaseClient` (from
-`@minnowdb/core/client`) is a main-thread async proxy of the full API. Your application contributes
-one line — constructing the `Worker`:
+For real datasets, use a worker — decoding and query execution are heavy enough to jank the main
+thread. Minnow ships both sides; you add one line, the `Worker` itself:
 
 ```ts
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
@@ -129,23 +125,18 @@ const client = new MinnowDatabaseClient(
   new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
   { store: { kind: "indexeddb", name: "app-db" } },
 );
-// Same code as above — the facade wraps the client exactly like a database:
 await client.migrate(appSchema);
 const db = createMinnow<DB>(client, { schema: appSchema });
+// …exactly the same code as above
 ```
 
-See [Workers & multi-tab](/docs/workers/) for the full client API, bundler setups, and custom
-worker entries built on `exposeDatabase()`.
+See [Workers & multi-tab](/docs/workers/) for the full client, bundler setups, and custom worker
+entries.
 
-> Correctness never depends on BroadcastChannel, Web Locks, page-close handlers, or successful
-> background work. IndexedDB is authoritative; the durability contract ends at a successfully
-> committed IndexedDB transaction.
+## Testing
 
-## Testing with an in-memory store
-
-For unit tests, substitute a `MemoryBlockStore` for the IndexedDB store. It implements the same
-storage interface, so table creation, batch writes, queries, compaction, and garbage collection
-behave identically without touching real browser storage.
+Swap in `MemoryBlockStore` and your tests run the real engine — tables, queries, compaction, all
+of it — without touching browser storage:
 
 ```ts
 import { MemoryBlockStore } from "@minnowdb/core/storage";
@@ -153,12 +144,9 @@ import { MemoryBlockStore } from "@minnowdb/core/storage";
 const database = new MinnowDatabase(new MemoryBlockStore());
 ```
 
-## Where to go next
+## Where next
 
-- [Workers & multi-tab](/docs/workers/) — the worker entry and client.
+- [Best practices](/docs/best-practices/) — the patterns the engine is designed around.
+- [Typed queries](/docs/queries/) — the query builder in full.
 - [Writes & transactions](/docs/writes/) — batches, buffered writers, maintenance.
-- [Schema & migrations](/docs/schema/) — the typed schema DSL.
-- [Typed queries](/docs/queries/) — the Kysely-style typed API.
-- [Live queries](/docs/live-queries/) — convergent re-execution on change.
-- [Architecture](/docs/architecture/) — storage, MVCC, and execution model.
-- [SQL support](/docs/sql/) — the checked-in feature matrix.
+- [Architecture](/docs/architecture/) — how it all works underneath.

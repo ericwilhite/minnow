@@ -1,21 +1,20 @@
 ---
 title: Writes & transactions
-description: Typed mutation builders, column-based batch writes, buffered writers, and maintenance.
+description: Typed mutations, column batches, buffered writers, and maintenance.
 ---
 
 # Writes & transactions
 
 <p class="lede">
-  Two layers, one pipeline: typed Kysely-style mutation builders on top, column-based batches
-  underneath. Every write validates before it stores anything, publishes immutable segments, and
-  reports its own metrics. Published blocks are never updated in place.
+  Two layers, one pipeline: typed mutation builders on top, column batches underneath. Every write
+  validates before it stores anything, and published data is never edited in place.
 </p>
 
 ## Typed writes
 
-The [query builder](/docs/queries/)'s facade carries the write side too, with Kysely conventions:
-`execute()` resolves to an array (one result object, or the `returning(...)` rows), and the
-idiomatic single-result call is `executeTakeFirst()` / `executeTakeFirstOrThrow()`.
+The [query builder](/docs/queries/) carries the write side too, with Kysely conventions:
+`execute()` resolves to an array, and the single-result calls are `executeTakeFirst()` /
+`executeTakeFirstOrThrow()`.
 
 ```ts
 const { numInsertedRows } = await db
@@ -46,23 +45,22 @@ const removed = await db
   .execute();
 ```
 
-- `set({ ...patch })` skips `undefined` entries, so spread-patches never accidentally null a
-  column; explicit `null` still writes NULL. Literals validate eagerly.
-- Insert `returning` echoes the written rows — exact, because the engine has no defaults or
-  generated columns. Update/delete `returning` rows come from the statement's own snapshot:
-  post-update values for updates, the rows as read for deletes.
-- Updates and deletes compile to the same mutation statements SQL parses into and run through the
-  engine's read-keys-then-apply pipeline; a competing writer fails the statement explicitly rather
-  than interleaving.
-- Result counts are plain numbers (`numInsertedRows: number`), not bigints.
+Worth knowing:
 
-Everything below is the batch layer the builders compile onto — use it directly for bulk ingestion
-or when compile-time types are not needed.
+- **`set({ ...patch })` skips `undefined` entries** — a spread-patch never accidentally nulls a
+  column. Explicit `null` still writes NULL.
+- **`returning` is exact.** Inserts echo the written rows (there are no defaults or generated
+  columns to surprise you); updates return post-update values; deletes return the rows as read.
+- **A competing writer fails your statement with a typed error** instead of interleaving.
+- **Counts are plain numbers** (`numInsertedRows: number`), not bigints.
+
+Everything below is the batch layer the builders compile onto — use it directly for bulk loads or
+when you don't need compile-time types.
 
 ## Creating tables
 
-A table uses only the four logical types. It may name one non-null column as a unique key, and
-columns may be declared `nullable`.
+A table uses the four column types, may name one non-null column as its unique key, and may mark
+columns `nullable`:
 
 ```ts
 await database.createTable({
@@ -78,10 +76,8 @@ await database.createTable({
 
 ## Batch writes
 
-Inserts validate column names, row counts, null values, and value types before writing.
-`upsertBatch` updates rows matching the unique key and inserts new keys. `updateBatch` writes
-immutable patch segments containing only the key and changed columns; it rejects missing keys and
-rechecks them after conflicts. Rows are deleted by unique key.
+Columns in, one commit out. Inserts validate names, types, nulls, and row counts before anything
+is stored:
 
 ```ts
 const result = await database.insertBatch("people", {
@@ -108,16 +104,15 @@ await database.updateBatch("people", {
 await database.deleteBatch("people", { keys: ["Ada"] });
 ```
 
-Unique-key checks use atomic, versioned persistent key chunks, avoiding both table-block scans and
-one-IndexedDB-operation-per-key overhead. The write result reports row count, block count, saved
-bytes, database version, encoding/staging/commit time, retries, rows per second, and write
-amplification.
+- **`upsertBatch`** updates rows matching the unique key and inserts the rest.
+- **`updateBatch`** writes only the key and the changed columns; missing keys are rejected.
+- **`deleteBatch`** deletes by unique key.
+- Every result carries metrics: rows, blocks, bytes, timings, retries, rows per second, write
+  amplification.
 
 ## Reading tables
 
-`readTable` accepts a column projection and an optional historical version. It fetches the required
-blocks for each visible segment in bulk windows of up to 16 block IDs; replay may additionally load
-a unique-key column needed to apply mutations.
+`readTable` takes a column projection and, optionally, a historical version:
 
 ```ts
 const scores = await database.readTable("people", {
@@ -127,8 +122,7 @@ const scores = await database.readTable("people", {
 
 ## Buffered writer
 
-A buffered writer combines individual rows into column batches and flushes at a row, byte, or age
-limit.
+For event streams: rows go in one at a time, batches come out at a row, byte, or age limit.
 
 ```ts
 const writer = database.bufferedWriter("people", {
@@ -139,65 +133,47 @@ const writer = database.bufferedWriter("people", {
 });
 await writer.add({ name: "Linus", score: 30, joined: new Date() });
 
-// Called by a worker-side handler when a main-thread lifecycle proxy requests a flush.
-writer.requestFlush();
+writer.requestFlush(); // non-blocking; failures go to onError
 await writer.close();
 ```
 
-An age-triggered flush waits behind an already-running batch and then drains rows accepted during
-that batch, so the timer cannot be consumed while data remains pending. `requestFlush()` is
-non-blocking and reports failures through the writer's `onError`. A main-thread worker proxy can
-use `attachLifecycleFlush()` to send that request when the document becomes hidden or the page
-fires `pagehide`.
+An age-triggered flush drains everything accepted so far, even rows that arrived while a previous
+batch was committing. `attachLifecycleFlush()` requests a flush when the page hides.
 
-> Lifecycle flushing is an optimization, not an unload-time durability guarantee. The durability
-> contract ends at a successfully committed IndexedDB transaction; browser shutdown cannot be made
-> reliable by visibility or page-lifecycle signals.
+> Lifecycle flushing is an optimization, not a durability guarantee. Durability ends at a
+> committed IndexedDB transaction — browser shutdown can't be made reliable by page events.
 
 ## Maintenance
 
-Compaction, garbage collection, and spill cleanup are stepped, durable, and cancellable. Each
-records a revisioned job that survives yields and database reopens.
+Compaction, garbage collection, and spill cleanup all advance in small, durable, resumable steps.
+A tab dying mid-job costs one step, not the job.
 
 ```ts
-// Advance a durable physical rewrite by one output block.
+// Advance a compaction one output block at a time.
 let progress = await database.compactTableStep("events", { maxBlocks: 1 });
 while (progress.result === null) {
   if (progress.jobId === null) throw new Error("Expected a compaction job");
   progress = await database.resumeCompactionJob(progress.jobId, { maxBlocks: 1 });
 }
-const jobs = await database.listCompactionJobs("events");
 
-// Reclaim unreachable history and terminal-job artifacts to completion.
-const collection = await database.collectGarbage({
-  maxItemsPerStep: 64,
-  maxPlanningItems: 1024,
-});
-
-// Or drive the same durable pass explicitly.
+// Reclaim unreachable history — in one call, or step by step.
+const collection = await database.collectGarbage({ maxItemsPerStep: 64 });
 let gcProgress = await database.collectGarbageStep({ maxItems: 8 });
-while (gcProgress.result === null) {
-  gcProgress = await database.resumeGarbageCollectionJob(gcProgress.jobId, { maxItems: 8 });
-}
 
-// Reclaim query spill pages abandoned by an abrupt tab loss once owner leases expire.
+// Reclaim spill pages abandoned by dead tabs, once their leases expire.
 const spillCleanup = await database.cleanupQuerySpill({ maxOwners: 64 });
 ```
 
-- `compactTable()` drives the checkpointed rewrite to completion; `compactTableStep()` advances it
-  by at most `maxBlocks` output blocks; `resumeCompactionJob()` continues a known job after a yield
-  or reopen.
-- `cancelCompactionJob(jobId)` durably settles an unpublished job as cancelled and atomically
-  aborts its linked transaction. It is idempotent and returns the terminal state plus any published
-  version, so a caller sees when publication had already won.
-- `collectGarbage()` / `collectGarbageStep()` run a lease-aware, restart-safe reachability pass.
-  Roots include the current manifest, unexpired reader/backup leases, active transactions, and
-  active compaction sources; historical manifests are tombstoned rather than deleted.
-- `cleanupQuerySpill()` reclaims spill pages whose owner lease is expired or missing; a
-  concurrently renewed owner is retained rather than torn down mid-query.
+- **`compactTable()`** runs to completion; **`compactTableStep()`** advances by at most
+  `maxBlocks`; **`resumeCompactionJob()`** continues after a yield or reopen;
+  **`listCompactionJobs()`** shows what's persisted.
+- **`cancelCompactionJob(jobId)`** settles a job as cancelled, atomically — either the cancel
+  wins or the publish already did, and the result tells you which. Idempotent.
+- **Garbage collection is reachability-based:** the current manifest, unexpired leases, active
+  transactions, and running compactions are the roots; everything else with known provenance is
+  reclaimable.
+- **Cancellation is cooperative** — an in-flight step notices at its next durable boundary, and
+  a cancelled job's blocks wait for a later GC pass.
 
-> Cancellation is cooperative: an in-flight step observes it at its next durable boundary. Blocks
-> already written by a cancelled job stay unreachable until a later garbage-collection pass
-> revalidates and reclaims them.
-
-See [Schema & migrations](/docs/schema/) for the typed alternative to `createTable`.
+See [Schema & migrations](/docs/schema/) for the typed alternative to `createTable`, and
+[Best practices](/docs/best-practices/) for when to schedule maintenance.

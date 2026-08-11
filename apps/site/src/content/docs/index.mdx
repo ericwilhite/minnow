@@ -10,10 +10,10 @@ description: What Minnow is, what it is for, and how the docs are organized.
   results, and durable storage built on immutable compressed columnar blocks over IndexedDB.
 </p>
 
-There is no server, no WASM blob, and no build step. You declare a schema once, and that one
-declaration drives migrations, autocomplete, row types, typed writes with `returning`, and live
-subscriptions. Underneath sits an engine with MVCC snapshots, atomic multi-tab publication,
-vectorized execution with explicit memory budgets, and background compaction.
+No server, no WASM file, no build step. You declare a schema once; that one declaration drives
+migrations, autocomplete, row types, typed writes, and live subscriptions. Underneath is a real
+engine: snapshot reads, atomic commits across tabs, memory-budgeted execution, background
+compaction.
 
 ```ts
 import {
@@ -65,16 +65,13 @@ const rows = await db
 
 ## Design commitments
 
-A few properties are constraints on the project, not aspirations — the full list is in
-[Architecture](/docs/architecture/):
+Four rules are fixed — the full reasoning is in [Architecture](/docs/architecture/):
 
-- **IndexedDB is authoritative.** Correctness never depends on BroadcastChannel, Web Locks,
-  page-close handlers, or successful background work. The durability contract ends at a
-  successfully committed IndexedDB transaction.
-- **Published data is immutable.** Writes append compressed columnar segments and publish them with
-  an atomic manifest compare-and-swap; another tab sees the old version or the new one, never a
-  partial write.
+- **IndexedDB is the source of truth.** Correctness never depends on BroadcastChannel, Web Locks,
+  or page-close handlers. Durability ends at a committed IndexedDB transaction.
+- **Published data is immutable.** Writes append and publish atomically; another tab sees the old
+  version or the new one, never a partial write.
 - **One plan, two front ends.** Builder queries compile to the exact plans their SQL equivalents
-  produce, enforced by structural plan-equality tests.
-- **The engine is owned.** Parser, binder, planner, optimizer, and executor are implemented here —
-  no SQLite, no DuckDB, no WASM engine underneath.
+  produce — enforced by tests.
+- **The engine is our own.** Parser, planner, optimizer, and executor are implemented here — no
+  SQLite or DuckDB underneath.

@@ -1,15 +1,14 @@
 ---
 title: Workers & multi-tab
-description: The shipped worker entry, the main-thread client, bundler setups, and custom entries.
+description: The shipped worker entry, the main-thread client, and bundler setups.
 ---
 
 # Workers & multi-tab
 
 <p class="lede">
-  The library ships both sides of the worker channel: a ready-made worker entry
-  (`@minnowdb/core/worker`) and a main-thread client (`@minnowdb/core/client`). Your application
-  contributes exactly one line — constructing the `Worker` — because that is the only line your
-  bundler must be able to see.
+  Minnow ships both sides of the worker setup: a ready-made worker entry (`@minnowdb/core/worker`)
+  and a main-thread client (`@minnowdb/core/client`). Your app contributes one line — the `new
+  Worker(...)` call — because that's the only line your bundler needs to see.
 </p>
 
 ## Quick start
@@ -47,47 +46,43 @@ const rows = await db
   .execute(); // Array<{ name: string; score: number }>
 ```
 
-The client sends its configuration to the worker in an init frame, so the stock entry needs no
-configuration of its own. Because the channel is ordered you may issue calls immediately;
-`await client.ready()` exists when you want to surface store-open failures eagerly. IndexedDB
-access, block decoding, planning, and query execution all run in the worker; the main thread holds
-only this proxy. The client also exposes the raw layer directly — `client.query(sql)`,
-`client.insertBatch(...)`, `client.createTable(...)` — mirroring the full database API.
+- The client sends its configuration to the worker on startup, so the stock entry needs none of
+  its own.
+- The channel is ordered, so you can issue calls immediately. `await client.ready()` exists to
+  surface store-open failures eagerly.
+- Storage access, decoding, planning, and execution all run in the worker; the main thread holds
+  only the proxy.
+- The raw layer is there too: `client.query(sql)`, `client.insertBatch(...)`,
+  `client.createTable(...)` — the full database API.
 
 ## Why you construct the Worker
 
-A worker needs a script URL at runtime, and
-`new Worker(new URL("…", import.meta.url), { type: "module" })` is only rewritten correctly when
-your bundler sees that exact expression in your build graph. Buried inside a published library it
-degrades differently under every bundler — which is why the one bundler-sensitive line lives in
-your code. It also keeps lifecycle ownership honest: you decide when the worker is created, shared,
-and terminated, and content-security policies (`worker-src`) are satisfied by your origin rather
-than worked around with blob URLs.
+A worker needs a script URL at runtime, and bundlers only rewrite
+`new Worker(new URL("…", import.meta.url), { type: "module" })` correctly when that exact
+expression appears in _your_ code — buried inside a library, it breaks differently under every
+bundler. Keeping it in your code also keeps lifecycle ownership honest (you decide when the worker
+starts and stops) and satisfies `worker-src` content-security policies from your own origin.
 
 ## What changes across the boundary
 
-- Every member is asynchronous. Members that are synchronous in the worker
-  (`PreparedQuery.execute()`, stats getters, `close()`) return promises on the client, and getter
-  pairs become methods — `writer.stats()`, `prepared.memoryUsage()`.
-- `prepareQuery()` still holds its materialized snapshot inputs in the worker until `close()`, but
-  a client-side `execute()` measures execution plus one channel round trip — benchmark inside the
-  worker when isolating executor time.
-- `migrate()` accepts the same schema DSL (serialized over the wire automatically) and reports its
-  steps in a data-only wire form.
-- Typed errors are rehydrated on the client: `instanceof UniqueConstraintError` works and carries
+- **Everything is async.** Members that are synchronous in the worker return promises on the
+  client, and getters become methods: `writer.stats()`, `prepared.memoryUsage()`.
+- **`prepareQuery()` still pins its snapshot in the worker** until `close()` — but a client-side
+  `execute()` includes a channel round trip. Benchmark inside the worker when isolating executor
+  time.
+- **`migrate()` takes the same schema DSL** — it's serialized over the wire automatically.
+- **Typed errors survive the trip.** `instanceof UniqueConstraintError` works on the client, with
   its fields; stack traces point into the worker.
-- Construction options that are functions (`now`, `createId`, a custom store) cannot cross the
-  channel — use a custom entry (below).
+- **Functions can't cross.** Construction options like `now`, `createId`, or a custom store need
+  a custom entry (below).
 
-The typed facade is unaffected by all of this: compiled plans and statements cross the channel by
-structured clone, so `selectFrom`, the typed [writes](/docs/writes/) with `returning`, and
-`.live()` behave identically on the main thread.
+The typed facade doesn't care about any of this: compiled plans cross the channel by structured
+clone, so `selectFrom`, typed [writes](/docs/writes/), and `.live()` behave identically.
 
 ## Buffered writers and live queries
 
-Stateful handles proxy transparently: the writer's age timer runs on the worker's clock, and
-live-query callbacks arrive as events. Cross-tab commit hints work by naming a BroadcastChannel the
-worker should join.
+Stateful handles proxy transparently — the writer's age timer runs on the worker's clock, and
+live-query callbacks arrive as events:
 
 ```ts
 const writer = client.bufferedWriter("people", {
@@ -109,12 +104,11 @@ await client.close({ terminateWorker: true });
 
 ## Bundler setups
 
-**Vite and webpack 5** both understand the quick-start pattern as written — they see the
-`new URL("@minnowdb/core/worker", import.meta.url)` expression, resolve the package subpath, and
-emit a separate worker chunk. Nothing else is required.
+**Vite and webpack 5** understand the quick-start pattern as written — they resolve the package
+subpath and emit a separate worker chunk. Nothing else needed.
 
-**esbuild** (and Parcel 2 with default settings) does not rewrite `new URL` worker expressions.
-Build the worker entry as its own bundle and point the Worker at the emitted file:
+**esbuild** (and Parcel 2 by default) doesn't rewrite `new URL` worker expressions. Bundle the
+worker entry separately and point at the output:
 
 ```ts
 // worker.ts — your one-line worker entry, bundled separately:
@@ -128,8 +122,8 @@ const client = new MinnowDatabaseClient(
 );
 ```
 
-**No bundler** — module workers cannot resolve bare specifiers (import maps do not apply inside
-workers in all engines yet), so use full URLs from your chosen CDN or vendored files:
+**No bundler** — module workers can't resolve bare specifiers, so use full URLs from a CDN or
+vendored files:
 
 ```ts
 // db-worker.js — served from your origin:
@@ -144,10 +138,10 @@ const client = new MinnowDatabaseClient(
 
 ## Custom worker entries
 
-The stock entry covers the cloneable configuration surface: the store descriptor (`indexeddb` or
+The stock entry covers everything a message can carry: the store descriptor (`indexeddb` or
 `memory`) plus `compression`, `rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and
-`prepareCacheBytes`. When construction needs things a message cannot carry — a custom `BlockStore`,
-deterministic `now`/`createId` seams — write your own entry and expose the database you built:
+`prepareCacheBytes`. For anything a message can't carry — a custom `BlockStore`, deterministic
+`now`/`createId` — write your own entry:
 
 ```ts
 // my-worker.ts
@@ -160,11 +154,9 @@ exposeDatabase(new MinnowDatabase(store, { compression: "gzip" }), self, {
 });
 ```
 
-`exposeDatabase()` answers the same client frames, acknowledging the client's init without
-reconstructing anything, so the main-thread code is unchanged. Underneath both entries sits
-`@minnowdb/core/worker-protocol`: versioned, structured-clone-safe RPC frames with method
-whitelists per handle — the worker never dispatches arbitrary property access.
+`exposeDatabase()` speaks the same protocol as the stock entry, so the main-thread code doesn't
+change. Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe
+RPC where each handle answers a fixed list of methods — never arbitrary property access.
 
-> The worker changes where work runs, not the durability contract: correctness never depends on
-> BroadcastChannel, Web Locks, page-close handlers, or successful background work. IndexedDB is
-> authoritative, and the contract still ends at a successfully committed IndexedDB transaction.
+> The worker changes where work runs, not the rules: IndexedDB stays authoritative, and
+> durability still ends at a committed transaction. See [Architecture](/docs/architecture/).
