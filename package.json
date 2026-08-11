@@ -1,5 +1,5 @@
 {
-  "name": "browserdatabase",
+  "name": "minnow",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,11 +8,13 @@
     "apps/*"
   ],
   "scripts": {
-    "build": "tsc -b && npm run build --workspace @browserdatabase/bench",
+    "build": "tsc -b && npm run build --workspace @minnowdb/bench",
+    "site:dev": "npm run dev --workspace @minnowdb/site",
+    "site:build": "tsc -b packages/core && npm run build --workspace @minnowdb/site",
     "typecheck": "tsc -b --pretty false",
     "test": "npm run build && vitest run",
     "test:browser": "npm run build && playwright test",
-    "test:library-browser": "tsc -b packages/storage-idb packages/testing packages/transactions packages/engine && playwright test --config playwright.library.config.ts",
+    "test:library-browser": "tsc -b packages/core && playwright test --config playwright.library.config.ts",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",

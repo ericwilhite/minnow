@@ -3,7 +3,7 @@
  * Descended from the old engine-comparison module; the monolithic four-engine comparison
  * run is gone, but the portable DDL, row conversion, and checksum machinery survives here.
  */
-import type { LogicalType } from "@browserdatabase/block-format";
+import type { LogicalType } from "@minnowdb/core/block-format";
 import type { EntityDefinition, GeneratedBatchColumns } from "../benchmark.js";
 
 export interface SqlQueryDefinition {

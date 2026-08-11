@@ -5,15 +5,15 @@
  * shows it.
  */
 import {
-  BrowserDatabase,
-  createBrowserDb,
+  MinnowDatabase,
+  createMinnow,
   column,
   schema,
   table,
-  type BrowserDb,
+  type Minnow,
   type InferDatabase,
-} from "@browserdatabase/engine";
-import { MemoryBlockStore } from "@browserdatabase/storage-idb";
+} from "@minnowdb/core";
+import { MemoryBlockStore } from "@minnowdb/core/storage";
 
 export interface ShowcaseExample {
   id: string;
@@ -22,8 +22,8 @@ export interface ShowcaseExample {
   run: () => Promise<string>;
 }
 
-function freshDatabase(): BrowserDatabase {
-  return new BrowserDatabase(new MemoryBlockStore());
+function freshDatabase(): MinnowDatabase {
+  return new MinnowDatabase(new MemoryBlockStore());
 }
 
 function show(value: unknown): string {
@@ -38,17 +38,17 @@ const people = table("people", {
 const appSchema = schema([people]);
 type DB = InferDatabase<typeof appSchema>;
 
-async function typedDb(): Promise<{ database: BrowserDatabase; db: BrowserDb<DB> }> {
+async function typedDb(): Promise<{ database: MinnowDatabase; db: Minnow<DB> }> {
   const database = freshDatabase();
   await database.migrate(appSchema);
-  return { database, db: createBrowserDb(database, { schema: appSchema }) };
+  return { database, db: createMinnow(database, { schema: appSchema }) };
 }
 
 const entries: ShowcaseExample[] = [
   {
     id: "sql",
     title: "Tables, column batches, SQL",
-    code: `const database = new BrowserDatabase(store);
+    code: `const database = new MinnowDatabase(store);
 
 await database.createTable({
   name: "people",
@@ -111,7 +111,7 @@ const appSchema = schema([people]);
 await database.migrate(appSchema);
 
 // DB is inferred from the schema — no generic passing.
-const db = createBrowserDb(database, { schema: appSchema });
+const db = createMinnow(database, { schema: appSchema });
 const written = await db
   .insertInto("people")
   .values({ name: "Ada", score: 10 }) // joined may be omitted; it pads to null

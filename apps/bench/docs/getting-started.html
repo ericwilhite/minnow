@@ -4,14 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Getting started — BrowserDatabase</title>
+    <title>Getting started — MinnowDatabase</title>
     <script type="module" src="/src/pages/doc.ts"></script>
   </head>
   <body data-page="docs/getting-started">
     <main>
       <h1>Getting started</h1>
       <p class="lead">
-        BrowserDatabase is an experimental browser-only relational database built around immutable
+        MinnowDatabase is an experimental browser-only relational database built around immutable
         compressed columnar blocks and IndexedDB. It includes persistent writes and snapshots, a
         deliberately limited read-only SQL API with a columnar executor, resumable compaction,
         lease-aware garbage collection, and deterministic fault injection.
@@ -41,14 +41,14 @@
         <code>returning</code>, and <a href="live-queries.html">live queries</a>:
       </p>
       <pre><code data-lang="ts">import {
-  BrowserDatabase,
-  BrowserDb,
+  MinnowDatabase,
+  Minnow,
   column,
   schema,
   table,
   type InferDatabase,
-} from "@browserdatabase/engine";
-import { IndexedDbBlockStore } from "@browserdatabase/storage-idb";
+} from "@minnowdb/core";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -58,10 +58,10 @@ const people = table("people", {
 const appSchema = schema([people]);
 
 const store = await IndexedDbBlockStore.open({ name: "app-db" });
-const database = new BrowserDatabase(store);
+const database = new MinnowDatabase(store);
 await database.migrate(appSchema);
 
-const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });
+const db = new Minnow&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });
 
 const written = await db
   .insertInto("people")
@@ -113,7 +113,7 @@ const resultSet = await database.query(`
 
       <h2>Run it in a worker</h2>
       <p>
-        <code>BrowserDatabase</code> runs wherever you construct it — the examples on the
+        <code>MinnowDatabase</code> runs wherever you construct it — the examples on the
         <a href="../index.html">overview page</a> run it on the main thread against an in-memory
         store, and the calling code is identical either way because the public API is asynchronous
         throughout.
@@ -121,20 +121,20 @@ const resultSet = await database.query(`
       <p>
         For real datasets, run it in a dedicated worker: IndexedDB access, block decoding, and query
         execution are heavy enough to jank the main thread. The library ships both sides of that
-        channel — <code>@browserdatabase/engine/worker</code> is a ready-made worker entry, and
-        <code>BrowserDatabaseClient</code> (from <code>@browserdatabase/engine/client</code>) is a
-        main-thread async proxy of the full API. Your application contributes one line —
-        constructing the <code>Worker</code>:
+        channel — <code>@minnowdb/core/worker</code> is a ready-made worker entry, and
+        <code>MinnowDatabaseClient</code> (from <code>@minnowdb/core/client</code>) is a main-thread
+        async proxy of the full API. Your application contributes one line — constructing the
+        <code>Worker</code>:
       </p>
-      <pre><code data-lang="ts">import { BrowserDatabaseClient } from "@browserdatabase/engine/client";
+      <pre><code data-lang="ts">import { MinnowDatabaseClient } from "@minnowdb/core/client";
 
-const client = new BrowserDatabaseClient(
-  new Worker(new URL("@browserdatabase/engine/worker", import.meta.url), { type: "module" }),
+const client = new MinnowDatabaseClient(
+  new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
   { store: { kind: "indexeddb", name: "app-db" } },
 );
 // Same code as above — the facade wraps the client exactly like a database:
 await client.migrate(appSchema);
-const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(client, { schema: appSchema });</code></pre>
+const db = new Minnow&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(client, { schema: appSchema });</code></pre>
       <p>
         See <a href="worker-client.html">Run it in a worker</a> for the full client API, bundler
         setups, and custom worker entries built on <code>exposeDatabase()</code>.

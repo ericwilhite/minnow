@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Query builder — BrowserDatabase</title>
+    <title>Query builder — MinnowDatabase</title>
     <script type="module" src="/src/pages/doc.ts"></script>
   </head>
   <body data-page="docs/orm">
@@ -18,12 +18,12 @@
 
       <h2>Setup</h2>
       <p>
-        <code>BrowserDb&lt;DB&gt;</code> wraps a database (or the
+        <code>Minnow&lt;DB&gt;</code> wraps a database (or the
         <a href="worker-client.html">worker client</a> — the API is identical over both). The
         <code>DB</code> type derives from the runtime schema, so one declaration drives migrations,
         autocomplete, and row types:
       </p>
-      <pre><code data-lang="ts">import { BrowserDb, column, schema, table, type InferDatabase } from "@browserdatabase/engine";
+      <pre><code data-lang="ts">import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -38,7 +38,7 @@ const orders = table("orders", {
 const appSchema = schema([people, orders]);
 
 await database.migrate(appSchema);
-const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });</code></pre>
+const db = new Minnow&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });</code></pre>
 
       <h2>Selects</h2>
       <pre><code data-lang="ts">const rows = await db
@@ -185,7 +185,7 @@ Typed builder -&gt; compile() ------------+</code></pre>
         <code>prepareQuery()</code> remain the raw read-only SQL API. Anything the builder does not
         express can be written as SQL against the same optimizer and executor.
       </p>
-      <pre><code data-lang="ts">import { sql } from "@browserdatabase/engine";
+      <pre><code data-lang="ts">import { sql } from "@minnowdb/core";
 
 const rows = await sql&lt;{ n: number }&gt;`
   SELECT COUNT(*) AS n FROM people WHERE city IN ${["London", "DC"]}

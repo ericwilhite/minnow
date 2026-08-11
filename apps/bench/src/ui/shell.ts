@@ -37,7 +37,7 @@ export function initShell(): void {
       return `<a href="${prefix}${href}"${active ? ' aria-current="page"' : ""}>${label}</a>`;
     })
     .join("");
-  header.innerHTML = `<nav><a class="brand" href="${prefix}index.html">BrowserDatabase</a>${links}</nav>`;
+  header.innerHTML = `<nav><a class="brand" href="${prefix}index.html">MinnowDatabase</a>${links}</nav>`;
   document.body.prepend(header);
 
   if (inDocs) {
@@ -55,6 +55,6 @@ export function initShell(): void {
 
   const footer = document.createElement("footer");
   footer.className = "site-footer";
-  footer.innerHTML = `<div>BrowserDatabase — a persistent columnar SQL database for the browser. Local workspace build.</div>`;
+  footer.innerHTML = `<div>MinnowDatabase — a persistent columnar SQL database for the browser. Local workspace build.</div>`;
   document.body.append(footer);
 }

@@ -5,12 +5,12 @@
  */
 import type { DurabilityMode } from "./benchmark.js";
 
-export type EngineId = "browserdatabase" | "sqlite" | "pglite";
+export type EngineId = "minnow" | "sqlite" | "pglite";
 
-export const engineIds: readonly EngineId[] = ["browserdatabase", "sqlite", "pglite"];
+export const engineIds: readonly EngineId[] = ["minnow", "sqlite", "pglite"];
 
 export const engineNames: Record<EngineId, string> = {
-  browserdatabase: "BrowserDatabase",
+  minnow: "MinnowDatabase",
   sqlite: "SQLite Wasm",
   pglite: "PGlite",
 };
@@ -22,7 +22,7 @@ export interface EngineMaterialization {
   engine: EngineId;
   status: "ready" | "failed";
   /**
-   * Where the copy physically lives: an IndexedDB database name for browserdatabase, an
+   * Where the copy physically lives: an IndexedDB database name for minnow, an
    * OPFS file path for sqlite, and for pglite the IndexedDB database name observed after
    * creation (Emscripten names it after the mount path, not the dataDir label).
    */
@@ -93,7 +93,7 @@ export interface EngineQueryRun {
   previewRows: Array<Record<string, unknown>>;
   truncated: boolean;
   checksum: number;
-  /** browserdatabase only: the optimized plan from explain(). */
+  /** minnow only: the optimized plan from explain(). */
   plan?: string;
 }
 
@@ -156,7 +156,7 @@ export interface FeatureEngineOutcome {
   engine: EngineId;
   /**
    * supported feature: "pass" means the example executed. unsupported feature: for
-   * browserdatabase, "pass" means the engine still fails with the recorded error (no
+   * minnow, "pass" means the engine still fails with the recorded error (no
    * drift); for other engines it reports whether they accept the example.
    */
   outcome: "pass" | "fail" | "accepts" | "rejects";
@@ -179,6 +179,6 @@ export interface FeatureSuiteResult {
   unsupportedCount: number;
   engines: EngineId[];
   features: FeatureReport[];
-  /** browserdatabase results that contradict the shipped matrix. */
+  /** minnow results that contradict the shipped matrix. */
   driftFailures: number;
 }

@@ -1,12 +1,4 @@
 {
   "files": [],
-  "references": [
-    { "path": "packages/block-format" },
-    { "path": "packages/storage-idb" },
-    { "path": "packages/worker-protocol" },
-    { "path": "packages/testing" },
-    { "path": "packages/transactions" },
-    { "path": "packages/engine" },
-    { "path": "apps/bench" }
-  ]
+  "references": [{ "path": "packages/core" }, { "path": "apps/bench" }]
 }

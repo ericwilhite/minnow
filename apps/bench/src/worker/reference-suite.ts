@@ -4,7 +4,7 @@
  * deterministic, so oracles run over tables regenerated in memory rather than rows read
  * back from any engine — the same inputs every engine received.
  */
-import type { DatabaseRow } from "@browserdatabase/engine";
+import type { DatabaseRow } from "@minnowdb/core";
 import { generateEntityBatch, getScenario, type EntityDefinition } from "../benchmark.js";
 import { loadDriver, requireMaterialization, type EngineSession } from "../engines/session.js";
 import { engineIds } from "../protocol.js";
@@ -24,7 +24,7 @@ export interface ReferenceQueryDefinition {
   name: string;
   complexity: "simple" | "moderate" | "complex";
   /**
-   * Submitted to BrowserDatabase verbatim. Queries outside the current SQL surface still
+   * Submitted to MinnowDatabase verbatim. Queries outside the current SQL surface still
    * carry their complete intended statement and record the engine's refusal, so the
    * report shows the real gap instead of a placeholder.
    */
@@ -424,7 +424,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
       complexity: "complex",
       tables: ["customers", "orders", "order_items", "returns", "payments"],
       expectedRows: 12,
-      // BrowserDatabase and PGlite both run DATE_TRUNC natively; the truncated month
+      // MinnowDatabase and PGlite both run DATE_TRUNC natively; the truncated month
       // canonicalizes to the same ISO instant on every path. sqlite has no DATE_TRUNC,
       // so its variant formats the month start as the equivalent ISO text directly.
       sql: "WITH cohorts AS (SELECT customer_id AS customer_id, DATE_TRUNC('month', joined_at) AS cohort_month FROM customers), returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id), captured AS (SELECT k.cohort_month AS cohort_month, o.customer_id AS customer_id, SUM(p.captured_amount) AS revenue, COUNT(*) AS orders FROM payments p JOIN orders o ON o.order_id = p.order_id JOIN cohorts k ON k.customer_id = o.customer_id WHERE p.status = 'captured' GROUP BY k.cohort_month, o.customer_id) SELECT cohort_month, COUNT(*) AS customers, SUM(revenue) AS revenue FROM captured GROUP BY cohort_month ORDER BY cohort_month",

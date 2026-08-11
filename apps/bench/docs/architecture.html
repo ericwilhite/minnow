@@ -4,14 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Architecture — BrowserDatabase</title>
+    <title>Architecture — MinnowDatabase</title>
     <script type="module" src="/src/pages/doc.ts"></script>
   </head>
   <body data-page="docs/architecture">
     <main>
       <h1>Architecture</h1>
       <p class="lead">
-        BrowserDatabase is a browser-only relational database engine for large local datasets,
+        MinnowDatabase is a browser-only relational database engine for large local datasets,
         designed around immutable compressed columnar storage, asynchronous worker execution, and
         IndexedDB transactions. This page condenses ARCHITECTURE.md.
       </p>
@@ -65,7 +65,7 @@
       </p>
       <p class="note">
         Today the library ships the engine, the versioned wire protocol, the worker entry, and the
-        main-thread full-API proxy (<code>BrowserDatabaseClient</code>) — see
+        main-thread full-API proxy (<code>MinnowDatabaseClient</code>) — see
         <a href="worker-client.html">run it in a worker</a>. Not shipped yet from the target shape:
         executor workers beneath the coordinator for segment-grained parallelism.
       </p>

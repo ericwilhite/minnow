@@ -8,7 +8,7 @@ import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol
 export interface PreparedStatement {
   /** Rows with canonicalized values (see engines/shared.ts). */
   execute(): Promise<Array<Record<string, unknown>>>;
-  /** browserdatabase only: the optimized plan. */
+  /** minnow only: the optimized plan. */
   plan?: string;
   close(): void;
 }
@@ -47,8 +47,8 @@ export function requireMaterialization(
 
 export async function loadDriver(engine: EngineId): Promise<EngineDriver> {
   switch (engine) {
-    case "browserdatabase":
-      return (await import("./browserdatabase.js")).browserDatabaseDriver;
+    case "minnow":
+      return (await import("./minnow.js")).minnowDriver;
     case "sqlite":
       return (await import("./sqlite.js")).sqliteDriver;
     case "pglite":

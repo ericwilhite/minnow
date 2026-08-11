@@ -4,8 +4,7 @@ export default defineConfig({
   testDir: "./apps/bench/tests",
   workers: 1,
   webServer: {
-    command:
-      "npm run dev --workspace @browserdatabase/bench -- --host 127.0.0.1 --port 4175 --strictPort",
+    command: "npm run dev --workspace @minnowdb/bench -- --host 127.0.0.1 --port 4175 --strictPort",
     port: 4175,
     reuseExistingServer: false,
   },

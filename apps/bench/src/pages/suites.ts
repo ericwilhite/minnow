@@ -508,7 +508,7 @@ function renderFeatureResult(result: FeatureSuiteResult): void {
     })
     .join("");
   fmResults.innerHTML = `
-    <p class="note">For BrowserDatabase, “pass” on an unsupported feature means the engine still refuses it with the recorded error. “accepts” / “rejects” on other engines is informational — their SQL surfaces simply differ.</p>
+    <p class="note">For MinnowDatabase, “pass” on an unsupported feature means the engine still refuses it with the recorded error. “accepts” / “rejects” on other engines is informational — their SQL surfaces simply differ.</p>
     <div class="table-scroll"><table><thead>${header}</thead><tbody>${rows}</tbody></table></div>`;
   void highlightAll(fmResults);
 }

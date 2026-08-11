@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Live queries — BrowserDatabase</title>
+    <title>Live queries — MinnowDatabase</title>
     <script type="module" src="/src/pages/doc.ts"></script>
   </head>
   <body data-page="docs/live-queries">
@@ -41,8 +41,7 @@ await db.close(); // closes the shared live set; open iterators end cleanly</cod
         yielded value is a true snapshot, but a slow consumer may skip intermediates. Configure
         cross-tab hints and polling once, on the facade:
         <code
-          >new BrowserDb(driver, { live: { channelName: "app-commits", pollIntervalMs: 5000 }
-          })</code
+          >new Minnow(driver, { live: { channelName: "app-commits", pollIntervalMs: 5000 } })</code
         >.
       </p>
 

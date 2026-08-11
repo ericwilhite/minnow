@@ -8,7 +8,7 @@ import {
   protocolVersion,
   type WorkerOperation,
   type WorkerResponse,
-} from "@browserdatabase/worker-protocol";
+} from "@minnowdb/core/worker-protocol";
 import { sampleMemory } from "../memory-probe.js";
 import type { WorkProgress } from "../protocol.js";
 

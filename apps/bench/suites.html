@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Benchmarks — BrowserDatabase</title>
+    <title>Benchmarks — MinnowDatabase</title>
     <script type="module" src="/src/pages/suites.ts"></script>
   </head>
   <body data-page="suites">
@@ -12,7 +12,7 @@
       <h1>Benchmarks &amp; test suites</h1>
       <p class="lead">
         Three independent suites. Reference queries verify results against hand-written JavaScript
-        oracles; the storage matrix measures BrowserDatabase's own configuration space; the
+        oracles; the storage matrix measures MinnowDatabase's own configuration space; the
         conformance run executes the documented SQL surface live.
       </p>
 
@@ -44,7 +44,7 @@
 
       <h2 id="storage">Storage configuration benchmark</h2>
       <p class="note">
-        BrowserDatabase only: writes and reads back the full dataset through the block store,
+        MinnowDatabase only: writes and reads back the full dataset through the block store,
         verifies every value, probes transaction conflicts and recovery, benchmarks the write API,
         and runs the reference queries with JavaScript baselines. Uses throwaway databases; nothing
         is retained. “Full matrix” runs raw/rle/gzip across five block sizes.
@@ -112,13 +112,13 @@
       <h2 id="feature-matrix">SQL conformance run</h2>
       <p class="note">
         Executes every example from the shipped feature matrix live. Supported examples must run on
-        BrowserDatabase; unsupported examples must still fail with the recorded error (drift
+        MinnowDatabase; unsupported examples must still fail with the recorded error (drift
         detection). SQLite Wasm and PGlite run the same statements against an identical in-memory
         fixture, so the table also shows honestly where other engines support something this engine
         does not.
       </p>
       <div class="checkbox-row" id="fm-engines">
-        <label><input type="checkbox" value="browserdatabase" checked /> BrowserDatabase</label>
+        <label><input type="checkbox" value="minnow" checked /> MinnowDatabase</label>
         <label><input type="checkbox" value="sqlite" checked /> SQLite Wasm</label>
         <label><input type="checkbox" value="pglite" checked /> PGlite</label>
       </div>

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Datasets — BrowserDatabase</title>
+    <title>Datasets — MinnowDatabase</title>
     <script type="module" src="/src/pages/datasets.ts"></script>
   </head>
   <body data-page="datasets">
@@ -31,7 +31,7 @@
             </select>
           </div>
           <div>
-            <label for="compression">Compression (BrowserDatabase)</label>
+            <label for="compression">Compression (MinnowDatabase)</label>
             <select id="compression">
               <option value="raw">raw</option>
               <option value="rle">rle</option>
@@ -57,7 +57,7 @@
           </div>
         </fieldset>
         <div class="checkbox-row" id="engine-checks">
-          <label><input type="checkbox" value="browserdatabase" checked /> BrowserDatabase</label>
+          <label><input type="checkbox" value="minnow" checked /> MinnowDatabase</label>
           <label><input type="checkbox" value="sqlite" checked /> SQLite Wasm</label>
           <label><input type="checkbox" value="pglite" checked /> PGlite</label>
         </div>
@@ -82,7 +82,7 @@
               <th>Created</th>
               <th class="num">Scale</th>
               <th class="num">Rows</th>
-              <th>BrowserDatabase</th>
+              <th>MinnowDatabase</th>
               <th>SQLite</th>
               <th>PGlite</th>
               <th></th>
@@ -92,7 +92,7 @@
         </table>
       </div>
       <p class="note">
-        BrowserDatabase copies persist as IndexedDB block stores, SQLite copies as OPFS database
+        MinnowDatabase copies persist as IndexedDB block stores, SQLite copies as OPFS database
         files, and PGlite copies as an IndexedDB-backed data directory. Everything stays on this
         machine; deleting a row removes that dataset's storage from all engines. Keep this page in a
         single tab while generating — PGlite allows one open instance per data directory.

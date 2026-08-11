@@ -1,5 +1,5 @@
 {
-  "name": "@browserdatabase/bench",
+  "name": "@minnowdb/bench",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,12 +8,7 @@
     "dev": "vite"
   },
   "dependencies": {
-    "@browserdatabase/block-format": "0.0.0",
-    "@browserdatabase/engine": "0.0.0",
-    "@browserdatabase/storage-idb": "0.0.0",
-    "@browserdatabase/testing": "0.0.0",
-    "@browserdatabase/transactions": "0.0.0",
-    "@browserdatabase/worker-protocol": "0.0.0",
+    "@minnowdb/core": "0.0.0",
     "@electric-sql/pglite": "^0.5.4",
     "@shikijs/core": "^3.0.0",
     "@shikijs/engine-javascript": "^3.0.0",

@@ -1,4 +1,4 @@
-import { compileQuery, executeQuery, type DatabaseRow } from "@browserdatabase/engine";
+import { compileQuery, executeQuery, type DatabaseRow } from "@minnowdb/core";
 import { describe, expect, it } from "vitest";
 import { generateEntityBatch, getScenario } from "./benchmark.js";
 import { comparisonQueries } from "./engines/shared.js";
@@ -15,7 +15,7 @@ function generatedRows(table: string): DatabaseRow[] {
   ) as DatabaseRow[];
 }
 
-describe("BrowserDatabase comparison SQL", () => {
+describe("MinnowDatabase comparison SQL", () => {
   it("matches the payment-funnel groups produced from the deterministic dataset", () => {
     const payments = generatedRows("payments");
     const transactions = generatedRows("payment_transactions");

@@ -1,0 +1,44 @@
+{
+  "name": "@minnowdb/core",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/engine/client.d.ts",
+      "default": "./dist/engine/client.js"
+    },
+    "./worker": {
+      "types": "./dist/engine/worker.d.ts",
+      "default": "./dist/engine/worker.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "default": "./dist/storage/index.js"
+    },
+    "./block-format": {
+      "types": "./dist/block-format/index.d.ts",
+      "default": "./dist/block-format/index.js"
+    },
+    "./transactions": {
+      "types": "./dist/transactions/index.d.ts",
+      "default": "./dist/transactions/index.js"
+    },
+    "./worker-protocol": {
+      "types": "./dist/worker-protocol/index.d.ts",
+      "default": "./dist/worker-protocol/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
+    "./sql-feature-matrix.json": "./sql-feature-matrix.json"
+  },
+  "files": [
+    "dist",
+    "sql-feature-matrix.json"
+  ]
+}

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Schema and migrations — BrowserDatabase</title>
+    <title>Schema and migrations — MinnowDatabase</title>
     <script type="module" src="/src/pages/doc.ts"></script>
   </head>
   <body data-page="docs/schema-migrations">
@@ -16,7 +16,7 @@
       </p>
 
       <h2>Defining a schema</h2>
-      <pre><code data-lang="ts">import { BrowserDb, column, schema, table, type InferDatabase } from "@browserdatabase/engine";
+      <pre><code data-lang="ts">import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -28,7 +28,7 @@ const appSchema = schema([people]);
 await database.migrate(appSchema);
 
 // The same declaration drives the query builder's types end to end:
-const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });
+const db = new Minnow&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(database, { schema: appSchema });
 await db.insertInto("people").values({ name: "Ada", score: 10 }).execute(); // joined pads to null
 const rows = await db.selectFrom("people").selectAll().execute();
 // Array&lt;{ name: string; score: number; joined: Date | null }&gt;</code></pre>
@@ -75,7 +75,7 @@ const rows = await db.selectFrom("people").selectAll().execute();
       <h2>Inferred shapes</h2>
       <p>
         <code>InferDatabase&lt;typeof appSchema&gt;</code> maps table names to row types for
-        <code>BrowserDb</code>. Lower-level helpers expose the per-table shapes (used by
+        <code>Minnow</code>. Lower-level helpers expose the per-table shapes (used by
         <code>typedTable()</code>, the thin schema-typed handle over the batch APIs):
       </p>
       <table>

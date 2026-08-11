@@ -7,10 +7,10 @@
 import type { DatasetRecord } from "../protocol.js";
 import { deleteDatabase, indexedDbRequest, indexedDbTransactionDone } from "./support.js";
 
-const REGISTRY_NAME = "browserdatabase-site-datasets-v2";
+const REGISTRY_NAME = "minnow-site-datasets-v2";
 const REGISTRY_STORE = "datasets";
 
-const V1_REGISTRY_NAME = "browserdatabase-dashboard-datasets-v1";
+const V1_REGISTRY_NAME = "minnow-dashboard-datasets-v1";
 const V1_STORE = "datasets";
 
 let v1CleanupPromise: Promise<void> | undefined;
@@ -24,7 +24,7 @@ function cleanupV1Registry(): Promise<void> {
       try {
         const databases = await indexedDB.databases();
         for (const database of databases) {
-          if (database.name?.startsWith("/pglite/browserdatabase-compare-") === true) {
+          if (database.name?.startsWith("/pglite/minnow-compare-") === true) {
             await deleteDatabase(database.name).catch(() => undefined);
           }
         }

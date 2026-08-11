@@ -1,7 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
-  testDir: "./packages/transactions/browser-tests",
+  testDir: "./packages/core/browser-tests",
   webServer: {
     command: "npx vite --host 127.0.0.1 --port 4180",
     port: 4180,

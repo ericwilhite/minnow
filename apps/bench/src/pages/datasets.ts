@@ -145,7 +145,7 @@ function renderList(datasets: DatasetRecord[]): void {
         <td>${escapeHtml(new Date(record.createdAt).toLocaleString())}</td>
         <td class="num">${formatDecimal(record.scale)}×</td>
         <td class="num">${formatInteger(record.totalRows)}</td>
-        <td>${engineCell(record.engines.browserdatabase)}</td>
+        <td>${engineCell(record.engines.minnow)}</td>
         <td>${engineCell(record.engines.sqlite)}</td>
         <td>${engineCell(record.engines.pglite)}</td>
         <td><button class="danger" data-delete="${record.id}">Delete</button></td>

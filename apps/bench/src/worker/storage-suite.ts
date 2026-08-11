@@ -1,5 +1,5 @@
 /**
- * The BrowserDatabase storage-configuration benchmark, moved nearly verbatim from the
+ * The MinnowDatabase storage-configuration benchmark, moved nearly verbatim from the
  * old dashboard worker: block write/readback with full value verification, transaction
  * conflict and recovery probes, write-API measurements, and the reference queries with
  * JavaScript baselines. Every database it opens is throwaway — dataset persistence is
@@ -11,16 +11,16 @@ import {
   inspectBlock,
   type ColumnInput,
   type DecodedColumn,
-} from "@browserdatabase/block-format";
+} from "@minnowdb/core/block-format";
 import {
-  BrowserDatabase,
+  MinnowDatabase,
   UniqueConstraintError,
   type BatchValue,
   type DatabaseRow,
-} from "@browserdatabase/engine";
-import { IndexedDbBlockStore, WriteConflictError } from "@browserdatabase/storage-idb";
-import { FaultInjectingBlockStore } from "@browserdatabase/testing";
-import { TransactionManager } from "@browserdatabase/transactions";
+} from "@minnowdb/core";
+import { IndexedDbBlockStore, WriteConflictError } from "@minnowdb/core/storage";
+import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
+import { TransactionManager } from "@minnowdb/core/transactions";
 import {
   benchmarkFocuses,
   durabilityModes,
@@ -71,7 +71,7 @@ export async function runStorageBenchmark(
 ): Promise<BenchmarkResult> {
   const scenario = getScenario(config.scenario);
   const runId = crypto.randomUUID();
-  const databaseName = `browserdatabase-bench-${runId}`;
+  const databaseName = `minnow-bench-${runId}`;
   const estimateBefore = await storageEstimate();
   // Sampled before any timer starts; the measurement waits for the next garbage collection.
   const memoryBefore = await requestMemorySample(requestId, "Measuring memory before the run");
@@ -357,7 +357,7 @@ async function benchmarkTransactions(
   durability: IDBTransactionDurability,
   runId: string,
 ): Promise<{ durationMs: number; checks: TransactionCheckMeasurement[] }> {
-  const databaseName = `browserdatabase-transaction-bench-${runId}`;
+  const databaseName = `minnow-transaction-bench-${runId}`;
   const firstStore = await IndexedDbBlockStore.open({ name: databaseName, durability });
   const secondStore = await IndexedDbBlockStore.open({ name: databaseName, durability });
   const checks: TransactionCheckMeasurement[] = [];
@@ -558,14 +558,14 @@ async function benchmarkLibraryWrites(
   runId: string,
 ): Promise<BenchmarkResult["library"]> {
   const scenario = getScenario(config.scenario);
-  const databaseName = `browserdatabase-library-bench-${runId}`;
+  const databaseName = `minnow-library-bench-${runId}`;
   const store = await IndexedDbBlockStore.open({
     name: databaseName,
     durability: config.durability,
   });
   const rowsPerBlock = Math.max(1, Math.min(100_000, Math.floor(config.targetBlockBytes / 8.125)));
   const maxBatchRows = 100_000;
-  const database = new BrowserDatabase(store, {
+  const database = new MinnowDatabase(store, {
     compression: config.compression,
     rowsPerBlock,
     maxCommitRetries: 8,
@@ -926,7 +926,7 @@ async function benchmarkLibraryWrites(
       durability: config.durability,
     });
     try {
-      const secondDatabase = new BrowserDatabase(secondStore, {
+      const secondDatabase = new MinnowDatabase(secondStore, {
         compression: config.compression,
         rowsPerBlock,
         maxCommitRetries: 8,
@@ -1053,7 +1053,7 @@ async function benchmarkReferenceQueries(
     name: databaseName,
     durability: config.durability,
   });
-  const database = new BrowserDatabase(store, {
+  const database = new MinnowDatabase(store, {
     compression: config.compression,
     rowsPerBlock: Math.max(1, Math.min(50_000, Math.floor(config.targetBlockBytes / 16))),
   });
@@ -1109,7 +1109,7 @@ async function benchmarkReferenceQueries(
       passed:
         integrityChecks.every((check) => check.passed) &&
         measurements.every((query) => query.verified),
-      note: `Each query is submitted to BrowserDatabase as SQL and executed through the public prepareQuery()/execute() API; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it excludes the storage read the engine timing also excludes, but it does no planning and keeps whole tables resident. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
+      note: `Each query is submitted to MinnowDatabase as SQL and executed through the public prepareQuery()/execute() API; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it excludes the storage read the engine timing also excludes, but it does no planning and keeps whole tables resident. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
     };
   } finally {
     store.close();
@@ -1117,7 +1117,7 @@ async function benchmarkReferenceQueries(
   }
 }
 async function measureReferenceQueryFromStorage(
-  database: BrowserDatabase,
+  database: MinnowDatabase,
   query: ReferenceQueryDefinition,
   sampleCount: number,
 ): Promise<{
@@ -1203,12 +1203,12 @@ async function measureReferenceQueryFromStorage(
  * without anyone editing the catalog.
  */
 async function measureReferenceQueryOnEngine(
-  database: BrowserDatabase,
+  database: MinnowDatabase,
   query: ReferenceQueryDefinition,
   oracleTuples: readonly unknown[][],
   sampleCount: number,
 ): Promise<BenchmarkResult["referenceQueries"]["queries"][number]["engine"]> {
-  let prepared: Awaited<ReturnType<BrowserDatabase["prepareQuery"]>> | undefined;
+  let prepared: Awaited<ReturnType<MinnowDatabase["prepareQuery"]>> | undefined;
   try {
     const prepareStarted = performance.now();
     prepared = await database.prepareQuery(query.sql);
@@ -1253,7 +1253,7 @@ async function measureReferenceQueryOnEngine(
   }
 }
 async function createReferenceTables(
-  database: BrowserDatabase,
+  database: MinnowDatabase,
   entities: readonly EntityDefinition[],
 ): Promise<void> {
   for (const entity of entities) {
@@ -1266,7 +1266,7 @@ async function createReferenceTables(
 }
 
 async function insertReferenceDataset(
-  database: BrowserDatabase,
+  database: MinnowDatabase,
   entities: readonly EntityDefinition[],
   scale: number,
 ): Promise<void> {
@@ -1367,7 +1367,7 @@ const referenceRelationships = [
 ] as const;
 
 async function validatePersistedReferenceDataset(
-  database: BrowserDatabase,
+  database: MinnowDatabase,
   metadata: Array<{ name: string; rows: number; loadMs: number }>,
 ): Promise<BenchmarkResult["referenceQueries"]["integrityChecks"]> {
   const checks: BenchmarkResult["referenceQueries"]["integrityChecks"] = [];

@@ -1,5 +1,5 @@
 /**
- * Live SQL conformance run over the shipped feature matrix. BrowserDatabase executes
+ * Live SQL conformance run over the shipped feature matrix. MinnowDatabase executes
  * every example the same way the engine's own test suite does: query examples through
  * compileQuery/executeQuery over an in-memory fixture, mutation and transaction
  * examples through database.execute() on a throwaway keyed database. Unsupported
@@ -7,14 +7,9 @@
  * PGlite run the same statements against an identical fixture, purely as information
  * about where other engines' surfaces differ.
  */
-import sqlFeatureMatrix from "@browserdatabase/engine/sql-feature-matrix.json";
-import {
-  BrowserDatabase,
-  compileQuery,
-  executeQuery,
-  type DatabaseRow,
-} from "@browserdatabase/engine";
-import { MemoryBlockStore } from "@browserdatabase/storage-idb";
+import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json";
+import { MinnowDatabase, compileQuery, executeQuery, type DatabaseRow } from "@minnowdb/core";
+import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { engineIds, engineNames } from "../protocol.js";
 import type {
   EngineId,
@@ -103,9 +98,7 @@ export async function runFeatureSuite(
     for (const runner of runners.values()) await runner.close();
   }
   const driftFailures = reports.filter((report) =>
-    report.engines.some(
-      (outcome) => outcome.engine === "browserdatabase" && outcome.outcome === "fail",
-    ),
+    report.engines.some((outcome) => outcome.engine === "minnow" && outcome.outcome === "fail"),
   ).length;
   progress(requestId, {
     phase: "complete",
@@ -136,7 +129,7 @@ async function measureFeature(
     error = caught instanceof Error ? caught.message : String(caught);
   }
   const ms = performance.now() - started;
-  if (engine === "browserdatabase") {
+  if (engine === "minnow") {
     if (feature.status === "supported") {
       return error === undefined
         ? { engine, outcome: "pass", ms }
@@ -168,8 +161,8 @@ interface FeatureRunner {
 
 async function createRunner(engine: EngineId): Promise<FeatureRunner> {
   switch (engine) {
-    case "browserdatabase":
-      return Promise.resolve(browserDatabaseRunner());
+    case "minnow":
+      return Promise.resolve(minnowRunner());
     case "sqlite":
       return sqliteRunner();
     case "pglite":
@@ -177,7 +170,7 @@ async function createRunner(engine: EngineId): Promise<FeatureRunner> {
   }
 }
 
-function browserDatabaseRunner(): FeatureRunner {
+function minnowRunner(): FeatureRunner {
   return {
     async execute(feature) {
       if (usesDatabase(feature)) {
@@ -192,8 +185,8 @@ function browserDatabaseRunner(): FeatureRunner {
 }
 
 /** Mirrors the fixture the engine's own conformance test seeds for mutation examples. */
-async function keyedDatabase(): Promise<BrowserDatabase> {
-  const database = new BrowserDatabase(new MemoryBlockStore(), { rowsPerBlock: 8 });
+async function keyedDatabase(): Promise<MinnowDatabase> {
+  const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 8 });
   await database.createTable({
     name: "keyed",
     uniqueKey: "name",

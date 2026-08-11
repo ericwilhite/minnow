@@ -1,4 +1,4 @@
-# BrowserDatabase Roadmap
+# Minnow Roadmap
 
 This roadmap is organized as vertical slices with measurable exit gates. Phase numbers preserve the implementation order developed during design; later phases may overlap experimentally but may not bypass the correctness and performance gates beneath them.
 
@@ -53,7 +53,7 @@ reference queries. A measured, read-only ad-hoc reference SQL console remains ex
 from library timings. The library now has a correctness-first native `query()`/`prepareQuery()` SQL
 subset for projections, filters, equi-joins, grouping, core aggregates, ordering, and limits. The
 engine comparison uses that public API and requires matching checksums. The checked-in 2026-08-11
-three-engine record measures BrowserDatabase SQL for the first time: at scale 10 in Chromium and
+three-engine record measures MinnowDatabase SQL for the first time: at scale 10 in Chromium and
 Firefox, all 15 reference queries execute with oracle-verified results and summed repeated-execution
 medians beat SQLite Wasm and PGlite in both browsers. The same-day prepare-cache follow-up record
 halved the remaining per-statement prepare cost with one batched catalog read
@@ -149,9 +149,9 @@ competing-writer outcomes in Chromium and Firefox with relaxed and strict Indexe
 These are single-scale observations; the broader Phase 5 exit gate still calls for performance
 curves.
 
-The 2026-08-08 1.93-million-row comparison records 303,723 BrowserDatabase rows/s after the key
+The 2026-08-08 1.93-million-row comparison records 303,723 MinnowDatabase rows/s after the key
 chunk and batch-staging optimization, versus 213,557 for persistent SQLite, 87,938 for persistent
-PGlite, and 1,589,803 for in-memory DuckDB in the same host Chromium run. BrowserDatabase's total
+PGlite, and 1,589,803 for in-memory DuckDB in the same host Chromium run. MinnowDatabase's total
 logical persisted payload is reported separately from implementation-specific physical page sizes.
 
 Exit gate: published benchmark curves for insert, upsert, update, delete, and competing commits under relaxed and strict durability. Upsert tests cover new rows, matching rows, duplicate keys, null keys, and two writers updating the same key.
@@ -236,7 +236,7 @@ bounded L0-prefix selection and lease-aware physical reclamation for known artif
   artifacts can be collected once no live root reaches them;
 - collected manifest descriptors retain `prunedAt` tombstones for lost-commit reconciliation, but
   cannot be newly opened or pinned and no longer root their blocks;
-- transient internal reader leases protect `BrowserDatabase` table/query materialization, while
+- transient internal reader leases protect `MinnowDatabase` table/query materialization, while
   begin/rebase/pin and lease-expiry races serialize with collection;
 - stale-transaction recovery routes physical deletion through the same durable collector;
 - completed collection results distinguish pruned/already-pruned/retained/missing manifests,
@@ -339,7 +339,7 @@ hash collisions, typed keys, duplicate order, `-0`, SQL `NaN` behavior, exact bu
 row/vector parity.
 
 Phase 7D-A adds durable temp-run pages plus asynchronous external merge sort and partitioned hash
-aggregation. Budgeted `BrowserDatabase.query()` spills ungrouped ordered output (including joins) or
+aggregation. Budgeted `MinnowDatabase.query()` spills ungrouped ordered output (including joins) or
 single-table grouped ordered output, pairwise-merges fixed pages, applies LIMIT at the final read, and
 removes every owner/run page after ordinary success or failure. Spill owners now register and renew
 durable leases while executing, and `cleanupQuerySpill()` reclaims pages whose owner lease is expired
@@ -348,7 +348,7 @@ renewed concurrently. Synchronous
 prepared execution remains a no-I/O fast path; `executeAsync()` exposes the spill-capable path.
 
 Phase 7E-A adds sliding-window scan streaming for budgeted single-table append/base
-`BrowserDatabase.query()` plans without joins. The executor awaits a window load before every scan
+`MinnowDatabase.query()` plans without joins. The executor awaits a window load before every scan
 batch in each asynchronous execution path, bound expressions read through per-vector resident
 windows, and the loader decodes whole blocks forward-only, reserving fixed window bytes before
 allocation and measured per-window dictionary bytes before installation. Under a budget, streaming
@@ -388,7 +388,7 @@ replace the remaining boxed growing containers, and cover those operator shapes 
 working-set budget.
 
 The schema-less empty-table row-adapter compatibility path rejects configured budgets rather than
-silently escaping the model; catalog-backed `BrowserDatabase` empty tables stay on the typed path.
+silently escaping the model; catalog-backed `MinnowDatabase` empty tables stay on the typed path.
 
 Exit gate: hot paths avoid row-object materialization and per-row callbacks; operator memory is accounted against a configured budget.
 
@@ -466,7 +466,7 @@ predicates push into derived and CTE sources on the base and inner-join sides (g
 only for grouped inners, never across a left join), unreferenced projections prune out of plain
 derived blocks (grouped and DISTINCT blocks keep their semantics-bearing select lists), and outer
 LIMIT combines into an unordered derived base. `renderPlan()` produces stable snapshots verified
-per rule, `BrowserDatabase.explain()` reports the optimized plan plus physical strategy notes, and
+per rule, `MinnowDatabase.explain()` reports the optimized plan plus physical strategy notes, and
 the differential fuzzer compares optimized columnar execution against the raw-plan row reference,
 so every rewrite sits inside the correctness net; an 80-seed sweep of 9,600 randomized queries
 passed. Zone-map segment pruning from Phase 8A and streamed/late-loaded scans from Phase 7 remain
@@ -505,7 +505,7 @@ schema at definition time (they are catalog metadata, not write-time constraints
 `planMigration` diffs the live catalog into deterministic steps — create table, add nullable
 column, rename column through its stable ID, widen nullability — and rejects everything else
 explicitly: type changes, drops, unique-key changes, non-null tightening, and non-nullable
-additions. `BrowserDatabase.migrate()` executes the plan idempotently with one atomic
+additions. `MinnowDatabase.migrate()` executes the plan idempotently with one atomic
 compare-and-swap per catalog alteration on a new revisioned `updateTable`, so an interrupted
 migration completes by re-running and a concurrent migrator fails with a typed conflict. Because
 every supported step is catalog-only, no rewrite piggybacking is needed yet: columns added after a
@@ -525,7 +525,7 @@ references from schema tables, expression builders (`eq`/`gt`/`inList`/arithmeti
 .groupBy().having().select().distinct().orderBy().limit().build()` constructs a `CompiledQuery`
 directly — never SQL text — then runs the same deterministic optimizer, including the parser's
 DISTINCT-to-grouping desugaring. `select()` shapes infer the result row type, `nullableRefs()`
-carries explicit `| null` typing for left-joined columns, and `BrowserDatabase.run()` executes
+carries explicit `| null` typing for left-joined columns, and `MinnowDatabase.run()` executes
 built queries through the same preparation pipeline as SQL. CRUD and batch writes are the Phase 14
 `typedTable` handles, and `query()`/`execute()` remain the raw SQL escape hatch. The exit gate is
 met by structural plan-equality tests — ORM plans compare deeply equal to compiled SQL across
@@ -543,7 +543,7 @@ Deliver persisted change sets, dependency extraction, cross-tab hints, version r
 Phase 16 delivers correctness-first selective re-execution. Every transaction commit persists its
 changed table IDs in the manifest — derived automatically from staged segments, with compaction
 marking itself logically unchanged so supersession never triggers reruns — and
-`BrowserDatabase.liveQueries()` builds subscription sets whose every hint path (local commit,
+`MinnowDatabase.liveQueries()` builds subscription sets whose every hint path (local commit,
 injected cross-tab channel message, poll tick, or explicit `refresh()`) converges on one
 authoritative check: read the durable manifest version through a version-only store read, and when
 it moved, union the change sets of the intervening manifests in bounded 64-record pages. A missing

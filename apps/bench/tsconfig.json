@@ -7,12 +7,5 @@
     "noEmit": true
   },
   "include": ["src/**/*.ts", "tests/**/*.ts", "vite.config.ts"],
-  "references": [
-    { "path": "../../packages/block-format" },
-    { "path": "../../packages/engine" },
-    { "path": "../../packages/storage-idb" },
-    { "path": "../../packages/testing" },
-    { "path": "../../packages/transactions" },
-    { "path": "../../packages/worker-protocol" }
-  ]
+  "references": [{ "path": "../../packages/core" }]
 }

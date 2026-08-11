@@ -1,22 +1,22 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const pages = [
-  { path: "/", title: "BrowserDatabase", nav: "Overview" },
-  { path: "/datasets.html", title: "Datasets — BrowserDatabase", nav: "Datasets" },
-  { path: "/query.html", title: "Query — BrowserDatabase", nav: "Query" },
-  { path: "/suites.html", title: "Benchmarks — BrowserDatabase", nav: "Benchmarks" },
-  { path: "/sql.html", title: "SQL support — BrowserDatabase", nav: "SQL support" },
-  { path: "/docs/getting-started.html", title: "Getting started — BrowserDatabase", nav: "Docs" },
-  { path: "/docs/worker-client.html", title: "Run it in a worker — BrowserDatabase", nav: "Docs" },
-  { path: "/docs/write-api.html", title: "Write API — BrowserDatabase", nav: "Docs" },
+  { path: "/", title: "MinnowDatabase", nav: "Overview" },
+  { path: "/datasets.html", title: "Datasets — MinnowDatabase", nav: "Datasets" },
+  { path: "/query.html", title: "Query — MinnowDatabase", nav: "Query" },
+  { path: "/suites.html", title: "Benchmarks — MinnowDatabase", nav: "Benchmarks" },
+  { path: "/sql.html", title: "SQL support — MinnowDatabase", nav: "SQL support" },
+  { path: "/docs/getting-started.html", title: "Getting started — MinnowDatabase", nav: "Docs" },
+  { path: "/docs/worker-client.html", title: "Run it in a worker — MinnowDatabase", nav: "Docs" },
+  { path: "/docs/write-api.html", title: "Write API — MinnowDatabase", nav: "Docs" },
   {
     path: "/docs/schema-migrations.html",
-    title: "Schema and migrations — BrowserDatabase",
+    title: "Schema and migrations — MinnowDatabase",
     nav: "Docs",
   },
-  { path: "/docs/orm.html", title: "Query builder — BrowserDatabase", nav: "Docs" },
-  { path: "/docs/live-queries.html", title: "Live queries — BrowserDatabase", nav: "Docs" },
-  { path: "/docs/architecture.html", title: "Architecture — BrowserDatabase", nav: "Docs" },
+  { path: "/docs/orm.html", title: "Query builder — MinnowDatabase", nav: "Docs" },
+  { path: "/docs/live-queries.html", title: "Live queries — MinnowDatabase", nav: "Docs" },
+  { path: "/docs/architecture.html", title: "Architecture — MinnowDatabase", nav: "Docs" },
 ];
 
 function collectPageErrors(page: Page): string[] {
@@ -30,9 +30,9 @@ test("every page loads with the injected shell and no uncaught errors", async ({
   for (const entry of pages) {
     await page.goto(entry.path);
     await expect(page).toHaveTitle(entry.title);
-    await expect(page.locator(".site-header .brand")).toHaveText("BrowserDatabase");
+    await expect(page.locator(".site-header .brand")).toHaveText("MinnowDatabase");
     await expect(page.locator('.site-header a[aria-current="page"]')).toHaveText(entry.nav);
-    await expect(page.locator(".site-footer")).toContainText("BrowserDatabase");
+    await expect(page.locator(".site-footer")).toContainText("MinnowDatabase");
   }
   // Docs pages carry a secondary docs nav and highlighted code.
   await page.goto("/docs/getting-started.html");
@@ -116,7 +116,7 @@ test("generates, queries, verifies, and deletes a dataset on all three engines",
   await expect(page.locator("#ref-results tbody tr")).toHaveCount(15);
   await expect(page.locator("#ref-results .badge.fail")).toHaveCount(0);
   // Every query now compiles on every engine: COALESCE and DATE_TRUNC joined the
-  // BrowserDatabase surface, so no cell reports "not supported".
+  // MinnowDatabase surface, so no cell reports "not supported".
   await expect(page.locator("#ref-results .badge.gap")).toHaveCount(0);
   await expect(page.locator("#ref-results")).toContainText("15/15 supported");
 

@@ -3,7 +3,7 @@
  * Cross-cutting worker plumbing: progress emission, cancellation, memory checkpoints
  * answered by the window, and small IndexedDB/arithmetic helpers.
  */
-import { protocolVersion, type ProgressResponse } from "@browserdatabase/worker-protocol";
+import { protocolVersion, type ProgressResponse } from "@minnowdb/core/worker-protocol";
 import { unavailableMemorySample, type MemorySample } from "../memory-probe.js";
 import type { WorkProgress } from "../protocol.js";
 

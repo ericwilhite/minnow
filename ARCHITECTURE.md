@@ -1,8 +1,8 @@
-# BrowserDatabase Architecture
+# Minnow Architecture
 
 Status: foundational design, August 2026
 
-BrowserDatabase is a browser-only relational database engine for large local datasets. It is designed around immutable compressed columnar storage, asynchronous worker execution, and IndexedDB transactions. The current implementation proves the storage and MVCC path, exposes an intentionally limited correctness-first SQL subset backed by an initial columnar executor, and leaves a fully memory-accounted vectorized planner and the ORM surface for later phases.
+MinnowDatabase is a browser-only relational database engine for large local datasets. It is designed around immutable compressed columnar storage, asynchronous worker execution, and IndexedDB transactions. The current implementation proves the storage and MVCC path, exposes an intentionally limited correctness-first SQL subset backed by an initial columnar executor, and leaves a fully memory-accounted vectorized planner and the ORM surface for later phases.
 
 ## Architectural invariants
 
@@ -343,7 +343,7 @@ be opened as a new snapshot, used to begin/rebase a transaction, or created/rene
 tombstone no longer roots its former blocks. Transaction begin and rebase retry when the latest
 manifest loses this race. Lease creation and renewal validate availability atomically, and expired
 lease removal uses its own revision comparison so it cannot erase a concurrent renewal.
-`BrowserDatabase` holds transient internal reader leases across table and query materialization,
+`MinnowDatabase` holds transient internal reader leases across table and query materialization,
 renewing long operations and releasing after the required data is materialized. Recovery marks stale
 transactions aborted, then routes any requested physical deletion through a durable collection job
 instead of directly removing their pending objects.
@@ -364,7 +364,7 @@ provenance or a conservative age policy.
 
 An unleased `TransactionManager.openSnapshot()` is only an in-process view of one descriptor; it is
 not a persistent GC root. Long-lived callers must use `openLeasedSnapshot()`, while
-`BrowserDatabase` creates and renews its own short-lived leases around materialization.
+`MinnowDatabase` creates and renews its own short-lived leases around materialization.
 
 Phase 6 remains deliberately incomplete. The L1 policy folds an oldest L0 prefix and optional whole
 L1 anchor into one L1 segment—a `base` for a keyed mutation history—or no segment when no selected
@@ -462,7 +462,7 @@ type tags prevent numeric/string aliasing. Dense declared-unique integer keys co
 typed lookup. Growth follows the same reserve-new, copy, release-old high-water contract as grouping.
 
 Phase 7D-A adds asynchronous durable spilling without changing synchronous prepared execution.
-`BrowserDatabase.query()` enables spill automatically when an execution budget is supplied. Ungrouped
+`MinnowDatabase.query()` enables spill automatically when an execution budget is supplied. Ungrouped
 ordered plans, including joins, sort bounded result runs into `temp` pages and pairwise stable-merge
 them. Single-table grouped ordered plans hash source row indexes into 64 durable partitions, aggregate
 one partition at a time, then merge sorted group-result runs. LIMIT applies only at the final read.

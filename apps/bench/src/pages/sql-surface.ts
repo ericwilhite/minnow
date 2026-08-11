@@ -1,4 +1,4 @@
-import sqlFeatureMatrix from "@browserdatabase/engine/sql-feature-matrix.json";
+import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json";
 import "../style.css";
 import { escapeHtml, required } from "../ui/format.js";
 import { highlightAll } from "../ui/highlight.js";

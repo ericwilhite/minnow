@@ -1,4 +1,4 @@
-import type { ColumnValues, Compression, LogicalType } from "@browserdatabase/block-format";
+import type { ColumnValues, Compression, LogicalType } from "@minnowdb/core/block-format";
 
 export const scenarioIds = ["telemetry", "commerce", "compression"] as const;
 export const benchmarkFocuses = ["roundtrip", "write", "read"] as const;
@@ -209,7 +209,7 @@ export interface ReferenceQueryEngineMeasurement {
   supported: boolean;
   /** Compile or execution error reported by the engine when `supported` is false. */
   error?: string;
-  /** Optimized plan from BrowserDatabase.explain(), absent when the SQL does not compile. */
+  /** Optimized plan from MinnowDatabase.explain(), absent when the SQL does not compile. */
   plan?: string;
   prepareMs: number;
   medianMs: number;
@@ -310,7 +310,7 @@ export interface AdHocQueryMetrics {
 export interface AdHocQueryResult {
   runId: string;
   sql: string;
-  /** Optimized logical plan and physical strategy notes from BrowserDatabase.explain(). */
+  /** Optimized logical plan and physical strategy notes from MinnowDatabase.explain(). */
   plan: string;
   tables: string[];
   columns: string[];

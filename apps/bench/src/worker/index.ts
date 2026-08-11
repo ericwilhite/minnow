@@ -4,7 +4,7 @@
  * suite modules, and reports failures. All engine work — including SQLite Wasm and
  * PGlite — runs inside this worker; SQLite's OPFS persistence requires it.
  */
-import { failure, parseRequest, success } from "@browserdatabase/worker-protocol";
+import { failure, parseRequest, success } from "@minnowdb/core/worker-protocol";
 import type { MemorySample } from "../memory-probe.js";
 import { datasetCreate, datasetDelete, datasetList, validateCreatePayload } from "./datasets.js";
 import { runFeatureSuite, validateFeaturePayload } from "./feature-suite.js";

@@ -196,7 +196,7 @@ function renderResult(result: RunQueryResult): void {
   planDetails.hidden = withPlan === undefined;
   planText.textContent = withPlan?.plan ?? "";
   const preview =
-    result.runs.find((run) => run.engine === "browserdatabase" && run.ok) ??
+    result.runs.find((run) => run.engine === "minnow" && run.ok) ??
     result.runs.find((run) => run.ok);
   renderPreview(preview);
   void highlightAll(results);

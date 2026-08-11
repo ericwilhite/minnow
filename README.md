@@ -1,6 +1,6 @@
-# BrowserDatabase
+# Minnow `><(((('>`
 
-BrowserDatabase is an experimental browser-only relational database built around immutable compressed
+Minnow is an experimental browser-only relational database built around immutable compressed
 columnar blocks and IndexedDB. The current slice includes the block format, atomic storage
 publication, persistent writes and snapshots, an intentionally limited read-only SQL API with an
 initial columnar executor, resumable and cancellable physical compaction of append and keyed mutation
@@ -22,7 +22,7 @@ The library can now save real tables and column-based batches. A table uses only
 above. Inserts validate column names, row counts, null values, and value types before writing.
 
 ```ts
-const database = new BrowserDatabase(store);
+const database = new MinnowDatabase(store);
 
 await database.createTable({
   name: "people",
@@ -224,7 +224,7 @@ distinct, and follows SQL null and `NaN` equality semantics. Dense unique intege
 direct typed lookup fast path.
 
 Phase 7D-A adds durable query spill pages in the existing `temp` store. With an explicit execution
-budget, `BrowserDatabase.query()` automatically uses asynchronous external merge sort for ungrouped
+budget, `MinnowDatabase.query()` automatically uses asynchronous external merge sort for ungrouped
 `ORDER BY` plans, including joined output, and 64-way partitioned hash aggregation for single-table
 `GROUP BY ... ORDER BY` plans. Sorted pages merge pairwise with left-run tie stability; LIMIT applies
 only while reading the final run. Temp pages are removed after ordinary success or failure. Each
@@ -237,10 +237,10 @@ retained owner counts. Reclamation races a live renewal atomically, so a concurr
 is retained rather than torn down mid-query.
 `PreparedQuery.execute()` remains the synchronous no-I/O path; `executeAsync()` accepts a spill store
 for callers that want the operator path directly; leases protect only spill stores created by
-`BrowserDatabase.query()`, and a caller-supplied spill store manages its own cleanup.
+`MinnowDatabase.query()`, and a caller-supplied spill store manages its own cleanup.
 
 Phase 7E-A streams the scan input for one deliberately narrow plan family. A budgeted
-`BrowserDatabase.query()` over a single append/base table with no join executes against a sliding
+`MinnowDatabase.query()` over a single append/base table with no join executes against a sliding
 block-aligned window instead of fully materialized projected vectors: each scan batch first makes
 its rows resident, forward-only, decoding whole physical blocks, reserving the replacement window's
 typed bytes before allocation and its measured per-window string dictionary bytes before
@@ -299,7 +299,7 @@ selective benchmarks remain.
 
 The exported row-array helper retains a compatibility oracle for schema-less empty inputs. Because it
 cannot construct typed empty vectors without column types, that fallback rejects an explicit memory
-budget instead of silently bypassing it. `BrowserDatabase` knows catalog types and supports budgeted
+budget instead of silently bypassing it. `MinnowDatabase` knows catalog types and supports budgeted
 queries over empty tables through the columnar path.
 
 Compaction is restart-safe and cooperative. A revisioned job in the IndexedDB `gc` store records an
@@ -426,7 +426,7 @@ atomic recheck still retains anything another live root reaches.
 
 Historical manifest descriptors are tombstoned with `prunedAt`, not deleted, so a transaction can
 reconcile a commit whose response was lost. A tombstoned version can no longer be opened for a data
-read, newly pinned, or used to root its former blocks. `BrowserDatabase` creates transient internal
+read, newly pinned, or used to root its former blocks. `MinnowDatabase` creates transient internal
 reader leases while materializing table reads and queries, then releases them after materialization.
 Transaction begin/rebase, lease creation/renewal, and compare-and-swap lease expiry are serialized
 with collection, so a race either establishes a valid root or receives
@@ -478,7 +478,7 @@ The schema DSL defines tables with compile-time row types and migrates the catal
 metadata-only steps:
 
 ```ts
-import { BrowserDatabase, column, schema, table, typedTable } from "@browserdatabase/engine";
+import { MinnowDatabase, column, schema, table, typedTable } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -504,17 +504,21 @@ stored data; declared `.references()` relations validate at definition time and 
 metadata rather than being enforced per write.
 
 The Kysely-style query builder constructs the same compiled plans as SQL, with typed results and
-no generic passing — `createBrowserDb` infers the database type from the schema value:
+no generic passing — `createMinnow` infers the database type from the schema value:
 
 ```ts
-import { createBrowserDb } from "@browserdatabase/engine";
+import { createMinnow } from "@minnowdb/core";
 
-const db = createBrowserDb(database, { schema: appSchema });
+const db = createMinnow(database, { schema: appSchema });
 const rows = await db
   .selectFrom("people as p")
   .innerJoin("orders as o", "o.person", "p.name")
   .groupBy("p.name")
-  .select((eb) => [eb.ref("p.name").as("name"), eb.fn.countAll().as("orders"), eb.fn.sum("o.total").as("revenue")])
+  .select((eb) => [
+    eb.ref("p.name").as("name"),
+    eb.fn.countAll().as("orders"),
+    eb.fn.sum("o.total").as("revenue"),
+  ])
   .orderBy("revenue", "desc")
   .execute(); // Array<{ name: string; orders: number; revenue: number | null }>
 ```
@@ -525,7 +529,7 @@ structural plan-equality tests enforce that. Left-joined columns type as `| null
 (`insertInto`/`updateTable`/`deleteFrom`) follow Kysely conventions with typed `returning`, and
 `query()`/`execute()`/`sql` remain the raw SQL escape hatch. When builders are exported across
 module boundaries, declare the database type as an interface
-(`interface DB extends InferDatabase<typeof appSchema> {}` with `new BrowserDb<DB>(...)`) so
+(`interface DB extends InferDatabase<typeof appSchema> {}` with `new Minnow<DB>(...)`) so
 hovers and declaration emit print `DB` by name — see `packages/engine/README.md` for the typed
 API guide and TypeScript best practices.
 
@@ -572,7 +576,7 @@ The browser dashboard currently supports:
 - a lazy-loaded public SQL comparison against SQLite Wasm, DuckDB-Wasm, and PGlite using the same
   50-table batches, explicit persistence/configuration disclosures, portable checksum-verified SQL,
   per-query median/p95 timing, engine-reported database size, loaded asset bytes, and available heap
-  telemetry; all four engines must return matching checksums, and BrowserDatabase reports snapshot
+  telemetry; all four engines must return matching checksums, and MinnowDatabase reports snapshot
   preparation separately from repeated `PreparedQuery.execute()` timing;
 - an exact list of every saved block, with every loaded value checked against the original;
 - measured journaled commits through the transaction API instead of direct manifest publication;
@@ -631,16 +635,16 @@ engine performance claims. They remain separate from the public vector-backed SQ
 bounded-memory vector contract, data skipping, and broader SQL coverage remain roadmap work. The
 upsert probe is capped at 1,000 saved keys and is not presented as a large-scale throughput benchmark.
 
-The cross-engine comparison keeps those reference timings separate. BrowserDatabase is measured
+The cross-engine comparison keeps those reference timings separate. MinnowDatabase is measured
 through `createTable()`, `insertBatch()`, `prepareQuery()`, `query()`, and `listTables()`; each SQL
 query is prepared against an immutable snapshot, and repeated execution is timed separately from
 snapshot loading and decoding. SQLite uses the OO1 API in the existing benchmark worker with the
 primary OPFS VFS or persistent OPFS SAH-pool fallback; DuckDB uses its async worker and Arrow
-ingestion; PGlite uses its IndexedDB filesystem with default durable syncing. BrowserDatabase,
+ingestion; PGlite uses its IndexedDB filesystem with default durable syncing. MinnowDatabase,
 SQLite, and PGlite must close, reopen, and verify their data before passing. DuckDB is the only
 memory-only adapter: its available OPFS database path was tested, but the installed Wasm build
 reopened an empty catalog, so the dashboard refuses to call it persistent. Every report puts all four
-engines in one comparison matrix and reports database size in MB. BrowserDatabase includes blocks,
+engines in one comparison matrix and reports database size in MB. MinnowDatabase includes blocks,
 key chunks, manifests, segments, transactions, and catalog records in its complete logical IndexedDB
 payload; SQLite and PGlite report full database sizes; DuckDB reports database memory.
 
@@ -651,10 +655,13 @@ npm install
 npm run check
 npx playwright install chromium firefox webkit
 npm run check:release
-npm run dev --workspace @browserdatabase/bench
+npm run dev --workspace @minnowdb/bench
+npm run dev --workspace @minnowdb/site
 ```
 
 `npm run check` is the local formatting, lint, type, build, and unit-test gate.
 `npm run check:release` adds the real IndexedDB library suite and full browser dashboard suite.
+`@minnowdb/bench` is the internal benchmark and test harness; `@minnowdb/site` is the public
+docs site (Astro), including the published benchmark results.
 
 See `ARCHITECTURE.md` and `ROADMAP.md` for the design and milestone gates.

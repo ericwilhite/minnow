@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
-    <title>Run it in a worker — BrowserDatabase</title>
+    <title>Run it in a worker — MinnowDatabase</title>
     <script type="module" src="/src/pages/doc.ts"></script>
   </head>
   <body data-page="docs/worker-client">
@@ -12,15 +12,15 @@
       <h1>Run it in a worker</h1>
       <p class="lead">
         The library ships both sides of the worker channel: a ready-made worker entry
-        (<code>@browserdatabase/engine/worker</code>) and a main-thread client
-        (<code>@browserdatabase/engine/client</code>). Your application contributes exactly one line
-        — constructing the <code>Worker</code> — because that is the only line your bundler must be
+        (<code>@minnowdb/core/worker</code>) and a main-thread client
+        (<code>@minnowdb/core/client</code>). Your application contributes exactly one line —
+        constructing the <code>Worker</code> — because that is the only line your bundler must be
         able to see.
       </p>
 
       <h2>Quick start</h2>
-      <pre><code data-lang="ts">import { BrowserDatabaseClient } from "@browserdatabase/engine/client";
-import { BrowserDb, column, schema, table, type InferDatabase } from "@browserdatabase/engine";
+      <pre><code data-lang="ts">import { MinnowDatabaseClient } from "@minnowdb/core/client";
+import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -28,14 +28,14 @@ const people = table("people", {
 });
 const appSchema = schema([people]);
 
-const client = new BrowserDatabaseClient(
-  new Worker(new URL("@browserdatabase/engine/worker", import.meta.url), { type: "module" }),
+const client = new MinnowDatabaseClient(
+  new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
   { store: { kind: "indexeddb", name: "app-db" } },
 );
 await client.migrate(appSchema);
 
 // The typed facade wraps the client exactly as it wraps an in-worker database.
-const db = new BrowserDb&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(client, { schema: appSchema });
+const db = new Minnow&lt;InferDatabase&lt;typeof appSchema&gt;&gt;(client, { schema: appSchema });
 await db
   .insertInto("people")
   .values([
@@ -130,7 +130,7 @@ await client.close({ terminateWorker: true });</code></pre>
       <h2>Bundler setups</h2>
       <p>
         <strong>Vite and webpack 5</strong> both understand the quick-start pattern as written —
-        they see the <code>new URL("@browserdatabase/engine/worker", import.meta.url)</code>
+        they see the <code>new URL("@minnowdb/core/worker", import.meta.url)</code>
         expression, resolve the package subpath, and emit a separate worker chunk. Nothing else is
         required.
       </p>
@@ -140,12 +140,12 @@ await client.close({ terminateWorker: true });</code></pre>
         the Worker at the emitted file:
       </p>
       <pre><code data-lang="ts">// worker.ts — your one-line worker entry, bundled separately:
-import "@browserdatabase/engine/worker";
+import "@minnowdb/core/worker";
 
 // esbuild app.ts worker.ts --bundle --format=esm --outdir=dist --splitting
 
 // app.ts:
-const client = new BrowserDatabaseClient(
+const client = new MinnowDatabaseClient(
   new Worker(new URL("./worker.js", import.meta.url), { type: "module" }),
 );</code></pre>
       <p>
@@ -154,11 +154,11 @@ const client = new BrowserDatabaseClient(
         vendored files:
       </p>
       <pre><code data-lang="ts">// db-worker.js — served from your origin:
-import "https://cdn.example.com/@browserdatabase/engine/dist/worker.js";
+import "https://cdn.example.com/@minnowdb/core/dist/worker.js";
 
 // main page:
-import { BrowserDatabaseClient } from "https://cdn.example.com/@browserdatabase/engine/dist/client.js";
-const client = new BrowserDatabaseClient(
+import { MinnowDatabaseClient } from "https://cdn.example.com/@minnowdb/core/dist/client.js";
+const client = new MinnowDatabaseClient(
   new Worker(new URL("./db-worker.js", import.meta.url), { type: "module" }),
 );</code></pre>
 
@@ -174,17 +174,17 @@ const client = new BrowserDatabaseClient(
         write your own entry and expose the database you built:
       </p>
       <pre><code data-lang="ts">// my-worker.ts
-import { BrowserDatabase, exposeDatabase } from "@browserdatabase/engine";
-import { IndexedDbBlockStore } from "@browserdatabase/storage-idb";
+import { MinnowDatabase, exposeDatabase } from "@minnowdb/core";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage";
 
 const store = await IndexedDbBlockStore.open({ name: "app-db", durability: "strict" });
-exposeDatabase(new BrowserDatabase(store, { compression: "gzip" }), self, {
+exposeDatabase(new MinnowDatabase(store, { compression: "gzip" }), self, {
   onDispose: () =&gt; store.close(),
 });</code></pre>
       <p>
         <code>exposeDatabase()</code> answers the same client frames, acknowledging the client's
         init without reconstructing anything, so the main-thread code is unchanged. Underneath both
-        entries sits <code>@browserdatabase/worker-protocol</code>: versioned, structured-clone-safe
+        entries sits <code>@minnowdb/core/worker-protocol</code>: versioned, structured-clone-safe
         RPC frames with method whitelists per handle — the worker never dispatches arbitrary
         property access.
       </p>
