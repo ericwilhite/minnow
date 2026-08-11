@@ -141,10 +141,10 @@ async function cleanupPartial(record: DatasetRecord, engine: EngineId): Promise<
       status: "failed",
       storageName:
         engine === "sqlite"
-          ? `/bdb-dataset-${record.id}.sqlite3`
+          ? `/mdb-dataset-${record.id}.sqlite3`
           : engine === "pglite"
-            ? `bdb-dataset-${record.id}`
-            : `bdb-dataset-${record.id}`,
+            ? `mdb-dataset-${record.id}`
+            : `mdb-dataset-${record.id}`,
       version: "",
       persistence: "",
       storedBytes: null,

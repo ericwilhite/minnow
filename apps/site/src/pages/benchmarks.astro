@@ -2,15 +2,19 @@
 import Base from "../layouts/Base.astro";
 import BenchBrowser, { type BenchResults } from "../components/BenchBrowser.astro";
 
-// Pick the newest engine-comparison capture per browser; filenames are date-prefixed.
+// Pick the newest engine-comparison capture per browser, decided by the recorded
+// capturedAt timestamp rather than filename order.
 const resultModules = import.meta.glob<{ default: BenchResults }>(
   "../../../../benchmarks/results/*engine-comparison*.json",
   { eager: true },
 );
 const byBrowser = new Map<string, { path: string; results: BenchResults }>();
-for (const [path, module] of Object.entries(resultModules).sort(([a], [b]) => a.localeCompare(b))) {
+for (const [path, module] of Object.entries(resultModules)) {
   const results = module.default;
-  byBrowser.set(results.browser.project, { path, results });
+  const current = byBrowser.get(results.browser.project);
+  if (current === undefined || results.capturedAt > current.results.capturedAt) {
+    byBrowser.set(results.browser.project, { path, results });
+  }
 }
 const panes = [...byBrowser.values()].map(({ results }) => ({
   results,

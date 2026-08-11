@@ -1,4 +1,4 @@
-/* MinnowDatabase docs & tools site. One stylesheet, light theme, no framework. */
+/* Minnow bench — the internal lab pages. One stylesheet, light theme, no framework. */
 
 :root {
   color-scheme: light;
@@ -84,32 +84,6 @@ main {
   max-width: 66rem;
   margin: 0 auto;
   padding: 0.75rem 1rem;
-}
-
-/* Docs sub-navigation */
-
-.docs-nav {
-  display: flex;
-  gap: 0.9rem;
-  flex-wrap: wrap;
-  padding: 0.4rem 0 0.9rem;
-  margin-bottom: 1.2rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.9rem;
-}
-
-.docs-nav a {
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.docs-nav a:hover {
-  color: var(--text);
-}
-
-.docs-nav a[aria-current="page"] {
-  color: var(--text);
-  font-weight: 600;
 }
 
 /* Typography */

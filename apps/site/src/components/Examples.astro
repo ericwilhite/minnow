@@ -93,11 +93,19 @@ import { showcaseExamples } from "../lib/examples.ts";
 </style>
 
 <script>
-  import { showcaseExamples } from "../lib/examples.ts";
+  // The engine only loads when someone actually runs an example, so the home page
+  // stays light. Hovering or focusing a Run button warms the module ahead of the click.
+  type ExamplesModule = typeof import("../lib/examples.ts");
+  let modulePromise: Promise<ExamplesModule> | undefined;
+  const loadExamples = (): Promise<ExamplesModule> =>
+    (modulePromise ??= import("../lib/examples.ts"));
 
   for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-run]")) {
+    button.addEventListener("pointerenter", () => void loadExamples(), { once: true });
+    button.addEventListener("focus", () => void loadExamples(), { once: true });
     button.addEventListener("click", async () => {
       const id = button.dataset.run;
+      const { showcaseExamples } = await loadExamples();
       const example = showcaseExamples.find((candidate) => candidate.id === id);
       const output = document.querySelector<HTMLElement>(`[data-output="${id ?? ""}"]`);
       if (example === undefined || output === null) return;

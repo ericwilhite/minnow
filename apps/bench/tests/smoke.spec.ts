@@ -1,22 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const pages = [
-  { path: "/", title: "MinnowDatabase", nav: "Overview" },
-  { path: "/datasets.html", title: "Datasets — MinnowDatabase", nav: "Datasets" },
-  { path: "/query.html", title: "Query — MinnowDatabase", nav: "Query" },
-  { path: "/suites.html", title: "Benchmarks — MinnowDatabase", nav: "Benchmarks" },
-  { path: "/sql.html", title: "SQL support — MinnowDatabase", nav: "SQL support" },
-  { path: "/docs/getting-started.html", title: "Getting started — MinnowDatabase", nav: "Docs" },
-  { path: "/docs/worker-client.html", title: "Run it in a worker — MinnowDatabase", nav: "Docs" },
-  { path: "/docs/write-api.html", title: "Write API — MinnowDatabase", nav: "Docs" },
-  {
-    path: "/docs/schema-migrations.html",
-    title: "Schema and migrations — MinnowDatabase",
-    nav: "Docs",
-  },
-  { path: "/docs/orm.html", title: "Query builder — MinnowDatabase", nav: "Docs" },
-  { path: "/docs/live-queries.html", title: "Live queries — MinnowDatabase", nav: "Docs" },
-  { path: "/docs/architecture.html", title: "Architecture — MinnowDatabase", nav: "Docs" },
+  { path: "/", title: "Minnow bench", nav: "Overview" },
+  { path: "/datasets.html", title: "Datasets — Minnow bench", nav: "Datasets" },
+  { path: "/query.html", title: "Query — Minnow bench", nav: "Query" },
+  { path: "/suites.html", title: "Benchmarks — Minnow bench", nav: "Benchmarks" },
+  { path: "/sql.html", title: "SQL support — Minnow bench", nav: "SQL support" },
 ];
 
 function collectPageErrors(page: Page): string[] {
@@ -30,15 +19,10 @@ test("every page loads with the injected shell and no uncaught errors", async ({
   for (const entry of pages) {
     await page.goto(entry.path);
     await expect(page).toHaveTitle(entry.title);
-    await expect(page.locator(".site-header .brand")).toHaveText("MinnowDatabase");
+    await expect(page.locator(".site-header .brand")).toHaveText("Minnow bench");
     await expect(page.locator('.site-header a[aria-current="page"]')).toHaveText(entry.nav);
-    await expect(page.locator(".site-footer")).toContainText("MinnowDatabase");
+    await expect(page.locator(".site-footer")).toContainText("Minnow bench");
   }
-  // Docs pages carry a secondary docs nav and highlighted code.
-  await page.goto("/docs/getting-started.html");
-  await expect(page.locator(".docs-nav a")).toHaveCount(7);
-  await expect(page.locator('.docs-nav a[aria-current="page"]')).toHaveText("Getting started");
-  await expect(page.locator("pre.shiki").first()).toBeVisible();
   expect(errors).toEqual([]);
 });
 

@@ -8,7 +8,7 @@ import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
 const BATCH_ROWS = 50_000;
 
 function storageName(record: DatasetRecord): string {
-  return `bdb-dataset-${record.id}`;
+  return `mdb-dataset-${record.id}`;
 }
 
 function databaseOptions(record: DatasetRecord): {

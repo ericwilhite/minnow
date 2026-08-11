@@ -5,6 +5,7 @@ import { defineConfig } from "astro/config";
 export default defineConfig({
   site: "https://minnowdb.dev",
   integrations: [mdx()],
+  prefetch: { prefetchAll: true },
   markdown: {
     shikiConfig: {
       themes: { light: "github-light", dark: "github-dark" },

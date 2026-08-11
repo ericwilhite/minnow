@@ -16,7 +16,7 @@ import {
 import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
 
 const BATCH_ROWS = 50_000;
-const SAH_POOL_NAME = "bdb-datasets";
+const SAH_POOL_NAME = "mdb-datasets";
 const PRAGMAS = "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
 
 interface SqliteContext {
@@ -49,7 +49,7 @@ function sqliteContext(): Promise<SqliteContext> {
 }
 
 function databasePath(record: DatasetRecord): string {
-  return `/bdb-dataset-${record.id}.sqlite3`;
+  return `/mdb-dataset-${record.id}.sqlite3`;
 }
 
 async function openDatabase(context: SqliteContext, path: string): Promise<Database> {

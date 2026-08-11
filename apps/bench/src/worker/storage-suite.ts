@@ -1048,7 +1048,7 @@ async function benchmarkReferenceQueries(
   config: BenchmarkConfig,
   runId: string,
 ): Promise<BenchmarkResult["referenceQueries"]> {
-  const databaseName = `bdb-storage-suite-reference-${runId}`;
+  const databaseName = `mdb-storage-suite-reference-${runId}`;
   const store = await IndexedDbBlockStore.open({
     name: databaseName,
     durability: config.durability,
