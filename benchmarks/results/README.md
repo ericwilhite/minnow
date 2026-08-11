@@ -49,8 +49,8 @@ storage-oriented benchmark and physical-rewrite work while leaving the row-parti
 configurable. Larger quota-dependent datasets and repeated-sample distributions remain future
 evidence work.
 
-The dated 2026-08-08 four-engine report predates BrowserDatabase's public read-only SQL API, so
-its BrowserDatabase SQL cells remain explicitly unmeasured. The 2026-08-11 three-engine record
+The dated 2026-08-08 four-engine report predates MinnowDatabase's public read-only SQL API, so
+its MinnowDatabase SQL cells remain explicitly unmeasured. The 2026-08-11 three-engine record
 (`engine-comparison-2026-08-11.md`, with raw Chromium and Firefox bundles) closes that gap: all 15
 reference queries run through `prepareQuery()`/`execute()` with oracle-verified results in both
 browsers. It reports repeated-execution medians and prepare-inclusive one-shot totals separately,

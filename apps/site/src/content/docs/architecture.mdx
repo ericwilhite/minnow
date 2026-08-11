@@ -1,0 +1,148 @@
+---
+title: Architecture
+description: Immutable columnar storage, MVCC manifests, vectorized execution, and the fault model.
+---
+
+# Architecture
+
+<p class="lede">
+  Minnow is a browser-only relational database engine for large local datasets, designed around
+  immutable compressed columnar storage, asynchronous worker execution, and IndexedDB transactions.
+  This page condenses the full ARCHITECTURE document.
+</p>
+
+## Architectural invariants
+
+These are constraints, not preferences:
+
+- Modern browsers only; database work never executes on the main thread.
+- No COOP/COEP requirement; no SharedArrayBuffer or Atomics dependency.
+- IndexedDB is the baseline persistence; OPFS may be added later behind the storage interface.
+- Published data is immutable compressed columnar blocks; writes are append-only delta segments,
+  compacted asynchronously.
+- Snapshot isolation through versioned MVCC manifests; IndexedDB `relaxed` durability by default.
+- Vectorized query execution; streaming inputs, explicit memory budgets, and spill remain required
+  exit gates.
+- Automatic statistics and data skipping; no user-managed indexes.
+- Correctness never depends on BroadcastChannel, Web Locks, page-close handlers, or successful
+  background work.
+- The SQL parser, binder, planner, optimizer, and executor are owned by this project. SQLite,
+  DuckDB, and other SQL engines are forbidden in the implementation.
+
+> The durability contract ends at a successfully committed IndexedDB transaction. Lifecycle signals
+> may request earlier flushing, but cannot make browser shutdown reliable.
+
+## System shape
+
+In the target shape, the main thread holds only an async API proxy: request IDs, cancellation, and
+results — no encoding, storage, planning, or execution. Every tab owns a dedicated coordinator
+worker with catalog and snapshot ownership, transaction coordination, query planning, and
+live-query dependency tracking. Beneath it sit the storage modules (IndexedDB, block codecs,
+manifests, leases/GC) and, later, executor workers for segment-grained tasks. Buffers cross worker
+boundaries as transferable `ArrayBuffer`s; parallelism is coarse-grained by immutable segment, so
+no shared queue or shared buffer cache is needed.
+
+> Today the library ships the engine, the versioned wire protocol, the worker entry, and the
+> main-thread full-API proxy (`MinnowDatabaseClient`) — see [Workers & multi-tab](/docs/workers/).
+> Not shipped yet from the target shape: executor workers beneath the coordinator for
+> segment-grained parallelism.
+
+Inside `@minnowdb/core` the layers map onto modules: `block-format` (versioned binary containers,
+statistics, codecs), `storage` (IndexedDB block and metadata persistence), `transactions`
+(snapshots, journals, atomic commits, recovery), and the engine (the coordinator and public API).
+Each is importable directly — `@minnowdb/core/block-format`, `@minnowdb/core/storage`,
+`@minnowdb/core/transactions`.
+
+## Logical and physical storage
+
+```
+Database -> Table -> Segment -> Row group -> Column block
+```
+
+- A segment is the immutable visibility and compaction unit.
+- A row group is the primary pruning and vector-scan unit.
+- A column block contains one encoded logical column for one row group.
+- Inserts, updates, and deletes land first in append-only L0 deltas; compaction rewrites them into
+  larger query-oriented segments.
+
+No row is stored as an individual IndexedDB value, and no entire table is one giant value. Every
+block starts with a fixed little-endian header: magic bytes, format version, type and encoding IDs,
+codec ID, row and null counts, payload lengths, a checksum of the uncompressed encoded payload, and
+optional zone-map statistics. Readers reject unknown mandatory versions, invalid lengths,
+unsupported codecs, and checksum mismatches. Published formats are append-only: new codecs use new
+IDs rather than changing old bytes.
+
+## MVCC and atomic publication
+
+Each transaction records a transaction ID, snapshot manifest version, pending blocks, and a compact
+change set. Readers resolve all data through one immutable manifest. Commit encodes and persists
+immutable blocks first, then opens a short IndexedDB metadata transaction, compares the expected
+manifest version, and publishes manifest N + 1. The manifest never references a partial block; a
+crash before publication leaves only unreachable blocks for later garbage collection. A
+compare-and-swap failure is a normal write conflict — the caller rebases or retries.
+
+Tables carry a hidden immutable row ID; writers atomically reserve ranges. Inserts create immutable
+column segments, upserts create newer keyed segments, partial updates create narrow
+key-plus-changed-columns segments, and deletes create key-only markers. Compaction uses the same
+atomic publication path and preserves row identity through ordered `rowIdSpans`; it rebases across
+concurrent commits while its sources remain visible, and aborts rather than publishing a stale
+rewrite.
+
+## Multi-tab correctness
+
+IndexedDB is authoritative. The final metadata transaction serializes manifest publication across
+tabs and workers; the compare-and-swap in IndexedDB is the correctness mechanism. BroadcastChannel
+may announce that a new version exists, but receivers always reconcile against IndexedDB, so missed
+or duplicated announcements are harmless. Reader and backup leases are persistent records with
+expiry — not inferred from open channels — and garbage collection retains everything an unexpired
+lease, active transaction, or active compaction still reaches.
+
+## Vectorized execution and bounded memory
+
+Queries execute over typed vectors: booleans as bytes, numbers and datetimes as `Float64Array`,
+strings dictionary-coded, each with a packed validity bitmap. The executor scans 2,048 source rows
+per batch. Queries accept an explicit `executionMemoryBudgetBytes`: retained vectors, join indexes,
+and grouped state reserve bytes before allocation, and a reservation exceeding the budget throws
+`QueryMemoryBudgetError`. Under a budget, ordered plans use asynchronous external merge sort and
+grouped plans use 64-way partitioned hash aggregation, spilling to durable lease-protected temp
+pages; a narrow plan family also streams its scan input through a sliding block-aligned window.
+
+> The bounded-memory exit gate is not yet claimed. Non-streamed shapes still materialize projected
+> columns in full, hash-join build sides have no spill path, and the model excludes result objects,
+> JavaScript array overhead, and browser allocator overhead. The figures are modeled workflow
+> bounds, not hard heap limits.
+
+## Automatic data skipping
+
+Block zone maps (row count, null count, numeric/datetime min/max) provide a conservative scan fast
+path for a single append/base table with AND-combined column-to-literal predicates: impossible row
+groups are rejected before vector materialization. Predicate blocks are checksum-verified and
+physically decoded before their metadata is trusted, because version-zero metadata has no
+independent checksum. Joins, mutation snapshots, strings, and computed predicates retain the full
+scan. Derived statistics are disposable; logical correctness never depends on them.
+
+## Fault model
+
+Deterministic fault injection has been required from the first storage implementation, with named
+points before and after block writes and manifest commits. The suite covers abandoned writers,
+stale tabs, corrupted bytes, transaction aborts, and crashes between block persistence and manifest
+publication. The core invariants under faults:
+
+1. A visible manifest references only complete, checksum-valid blocks.
+2. A failed or stale manifest comparison cannot publish changes.
+3. Retrying an immutable block write cannot mutate already-published bytes.
+4. Unpublished objects never affect reads and are safe to collect later.
+5. UI responsiveness does not depend on operation size.
+
+## Explicit non-goals
+
+- No full SQL surface yet; the current subset is deliberately limited, and its executor does not
+  claim the bounded-memory exit gate.
+- No claim of multi-gigabyte performance until browser measurements support it.
+- No required OPFS, Web Locks, BroadcastChannel, SharedWorker, WASM, or SharedArrayBuffer.
+- No user-facing index DDL.
+- No compatibility promise for the experimental version-zero block format.
+
+See [Getting started](/docs/getting-started/) for the API entry point,
+[Writes & transactions](/docs/writes/) for compaction and garbage collection details, and
+[Benchmarks](/benchmarks/) for the measurements behind the decision gates.

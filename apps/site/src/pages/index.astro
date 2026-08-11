@@ -1,0 +1,226 @@
+---
+import Base from "../layouts/Base.astro";
+import Logo from "../components/Logo.astro";
+import Examples from "../components/Examples.astro";
+---
+
+<Base title="Minnow — a relational database for the browser">
+  <main class="home">
+    <section class="hero">
+      <div class="hero-logo"><Logo size={72} /></div>
+      <h1>minnow</h1>
+      <p class="tagline">A tiny relational database that lives in your browser.</p>
+      <p class="sub">
+        Typed queries, real SQL, live results, and durable IndexedDB storage — no server, no WASM
+        blob, no build step.
+      </p>
+      <div class="install"><code>npm install @minnowdb/core</code></div>
+      <div class="cta">
+        <a class="button primary" href="/docs/getting-started/">Get started</a>
+        <a class="button" href="/docs/architecture/">How it works</a>
+      </div>
+    </section>
+
+    <section class="features">
+      <div class="feature">
+        <h3>Typed end to end</h3>
+        <p>
+          Declare a schema once; every query, insert, and live subscription is inferred from it. No
+          generics to pass, no codegen.
+        </p>
+      </div>
+      <div class="feature">
+        <h3>Real SQL</h3>
+        <p>
+          Joins, aggregates, window functions, CTEs, set operations — a documented SQL surface with a
+          published conformance matrix.
+        </p>
+      </div>
+      <div class="feature">
+        <h3>Live queries</h3>
+        <p>
+          Subscribe to a query and get fresh rows after every commit — across tabs, powered by
+          incremental recomputation.
+        </p>
+      </div>
+      <div class="feature">
+        <h3>Multi-tab safe</h3>
+        <p>
+          Immutable columnar blocks and atomic publication make concurrent tabs a designed-for case,
+          not an accident.
+        </p>
+      </div>
+      <div class="feature">
+        <h3>Columnar storage</h3>
+        <p>
+          Compressed, checksummed column blocks over IndexedDB, with budgeted memory, spill-to-disk
+          sorts, and background compaction.
+        </p>
+      </div>
+      <div class="feature">
+        <h3>Honest benchmarks</h3>
+        <p>
+          Measured against SQLite WASM and PGlite in real browsers, with the methodology published
+          alongside <a href="/benchmarks/">the numbers</a>.
+        </p>
+      </div>
+    </section>
+
+    <section class="showcase">
+      <h2>See it run</h2>
+      <p class="showcase-sub">
+        These snippets execute the real engine, right here on this page.
+      </p>
+      <Examples />
+    </section>
+  </main>
+</Base>
+
+<style>
+  .home {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+  }
+
+  .hero {
+    text-align: center;
+    padding: 5.5rem 0 4rem;
+  }
+
+  .hero-logo {
+    color: var(--text);
+    margin-bottom: 0.5rem;
+  }
+
+  .hero h1 {
+    font-size: 3.2rem;
+    font-weight: 750;
+    letter-spacing: -0.03em;
+    margin: 0 0 0.35em;
+  }
+
+  .tagline {
+    font-size: 1.35rem;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.4em;
+  }
+
+  .sub {
+    color: var(--text-secondary);
+    max-width: 34rem;
+    margin: 0 auto 1.8rem;
+  }
+
+  .install {
+    margin-bottom: 1.8rem;
+  }
+
+  .install code {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.55rem 1.1rem;
+    color: var(--text-secondary);
+  }
+
+  .cta {
+    display: flex;
+    justify-content: center;
+    gap: 0.75rem;
+  }
+
+  .button {
+    font-size: 0.92rem;
+    font-weight: 550;
+    padding: 0.5rem 1.15rem;
+    border-radius: 8px;
+    border: 1px solid var(--border-strong);
+    transition: background 120ms ease;
+  }
+
+  .button:hover {
+    background: var(--bg-hover);
+  }
+
+  .button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+
+  .button.primary:hover {
+    filter: brightness(1.08);
+  }
+
+  .features {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1rem;
+    padding: 2rem 0 3rem;
+  }
+
+  .feature {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.1rem 1.25rem;
+    background: var(--bg);
+    transition: background 150ms ease;
+  }
+
+  .feature:hover {
+    background: var(--bg-secondary);
+  }
+
+  .feature h3 {
+    font-size: 0.98rem;
+    font-weight: 650;
+    margin: 0 0 0.35em;
+  }
+
+  .feature p {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    margin: 0;
+  }
+
+  .feature a {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .showcase {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding-bottom: 2rem;
+  }
+
+  .showcase h2 {
+    font-size: 1.6rem;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    margin: 0 0 0.3em;
+  }
+
+  .showcase-sub {
+    color: var(--text-secondary);
+    margin: 0 0 2rem;
+  }
+
+  @media (max-width: 860px) {
+    .features {
+      grid-template-columns: 1fr;
+    }
+
+    .hero {
+      padding-top: 3.5rem;
+    }
+
+    .hero h1 {
+      font-size: 2.5rem;
+    }
+  }
+</style>

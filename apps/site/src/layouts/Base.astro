@@ -1,0 +1,130 @@
+---
+import Logo from "../components/Logo.astro";
+import ThemeToggle from "../components/ThemeToggle.astro";
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const { title, description = "Minnow — a tiny relational database that lives in your browser." } =
+  Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>{title}</title>
+    <script is:inline>
+      const stored = localStorage.getItem("minnow-theme");
+      if (stored === "light" || stored === "dark") {
+        document.documentElement.dataset.theme = stored;
+      }
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="/">
+          <Logo size={26} />
+          <span class="wordmark">minnow</span>
+        </a>
+        <nav class="site-nav">
+          <a href="/docs/">Docs</a>
+          <a href="/docs/api/">API</a>
+          <a href="/benchmarks/">Benchmarks</a>
+          <ThemeToggle />
+        </nav>
+      </div>
+    </header>
+    <slot />
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <span class="ascii" aria-hidden="true">{"><(((('>"}</span>
+        <span>Minnow — a relational database for the browser.</span>
+      </div>
+    </footer>
+  </body>
+</html>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header-inner {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+    height: 3.4rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    color: var(--text);
+  }
+
+  .wordmark {
+    font-weight: 700;
+    font-size: 1.05rem;
+    letter-spacing: -0.01em;
+  }
+
+  .site-nav {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .site-nav a {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    padding: 0.35rem 0.6rem;
+    border-radius: 6px;
+    transition:
+      background 120ms ease,
+      color 120ms ease;
+  }
+
+  .site-nav a:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  .site-footer {
+    border-top: 1px solid var(--border);
+    margin-top: 5rem;
+  }
+
+  .footer-inner {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    color: var(--text-faint);
+    font-size: 0.85rem;
+  }
+
+  .ascii {
+    font-family: var(--font-mono);
+  }
+</style>

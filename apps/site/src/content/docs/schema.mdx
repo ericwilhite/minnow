@@ -1,0 +1,81 @@
+---
+title: Schema & migrations
+description: The typed schema DSL and deterministic, metadata-only migrations.
+---
+
+# Schema & migrations
+
+<p class="lede">
+  The schema DSL defines tables with compile-time row types and migrates the catalog through
+  deterministic, metadata-only steps. No stored data is rewritten by a migration.
+</p>
+
+## Defining a schema
+
+```ts
+import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
+
+const people = table("people", {
+  name: column.string().unique(),
+  score: column.number(),
+  joined: column.datetime().nullable(),
+});
+const appSchema = schema([people]);
+
+await database.migrate(appSchema);
+
+// The same declaration drives the query builder's types end to end:
+const db = new Minnow<InferDatabase<typeof appSchema>>(database, { schema: appSchema });
+await db.insertInto("people").values({ name: "Ada", score: 10 }).execute(); // joined pads to null
+const rows = await db.selectFrom("people").selectAll().execute();
+// Array<{ name: string; score: number; joined: Date | null }>
+```
+
+Column builders exist for the four logical types — `column.boolean()`, `column.number()`,
+`column.string()`, `column.datetime()` — with modifiers:
+
+- `.unique()` — marks the table's unique key (one non-null column).
+- `.nullable()` — permits NULL and widens the inferred type.
+- `.renamedFrom()` — renames a column through its stable ID, so a rename is a metadata step rather
+  than a drop-and-add.
+- `.references()` — declares a relation. It validates at definition time and lives in catalog
+  metadata; it is not enforced per write.
+
+## Migration semantics
+
+`migrate()` diffs the live catalog into deterministic metadata-only steps: create table, add
+nullable column, rename through the stable column ID, widen nullability. Each catalog change
+executes with one atomic compare-and-swap, and the whole sequence is idempotent — an interrupted
+migration completes by re-running. A concurrent migrator fails with a typed conflict instead of
+interleaving.
+
+Rejected explicitly, rather than attempted:
+
+- type changes
+- column or table drops
+- unique-key changes
+- non-null tightening
+- non-nullable column additions
+
+Columns added after a segment was written read as NULL everywhere without rewriting stored data.
+Physical rewrites are deferred to [compaction](/docs/writes/) where possible.
+
+## Inferred shapes
+
+`InferDatabase<typeof appSchema>` maps table names to row types for `Minnow`. Lower-level helpers
+expose the per-table shapes (used by `typedTable()`, the thin schema-typed handle over the batch
+APIs):
+
+| Type                 | Meaning                                             |
+| -------------------- | --------------------------------------------------- |
+| `InferRow`           | The select shape; nullable columns are `\| null`.   |
+| `InferInsertRow`     | The insert shape; nullable columns may be omitted.  |
+| `InferUpdateChanges` | The partial-update shape accepted by keyed updates. |
+
+Each table definition also carries a Standard Schema-compatible `~standard` validator, so a
+definition can be handed to any library that consumes the Standard Schema interface for runtime row
+validation.
+
+> The same definitions feed the [query builder](/docs/queries/) and the typed
+> [write API](/docs/writes/), which derive every reference and row type from these column
+> declarations. Raw `createTable` remains available when compile-time types are not needed.

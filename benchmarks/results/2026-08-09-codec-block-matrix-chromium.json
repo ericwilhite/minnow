@@ -1304,7 +1304,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -5921,7 +5921,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -10574,7 +10574,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -15383,7 +15383,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -20576,7 +20576,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -26621,7 +26621,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -31238,7 +31238,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -35891,7 +35891,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -40700,7 +40700,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -45893,7 +45893,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -51938,7 +51938,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -56555,7 +56555,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -61208,7 +61208,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -66017,7 +66017,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {
@@ -71210,7 +71210,7 @@
         }
       ],
       "passed": true,
-      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted BrowserDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
+      "note": "Reference workload only: validation and each query load bounded table subsets from the persisted MinnowDatabase dataset, then release them before the next query. The complete 50-table dataset is never retained as one JavaScript object graph. Each query reports seven normalized timing samples; fast queries repeat inside a sample to exceed timer resolution. These are not native query-engine operator timings."
     },
     "entities": [
       {

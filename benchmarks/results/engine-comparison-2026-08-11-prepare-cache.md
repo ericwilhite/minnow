@@ -4,7 +4,7 @@
 
 Same-day follow-up to `engine-comparison-2026-08-11.md`, which identified per-statement
 `prepareQuery()` cost — snapshot leasing, catalog round trips, input materialization, and
-CTE execution — as BrowserDatabase's dominant one-shot cost. This run measures the same
+CTE execution — as MinnowDatabase's dominant one-shot cost. This run measures the same
 15-query, three-engine, scale-10 workload on the same host after three engine changes:
 
 1. **One coherent catalog read.** A new optional `BlockStore.getQueryCatalogState()`
@@ -47,7 +47,7 @@ record's measurement-semantics section). All 90 engine-query cells across both b
 returned oracle-verified results, and the write path is unchanged (Chromium insert
 3.43 s, 18.99 MB stored).
 
-- Repeated-execution medians are untouched: BrowserDatabase still wins every one of the
+- Repeated-execution medians are untouched: MinnowDatabase still wins every one of the
   15 queries in both browsers.
 - First-touch prepare halved in Chromium (2.1×) and dropped 2.8× in Firefox. In Firefox
   the prepare-inclusive one-shot total now beats both engines outright; in Chromium it

@@ -1,0 +1,137 @@
+---
+import { Code } from "astro:components";
+import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json";
+import Docs from "../../layouts/Docs.astro";
+
+interface SqlFeature {
+  id: string;
+  status: "supported" | "unsupported";
+  example: string;
+  error?: string;
+  notes?: string;
+}
+
+const features = (sqlFeatureMatrix as { features: SqlFeature[] }).features;
+const supported = features.filter((feature) => feature.status === "supported");
+const unsupported = features.filter((feature) => feature.status !== "supported");
+const themes = { light: "github-light", dark: "github-dark" } as const;
+---
+
+<Docs
+  title="SQL support"
+  description="The checked-in SQL feature matrix: every supported and rejected form, with examples."
+>
+  <h1>SQL support</h1>
+  <p class="lede">
+    The SQL surface is recorded in a checked-in feature matrix that ships with the package
+    (<code>@minnowdb/core/sql-feature-matrix.json</code>). The engine's conformance suite reports
+    drift against this file, so this page and the engine cannot silently disagree.
+  </p>
+  <p>
+    <strong>{supported.length}</strong> of <strong>{features.length}</strong> cataloged SQL
+    features are supported; <strong>{unsupported.length}</strong> are explicitly not.
+  </p>
+
+  <h2>Supported</h2>
+  <div class="feature-list">
+    {
+      supported.map((feature) => (
+        <article class="sql-feature supported">
+          <div class="feature-head">
+            <code class="feature-id">{feature.id}</code>
+            <span class="badge yes">supported</span>
+          </div>
+          <Code code={feature.example} lang="sql" themes={themes} defaultColor={false} />
+          {feature.notes !== undefined && <small>{feature.notes}</small>}
+        </article>
+      ))
+    }
+  </div>
+
+  <h2>Explicitly unsupported</h2>
+  <p>
+    These forms are rejected with a typed error rather than silently misbehaving. A note
+    distinguishes a missing capability from one reachable through a typed API, or from a deliberate
+    restriction.
+  </p>
+  <div class="feature-list">
+    {
+      unsupported.map((feature) => (
+        <article class="sql-feature unsupported">
+          <div class="feature-head">
+            <code class="feature-id">{feature.id}</code>
+            <span class="badge no">not supported</span>
+          </div>
+          <Code code={feature.example} lang="sql" themes={themes} defaultColor={false} />
+          {feature.error !== undefined && <em class="feature-error">{feature.error}</em>}
+          {feature.notes !== undefined && <small>{feature.notes}</small>}
+        </article>
+      ))
+    }
+  </div>
+</Docs>
+
+<style>
+  .feature-list {
+    display: grid;
+    gap: 0.9rem;
+    margin: 1.2rem 0 2rem;
+  }
+
+  .sql-feature {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.8rem 1rem;
+  }
+
+  .feature-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .feature-id {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  .badge {
+    font-size: 0.72rem;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 0.12rem 0.6rem;
+    white-space: nowrap;
+  }
+
+  .badge.yes {
+    color: #0f7b3f;
+    background: rgba(68, 131, 97, 0.14);
+  }
+
+  .badge.no {
+    color: var(--code-inline);
+    background: rgba(212, 76, 71, 0.12);
+  }
+
+  .sql-feature :global(pre.astro-code) {
+    margin: 0.4rem 0;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.8rem;
+  }
+
+  .feature-error {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    margin-top: 0.3rem;
+  }
+
+  .sql-feature small {
+    display: block;
+    color: var(--text-faint);
+    margin-top: 0.3rem;
+  }
+</style>

@@ -4,8 +4,15 @@
     {
       "name": "bench",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--workspace", "@browserdatabase/bench"],
+      "runtimeArgs": ["run", "dev", "--workspace", "@minnowdb/bench"],
       "port": 4173,
+      "autoPort": true
+    },
+    {
+      "name": "site",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--workspace", "@minnowdb/site"],
+      "port": 4321,
       "autoPort": true
     }
   ]

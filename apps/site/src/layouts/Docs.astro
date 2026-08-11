@@ -1,0 +1,126 @@
+---
+import Base from "./Base.astro";
+import { docsNav } from "../nav.ts";
+
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const { title, description } = Astro.props;
+const currentPath = Astro.url.pathname.replace(/\/?$/, "/");
+---
+
+<Base title={`${title} · Minnow`} description={description}>
+  <div class="docs-shell">
+    <aside class="sidebar">
+      <nav aria-label="Docs">
+        {
+          docsNav.map((section) => (
+            <div class="nav-section">
+              <div class="nav-heading">{section.title}</div>
+              {section.items.map((item) => (
+                <a href={item.href} class:list={["nav-link", { active: item.href === currentPath }]}>
+                  {item.title}
+                </a>
+              ))}
+            </div>
+          ))
+        }
+      </nav>
+    </aside>
+    <main class="docs-main">
+      <article class="prose">
+        <slot />
+      </article>
+    </main>
+  </div>
+</Base>
+
+<style>
+  .docs-shell {
+    display: grid;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+    max-width: 72rem;
+    margin: 0 auto;
+    gap: 3rem;
+    padding: 0 1.5rem;
+  }
+
+  .sidebar {
+    border-right: 1px solid var(--border);
+    padding: 1.75rem 1rem 2rem 0;
+  }
+
+  .sidebar nav {
+    position: sticky;
+    top: 5rem;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+  }
+
+  .nav-section {
+    margin-bottom: 1.4rem;
+  }
+
+  .nav-heading {
+    font-size: 0.72rem;
+    font-weight: 650;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-faint);
+    padding: 0.3rem 0.6rem;
+  }
+
+  .nav-link {
+    display: block;
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    padding: 0.28rem 0.6rem;
+    border-radius: 6px;
+    transition:
+      background 120ms ease,
+      color 120ms ease;
+  }
+
+  .nav-link:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  .nav-link.active {
+    background: var(--accent-bg);
+    color: var(--accent);
+    font-weight: 550;
+  }
+
+  .docs-main {
+    padding: 2.5rem 0 3rem;
+    min-width: 0;
+  }
+
+  @media (max-width: 860px) {
+    .docs-shell {
+      grid-template-columns: 1fr;
+      gap: 0;
+    }
+
+    .sidebar {
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 0;
+    }
+
+    .sidebar nav {
+      position: static;
+      max-height: none;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1.5rem;
+    }
+
+    .nav-section {
+      margin-bottom: 0.5rem;
+    }
+  }
+</style>

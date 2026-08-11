@@ -21,7 +21,7 @@
     "targetBlockBytes": 1048576,
     "durability": "relaxed",
     "engines": [
-      "browserdatabase",
+      "minnow",
       "sqlite",
       "pglite"
     ]
@@ -91,8 +91,8 @@
     "targetBlockBytes": 1048576,
     "durability": "relaxed",
     "engines": {
-      "browserdatabase": {
-        "engine": "browserdatabase",
+      "minnow": {
+        "engine": "minnow",
         "status": "ready",
         "storageName": "bdb-dataset-92983140-2c8b-4559-8855-fb65760e1c9c",
         "version": "workspace",
@@ -129,7 +129,7 @@
     "scale": 10,
     "sampleCount": 7,
     "engines": [
-      "browserdatabase",
+      "minnow",
       "sqlite",
       "pglite"
     ],
@@ -146,7 +146,7 @@
         "oracleRows": 1,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 52.020000000004075,
             "medianMs": 0.07999999998719431,
@@ -189,7 +189,7 @@
         "oracleRows": 25,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 9.339999999996508,
             "medianMs": 0.3200000000069849,
@@ -232,7 +232,7 @@
         "oracleRows": 4,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 4.439999999987776,
             "medianMs": 1.179999999993015,
@@ -277,7 +277,7 @@
         "oracleRows": 20,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 13.860000000000582,
             "medianMs": 7.220000000001164,
@@ -321,7 +321,7 @@
         "oracleRows": 5,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 13,
             "medianMs": 6.180000000007567,
@@ -366,7 +366,7 @@
         "oracleRows": 1800,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 20.880000000004657,
             "medianMs": 3.860000000000582,
@@ -410,7 +410,7 @@
         "oracleRows": 15,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 27.85999999998603,
             "medianMs": 0.03999999999359716,
@@ -457,7 +457,7 @@
         "oracleRows": 12,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 14.740000000005239,
             "medianMs": 0.4400000000023283,
@@ -503,7 +503,7 @@
         "oracleRows": 480,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 18.10000000000582,
             "medianMs": 1.5,
@@ -548,7 +548,7 @@
         "oracleRows": 5,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 13.619999999995343,
             "medianMs": 6.279999999998836,
@@ -593,7 +593,7 @@
         "oracleRows": 240,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 7.899999999994179,
             "medianMs": 3.6999999999970896,
@@ -638,7 +638,7 @@
         "oracleRows": 80,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 39.10000000000582,
             "medianMs": 0.6600000000034925,
@@ -682,7 +682,7 @@
         "oracleRows": 400,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 10.680000000007567,
             "medianMs": 4.460000000006403,
@@ -725,7 +725,7 @@
         "oracleRows": 4,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 9.820000000006985,
             "medianMs": 5.7999999999883585,
@@ -770,7 +770,7 @@
         "oracleRows": 4,
         "engines": [
           {
-            "engine": "browserdatabase",
+            "engine": "minnow",
             "supported": true,
             "prepareMs": 28.20000000001164,
             "medianMs": 4.039999999993597,
@@ -803,12 +803,12 @@
       }
     ],
     "totalMsByEngine": {
-      "browserdatabase": 45.75999999998021,
+      "minnow": 45.75999999998021,
       "sqlite": 1114.0000000000146,
       "pglite": 796.2400000000052
     },
     "supportedByEngine": {
-      "browserdatabase": 15,
+      "minnow": 15,
       "sqlite": 15,
       "pglite": 15
     },

@@ -3,7 +3,7 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["**/dist/**", "**/coverage/**", "**/playwright-report/**"] },
+  { ignores: ["**/dist/**", "**/coverage/**", "**/playwright-report/**", "**/.astro/**"] },
   eslint.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
@@ -20,7 +20,7 @@ export default tseslint.config(
             {
               group: ["node:*", "*sqlite*", "*duckdb*"],
               message:
-                "Shipped BrowserDatabase packages must remain browser-only and engine-independent.",
+                "Shipped MinnowDatabase packages must remain browser-only and engine-independent.",
             },
           ],
         },
@@ -32,8 +32,9 @@ export default tseslint.config(
     },
   },
   {
-    files: ["*.js", "*.ts"],
+    files: ["*.js", "*.ts", "**/*.mjs"],
     extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: { globals: { ...globals.node } },
   },
   {
     files: ["apps/bench/src/engines/**/*.ts", "apps/bench/vite.config.ts"],

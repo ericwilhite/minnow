@@ -1,0 +1,118 @@
+---
+import { Code } from "astro:components";
+import { showcaseExamples } from "../lib/examples.ts";
+---
+
+<section class="examples">
+  {
+    showcaseExamples.map((example) => (
+      <article class="example" id={`example-${example.id}`}>
+        <h3>{example.title}</h3>
+        <Code
+          code={example.code}
+          lang="ts"
+          themes={{ light: "github-light", dark: "github-dark" }}
+          defaultColor={false}
+        />
+        <div class="run-row">
+          <button class="run" type="button" data-run={example.id}>
+            Run
+          </button>
+          <span class="hint">runs in your browser against an in-memory store</span>
+        </div>
+        <pre class="output" data-output={example.id} hidden></pre>
+      </article>
+    ))
+  }
+</section>
+
+<style>
+  .examples {
+    display: grid;
+    gap: 2.5rem;
+  }
+
+  .example h3 {
+    font-size: 1.05rem;
+    font-weight: 650;
+    margin: 0 0 0.6rem;
+  }
+
+  .run-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+  }
+
+  button.run {
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 550;
+    padding: 0.3rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg);
+    color: var(--text);
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      border-color 120ms ease;
+  }
+
+  button.run:hover {
+    background: var(--bg-hover);
+  }
+
+  button.run:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .hint {
+    font-size: 0.8rem;
+    color: var(--text-faint);
+  }
+
+  .output {
+    margin: 0.75rem 0 0;
+    padding: 0.9rem 1.1rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    line-height: 1.55;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .output.error {
+    color: var(--code-inline);
+  }
+</style>
+
+<script>
+  import { showcaseExamples } from "../lib/examples.ts";
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-run]")) {
+    button.addEventListener("click", async () => {
+      const id = button.dataset.run;
+      const example = showcaseExamples.find((candidate) => candidate.id === id);
+      const output = document.querySelector<HTMLElement>(`[data-output="${id ?? ""}"]`);
+      if (example === undefined || output === null) return;
+      button.disabled = true;
+      output.hidden = false;
+      output.classList.remove("error");
+      output.textContent = "Running…";
+      try {
+        output.textContent = await example.run();
+      } catch (error) {
+        output.classList.add("error");
+        output.textContent = error instanceof Error ? error.message : String(error);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+</script>

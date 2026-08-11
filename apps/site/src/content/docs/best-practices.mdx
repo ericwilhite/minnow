@@ -1,0 +1,136 @@
+---
+title: Best practices
+description: The patterns Minnow is designed around — workers, typed facades, batches, budgets, and maintenance.
+---
+
+# Best practices
+
+<p class="lede">
+  Minnow has opinions. Most of them exist so that the failure you see in development is the same one
+  you would have seen in production — this page collects the patterns the engine is designed around
+  and the traps it deliberately refuses to paper over.
+</p>
+
+## Run the database in a worker
+
+The engine runs wherever you construct it, but IndexedDB access, block decoding, planning, and
+query execution are heavy enough to jank the main thread. In production, construct the database in
+a dedicated worker and keep only the proxy on the main thread — the shipped
+[worker entry and client](/docs/workers/) make this a three-line setup, and the typed facade
+behaves identically over both. Reserve main-thread construction for tests and prototypes.
+
+## Declare the schema once, work typed
+
+One `schema([...])` declaration drives migrations, autocomplete, row types, typed writes, and live
+queries. Prefer `createMinnow(database, { schema })` — it infers the `DB` type from the schema
+value, so there is no generic to keep in sync:
+
+```ts
+const db = createMinnow(database, { schema: appSchema });
+```
+
+Drop to the raw layer (`database.query()`, `insertBatch()`, the `sql` tag) for bulk ingestion and
+ad-hoc SQL — it is the same pipeline, not a second engine. Builder queries compile to the exact
+plans their SQL equivalents produce, so switching layers never changes semantics.
+
+## Write in batches, not loops
+
+Every commit publishes segments and runs a manifest compare-and-swap; a loop of single-row inserts
+pays that full cost per row. Give the engine columns, or let the buffered writer do the batching:
+
+```ts
+// Bulk load: one commit, columnar from the start.
+await database.insertBatch("events", { columns: { id: ids, at: dates, kind: kinds } });
+
+// Event streams: rows in, batches out.
+const writer = database.bufferedWriter("events", {
+  mode: "upsert",
+  maxRows: 1_000,
+  maxAgeMs: 1_000,
+  onError: (error) => report(error),
+});
+await writer.add(event);
+```
+
+## Do not trust page unload
+
+`attachLifecycleFlush()` flushes buffered writers when the tab hides — use it, but treat it as an
+optimization. The durability contract ends at a successfully committed IndexedDB transaction;
+nothing you do in `pagehide` makes browser shutdown reliable. Data that must survive belongs in a
+committed batch, not in a buffer you hope will flush.
+
+## Give big queries a memory budget
+
+Queries accept `executionMemoryBudgetBytes`. Without one, a large sort or join materializes what it
+needs and may take the tab down with it; with one, ordered plans switch to external merge sort and
+grouped plans to partitioned spill, or you get a typed `QueryMemoryBudgetError` instead of a
+crashed tab:
+
+```ts
+try {
+  const result = await database.query(bigSql, { executionMemoryBudgetBytes: 64 * 1024 * 1024 });
+} catch (error) {
+  if (error instanceof QueryMemoryBudgetError) {
+    // narrow the query, raise the budget, or page through smaller slices
+  }
+}
+```
+
+If a tab can die abruptly mid-query, schedule `cleanupQuerySpill()` occasionally so abandoned spill
+pages are reclaimed once their owner leases expire.
+
+## Expect write conflicts; handle them as data
+
+Concurrent tabs are a designed-for case, and the resolution is explicit: a losing commit fails its
+manifest compare-and-swap and surfaces a typed error rather than interleaving. Catch
+`UniqueConstraintError` / conflict failures and retry or rebase at the level where you know what
+the right merge is. The engine retries transparently where that is safe (`maxCommitRetries`); what
+reaches you is the case that genuinely needs an application decision.
+
+## Treat migrations as additive
+
+`migrate()` performs metadata-only steps and rejects everything destructive: type changes, drops,
+unique-key changes, non-null tightening. Design schemas accordingly — add nullable columns, rename
+through `.renamedFrom()` (a metadata step, not a drop-and-add), and let
+[compaction](/docs/writes/) handle physical rewrites. If a truly breaking change is unavoidable,
+that is a new table plus an application-level copy, done deliberately.
+
+## Close what you open
+
+`prepareQuery()` pins an immutable snapshot until `close()` — a leaked prepared query pins history
+and blocks garbage collection from reclaiming it. Live subscriptions, buffered writers, live sets,
+and the database itself all have `close()`; on the worker client, `close({ terminateWorker: true })`
+tears down the whole stack cleanly.
+
+## Schedule maintenance in idle time
+
+Compaction, garbage collection, and spill cleanup are stepped, durable, and cancellable — designed
+to run in small increments whenever the app is quiet, and to survive a tab closing mid-job:
+
+```ts
+requestIdleCallback(async () => {
+  await database.compactTableStep("events", { maxBlocks: 1 });
+  await database.collectGarbageStep({ maxItems: 8 });
+});
+```
+
+A resumed job continues from its durable checkpoint; there is no penalty for stopping.
+
+## Test against the same engine
+
+`MemoryBlockStore` implements the full storage interface, so unit tests run the real engine —
+planner, executor, compaction, GC — without touching browser storage. For crash and recovery
+testing, `FaultInjectingBlockStore` (from `@minnowdb/core/testing`) injects deterministic faults at
+named points around block writes and manifest commits:
+
+```ts
+import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
+
+const store = new FaultInjectingBlockStore(new MemoryBlockStore(), (point) => {
+  if (point === "beforeManifestCommit") throw new Error("crash here");
+});
+```
+
+If your test would pass against a mock but fail against the engine, the engine was telling you
+something.

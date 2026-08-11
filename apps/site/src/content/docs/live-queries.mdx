@@ -1,0 +1,94 @@
+---
+title: Live queries
+description: Convergent re-execution — subscribe to any query and get fresh rows after every commit.
+---
+
+# Live queries
+
+<p class="lede">
+  Live queries re-execute selectively when their tables change. Re-execution is the correctness
+  baseline; every notification path converges on the durable manifest version, so a missed message
+  can delay a refresh but cannot produce a stale result.
+</p>
+
+## Typed live queries
+
+Any [built query](/docs/queries/) becomes a live query with `.live()`. Subscribers get the current
+typed rows immediately, then a fresh result after any commit that may have changed them; dependency
+tables come from the compiled plan, with no SQL re-parse.
+
+```ts
+const live = db.selectFrom("people").select(["name"]).where("score", ">", 15).live();
+
+const sub = await live.subscribe({
+  onChange: (rows) => render(rows), // rows: Array<{ name: string }>
+  onComplete: () => {}, // optional: the live set closed
+});
+// or, latest-wins async iteration:
+for await (const rows of live) render(rows);
+
+await sub.close();
+await db.close(); // closes the shared live set; open iterators end cleanly
+```
+
+Iteration ends promptly on `break`, `iterator.return()` (so `Promise.race` timeouts work), or when
+the live set closes — a cancelled iterator never waits for the next commit. Async iteration
+coalesces to the latest result: every yielded value is a true snapshot, but a slow consumer may
+skip intermediates. Configure cross-tab hints and polling once, on the facade:
+`new Minnow(driver, { live: { channelName: "app-commits", pollIntervalMs: 5000 } })`.
+
+## Subscribing with SQL
+
+The underlying live-query set also accepts raw SQL text:
+
+```ts
+const live = database.liveQueries({ channelName: "db", pollIntervalMs: 5_000 });
+const subscription = await live.subscribe(
+  "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status",
+  { onChange: (result) => render(result) },
+);
+// later: subscription.close(); live.close();
+```
+
+## How convergence works
+
+Every commit persists its changed table IDs in the manifest before any notification (compaction
+marks itself logically unchanged). Four hint paths can trigger a sweep:
+
+- a local commit in the same database instance;
+- a cross-tab BroadcastChannel message;
+- a poll tick;
+- an explicit `refresh()`.
+
+All four converge on the same durable manifest version. Hints are only accelerants — the change
+sets in the manifest are authoritative, so missed messages and suspended tabs delay a refresh but
+cannot produce stale results. This matches the architectural rule that correctness never depends on
+BroadcastChannel delivery.
+
+## Sweeps and suppression
+
+Sweeps read change sets in bounded pages and skip subscriptions whose tables did not change; a
+commit without a change set widens conservatively to every subscription. A subscription retains
+only its query (SQL text or compiled plan), its dependency table IDs, and a numeric result digest —
+never rows. When a rerun produces an unchanged digest, the notification is suppressed, so
+`onChange` fires only when the result actually differs.
+
+## Observability
+
+`live.stats` reports counters for the mechanism itself:
+
+- hints received and sweeps performed;
+- reruns executed and reruns avoided by change-set filtering;
+- notifications suppressed by an unchanged digest;
+- sweep latency.
+
+## Limitations
+
+> Incremental maintenance remains future work. When it arrives it will be introduced only for
+> proven-safe operator shapes, and full re-execution stays as the correctness baseline it is
+> checked against. Subscriptions accept anything the read surface executes — built queries or the
+> same read-only SQL subset as `query()`; see [SQL support](/docs/sql/).
+
+Related: [the query builder](/docs/queries/) compiles to the same plans these subscriptions execute
+(its `.live()` is this mechanism), and [Architecture](/docs/architecture/) covers manifests, change
+sets, and multi-tab coordination in more depth.

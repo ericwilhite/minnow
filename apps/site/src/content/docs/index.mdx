@@ -1,0 +1,72 @@
+---
+title: Overview
+description: What Minnow is, what it is for, and how the docs are organized.
+---
+
+# Minnow
+
+<p class="lede">
+  Minnow is a relational database that runs entirely in the browser: typed queries, real SQL, live
+  results, and durable storage built on immutable compressed columnar blocks over IndexedDB.
+</p>
+
+There is no server, no WASM blob, and no build step. You declare a schema once, and that one
+declaration drives migrations, autocomplete, row types, typed writes with `returning`, and live
+subscriptions. Underneath sits an engine with MVCC snapshots, atomic multi-tab publication,
+vectorized execution with explicit memory budgets, and background compaction.
+
+```ts
+import { createMinnow, MinnowDatabase, column, schema, table } from "@minnowdb/core";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+
+const people = table("people", {
+  name: column.string().unique(),
+  score: column.number(),
+  joined: column.datetime().nullable(),
+});
+const appSchema = schema([people]);
+
+const database = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "app-db" }));
+await database.migrate(appSchema);
+
+const db = createMinnow(database, { schema: appSchema });
+const rows = await db
+  .selectFrom("people")
+  .where("score", ">=", 10)
+  .select(["name", "joined"])
+  .orderBy("name")
+  .execute(); // Array<{ name: string; joined: Date | null }>
+```
+
+> Minnow is experimental. The version-zero block format carries no compatibility promise, and the
+> SQL surface is a correctness-first subset, not full SQL-92 coverage.
+
+## Where to go
+
+- [Getting started](/docs/getting-started/) — install, first session, workers, testing.
+- [Best practices](/docs/best-practices/) — the patterns the engine is designed around.
+- [Schema & migrations](/docs/schema/) — the typed schema DSL and what `migrate()` will and won't do.
+- [Typed queries](/docs/queries/) — the Kysely-style builder and its expression vocabulary.
+- [Writes & transactions](/docs/writes/) — typed mutations, batch writes, buffered writers, maintenance.
+- [Live queries](/docs/live-queries/) — convergent re-execution when tables change.
+- [Workers & multi-tab](/docs/workers/) — the shipped worker entry and main-thread client.
+- [Architecture](/docs/architecture/) — storage model, MVCC, execution, fault model.
+- [API reference](/docs/api/) — every public export, by module.
+- [SQL support](/docs/sql/) — the checked-in feature matrix.
+- [Benchmarks](/benchmarks/) — measured against SQLite WASM and PGlite in real browsers.
+
+## Design commitments
+
+A few properties are constraints on the project, not aspirations — the full list is in
+[Architecture](/docs/architecture/):
+
+- **IndexedDB is authoritative.** Correctness never depends on BroadcastChannel, Web Locks,
+  page-close handlers, or successful background work. The durability contract ends at a
+  successfully committed IndexedDB transaction.
+- **Published data is immutable.** Writes append compressed columnar segments and publish them with
+  an atomic manifest compare-and-swap; another tab sees the old version or the new one, never a
+  partial write.
+- **One plan, two front ends.** Builder queries compile to the exact plans their SQL equivalents
+  produce, enforced by structural plan-equality tests.
+- **The engine is owned.** Parser, binder, planner, optimizer, and executor are implemented here —
+  no SQLite, no DuckDB, no WASM engine underneath.

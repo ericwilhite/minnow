@@ -1,0 +1,84 @@
+---
+/**
+ * The minnow — an SVG descendant of the ASCII original: ><(((('>
+ * Tail wags, body bobs; both stop under prefers-reduced-motion.
+ */
+interface Props {
+  size?: number;
+  swim?: boolean;
+}
+const { size = 28, swim = true } = Astro.props;
+---
+
+<svg
+  class:list={["minnow-logo", { swim }]}
+  width={size * 1.8}
+  height={size}
+  viewBox="0 0 72 40"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+  aria-hidden="true"
+>
+  <g class="fish" fill="currentColor">
+    <g class="tail">
+      <path d="M28 20 L10 9.5 C14.2 16.4 14.2 23.6 10 30.5 Z"></path>
+    </g>
+    <path class="fin" d="M43 10.5 L47.5 4.5 L52.5 10.9 Z"></path>
+    <path
+      class="body"
+      d="M27 20 C30.5 11.5 41 8.2 51 10.8 C58.5 12.8 64 16.4 66.5 20 C64 23.6 58.5 27.2 51 29.2 C41 31.8 30.5 28.5 27 20 Z"
+    ></path>
+    <g class="scales" stroke="var(--bg, #fff)" stroke-width="1.4" stroke-linecap="round" opacity="0.55">
+      <path d="M38 13.4 C34.8 17.6 34.8 22.4 38 26.6"></path>
+      <path d="M44.5 12.2 C41 17 41 23 44.5 27.8"></path>
+      <path d="M51 11.6 C47.4 16.8 47.4 23.2 51 28.4"></path>
+    </g>
+    <circle class="eye" cx="58.6" cy="17.6" r="1.9" fill="var(--bg, #fff)"></circle>
+  </g>
+</svg>
+
+<style>
+  .minnow-logo {
+    display: inline-block;
+    vertical-align: middle;
+    overflow: visible;
+  }
+
+  .swim .fish {
+    animation: minnow-bob 3.6s ease-in-out infinite;
+  }
+
+  .swim .tail {
+    transform-origin: 27px 20px;
+    animation: minnow-wag 0.85s ease-in-out infinite alternate;
+  }
+
+  @keyframes minnow-wag {
+    from {
+      transform: rotate(10deg);
+    }
+    to {
+      transform: rotate(-10deg);
+    }
+  }
+
+  @keyframes minnow-bob {
+    0%,
+    100% {
+      transform: translateY(0) rotate(0deg);
+    }
+    30% {
+      transform: translateY(-1.6px) rotate(-1.2deg);
+    }
+    65% {
+      transform: translateY(1.1px) rotate(0.8deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .swim .fish,
+    .swim .tail {
+      animation: none;
+    }
+  }
+</style>

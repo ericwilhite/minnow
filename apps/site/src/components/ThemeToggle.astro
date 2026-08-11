@@ -1,0 +1,85 @@
+<button id="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle theme">
+  <svg
+    class="sun"
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+  >
+    <circle cx="12" cy="12" r="4.5"></circle>
+    <path
+      d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"
+    ></path>
+  </svg>
+  <svg
+    class="moon"
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"></path>
+  </svg>
+</button>
+
+<style>
+  button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 120ms ease;
+  }
+
+  button:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  .moon {
+    display: none;
+  }
+
+  :global(:root[data-theme="dark"]) .moon {
+    display: block;
+  }
+
+  :global(:root[data-theme="dark"]) .sun {
+    display: none;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :global(:root:not([data-theme])) .moon {
+      display: block;
+    }
+    :global(:root:not([data-theme])) .sun {
+      display: none;
+    }
+  }
+</style>
+
+<script>
+  const toggle = document.getElementById("theme-toggle");
+  toggle?.addEventListener("click", () => {
+    const root = document.documentElement;
+    const current =
+      root.dataset.theme ??
+      (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = current === "dark" ? "light" : "dark";
+    root.dataset.theme = next;
+    localStorage.setItem("minnow-theme", next);
+  });
+</script>

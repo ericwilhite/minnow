@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 40">
+  <style>
+    path, circle.body { fill: #37352f; }
+    circle.eye, .scales path { stroke: none; }
+    @media (prefers-color-scheme: dark) {
+      path, circle.body { fill: #d4d4d4; }
+    }
+  </style>
+  <g>
+    <path d="M28 20 L10 9.5 C14.2 16.4 14.2 23.6 10 30.5 Z"/>
+    <path d="M43 10.5 L47.5 4.5 L52.5 10.9 Z"/>
+    <path d="M27 20 C30.5 11.5 41 8.2 51 10.8 C58.5 12.8 64 16.4 66.5 20 C64 23.6 58.5 27.2 51 29.2 C41 31.8 30.5 28.5 27 20 Z"/>
+    <circle class="eye" cx="58.6" cy="17.6" r="1.9" fill="#ffffff"/>
+  </g>
+</svg>

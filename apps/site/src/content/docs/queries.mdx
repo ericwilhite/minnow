@@ -1,0 +1,149 @@
+---
+title: Typed queries
+description: The Kysely-style query builder — autocomplete, inferred row types, and plans identical to SQL.
+---
+
+# Typed queries
+
+<p class="lede">
+  A Kysely-style typed query builder. String column references with autocomplete, an expression
+  builder for everything beyond comparisons, and inferred row types — compiling to the same plans as
+  SQL, never to SQL strings.
+</p>
+
+## Setup
+
+`Minnow<DB>` wraps a database (or the [worker client](/docs/workers/) — the API is identical over
+both). The `DB` type derives from the runtime schema, so one declaration drives migrations,
+autocomplete, and row types:
+
+```ts
+import { Minnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
+
+const people = table("people", {
+  name: column.string().unique(),
+  score: column.number(),
+  city: column.string().nullable(),
+});
+const orders = table("orders", {
+  order_id: column.number().unique(),
+  person: column.string().references("people", "name"),
+  total: column.number(),
+});
+const appSchema = schema([people, orders]);
+
+await database.migrate(appSchema);
+const db = new Minnow<InferDatabase<typeof appSchema>>(database, { schema: appSchema });
+```
+
+`createMinnow(database, { schema: appSchema })` does the same with the `DB` type inferred from the
+schema value — no generic passing.
+
+## Selects
+
+```ts
+const rows = await db
+  .selectFrom("people as p")
+  .innerJoin("orders as o", "o.person", "p.name")
+  .where("p.score", ">", 10)
+  .where((eb) => eb.or([eb("p.city", "=", "London"), eb("p.city", "is", null)]))
+  .groupBy("p.name")
+  .having((eb) => eb(eb.fn.countAll(), ">", 1))
+  .select(["p.name"])
+  .select((eb) => [eb.fn.sum("o.total").as("revenue")])
+  .orderBy("revenue", "desc")
+  .limit(10)
+  .execute(); // Array<{ name: string; revenue: number | null }>
+```
+
+- String left-hand sides are **column references**; right-hand sides are **values**. Compare two
+  columns with `eb.ref("a.x")` or a join's `onRef`.
+- `select()` takes strings (`"p.name"`, `"p.name as owner"`), an expression callback, or both
+  across repeated calls; `selectAll()` is `SELECT *`.
+- Left-joined columns widen to `| null` in the row type, matching what a left join actually
+  returns.
+- `execute()`, `executeTakeFirst()`, `executeTakeFirstOrThrow()`, `compile()`, and
+  [`.live()`](/docs/live-queries/).
+
+## Expression vocabulary
+
+| Category         | Forms                                                                                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Comparisons      | `eb(lhs, op, rhs)` with `=`, `!=`, `<`, `<=`, `>`, `>=`, `like`, `not like`, `in`, `not in`, `is`, `is not`; `eb.between`, `eb.notBetween` |
+| Boolean logic    | `eb.and([...])`, `eb.or([...])`, `eb.not(...)`                                                                                             |
+| Arithmetic       | `eb(lhs, "+" \| "-" \| "*" \| "/", rhs)`, `eb.neg(...)`                                                                                    |
+| Aggregates       | `eb.fn.count`, `countAll`, `sum`, `avg`, `min`, `max`; `fn.count(x).distinct()`                                                            |
+| Scalar functions | `eb.fn.round`, `coalesce`, `dateTrunc`                                                                                                     |
+| Windows          | `eb.rowNumber() / rank() / denseRank()` and aggregate `.over((o) => o.partitionBy(...).orderBy(...))`                                      |
+| Conditionals     | `eb.case().when(...).then(...).else(...).end()`                                                                                            |
+| Subqueries       | `eb.selectFrom(...)`, `eb.exists(...)`, and builders as `in` / comparison operands                                                         |
+
+Aggregate results are typed honestly: `sum` over an empty group is `null`, so its result type is
+`number | null`.
+
+## Derived tables, CTEs, set operations
+
+```ts
+const spend = db
+  .selectFrom("orders")
+  .groupBy("person")
+  .select((eb) => [eb.ref("person").as("person"), eb.fn.sum("total").as("total")]);
+
+// As a derived table…
+await db.selectFrom(spend.as("t")).where("t.total", ">", 10).select(["t.person"]).execute();
+
+// …or as a CTE, joinable by name.
+await db
+  .with("spend", () => spend)
+  .selectFrom("people as p")
+  .innerJoin("spend", "spend.person", "p.name")
+  .select(["p.name", "spend.total"])
+  .execute();
+
+// Set operations chain left to right; member row types must match.
+await db
+  .selectFrom("people")
+  .select(["name"])
+  .unionAll(db.selectFrom("orders").select(["person as name"]))
+  .orderBy("name")
+  .execute();
+```
+
+Derived and CTE columns stay fully type-checked — an unknown column on `"t."` is a compile error,
+exactly like a real table.
+
+## One plan, two front ends
+
+`compile()` ends in the same assembly functions the SQL parser ends in, with a shared
+derived-source numbering sequence, so a builder query and its equivalent SQL produce _identical_
+optimized plans — the same validation errors, the same DISTINCT/COUNT(DISTINCT)/window desugars,
+the same execution strategy. This is not an aspiration: structural plan-equality tests enforce it
+shape by shape.
+
+```
+SQL -> lexer -> parser ----------------+
+                                       +-> shared assembly -> optimizer -> physical plan
+Typed builder -> compile() ------------+
+```
+
+## The SQL escape hatch
+
+The `sql` template tag renders interpolations as SQL literals (strings escape their quotes, arrays
+become IN lists, nested fragments splice), and `query()` / `prepareQuery()` remain the raw
+read-only SQL API. Anything the builder does not express can be written as SQL against the same
+optimizer and executor.
+
+```ts
+import { sql } from "@minnowdb/core";
+
+const rows = await sql<{ n: number }>`
+  SELECT COUNT(*) AS n FROM people WHERE city IN ${["London", "DC"]}
+`.execute(db);
+```
+
+> Writes have the same treatment — see [Writes & transactions](/docs/writes/) for `insertInto` /
+> `updateTable` / `deleteFrom` with `returning`. The supported and rejected SQL forms are recorded
+> in a checked-in feature matrix; see [SQL support](/docs/sql/), and
+> [live queries](/docs/live-queries/) for re-executing any built query when its tables change.
+> Known limits: correlated subqueries compile but the engine resolves subqueries at one snapshot,
+> so they fail at execution; ORDER BY must name a selected column or output alias.

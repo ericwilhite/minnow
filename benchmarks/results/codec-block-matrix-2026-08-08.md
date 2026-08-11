@@ -71,7 +71,7 @@ workloads:
 - Byte-RLE is dominated here: it is slower than raw and increases stored bytes. It remains a
   correctness codec because other value distributions may behave differently.
 
-This does not silently change the current public `BrowserDatabase` default. That API partitions by
+This does not silently change the current public `MinnowDatabase` default. That API partitions by
 rows rather than target bytes and remains configurable. Phase 6B must persist an explicit byte
 budget, target layout, and output codec before adopting this policy for background rewrites.
 Selective-scan and memory-pressure evidence from Phase 7 may revise the provisional target.
