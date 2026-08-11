@@ -561,6 +561,23 @@ export class TempOwnerConflictError extends Error {
   }
 }
 
+/**
+ * One coherent read of everything query preparation needs before touching blocks: the
+ * current manifest version, the named table records, every segment of the found tables,
+ * and the transaction records those segments reference. Stores that can produce this in
+ * one atomic read collapse the sequential per-record round trips a prepare would
+ * otherwise issue.
+ */
+export interface QueryCatalogState {
+  manifestVersion: number | null;
+  /** Positional per requested name; undefined where the table does not exist. */
+  tables: Array<TableRecord | undefined>;
+  /** Segments of the found tables, sorted by id like listSegments. */
+  segments: SegmentRecord[];
+  /** Records for the segments' transaction ids; missing records are omitted. */
+  transactions: TransactionRecord[];
+}
+
 export interface BlockStore {
   addBlock(id: string, bytes: Uint8Array): Promise<void>;
   addBlocks(blocks: readonly BlockWrite[]): Promise<void>;
@@ -586,6 +603,12 @@ export interface BlockStore {
   getCurrentManifest(): Promise<Manifest | undefined>;
   /** The current version alone, without materializing the manifest's block list. */
   getCurrentManifestVersion(): Promise<number | null>;
+  /**
+   * Optional: one atomic catalog read for query preparation. Implementations must return
+   * the same records the individual getTableByName/listSegments/getTransactions calls
+   * would; callers fall back to those calls when this is absent.
+   */
+  getQueryCatalogState?(tableNames: readonly string[]): Promise<QueryCatalogState>;
   getManifest(version: number): Promise<Manifest | undefined>;
   listManifests(): Promise<Manifest[]>;
   listManifestPage(

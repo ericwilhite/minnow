@@ -52,7 +52,15 @@ multiplier grows every dimension, bridge, transaction, and ledger table. It vali
 reference queries. A measured, read-only ad-hoc reference SQL console remains explicitly separate
 from library timings. The library now has a correctness-first native `query()`/`prepareQuery()` SQL
 subset for projections, filters, equi-joins, grouping, core aggregates, ordering, and limits. The
-four-engine comparison uses that public API and requires matching checksums. The Phase 7A columnar
+engine comparison uses that public API and requires matching checksums. The checked-in 2026-08-11
+three-engine record measures BrowserDatabase SQL for the first time: at scale 10 in Chromium and
+Firefox, all 15 reference queries execute with oracle-verified results and summed repeated-execution
+medians beat SQLite Wasm and PGlite in both browsers. The same-day prepare-cache follow-up record
+halved the remaining per-statement prepare cost with one batched catalog read
+(`BlockStore.getQueryCatalogState`), a shared internal reader lease per manifest version, and a
+byte-bounded prepare cache (`prepareCacheBytes`, default 64 MiB) keyed by exact visible segment
+ids over assembled column vectors, zone-pruned projections, and derived-block results; execution
+medians were unchanged and repeated same-statement prepares fell to millisecond scale. The Phase 7A columnar
 executor now backs the public subset; memory-accounted execution, statistics, broader SQL, and
 cost-based optimization remain planned in Phases 7–13.
 
@@ -371,7 +379,8 @@ workspace plus its compacted output. Merge planning updates source slots in plac
 spans and column ranges in one pass, but still retains a whole-plan key map and source slots. Returned
 result objects, group-key and retained aggregate
 reference containers, property and JavaScript array-capacity overhead, spill serialization/native
-IndexedDB work, caller-owned result lifetime, and allocator overhead are not counted. Unordered
+IndexedDB work, caller-owned result lifetime, allocator overhead, and the prepare cache's retained
+bytes (byte-bounded separately by `prepareCacheBytes`) are not counted. Unordered
 grouped state, hash-join build sides, and DISTINCT still have no spill path, single-table global
 aggregates rely on streamed input plus bounded accumulator state rather than a spill, and the
 default remains effectively unbounded. Later Phase 7 work must stream joined and mutation inputs,

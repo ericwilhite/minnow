@@ -49,7 +49,15 @@ storage-oriented benchmark and physical-rewrite work while leaving the row-parti
 configurable. Larger quota-dependent datasets and repeated-sample distributions remain future
 evidence work.
 
-The dated four-engine report predates BrowserDatabase's public read-only SQL API, so its
-BrowserDatabase SQL cells remain explicitly unmeasured. The current dashboard comparison now runs
-the shared six-query workload through `prepareQuery()`/`query()` and requires matching checksums
-from all four engines; a new checked-in run is still needed to publish those timings.
+The dated 2026-08-08 four-engine report predates BrowserDatabase's public read-only SQL API, so
+its BrowserDatabase SQL cells remain explicitly unmeasured. The 2026-08-11 three-engine record
+(`engine-comparison-2026-08-11.md`, with raw Chromium and Firefox bundles) closes that gap: all 15
+reference queries run through `prepareQuery()`/`execute()` with oracle-verified results in both
+browsers. It reports repeated-execution medians and prepare-inclusive one-shot totals separately,
+because the engines' public fast paths front-load different work; read its measurement-semantics
+section before quoting either aggregate. The same-day follow-up
+(`engine-comparison-2026-08-11-prepare-cache.md`, with `-optimized-` raw bundles) records the
+prepare-cost reduction that landed after that run: one batched catalog read, a shared internal
+reader lease, and a byte-bounded prepare cache keyed by visible segment ids. Summed prepare fell
+2.1× in Chromium and 2.8× in Firefox with execution medians unchanged, and a repeated prepare of
+the same statement fell from 426 ms summed to 44 ms in the main-thread harness.

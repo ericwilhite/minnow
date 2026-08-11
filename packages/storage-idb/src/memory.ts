@@ -16,6 +16,7 @@ import {
   LeaseConflictError,
   type Manifest,
   type PublishManifestInput,
+  type QueryCatalogState,
   type RowIdRange,
   type RunGarbageCollectionStepInput,
   type SegmentRecord,
@@ -281,6 +282,26 @@ export class MemoryBlockStore implements BlockStore {
 
   async getCurrentManifestVersion(): Promise<number | null> {
     return this.#currentVersion;
+  }
+
+  async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
+    const tables = await Promise.all(tableNames.map((name) => this.getTableByName(name)));
+    const foundTableIds = new Set(
+      tables.filter((table): table is TableRecord => table !== undefined).map((table) => table.id),
+    );
+    const segments = (await this.listSegments()).filter((record) =>
+      foundTableIds.has(record.tableId),
+    );
+    const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
+    const transactions = (await this.getTransactions(transactionIds)).filter(
+      (record): record is TransactionRecord => record !== undefined,
+    );
+    return {
+      manifestVersion: this.#currentVersion,
+      tables,
+      segments,
+      transactions,
+    };
   }
 
   async getCurrentManifest(): Promise<Manifest | undefined> {

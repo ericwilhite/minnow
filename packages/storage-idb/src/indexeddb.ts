@@ -17,6 +17,7 @@ import {
   LeaseConflictError,
   type Manifest,
   type PublishManifestInput,
+  type QueryCatalogState,
   type RowIdRange,
   type RunGarbageCollectionStepInput,
   type SegmentRecord,
@@ -423,6 +424,49 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     await transactionDone(transaction);
     return typeof value === "number" ? value : null;
+  }
+
+  async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
+    const transaction = this.#transaction(["catalog", "segments", "transactions"], "readonly");
+    const catalog = transaction.objectStore("catalog");
+    const [versionValue, tableIds] = await Promise.all([
+      requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
+      Promise.all(
+        tableNames.map((name) =>
+          requestResult<unknown>(catalog.get(`${TABLE_NAME_PREFIX}${name}`)),
+        ),
+      ),
+    ]);
+    const tables = await Promise.all(
+      tableIds.map(async (id) => {
+        if (typeof id !== "string") return undefined;
+        const value: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${id}`));
+        return value === undefined ? undefined : asTableRecord(value);
+      }),
+    );
+    const foundTableIds = new Set(
+      tables.filter((table): table is TableRecord => table !== undefined).map((table) => table.id),
+    );
+    const segments: SegmentRecord[] = [];
+    await visitObjectStoreSequentially(transaction.objectStore("segments"), (value) => {
+      const record = asSegmentRecord(value);
+      if (foundTableIds.has(record.tableId)) segments.push(record);
+    });
+    segments.sort((left, right) => left.id.localeCompare(right.id));
+    const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
+    const transactionStore = transaction.objectStore("transactions");
+    const transactionValues = await Promise.all(
+      transactionIds.map((id) => requestResult<unknown>(transactionStore.get(id))),
+    );
+    await transactionDone(transaction);
+    return {
+      manifestVersion: typeof versionValue === "number" ? versionValue : null,
+      tables,
+      segments,
+      transactions: transactionValues
+        .filter((value) => value !== undefined)
+        .map((value) => asTransactionRecord(value)),
+    };
   }
 
   async getCurrentManifest(): Promise<Manifest | undefined> {

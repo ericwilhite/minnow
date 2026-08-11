@@ -10,6 +10,7 @@ import type {
   LeaseRecord,
   Manifest,
   PublishManifestInput,
+  QueryCatalogState,
   RowIdRange,
   RunGarbageCollectionStepInput,
   SegmentRecord,
@@ -37,10 +38,18 @@ export type FaultPoint = (typeof faultPoints)[number];
 export type FaultInjector = (point: FaultPoint) => void | Promise<void>;
 
 export class FaultInjectingBlockStore implements BlockStore {
+  /** Present only when the inner store implements it, so callers' fallbacks stay honest. */
+  getQueryCatalogState?: (tableNames: readonly string[]) => Promise<QueryCatalogState>;
+
   constructor(
     private readonly inner: BlockStore,
     private readonly inject: FaultInjector,
-  ) {}
+  ) {
+    const innerCatalogState = inner.getQueryCatalogState?.bind(inner);
+    if (innerCatalogState !== undefined) {
+      this.getQueryCatalogState = (tableNames) => innerCatalogState(tableNames);
+    }
+  }
 
   async addBlock(id: string, bytes: Uint8Array): Promise<void> {
     await this.inject("beforeBlockWrite");

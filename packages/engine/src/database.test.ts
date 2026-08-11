@@ -5769,3 +5769,284 @@ it("executes the extended SQL surface through the stored query path", async () =
   });
   store.close();
 });
+
+describe("prepared-input cache and shared read lease", () => {
+  class LeaseCountingStore extends CountingMemoryBlockStore {
+    leaseCreates = 0;
+    catalogStateCalls = 0;
+
+    override async createLease(
+      record: Parameters<MemoryBlockStore["createLease"]>[0],
+    ): Promise<void> {
+      this.leaseCreates += 1;
+      return super.createLease(record);
+    }
+
+    override async getQueryCatalogState(
+      tableNames: readonly string[],
+    ): Promise<Awaited<ReturnType<MemoryBlockStore["getQueryCatalogState"]>>> {
+      this.catalogStateCalls += 1;
+      return super.getQueryCatalogState(tableNames);
+    }
+  }
+
+  async function seededStore(
+    options: ConstructorParameters<typeof BrowserDatabase>[1] = {},
+  ): Promise<{ store: LeaseCountingStore; database: BrowserDatabase }> {
+    const store = new LeaseCountingStore();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 4, ...options });
+    await database.createTable({
+      name: "orders",
+      columns: [
+        { name: "region", type: "string" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    await database.insertBatch("orders", {
+      columns: {
+        region: ["west", "east", "west", "north", "east", "west"],
+        amount: [3, 8, 10, 4, 6, 2],
+      },
+    });
+    return { store, database };
+  }
+
+  it("skips block reads and lease writes on repeated prepares at one version", async () => {
+    const { store, database } = await seededStore();
+    const first = await database.prepareQuery(
+      "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
+    );
+    const firstRows = first.execute().rows;
+    first.close();
+    expect(store.blockReadCalls).toBeGreaterThan(0);
+    const blockReadsAfterFirst = store.blockReadCalls;
+    const leasesAfterFirst = store.leaseCreates;
+    const second = await database.prepareQuery(
+      "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
+    );
+    const secondRows = second.execute().rows;
+    second.close();
+    expect(secondRows).toEqual(firstRows);
+    expect(store.blockReadCalls).toBe(blockReadsAfterFirst);
+    expect(store.leaseCreates).toBe(leasesAfterFirst);
+    expect(store.catalogStateCalls).toBeGreaterThan(0);
+  });
+
+  it("shares cached vectors across different statements over the same columns", async () => {
+    const { store, database } = await seededStore();
+    await database.query("SELECT region, amount FROM orders ORDER BY amount");
+    const blockReadsAfterFirst = store.blockReadCalls;
+    const grouped = await database.query(
+      "SELECT region, COUNT(*) AS orders FROM orders GROUP BY region ORDER BY region",
+    );
+    expect(grouped.rows).toEqual([
+      { region: "east", orders: 2 },
+      { region: "north", orders: 1 },
+      { region: "west", orders: 3 },
+    ]);
+    expect(store.blockReadCalls).toBe(blockReadsAfterFirst);
+  });
+
+  it("serves fresh rows and a fresh lease after a write changes the segment set", async () => {
+    const { store, database } = await seededStore();
+    const before = await database.query("SELECT COUNT(*) AS orders FROM orders");
+    expect(before.rows).toEqual([{ orders: 6 }]);
+    const leasesBeforeWrite = store.leaseCreates;
+    await database.insertBatch("orders", {
+      columns: { region: ["south"], amount: [11] },
+    });
+    const after = await database.query("SELECT COUNT(*) AS orders FROM orders");
+    expect(after.rows).toEqual([{ orders: 7 }]);
+    expect(store.leaseCreates).toBeGreaterThan(leasesBeforeWrite);
+    const totals = await database.query(
+      "SELECT region, SUM(amount) AS total FROM orders WHERE region = 'south' GROUP BY region",
+    );
+    expect(totals.rows).toEqual([{ region: "south", total: 11 }]);
+  });
+
+  it("still prepares correctly when the store lacks the batched catalog read", async () => {
+    const { store, database } = await seededStore();
+    (store as { getQueryCatalogState?: unknown }).getQueryCatalogState = undefined;
+    const result = await database.query(
+      "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
+    );
+    expect(result.rows).toEqual([
+      { region: "east", total: 14 },
+      { region: "north", total: 4 },
+      { region: "west", total: 15 },
+    ]);
+    const blockReadsAfterFirst = store.blockReadCalls;
+    await database.query("SELECT region, SUM(amount) AS total FROM orders GROUP BY region");
+    expect(store.blockReadCalls).toBe(blockReadsAfterFirst);
+  });
+
+  it("re-reads blocks when the cache is disabled", async () => {
+    const { store, database } = await seededStore({ prepareCacheBytes: 0 });
+    await database.query("SELECT SUM(amount) AS total FROM orders");
+    const blockReadsAfterFirst = store.blockReadCalls;
+    await database.query("SELECT SUM(amount) AS total FROM orders");
+    expect(store.blockReadCalls).toBeGreaterThan(blockReadsAfterFirst);
+  });
+
+  it("keeps results exact under a cache too small to hold every column", async () => {
+    const { database } = await seededStore({ prepareCacheBytes: 96 });
+    for (let round = 0; round < 3; round += 1) {
+      const result = await database.query(
+        "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
+      );
+      expect(result.rows).toEqual([
+        { region: "east", total: 14 },
+        { region: "north", total: 4 },
+        { region: "west", total: 15 },
+      ]);
+    }
+  });
+
+  it("rejects invalid cache sizes", () => {
+    const store = new MemoryBlockStore();
+    expect(() => new BrowserDatabase(store, { prepareCacheBytes: -1 })).toThrow(RangeError);
+    expect(() => new BrowserDatabase(store, { prepareCacheBytes: 1.5 })).toThrow(RangeError);
+  });
+
+  it("keeps mutation-replay reads uncached and exact", async () => {
+    const store = new LeaseCountingStore();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 4 });
+    await database.createTable({
+      name: "inventory",
+      uniqueKey: "sku",
+      columns: [
+        { name: "sku", type: "string" },
+        { name: "count", type: "number" },
+      ],
+    });
+    await database.insertBatch("inventory", {
+      columns: { sku: ["a", "b", "c"], count: [1, 2, 3] },
+    });
+    await database.upsertBatch("inventory", {
+      columns: { sku: ["b", "d"], count: [20, 4] },
+    });
+    for (let round = 0; round < 2; round += 1) {
+      const result = await database.query("SELECT sku, count FROM inventory ORDER BY sku");
+      expect(result.rows).toEqual([
+        { sku: "a", count: 1 },
+        { sku: "b", count: 20 },
+        { sku: "c", count: 3 },
+        { sku: "d", count: 4 },
+      ]);
+    }
+  });
+});
+
+describe("derived-block and pruned-projection caching", () => {
+  class ReadCountingStore extends CountingMemoryBlockStore {}
+
+  async function seeded(): Promise<{ store: ReadCountingStore; database: BrowserDatabase }> {
+    const store = new ReadCountingStore();
+    const database = new BrowserDatabase(store, { rowsPerBlock: 4 });
+    await database.createTable({
+      name: "orders",
+      columns: [
+        { name: "region", type: "string" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    await database.insertBatch("orders", {
+      columns: {
+        region: ["west", "east", "west", "north", "east", "west"],
+        amount: [3, 8, 10, 4, 6, 2],
+      },
+    });
+    return { store, database };
+  }
+
+  it("reuses CTE block results across prepares and refreshes them after writes", async () => {
+    const { store, database } = await seeded();
+    const sql =
+      "WITH totals AS (SELECT region, SUM(amount) AS total FROM orders GROUP BY region) " +
+      "SELECT region, total FROM totals ORDER BY total DESC";
+    const first = await database.query(sql);
+    expect(first.rows).toEqual([
+      { region: "west", total: 15 },
+      { region: "east", total: 14 },
+      { region: "north", total: 4 },
+    ]);
+    const readsAfterFirst = store.blockReadCalls;
+    const second = await database.query(sql);
+    expect(second.rows).toEqual(first.rows);
+    expect(store.blockReadCalls).toBe(readsAfterFirst);
+    await database.insertBatch("orders", {
+      columns: { region: ["north"], amount: [40] },
+    });
+    const third = await database.query(sql);
+    expect(third.rows).toEqual([
+      { region: "north", total: 44 },
+      { region: "west", total: 15 },
+      { region: "east", total: 14 },
+    ]);
+  });
+
+  it("re-prepares window functions over CTEs without re-registered schemas", async () => {
+    const { store, database } = await seeded();
+    const sql =
+      "WITH totals AS (SELECT region, SUM(amount) AS revenue FROM orders GROUP BY region), " +
+      "ranked AS (SELECT region, revenue, DENSE_RANK() OVER (ORDER BY revenue DESC) AS rank FROM totals) " +
+      "SELECT region, revenue, rank FROM ranked WHERE rank <= 2 ORDER BY rank";
+    const expected = [
+      { region: "west", revenue: 15, rank: 1 },
+      { region: "east", revenue: 14, rank: 2 },
+    ];
+    const first = await database.query(sql);
+    expect(first.rows).toEqual(expected);
+    const readsAfterFirst = store.blockReadCalls;
+    // The second prepare hits the cached windowed inner block; its schema must come from
+    // the cache because the nested CTE registration is skipped on a hit.
+    const second = await database.query(sql);
+    expect(second.rows).toEqual(expected);
+    expect(store.blockReadCalls).toBe(readsAfterFirst);
+    await database.insertBatch("orders", {
+      columns: { region: ["north"], amount: [40] },
+    });
+    const third = await database.query(sql);
+    expect(third.rows).toEqual([
+      { region: "north", revenue: 44, rank: 1 },
+      { region: "west", revenue: 15, rank: 2 },
+    ]);
+  });
+
+  it("reuses scalar subquery results and refreshes them after writes", async () => {
+    const { database } = await seeded();
+    const sql = "SELECT region FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)";
+    const first = await database.query(sql);
+    expect(new Set(first.rows.map((row) => row.region))).toEqual(new Set(["east", "west"]));
+    await database.insertBatch("orders", {
+      columns: { region: ["south"], amount: [100] },
+    });
+    const second = await database.query(sql);
+    expect(second.rows).toEqual([{ region: "south" }]);
+  });
+
+  it("reuses pruned projections per predicate and refreshes them after writes", async () => {
+    const { store, database } = await seeded();
+    const sql = "SELECT region, amount FROM orders WHERE amount > 7";
+    const first = await database.query(sql);
+    expect(first.rows).toEqual([
+      { region: "east", amount: 8 },
+      { region: "west", amount: 10 },
+    ]);
+    const readsAfterFirst = store.blockReadCalls;
+    const second = await database.query(sql);
+    expect(second.rows).toEqual(first.rows);
+    expect(store.blockReadCalls).toBe(readsAfterFirst);
+    const other = await database.query("SELECT region, amount FROM orders WHERE amount > 9");
+    expect(other.rows).toEqual([{ region: "west", amount: 10 }]);
+    await database.insertBatch("orders", {
+      columns: { region: ["south"], amount: [50] },
+    });
+    const third = await database.query(sql);
+    expect(third.rows).toEqual([
+      { region: "east", amount: 8 },
+      { region: "west", amount: 10 },
+      { region: "south", amount: 50 },
+    ]);
+  });
+});

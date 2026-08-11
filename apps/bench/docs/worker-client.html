@@ -79,9 +79,9 @@ const rows = await db
           <code>prepared.memoryUsage()</code>.
         </li>
         <li>
-          <code>prepareQuery()</code> still pins one leased snapshot in the worker until
-          <code>close()</code>, but a client-side <code>execute()</code> measures execution plus one
-          channel round trip — benchmark inside the worker when isolating executor time.
+          <code>prepareQuery()</code> still holds its materialized snapshot inputs in the worker
+          until <code>close()</code>, but a client-side <code>execute()</code> measures execution
+          plus one channel round trip — benchmark inside the worker when isolating executor time.
         </li>
         <li>
           <code>migrate()</code> accepts the same schema DSL (serialized over the wire
@@ -168,10 +168,10 @@ const client = new BrowserDatabaseClient(
           >indexeddb</code
         >
         or <code>memory</code>) plus <code>compression</code>, <code>rowsPerBlock</code>,
-        <code>maxCommitRetries</code>, and <code>spillOwnerLeaseMs</code>. When construction needs
-        things a message cannot carry — a custom <code>BlockStore</code>, deterministic
-        <code>now</code>/<code>createId</code> seams — write your own entry and expose the database
-        you built:
+        <code>maxCommitRetries</code>, <code>spillOwnerLeaseMs</code>, and
+        <code>prepareCacheBytes</code>. When construction needs things a message cannot carry — a
+        custom <code>BlockStore</code>, deterministic <code>now</code>/<code>createId</code> seams —
+        write your own entry and expose the database you built:
       </p>
       <pre><code data-lang="ts">// my-worker.ts
 import { BrowserDatabase, exposeDatabase } from "@browserdatabase/engine";

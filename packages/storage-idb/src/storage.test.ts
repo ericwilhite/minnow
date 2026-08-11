@@ -725,6 +725,69 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("returns one coherent query catalog state matching the individual reads", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      await store.addTable({
+        id: "events-id",
+        name: "events",
+        columns: [{ id: "value-column", name: "value", type: "number", nullable: false }],
+        createdAt: timestamp,
+      });
+      await store.addTable({
+        id: "other-id",
+        name: "other",
+        columns: [{ id: "other-column", name: "label", type: "string", nullable: false }],
+        createdAt: timestamp,
+      });
+      await store.addBlock("state-block", Uint8Array.of(1));
+      await store.addSegment({
+        id: "state-segment",
+        tableId: "events-id",
+        transactionId: "state-transaction",
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { "value-column": ["state-block"] },
+        createdAt: timestamp,
+      });
+      await store.addSegment({
+        id: "other-segment",
+        tableId: "other-id",
+        transactionId: "state-transaction",
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { "other-column": ["state-block"] },
+        createdAt: timestamp,
+      });
+      await store.createTransaction({
+        ...activeTransaction("state-transaction"),
+        pendingBlockIds: ["state-block"],
+        pendingSegmentIds: ["state-segment", "other-segment"],
+      });
+      await store.commitTransaction({
+        transactionId: "state-transaction",
+        expectedTransactionRevision: 0,
+        expectedManifestVersion: null,
+        blockIds: ["state-block"],
+        committedAt: timestamp,
+      });
+
+      const state = await store.getQueryCatalogState?.(["events", "missing"]);
+      expect(state).toBeDefined();
+      expect(state?.manifestVersion).toBe(await store.getCurrentManifestVersion());
+      expect(state?.tables).toEqual([await store.getTableByName("events"), undefined]);
+      // Only the found tables' segments are returned, matching a filtered listSegments.
+      expect(state?.segments).toEqual(await store.listSegments("events-id"));
+      expect(state?.transactions).toEqual(
+        (await store.getTransactions(["state-transaction"])).filter(
+          (record) => record !== undefined,
+        ),
+      );
+      store.close();
+    });
+
     it("pages manifests and transactions with stable exclusive cursors", async () => {
       const store = await implementation.create();
       await store.addBlock("page-block", Uint8Array.of(1));

@@ -40,6 +40,7 @@ import {
   type MergeCompactionSourceBlock,
   type MergeCompactionSourceColumn,
   type MergeCompactionSourceSegment,
+  type QueryCatalogState,
   type RechunkCompactionOutputWindow,
   type RechunkCompactionRewritePlan,
   type RechunkCompactionSourceBlock,
@@ -426,6 +427,16 @@ export interface BrowserDatabaseOptions {
   createId?: () => string;
   /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
   spillOwnerLeaseMs?: number;
+  /**
+   * Retained bytes for the prepare cache: assembled append-table column vectors,
+   * zone-pruned projections, and derived/subquery block results that let repeated query
+   * preparation skip block reads, decompression, vector assembly, and deterministic
+   * re-execution. Entries are keyed by the exact visible segment ids (plus predicate
+   * values and the block plan where relevant), so a cached entry can never serve stale
+   * data; writes simply stop matching and old entries age out of the byte-bounded LRU.
+   * 0 disables the cache. Defaults to 64 MiB.
+   */
+  prepareCacheBytes?: number;
 }
 
 export interface QuerySpillCleanupOptions {
@@ -506,6 +517,13 @@ export class BrowserDatabase {
   readonly #internalLeaseOwnerId = `browserdatabase/${crypto.randomUUID()}`;
   readonly #liveSets = new Set<LiveQuerySet>();
   #internalLeaseSequence = 0;
+  readonly #prepareCacheLimitBytes: number;
+  /** Insertion order doubles as LRU order; hits re-insert their entry. */
+  readonly #prepareCache = new Map<string, { payload: unknown; bytes: number }>();
+  #prepareCacheUsedBytes = 0;
+  readonly #visibilityFingerprints = new WeakMap<SegmentVisibilityCatalog, Map<string, string>>();
+  #sharedLease: SharedLeaseEntry | undefined;
+  #sharedLeaseRenewal: Promise<void> | undefined;
 
   constructor(
     private readonly store: BlockStore,
@@ -525,6 +543,10 @@ export class BrowserDatabase {
     this.#spillOwnerLeaseMs = options.spillOwnerLeaseMs ?? 60_000;
     if (!Number.isSafeInteger(this.#spillOwnerLeaseMs) || this.#spillOwnerLeaseMs <= 0) {
       throw new RangeError("Spill owner lease lifetime must be a positive whole number");
+    }
+    this.#prepareCacheLimitBytes = options.prepareCacheBytes ?? 64 * 1024 * 1024;
+    if (!Number.isSafeInteger(this.#prepareCacheLimitBytes) || this.#prepareCacheLimitBytes < 0) {
+      throw new RangeError("Prepare cache bytes must be a non-negative whole number");
     }
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
@@ -1101,21 +1123,23 @@ export class BrowserDatabase {
   ): Promise<PreparedQuery> {
     const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
     try {
-      const realTables = await this.#findRealBlockTables(plan);
-      const typedSchemas = new Map<string, SqlColumnSchema[]>(
-        [...realTables.values()].map((table) => [
-          table.name,
-          table.columns.map(({ name, type }) => ({ name, type })),
-        ]),
-      );
       let columnarTables = new Map<string, ColumnarTable>();
       let resolvedPlan = plan;
-      await this.#withLeasedSnapshot(options.version, async (snapshot) => {
-        const visibility = await this.#blockSegmentVisibility(realTables);
+      const prepareAtSnapshot = async (
+        snapshot: LeasedSnapshot,
+        realTables: Map<string, TableRecord>,
+        visibility: SegmentVisibilityCatalog,
+      ): Promise<void> => {
+        const typedSchemas = new Map<string, SqlColumnSchema[]>(
+          [...realTables.values()].map((table) => [
+            table.name,
+            table.columns.map(({ name, type }) => ({ name, type })),
+          ]),
+        );
         const resolution = subqueryResolutionSteps(plan);
         for (const step of resolution.steps) {
           step.substitute(
-            await this.#executeBlock(
+            await this.#executeBlockCached(
               step.block,
               snapshot,
               visibility,
@@ -1134,7 +1158,17 @@ export class BrowserDatabase {
           realTables,
           typedSchemas,
         );
-      });
+      };
+      if (options.version !== undefined) {
+        // Explicit time travel keeps the per-call lease and version-anchored reads.
+        const realTables = await this.#findRealBlockTables(plan);
+        await this.#withLeasedSnapshot(options.version, async (snapshot) => {
+          const visibility = await this.#blockSegmentVisibility(realTables);
+          await prepareAtSnapshot(snapshot, realTables, visibility);
+        });
+      } else {
+        await this.#withSharedCatalogSnapshot(collectRealTableNames(plan), prepareAtSnapshot);
+      }
       return createPreparedColumnarQuery(
         chooseJoinOrder(resolvedPlan, columnarTables),
         columnarTables,
@@ -1146,57 +1180,122 @@ export class BrowserDatabase {
     }
   }
 
+  /**
+   * Reads the catalog state every prepare needs in one coherent store read, then runs the
+   * action under a shared internal reader lease anchored to that state's manifest version.
+   * The lease is reused across prepares at the same version, so steady-state preparation
+   * costs one catalog read instead of per-record round trips plus lease create/release
+   * write transactions. If the manifest is pruned between the read and the lease, the
+   * state is re-read.
+   */
+  async #withSharedCatalogSnapshot<T>(
+    names: readonly string[],
+    action: (
+      snapshot: LeasedSnapshot,
+      realTables: Map<string, TableRecord>,
+      visibility: SegmentVisibilityCatalog,
+    ) => Promise<T>,
+  ): Promise<T> {
+    for (;;) {
+      const state = await this.#queryCatalogState(names);
+      const realTables = new Map<string, TableRecord>();
+      names.forEach((name, index) => {
+        const table = state.tables[index];
+        if (table === undefined) throw new Error(`Table not found: ${name}`);
+        realTables.set(table.name, table);
+      });
+      const segmentsByTable = new Map<string, SegmentRecord[]>();
+      for (const segment of state.segments) {
+        const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
+        tableSegments.push(segment);
+        segmentsByTable.set(segment.tableId, tableSegments);
+      }
+      const visibility: SegmentVisibilityCatalog = {
+        transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
+        segmentsByTable,
+      };
+      const entry = await this.#acquireSharedLease(state.manifestVersion);
+      if (entry === undefined) continue;
+      try {
+        return await action(entry.lease, realTables, visibility);
+      } finally {
+        this.#releaseSharedLease(entry);
+      }
+    }
+  }
+
+  /** One coherent catalog read via the store's batched method, or its sequential shape. */
+  async #queryCatalogState(names: readonly string[]): Promise<QueryCatalogState> {
+    const batched = this.store.getQueryCatalogState?.bind(this.store);
+    if (batched !== undefined) return batched(names);
+    // The version is read first so the segment listing is a superset of the version's
+    // committed segments; blocks outside the leased manifest filter out during reads.
+    const manifestVersion = await this.store.getCurrentManifestVersion();
+    const tables = await Promise.all(names.map((name) => this.store.getTableByName(name)));
+    const found = tables.filter((table): table is TableRecord => table !== undefined);
+    const tableIds = new Set(found.map((table) => table.id));
+    const only = found.length === 1 ? found[0] : undefined;
+    const segments =
+      only !== undefined
+        ? await this.store.listSegments(only.id)
+        : (await this.store.listSegments()).filter((segment) => tableIds.has(segment.tableId));
+    const transactions = await this.#transactionRecordsForSegments(segments);
+    return { manifestVersion, tables, segments, transactions };
+  }
+
+  /**
+   * Reuses the shared internal reader lease when it targets the requested version and has
+   * not expired; otherwise opens a fresh lease at that exact version and retires the old
+   * one once its readers drain. Returns undefined when the version's manifest disappeared
+   * between the catalog read and the lease, so the caller can re-read.
+   */
+  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+    const current = this.#sharedLease;
+    if (
+      current?.version === version &&
+      current.lease.expiresAt.getTime() - this.#now().getTime() > 0
+    ) {
+      current.refCount += 1;
+      try {
+        await this.#renewInternalLeaseIfNeeded(current.lease);
+        return current;
+      } catch (error) {
+        this.#releaseSharedLease(current);
+        throw error;
+      }
+    }
+    let lease: LeasedSnapshot;
+    try {
+      lease = await this.#transactions.openLeasedSnapshot({
+        id: `${this.#internalLeaseOwnerId}/${String(this.#internalLeaseSequence++)}`,
+        ownerId: this.#internalLeaseOwnerId,
+        ttlMs: INTERNAL_READ_LEASE_TTL_MS,
+        version,
+      });
+    } catch (error) {
+      if (error instanceof SnapshotManifestMissingError) return undefined;
+      throw error;
+    }
+    const entry: SharedLeaseEntry = { lease, version, refCount: 1 };
+    const previous = this.#sharedLease;
+    this.#sharedLease = entry;
+    if (previous?.refCount === 0) {
+      void previous.lease.release().catch(() => undefined);
+    }
+    return entry;
+  }
+
+  #releaseSharedLease(entry: SharedLeaseEntry): void {
+    entry.refCount -= 1;
+    if (entry.refCount === 0 && entry !== this.#sharedLease) {
+      void entry.lease.release().catch(() => undefined);
+    }
+  }
+
   /** Collects every real table referenced by a block, its derived sources, or its subqueries. */
   async #findRealBlockTables(plan: CompiledQuery): Promise<Map<string, TableRecord>> {
-    const names = new Set<string>();
-    const excluded = new Set<string>();
-    const walkExpression = (expression: Expression): void => {
-      if (expression.kind === "subquery" || expression.kind === "exists") {
-        walk(expression.block);
-        return;
-      }
-      if (expression.kind === "binary" || expression.kind === "condition") {
-        walkExpression(expression.left);
-        walkExpression(expression.right);
-      } else if (expression.kind === "logical") {
-        walkExpression(expression.left);
-        walkExpression(expression.right);
-      } else if (expression.kind === "not") walkExpression(expression.operand);
-      else if (expression.kind === "case") {
-        for (const branch of expression.branches) {
-          walkExpression(branch.when);
-          walkExpression(branch.then);
-        }
-        if (expression.otherwise !== undefined) walkExpression(expression.otherwise);
-      } else if (expression.kind === "call") expression.arguments.forEach(walkExpression);
-      else if (expression.kind === "list") expression.items.forEach(walkExpression);
-    };
-    const walk = (block: CompiledQuery): void => {
-      for (const source of [block.base, ...block.joins]) {
-        if (source.union !== undefined) source.union.blocks.forEach(walk);
-        else if (source.windowed !== undefined) walk(source.windowed.block);
-        else if (source.recursive !== undefined) {
-          // The self-reference is bound per iteration, never loaded from storage.
-          excluded.add(source.recursive.reference);
-          walk(source.recursive.base);
-          walk(source.recursive.step);
-        } else if (source.derived === undefined) names.add(source.table);
-        else walk(source.derived);
-      }
-      for (const item of block.select) walkExpression(item.expression);
-      block.groupBy.forEach(walkExpression);
-      for (const join of block.joins) {
-        if (join.on !== undefined) walkExpression(join.on);
-      }
-      for (const predicate of [...block.predicates, ...block.having]) {
-        walkExpression(predicate.left);
-        walkExpression(predicate.right);
-      }
-      for (const order of block.orderBy) walkExpression(order.expression);
-    };
-    walk(plan);
-    for (const name of excluded) names.delete(name);
-    const tables = await Promise.all([...names].map((name) => this.#findTable(name)));
+    const names = collectRealTableNames(plan);
+    const tables = await Promise.all(names.map((name) => this.#findTable(name)));
     return new Map(tables.map((table) => [table.name, table]));
   }
 
@@ -1244,7 +1343,7 @@ export class BrowserDatabase {
       if (inputs.has(source.table)) continue;
       if (source.recursive !== undefined) {
         const { reference, base, step, all } = source.recursive;
-        const baseResult = await this.#executeBlock(
+        const { result: baseResult, schema } = await this.#executeBlockWithSchemaCached(
           base,
           snapshot,
           visibility,
@@ -1252,7 +1351,6 @@ export class BrowserDatabase {
           realTables,
           typedSchemas,
         );
-        const schema = inferBlockSchema(base, typedSchemas);
         typedSchemas.set(reference, schema);
         const state = createRecursiveCteState(baseResult, all);
         while (state.frontier.length > 0) {
@@ -1295,7 +1393,7 @@ export class BrowserDatabase {
         const results: QueryResult[] = [];
         let schema: SqlColumnSchema[] | undefined;
         for (const member of source.union.blocks) {
-          const result = await this.#executeBlock(
+          const { result, schema: memberSchema } = await this.#executeBlockWithSchemaCached(
             member,
             snapshot,
             visibility,
@@ -1303,7 +1401,6 @@ export class BrowserDatabase {
             realTables,
             typedSchemas,
           );
-          const memberSchema = inferBlockSchema(member, typedSchemas);
           if (schema === undefined) schema = memberSchema;
           else {
             if (memberSchema.length !== schema.length) {
@@ -1324,7 +1421,7 @@ export class BrowserDatabase {
         continue;
       }
       if (source.windowed !== undefined) {
-        const inner = await this.#executeBlock(
+        const { result: inner, schema: innerSchema } = await this.#executeBlockWithSchemaCached(
           source.windowed.block,
           snapshot,
           visibility,
@@ -1332,7 +1429,6 @@ export class BrowserDatabase {
           realTables,
           typedSchemas,
         );
-        const innerSchema = inferBlockSchema(source.windowed.block, typedSchemas);
         const windowed = applyWindowFunctions(inner, source.windowed.windows);
         const schema = [
           ...innerSchema,
@@ -1347,7 +1443,7 @@ export class BrowserDatabase {
       }
       const derived = source.derived;
       if (derived === undefined) continue;
-      const result = await this.#executeBlock(
+      const { result, schema } = await this.#executeBlockWithSchemaCached(
         derived,
         snapshot,
         visibility,
@@ -1355,7 +1451,6 @@ export class BrowserDatabase {
         realTables,
         typedSchemas,
       );
-      const schema = inferBlockSchema(derived, typedSchemas);
       typedSchemas.set(source.table, schema);
       inputs.set(source.table, derivedColumnarTable(source.table, result, schema));
     }
@@ -2069,6 +2164,114 @@ export class BrowserDatabase {
     } finally {
       prepared.close();
     }
+  }
+
+  /**
+   * Executes a real-table-rooted block through the prepare cache: the result of a
+   * derived table, union member, windowed inner block, recursive base, or scalar/IN
+   * subquery is a pure function of its compiled plan and the visible segment ids of the
+   * real tables it references, so an identical block over identical table states reuses
+   * the previous result instead of re-reading and re-executing.
+   */
+  async #executeBlockCached(
+    block: CompiledQuery,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    memory: QueryMemoryContext,
+    realTables: ReadonlyMap<string, TableRecord>,
+    typedSchemas: Map<string, SqlColumnSchema[]>,
+  ): Promise<QueryResult> {
+    const key = await this.#blockResultCacheKey(block, snapshot, visibility, realTables);
+    if (key !== undefined) {
+      const cached = this.#cacheGet(key) as QueryResult | undefined;
+      if (cached !== undefined) return cached;
+    }
+    const result = await this.#executeBlock(
+      block,
+      snapshot,
+      visibility,
+      memory,
+      realTables,
+      typedSchemas,
+    );
+    if (key !== undefined) this.#cachePut(key, result, queryResultRetainedBytes(result));
+    return result;
+  }
+
+  /**
+   * Like #executeBlockCached, but also carries the block's inferred output schema. The
+   * schema must be captured at miss time: executing the block registers its nested
+   * synthetic sources in typedSchemas, and a later cache hit skips that registration, so
+   * re-inferring the schema at hit time would find those names missing.
+   */
+  async #executeBlockWithSchemaCached(
+    block: CompiledQuery,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    memory: QueryMemoryContext,
+    realTables: ReadonlyMap<string, TableRecord>,
+    typedSchemas: Map<string, SqlColumnSchema[]>,
+  ): Promise<{ result: QueryResult; schema: SqlColumnSchema[] }> {
+    const key = await this.#blockResultCacheKey(block, snapshot, visibility, realTables);
+    const schemaKey = key === undefined ? undefined : `s${key}`;
+    if (schemaKey !== undefined) {
+      const cached = this.#cacheGet(schemaKey) as
+        { result: QueryResult; schema: SqlColumnSchema[] } | undefined;
+      if (cached !== undefined) return cached;
+    }
+    const result = await this.#executeBlock(
+      block,
+      snapshot,
+      visibility,
+      memory,
+      realTables,
+      typedSchemas,
+    );
+    const schema = inferBlockSchema(block, typedSchemas);
+    const entry = { result, schema };
+    if (schemaKey !== undefined) {
+      this.#cachePut(schemaKey, entry, queryResultRetainedBytes(result) + 64);
+    }
+    return entry;
+  }
+
+  async #blockResultCacheKey(
+    block: CompiledQuery,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    realTables: ReadonlyMap<string, TableRecord>,
+  ): Promise<string | undefined> {
+    if (this.#prepareCacheLimitBytes === 0) return undefined;
+    const parts: string[] = [];
+    for (const name of collectRealTableNames(block).sort()) {
+      const table = realTables.get(name);
+      if (table === undefined) return undefined;
+      parts.push(`${table.id}=${await this.#tableFingerprint(table, snapshot, visibility)}`);
+    }
+    try {
+      return `blk\u0000${parts.join(";")}\u0000${JSON.stringify(block)}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The ordered visible segment ids of one table, memoized per visibility catalog. */
+  async #tableFingerprint(
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+  ): Promise<string> {
+    let memo = this.#visibilityFingerprints.get(visibility);
+    if (memo === undefined) {
+      memo = new Map();
+      this.#visibilityFingerprints.set(visibility, memo);
+    }
+    const existing = memo.get(table.id);
+    if (existing !== undefined) return existing;
+    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+    const fingerprint = segments.map((segment) => segment.id).join(",");
+    memo.set(table.id, fingerprint);
+    return fingerprint;
   }
 
   async listVisibleSegments(tableName: string, version?: number): Promise<VisibleSegment[]> {
@@ -4394,6 +4597,75 @@ export class BrowserDatabase {
     );
   }
 
+  /** Every projected column from cache, or undefined on any miss (misses fall through). */
+  #cachedAppendColumns(
+    table: TableRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    fingerprint: string,
+  ): Map<string, ColumnVector> | undefined {
+    if (this.#prepareCacheLimitBytes === 0) return undefined;
+    const columns = new Map<string, ColumnVector>();
+    for (const column of projectedColumns) {
+      const vector = this.#cachedColumnVector(table.id, column.id, fingerprint);
+      if (vector === undefined) return undefined;
+      columns.set(column.name, vector);
+    }
+    return columns;
+  }
+
+  #cacheGet(key: string): unknown {
+    if (this.#prepareCacheLimitBytes === 0) return undefined;
+    const entry = this.#prepareCache.get(key);
+    if (entry === undefined) return undefined;
+    this.#prepareCache.delete(key);
+    this.#prepareCache.set(key, entry);
+    return entry.payload;
+  }
+
+  /**
+   * Caches one prepared artifact under the byte-bounded LRU. Payloads are shared
+   * read-only across prepared queries; entries for superseded segment sets simply stop
+   * matching and age out the same way evicted entries do.
+   */
+  #cachePut(key: string, payload: unknown, bytes: number): void {
+    if (this.#prepareCacheLimitBytes === 0 || bytes > this.#prepareCacheLimitBytes) return;
+    const existing = this.#prepareCache.get(key);
+    if (existing !== undefined) {
+      this.#prepareCache.delete(key);
+      this.#prepareCacheUsedBytes -= existing.bytes;
+    }
+    this.#prepareCache.set(key, { payload, bytes });
+    this.#prepareCacheUsedBytes += bytes;
+    for (const [oldestKey, entry] of this.#prepareCache) {
+      if (this.#prepareCacheUsedBytes <= this.#prepareCacheLimitBytes) break;
+      if (oldestKey === key) continue;
+      this.#prepareCache.delete(oldestKey);
+      this.#prepareCacheUsedBytes -= entry.bytes;
+    }
+  }
+
+  #cachedColumnVector(
+    tableId: string,
+    columnId: string,
+    fingerprint: string,
+  ): ColumnVector | undefined {
+    return this.#cacheGet(`vec\u0000${tableId}\u0000${columnId}\u0000${fingerprint}`) as
+      ColumnVector | undefined;
+  }
+
+  #storeColumnVector(
+    tableId: string,
+    columnId: string,
+    fingerprint: string,
+    vector: ColumnVector,
+  ): void {
+    this.#cachePut(
+      `vec\u0000${tableId}\u0000${columnId}\u0000${fingerprint}`,
+      vector,
+      columnVectorRetainedBytes(vector),
+    );
+  }
+
   async #materializeColumnarTableAtSnapshot(
     table: TableRecord,
     snapshot: LeasedSnapshot,
@@ -4409,8 +4681,39 @@ export class BrowserDatabase {
         return kind === "insert" || kind === "base";
       })
     ) {
+      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+      if (projectedColumns.length === 0) {
+        return { name: table.name, rowCount, columns: new Map() };
+      }
+      const projectedKey =
+        keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
+          ? keyColumn.name
+          : undefined;
+      // Segment records are immutable, so the ordered visible segment ids exactly identify
+      // a column's assembled vector; a fully cached projection needs no store reads at all.
+      const fingerprint = segments.map((segment) => segment.id).join(",");
+      const cachedColumns = this.#cachedAppendColumns(table, projectedColumns, fingerprint);
+      if (cachedColumns !== undefined) {
+        return {
+          name: table.name,
+          rowCount,
+          columns: cachedColumns,
+          ...(projectedKey ? { uniqueKey: projectedKey } : {}),
+        };
+      }
       const predicates = plan === undefined ? [] : zonePredicates(plan, table);
       if (predicates.length > 0) {
+        const prunedKey =
+          `prn\u0000${table.id}\u0000${fingerprint}\u0000` +
+          `${projectedColumns.map((column) => column.id).join(",")}\u0000` +
+          predicates
+            .map(
+              (predicate) =>
+                `${predicate.column.id} ${predicate.operator} ${String(predicate.value)}`,
+            )
+            .join("&");
+        const cachedPruned = this.#cacheGet(prunedKey) as ColumnarTable | undefined;
+        if (cachedPruned !== undefined) return cachedPruned;
         const pruned = await this.#materializePrunedAppendTable(
           table,
           snapshot,
@@ -4418,23 +4721,20 @@ export class BrowserDatabase {
           segments,
           predicates,
         );
-        if (pruned !== undefined) return pruned;
-      }
-      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
-      if (projectedColumns.length === 0) {
-        return { name: table.name, rowCount, columns: new Map() };
+        if (pruned !== undefined) {
+          this.#cachePut(prunedKey, pruned, columnarTableRetainedBytes(pruned));
+          return pruned;
+        }
       }
       const columns = new Map<string, ColumnVector>();
       for (const column of projectedColumns) {
-        columns.set(
-          column.name,
-          await this.#materializeAppendColumnVector(column, segments, snapshot, rowCount),
-        );
+        let vector = this.#cachedColumnVector(table.id, column.id, fingerprint);
+        if (vector === undefined) {
+          vector = await this.#materializeAppendColumnVector(column, segments, snapshot, rowCount);
+          this.#storeColumnVector(table.id, column.id, fingerprint, vector);
+        }
+        columns.set(column.name, vector);
       }
-      const projectedKey =
-        keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
-          ? keyColumn.name
-          : undefined;
       return {
         name: table.name,
         rowCount,
@@ -5047,6 +5347,18 @@ export class BrowserDatabase {
 
   async #renewInternalLeaseIfNeeded(snapshot: LeasedSnapshot): Promise<void> {
     if (snapshot.expiresAt.getTime() - this.#now().getTime() > INTERNAL_READ_LEASE_TTL_MS / 2) {
+      return;
+    }
+    if (snapshot === this.#sharedLease?.lease) {
+      // Overlapping prepares share one lease record; concurrent renewals would race the
+      // lease's revision compare-and-swap, so they share one in-flight renewal instead.
+      this.#sharedLeaseRenewal ??= snapshot
+        .renew(INTERNAL_READ_LEASE_TTL_MS)
+        .then(() => undefined)
+        .finally(() => {
+          this.#sharedLeaseRenewal = undefined;
+        });
+      await this.#sharedLeaseRenewal;
       return;
     }
     await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
@@ -6560,6 +6872,92 @@ function garbageCollectionProgress(job: GarbageCollectionJobRecord): GarbageColl
     examinedBlockCount: job.cursor.blockIndex,
     result,
   };
+}
+
+/** One shared internal reader lease, reused across prepares at the same manifest version. */
+interface SharedLeaseEntry {
+  lease: LeasedSnapshot;
+  version: number | null;
+  refCount: number;
+}
+
+/** Collects every real table name referenced by a block, its derived sources, or its subqueries. */
+function collectRealTableNames(plan: CompiledQuery): string[] {
+  const names = new Set<string>();
+  const excluded = new Set<string>();
+  const walkExpression = (expression: Expression): void => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      walk(expression.block);
+      return;
+    }
+    if (expression.kind === "binary" || expression.kind === "condition") {
+      walkExpression(expression.left);
+      walkExpression(expression.right);
+    } else if (expression.kind === "logical") {
+      walkExpression(expression.left);
+      walkExpression(expression.right);
+    } else if (expression.kind === "not") walkExpression(expression.operand);
+    else if (expression.kind === "case") {
+      for (const branch of expression.branches) {
+        walkExpression(branch.when);
+        walkExpression(branch.then);
+      }
+      if (expression.otherwise !== undefined) walkExpression(expression.otherwise);
+    } else if (expression.kind === "call") expression.arguments.forEach(walkExpression);
+    else if (expression.kind === "list") expression.items.forEach(walkExpression);
+  };
+  const walk = (block: CompiledQuery): void => {
+    for (const source of [block.base, ...block.joins]) {
+      if (source.union !== undefined) source.union.blocks.forEach(walk);
+      else if (source.windowed !== undefined) walk(source.windowed.block);
+      else if (source.recursive !== undefined) {
+        // The self-reference is bound per iteration, never loaded from storage.
+        excluded.add(source.recursive.reference);
+        walk(source.recursive.base);
+        walk(source.recursive.step);
+      } else if (source.derived === undefined) names.add(source.table);
+      else walk(source.derived);
+    }
+    for (const item of block.select) walkExpression(item.expression);
+    block.groupBy.forEach(walkExpression);
+    for (const join of block.joins) {
+      if (join.on !== undefined) walkExpression(join.on);
+    }
+    for (const predicate of [...block.predicates, ...block.having]) {
+      walkExpression(predicate.left);
+      walkExpression(predicate.right);
+    }
+    for (const order of block.orderBy) walkExpression(order.expression);
+  };
+  walk(plan);
+  for (const name of excluded) names.delete(name);
+  return [...names];
+}
+
+/** Retained payload of a cached column vector: typed arrays plus dictionary characters. */
+function columnVectorRetainedBytes(vector: ColumnVector): number {
+  const base = vector.validity.byteLength;
+  if (vector.kind === "string") {
+    let dictionaryBytes = 0;
+    for (const value of vector.dictionary) dictionaryBytes += 16 + value.length * 2;
+    return base + vector.codes.byteLength + dictionaryBytes;
+  }
+  return base + vector.values.byteLength;
+}
+
+/** Retained payload of a cached columnar table: its vectors plus fixed overhead. */
+function columnarTableRetainedBytes(table: ColumnarTable): number {
+  let bytes = 128;
+  for (const vector of table.columns.values()) bytes += columnVectorRetainedBytes(vector);
+  return bytes;
+}
+
+/** Retained payload of a cached block result: column names plus estimated row values. */
+function queryResultRetainedBytes(result: QueryResult): number {
+  let bytes = 64;
+  for (const column of result.columns) bytes += 16 + column.length * 2;
+  for (const row of result.rows) bytes += estimateRowBytes(row);
+  return bytes;
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {

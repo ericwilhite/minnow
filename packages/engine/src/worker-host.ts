@@ -38,7 +38,7 @@ export type StoreDescriptor =
 /** The cloneable subset of BrowserDatabaseOptions; function-valued seams stay worker-side. */
 export type WireDatabaseOptions = Pick<
   BrowserDatabaseOptions,
-  "compression" | "rowsPerBlock" | "maxCommitRetries" | "spillOwnerLeaseMs"
+  "compression" | "rowsPerBlock" | "maxCommitRetries" | "spillOwnerLeaseMs" | "prepareCacheBytes"
 >;
 
 export interface DatabaseInitPayload {
