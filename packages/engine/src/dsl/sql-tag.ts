@@ -15,11 +15,14 @@ export interface SqlExecutable {
 export type RawSqlValue =
   QueryValue | ReadonlyArray<QueryValue | RawSqlFragment<unknown>> | RawSqlFragment<unknown>;
 
-export class RawSqlFragment<TRow> {
+export class RawSqlFragment<out TRow> {
   constructor(readonly sql: string) {}
 
   /** Phantom row type; never materialized at runtime. */
   declare readonly __row?: TRow;
+
+  /** Type-only: the fragment's row, e.g. `type Row = typeof fragment.$inferRow`. Undefined at runtime. */
+  declare readonly $inferRow: TRow;
 
   async execute(db: SqlExecutable): Promise<TRow[]> {
     return (await db.$executeRaw(this.sql)) as TRow[];

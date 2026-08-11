@@ -24,6 +24,7 @@ import {
   type InOperatorToken,
   type IsOperatorToken,
   type LikeOperatorToken,
+  type ScalarSubquery,
   type SqlBool,
   type ValueOperand,
 } from "./expression.js";
@@ -38,6 +39,7 @@ import {
   type ContextWithLeftTable,
   type ContextWithTable,
   type ExpressionSource,
+  type JoinResult,
   type ReferencedValue,
   type RowFromSelections,
   type Selection,
@@ -67,7 +69,7 @@ export interface ExecuteServices {
 }
 
 /** A sub-select named for use as a derived table in `selectFrom`. */
-export interface AliasedSelectQuery<TRow, TAlias extends string> {
+export interface AliasedSelectQuery<out TRow, out TAlias extends string> {
   readonly kind: "dsl-aliased-select";
   readonly alias: TAlias;
   readonly builder: BlockCompilable;
@@ -129,7 +131,7 @@ type WhereFactory<DB, TCtx> = (eb: ExpressionBuilder<DB, TCtx>) => ExpressionWra
 
 type SelectFactory<DB, TCtx, TSel> = (eb: ExpressionBuilder<DB, TCtx>) => readonly TSel[];
 
-export class JoinBuilder<TCtx> {
+export class JoinBuilder<in out TCtx> {
   constructor(readonly conditions: readonly ExpressionSource[] = []) {}
 
   /** Joins on two columns; the usual `ON a.x = b.y`. */
@@ -181,8 +183,11 @@ export class JoinBuilder<TCtx> {
 
 type JoinCallback<TCtx> = (join: JoinBuilder<TCtx>) => JoinBuilder<TCtx>;
 
-export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
+export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements BlockCompilable {
   readonly kind = "dsl-select-builder" as const;
+
+  /** Type-only: the output row, e.g. `type Row = typeof query.$inferRow`. Undefined at runtime. */
+  declare readonly $inferRow: TRow;
 
   constructor(
     private readonly state: SelectState,
@@ -226,23 +231,19 @@ export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
 
   // --- Joins ------------------------------------------------------------------------------------
 
-  /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return --
+  /* eslint-disable @typescript-eslint/no-explicit-any --
      the join implementation signatures erase the evolving context type; the public overloads
      above them carry the precise ContextWithTable/ContextWithLeftTable types. */
   innerJoin<TE extends TableExpression<DB>>(
     table: TE,
     lhs: ColumnReference<ContextWithTable<DB, TCtx, TE>>,
     rhs: ColumnReference<ContextWithTable<DB, TCtx, TE>>,
-  ): SelectQueryBuilder<DB, ContextWithTable<DB, TCtx, TE>, TRow>;
+  ): JoinResult<TCtx, TE, SelectQueryBuilder<DB, ContextWithTable<DB, TCtx, TE>, TRow>>;
   innerJoin<TE extends TableExpression<DB>>(
     table: TE,
     callback: JoinCallback<ContextWithTable<DB, TCtx, TE>>,
-  ): SelectQueryBuilder<DB, ContextWithTable<DB, TCtx, TE>, TRow>;
-  innerJoin(
-    table: string,
-    lhsOrCallback: unknown,
-    rhs?: unknown,
-  ): SelectQueryBuilder<DB, any, TRow> {
+  ): JoinResult<TCtx, TE, SelectQueryBuilder<DB, ContextWithTable<DB, TCtx, TE>, TRow>>;
+  innerJoin(table: string, lhsOrCallback: unknown, rhs?: unknown): any {
     return this.#join("inner", table, lhsOrCallback, rhs);
   }
 
@@ -250,16 +251,12 @@ export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
     table: TE,
     lhs: ColumnReference<ContextWithTable<DB, TCtx, TE>>,
     rhs: ColumnReference<ContextWithTable<DB, TCtx, TE>>,
-  ): SelectQueryBuilder<DB, ContextWithLeftTable<DB, TCtx, TE>, TRow>;
+  ): JoinResult<TCtx, TE, SelectQueryBuilder<DB, ContextWithLeftTable<DB, TCtx, TE>, TRow>>;
   leftJoin<TE extends TableExpression<DB>>(
     table: TE,
     callback: JoinCallback<ContextWithTable<DB, TCtx, TE>>,
-  ): SelectQueryBuilder<DB, ContextWithLeftTable<DB, TCtx, TE>, TRow>;
-  leftJoin(
-    table: string,
-    lhsOrCallback: unknown,
-    rhs?: unknown,
-  ): SelectQueryBuilder<DB, any, TRow> {
+  ): JoinResult<TCtx, TE, SelectQueryBuilder<DB, ContextWithLeftTable<DB, TCtx, TE>, TRow>>;
+  leftJoin(table: string, lhsOrCallback: unknown, rhs?: unknown): any {
     return this.#join("left", table, lhsOrCallback, rhs);
   }
 
@@ -283,7 +280,7 @@ export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
       this.services,
     );
   }
-  /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return */
+  /* eslint-enable @typescript-eslint/no-explicit-any */
 
   // --- Filters and grouping ---------------------------------------------------------------------
 
@@ -295,7 +292,7 @@ export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
   where<TRef extends ColumnReference<TCtx> & string>(
     lhs: TRef,
     operator: InOperatorToken,
-    rhs: ReadonlyArray<ReferencedValue<TCtx, TRef>> | BlockCompilable,
+    rhs: ReadonlyArray<ReferencedValue<TCtx, TRef>> | ScalarSubquery<ReferencedValue<TCtx, TRef>>,
   ): SelectQueryBuilder<DB, TCtx, TRow>;
   where(
     lhs: ColumnReference<TCtx>,
@@ -319,7 +316,7 @@ export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
   having<TRef extends ColumnReference<TCtx> & string>(
     lhs: TRef,
     operator: InOperatorToken,
-    rhs: ReadonlyArray<ReferencedValue<TCtx, TRef>> | BlockCompilable,
+    rhs: ReadonlyArray<ReferencedValue<TCtx, TRef>> | ScalarSubquery<ReferencedValue<TCtx, TRef>>,
   ): SelectQueryBuilder<DB, TCtx, TRow>;
   having(
     lhs: ColumnReference<TCtx>,
@@ -403,9 +400,23 @@ export class SelectQueryBuilder<DB, TCtx, TRow> implements BlockCompilable {
 
   select<TSel extends Selection<TCtx>>(
     selections: readonly TSel[] | SelectFactory<DB, TCtx, TSel>,
+  ): SelectQueryBuilder<DB, TCtx, Simplify<TRow & RowFromSelections<TCtx, TSel>>>;
+  /* eslint-disable @typescript-eslint/unified-signatures --
+     kept as a separate overload: a `TSel | readonly TSel[]` union makes factory returns infer
+     the array itself as TSel, collapsing the selection types. */
+  select<TSel extends Selection<TCtx>>(
+    selection: TSel | ((eb: ExpressionBuilder<DB, TCtx>) => TSel),
+  ): SelectQueryBuilder<DB, TCtx, Simplify<TRow & RowFromSelections<TCtx, TSel>>>;
+  /* eslint-enable @typescript-eslint/unified-signatures */
+  select<TSel extends Selection<TCtx>>(
+    selections:
+      | TSel
+      | readonly TSel[]
+      | ((eb: ExpressionBuilder<DB, TCtx>) => TSel | readonly TSel[]),
   ): SelectQueryBuilder<DB, TCtx, Simplify<TRow & RowFromSelections<TCtx, TSel>>> {
     const resolved = typeof selections === "function" ? selections(this.#eb()) : selections;
-    const additions = resolved.map((selection) => this.#selection(selection));
+    const list: ReadonlyArray<Selection<TCtx>> = Array.isArray(resolved) ? resolved : [resolved];
+    const additions = list.map((selection) => this.#selection(selection));
     if (this.state.selections === "all") {
       throw new TypeError("SELECT * cannot be mixed with other expressions");
     }

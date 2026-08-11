@@ -503,28 +503,31 @@ explicitly. Columns added after a segment was written read as NULL everywhere wi
 stored data; declared `.references()` relations validate at definition time and live in catalog
 metadata rather than being enforced per write.
 
-The ORM query builder constructs the same compiled plans as SQL, with typed results:
+The Kysely-style query builder constructs the same compiled plans as SQL, with typed results and
+no generic passing — `createBrowserDb` infers the database type from the schema value:
 
 ```ts
-import { count, eq, from, refs, sum } from "@browserdatabase/engine";
+import { createBrowserDb } from "@browserdatabase/engine";
 
-const p = refs(people, "p");
-const o = refs(orders, "o");
-const rows = await database.run(
-  from(people, "p")
-    .innerJoin(orders, "o", eq(o.person, p.name))
-    .groupBy(p.name)
-    .select({ name: p.name, orders: count(), revenue: sum(o.total) })
-    .orderBy("revenue", "desc")
-    .build(),
-); // Array<{ name: string; orders: number; revenue: number | null }>
+const db = createBrowserDb(database, { schema: appSchema });
+const rows = await db
+  .selectFrom("people as p")
+  .innerJoin("orders as o", "o.person", "p.name")
+  .groupBy("p.name")
+  .select((eb) => [eb.ref("p.name").as("name"), eb.fn.countAll().as("orders"), eb.fn.sum("o.total").as("revenue")])
+  .orderBy("revenue", "desc")
+  .execute(); // Array<{ name: string; orders: number; revenue: number | null }>
 ```
 
-Builder expressions assemble plan nodes directly — never SQL strings — and `build()` runs the
-same deterministic optimizer, so an ORM query and its equivalent SQL bind to identical plans;
-structural plan-equality tests enforce that. `nullableRefs()` types left-joined columns with
-`| null`, `typedTable` covers CRUD and batch writes, and `query()`/`execute()` remain the raw SQL
-escape hatch.
+Builder queries compile through the same assembly pipeline as the SQL parser — never SQL
+strings — so a builder query and its equivalent SQL bind to identical optimized plans;
+structural plan-equality tests enforce that. Left-joined columns type as `| null`, mutations
+(`insertInto`/`updateTable`/`deleteFrom`) follow Kysely conventions with typed `returning`, and
+`query()`/`execute()`/`sql` remain the raw SQL escape hatch. When builders are exported across
+module boundaries, declare the database type as an interface
+(`interface DB extends InferDatabase<typeof appSchema> {}` with `new BrowserDb<DB>(...)`) so
+hovers and declaration emit print `DB` by name — see `packages/engine/README.md` for the typed
+API guide and TypeScript best practices.
 
 Live queries re-execute selectively when their tables change:
 

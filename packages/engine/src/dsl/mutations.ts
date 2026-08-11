@@ -23,7 +23,6 @@ import {
 import { NoResultError } from "./select-query-builder.js";
 import {
   materialize,
-  type BlockCompilable,
   type ColumnReference,
   type CompileContext,
   type ExpressionSource,
@@ -93,7 +92,10 @@ async function takeFirstOrThrow<TReturn>(results: Promise<TReturn[]>): Promise<T
 
 // --- INSERT -------------------------------------------------------------------------------------
 
-export class InsertQueryBuilder<DB, TTable extends keyof DB & string, TReturn = InsertResult> {
+export class InsertQueryBuilder<in out DB, in out TTable extends keyof DB & string, out TReturn = InsertResult> {
+  /** Type-only: the execute() element, e.g. `typeof q.$inferResult`. Undefined at runtime. */
+  declare readonly $inferResult: TReturn;
+
   constructor(
     private readonly services: MutationServices,
     private readonly table: TTable,
@@ -241,7 +243,10 @@ async function runReturning<TReturn>(
 
 // --- UPDATE -------------------------------------------------------------------------------------
 
-export class UpdateQueryBuilder<DB, TTable extends keyof DB & string, TReturn = UpdateResult> {
+export class UpdateQueryBuilder<in out DB, in out TTable extends keyof DB & string, out TReturn = UpdateResult> {
+  /** Type-only: the execute() element, e.g. `typeof q.$inferResult`. Undefined at runtime. */
+  declare readonly $inferResult: TReturn;
+
   constructor(
     private readonly services: MutationServices,
     private readonly table: TTable,
@@ -297,10 +302,11 @@ export class UpdateQueryBuilder<DB, TTable extends keyof DB & string, TReturn = 
     operator: ComparisonOperatorToken | LikeOperatorToken,
     rhs: ValueOperand<ReferencedValue<Ctx<DB, TTable>, TRef>>,
   ): UpdateQueryBuilder<DB, TTable, TReturn>;
+  // No subquery arm here: mutations reject derived tables at runtime, so IN takes only values.
   where<TRef extends ColumnReference<Ctx<DB, TTable>> & string>(
     lhs: TRef,
     operator: InOperatorToken,
-    rhs: ReadonlyArray<ReferencedValue<Ctx<DB, TTable>, TRef>> | BlockCompilable,
+    rhs: ReadonlyArray<ReferencedValue<Ctx<DB, TTable>, TRef>>,
   ): UpdateQueryBuilder<DB, TTable, TReturn>;
   where(
     lhs: ColumnReference<Ctx<DB, TTable>>,
@@ -375,7 +381,10 @@ export class UpdateQueryBuilder<DB, TTable extends keyof DB & string, TReturn = 
 
 // --- DELETE -------------------------------------------------------------------------------------
 
-export class DeleteQueryBuilder<DB, TTable extends keyof DB & string, TReturn = DeleteResult> {
+export class DeleteQueryBuilder<in out DB, in out TTable extends keyof DB & string, out TReturn = DeleteResult> {
+  /** Type-only: the execute() element, e.g. `typeof q.$inferResult`. Undefined at runtime. */
+  declare readonly $inferResult: TReturn;
+
   constructor(
     private readonly services: MutationServices,
     private readonly table: TTable,
@@ -388,10 +397,11 @@ export class DeleteQueryBuilder<DB, TTable extends keyof DB & string, TReturn = 
     operator: ComparisonOperatorToken | LikeOperatorToken,
     rhs: ValueOperand<ReferencedValue<Ctx<DB, TTable>, TRef>>,
   ): DeleteQueryBuilder<DB, TTable, TReturn>;
+  // No subquery arm here: mutations reject derived tables at runtime, so IN takes only values.
   where<TRef extends ColumnReference<Ctx<DB, TTable>> & string>(
     lhs: TRef,
     operator: InOperatorToken,
-    rhs: ReadonlyArray<ReferencedValue<Ctx<DB, TTable>, TRef>> | BlockCompilable,
+    rhs: ReadonlyArray<ReferencedValue<Ctx<DB, TTable>, TRef>>,
   ): DeleteQueryBuilder<DB, TTable, TReturn>;
   where(
     lhs: ColumnReference<Ctx<DB, TTable>>,

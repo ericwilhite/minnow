@@ -6,10 +6,11 @@
  */
 import {
   BrowserDatabase,
-  BrowserDb,
+  createBrowserDb,
   column,
   schema,
   table,
+  type BrowserDb,
   type InferDatabase,
 } from "@browserdatabase/engine";
 import { MemoryBlockStore } from "@browserdatabase/storage-idb";
@@ -40,7 +41,7 @@ type DB = InferDatabase<typeof appSchema>;
 async function typedDb(): Promise<{ database: BrowserDatabase; db: BrowserDb<DB> }> {
   const database = freshDatabase();
   await database.migrate(appSchema);
-  return { database, db: new BrowserDb<DB>(database, { schema: appSchema }) };
+  return { database, db: createBrowserDb(database, { schema: appSchema }) };
 }
 
 const entries: ShowcaseExample[] = [
@@ -109,7 +110,8 @@ const result = await database.query(\`
 const appSchema = schema([people]);
 await database.migrate(appSchema);
 
-const db = new BrowserDb<InferDatabase<typeof appSchema>>(database, { schema: appSchema });
+// DB is inferred from the schema — no generic passing.
+const db = createBrowserDb(database, { schema: appSchema });
 const written = await db
   .insertInto("people")
   .values({ name: "Ada", score: 10 }) // joined may be omitted; it pads to null

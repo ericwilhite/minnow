@@ -34,7 +34,10 @@ export interface LiveQueryHandlers<TRow> {
   onComplete?(): void;
 }
 
-export class LiveQuery<TRow> implements AsyncIterable<TRow[]> {
+export class LiveQuery<out TRow> implements AsyncIterable<TRow[]> {
+  /** Type-only: the subscription row, e.g. `type Row = typeof live.$inferRow`. Undefined at runtime. */
+  declare readonly $inferRow: TRow;
+
   constructor(
     private readonly services: LiveQueryServices,
     private readonly query: TypedQueryEnvelope<TRow>,

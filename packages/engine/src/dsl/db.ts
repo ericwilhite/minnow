@@ -25,6 +25,7 @@ import {
   type AnyRow,
   type BlockCompilable,
   type ContextWithTable,
+  type InferDatabase,
   type TableExpression,
   type TypedQueryEnvelope,
 } from "./types.js";
@@ -87,11 +88,35 @@ export interface BrowserDbOptions {
 
 type EmptyContext = Record<never, AnyRow>;
 
+/**
+ * Creates the typed facade with `DB` inferred from the runtime schema: one `schema(...)` value
+ * drives migrations, insert padding, and every builder's column types, with no generic passing
+ * and no way for the type-level database to drift from the schema the driver migrated with.
+ *
+ * ```ts
+ * const db = createBrowserDb(database, { schema: appSchema });
+ * ```
+ *
+ * When builders are exported across module boundaries, prefer a named interface so declaration
+ * emit and hovers print `DB` instead of the expanded schema:
+ *
+ * ```ts
+ * interface DB extends InferDatabase<typeof appSchema> {}
+ * const db = new BrowserDb<DB>(database, { schema: appSchema });
+ * ```
+ */
+export function createBrowserDb<TTables extends readonly AnyTable[]>(
+  driver: DslDriver,
+  options: Omit<BrowserDbOptions, "schema"> & { schema: SchemaDefinition<TTables> },
+): BrowserDb<InferDatabase<SchemaDefinition<TTables>>> {
+  return new BrowserDb(driver, options);
+}
+
 interface SharedLiveSet {
   set?: DriverLiveSet | undefined;
 }
 
-export class BrowserDb<DB> {
+export class BrowserDb<in out DB> {
   readonly #driver: DslDriver;
   readonly #options: BrowserDbOptions;
   readonly #ctes: readonly CteDefinition[];

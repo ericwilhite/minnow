@@ -47,6 +47,34 @@ export type ColumnReference<TCtx> = {
     (keyof TCtx[TAlias] & string) | `${TAlias}.${keyof TCtx[TAlias] & string}`;
 }[keyof TCtx & string];
 
+/**
+ * Only the columns whose (non-null) value type matches `TValue`, as bare or qualified names.
+ * Numeric and date functions constrain their column arguments with this, so `fn.sum("name")`
+ * on a string column is a compile error instead of a runtime surprise.
+ */
+export type ColumnReferenceOf<TCtx, TValue> = {
+  [TAlias in keyof TCtx & string]: {
+    [TColumn in keyof TCtx[TAlias] & string]: NonNullable<TCtx[TAlias][TColumn]> extends TValue
+      ? TColumn | `${TAlias}.${TColumn}`
+      : never;
+  }[keyof TCtx[TAlias] & string];
+}[keyof TCtx & string];
+
+/** A join whose alias collides with one already in scope resolves to this instead of a builder. */
+export interface DuplicateJoinAliasError<TMessage extends string> {
+  readonly duplicateJoinAlias: TMessage;
+}
+
+/**
+ * The result of a join: the builder when the alias is new, and a readable branded error type
+ * when the alias is already in scope. The guard lives in the return type (not the parameter)
+ * so it cannot interfere with inference of the table expression.
+ */
+export type JoinResult<TCtx, TE extends string, TBuilder> =
+  ExtractTableAlias<TE> extends keyof TCtx & string
+    ? DuplicateJoinAliasError<`alias '${ExtractTableAlias<TE>}' is already used in this query`>
+    : TBuilder;
+
 /** The value type a reference resolves to; bare names union across matching tables. */
 export type ReferencedValue<
   TCtx,
@@ -67,7 +95,7 @@ export type ReferencedValue<
 export type StringSelection<TCtx> = ColumnReference<TCtx> | `${ColumnReference<TCtx>} as ${string}`;
 
 /** An expression given an output name with `.as(alias)`. */
-export interface AliasedExpression<TValue, TAlias extends string> {
+export interface AliasedExpression<out TValue, out TAlias extends string> {
   readonly kind: "aliased-expression";
   readonly alias: TAlias;
   /** Materializes at compile time so subquery sources number under the shared sequence. */
@@ -168,7 +196,7 @@ export function isBlockCompilable(value: unknown): value is BlockCompilable {
 }
 
 /** The `{ kind: "typed-query" }` envelope the engine's `run()` executes. */
-export interface TypedQueryEnvelope<TRow> {
+export interface TypedQueryEnvelope<out TRow> {
   readonly kind: "typed-query";
   readonly plan: CompiledQuery;
   readonly __row?: TRow;

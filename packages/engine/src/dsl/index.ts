@@ -1,5 +1,6 @@
 export {
   BrowserDb,
+  createBrowserDb,
   type BrowserDbOptions,
   type DriverLiveSet,
   type DslDriver,
@@ -21,6 +22,7 @@ export {
   type InOperatorToken,
   type IsOperatorToken,
   type LikeOperatorToken,
+  type ScalarSubquery,
   type SqlBool,
   type ValueOperand,
 } from "./expression.js";
@@ -51,9 +53,12 @@ export type {
   AliasedExpression,
   AllColumnsRow,
   ColumnReference,
+  ColumnReferenceOf,
   ContextWithLeftTable,
   ContextWithTable,
+  DuplicateJoinAliasError,
   InferDatabase,
+  JoinResult,
   InsertRowFor,
   ReferencedValue,
   RowFromSelections,

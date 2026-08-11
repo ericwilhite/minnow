@@ -12,6 +12,7 @@ import {
   type AliasedExpression,
   type BlockCompilable,
   type ColumnReference,
+  type ColumnReferenceOf,
   type CompileContext,
   type ContextWithTable,
   type ExpressionSource,
@@ -46,7 +47,7 @@ export type BinaryOperatorToken =
 const comparisonTokens = new Set<string>(["=", "!=", "<>", ">", ">=", "<", "<="]);
 const arithmeticTokens = new Set<string>(["+", "-", "*", "/"]);
 
-export class ExpressionWrapper<TValue> {
+export class ExpressionWrapper<out TValue> {
   readonly kind = "dsl-expression" as const;
   constructor(readonly source: ExpressionSource) {}
 
@@ -60,12 +61,20 @@ export function isExpressionWrapper(value: unknown): value is ExpressionWrapper<
   return value instanceof ExpressionWrapper;
 }
 
-/** A value operand: a literal, a wrapped expression, or a scalar subquery. */
+/**
+ * A subquery usable where a scalar `TValue` is expected: its row must be a single column whose
+ * value fits. Only the value side is checked structurally — the builder's `DB`/context do not
+ * matter here, hence the `any`s.
+ */
+/* eslint-disable-next-line @typescript-eslint/no-explicit-any -- type-position wildcard */
+export type ScalarSubquery<TValue> = SelectQueryBuilder<any, any, Record<string, TValue | null>>;
+
+/** A value operand: a literal, a wrapped expression, or a scalar subquery of the same type. */
 export type ValueOperand<TValue> =
-  TValue | null | ExpressionWrapper<TValue | null> | BlockCompilable;
+  TValue | null | ExpressionWrapper<TValue | null> | ScalarSubquery<TValue>;
 
 type ArithmeticOperand<TCtx> =
-  ColumnReference<TCtx> | number | ExpressionWrapper<number | null> | ExpressionWrapper<number>;
+  ColumnReferenceOf<TCtx, number> | number | ExpressionWrapper<number | null>;
 
 // --- Operand resolution -------------------------------------------------------------------------
 
@@ -196,7 +205,7 @@ interface OverClauseState {
   orderBy: Array<{ source: ExpressionSource; direction: "asc" | "desc" }>;
 }
 
-export class OverBuilder<TCtx> {
+export class OverBuilder<in out TCtx> {
   constructor(private readonly state: OverClauseState = { partitionBy: [], orderBy: [] }) {}
 
   partitionBy(
@@ -266,7 +275,7 @@ function overClauseOf<TCtx>(configure: OverConfigure<TCtx> | undefined): OverCla
 }
 
 /** A ranking window function; SQL requires OVER, so only `.over()` yields an expression. */
-export class WindowFunctionBuilder<TCtx> {
+export class WindowFunctionBuilder<in out TCtx> {
   constructor(private readonly name: WindowFunctionName) {}
 
   over(configure?: OverConfigure<TCtx>): ExpressionWrapper<number> {
@@ -276,7 +285,7 @@ export class WindowFunctionBuilder<TCtx> {
 
 // --- Aggregate functions ------------------------------------------------------------------------
 
-export class AggregateExpressionWrapper<TCtx, TValue> extends ExpressionWrapper<TValue> {
+export class AggregateExpressionWrapper<in out TCtx, out TValue> extends ExpressionWrapper<TValue> {
   constructor(
     private readonly name: AggregateName,
     private readonly argument: ExpressionSource,
@@ -316,7 +325,29 @@ export class AggregateExpressionWrapper<TCtx, TValue> extends ExpressionWrapper<
   }
 }
 
-export interface FunctionModule<TCtx> {
+/** A COALESCE argument: a column reference or any wrapped expression. */
+type CoalesceArg<TCtx> = ColumnReference<TCtx> | ExpressionWrapper<unknown>;
+
+type CoalesceArgValue<TCtx, TArg> = TArg extends ExpressionWrapper<infer TValue>
+  ? TValue
+  : TArg extends string
+    ? ReferencedValue<TCtx, TArg>
+    : never;
+
+/**
+ * The union of the operand value types; null stays only when the final fallback is itself
+ * nullable, matching COALESCE's first-non-null semantics.
+ */
+type CoalesceValue<TCtx, TArgs extends readonly unknown[]> = TArgs extends readonly [
+  ...unknown[],
+  infer TLast,
+]
+  ?
+      | Exclude<CoalesceArgValue<TCtx, TArgs[number]>, null>
+      | Extract<CoalesceArgValue<TCtx, TLast>, null>
+  : CoalesceArgValue<TCtx, TArgs[number]>;
+
+export interface FunctionModule<in out TCtx> {
   /** COUNT(argument); counts non-null values. */
   count(
     reference: ColumnReference<TCtx> | ExpressionWrapper<unknown>,
@@ -324,10 +355,10 @@ export interface FunctionModule<TCtx> {
   /** COUNT(*). */
   countAll(): AggregateExpressionWrapper<TCtx, number>;
   sum(
-    reference: ColumnReference<TCtx> | ExpressionWrapper<number | null>,
+    reference: ColumnReferenceOf<TCtx, number> | ExpressionWrapper<number | null>,
   ): AggregateExpressionWrapper<TCtx, number | null>;
   avg(
-    reference: ColumnReference<TCtx> | ExpressionWrapper<number | null>,
+    reference: ColumnReferenceOf<TCtx, number> | ExpressionWrapper<number | null>,
   ): AggregateExpressionWrapper<TCtx, number | null>;
   min<TRef extends ColumnReference<TCtx>>(
     reference: TRef,
@@ -342,12 +373,12 @@ export interface FunctionModule<TCtx> {
     expression: ExpressionWrapper<TValue>,
   ): AggregateExpressionWrapper<TCtx, TValue | null>;
   round(value: ArithmeticOperand<TCtx>, digits?: number): ExpressionWrapper<number | null>;
-  coalesce(
-    ...values: ReadonlyArray<ColumnReference<TCtx> | ExpressionWrapper<unknown>>
-  ): ExpressionWrapper<unknown>;
+  coalesce<TArgs extends readonly [CoalesceArg<TCtx>, ...Array<CoalesceArg<TCtx>>]>(
+    ...values: TArgs
+  ): ExpressionWrapper<CoalesceValue<TCtx, TArgs>>;
   dateTrunc(
     unit: "year" | "month" | "day" | "hour" | "minute" | "second",
-    value: ColumnReference<TCtx> | Date | ExpressionWrapper<Date | null>,
+    value: ColumnReferenceOf<TCtx, Date> | Date | ExpressionWrapper<Date | null>,
   ): ExpressionWrapper<Date | null>;
 }
 
@@ -382,7 +413,7 @@ function createFunctionModule<TCtx>(): FunctionModule<TCtx> {
             : [operandAsRef(value), literalExpression(digits)],
         ),
       ),
-    coalesce: (...values) => {
+    coalesce: (...values: ReadonlyArray<CoalesceArg<TCtx>>) => {
       if (values.length === 0) throw new TypeError("COALESCE requires at least one argument");
       return new ExpressionWrapper(call("COALESCE", values.map(operandAsRef)));
     },
@@ -398,7 +429,7 @@ interface CaseBranch {
   then: ExpressionSource;
 }
 
-export class CaseThenBuilder<TCtx, TValue> {
+export class CaseThenBuilder<in out TCtx, out TValue> {
   constructor(
     private readonly branches: readonly CaseBranch[],
     private readonly pendingWhen: ExpressionSource,
@@ -414,7 +445,7 @@ export class CaseThenBuilder<TCtx, TValue> {
   }
 }
 
-export class CaseBuilder<TCtx, TValue = never> {
+export class CaseBuilder<in out TCtx, out TValue = never> {
   constructor(private readonly branches: readonly CaseBranch[] = []) {}
 
   when(condition: ExpressionWrapper<SqlBool>): CaseThenBuilder<TCtx, TValue>;
@@ -440,7 +471,7 @@ export class CaseBuilder<TCtx, TValue = never> {
   }
 }
 
-export class CaseEndBuilder<TValue> {
+export class CaseEndBuilder<out TValue> {
   constructor(
     private readonly branches: readonly CaseBranch[],
     private readonly otherwise: ExpressionSource,
@@ -472,7 +503,7 @@ function buildCase(
 
 // --- The builder --------------------------------------------------------------------------------
 
-export interface ExpressionBuilder<DB, TCtx> {
+export interface ExpressionBuilder<in out DB, in out TCtx> {
   /** Compares a column (or expression) to a value; string left-hand sides are references. */
   <TRef extends ColumnReference<TCtx> & string>(
     lhs: TRef,
@@ -482,7 +513,7 @@ export interface ExpressionBuilder<DB, TCtx> {
   (
     lhs: ExpressionWrapper<unknown>,
     operator: ComparisonOperatorToken,
-    rhs: QueryValue | ExpressionWrapper<unknown> | BlockCompilable,
+    rhs: QueryValue | ExpressionWrapper<unknown> | ScalarSubquery<unknown>,
   ): ExpressionWrapper<SqlBool>;
   (
     lhs: ColumnReference<TCtx> | ExpressionWrapper<string | null>,
@@ -492,7 +523,9 @@ export interface ExpressionBuilder<DB, TCtx> {
   <TRef extends ColumnReference<TCtx> & string>(
     lhs: TRef,
     operator: InOperatorToken,
-    rhs: ReadonlyArray<ReferencedValue<TCtx, TRef> | ExpressionWrapper<unknown>> | BlockCompilable,
+    rhs:
+      | ReadonlyArray<ReferencedValue<TCtx, TRef> | ExpressionWrapper<unknown>>
+      | ScalarSubquery<ReferencedValue<TCtx, TRef>>,
   ): ExpressionWrapper<SqlBool>;
   (
     lhs: ColumnReference<TCtx> | ExpressionWrapper<unknown>,

@@ -54,10 +54,17 @@ export function createCoordinator(store: BlockStore) {
   };
 }
 
-export function attachCoordinator(
-  scope: Pick<DedicatedWorkerGlobalScope, "addEventListener" | "postMessage">,
-  store: BlockStore,
-): void {
+/**
+ * The slice of DedicatedWorkerGlobalScope the coordinator drives. Structural (not
+ * `Pick<DedicatedWorkerGlobalScope, ...>`) so the shipped declarations type-check for consumers
+ * without the WebWorker lib under `skipLibCheck: false`.
+ */
+export interface CoordinatorScope {
+  addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
+  postMessage(message: unknown, transfer?: Transferable[]): void;
+}
+
+export function attachCoordinator(scope: CoordinatorScope, store: BlockStore): void {
   const coordinate = createCoordinator(store);
   scope.addEventListener("message", (event: MessageEvent<unknown>) => {
     void coordinate(event.data).then((reply) => {

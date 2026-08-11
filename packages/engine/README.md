@@ -10,7 +10,7 @@ One schema declaration drives everything — migration planning, insert validati
 builder's autocomplete:
 
 ```ts
-import { BrowserDb, column, schema, table, type InferDatabase } from "@browserdatabase/engine";
+import { column, createBrowserDb, schema, table } from "@browserdatabase/engine";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -23,13 +23,16 @@ const orders = table("orders", {
   total: column.number(),
 });
 const appSchema = schema([people, orders]);
-type DB = InferDatabase<typeof appSchema>;
 
-// In a worker: new BrowserDb<DB>(database, { schema: appSchema })
-// On the main thread: new BrowserDb<DB>(client, { schema: appSchema })
+// In a worker the driver is a BrowserDatabase; on the main thread, a BrowserDatabaseClient.
 await driver.migrate(appSchema);
-const db = new BrowserDb<DB>(driver, { schema: appSchema });
+const db = createBrowserDb(driver, { schema: appSchema });
 ```
+
+`createBrowserDb` infers the database type from the schema value — no generic passing, and the
+type-level database can never drift from the schema the driver migrated with. See
+[TypeScript ergonomics and performance](#typescript-ergonomics-and-performance) for when to
+declare a named `DB` interface instead.
 
 ### Selects
 
@@ -148,6 +151,65 @@ const rows = await sql<{ n: number }>`
 Interpolations render as SQL literals (strings escape their quotes, arrays become IN lists,
 nested `sql` fragments splice). Values the SQL surface cannot represent — non-finite numbers,
 datetimes with a time component — throw instead of silently corrupting.
+
+### TypeScript ergonomics and performance
+
+The builder is inference-first: no call in a query chain ever needs a type argument. Column
+references autocomplete as bare and alias-qualified names, value positions are typed by the
+referenced column, and the result row type is assembled from the selections. A few conventions
+keep large apps fast and the emitted types small:
+
+**Small apps: let the factory infer.**
+
+```ts
+const db = createBrowserDb(driver, { schema: appSchema });
+```
+
+**Apps that export builders or share a `db` across modules: declare `DB` as an interface.**
+
+```ts
+import { BrowserDb, type InferDatabase } from "@browserdatabase/engine";
+
+interface DB extends InferDatabase<typeof appSchema> {}
+const db = new BrowserDb<DB>(driver, { schema: appSchema });
+```
+
+An interface gives the database type a *name* that survives into hovers, error messages, and
+declaration emit. With a plain `type DB = InferDatabase<...>` alias, every exported query prints
+the whole database structurally; in a 40-table/240-query stress project that was **22 MB** of
+`.d.ts` and 947k type instantiations, versus **77 KB** and 423k with the interface — same
+queries, ~2× faster consumer type-checking. If you never export builders, the alias (or the
+factory's anonymous inference) is fine.
+
+**Extracting row types.** Every select builder, live query, mutation builder, and `sql` fragment
+carries a type-only accessor — no `Awaited<ReturnType<...>>` gymnastics:
+
+```ts
+const query = db.selectFrom("people").select(["name", "city"]);
+type PersonRow = typeof query.$inferRow; // { name: string; city: string | null }
+
+const removal = db.deleteFrom("people").returningAll();
+type Deleted = typeof removal.$inferResult; // the full people row
+```
+
+(`$inferRow` / `$inferResult` exist only in the type system; reading them at runtime yields
+`undefined`.)
+
+**Variance is annotated.** Every public generic (`SelectQueryBuilder`, `ExpressionBuilder`,
+`ExpressionWrapper`, mutation builders, `LiveQuery`, `BrowserDb`) declares explicit `in`/`out`
+variance, so the compiler never has to measure it structurally — this removes the first-query
+type-checking warm-up and keeps builder-to-builder assignability checks O(type-argument) instead
+of O(structure).
+
+**What the types catch.** Unknown tables/columns, wrong value types per column, missing
+non-nullable insert columns, excess insert/update keys, mismatched set-operation rows,
+non-numeric operands to `sum`/`avg`/`round`/arithmetic, non-datetime operands to `dateTrunc`,
+scalar-subquery operands whose column type does not match, subqueries in mutation predicates
+(unsupported at runtime), and duplicate join aliases — a duplicate alias resolves to a
+`DuplicateJoinAliasError<...>` type whose message names the collision, surfacing on the next
+chained call. `coalesce` infers its output from its operands and drops `null` when the final
+fallback is non-null. All of this is pinned by `src/dsl/dsl-typecheck.test.ts`, including a
+50-table wide-schema case that keeps type-checking cost visible in CI.
 
 ### Limits (by design)
 

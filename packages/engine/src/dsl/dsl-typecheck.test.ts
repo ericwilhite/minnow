@@ -4,7 +4,7 @@ import { MemoryBlockStore } from "@browserdatabase/storage-idb";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { BrowserDatabase } from "../database.js";
 import { column, schema, table } from "../schema.js";
-import { BrowserDb } from "./db.js";
+import { BrowserDb, createBrowserDb } from "./db.js";
 import { type InferDatabase } from "./types.js";
 
 /**
@@ -28,8 +28,10 @@ const orders = table("orders", {
 const appSchema = schema([people, orders]);
 type DB = InferDatabase<typeof appSchema>;
 
+// The factory infers DB from the runtime schema; the declared return type pins that the
+// inferred database type is exactly InferDatabase<typeof appSchema>.
 function createDb(): BrowserDb<DB> {
-  return new BrowserDb<DB>(new BrowserDatabase(new MemoryBlockStore()), { schema: appSchema });
+  return createBrowserDb(new BrowserDatabase(new MemoryBlockStore()), { schema: appSchema });
 }
 
 // Never executed — these functions exist only so the type checker enforces the expect-error
@@ -57,6 +59,27 @@ function invalidQueriesAreRejected(db: BrowserDb<DB>): void {
   void q.select(["p.nope"]);
   // @ts-expect-error -- ordering key must be a context column or output alias
   void q.select(["p.name"]).orderBy("mystery");
+
+  // @ts-expect-error -- SUM only accepts numeric columns
+  void q.select((eb) => [eb.fn.sum("p.name").as("s")]);
+  // @ts-expect-error -- AVG only accepts numeric columns
+  void q.select((eb) => [eb.fn.avg("p.city").as("a")]);
+  // @ts-expect-error -- arithmetic only accepts numeric operands
+  void q.select((eb) => [eb("p.name", "+", 1).as("n")]);
+  // @ts-expect-error -- DATE_TRUNC only accepts datetime columns
+  void q.select((eb) => [eb.fn.dateTrunc("day", "p.score").as("d")]);
+
+  // @ts-expect-error -- a scalar operand subquery must yield the compared column's type
+  void q.where((eb) => eb("p.score", "=", eb.selectFrom("people").select(["name"])));
+  // @ts-expect-error -- an IN subquery must yield the compared column's type
+  void q.where("p.score", "in", q.select(["p.name"]));
+
+  const dup = q.innerJoin("orders as p", "p.name", "p.name");
+  /* eslint-disable @typescript-eslint/no-unsafe-call --
+     the call is intentionally unresolvable: dup is a DuplicateJoinAliasError, not a builder */
+  // @ts-expect-error -- a duplicate join alias resolves to an error type, not a builder
+  void dup.selectAll();
+  /* eslint-enable @typescript-eslint/no-unsafe-call */
 }
 
 function invalidMutationsAreRejected(db: BrowserDb<DB>): void {
@@ -74,6 +97,9 @@ function invalidMutationsAreRejected(db: BrowserDb<DB>): void {
   const names = db.selectFrom("people").select(["name"]);
   // @ts-expect-error -- union member row {person: string} does not match {name: string}
   void names.union(db.selectFrom("orders").select(["person"]));
+
+  // @ts-expect-error -- mutation predicates do not support subqueries
+  void db.deleteFrom("people").where("name", "in", db.selectFrom("orders").select(["person"]));
 }
 
 // Derived tables and CTEs must keep their precise row types — no index-signature collapse.
@@ -142,6 +168,46 @@ describe("infers precise row types", () => {
       .select(["p.name", "o.total", "o.person"]);
     expectTypeOf(left.execute).returns.resolves.toEqualTypeOf<
       Array<{ name: string; total: number | null; person: string | null }>
+    >();
+  });
+
+  it("infers the facade type from the runtime schema", () => {
+    const inferred = createBrowserDb(new BrowserDatabase(new MemoryBlockStore()), {
+      schema: appSchema,
+    });
+    expectTypeOf(inferred).toEqualTypeOf<BrowserDb<DB>>();
+  });
+
+  it("accepts a single selection without an array and keeps its type", () => {
+    const db = createDb();
+    const scalar = db.selectFrom("people").select("name");
+    expectTypeOf(scalar.execute).returns.resolves.toEqualTypeOf<Array<{ name: string }>>();
+    const scalarExpression = db.selectFrom("people").select((eb) => eb.fn.countAll().as("n"));
+    expectTypeOf(scalarExpression.execute).returns.resolves.toEqualTypeOf<Array<{ n: number }>>();
+  });
+
+  it("exposes output rows type-only through $inferRow / $inferResult", () => {
+    const db = createDb();
+    const q = db.selectFrom("people").select(["name", "city"]);
+    expectTypeOf<(typeof q)["$inferRow"]>().toEqualTypeOf<{ name: string; city: string | null }>();
+    expectTypeOf<Array<(typeof q)["$inferRow"]>>().toEqualTypeOf<
+      Awaited<ReturnType<typeof q.execute>>
+    >();
+    const live = q.live();
+    expectTypeOf(live.$inferRow).toEqualTypeOf<{ name: string; city: string | null }>();
+    const returning = db.deleteFrom("people").returning(["name"]);
+    expectTypeOf(returning.$inferResult).toEqualTypeOf<{ name: string }>();
+  });
+
+  it("types coalesce by its operands, dropping null when the fallback is non-null", () => {
+    const db = createDb();
+    const q = db.selectFrom("people").select((eb) => [
+      eb.fn.coalesce("city", "name").as("place"),
+      eb.fn.coalesce("city", eb.val("fallback")).as("sure"),
+      eb.fn.coalesce("joined", "joined").as("maybe"),
+    ]);
+    expectTypeOf(q.execute).returns.resolves.toEqualTypeOf<
+      Array<{ place: string; sure: string; maybe: Date | null }>
     >();
   });
 
