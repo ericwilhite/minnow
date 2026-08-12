@@ -208,8 +208,8 @@ if (import.meta.env.DEV) mountMinnowDevtools(db);
 ```
 
 A launcher appears in the corner (`Cmd/Ctrl + Shift + D`). Browse tables in a windowed grid with
-sortable headers and typed filters, or run SQL in the console. The panel floats over your page
-without blocking it, every statement that changes data is described and confirmed first, and
+sortable headers and typed filters, edit records inline, or run SQL in the console. The panel
+floats over your page without blocking it, every change is described and confirmed first, and
 `permissions: { write: false }` refuses those statements outright. It also ships as
 `<minnow-devtools>`, a custom element that works in any framework. See
 [the devtools guide](apps/site/src/content/docs/devtools.mdx).

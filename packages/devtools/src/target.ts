@@ -1,4 +1,15 @@
-import type { ExecuteResult, QueryOptions, QueryResult, TableDefinition } from "@minnowdb/core";
+import type {
+  BatchRow,
+  DeleteBatchInput,
+  DeleteBatchResult,
+  ExecuteResult,
+  InsertBatchResult,
+  QueryOptions,
+  QueryResult,
+  TableDefinition,
+  UpdateBatchInput,
+  UpdateBatchResult,
+} from "@minnowdb/core";
 
 /**
  * The slice of the database the devtools drive. `MinnowDatabase` and `MinnowDatabaseClient`
@@ -10,6 +21,26 @@ export interface DevtoolsTarget {
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   explain(sql: string): Promise<string>;
   execute(sql: string): Promise<ExecuteResult>;
+}
+
+/**
+ * The keyed write API the row editor uses. It is separate from `DevtoolsTarget` because browsing
+ * needs none of it: a target that only reads is a perfectly good one, and the editor turns itself
+ * off rather than failing when these are missing.
+ */
+export interface EditableTarget extends DevtoolsTarget {
+  insert(tableName: string, row: BatchRow): Promise<InsertBatchResult>;
+  updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult>;
+  deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult>;
+}
+
+const writeMethods = ["insert", "updateBatch", "deleteBatch"] as const;
+
+/** Whether this target can write at all, independent of whether it is allowed to. */
+export function isEditableTarget(target: DevtoolsTarget): target is EditableTarget {
+  return writeMethods.every(
+    (method) => typeof (target as unknown as Record<string, unknown>)[method] === "function",
+  );
 }
 
 /** What the devtools accept: a database, a worker client, or the typed facade over either. */

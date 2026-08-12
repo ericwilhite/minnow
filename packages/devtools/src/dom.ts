@@ -60,6 +60,7 @@ export function icon(path: string): SVGSVGElement {
 }
 
 export const icons = {
+  table: "M4 5h16v14H4zM4 10h16M10 10v9",
   close: "M6 6l12 12M18 6L6 18",
   minimize: "M6 12h12",
   play: "M6 4l14 8-14 8V4z",

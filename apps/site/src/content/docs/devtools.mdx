@@ -6,8 +6,8 @@ description: An embeddable SQL console for your database — a floating panel in
 # Devtools
 
 <p class="lede">
-  A panel you drop into any app to run SQL against the database it is already using. It floats over
-  your page without blocking it, and every statement that changes data asks first.
+  A panel you drop into any app to browse, edit, and query the database it is already using. It
+  floats over your page without blocking it, and every change asks first.
 </p>
 
 ## Install
@@ -90,6 +90,31 @@ one just gets slower the further in you go.
 **Counting.** `COUNT(*)` scans the whole table, so it runs alongside the first page rather than
 delaying it. Until it lands, the status bar says how many rows are loaded.
 
+## Editing rows
+
+Double-click a cell to edit it. Click a row to select it, then **Delete row**. **Add row** opens a
+form with one input per column. Every one of them describes what it is about to do and waits for
+you to agree — the confirmation names the table, the key, and the before and after values.
+
+Values are typed as the column is typed, and checked in the editor rather than after you confirm:
+`twelve` in a number column is refused on the spot. A blank input means NULL where the column
+allows it, and `NULL` typed into a text column means the same thing (a literal `'NULL'` string
+needs the quotes).
+
+Writes go through the keyed batch API rather than generated SQL, so a datetime is written to the
+millisecond — the day-granular limit applies only to filters, which have to compile to SQL.
+
+After a write the row is re-read rather than patched in place, so the grid shows what actually
+landed.
+
+**When editing is unavailable**, the panel says so in a banner instead of leaving a dead button:
+
+| Situation                   | What you can still do                                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `permissions.write: false`  | Browse only.                                                                                            |
+| The target has no write API | Browse only.                                                                                            |
+| The table has no unique key | Browse and insert — the engine keys updates and deletes by the unique key and refuses them without one. |
+
 ## The window
 
 It is a window, not a modal. There is no backdrop over your page and no focus trap — the app
@@ -104,8 +129,8 @@ Two badges in the title bar say what you are working with:
 
 ## Running statements
 
-The **Query** tab is a SQL console over the same database. `Cmd/Ctrl + Enter` runs. Queries return rows; anything that changes data is described and confirmed
-first:
+The **Query** tab is a SQL console over the same database. `Cmd/Ctrl + Enter` runs. Queries return
+rows; anything that changes data is described and confirmed first:
 
 - The prompt names the table, the operation, and the statement itself before it runs.
 - An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.

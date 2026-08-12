@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { resolveTarget, runsOffMainThread, type DevtoolsTarget } from "./target.js";
+import {
+  isEditableTarget,
+  resolveTarget,
+  runsOffMainThread,
+  type DevtoolsTarget,
+} from "./target.js";
 
 function stubTarget(): DevtoolsTarget {
   return {
@@ -33,6 +38,23 @@ describe("resolveTarget", () => {
 
   it("reports the outer object's gaps when the driver is no better", () => {
     expect(() => resolveTarget({ driver: {} })).toThrow(/listTables/);
+  });
+});
+
+describe("isEditableTarget", () => {
+  it("requires every keyed write method, since editing needs all three", () => {
+    expect(isEditableTarget(stubTarget())).toBe(false);
+    const writes = {
+      insert: async () => undefined,
+      updateBatch: async () => undefined,
+      deleteBatch: async () => undefined,
+    };
+    expect(isEditableTarget(Object.assign(stubTarget(), writes))).toBe(true);
+    expect(
+      isEditableTarget(
+        Object.assign(stubTarget(), { insert: writes.insert, updateBatch: writes.updateBatch }),
+      ),
+    ).toBe(false);
   });
 });
 

@@ -1,5 +1,6 @@
-import type { QueryRow } from "@minnowdb/core";
-import { el } from "../dom.js";
+import type { QueryRow, QueryValue } from "@minnowdb/core";
+import type { ConfirmLayer } from "../confirm.js";
+import { button, el } from "../dom.js";
 import { createGrid, type GridColumn } from "../results/grid.js";
 import { isSortable } from "../sql/literal.js";
 import {
@@ -10,10 +11,22 @@ import {
   type Cursor,
   type Sort,
 } from "../sql/select.js";
-import type { DevtoolsTarget } from "../target.js";
+import { isEditableTarget, type DevtoolsTarget, type EditableTarget } from "../target.js";
+import { formatForInput, inputHint, parseInput } from "../values.js";
 import { findTable, toCatalog, type TableInfo } from "./catalog.js";
 import { createFilterBar } from "./filter-editor.js";
+import { createInsertForm } from "./insert-form.js";
 import { createSchemaRail } from "./tree.js";
+import {
+  applyCellEdit,
+  applyDelete,
+  applyInsert,
+  confirmCellEdit,
+  confirmDelete,
+  confirmInsert,
+  editingBlockedReason,
+  rowKey,
+} from "./writes.js";
 
 export interface ExplorerView {
   node: HTMLElement;
@@ -21,12 +34,29 @@ export interface ExplorerView {
   refresh(): Promise<void>;
 }
 
+export interface ExplorerDeps {
+  target: DevtoolsTarget;
+  confirm: ConfirmLayer;
+  /** Whether the panel is allowed to change data at all. */
+  write: boolean;
+}
+
 /** Rows per request. Large enough that scrolling rarely waits, small enough to stay instant. */
 const pageSize = 200;
 
-export function createExplorer(target: DevtoolsTarget): ExplorerView {
+export function createExplorer(deps: ExplorerDeps): ExplorerView {
+  const { target, confirm } = deps;
+  // Present only when the panel may write and the target can: everything downstream then treats
+  // its absence as "editing is off" without re-deriving why.
+  const editor: EditableTarget | undefined =
+    deps.write && isEditableTarget(target) ? target : undefined;
+
   const status = el("div", { class: "statusbar" });
   const crumb = el("span", { class: "crumb", text: "Pick a table" });
+  const addRow = button("btn mini", "Add row");
+  const deleteRow = button("btn mini danger", "Delete row");
+  const banner = el("div", { class: "banner" });
+  banner.hidden = true;
 
   const grid = createGrid({
     onSort: (column) => {
@@ -34,6 +64,12 @@ export function createExplorer(target: DevtoolsTarget): ExplorerView {
     },
     onNearEnd: () => {
       void loadMore();
+    },
+    onSelect: () => {
+      updateRowActions();
+    },
+    onEditCell: (row, column, index) => {
+      beginCellEdit(row, column, index);
     },
   });
 
@@ -43,11 +79,18 @@ export function createExplorer(target: DevtoolsTarget): ExplorerView {
   const rail = createSchemaRail((name) => {
     void open(name);
   });
+  const insertForm = createInsertForm({
+    onSubmit: (values) => {
+      void commitInsert(values);
+    },
+  });
 
   const main = el("div", { class: "explorer-main" }, [
-    el("div", { class: "toolbar" }, [crumb, el("span", { class: "spacer" })]),
+    el("div", { class: "toolbar" }, [crumb, el("span", { class: "spacer" }), addRow, deleteRow]),
+    banner,
     filterBar.node,
     grid.node,
+    insertForm.node,
     status,
   ]);
   const node = el("div", { class: "explorer" }, [rail.node, main]);
@@ -157,6 +200,126 @@ export function createExplorer(target: DevtoolsTarget): ExplorerView {
     await fetchPage(current, generation, true);
   }
 
+  /**
+   * Row editing is offered only where it can actually work: writes allowed, a target that has the
+   * write API, and a table with a unique key to address a row by. The banner says which of those
+   * is missing rather than leaving a dead button.
+   */
+  function updateRowActions(): void {
+    const current = table;
+    if (current === undefined) return;
+    const blocked = editingBlockedReason(current, deps.write, isEditableTarget(target));
+    const keyed = current.uniqueKey !== undefined;
+
+    // Inserts need no key, so they survive the one blocker that only affects keyed writes.
+    addRow.hidden = editor === undefined;
+    deleteRow.hidden = editor === undefined || !keyed;
+    deleteRow.disabled = grid.selectedIndex() === undefined;
+
+    banner.hidden = blocked === undefined;
+    if (blocked !== undefined) banner.textContent = blocked;
+  }
+
+  async function withWrite(
+    request: ReturnType<typeof confirmCellEdit>,
+    run: () => Promise<string>,
+  ): Promise<void> {
+    if (!(await confirm.ask(request))) {
+      setStatus("cancelled");
+      return;
+    }
+    try {
+      setStatus(await run());
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function beginCellEdit(row: QueryRow, columnName: string, index: number): void {
+    const current = table;
+    if (current === undefined || editor === undefined) return;
+    if (editingBlockedReason(current, deps.write, true) !== undefined) return;
+    const column = current.columns.find(({ name }) => name === columnName);
+    const key = rowKey(current, row);
+    if (column === undefined || key === undefined) return;
+
+    const from = row[columnName] ?? null;
+    grid.editCell(index, columnName, {
+      initial: formatForInput(from),
+      placeholder: inputHint(column.type, column.nullable),
+      onCancel: () => undefined,
+      onCommit: (text) => {
+        const parsed = parseInput(text, column.type, column.nullable);
+        if (!parsed.ok) {
+          setStatus(parsed.message);
+          return;
+        }
+        if (parsed.value === from) return;
+        void withWrite(
+          confirmCellEdit({ table: current, column, key, from, to: parsed.value }),
+          async () => {
+            const changed = await applyCellEdit(editor, {
+              table: current,
+              column,
+              key,
+              from,
+              to: parsed.value,
+            });
+            // Keyed updates read then mutate, so the row is refetched rather than patched — the
+            // grid shows what actually landed, not what was asked for.
+            await refreshRow(current, key, index);
+            return `updated ${String(changed)} row`;
+          },
+        );
+      },
+    });
+  }
+
+  /** Rereads one row after a write, so the grid never shows an optimistic guess. */
+  async function refreshRow(current: TableInfo, key: QueryValue, index: number): Promise<void> {
+    const keyColumn = current.columns.find((column) => column.isUniqueKey);
+    if (keyColumn === undefined) return;
+    const result = await target.query(
+      buildPageQuery({
+        table: current,
+        filters: [{ column: keyColumn.name, type: keyColumn.type, operator: "=", values: [key] }],
+        limit: 1,
+      }),
+    );
+    const row = result.rows[0];
+    if (row === undefined) grid.removeRow(index);
+    else grid.replaceRow(index, row);
+  }
+
+  function requestDelete(): void {
+    const current = table;
+    const index = grid.selectedIndex();
+    if (current === undefined || editor === undefined || index === undefined) return;
+    const row = grid.rowAt(index);
+    if (row === undefined) return;
+    const key = rowKey(current, row);
+    if (key === undefined) return;
+
+    void withWrite(confirmDelete(current, key, row), async () => {
+      const removed = await applyDelete(editor, current, key);
+      grid.removeRow(index);
+      if (total !== undefined) total -= removed;
+      updateRowActions();
+      return `deleted ${String(removed)} row`;
+    });
+  }
+
+  async function commitInsert(values: Record<string, QueryValue>): Promise<void> {
+    const current = table;
+    if (current === undefined || editor === undefined) return;
+    await withWrite(confirmInsert(current, values), async () => {
+      const inserted = await applyInsert(editor, current, values);
+      insertForm.close();
+      await reload();
+      return `inserted ${String(inserted)} row`;
+    });
+  }
+
   /** Clicking a header cycles ascending, descending, then back to the table's own order. */
   function toggleSort(column: string): void {
     if (sort?.column !== column) sort = { column, direction: "asc" };
@@ -172,6 +335,8 @@ export function createExplorer(target: DevtoolsTarget): ExplorerView {
     sort = undefined;
     rail.setSelected(name);
     filterBar.setTable(current);
+    insertForm.close();
+    updateRowActions();
     crumb.replaceChildren(
       el("span", { text: name }),
       el("span", {
@@ -198,7 +363,14 @@ export function createExplorer(target: DevtoolsTarget): ExplorerView {
     }
   }
 
+  addRow.addEventListener("click", () => {
+    if (table !== undefined) insertForm.open(table);
+  });
+  deleteRow.addEventListener("click", requestDelete);
+
   grid.setMessage("Pick a table to browse it.");
+  addRow.hidden = true;
+  deleteRow.hidden = true;
 
   return { node, refresh };
 }

@@ -1,6 +1,7 @@
 import type { QueryValue } from "@minnowdb/core";
 import { button, el } from "../dom.js";
 import type { ColumnType } from "../sql/literal.js";
+import { parseInput } from "../values.js";
 import type { TableInfo } from "./catalog.js";
 import {
   describeFilter,
@@ -19,13 +20,14 @@ export interface FilterBar {
   clear(): void;
 }
 
-/** Turns the typed text into the value the column's type expects, or null when it is blank. */
+/**
+ * A filter value is always optional — a blank box means "no filter yet", not "match NULL", which
+ * is what the `is null` operator is for. So parsing treats every column as nullable and the
+ * incomplete filter is simply dropped.
+ */
 function parseValue(text: string, type: ColumnType): QueryValue {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return null;
-  if (type === "number") return Number(trimmed);
-  if (type === "boolean") return trimmed.toLowerCase() === "true";
-  return trimmed;
+  const parsed = parseInput(text, type, true);
+  return parsed.ok ? parsed.value : null;
 }
 
 /**

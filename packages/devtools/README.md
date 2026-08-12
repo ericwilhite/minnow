@@ -24,8 +24,10 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
   so it works unchanged in React, Vue, Svelte, Solid, Astro, and plain HTML.
 - **A window, not a modal** — no backdrop, no focus trap; the page underneath stays interactive.
   Drag by the title bar, resize from the corner grip, and it reopens where you left it.
-- **Changes are confirmed first** — the prompt names the table, the operation, and the statement.
-  An `UPDATE` or `DELETE` with no `WHERE` is called out as hitting every row.
+- **Edit records** — double-click a cell, select a row to delete it, or add one through a typed
+  form. Values are validated against the column's type before anything is confirmed.
+- **Changes are confirmed first** — the prompt names the table, the key, and the before and after
+  values. An `UPDATE` or `DELETE` with no `WHERE` is called out as hitting every row.
 - **`permissions: { write: false }`** refuses statements that change data before they reach the
   database.
 

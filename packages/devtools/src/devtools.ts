@@ -49,7 +49,7 @@ export function createDevtools(
   adoptStyles(root);
 
   const confirm = createConfirmLayer();
-  const explorer = createExplorer(target);
+  const explorer = createExplorer({ target, confirm, write: resolved.write });
   const view = createConsole({
     target,
     confirm,

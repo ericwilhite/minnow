@@ -1,4 +1,4 @@
-import { el } from "../dom.js";
+import { el, icon, icons } from "../dom.js";
 import { isEditable, type TableInfo } from "./catalog.js";
 
 export interface SchemaRail {
@@ -64,7 +64,7 @@ export function createSchemaRail(onSelect: (table: string) => void): SchemaRail 
           attrs: { "aria-expanded": String(open) },
         },
         [
-          el("span", { class: "tnode-chev", text: open ? "▾" : "▸" }),
+          el("span", { class: "tnode-icon" }, [icon(icons.table)]),
           el("span", { class: "tnode-name", text: table.name }),
           el("span", {
             class: "tnode-meta",

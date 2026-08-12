@@ -16,6 +16,18 @@ export interface GridDeps {
   onSort?(column: string): void;
   /** Fired when the viewport nears the end of the loaded rows. */
   onNearEnd?(): void;
+  /** Fired when a row is clicked, with undefined when the selection is cleared. */
+  onSelect?(row: QueryRow | undefined, index: number | undefined): void;
+  /** Fired on a double-click in a cell, which is the request to edit it. */
+  onEditCell?(row: QueryRow, column: string, index: number): void;
+}
+
+export interface CellEditor {
+  /** Text the editor opens with. */
+  initial: string;
+  placeholder?: string;
+  onCommit(text: string): void;
+  onCancel(): void;
 }
 
 export interface Grid {
@@ -28,6 +40,16 @@ export interface Grid {
   /** Replaces the body with a message, for the empty and error states. */
   setMessage(message: string): void;
   rowCount(): number;
+  rowAt(index: number): QueryRow | undefined;
+  setSelected(index: number | undefined): void;
+  selectedIndex(): number | undefined;
+  /** Replaces one row's values in place, after a write changed it. */
+  replaceRow(index: number, row: QueryRow): void;
+  /** Drops one row, after it was deleted. */
+  removeRow(index: number): void;
+  /** Opens an input over a cell, aligned to the column by the grid template itself. */
+  editCell(index: number, column: string, editor: CellEditor): void;
+  closeEdit(): void;
 }
 
 /** Row height is fixed so the scroll position maps to an index by division, not measurement. */
@@ -71,6 +93,9 @@ export function createGrid(deps: GridDeps = {}): Grid {
   let frame = 0;
   let template = "";
   let notifiedForCount = -1;
+  let selected: number | undefined;
+  /** The open cell editor, positioned like a row so the grid template aligns it for free. */
+  let editing: { index: number; node: HTMLElement; input: HTMLInputElement } | undefined;
 
   function columnWidth(column: GridColumn): string {
     // Numbers and keys are narrow and predictable; text gets the room, bounded so one long value
@@ -138,6 +163,8 @@ export function createGrid(deps: GridDeps = {}): Grid {
     const row = rows[index];
     if (row === undefined) return;
     node.style.transform = `translateY(${String(index * rowHeight)}px)`;
+    node.dataset.index = String(index);
+    node.classList.toggle("sel", index === selected);
     const cells = node.children;
     for (let column = 0; column < columns.length; column += 1) {
       const cell = cells[column];
@@ -200,6 +227,58 @@ export function createGrid(deps: GridDeps = {}): Grid {
 
   viewport.addEventListener("scroll", schedule, { passive: true });
 
+  /** Reads the row and column a pointer event landed on, using the pooled node's own bookkeeping. */
+  function locate(event: Event): { index: number; row: QueryRow; column?: string } | undefined {
+    const cell = (event.target as Element | null)?.closest(".cell");
+    const rowNode = (event.target as Element | null)?.closest(".grid-row");
+    if (!(rowNode instanceof HTMLElement)) return undefined;
+    const index = Number(rowNode.dataset.index ?? "-1");
+    const row = rows[index];
+    if (row === undefined) return undefined;
+    const position =
+      cell === null || cell === undefined
+        ? -1
+        : Array.prototype.indexOf.call(rowNode.children, cell);
+    const column = columns[position]?.name;
+    return column === undefined ? { index, row } : { index, row, column };
+  }
+
+  sizer.addEventListener("click", (event) => {
+    const hit = locate(event);
+    if (hit === undefined) return;
+    // Clicking the selected row again clears it, so there is always a way back to no selection.
+    const next = selected === hit.index ? undefined : hit.index;
+    setSelected(next);
+    deps.onSelect?.(next === undefined ? undefined : hit.row, next);
+  });
+
+  sizer.addEventListener("dblclick", (event) => {
+    const hit = locate(event);
+    if (hit?.column === undefined) return;
+    deps.onEditCell?.(hit.row, hit.column, hit.index);
+  });
+
+  /** Repaints just the slots holding these rows, rather than the whole window. */
+  function invalidate(...indexes: Array<number | undefined>): void {
+    for (const index of indexes) {
+      if (index === undefined || pool.length === 0) continue;
+      const slot = index % pool.length;
+      if (slotRow[slot] === index) slotRow[slot] = -1;
+    }
+    render();
+  }
+
+  function setSelected(index: number | undefined): void {
+    const previous = selected;
+    selected = index;
+    invalidate(previous, index);
+  }
+
+  function closeEdit(): void {
+    editing?.node.remove();
+    editing = undefined;
+  }
+
   /** Drops every pooled node, for when the columns or the whole result change. */
   function reset(): void {
     pool = [];
@@ -214,8 +293,13 @@ export function createGrid(deps: GridDeps = {}): Grid {
   return {
     node,
     rowCount: () => rows.length,
+    rowAt: (index) => rows[index],
+    selectedIndex: () => selected,
+    setSelected,
+    closeEdit,
     setColumns: (next) => {
       columns = [...next];
+      closeEdit();
       reset();
       renderHead();
       render();
@@ -223,6 +307,8 @@ export function createGrid(deps: GridDeps = {}): Grid {
     setRows: (next) => {
       rows = [...next];
       notifiedForCount = -1;
+      selected = undefined;
+      closeEdit();
       reset();
       setHeight();
       viewport.scrollTop = 0;
@@ -234,11 +320,71 @@ export function createGrid(deps: GridDeps = {}): Grid {
       setHeight();
       render();
     },
+    replaceRow: (index, row) => {
+      if (rows[index] === undefined) return;
+      rows[index] = row;
+      invalidate(index);
+    },
+    removeRow: (index) => {
+      if (rows[index] === undefined) return;
+      rows.splice(index, 1);
+      if (selected === index) selected = undefined;
+      closeEdit();
+      setHeight();
+      // Every row after the removed one shifted up, so the whole ring is stale.
+      slotRow = slotRow.map(() => -1);
+      render();
+    },
     setMessage: (message) => {
       rows = [];
+      selected = undefined;
+      closeEdit();
       reset();
       sizer.style.height = "auto";
       sizer.append(el("div", { class: "grid-message", text: message }));
+    },
+    editCell: (index, column, editor) => {
+      closeEdit();
+      const position = columns.findIndex(({ name }) => name === column);
+      if (position < 0 || rows[index] === undefined) return;
+
+      const input = el("input", {
+        class: "cell-input",
+        type: "text",
+        attrs: { "aria-label": `${column} value`, spellcheck: "false" },
+      });
+      input.value = editor.initial;
+      if (editor.placeholder !== undefined) input.placeholder = editor.placeholder;
+
+      const holder = el("div", { class: "cell-edit" }, [input]);
+      holder.style.gridColumn = String(position + 1);
+      const node = el("div", { class: "grid-row editing" }, [holder]);
+      node.style.gridTemplateColumns = template;
+      node.style.transform = `translateY(${String(index * rowHeight)}px)`;
+
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          const text = input.value;
+          closeEdit();
+          editor.onCommit(text);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          closeEdit();
+          editor.onCancel();
+        }
+      });
+      // Clicking away is a cancel, not a silent commit: a change only happens on purpose.
+      input.addEventListener("blur", () => {
+        if (editing?.input !== input) return;
+        closeEdit();
+        editor.onCancel();
+      });
+
+      sizer.append(node);
+      editing = { index, node, input };
+      input.focus();
+      input.select();
     },
   };
 }
