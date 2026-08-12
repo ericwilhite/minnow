@@ -10,6 +10,7 @@ import {
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   MissingKeyError,
+  SqlCompileError,
   UniqueConstraintError,
 } from "./errors.js";
 import {
@@ -463,6 +464,7 @@ export {
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   MissingKeyError,
+  SqlCompileError,
   UniqueConstraintError,
 };
 

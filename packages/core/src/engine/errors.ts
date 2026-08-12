@@ -66,3 +66,26 @@ export class CompactionJobCancelledError extends Error {
     super(`Compaction job cancelled: ${jobId}`);
   }
 }
+
+/**
+ * SQL that failed to compile, located in the text the caller passed. `offset` and `length` are
+ * character positions into that exact string — leading whitespace included — so an editor can
+ * underline the token that failed without re-deriving the position from the message.
+ *
+ * `length` is 0 where the failure has no width: an empty statement, or a query that ended before
+ * the parser expected it to. Errors raised after parsing succeeds (plan optimization, execution)
+ * carry no position and stay plain `TypeError`s.
+ *
+ * It extends `TypeError` because that is what compilation failures threw before positions existed.
+ */
+export class SqlCompileError extends TypeError {
+  override readonly name = "SqlCompileError";
+
+  constructor(
+    message: string,
+    readonly offset: number,
+    readonly length: number,
+  ) {
+    super(message);
+  }
+}

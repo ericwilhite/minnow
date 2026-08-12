@@ -2,7 +2,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabaseClient, type ClientTransport } from "./client.js";
 import { MinnowDatabase } from "./database.js";
-import { UniqueConstraintError } from "./errors.js";
+import { SqlCompileError, UniqueConstraintError } from "./errors.js";
 import { compileQuery, type QueryResult } from "./query.js";
 import { column, schema, table, typedTable } from "./schema.js";
 import { attachDatabaseWorker, exposeDatabase, type RpcScope } from "./worker-host.js";
@@ -103,6 +103,19 @@ describe("MinnowDatabaseClient", () => {
     expect(typed.tableName).toBe("people");
     expect(typed.columnName).toBe("id");
     expect(typed.value).toBe(1);
+  });
+
+  it("carries compile-error positions across the worker boundary", async () => {
+    // A devtools editor compiles in the page, but a query typed against the client fails in the
+    // worker; the position has to survive serialization or the squiggle lands nowhere.
+    const client = connect();
+    await createPeopleTable(client);
+    const sql = "SELECT * FROM people WHERE name = 'unclosed";
+    const failure = await client.query(sql).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(SqlCompileError);
+    const typed = failure as SqlCompileError;
+    expect(typed.message).toBe("Unterminated string literal");
+    expect(sql.slice(typed.offset, typed.offset + typed.length)).toBe("'unclosed");
   });
 
   it("migrates a schema DSL definition and reports wire-format steps", async () => {

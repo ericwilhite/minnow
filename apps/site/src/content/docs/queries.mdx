@@ -187,6 +187,35 @@ const rows = await sql<{ n: number }>`
 
 `query()` and `prepareQuery()` remain the raw read-only SQL API.
 
+### Locating a compile error
+
+SQL that fails to compile throws a `SqlCompileError` carrying the position of the token that
+failed, so an editor can underline it. `offset` and `length` index the exact string you passed —
+leading whitespace included:
+
+```ts
+import { SqlCompileError } from "@minnowdb/core";
+
+const text = "SELECT * FROM people WHERE name = 'unclosed";
+
+try {
+  await database.query(text);
+} catch (error) {
+  if (error instanceof SqlCompileError) {
+    // "'unclosed" — Unterminated string literal
+    console.log(text.slice(error.offset, error.offset + error.length), error.message);
+  }
+}
+```
+
+Syntax errors point at the exact token. Errors raised once a block has parsed — a function called
+with the wrong number of arguments, say — point at the token that follows it. `length` is 0 where
+the failure has no width, such as a query that ends early. Failures after compilation succeeds
+(plan optimization, execution) carry no position and stay plain `TypeError`s.
+
+`SqlCompileError` extends `TypeError` and survives the worker channel, so positions arrive intact
+on `MinnowDatabaseClient` too.
+
 > Writes get the same treatment — `insertInto` / `updateTable` / `deleteFrom` with `returning`,
 > in [Writes & transactions](/docs/writes/). The full supported-SQL list is the
 > [feature matrix](/docs/sql/). Known limits: correlated subqueries compile but fail at execution

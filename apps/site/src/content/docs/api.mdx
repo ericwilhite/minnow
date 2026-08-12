@@ -55,6 +55,7 @@ From `@minnowdb/core`. See [Typed queries](/docs/queries/) and [Writes](/docs/wr
 | `.with(name, () => query)`                 | Adds a CTE usable as a from/join source in the following query.                                                                                                                                                     |
 | `.search(query, { tables?, limit? })`      | Document search across tables (all schema tables by default): per-table MATCH + BM25 scans merged into one relevance-ranked `{ table, row, score }` list.                                                           |
 | `.close()`                                 | Closes the shared live set (and any driver-owned resources the facade created).                                                                                                                                     |
+| `.driver`                                  | The `MinnowDatabase` or `MinnowDatabaseClient` behind the facade, for tools handed only the facade. Application code should keep its own reference instead.                                                         |
 | `MinnowOptions`                            | Facade options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`.                                                                                                                  |
 | `DslDriver, DriverLiveSet, DslLiveOptions` | The driver contract, implemented by both the database and the worker client.                                                                                                                                        |
 
@@ -165,6 +166,7 @@ Notable supporting exports:
 | --------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
 | `UniqueConstraintError`                                                                       | A write violates the table's unique key.               |
 | `MissingKeyError`                                                                             | A keyed update/delete names a key that does not exist. |
+| `SqlCompileError`                                                                             | SQL fails to compile; carries `offset` and `length`.   |
 | `QueryMemoryBudgetError`                                                                      | A reservation exceeds `executionMemoryBudgetBytes`.    |
 | `NoResultError`                                                                               | `executeTakeFirstOrThrow()` finds no row.              |
 | `CompactionMemoryBudgetError, CompactionWriteAmplificationError, CompactionJobCancelledError` | Compaction guardrails.                                 |

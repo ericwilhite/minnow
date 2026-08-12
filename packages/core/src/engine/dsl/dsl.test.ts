@@ -81,6 +81,23 @@ describe("InferDatabase", () => {
   });
 });
 
+describe("driver access", () => {
+  it("hands back the driver the facade was created with", () => {
+    const { db, database } = createDb();
+    expect(db.driver).toBe(database);
+    // Tools given only the facade reach the catalog and raw SQL entry points through it.
+    expect(typeof (db.driver as MinnowDatabase).listTables).toBe("function");
+  });
+
+  it("keeps the same driver on facades derived with with()", () => {
+    const { db, database } = createDb();
+    const derived = db.with("recent", (creator) =>
+      creator.selectFrom("orders").select(["order_id"]),
+    );
+    expect(derived.driver).toBe(database);
+  });
+});
+
 describe("select builder plan parity", () => {
   const { db } = createDb();
 

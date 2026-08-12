@@ -143,6 +143,16 @@ export class Minnow<in out DB> {
     this.#liveBox = liveBox;
   }
 
+  /**
+   * The driver this facade was created with — the `MinnowDatabase` or `MinnowDatabaseClient`
+   * behind it. Tools handed only the facade (devtools, inspectors, schema browsers) reach the
+   * catalog and the raw SQL entry points through here; application code should keep its own
+   * reference to the driver rather than reaching back through the facade.
+   */
+  get driver(): DslDriver {
+    return this.#driver;
+  }
+
   #liveServices(): LiveQueryServices {
     return {
       subscribe: async (query: TypedQueryEnvelope<unknown>, handlers) => {

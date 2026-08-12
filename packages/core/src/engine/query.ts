@@ -1,4 +1,5 @@
 import type { DatabaseRow } from "./database.js";
+import { SqlCompileError } from "./errors.js";
 import {
   cachedQueryTerms,
   ftsBm25Row,
@@ -272,6 +273,12 @@ type RowContext = Record<string, DatabaseRow | undefined>;
 interface Token {
   kind: "identifier" | "number" | "string" | "operator" | "punctuation" | "eof";
   text: string;
+  /**
+   * Half-open character span in the tokenized text. String tokens span their quotes even though
+   * `text` holds the unescaped value, so a squiggle covers what the author actually typed.
+   */
+  start: number;
+  end: number;
 }
 
 const clauseKeywords = new Set([
@@ -295,11 +302,45 @@ export interface CompileQueryOptions {
   readonly optimize?: boolean;
 }
 
+/**
+ * Trims the statement the parser sees while remembering how far that shifted every position, so
+ * compile errors report offsets into the caller's own text rather than the trimmed copy.
+ */
+function normalizeSql(sql: string): { text: string; offset: number } {
+  return { text: sql.trim().replace(/;$/, "").trim(), offset: sql.length - sql.trimStart().length };
+}
+
+/**
+ * Rethrows a compilation failure with a position. Errors that already carry one only shift into
+ * the caller's coordinates; anything else takes the parser's current token as its anchor. Non-type
+ * errors pass through untouched — they come from execution, not from reading the text.
+ */
+function throwLocated(error: unknown, offset: number, span: { start: number; end: number }): never {
+  if (error instanceof SqlCompileError) {
+    if (offset === 0) throw error;
+    throw new SqlCompileError(error.message, error.offset + offset, error.length);
+  }
+  if (error instanceof TypeError) {
+    throw new SqlCompileError(
+      error.message,
+      offset + span.start,
+      Math.max(span.end - span.start, 0),
+    );
+  }
+  throw error;
+}
+
 export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
-  const normalized = sql.trim().replace(/;$/, "").trim();
-  if (normalized.length === 0) throw new TypeError("Enter a SELECT query");
-  const parser = new Parser(tokenize(normalized));
-  const plan = parser.parse(normalized);
+  const { text, offset } = normalizeSql(sql);
+  if (text.length === 0) throw new SqlCompileError("Enter a SELECT query", offset, 0);
+  let parser: Parser | undefined;
+  let plan: CompiledQuery;
+  try {
+    parser = new Parser(tokenize(text));
+    plan = parser.parse(text);
+  } catch (error) {
+    throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
+  }
   return options.optimize === false ? plan : optimizePlan(plan);
 }
 
@@ -324,16 +365,22 @@ export type CompiledStatement =
  * leading keyword fails explicitly.
  */
 export function compileStatement(sql: string): CompiledStatement {
-  const normalized = sql.trim().replace(/;$/, "").trim();
-  if (normalized.length === 0) throw new TypeError("Enter a SQL statement");
-  const tokens = tokenize(normalized);
-  const first = tokens[0];
-  const keyword = first?.kind === "identifier" ? first.text.toUpperCase() : "";
-  if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
-    return new Parser(tokens).parseMutation(keyword);
+  const { text, offset } = normalizeSql(sql);
+  if (text.length === 0) throw new SqlCompileError("Enter a SQL statement", offset, 0);
+  let parser: Parser | undefined;
+  try {
+    const tokens = tokenize(text);
+    const first = tokens[0];
+    const keyword = first?.kind === "identifier" ? first.text.toUpperCase() : "";
+    if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
+      parser = new Parser(tokens);
+      return parser.parseMutation(keyword);
+    }
+    compileQuery(text);
+    return { kind: "select", sql: text };
+  } catch (error) {
+    throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
   }
-  compileQuery(normalized);
-  return { kind: "select", sql: normalized };
 }
 
 /** Evaluates an expression against one row, for UPDATE SET assignment computation. */
@@ -2966,7 +3013,19 @@ class Parser {
   }
 
   #peek(): Token {
-    return this.tokens[this.#index] ?? { kind: "eof", text: "" };
+    const last = this.tokens[this.tokens.length - 1];
+    const end = last === undefined ? 0 : last.end;
+    return this.tokens[this.#index] ?? { kind: "eof", text: "", start: end, end };
+  }
+
+  /**
+   * Span of the token the parser is positioned on. Syntax errors throw while sitting on the token
+   * that failed, so this is where the failure belongs; errors raised after a block finishes
+   * parsing land on the token that follows it.
+   */
+  get span(): { start: number; end: number } {
+    const { start, end } = this.#peek();
+    return { start, end };
   }
 }
 
@@ -3498,19 +3557,20 @@ function tokenize(sql: string): Token[] {
     if (/[A-Za-z_]/.test(character)) {
       const start = index++;
       while (index < sql.length && /[A-Za-z0-9_]/.test(sql[index] ?? "")) index += 1;
-      tokens.push({ kind: "identifier", text: sql.slice(start, index) });
+      tokens.push({ kind: "identifier", text: sql.slice(start, index), start, end: index });
       continue;
     }
     if (/\d/.test(character)) {
       const start = index++;
       while (index < sql.length && /[\d.]/.test(sql[index] ?? "")) index += 1;
       const text = sql.slice(start, index);
-      if (!/^\d+(?:\.\d+)?$/.test(text)) throw new TypeError(`Invalid number: ${text}`);
-      tokens.push({ kind: "number", text });
+      if (!/^\d+(?:\.\d+)?$/.test(text))
+        throw new SqlCompileError(`Invalid number: ${text}`, start, index - start);
+      tokens.push({ kind: "number", text, start, end: index });
       continue;
     }
     if (character === "'") {
-      index += 1;
+      const start = index++;
       let value = "";
       let closed = false;
       while (index < sql.length) {
@@ -3523,27 +3583,29 @@ function tokenize(sql: string): Token[] {
           break;
         } else value += sql[index++] ?? "";
       }
-      if (!closed) throw new TypeError("Unterminated string literal");
-      tokens.push({ kind: "string", text: value });
+      if (!closed)
+        throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
+      tokens.push({ kind: "string", text: value, start, end: index });
       continue;
     }
     const pair = sql.slice(index, index + 2);
     if (pair === "--" || pair === "/*") {
-      throw new TypeError("SQL comments are not supported");
+      throw new SqlCompileError("SQL comments are not supported", index, pair.length);
     }
-    if (character === ";") throw new TypeError("Run one SELECT statement at a time");
+    if (character === ";")
+      throw new SqlCompileError("Run one SELECT statement at a time", index, 1);
     if ([">=", "<=", "!=", "<>"].includes(pair)) {
-      tokens.push({ kind: "operator", text: pair });
+      tokens.push({ kind: "operator", text: pair, start: index, end: index + 2 });
       index += 2;
       continue;
     }
     if (["+", "-", "*", "/", "=", ">", "<"].includes(character))
-      tokens.push({ kind: "operator", text: character });
+      tokens.push({ kind: "operator", text: character, start: index, end: index + 1 });
     else if (["(", ")", ",", "."].includes(character))
-      tokens.push({ kind: "punctuation", text: character });
-    else throw new TypeError(`Unsupported SQL character: ${character}`);
+      tokens.push({ kind: "punctuation", text: character, start: index, end: index + 1 });
+    else throw new SqlCompileError(`Unsupported SQL character: ${character}`, index, 1);
     index += 1;
   }
-  tokens.push({ kind: "eof", text: "" });
+  tokens.push({ kind: "eof", text: "", start: sql.length, end: sql.length });
   return tokens;
 }

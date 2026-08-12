@@ -52,6 +52,7 @@ import {
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   MissingKeyError,
+  SqlCompileError,
   UniqueConstraintError,
 } from "./errors.js";
 import type { LiveQueryInput, LiveQueryStats, LiveQuerySubscribeOptions } from "./live.js";
@@ -124,6 +125,7 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
     CompactionMemoryBudgetError,
     CompactionWriteAmplificationError,
     CompactionJobCancelledError,
+    SqlCompileError,
     QueryMemoryBudgetError,
     WriteConflictError,
     UniqueKeyConflictError,

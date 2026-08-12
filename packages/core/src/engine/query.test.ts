@@ -2,9 +2,11 @@ import { IDBFactory } from "fake-indexeddb";
 import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
+import { SqlCompileError } from "./errors.js";
 import { QueryMemoryBudgetError } from "./memory.js";
 import {
   compileQuery,
+  compileStatement,
   createPreparedQuery,
   executeQuery,
   executeRowQuery,
@@ -1140,5 +1142,78 @@ describe("scalar functions", () => {
       { amount: 3 },
       { amount: 6 },
     ]);
+  });
+});
+
+describe("compile error positions", () => {
+  /** The text a `SqlCompileError` points at, sliced back out of the caller's own SQL. */
+  function failurePoint(compile: () => unknown, sql: string): { at: string; message: string } {
+    try {
+      compile();
+    } catch (error) {
+      if (!(error instanceof SqlCompileError)) throw error;
+      expect(error.offset).toBeGreaterThanOrEqual(0);
+      expect(error.offset + error.length).toBeLessThanOrEqual(sql.length);
+      return {
+        at: sql.slice(error.offset, error.offset + error.length),
+        message: error.message,
+      };
+    }
+    throw new Error(`Expected compilation to fail: ${sql}`);
+  }
+
+  function queryFailure(sql: string): { at: string; message: string } {
+    return failurePoint(() => compileQuery(sql), sql);
+  }
+
+  it("points tokenizer failures at the offending characters", () => {
+    expect(queryFailure("SELECT * FROM events WHERE x = 'oops")).toEqual({
+      at: "'oops",
+      message: "Unterminated string literal",
+    });
+    expect(queryFailure("SELECT * FROM events -- note").at).toBe("--");
+    expect(queryFailure("SELECT # FROM events").at).toBe("#");
+    expect(queryFailure("SELECT * FROM a; SELECT * FROM b").at).toBe(";");
+    expect(queryFailure("SELECT 1.2.3 FROM events").at).toBe("1.2.3");
+  });
+
+  it("points parser failures at the token that failed", () => {
+    expect(queryFailure("DELETE FROM events")).toEqual({
+      at: "DELETE",
+      message: "Expected SELECT, found DELETE",
+    });
+    // A query that ends early has nowhere to point but the end, so the span is empty.
+    expect(queryFailure("SELECT * FROM")).toEqual({
+      at: "",
+      message: "Expected identifier, found end of query",
+    });
+    expect(queryFailure("")).toEqual({ at: "", message: "Enter a SELECT query" });
+  });
+
+  it("reports positions in the caller's text, not the trimmed copy", () => {
+    // compileQuery trims before parsing; the offset must still index the string it was given.
+    expect(queryFailure("\n   DELETE FROM events").at).toBe("DELETE");
+    expect(queryFailure("\t\t SELECT # FROM events").at).toBe("#");
+  });
+
+  it("locates statement failures too", () => {
+    const sql = "  INSERT INTO t (a) SELECT a FROM t";
+    expect(failurePoint(() => compileStatement(sql), sql)).toEqual({
+      at: "SELECT",
+      message: "Expected VALUES, found SELECT",
+    });
+  });
+
+  it("stays a TypeError so existing handling keeps working", () => {
+    const error = (() => {
+      try {
+        compileQuery("DELETE FROM events");
+      } catch (thrown) {
+        return thrown;
+      }
+      throw new Error("Expected compilation to fail");
+    })();
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).toBeInstanceOf(SqlCompileError);
   });
 });
