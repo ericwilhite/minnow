@@ -316,6 +316,12 @@ export interface CompactionJobRecord {
   readonly maximumOutputStoredBytes?: number;
   /** Immutable conservative full-block upper bound for the planned output. */
   readonly plannedOutputStoredBytesUpperBound?: number;
+  /**
+   * Immutable stored bytes already written by cancelled or aborted attempts at these same
+   * sources. The persisted ceiling is reduced by this amount, so attempts share one lifetime
+   * write-amplification budget.
+   */
+  readonly priorAttemptOutputStoredBytes?: number;
   peakWorkingBytes?: number;
   outputLogicalBytes?: number;
   targetLevel: number;
@@ -785,25 +791,55 @@ export function normalizeSegmentRecord(record: SegmentRecord): SegmentRecord {
   if (record.level !== 2) {
     throw new TypeError("A partitioned segment must have explicit level two");
   }
-  if ((record.kind ?? "insert") !== "insert") {
-    throw new TypeError("A partitioned segment must be an insert");
+  const kind = record.kind ?? "insert";
+  if (kind !== "insert" && kind !== "base") {
+    throw new TypeError("A partitioned segment must be an insert or a merged base");
   }
   if (record.logicalOrder === undefined) {
     throw new TypeError("A partitioned segment requires an explicit logical order");
   }
   nonNegativeWholeNumber(record.logicalOrder, "Segment logical order");
-  if (record.rowIdSpans !== undefined) {
-    throw new TypeError("A partitioned segment cannot contain row ID spans");
-  }
   const rowCount = positiveWholeNumber(record.rowCount, "Segment row count");
-  if (typeof record.rowIdStart !== "bigint" || record.rowIdStart <= 0n) {
-    throw new RangeError("Segment row ID start must be a positive bigint");
+  if (kind === "insert") {
+    // Append-row-range partition: one contiguous positive row-ID interval, no spans.
+    if (record.rowIdSpans !== undefined) {
+      throw new TypeError("A partitioned segment cannot contain row ID spans");
+    }
+    if (typeof record.rowIdStart !== "bigint" || record.rowIdStart <= 0n) {
+      throw new RangeError("Segment row ID start must be a positive bigint");
+    }
+    if (
+      typeof record.rowIdEndExclusive !== "bigint" ||
+      record.rowIdEndExclusive !== record.rowIdStart + BigInt(rowCount)
+    ) {
+      throw new RangeError("A partitioned segment must have a contiguous positive row ID envelope");
+    }
+    return structuredClone({ ...record, partitionOrdinal });
   }
-  if (
-    typeof record.rowIdEndExclusive !== "bigint" ||
-    record.rowIdEndExclusive !== record.rowIdStart + BigInt(rowCount)
-  ) {
-    throw new RangeError("A partitioned segment must have a contiguous positive row ID envelope");
+  // Keyed multi-range partition: a merged full-row base whose live rows keep their original
+  // ids, described by positive, sorted, non-overlapping spans that sum to the row count.
+  if (record.rowIdSpans === undefined || record.rowIdSpans.length === 0) {
+    throw new TypeError("A merged partitioned segment requires row ID spans");
+  }
+  let spanRows = 0;
+  let previousEnd = 0n;
+  for (const span of record.rowIdSpans) {
+    if (
+      typeof span.rowIdStart !== "bigint" ||
+      span.rowIdStart <= 0n ||
+      !Number.isSafeInteger(span.rowCount) ||
+      span.rowCount <= 0
+    ) {
+      throw new RangeError("A partitioned segment span must be a positive non-empty interval");
+    }
+    if (span.rowIdStart < previousEnd) {
+      throw new RangeError("Partitioned segment spans must be sorted and non-overlapping");
+    }
+    previousEnd = span.rowIdStart + BigInt(span.rowCount);
+    spanRows += span.rowCount;
+  }
+  if (spanRows !== rowCount) {
+    throw new RangeError("Partitioned segment spans must cover exactly the row count");
   }
   return structuredClone({ ...record, partitionOrdinal });
 }
@@ -1218,6 +1254,11 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
   if (level2PolicyFieldCount !== 0 && level2PolicyFieldCount !== level2PolicyValues.length) {
     throw new TypeError("Append-row-range L2 compaction policy fields must be present together");
   }
+  if (record.priorAttemptOutputStoredBytes !== undefined && level2PolicyFieldCount === 0) {
+    throw new TypeError(
+      "Compaction prior-attempt accounting requires the L2 compaction policy fields",
+    );
+  }
   let level2Policy:
     | Pick<
         CompactionJobRecord,
@@ -1225,20 +1266,27 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
         | "maxWriteAmplification"
         | "maximumOutputStoredBytes"
         | "plannedOutputStoredBytesUpperBound"
+        | "priorAttemptOutputStoredBytes"
       >
     | undefined;
   if (level2PolicyFieldCount !== 0) {
-    if (rewritePlan.kind !== "rechunk-v1") {
-      throw new TypeError("Append-row-range L2 compaction requires a rechunk plan");
+    if (rewritePlan.kind !== "rechunk-v1" && rewritePlan.kind !== "merge-v1") {
+      throw new TypeError("L2 compaction requires a rechunk or merge plan");
     }
     if (record.targetLevel !== 2) {
       throw new TypeError("Append-row-range L2 compaction must target level two");
     }
+    // Append-row-range promotions consume pure level-zero prefixes; keyed merge promotions may
+    // also fold a retained level-one anchor, whose bytes never count toward the L0 ceiling.
     if (
-      sourceLevelStoredBytes?.level0SourceStoredBytes !== sourceStoredBytes ||
-      sourceLevelStoredBytes.anchorSourceStoredBytes !== 0
+      rewritePlan.kind === "rechunk-v1" &&
+      (sourceLevelStoredBytes?.level0SourceStoredBytes !== sourceStoredBytes ||
+        sourceLevelStoredBytes.anchorSourceStoredBytes !== 0)
     ) {
       throw new TypeError("Append-row-range L2 compaction requires only level-zero source bytes");
+    }
+    if (rewritePlan.kind === "merge-v1" && sourceLevelStoredBytes === undefined) {
+      throw new TypeError("Keyed L2 compaction requires source-level byte accounting");
     }
     const outputPartitionOrdinal = nonNegativeWholeNumber(
       record.outputPartitionOrdinal,
@@ -1256,12 +1304,21 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
       record.plannedOutputStoredBytesUpperBound,
       "Compaction planned output stored byte upper bound",
     );
+    const priorAttemptOutputStoredBytes =
+      record.priorAttemptOutputStoredBytes === undefined
+        ? undefined
+        : nonNegativeWholeNumber(
+            record.priorAttemptOutputStoredBytes,
+            "Compaction prior-attempt output stored bytes",
+          );
     const amplificationCeiling = floorWholeNumberProduct(
       sourceStoredBytes,
       maxWriteAmplification,
       "Compaction write amplification product",
     );
-    if (maximumOutputStoredBytes > amplificationCeiling) {
+    // The persisted ceiling plus everything failed attempts already wrote must stay within
+    // the amplification limit — attempts share one lifetime budget.
+    if (maximumOutputStoredBytes + (priorAttemptOutputStoredBytes ?? 0) > amplificationCeiling) {
       throw new RangeError("Compaction output stored byte ceiling exceeds its amplification limit");
     }
     if (plannedOutputStoredBytesUpperBound > maximumOutputStoredBytes) {
@@ -1275,6 +1332,7 @@ export function normalizeCompactionJobRecord(record: CompactionJobRecord): Compa
       maxWriteAmplification,
       maximumOutputStoredBytes,
       plannedOutputStoredBytesUpperBound,
+      ...(priorAttemptOutputStoredBytes === undefined ? {} : { priorAttemptOutputStoredBytes }),
     };
   }
   const normalized: CompactionJobRecord = {
@@ -1366,6 +1424,7 @@ export function updateCompactionJobRecord(
     "maxWriteAmplification",
     "maximumOutputStoredBytes",
     "plannedOutputStoredBytesUpperBound",
+    "priorAttemptOutputStoredBytes",
   ] as const) {
     if (Reflect.has(update, field)) {
       throw new TypeError(`Compaction ${field} is immutable`);

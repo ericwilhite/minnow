@@ -4270,26 +4270,9 @@ it("retains an optional L1 prefix while omitted targets continue established L2 
   store.close();
 });
 
-it("rejects keyed and malformed L2 layouts without creating compaction jobs", async () => {
+it("rejects non-keyed mutation histories and malformed L2 layouts without creating jobs", async () => {
   const store = new MemoryBlockStore();
   const database = new MinnowDatabase(store, { compression: "raw" });
-  await database.createTable({
-    name: "keyed_l2_rejection",
-    uniqueKey: "key",
-    columns: [
-      { name: "key", type: "string" },
-      { name: "value", type: "number" },
-    ],
-  });
-  await database.insert("keyed_l2_rejection", { key: "a", value: 1 });
-  await database.insert("keyed_l2_rejection", { key: "b", value: 2 });
-  expect(
-    await database.compactTable("keyed_l2_rejection", {
-      targetLevel: 2,
-      minimumLevel0Segments: 1,
-    }),
-  ).toMatchObject({ compacted: false, skipReason: "contains-mutation-segments" });
-
   await database.createTable({
     name: "interleaved_l2_layout",
     columns: [{ name: "value", type: "number" }],
@@ -4370,6 +4353,233 @@ it("rejects keyed and malformed L2 layouts without creating compaction jobs", as
     }),
   ).toMatchObject({ compacted: false, skipReason: "unsupported-level-layout" });
   expect(await store.listCompactionJobs()).toEqual([]);
+  store.close();
+});
+
+it("promotes keyed mutation prefixes into immutable multi-range L2 partitions", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "keyed_l2",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "label", type: "string" },
+    ],
+  });
+  const query = "SELECT id, label FROM keyed_l2 ORDER BY id";
+  const partitionSpans: Array<Array<{ rowIdStart: bigint; rowCount: number }>> = [];
+  for (let wave = 0; wave < 3; wave += 1) {
+    // Each wave inserts twelve keys, updates four of them, and deletes two — a self-contained
+    // keyed prefix whose merge folds every mutation it references.
+    const base = wave * 100;
+    await database.insertBatch("keyed_l2", {
+      columns: {
+        id: Array.from({ length: 12 }, (_, index) => base + index),
+        label: Array.from({ length: 12 }, (_, index) => `w${String(wave)}-${String(index)}`),
+      },
+    });
+    await database.updateBatch("keyed_l2", {
+      keys: [base, base + 1, base + 2, base + 3],
+      changes: {
+        label: [
+          `u${String(wave)}-0`,
+          `u${String(wave)}-1`,
+          `u${String(wave)}-2`,
+          `u${String(wave)}-3`,
+        ],
+      },
+    });
+    await database.deleteBatch("keyed_l2", { keys: [base + 10, base + 11] });
+
+    const before = await database.query(query);
+    const result = await database.compactTable("keyed_l2", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+      outputCompression: "raw",
+    });
+    expect(result).toMatchObject({
+      compacted: true,
+      outputPartitionOrdinal: wave,
+      priorAttemptOutputStoredBytes: 0,
+    });
+    expect(result.outputStoredBytes).toBeLessThanOrEqual(
+      result.plannedOutputStoredBytesUpperBound ?? 0,
+    );
+    expect(result.plannedOutputStoredBytesUpperBound ?? 0).toBeLessThanOrEqual(
+      result.maximumOutputStoredBytes ?? 0,
+    );
+    // The published partition is a merged full-row base carrying disjoint row-ID spans.
+    const table = await store.getTableByName("keyed_l2");
+    if (table === undefined) throw new Error("Expected the keyed table record");
+    const partitions = (await store.listSegments(table.id))
+      .filter((segment) => segment.partitionOrdinal !== undefined)
+      .sort((left, right) => (left.partitionOrdinal ?? 0) - (right.partitionOrdinal ?? 0));
+    expect(partitions.map((segment) => segment.partitionOrdinal)).toEqual(
+      Array.from({ length: wave + 1 }, (_, index) => index),
+    );
+    const record = partitions[wave];
+    if (record === undefined) throw new Error("Expected a published keyed partition");
+    expect(record).toMatchObject({ kind: "base", level: 2, partitionOrdinal: wave });
+    expect(record.rowIdSpans?.length ?? 0).toBeGreaterThan(0);
+    partitionSpans.push(
+      (record.rowIdSpans ?? []).map((span) => ({
+        rowIdStart: span.rowIdStart,
+        rowCount: span.rowCount,
+      })),
+    );
+    // Rows and order are untouched by the promotion.
+    expect(await database.query(query)).toEqual(before);
+  }
+  // Spans are pairwise disjoint across all published partitions.
+  const intervals = partitionSpans
+    .flat()
+    .map((span) => ({ start: span.rowIdStart, end: span.rowIdStart + BigInt(span.rowCount) }))
+    .sort((left, right) => (left.start < right.start ? -1 : 1));
+  for (let index = 1; index < intervals.length; index += 1) {
+    const interval = intervals[index];
+    const previous = intervals[index - 1];
+    if (interval === undefined || previous === undefined) throw new Error("Missing interval");
+    expect(interval.start >= previous.end).toBe(true);
+  }
+
+  // A delta referencing a key frozen into a published partition cannot fold without rewriting
+  // that partition; the planner skips explicitly and the data stays correct via replay.
+  await database.updateBatch("keyed_l2", { keys: [5], changes: { label: ["rewritten"] } });
+  const beforeSkip = await database.query(query);
+  expect(
+    await database.compactTable("keyed_l2", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+      outputCompression: "raw",
+    }),
+  ).toMatchObject({ compacted: false, skipReason: "keys-outside-selected-sources" });
+  expect(await store.listCompactionJobs()).toEqual(
+    (await store.listCompactionJobs()).filter((job) => job.state === "published"),
+  );
+  expect(await database.query(query)).toEqual(beforeSkip);
+  expect(beforeSkip.rows.find((row) => row.id === 5)?.label).toBe("rewritten");
+  store.close();
+});
+
+it("retries a cancelled keyed L2 promotion under the shared lifetime ceiling", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, { compression: "raw" });
+  await database.createTable({
+    name: "keyed_l2_retry",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "label", type: "string" },
+    ],
+  });
+  await database.insertBatch("keyed_l2_retry", {
+    columns: {
+      id: Array.from({ length: 16 }, (_, index) => index),
+      label: Array.from({ length: 16 }, (_, index) => `row-${String(index)}`),
+    },
+  });
+  await database.updateBatch("keyed_l2_retry", {
+    keys: [1, 3],
+    changes: { label: ["updated-1", "updated-3"] },
+  });
+  const query = "SELECT id, label FROM keyed_l2_retry ORDER BY id";
+  const before = await database.query(query);
+  const options = {
+    targetLevel: 2 as const,
+    minimumLevel0Segments: 1,
+    targetBlockBytes: 64,
+    outputCompression: "raw" as const,
+  };
+  const first = await database.compactTableStep("keyed_l2_retry", { ...options, maxBlocks: 1 });
+  expect(first.result).toBeNull();
+  if (first.jobId === null) throw new Error("Expected a keyed promotion job");
+  const interrupted = await store.getCompactionJob(first.jobId);
+  const attemptBytes = interrupted?.outputStoredBytes ?? 0;
+  expect(interrupted?.rewritePlan?.kind).toBe("merge-v1");
+  expect(interrupted?.outputPartitionOrdinal).toBe(0);
+  expect(attemptBytes).toBeGreaterThan(0);
+  await database.cancelCompactionJob(first.jobId);
+
+  const published = await database.compactTable("keyed_l2_retry", options);
+  expect(published).toMatchObject({
+    compacted: true,
+    outputPartitionOrdinal: 0,
+    priorAttemptOutputStoredBytes: attemptBytes,
+    lifetimeOutputStoredBytes: attemptBytes + published.outputStoredBytes,
+  });
+  expect(await database.query(query)).toEqual(before);
+  store.close();
+});
+
+it("shares one lifetime write-amplification budget across failed L2 attempts", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, { compression: "raw" });
+  await database.createTable({ name: "events", columns: [{ name: "value", type: "number" }] });
+  for (let value = 1; value <= 8; value += 1) await database.insert("events", { value });
+  const options = {
+    targetLevel: 2 as const,
+    minimumLevel0Segments: 8,
+    maxLevel0Segments: 8,
+    targetBlockBytes: 64,
+    outputCompression: "raw" as const,
+  };
+
+  // First attempt: one checkpointed output block, then cancellation.
+  const first = await database.compactTableStep("events", { ...options, maxBlocks: 1 });
+  expect(first.result).toBeNull();
+  if (first.jobId === null) throw new Error("Expected a persisted compaction job");
+  const interrupted = await store.getCompactionJob(first.jobId);
+  if (interrupted === undefined) throw new Error("Expected the interrupted job record");
+  const attemptBytes = interrupted.outputStoredBytes;
+  const fullCeiling = interrupted.maximumOutputStoredBytes ?? 0;
+  const plannedUpperBound = interrupted.plannedOutputStoredBytesUpperBound ?? 0;
+  const level0Bytes = interrupted.level0SourceStoredBytes ?? 0;
+  expect(attemptBytes).toBeGreaterThan(0);
+  expect(interrupted.priorAttemptOutputStoredBytes).toBe(0);
+  await database.cancelCompactionJob(first.jobId);
+
+  // The retry shares the lifetime ceiling: its budget shrinks by the cancelled attempt's bytes.
+  const second = await database.compactTableStep("events", { ...options, maxBlocks: 1 });
+  if (second.jobId === null) throw new Error("Expected a retry compaction job");
+  expect(second.jobId).not.toBe(first.jobId);
+  const retry = await store.getCompactionJob(second.jobId);
+  expect(retry).toMatchObject({
+    priorAttemptOutputStoredBytes: attemptBytes,
+    maximumOutputStoredBytes: fullCeiling - attemptBytes,
+  });
+  const secondBytes = retry?.outputStoredBytes ?? 0;
+  await database.cancelCompactionJob(second.jobId);
+
+  // With a cap sized exactly to the planned output, the bytes failed attempts already wrote
+  // starve the remaining budget and planning skips before writing anything.
+  const starvedAmplification = plannedUpperBound / level0Bytes;
+  const starved = await database.compactTableStep("events", {
+    ...options,
+    maxBlocks: 1,
+    maxWriteAmplification: starvedAmplification,
+  });
+  expect(starved.result).toMatchObject({
+    compacted: false,
+    skipReason: "write-amplification-budget",
+    priorAttemptOutputStoredBytes: attemptBytes + secondBytes,
+    lifetimeOutputStoredBytes: attemptBytes + secondBytes,
+    maximumOutputStoredBytes: Math.max(0, plannedUpperBound - attemptBytes - secondBytes),
+  });
+
+  // A published attempt reports the shared lifetime spend alongside its own output.
+  const published = await database.compactTable("events", options);
+  expect(published).toMatchObject({
+    compacted: true,
+    priorAttemptOutputStoredBytes: attemptBytes + secondBytes,
+    lifetimeOutputStoredBytes: attemptBytes + secondBytes + published.outputStoredBytes,
+  });
+  expect(published.outputStoredBytes).toBeLessThanOrEqual(
+    (published.maximumOutputStoredBytes ?? 0) + 0,
+  );
+  expect((published.maximumOutputStoredBytes ?? 0) + attemptBytes + secondBytes).toBe(
+    Math.floor(level0Bytes * 16),
+  );
   store.close();
 });
 

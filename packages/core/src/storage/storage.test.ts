@@ -1023,8 +1023,35 @@ for (const implementation of stores()) {
           message: "explicit level two",
         },
         {
-          record: { ...valid, id: "wrong-kind", kind: "base" },
-          message: "must be an insert",
+          record: { ...valid, id: "wrong-kind", kind: "update" },
+          message: "must be an insert or a merged base",
+        },
+        {
+          record: { ...valid, id: "base-without-spans", kind: "base" },
+          message: "requires row ID spans",
+        },
+        {
+          record: {
+            ...valid,
+            id: "base-overlapping-spans",
+            kind: "base",
+            rowCount: 4,
+            rowIdSpans: [
+              { rowStart: 0, rowCount: 2, rowIdStart: 5n },
+              { rowStart: 2, rowCount: 2, rowIdStart: 6n },
+            ],
+          },
+          message: "sorted and non-overlapping",
+        },
+        {
+          record: {
+            ...valid,
+            id: "base-span-row-count-mismatch",
+            kind: "base",
+            rowCount: 5,
+            rowIdSpans: [{ rowStart: 0, rowCount: 2, rowIdStart: 5n }],
+          },
+          message: "cover exactly the row count",
         },
         {
           record: { ...withoutLogicalOrder, id: "missing-logical-order" },
@@ -1540,25 +1567,65 @@ for (const implementation of stores()) {
           message: "planned output exceeds its stored byte ceiling",
         },
       ];
-      const mergePolicy = mergeCompactionJob("merge-level-two-policy");
+      const mergePolicy = mergeCompactionJob("merge-level-two-policy-missing-accounting");
       invalidRecords.push({
         record: {
           ...mergePolicy,
-          level0SourceStoredBytes: mergePolicy.sourceStoredBytes,
-          anchorSourceStoredBytes: 0,
           outputPartitionOrdinal: 0,
           maxWriteAmplification: 2,
           maximumOutputStoredBytes: 90,
           plannedOutputStoredBytesUpperBound: 80,
           targetLevel: 2,
         },
-        message: "requires a rechunk plan",
+        message: "requires source-level byte accounting",
+      });
+      invalidRecords.push({
+        record: {
+          ...level2CompactionJob("prior-attempts-without-policy"),
+          outputPartitionOrdinal: undefined,
+          maxWriteAmplification: undefined,
+          maximumOutputStoredBytes: undefined,
+          plannedOutputStoredBytesUpperBound: undefined,
+          priorAttemptOutputStoredBytes: 10,
+        } as unknown as CompactionJobRecord,
+        message: "requires the L2 compaction policy fields",
+      });
+      invalidRecords.push({
+        record: {
+          ...level2CompactionJob("prior-attempts-exceed-ceiling"),
+          maxWriteAmplification: 1,
+          maximumOutputStoredBytes: 355,
+          plannedOutputStoredBytesUpperBound: 300,
+          priorAttemptOutputStoredBytes: 6,
+        },
+        message: "ceiling exceeds its amplification limit",
       });
 
       for (const invalid of invalidRecords) {
         await expect(store.createCompactionJob(invalid.record)).rejects.toThrow(invalid.message);
         expect(await store.getCompactionJob(invalid.record.id)).toBeUndefined();
       }
+
+      // A keyed merge promotion persists the policy fields (with anchor bytes) and the shared
+      // lifetime accounting.
+      const keyedMerge = mergeCompactionJob("keyed-merge-level-two-policy");
+      const keyedMergeJob: CompactionJobRecord = {
+        ...keyedMerge,
+        level0SourceStoredBytes: keyedMerge.sourceStoredBytes - 10,
+        anchorSourceStoredBytes: 10,
+        outputPartitionOrdinal: 1,
+        maxWriteAmplification: 2,
+        maximumOutputStoredBytes: 85,
+        plannedOutputStoredBytesUpperBound: 80,
+        priorAttemptOutputStoredBytes: 5,
+        targetLevel: 2,
+      };
+      await store.createCompactionJob(keyedMergeJob);
+      expect(await store.getCompactionJob(keyedMergeJob.id)).toMatchObject({
+        outputPartitionOrdinal: 1,
+        priorAttemptOutputStoredBytes: 5,
+        anchorSourceStoredBytes: 10,
+      });
 
       const immutable = level2CompactionJob("immutable-level-two-policy");
       await store.createCompactionJob(immutable);
@@ -1567,6 +1634,7 @@ for (const implementation of stores()) {
         ["maxWriteAmplification", 3],
         ["maximumOutputStoredBytes", 700],
         ["plannedOutputStoredBytesUpperBound", 500],
+        ["priorAttemptOutputStoredBytes", 25],
       ] as const) {
         const update = {
           [field]: value,

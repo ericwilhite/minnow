@@ -463,11 +463,15 @@ become immutable ordinal L2 partitions, so prior L2 bytes are never rewritten.
 
 For a common configured cap, summing successfully published L2 output block bytes across those
 disjoint sources stays at or below that cap times the corresponding promoted L0 block bytes. This
-guarantee is intentionally narrower than total browser write amplification. It excludes output
-written by cancelled or aborted attempts, IndexedDB and manifest metadata, browser storage-engine
-overhead, garbage collection, and any claim about bytes ultimately returned to quota. Phase 6 still
-needs keyed/clustered multi-range L2, lifetime accounting for failed attempts, and spillable or
-resumable merge planning. Garbage collection now reclaims known unreachable physical artifacts with
+guarantee is intentionally narrower than total browser write amplification. It excludes IndexedDB
+and manifest metadata, browser storage-engine overhead, garbage collection, and any claim about
+bytes ultimately returned to quota — but it now includes output written by cancelled or aborted
+attempts, which persists on the retry's job record and reduces its ceiling so attempts at the same
+sources share one lifetime budget. Keyed tables promote multi-range L2 partitions through the
+merge path (span-carrying full-row bases; prefixes whose mutations reference keys in published
+partitions skip with `keys-outside-selected-sources`). Phase 6 still needs key-range (clustered)
+L2 partition rewrite and spillable or resumable merge planning. Garbage collection now reclaims
+known unreachable physical artifacts with
 paged/capped candidate and root envelopes, but scan work still scales with history and a single large
 metadata record remains unbounded. Unknown pre-journal orphans plus broader catalog, terminal-job,
 and metadata cleanup remain future work. A compaction result's

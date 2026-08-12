@@ -310,6 +310,7 @@ export interface CompactTableStepOptions extends CompactTableOptions {
 export type CompactionSkipReason =
   | "below-segment-threshold"
   | "contains-mutation-segments"
+  | "keys-outside-selected-sources"
   | "non-contiguous-row-ids"
   | "unsupported-level-layout"
   | "write-amplification-budget";
@@ -333,6 +334,10 @@ export interface CompactTableResult {
   maxWriteAmplification?: number;
   maximumOutputStoredBytes?: number;
   plannedOutputStoredBytesUpperBound?: number;
+  /** Stored bytes cancelled or aborted attempts at these sources already wrote. */
+  priorAttemptOutputStoredBytes?: number;
+  /** This attempt's output plus every prior failed attempt's, sharing one lifetime ceiling. */
+  lifetimeOutputStoredBytes?: number;
   outputLogicalBytes?: number;
   targetBlockBytes?: number;
   outputCompression?: Compression;
@@ -3210,6 +3215,7 @@ export class MinnowDatabase {
     let level0Segments: readonly SegmentRecord[];
     let effectiveMinimumLevel0Segments: number;
     let outputPartitionOrdinal: number | undefined;
+    let keyedLevelTwo = false;
     if (targetLevel === 1) {
       const firstLevel = visibleSegments[0]?.level ?? 0;
       const hasAnchor = firstLevel === 1;
@@ -3231,13 +3237,16 @@ export class MinnowDatabase {
       effectiveMinimumLevel0Segments = hasAnchor
         ? minimumLevel0Segments
         : Math.max(2, minimumLevel0Segments);
-    } else {
-      if (
-        table.uniqueKeyColumnId !== undefined ||
-        visibleSegments.some(
-          (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
-        )
-      ) {
+    } else if (
+      table.uniqueKeyColumnId !== undefined ||
+      visibleSegments.some(
+        (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+      )
+    ) {
+      // Keyed multi-range L2: merge (optional anchor + oldest level-zero prefix) into a new
+      // span-carrying partition. Published partitions are never rewritten; mutation kinds
+      // without a unique key cannot merge and keep the materialized skip.
+      if (table.uniqueKeyColumnId === undefined) {
         return compactTableSkipped(
           table.name,
           "contains-mutation-segments",
@@ -3246,6 +3255,22 @@ export class MinnowDatabase {
           version,
         );
       }
+      const layout = keyedLevelTwoLayout(visibleSegments);
+      if (layout === null) {
+        return compactTableSkipped(
+          table.name,
+          "unsupported-level-layout",
+          visibleSegments,
+          visibleBlockIds,
+          version,
+        );
+      }
+      anchor = layout.anchor;
+      level0Segments = layout.level0Segments;
+      effectiveMinimumLevel0Segments = minimumLevel0Segments;
+      outputPartitionOrdinal = layout.levelTwoSegments.length;
+      keyedLevelTwo = true;
+    } else {
       const layout = appendLevelTwoLayout(visibleSegments);
       if (layout === null) {
         return compactTableSkipped(
@@ -3281,12 +3306,15 @@ export class MinnowDatabase {
     const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
     const hasContiguousSourceRowIds = hasContiguousRowIds(sourceSegments);
     const hasPositiveSourceRowIds = (sourceSegments[0]?.rowIdStart ?? 0n) > 0n;
-    const requiresMerge =
-      targetLevel === 1 &&
-      (sourceSegments.some(
-        (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
-      ) ||
-        (!hasContiguousSourceRowIds && table.uniqueKeyColumnId !== undefined));
+    // A keyed L2 promotion always merges: one uniform partition shape (a full-row base with
+    // row-ID spans) regardless of whether the selected prefix happens to be pure inserts.
+    const requiresMerge = keyedLevelTwo
+      ? true
+      : targetLevel === 1 &&
+        (sourceSegments.some(
+          (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+        ) ||
+          (!hasContiguousSourceRowIds && table.uniqueKeyColumnId !== undefined));
     if (
       !requiresMerge &&
       (!hasContiguousSourceRowIds || (targetLevel === 2 && !hasPositiveSourceRowIds))
@@ -3326,16 +3354,10 @@ export class MinnowDatabase {
       options.memoryBudgetBytes ?? DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
       "Compaction memory budget",
     );
-    const rewritePlan = requiresMerge
-      ? await this.#createMergeCompactionPlan(
-          table,
-          sourceSegments,
-          targetBlockBytes,
-          outputCompression,
-          memoryBudgetBytes,
-          snapshot,
-        )
-      : await this.#createRechunkCompactionPlan(
+    let mergePlan: MergeCompactionRewritePlan | undefined;
+    if (requiresMerge) {
+      try {
+        mergePlan = await this.#createMergeCompactionPlan(
           table,
           sourceSegments,
           targetBlockBytes,
@@ -3343,6 +3365,32 @@ export class MinnowDatabase {
           memoryBudgetBytes,
           snapshot,
         );
+      } catch (error) {
+        // A keyed L2 prefix whose mutations reference keys living in already-published
+        // partitions cannot fold them without rewriting those partitions (key-range rewrite
+        // remains future work); those deltas stay as replayable level-zero history.
+        if (keyedLevelTwo && errorMessage(error).includes("references a missing key")) {
+          return compactTableSkipped(
+            table.name,
+            "keys-outside-selected-sources",
+            sourceSegments,
+            sourceBlockIds,
+            version,
+          );
+        }
+        throw error;
+      }
+    }
+    const rewritePlan =
+      mergePlan ??
+      (await this.#createRechunkCompactionPlan(
+        table,
+        sourceSegments,
+        targetBlockBytes,
+        outputCompression,
+        memoryBudgetBytes,
+        snapshot,
+      ));
     const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
     if (minimumMemoryBytes > memoryBudgetBytes) {
       throw new CompactionMemoryBudgetError(memoryBudgetBytes, minimumMemoryBytes);
@@ -3355,26 +3403,41 @@ export class MinnowDatabase {
       throw new Error("Compaction source byte accounting differs from its rewrite plan");
     }
 
+    const baseJobId = ["compaction", table.id, "manifest", String(version)].join("/");
     let levelTwoBudget:
       | {
           outputPartitionOrdinal: number;
           maxWriteAmplification: number;
           maximumOutputStoredBytes: number;
           plannedOutputStoredBytesUpperBound: number;
+          priorAttemptOutputStoredBytes: number;
         }
       | undefined;
     if (targetLevel === 2) {
-      if (rewritePlan.kind !== "rechunk-v1" || outputPartitionOrdinal === undefined) {
-        throw new Error("L2 compaction requires an append-only physical rewrite");
+      if (outputPartitionOrdinal === undefined) {
+        throw new Error("L2 compaction requires an append-only or merged physical rewrite");
       }
       const maxWriteAmplification = levelTwoMaxWriteAmplification;
       if (maxWriteAmplification === undefined) {
         throw new Error("L2 compaction write-amplification policy is missing");
       }
-      const maximumOutputStoredBytes = floorWholeNumberProduct(
-        selection.level0SourceStoredBytes,
-        maxWriteAmplification,
-        "Compaction maximum output stored bytes",
+      // Attempts at promoting the same sources share one lifetime ceiling: bytes a cancelled
+      // or aborted attempt already wrote for this manifest version reduce what the next
+      // attempt may spend, so repeated failures cannot multiply the physical write budget.
+      const priorAttemptOutputStoredBytes = (await this.store.listCompactionJobs(table.id))
+        .filter(
+          (candidate) =>
+            (candidate.state === "cancelled" || candidate.state === "aborted") &&
+            (candidate.id === baseJobId || candidate.id.startsWith(`${baseJobId}/retry/`)),
+        )
+        .reduce((total, candidate) => total + candidate.outputStoredBytes, 0);
+      const maximumOutputStoredBytes = Math.max(
+        0,
+        floorWholeNumberProduct(
+          selection.level0SourceStoredBytes,
+          maxWriteAmplification,
+          "Compaction maximum output stored bytes",
+        ) - priorAttemptOutputStoredBytes,
       );
       const plannedOutputStoredBytesUpperBound =
         await this.#plannedPhysicalOutputStoredBytesUpperBound(rewritePlan, snapshot);
@@ -3383,6 +3446,7 @@ export class MinnowDatabase {
         maxWriteAmplification,
         maximumOutputStoredBytes,
         plannedOutputStoredBytesUpperBound,
+        priorAttemptOutputStoredBytes,
       };
       if (plannedOutputStoredBytesUpperBound > maximumOutputStoredBytes) {
         return compactionWriteAmplificationSkipped({
@@ -3395,6 +3459,7 @@ export class MinnowDatabase {
           maxWriteAmplification,
           maximumOutputStoredBytes,
           plannedOutputStoredBytesUpperBound,
+          priorAttemptOutputStoredBytes,
           targetBlockBytes,
           outputCompression,
           memoryBudgetBytes,
@@ -3404,7 +3469,7 @@ export class MinnowDatabase {
       }
     }
 
-    let id = ["compaction", table.id, "manifest", String(version)].join("/");
+    let id = baseJobId;
     const existing = await this.store.getCompactionJob(id);
     if (existing !== undefined && existing.state !== "aborted" && existing.state !== "cancelled") {
       return existing;
@@ -4637,11 +4702,15 @@ export class MinnowDatabase {
       }
     }
     if (job.outputPartitionOrdinal !== undefined) {
-      if (plan.kind !== "rechunk-v1") {
-        throw new Error("L2 compaction requires a rechunk rewrite plan");
+      if (plan.kind === "rechunk-v1") {
+        await this.#assertLevelTwoSnapshotOrder(job, plan, snapshot, transactions);
+        return;
       }
-      await this.#assertLevelTwoSnapshotOrder(job, plan, snapshot, transactions);
-      return;
+      if (plan.kind !== "merge-v1") {
+        throw new Error("L2 compaction requires a rechunk or merge rewrite plan");
+      }
+      // A keyed multi-range promotion falls through to the merge-source and ordering checks
+      // below; the retained partitions are validated against the planned ordinal there.
     }
     let latestSource: Pick<
       MergeCompactionSourceSegment,
@@ -4680,8 +4749,15 @@ export class MinnowDatabase {
     if (latestSource === null || outputLogicalOrder === null) {
       throw new Error("Compaction source order is unavailable");
     }
+    const retainedPartitionOrdinals: number[] = [];
     for (const segment of visibleSegments) {
       if (sourceIds.has(segment.id)) continue;
+      // A keyed L2 promotion retains the already-published partitions untouched; they precede
+      // the merge sources by construction and are validated against the planned ordinal below.
+      if (job.outputPartitionOrdinal !== undefined && segment.partitionOrdinal !== undefined) {
+        retainedPartitionOrdinals.push(segment.partitionOrdinal);
+        continue;
+      }
       if ((segment.level ?? 0) !== 0) {
         throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
       }
@@ -4699,6 +4775,15 @@ export class MinnowDatabase {
         }) >= 0
       ) {
         throw new Error(`Concurrent segment would reorder compaction output: ${segment.id}`);
+      }
+    }
+    if (job.outputPartitionOrdinal !== undefined) {
+      retainedPartitionOrdinals.sort((left, right) => left - right);
+      if (
+        retainedPartitionOrdinals.length !== job.outputPartitionOrdinal ||
+        retainedPartitionOrdinals.some((ordinal, index) => ordinal !== index)
+      ) {
+        throw new Error("Concurrent segments violate the planned L2 layout");
       }
     }
   }
@@ -4949,6 +5034,9 @@ export class MinnowDatabase {
             maxWriteAmplification: job.maxWriteAmplification ?? 0,
             maximumOutputStoredBytes: job.maximumOutputStoredBytes ?? 0,
             plannedOutputStoredBytesUpperBound: job.plannedOutputStoredBytesUpperBound ?? 0,
+            priorAttemptOutputStoredBytes: job.priorAttemptOutputStoredBytes ?? 0,
+            lifetimeOutputStoredBytes:
+              (job.priorAttemptOutputStoredBytes ?? 0) + job.outputStoredBytes,
           }),
       outputLogicalBytes,
       ...(rewritePlan.kind !== "copy-v1"
@@ -7468,6 +7556,9 @@ function compactionProgress(
           maxWriteAmplification: job.maxWriteAmplification ?? 0,
           maximumOutputStoredBytes: job.maximumOutputStoredBytes ?? 0,
           plannedOutputStoredBytesUpperBound: job.plannedOutputStoredBytesUpperBound ?? 0,
+          priorAttemptOutputStoredBytes: job.priorAttemptOutputStoredBytes ?? 0,
+          lifetimeOutputStoredBytes:
+            (job.priorAttemptOutputStoredBytes ?? 0) + job.outputStoredBytes,
         }),
     ...(rewritePlan.kind !== "copy-v1"
       ? {
@@ -7799,6 +7890,81 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
   return { retainedPrefix, levelTwoSegments, level0Segments };
 }
 
+interface KeyedLevelTwoLayout {
+  levelTwoSegments: readonly SegmentRecord[];
+  anchor: SegmentRecord | undefined;
+  level0Segments: readonly SegmentRecord[];
+}
+
+/**
+ * Validates a keyed table's visible history for multi-range L2 promotion: existing partitions
+ * (append-shaped inserts or merged bases carrying row-ID spans) with ordinals exactly 0..N-1,
+ * then an optional single level-one anchor, then level-zero segments of any mutation kind. Every
+ * row footprint — a partition's spans or interval, the anchor's, and each level-zero
+ * insert/upsert interval — must be pairwise disjoint; update and delete deltas carry no
+ * footprint. Returns null when the shape does not hold so the planner skips explicitly.
+ */
+function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoLayout | null {
+  let index = 0;
+  const levelTwoSegments: SegmentRecord[] = [];
+  for (;;) {
+    const segment = segments[index];
+    if (segment === undefined || (segment.level ?? 0) !== 2) break;
+    const kind = segment.kind ?? "insert";
+    if (
+      segment.partitionOrdinal !== levelTwoSegments.length ||
+      !Number.isSafeInteger(segment.logicalOrder) ||
+      (segment.logicalOrder ?? -1) < 0 ||
+      (kind !== "insert" && kind !== "base") ||
+      (kind === "insert" && segment.rowIdSpans !== undefined) ||
+      (kind === "base" && (segment.rowIdSpans?.length ?? 0) === 0)
+    ) {
+      return null;
+    }
+    levelTwoSegments.push(segment);
+    index += 1;
+  }
+  let anchor: SegmentRecord | undefined;
+  const maybeAnchor = segments[index];
+  if (maybeAnchor !== undefined && (maybeAnchor.level ?? 0) === 1) {
+    const kind = maybeAnchor.kind ?? "insert";
+    if ((kind !== "insert" && kind !== "base") || maybeAnchor.partitionOrdinal !== undefined) {
+      return null;
+    }
+    anchor = maybeAnchor;
+    index += 1;
+  }
+  const level0Segments = segments.slice(index);
+  if (
+    level0Segments.some(
+      (segment) => (segment.level ?? 0) !== 0 || segment.partitionOrdinal !== undefined,
+    )
+  ) {
+    return null;
+  }
+  const intervals: Array<{ start: bigint; end: bigint }> = [];
+  for (const segment of segments) {
+    if (segment.rowIdSpans !== undefined) {
+      for (const span of segment.rowIdSpans) {
+        intervals.push({ start: span.rowIdStart, end: span.rowIdStart + BigInt(span.rowCount) });
+      }
+      continue;
+    }
+    if (segment.rowIdEndExclusive <= segment.rowIdStart) continue;
+    if (segment.rowIdEndExclusive - segment.rowIdStart !== BigInt(segment.rowCount)) return null;
+    intervals.push({ start: segment.rowIdStart, end: segment.rowIdEndExclusive });
+  }
+  intervals.sort((left, right) =>
+    left.start < right.start ? -1 : left.start > right.start ? 1 : 0,
+  );
+  for (const [intervalIndex, interval] of intervals.entries()) {
+    if (interval.start <= 0n) return null;
+    const previous = intervals[intervalIndex - 1];
+    if (previous !== undefined && interval.start < previous.end) return null;
+  }
+  return { levelTwoSegments, anchor, level0Segments };
+}
+
 function compactionWriteAmplificationSkipped(input: {
   tableName: string;
   sourceSegments: readonly SegmentRecord[];
@@ -7809,6 +7975,7 @@ function compactionWriteAmplificationSkipped(input: {
   maxWriteAmplification: number;
   maximumOutputStoredBytes: number;
   plannedOutputStoredBytesUpperBound: number;
+  priorAttemptOutputStoredBytes: number;
   targetBlockBytes: number;
   outputCompression: Compression;
   memoryBudgetBytes: number;
@@ -7832,6 +7999,8 @@ function compactionWriteAmplificationSkipped(input: {
     maxWriteAmplification: input.maxWriteAmplification,
     maximumOutputStoredBytes: input.maximumOutputStoredBytes,
     plannedOutputStoredBytesUpperBound: input.plannedOutputStoredBytesUpperBound,
+    priorAttemptOutputStoredBytes: input.priorAttemptOutputStoredBytes,
+    lifetimeOutputStoredBytes: input.priorAttemptOutputStoredBytes,
     targetBlockBytes: input.targetBlockBytes,
     outputCompression: input.outputCompression,
     memoryBudgetBytes: input.memoryBudgetBytes,

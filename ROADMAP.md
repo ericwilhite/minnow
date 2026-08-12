@@ -330,10 +330,11 @@ in progress, but an in-flight step observes it at the next durable boundary and
 cursor, progress, metrics, and completed artifact IDs until a collection pass proves their artifacts
 unreachable.
 
-Remaining Phase 6 delivery:
+Remaining Phase 6 delivery (keyed multi-range L2 selection and lifetime write-amplification
+accounting for cancelled/aborted attempts landed 2026-08-12; see the checklist entry):
 
-- keyed/clustered multi-range L2 selection;
-- lifetime write-amplification accounting that includes cancelled and aborted attempts;
+- key-range (clustered) L2 partition rewrite, so mutations referencing keys inside published
+  partitions can fold instead of accumulating as replayable level-zero history;
 - spillable or resumable merge planning before the immutable plan exists;
 - bounded source-record envelopes and indexed root discovery that avoids full metadata scans; and
 - broader unknown-orphan, catalog, terminal-job, and metadata cleanup.
@@ -629,11 +630,13 @@ The current repository slice has completed the Phase 5 storage/write foundation 
 four-way durability matrix. Phase 6A through Phase 6E-A now provide durable, restart-safe,
 output-block-stepped physical rechunking, bounded oldest-prefix L0-to-L1 selection, keyed mutation
 merging with stable row IDs, immutable append-row-range L2 partitions with a hard published-output
-byte budget, safe cooperative job cancellation, and lease-aware physical reclamation for artifacts
-with persisted provenance. Phase 6 remains open for keyed/clustered multi-range L2, failed-attempt
-lifetime amplification accounting, spillable/resumable merge planning, chunked planning/indexed
-roots, and broader orphan/catalog/job cleanup. The broader Phase 5 performance curves and
-larger/repeated benchmark tiers remain outstanding.
+byte budget, safe cooperative job cancellation, lease-aware physical reclamation for artifacts
+with persisted provenance, keyed multi-range L2 promotion through the merge path, and lifetime
+write-amplification accounting that charges cancelled and aborted attempts against their retry's
+ceiling. Phase 6 remains open for key-range (clustered) L2 partition rewrite,
+spillable/resumable merge planning, chunked planning/indexed roots, and broader
+orphan/catalog/job cleanup. The broader Phase 5 performance curves and larger/repeated benchmark
+tiers remain outstanding.
 
 - [x] Record architecture and roadmap.
 - [x] Scaffold packages and quality gates.
@@ -665,8 +668,22 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Merge keyed upsert/update/delete deltas into row-ID-preserving full-row base segments.
 - [x] Add bounded oldest-prefix L0 -> L1 selection with persisted incremental amplification inputs.
 - [x] Add immutable append-row-range L2 partitions with a hard published-output byte budget.
-- [ ] Build keyed/clustered multi-range L2 selection and failed-attempt lifetime amplification
-      accounting.
+- [x] Build keyed multi-range L2 selection and failed-attempt lifetime amplification
+      accounting (2026-08-12). A keyed table's [partitions][optional anchor][L0 prefix] history
+      now promotes (anchor + oldest prefix) through the merge path into a new level-2 partition:
+      a full-row base segment carrying its merged row-ID spans and the next ordinal, with the
+      same immutable amplification policy fields as append-row-range promotions (anchor bytes
+      never count toward the L0 ceiling). A prefix whose mutations reference keys frozen into
+      published partitions skips with `keys-outside-selected-sources` — those deltas stay as
+      replayable level-zero history, because folding them requires key-range partition rewrite,
+      which remains open. Lifetime accounting: attempts at promoting the same manifest version's
+      sources share one ceiling — bytes written by cancelled or aborted attempts persist as
+      `priorAttemptOutputStoredBytes` and reduce the retry's `maximumOutputStoredBytes`, results
+      report `lifetimeOutputStoredBytes`, and a starved ceiling skips with
+      `write-amplification-budget` before any write.
+- [ ] Key-range (clustered) L2 partition rewrite: fold mutations that reference keys inside
+      published partitions by selecting and rewriting the intersecting partitions as merge
+      sources, with rewritten-partition bytes entering the lifetime amplification accounting.
 - [x] Add safe compaction-job cancellation.
 - [x] Add lease-aware garbage collection and physical reclamation for superseded blocks.
 - [x] Route the public SQL subset and mutation replay through the Phase 7A columnar executor.

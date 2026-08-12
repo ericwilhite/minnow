@@ -220,15 +220,27 @@ inherit the earliest source `logicalOrder`, so an unselected or concurrently com
 remains after the consolidated output. A caller can explicitly lower the minimum to one to drain
 `L1 + 1 L0`; a table without an anchor still requires at least two sources.
 
-The Phase 6E-A policy is append-row-range L2, not clustered/key-range L2. A caller explicitly starts
-it with `targetLevel: 2` on a non-keyed table. The visible layout must be one optional retained legacy
-L1 insert, then L2 insert partitions with exact consecutive `partitionOrdinal` values `0..N-1`, then
-ordinary L0 inserts. The planner takes only an oldest complete L0 prefix and emits one new L2
-partition at ordinal `N`; neither the L1 nor any earlier L2 partition is a rewrite source. Once `N`
-is positive, an omitted target automatically continues L2. This policy permits a minimum of one,
-including direct one-segment L0-to-L2 promotion. A unique key, mutation/base segment, row-ID gap in
-the selected sources, or malformed level/ordinal layout makes the policy skip without weakening its
-append-only assumptions.
+The Phase 6E-A policy is append-row-range L2. A caller explicitly starts it with `targetLevel: 2`
+on a non-keyed table. The visible layout must be one optional retained legacy L1 insert, then L2
+insert partitions with exact consecutive `partitionOrdinal` values `0..N-1`, then ordinary L0
+inserts. The planner takes only an oldest complete L0 prefix and emits one new L2 partition at
+ordinal `N`; neither the L1 nor any earlier L2 partition is a rewrite source. Once `N` is
+positive, an omitted target automatically continues L2. This policy permits a minimum of one,
+including direct one-segment L0-to-L2 promotion. A mutation/base segment without a unique key,
+a row-ID gap in the selected sources, or a malformed level/ordinal layout makes the policy skip
+without weakening its append-only assumptions.
+
+A keyed table promotes through the merge path instead: its visible layout may hold multi-range L2
+partitions (merged full-row `base` segments carrying disjoint row-ID spans, or append-shaped
+inserts) at ordinals `0..N-1`, then an optional single L1 anchor, then L0 segments of any mutation
+kind. The planner merges (anchor + oldest L0 prefix) into one new span-carrying partition at
+ordinal `N` under the same immutable amplification policy fields; anchor bytes never count toward
+the L0 ceiling. Published partitions are never rewritten, so a prefix whose mutations reference
+keys frozen into earlier partitions skips with `keys-outside-selected-sources` and those deltas
+stay as replayable level-zero history — folding them requires key-range partition rewrite, which
+remains future work. Failed attempts share one lifetime budget: bytes written by cancelled or
+aborted attempts at the same manifest version persist as `priorAttemptOutputStoredBytes`, reduce
+the retry's persisted ceiling, and appear in results as `lifetimeOutputStoredBytes`.
 
 Ordinal-less level-two jobs persisted by the earlier generic target-level implementation remain
 resumable for durable upgrade compatibility. They lack the four Phase 6E-A policy fields and are
@@ -402,10 +414,11 @@ prefix and no existing L2 partition is rewritten.
 
 Under a common configured cap, the sum of those successfully published L2 full-block bytes is at
 most the cap times the sum of their promoted L0 block bytes. This is a hard publication invariant,
-not a claim about all physical writes: cancelled or aborted attempts may already have written
-unpublished output, and metadata, IndexedDB internals, garbage collection, browser disk traffic, and
-quota recovery are outside the accounting boundary. Keyed/clustered multi-range L2, lifetime
-accounting for failed attempts, spillable or resumable merge planning, chunked collection
+not a claim about all physical writes: metadata, IndexedDB internals, garbage collection, browser
+disk traffic, and quota recovery are outside the accounting boundary. Cancelled and aborted
+attempts' unpublished output is now inside it: those bytes persist on the retry's job record and
+reduce its ceiling, so attempts at the same sources share one lifetime budget. Key-range
+(clustered) L2 partition rewrite, spillable or resumable merge planning, chunked collection
 planning/indexed root discovery, and broader orphan, catalog, terminal-job, and metadata cleanup
 remain future work. Known unreachable source/output artifacts are physically reclaimable by the
 separate collector.
