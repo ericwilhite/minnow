@@ -10,13 +10,13 @@
   "dependencies": {
     "@minnowdb/core": "0.0.0",
     "@electric-sql/pglite": "^0.5.4",
-    "@shikijs/core": "^3.0.0",
-    "@shikijs/engine-javascript": "^3.0.0",
-    "@shikijs/langs": "^3.0.0",
-    "@shikijs/themes": "^3.0.0",
+    "@shikijs/core": "^4.4.3",
+    "@shikijs/engine-javascript": "^4.4.3",
+    "@shikijs/langs": "^4.4.3",
+    "@shikijs/themes": "^4.4.3",
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
   },
   "devDependencies": {
-    "vite": "^7.1.1"
+    "vite": "^8.2.1"
   }
 }

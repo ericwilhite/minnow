@@ -263,6 +263,8 @@ function rewriteForInner(
     }
     return { ...expression, branches, ...(otherwise === undefined ? {} : { otherwise }) };
   }
+  // A full-text document is defined against its own scan source; never push it inward.
+  if (expression.kind === "fts") return undefined;
   // An EXISTS block (the only remaining kind) is self-contained, so it moves unchanged.
   return expression;
 }
@@ -313,6 +315,12 @@ function pruneDerivedProjections(block: CompiledQuery): void {
     if (derived.select.some((item) => item.expression.kind === "wildcard")) continue;
     const referenced = referencedOutputAliases(block, source, singleSource);
     if (referenced === undefined) continue;
+    // The block's own ORDER BY resolves against its select aliases (including the hidden
+    // "(order N)" items the ORDER-BY-expression desugar adds), so those outputs are
+    // load-bearing even when the outer block never reads them.
+    for (const order of derived.orderBy) {
+      if (order.expression.kind === "column") referenced.add(order.expression.reference);
+    }
     const kept = derived.select.filter((item) => referenced.has(item.alias));
     if (kept.length === derived.select.length) continue;
     derived.select = kept.length > 0 ? kept : derived.select.slice(0, 1);
@@ -354,7 +362,11 @@ function referencedOutputAliases(
       if (expression.otherwise !== undefined) visit(expression.otherwise);
     } else if (expression.kind === "call") expression.arguments.forEach(visit);
     else if (expression.kind === "list") expression.items.forEach(visit);
-    else if (expression.kind === "window") {
+    else if (expression.kind === "fts") {
+      // MATCH(*) references every source column, so pruning is unprovable.
+      if (expression.columns === "*") state.provable = false;
+      else expression.columns.forEach(visit);
+    } else if (expression.kind === "window") {
       expression.partitionBy.forEach(visit);
       expression.orderBy.forEach((order) => {
         visit(order.expression);
@@ -521,6 +533,12 @@ function renderExpression(expression: Expression): string {
   if (expression.kind === "exists") return "exists (subquery)";
   if (expression.kind === "case") {
     return `case [${String(expression.branches.length)} branches]`;
+  }
+  if (expression.kind === "fts") {
+    const columns =
+      expression.columns === "*" ? "*" : expression.columns.map(renderExpression).join(", ");
+    const name = expression.op === "match" ? "match" : "bm25";
+    return `${name}(${columns}) against '${expression.query}'`;
   }
   return `${expression.name}(...) over (...)`;
 }

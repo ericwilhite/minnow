@@ -32,9 +32,27 @@ import {
   type ValidatedPhysicalColumn,
 } from "../block-format/index.js";
 import {
+  fillColumnDefaults,
+  patchAutoIncrementValues,
+  type AutoIncrementFill,
+  type FilledBatch,
+} from "./defaults.js";
+import {
+  cachedQueryTerms,
+  FTS_TOKENIZER_VERSION,
+  renderDocumentValue,
+  tokenize as ftsTokenize,
+  type FtsStats,
+} from "./fts.js";
+import {
   simpleDataTypes,
   floorWholeNumberProduct,
   type BlockStore,
+  type ColumnDefault,
+  validateColumnDefault,
+  type FtsColumnDelta,
+  type FtsColumnIndexRecord,
+  type FtsPosting,
   CompactionJobConflictError,
   type CompactionJobRecord,
   type CompactionJobState,
@@ -60,6 +78,7 @@ import {
   type TableRecord,
   type TransactionRecord,
   SnapshotManifestMissingError,
+  TableRecordConflictError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
   WriteConflictError,
@@ -83,7 +102,14 @@ import {
   expressionColumnNames,
   inferBlockSchema,
   referencedColumns,
+  childExpressions,
+  expandFtsColumns,
+  forEachBlockExpression,
+  planContainsFts,
+  projectResultColumns,
   subqueryResolutionSteps,
+  topLevelFtsMatchConjuncts,
+  transparentProjectionSource,
   windowOutputType,
   type ComparisonOperator,
   type CompiledQuery,
@@ -112,6 +138,7 @@ import {
 import {
   columnarTableFromRows,
   createColumnarTable,
+  vectorValue,
   type ColumnarTable,
   type ColumnVector,
   type QuerySpillStore,
@@ -192,6 +219,8 @@ export interface ColumnDefinition {
   name: string;
   type: SimpleDataType;
   nullable?: boolean;
+  /** Fills null-or-absent slots at insert time; never applied at read time. */
+  defaultValue?: ColumnDefault;
 }
 
 export interface CreateTableInput {
@@ -210,6 +239,11 @@ export interface InsertBatchResult {
   storedBytes: number;
   version: number;
   metrics: WriteMetrics;
+  /**
+   * Full written vectors, input row order, for every column where the engine filled at least
+   * one default or generated slot. Absent when the batch was written exactly as provided.
+   */
+  generatedColumns?: Record<string, BatchValue[]>;
 }
 
 export interface UpsertBatchResult extends InsertBatchResult {
@@ -448,6 +482,12 @@ export interface MinnowDatabaseOptions {
    * 0 disables the cache. Defaults to 64 MiB.
    */
   prepareCacheBytes?: number;
+  /**
+   * Visible-row threshold at which a full-text MATCH on an unindexed append-only column
+   * schedules a background index build (fire-and-forget; correctness never waits on it).
+   * Defaults to 4096.
+   */
+  ftsAutoIndexRows?: number;
 }
 
 export interface QuerySpillCleanupOptions {
@@ -529,6 +569,9 @@ export class MinnowDatabase {
   readonly #liveSets = new Set<LiveQuerySet>();
   #internalLeaseSequence = 0;
   readonly #prepareCacheLimitBytes: number;
+  readonly #ftsAutoIndexRows: number;
+  /** One background build attempt per (table, column) per session; misses just stay scans. */
+  readonly #ftsBuildsInFlight = new Set<string>();
   /** Insertion order doubles as LRU order; hits re-insert their entry. */
   readonly #prepareCache = new Map<string, { payload: unknown; bytes: number }>();
   #prepareCacheUsedBytes = 0;
@@ -566,6 +609,10 @@ export class MinnowDatabase {
     if (!Number.isSafeInteger(this.#prepareCacheLimitBytes) || this.#prepareCacheLimitBytes < 0) {
       throw new RangeError("Prepare cache bytes must be a non-negative whole number");
     }
+    this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
+    if (!Number.isSafeInteger(this.#ftsAutoIndexRows) || this.#ftsAutoIndexRows < 0) {
+      throw new RangeError("Full-text auto-index row threshold must be a non-negative whole number");
+    }
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
       createId: this.#createId,
@@ -588,6 +635,7 @@ export class MinnowDatabase {
         name: columnName,
         type: column.type,
         nullable: column.nullable ?? false,
+        ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
       };
     });
     const uniqueKeyColumn =
@@ -599,6 +647,14 @@ export class MinnowDatabase {
     }
     if (uniqueKeyColumn?.nullable === true) {
       throw new TypeError(`Unique key cannot be nullable: ${uniqueKeyColumn.name}`);
+    }
+    for (const column of columns) {
+      if (column.defaultValue !== undefined) {
+        validateColumnDefault(
+          { ...column, isUniqueKey: column === uniqueKeyColumn },
+          column.defaultValue,
+        );
+      }
     }
     await this.store.addTable({
       id: this.#createId(),
@@ -620,6 +676,7 @@ export class MinnowDatabase {
           name: column.name,
           type: column.type,
           nullable: column.nullable,
+          ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
         })),
         ...(uniqueKey === undefined ? {} : { uniqueKey }),
       };
@@ -628,10 +685,13 @@ export class MinnowDatabase {
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
     const table = await this.#findTable(tableName);
-    const batch = toColumnarBatch(input);
-    const rowCount = validateBatch(table, batch);
-    const keys = batchKeys(table, batch);
-    const result = await this.#writeBatch(table, batch, "insert", keys);
+    const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    const keys =
+      autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
+        ? batchKeys(table, batch)
+        : undefined;
+    const result = await this.#writeBatch(table, batch, "insert", keys, autoIncrement);
+    collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       tableName: result.tableName,
       segmentId: result.segmentId,
@@ -640,7 +700,21 @@ export class MinnowDatabase {
       storedBytes: result.storedBytes,
       version: result.version,
       metrics: result.metrics,
+      ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
     };
+  }
+
+  /** Pivots, fills pure defaults, and validates — the shared front half of insert and upsert. */
+  #fillDefaults(
+    table: TableRecord,
+    input: InsertBatchInput,
+  ): FilledBatch & { rowCount: number } {
+    const pivoted = toColumnarBatch(input);
+    // The pivot stamps rowCount, so an all-default batch keeps its row count even after the
+    // columnar form crossed the worker boundary.
+    const filled = fillColumnDefaults(table, pivoted, this.#now, pivoted.rowCount);
+    const rowCount = validateBatch(table, filled.batch, filled.autoIncrement?.column.name);
+    return { ...filled, rowCount };
   }
 
   async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
@@ -653,12 +727,16 @@ export class MinnowDatabase {
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
     }
-    const batch = toColumnarBatch(input);
-    const rowCount = validateBatch(table, batch);
-    const keys = batchKeys(table, batch);
-    if (keys === undefined) throw new Error("Unique key metadata is missing");
-    const result = await this.#writeBatch(table, batch, "upsert", keys);
-    return { ...result, rowCount };
+    const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
+    const keys = deferred ? undefined : batchKeys(table, batch);
+    const result = await this.#writeBatch(table, batch, "upsert", keys, autoIncrement);
+    collectAutoIncrementGenerated(batch, generated, autoIncrement);
+    return {
+      ...result,
+      rowCount,
+      ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
+    };
   }
 
   async upsert(tableName: string, row: BatchRow): Promise<UpsertBatchResult> {
@@ -714,7 +792,7 @@ export class MinnowDatabase {
       remove: true,
       ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
     });
-    let deletedRowCount = 0;
+    let deletedRowCount: number;
     let storedBytes = 0;
     let blockCount = 0;
     let encodeMs = 0;
@@ -981,39 +1059,79 @@ export class MinnowDatabase {
     input: ColumnarBatch,
     kind: "insert" | "upsert",
     keys: Map<string, Exclude<BatchValue, null>> | undefined,
+    autoIncrement?: AutoIncrementFill,
   ): Promise<UpsertBatchResult> {
     const started = performance.now();
     const rowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     const logicalBytes = estimateBatchBytes(input);
-    const { transaction, rowIds: reservedRowIds } = await this.#transactions.beginWithReservation({
-      tableId: table.id,
-      count: rowCount,
-    });
-    if (keys !== undefined) {
-      transaction.setUniqueKeyChanges({
-        tableId: table.id,
-        keyTokens: [...keys.keys()],
-        requireAbsent: kind === "insert",
-        ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
-      });
-    }
+    const { transaction, rowIds: reservedRowIds, autoIncrementValues } =
+      await this.#transactions.beginWithReservation(
+        { tableId: table.id, count: rowCount },
+        autoIncrement === undefined
+          ? undefined
+          : {
+              tableId: table.id,
+              columnId: autoIncrement.column.id,
+              count: autoIncrement.missingIndexes.length,
+              atLeast: autoIncrement.atLeast,
+            },
+      );
+    let resolvedKeys = keys;
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const batchBlockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
     let storedBytes = 0;
     let blockCount = 0;
-    let counts = { inserted: 0, updated: 0 };
+    let counts: { inserted: number; updated: number };
     let encodeMs = 0;
     let stageMs = 0;
     let commitMs = 0;
     let retries = 0;
 
     try {
+      if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
+        // Generated values are assigned once here and survive commit-retry rebase unchanged,
+        // exactly like reserved row ids; an abort burns the range and leaves a gap.
+        const values =
+          autoIncrementValues ??
+          (await this.store.reserveAutoIncrement(
+            table.id,
+            autoIncrement.column.id,
+            autoIncrement.missingIndexes.length,
+            autoIncrement.atLeast,
+          ));
+        patchAutoIncrementValues(input, autoIncrement, values);
+        // The pending column's nulls were exempted from pre-validation; the patched slots pass
+        // the same validator as caller-supplied values, so every persisted slot is validated.
+        const patched = input.columns[autoIncrement.column.name] ?? [];
+        for (const rowIndex of autoIncrement.missingIndexes) {
+          validateValue(autoIncrement.column, patched[rowIndex] ?? null, rowIndex);
+        }
+        resolvedKeys = batchKeys(table, input);
+      }
+      if (resolvedKeys !== undefined) {
+        transaction.setUniqueKeyChanges({
+          tableId: table.id,
+          keyTokens: [...resolvedKeys.keys()],
+          requireAbsent: kind === "insert",
+          ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
+        });
+      }
       counts =
-        kind === "insert" && keys !== undefined
-          ? { inserted: keys.size, updated: 0 }
-          : await this.#classifyKeys(table, transaction.snapshotVersion, kind, keys);
+        kind === "insert" && resolvedKeys !== undefined
+          ? { inserted: resolvedKeys.size, updated: 0 }
+          : await this.#classifyKeys(table, transaction.snapshotVersion, kind, resolvedKeys);
       const rowIds = reservedRowIds ?? (await this.store.reserveRowIds(table.id, rowCount));
+      // Insert batches maintain any active full-text index by tokenizing their own rows into a
+      // commit delta. Other mutation kinds emit nothing on purpose: the store's stale-writer
+      // rule then flips the index to "invalid" (keyed histories are unindexable) and the scan
+      // path stays correct.
+      if (kind === "insert") {
+        const ftsDeltas = buildFtsColumnDeltas(table, input, rowIds.start);
+        if (ftsDeltas.length > 0) {
+          transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
+        }
+      }
       for (const column of table.columns) {
         const values = input.columns[column.name] ?? [];
         const blockIds: string[] = [];
@@ -1093,17 +1211,17 @@ export class MinnowDatabase {
           retries += 1;
           const snapshot = await transaction.rebase();
           counts =
-            kind === "insert" && keys !== undefined
-              ? { inserted: keys.size, updated: 0 }
-              : await this.#classifyKeys(table, snapshot.version, kind, keys);
+            kind === "insert" && resolvedKeys !== undefined
+              ? { inserted: resolvedKeys.size, updated: 0 }
+              : await this.#classifyKeys(table, snapshot.version, kind, resolvedKeys);
         }
       }
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      if (error instanceof UniqueKeyConflictError && keys !== undefined) {
+      if (error instanceof UniqueKeyConflictError && resolvedKeys !== undefined) {
         const keyColumn = getUniqueKeyColumn(table);
-        const value = keys.get(error.keyToken);
+        const value = resolvedKeys.get(error.keyToken);
         if (keyColumn !== undefined && value !== undefined) {
           throw new UniqueConstraintError(table.name, keyColumn.name, value);
         }
@@ -1155,6 +1273,7 @@ export class MinnowDatabase {
     try {
       let columnarTables = new Map<string, ColumnarTable>();
       let resolvedPlan = plan;
+      let ftsStats: Map<string, FtsStats> | undefined;
       const prepareAtSnapshot = async (
         snapshot: LeasedSnapshot,
         realTables: Map<string, TableRecord>,
@@ -1166,7 +1285,13 @@ export class MinnowDatabase {
             table.columns.map(({ name, type }) => ({ name, type })),
           ]),
         );
-        const resolution = subqueryResolutionSteps(plan);
+        // MATCH(*)/BM25(*) expand against the catalog first — copy-on-write, so the compile
+        // cache's plan (and the parity tests) keep "*" — and subquery resolution then collects
+        // its steps from the expanded plan so substitutions land in the object that executes.
+        const expandedPlan = expandFtsColumns(plan, (tableName) =>
+          searchableFtsColumns(realTables.get(tableName)),
+        );
+        const resolution = subqueryResolutionSteps(expandedPlan);
         for (const step of resolution.steps) {
           step.substitute(
             await this.#executeBlockCached(
@@ -1180,6 +1305,9 @@ export class MinnowDatabase {
           );
         }
         resolvedPlan = resolution.plan;
+        // Index-served BM25 statistics, computed against the same catalog snapshot the pruner
+        // reads, so a pruned scoring scan always carries exact corpus numbers.
+        ftsStats = await this.#ftsIndexStats(resolvedPlan, realTables, snapshot, visibility);
         columnarTables = await this.#prepareBlockInputs(
           resolvedPlan,
           snapshot,
@@ -1203,6 +1331,7 @@ export class MinnowDatabase {
         chooseJoinOrder(resolvedPlan, columnarTables),
         columnarTables,
         memory,
+        ftsStats === undefined ? {} : { ftsStats },
       );
     } catch (error) {
       memory.close();
@@ -1522,6 +1651,15 @@ export class MinnowDatabase {
     if (this.#canStreamPlanShape(plan, options)) {
       const streamed = await this.#queryStreamed(plan, options, spillPageRows);
       if (streamed !== undefined) return streamed;
+    } else {
+      // An ORDER-BY-expression wrapper is a pure projection over the real query: stream the
+      // inner block and project the hidden ordering column away, so the wrap never costs a
+      // query its streaming eligibility.
+      const wrapper = transparentProjectionSource(plan);
+      if (wrapper !== undefined && this.#canStreamPlanShape(wrapper.inner, options)) {
+        const streamed = await this.#queryStreamed(wrapper.inner, options, spillPageRows);
+        if (streamed !== undefined) return projectResultColumns(streamed, wrapper.aliases);
+      }
     }
     const prepared = await this.#prepareCompiledPlan(plan, options);
     try {
@@ -1693,6 +1831,22 @@ export class MinnowDatabase {
   async migrate(
     definition: SchemaDefinition<readonly AnyTable[]>,
   ): Promise<{ createdTables: string[]; alteredTables: string[]; steps: MigrationStep[] }> {
+    // Table revisions also move under background full-text index activity (build stamps,
+    // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
+    // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
+    // a genuinely concurrent migrator still fails explicitly once the retries are exhausted.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#migrateOnce(definition);
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  async #migrateOnce(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+  ): Promise<{ createdTables: string[]; alteredTables: string[]; steps: MigrationStep[] }> {
     // One listTables pass drives planning and execution: a create step exists only because the
     // table was absent from this snapshot, and each altered table applies all of its steps in a
     // single compare-and-swap, so a migration costs one catalog write per changed table however
@@ -1714,6 +1868,9 @@ export class MinnowDatabase {
             name,
             type: columnDefinition.type,
             ...(columnDefinition.isNullable ? { nullable: true } : {}),
+            ...(columnDefinition.defaultSpec === undefined
+              ? {}
+              : { defaultValue: columnDefinition.defaultSpec }),
           })),
         });
         createdTables.push(step.table.name);
@@ -1742,7 +1899,15 @@ export class MinnowDatabase {
    * the prepared execution would choose, without executing it.
    */
   async explain(sql: string): Promise<string> {
-    const plan = this.#compileCached(sql);
+    let plan = this.#compileCached(sql);
+    // Explain reports on the plan the engine would execute, so MATCH(*)/BM25(*) expand against
+    // the catalog exactly as preparation does (copy-on-write — the cache keeps "*").
+    if (planContainsFts(plan)) {
+      const realTables = await this.#findRealBlockTables(plan);
+      plan = expandFtsColumns(plan, (tableName) =>
+        searchableFtsColumns(realTables.get(tableName)),
+      );
+    }
     const notes: string[] = [];
     if (this.#canStreamPlanShape(plan, { executionMemoryBudgetBytes: 1 })) {
       notes.push("eligible to stream the base scan through resident block windows under a budget");
@@ -1757,6 +1922,47 @@ export class MinnowDatabase {
       }
     }
     if (blockHasSubqueries(plan)) notes.push("resolves uncorrelated subqueries at one snapshot");
+    if (planContainsFts(plan)) {
+      notes.push("full-text MATCH evaluates via per-dictionary term tables on the scan");
+      if (table === undefined && plan.joins.length === 0) {
+        const record = await this.#findTable(plan.base.table);
+        const readyColumnIds = new Set(
+          Object.entries(record.ftsColumns ?? {})
+            .filter(
+              ([, state]) =>
+                state.state === "ready" && state.tokenizerVersion === FTS_TOKENIZER_VERSION,
+            )
+            .map(([columnId]) => columnId),
+        );
+        const columnsByName = new Map(
+          record.columns.map((column) => [column.name, column] as const),
+        );
+        const scoringServed = [...this.#ftsBm25Nodes(plan).values()].every((node) =>
+          node.columns.every((expression) => {
+            if (expression.kind !== "column") return false;
+            const column = columnsByName.get(
+              expression.reference.split(".").at(-1) ?? expression.reference,
+            );
+            return column !== undefined && readyColumnIds.has(column.id);
+          }),
+        );
+        const scoring = planContainsFts(plan, "bm25");
+        if (readyColumnIds.size > 0 && (!scoring || scoringServed)) {
+          notes.push("a ready full-text index prunes the base scan to candidate segments");
+        }
+        if (scoring) {
+          notes.push(
+            scoringServed
+              ? "BM25 statistics come from the full-text index"
+              : "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
+          );
+        }
+      } else if (planContainsFts(plan, "bm25")) {
+        notes.push(
+          "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
+        );
+      }
+    }
     return `${renderPlan(plan)}\n${notes.map((note) => `-- ${note}`).join("\n")}`;
   }
 
@@ -1791,17 +1997,29 @@ export class MinnowDatabase {
         columns[column] = statement.rows.map((row) => row[index] ?? null);
       });
       const result = await this.insertBatch(statement.table, { columns });
-      const returningColumns =
-        options.returning === undefined
-          ? undefined
-          : options.returning === "*"
-            ? statement.columns
+      let returningColumns: readonly string[] | undefined;
+      if (options.returning !== undefined) {
+        // A default-bearing column may be returned even when the column list omits it — the
+        // engine generated its values and reported them back.
+        const table = await this.#findTable(statement.table);
+        const defaultNames = new Set(
+          table.columns
+            .filter((column) => column.defaultValue !== undefined)
+            .map((column) => column.name),
+        );
+        returningColumns =
+          options.returning === "*"
+            ? table.columns
+                .map((column) => column.name)
+                .filter((name) => statement.columns.includes(name) || defaultNames.has(name))
             : options.returning;
-      for (const name of returningColumns ?? []) {
-        if (!statement.columns.includes(name)) {
-          throw new TypeError(`INSERT returning column is not in the column list: ${name}`);
+        for (const name of returningColumns) {
+          if (!statement.columns.includes(name) && !defaultNames.has(name)) {
+            throw new TypeError(`INSERT returning column is not in the column list: ${name}`);
+          }
         }
       }
+      const generated = result.generatedColumns ?? {};
       return {
         kind: "insert",
         table: statement.table,
@@ -1810,11 +2028,11 @@ export class MinnowDatabase {
         ...(returningColumns === undefined
           ? {}
           : {
-              returnedRows: statement.rows.map((row) =>
+              returnedRows: statement.rows.map((row, rowIndex) =>
                 Object.fromEntries(
-                  returningColumns.map((name) => [
+                  (returningColumns ?? []).map((name) => [
                     name,
-                    row[statement.columns.indexOf(name)] ?? null,
+                    generated[name]?.[rowIndex] ?? row[statement.columns.indexOf(name)] ?? null,
                   ]),
                 ),
               ),
@@ -1970,6 +2188,11 @@ export class MinnowDatabase {
     const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
     const uniqueTableNames = [...new Set(tableNames)];
     const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
+    // Copy-on-write: expansion clones only full-text plans, leaving the compile cache's copy
+    // untouched.
+    plan = expandFtsColumns(plan, (tableName) =>
+      searchableFtsColumns(tables.find((table) => table.name === tableName)),
+    );
     const schemas = new Map(
       tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
     );
@@ -1997,7 +2220,24 @@ export class MinnowDatabase {
         transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
         segmentsByTable,
       };
-      const baseSegments = await this.#visibleSegmentRecords(baseTable, snapshot, visibility);
+      // Scoring needs corpus statistics: streamed windows cannot run the scan-side stats pass,
+      // so a BM25 plan streams only when the index serves exact statistics; otherwise fall
+      // back to the materialized path.
+      const ftsStats = await this.#ftsIndexStats(
+        plan,
+        new Map(tables.map((record) => [record.name, record])),
+        snapshot,
+        visibility,
+      );
+      if (planContainsFts(plan, "bm25") && ftsStats === undefined) return undefined;
+      // The streamed scan honors the same index pruning as the materialized path; a budgeted
+      // MATCH query must not silently pay the full scan just because it streams.
+      const baseSegments = await this.#ftsPrunedSegments(
+        baseTable,
+        await this.#visibleSegmentRecords(baseTable, snapshot, visibility),
+        plan,
+        snapshot,
+      );
       const baseView = this.#streamedViewFactory(
         baseTable,
         projectedBaseColumns,
@@ -2070,7 +2310,12 @@ export class MinnowDatabase {
               ),
             );
           }
-          prepared = createPreparedColumnarQuery(plan, inputTables, memory);
+          prepared = createPreparedColumnarQuery(
+            plan,
+            inputTables,
+            memory,
+            ftsStats === undefined ? {} : { ftsStats },
+          );
           if (!attempt.spill) {
             try {
               return await prepared.executeAsync({ loadScanWindow: streamed.load });
@@ -2696,6 +2941,7 @@ export class MinnowDatabase {
     typedSchemas: Map<string, SqlColumnSchema[]>,
     extraInputs?: ReadonlyMap<string, ColumnarTable>,
   ): Promise<QueryResult> {
+    const ftsStats = await this.#ftsIndexStats(block, realTables, snapshot, visibility);
     const inputs = await this.#prepareBlockInputs(
       block,
       snapshot,
@@ -2705,7 +2951,12 @@ export class MinnowDatabase {
       typedSchemas,
       extraInputs,
     );
-    const prepared = createPreparedColumnarQuery(block, inputs, memory.createChild());
+    const prepared = createPreparedColumnarQuery(
+      block,
+      inputs,
+      memory.createChild(),
+      ftsStats === undefined ? {} : { ftsStats },
+    );
     try {
       return prepared.execute();
     } finally {
@@ -3134,7 +3385,8 @@ export class MinnowDatabase {
       } catch (error) {
         if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
         const latest = await this.store.getGarbageCollectionJob(job.id);
-        if (latest === undefined) throw new Error(`Garbage collection job not found: ${job.id}`);
+        if (latest === undefined)
+          throw new Error(`Garbage collection job not found: ${job.id}`, { cause: error });
         job = latest;
       }
     }
@@ -4429,7 +4681,7 @@ export class MinnowDatabase {
             job,
             "Compaction sources changed before publication",
           );
-          throw new Error(job.error);
+          throw new Error(job.error, { cause: error });
         }
         const rebased = await transaction.rebase();
         try {
@@ -4437,7 +4689,7 @@ export class MinnowDatabase {
         } catch (error) {
           if (transaction.status === "active") await transaction.abort();
           job = await this.#abortCompactionJob(job, errorMessage(error));
-          throw new Error(job.error);
+          throw new Error(job.error, { cause: error });
         }
         const missingSourceId = job.sourceBlockIds.find((id) => !rebased.hasBlock(id));
         if (missingSourceId !== undefined) {
@@ -4446,7 +4698,7 @@ export class MinnowDatabase {
             job,
             `Compaction source is no longer visible: ${missingSourceId}`,
           );
-          throw new Error(job.error);
+          throw new Error(job.error, { cause: error });
         }
         transaction.supersedeBlocks(job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
@@ -5296,6 +5548,295 @@ export class MinnowDatabase {
     );
   }
 
+  /**
+   * Builds (or rebuilds) the persisted full-text pruning index for one column from the current
+   * snapshot. Append-only tables only. The planner consults the index when the column is
+   * "ready" with a matching tokenizer version and re-verifies every candidate row, so a stale,
+   * missing, or lost index costs speed, never correctness. Searches schedule this lazily once
+   * a table crosses the auto-index threshold; calling it directly is just a warm-up.
+   */
+  async buildFtsIndex(tableName: string, columnName: string): Promise<void> {
+    const table = await this.#findTable(tableName);
+    const column = table.columns.find((candidate) => candidate.name === columnName);
+    if (column === undefined) throw new TypeError(`Unknown column: ${columnName}`);
+    if (column.type === "boolean") {
+      throw new TypeError(`Full-text indexes cannot cover boolean columns: ${columnName}`);
+    }
+    const stamp = (
+      record: TableRecord,
+      state: FtsColumnIndexRecord["state"],
+      buildFromVersion: number,
+    ): Promise<TableRecord> =>
+      this.store.updateTable(record.id, record.revision ?? 0, {
+        ftsColumns: {
+          ...record.ftsColumns,
+          [column.id]: {
+            storage: "fts-chunks-v1",
+            tokenizerVersion: FTS_TOKENIZER_VERSION,
+            state,
+            buildFromVersion,
+          },
+        },
+      });
+    // From this flip on, every writer that reads the record emits commit deltas; writers that
+    // committed against the older record flip the column to "invalid" in the store, which the
+    // ready-CAS below observes as a revision conflict and abandons the build.
+    const marked = await stamp(table, "building", -1);
+    await this.#withLeasedSnapshot(undefined, async (snapshot) => {
+      const segments = await this.#visibleSegmentRecords(marked, snapshot);
+      if (segments.some((segment) => (segment.kind ?? "insert") !== "insert")) {
+        await stamp(marked, "invalid", -1).catch(() => undefined);
+        throw new TypeError(
+          `Full-text indexes support append-only tables; ${tableName} has keyed mutations`,
+        );
+      }
+      const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+      const vector = await this.#materializeAppendColumnVector(
+        column,
+        segments,
+        snapshot,
+        rowCount,
+      );
+      const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
+      let totalTokens = 0;
+      let offset = 0;
+      for (const segment of segments) {
+        for (let row = 0; row < segment.rowCount; row += 1) {
+          totalTokens += addFtsDocument(
+            byTerm,
+            vectorValue(vector, offset + row),
+            segment.rowIdStart + BigInt(row),
+          );
+        }
+        offset += segment.rowCount;
+      }
+      const coversVersion = snapshot.version ?? -1;
+      await this.store.writeFtsBase(table.id, column.id, {
+        coversVersion,
+        chunks: chunkFtsPostings(sortedFtsPostings(byTerm)),
+        totalTokens,
+      });
+      const fresh = await this.store.getTable(table.id);
+      const current = fresh?.ftsColumns?.[column.id];
+      if (fresh !== undefined && current?.state === "building") {
+        await this.store.updateTable(fresh.id, fresh.revision ?? 0, {
+          ftsColumns: {
+            ...fresh.ftsColumns,
+            [column.id]: { ...current, state: "ready", buildFromVersion: coversVersion },
+          },
+        });
+      }
+    });
+  }
+
+  /**
+   * Segment-level candidate pruning for a top-level MATCH conjunct backed by ready indexes.
+   * Candidates come from per-term postings (union across the document's columns, intersection
+   * across terms); segments whose row-id range contains no candidate cannot satisfy the
+   * conjunct and drop before their blocks are read. The scan still evaluates MATCH on every
+   * surviving row, so false positives are free and false negatives are impossible for
+   * append-only histories (rows never change after their postings are written).
+   */
+  /**
+   * The top block's BM25 nodes, deduplicated by their compiled signature — the same key the
+   * executor's bind step uses, so served statistics land on exactly the nodes that asked.
+   */
+  #ftsBm25Nodes(plan: CompiledQuery): Map<string, { columns: Expression[]; query: string }> {
+    const nodes = new Map<string, { columns: Expression[]; query: string }>();
+    const visit = (expression: Expression): void => {
+      if (expression.kind === "fts" && expression.op === "bm25" && expression.columns !== "*") {
+        nodes.set(JSON.stringify(expression), {
+          columns: expression.columns,
+          query: expression.query,
+        });
+        return;
+      }
+      for (const child of childExpressions(expression)) visit(child);
+    };
+    forEachBlockExpression(plan, visit);
+    return nodes;
+  }
+
+  /**
+   * Whether the persisted index can serve exact BM25 statistics for every scoring node of the
+   * plan. This single predicate is shared by the stats service and the segment pruner over the
+   * same catalog snapshot, so "the scan was pruned" implies "statistics came from the index" —
+   * the invariant that keeps scores identical whether or not an index exists.
+   */
+  #ftsIndexServesScoring(
+    plan: CompiledQuery,
+    table: TableRecord,
+    segments: readonly SegmentRecord[],
+  ): boolean {
+    if (plan.joins.length > 0 || plan.base.table !== table.name) return false;
+    if (!segments.every((segment) => (segment.kind ?? "insert") === "insert")) return false;
+    const columnsByName = new Map(table.columns.map((column) => [column.name, column] as const));
+    for (const node of this.#ftsBm25Nodes(plan).values()) {
+      for (const expression of node.columns) {
+        if (expression.kind !== "column") return false;
+        const column = columnsByName.get(
+          expression.reference.split(".").at(-1) ?? expression.reference,
+        );
+        const state = column === undefined ? undefined : table.ftsColumns?.[column.id];
+        if (state?.state !== "ready" || state.tokenizerVersion !== FTS_TOKENIZER_VERSION) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Exact BM25 corpus statistics from the postings index, keyed by node signature, or
+   * undefined when any scoring node cannot be served (the scan then computes its own).
+   * docCount is the visible row count (every row is a document); per-term document frequency
+   * is the size of the union of the term's posting row ids across the document's columns; and
+   * token totals merge from the base plus commit deltas. All exact for append-only histories.
+   */
+  async #ftsIndexStats(
+    plan: CompiledQuery,
+    realTables: ReadonlyMap<string, TableRecord>,
+    snapshot: LeasedSnapshot,
+    visibility?: SegmentVisibilityCatalog,
+  ): Promise<Map<string, FtsStats> | undefined> {
+    if (!planContainsFts(plan, "bm25")) return undefined;
+    const table = realTables.get(plan.base.table);
+    if (table === undefined) return undefined;
+    const nodes = this.#ftsBm25Nodes(plan);
+    if (nodes.size === 0) return undefined;
+    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+    if (!this.#ftsIndexServesScoring(plan, table, segments)) return undefined;
+    const docCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+    const columnsByName = new Map(table.columns.map((column) => [column.name, column] as const));
+    const upToVersion = snapshot.version ?? -1;
+    const stats = new Map<string, FtsStats>();
+    for (const [signature, node] of nodes) {
+      const terms = cachedQueryTerms(node.query);
+      const columns = node.columns.map((expression) =>
+        expression.kind === "column"
+          ? columnsByName.get(expression.reference.split(".").at(-1) ?? expression.reference)
+          : undefined,
+      );
+      if (columns.some((column) => column === undefined)) return undefined;
+      const perColumn = await Promise.all(
+        (columns as TableColumnRecord[]).map((column) =>
+          this.store.readFtsCandidates(table.id, column.id, terms, upToVersion),
+        ),
+      );
+      if (perColumn.some((result) => result.deltaChunkCount > 16)) {
+        this.#scheduleFtsBuilds(table, columns as TableColumnRecord[], segments, true);
+      }
+      const dfByTerm = terms.map(
+        (_, term) =>
+          unionSortedRowIds(perColumn.map((result) => result.rowIdsByTerm[term] ?? [])).length,
+      );
+      stats.set(signature, {
+        docCount,
+        totalTokens: perColumn.reduce((total, result) => total + result.totalTokens, 0),
+        dfByTerm,
+      });
+    }
+    return stats;
+  }
+
+  async #ftsPrunedSegments(
+    table: TableRecord,
+    segments: SegmentRecord[],
+    plan: CompiledQuery,
+    snapshot: LeasedSnapshot,
+  ): Promise<SegmentRecord[]> {
+    if (plan.joins.length > 0 || plan.base.table !== table.name) return segments;
+    const matches = topLevelFtsMatchConjuncts(plan);
+    if (matches.length === 0) return segments;
+    if (!segments.every((segment) => (segment.kind ?? "insert") === "insert")) return segments;
+    // A scoring plan may only prune when the index serves its corpus statistics — otherwise
+    // the scan-side stats pass would measure a shrunken corpus and scores would change the
+    // moment an index appeared. The shared predicate keeps this in lockstep with the stats
+    // service reading the same catalog snapshot.
+    if (
+      planContainsFts(plan, "bm25") &&
+      !this.#ftsIndexServesScoring(plan, table, segments)
+    ) {
+      return segments;
+    }
+    const columnsByName = new Map(table.columns.map((column) => [column.name, column] as const));
+    let surviving = segments;
+    for (const match of matches) {
+      const terms = cachedQueryTerms(match.query);
+      if (terms.length === 0) continue;
+      const columns = match.columns.flatMap((expression) =>
+        expression.kind === "column"
+          ? [columnsByName.get(expression.reference.split(".").at(-1) ?? expression.reference)]
+          : [undefined],
+      );
+      if (columns.some((column) => column === undefined)) continue;
+      const resolved = columns as TableColumnRecord[];
+      const ready = resolved.every((column) => {
+        const state = table.ftsColumns?.[column.id];
+        return state?.state === "ready" && state.tokenizerVersion === FTS_TOKENIZER_VERSION;
+      });
+      if (!ready) {
+        this.#scheduleFtsBuilds(table, resolved, segments);
+        continue;
+      }
+      const upToVersion = snapshot.version ?? -1;
+      const perColumn = await Promise.all(
+        resolved.map((column) =>
+          this.store.readFtsCandidates(table.id, column.id, terms, upToVersion),
+        ),
+      );
+      // A long delta tail re-merges on every read; folding is just a rebuild at a newer version.
+      if (perColumn.some((result) => result.deltaChunkCount > 16)) {
+        this.#scheduleFtsBuilds(table, resolved, segments, true);
+      }
+      // Document semantics over sorted candidate arrays: per term, union across the document's
+      // columns; across terms, intersection. Both are linear merges, and the segment filter is
+      // then one binary search per segment — no per-candidate scans.
+      let candidates: bigint[] | undefined;
+      for (let term = 0; term < terms.length; term += 1) {
+        const union = unionSortedRowIds(perColumn.map((result) => result.rowIdsByTerm[term] ?? []));
+        candidates = candidates === undefined ? union : intersectSortedRowIds(candidates, union);
+        if (candidates.length === 0) break;
+      }
+      const candidateList = candidates ?? [];
+      surviving =
+        candidateList.length === 0
+          ? []
+          : surviving.filter((segment) =>
+              sortedRowIdsIntersectRange(
+                candidateList,
+                segment.rowIdStart,
+                segment.rowIdEndExclusive,
+              ),
+            );
+      if (surviving.length === 0) break;
+    }
+    return surviving;
+  }
+
+  /**
+   * Fire-and-forget lazy index builds. Keys release when the attempt settles, so a failed or
+   * lost build (including a column durably stuck in "building" after a killed tab) retries on
+   * the next search rather than wedging for the session.
+   */
+  #scheduleFtsBuilds(
+    table: TableRecord,
+    columns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    rebuild = false,
+  ): void {
+    const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
+    if (!rebuild && rowCount < this.#ftsAutoIndexRows) return;
+    for (const column of columns) {
+      const key = `${table.id}/${column.id}`;
+      if (this.#ftsBuildsInFlight.has(key)) continue;
+      this.#ftsBuildsInFlight.add(key);
+      void this.buildFtsIndex(table.name, column.name)
+        .catch(() => undefined)
+        .finally(() => this.#ftsBuildsInFlight.delete(key));
+    }
+  }
+
   async #materializeColumnarTableAtSnapshot(
     table: TableRecord,
     snapshot: LeasedSnapshot,
@@ -5303,7 +5844,11 @@ export class MinnowDatabase {
     visibility?: SegmentVisibilityCatalog,
     plan?: CompiledQuery,
   ): Promise<ColumnarTable> {
-    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+    const visibleSegments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+    const segments =
+      plan === undefined
+        ? visibleSegments
+        : await this.#ftsPrunedSegments(table, visibleSegments, plan, snapshot);
     const keyColumn = getUniqueKeyColumn(table);
     if (
       segments.every((segment) => {
@@ -6155,7 +6700,12 @@ function validateName(name: string, kind: string): string {
   return trimmed;
 }
 
-function validateBatch(table: TableRecord, input: ColumnarBatch): number {
+
+function validateBatch(
+  table: TableRecord,
+  input: ColumnarBatch,
+  pendingColumn?: string,
+): number {
   const expected = new Set(table.columns.map((column) => column.name));
   for (const name of Object.keys(input.columns)) {
     if (!expected.has(name)) throw new TypeError(`Unknown column: ${name}`);
@@ -6170,14 +6720,29 @@ function validateBatch(table: TableRecord, input: ColumnarBatch): number {
   for (const column of table.columns) {
     const values = input.columns[column.name] ?? [];
     if (values.length !== rowCount) throw new TypeError("All columns must have the same row count");
+    // The pending auto-increment column keeps its null slots until the write path reserves a
+    // range from storage, so nulls pass here; every explicit value still type-checks.
+    const allowNull = column.name === pendingColumn;
     // An index loop rather than forEach: forEach skips holes in sparse arrays, which would let an
     // undefined value reach the block encoder and persist a corrupt block that only fails at read
     // time. Every slot is validated, holes included.
     for (let index = 0; index < values.length; index += 1) {
-      validateValue(column, values[index] as BatchValue, index);
+      const value = values[index] as BatchValue;
+      if (allowNull && value === null) continue;
+      validateValue(column, value, index);
     }
   }
   return rowCount;
+}
+
+/** Folds the storage-generated auto-increment vector into the generated-columns result map. */
+function collectAutoIncrementGenerated(
+  batch: ColumnarBatch,
+  generated: Map<string, BatchValue[]>,
+  autoIncrement: AutoIncrementFill | undefined,
+): void {
+  if (autoIncrement === undefined || autoIncrement.missingIndexes.length === 0) return;
+  generated.set(autoIncrement.column.name, [...(batch.columns[autoIncrement.column.name] ?? [])]);
 }
 
 function validateUpdateBatch(
@@ -6244,6 +6809,127 @@ function validateValue(column: TableColumnRecord, value: BatchValue, index: numb
   if (!valid) {
     throw new TypeError(`${column.name}[${String(index)}] must be ${column.type}`);
   }
+}
+
+/** Merges per-column sorted row-id arrays into one sorted, de-duplicated array. */
+function unionSortedRowIds(arrays: ReadonlyArray<readonly bigint[]>): bigint[] {
+  const nonEmpty = arrays.filter((array) => array.length > 0);
+  if (nonEmpty.length === 0) return [];
+  if (nonEmpty.length === 1) return [...(nonEmpty[0] ?? [])];
+  const merged = ([] as bigint[])
+    .concat(...(nonEmpty as bigint[][]))
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  const unique: bigint[] = [];
+  for (const rowId of merged) {
+    if (unique.length === 0 || unique[unique.length - 1] !== rowId) unique.push(rowId);
+  }
+  return unique;
+}
+
+/** Two-pointer intersection of sorted row-id arrays. */
+function intersectSortedRowIds(left: readonly bigint[], right: readonly bigint[]): bigint[] {
+  const result: bigint[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const a = left[leftIndex] ?? 0n;
+    const b = right[rightIndex] ?? 0n;
+    if (a === b) {
+      result.push(a);
+      leftIndex += 1;
+      rightIndex += 1;
+    } else if (a < b) {
+      leftIndex += 1;
+    } else {
+      rightIndex += 1;
+    }
+  }
+  return result;
+}
+
+/** Whether any sorted row id falls inside [start, endExclusive) — one binary search. */
+function sortedRowIdsIntersectRange(
+  sorted: readonly bigint[],
+  start: bigint,
+  endExclusive: bigint,
+): boolean {
+  let low = 0;
+  let high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((sorted[middle] ?? 0n) < start) low = middle + 1;
+    else high = middle;
+  }
+  return low < sorted.length && (sorted[low] ?? 0n) < endExclusive;
+}
+
+/**
+ * Tokenizes one cell into the term accumulator, tracking per-document term frequency, and
+ * returns the cell's token count so producers can total the column's tokens for BM25 stats.
+ */
+function addFtsDocument(
+  byTerm: Map<string, { rowIds: bigint[]; tf: number[] }>,
+  value: BatchValue,
+  rowId: bigint,
+): number {
+  const rendered = renderDocumentValue(value);
+  if (rendered === undefined) return 0;
+  const tokens = ftsTokenize(rendered);
+  const counts = new Map<string, number>();
+  for (const token of tokens) counts.set(token, (counts.get(token) ?? 0) + 1);
+  for (const [term, tf] of counts) {
+    const posting = byTerm.get(term) ?? { rowIds: [], tf: [] };
+    posting.rowIds.push(rowId);
+    posting.tf.push(tf);
+    byTerm.set(term, posting);
+  }
+  return tokens.length;
+}
+
+function sortedFtsPostings(byTerm: Map<string, { rowIds: bigint[]; tf: number[] }>): FtsPosting[] {
+  return [...byTerm.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([term, posting]) => ({ term, rowIds: posting.rowIds, tf: posting.tf }));
+}
+
+/** Term-range partitioning for the base chunks; 128 terms per chunk keeps records small. */
+function chunkFtsPostings(postings: FtsPosting[], size = 128): FtsPosting[][] {
+  const chunks: FtsPosting[][] = [];
+  for (let start = 0; start < postings.length; start += size) {
+    chunks.push(postings.slice(start, start + size));
+  }
+  return chunks;
+}
+
+/** Tokenizes an insert batch's values for every active full-text column into commit deltas. */
+function buildFtsColumnDeltas(
+  table: TableRecord,
+  input: ColumnarBatch,
+  rowIdStart: bigint,
+): FtsColumnDelta[] {
+  const active = Object.entries(table.ftsColumns ?? {}).filter(
+    ([, record]) => record.state !== "invalid",
+  );
+  if (active.length === 0) return [];
+  const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
+  return active.flatMap(([columnId]) => {
+    const column = columnsById.get(columnId);
+    if (column === undefined) return [];
+    const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
+    let totalTokens = 0;
+    (input.columns[column.name] ?? []).forEach((value, index) => {
+      totalTokens += addFtsDocument(byTerm, value, rowIdStart + BigInt(index));
+    });
+    return [{ columnId, postings: sortedFtsPostings(byTerm), totalTokens }];
+  });
+}
+
+/** The columns a MATCH(*) document draws from: everything except booleans. */
+function searchableFtsColumns(table: TableRecord | undefined): readonly string[] | undefined {
+  if (table === undefined) return undefined;
+  return table.columns
+    .filter((column) => column.type !== "boolean")
+    .map((column) => column.name);
 }
 
 function getUniqueKeyColumn(table: TableRecord): TableColumnRecord | undefined {

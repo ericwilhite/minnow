@@ -11,6 +11,7 @@ import {
   SnapshotManifestMissingError,
   type TransactionRecord,
   TransactionRecordConflictError,
+  type FtsChanges,
   type UniqueKeyChanges,
 } from "../storage/index.js";
 
@@ -128,6 +129,7 @@ export class LeasedSnapshot extends Snapshot {
 export class DatabaseTransaction {
   #record: TransactionRecord;
   #uniqueKeyChanges: UniqueKeyChanges | undefined;
+  #ftsChanges: FtsChanges | undefined;
   readonly #supersededBlockIds = new Set<string>();
   readonly #changedTableIds = new Set<string>();
   #logicallyUnchanged = false;
@@ -297,6 +299,12 @@ export class DatabaseTransaction {
     };
   }
 
+  /** Attaches the commit's full-text index deltas; applied atomically with the publish. */
+  setFtsChanges(changes: FtsChanges): void {
+    this.#assertActive();
+    this.#ftsChanges = changes;
+  }
+
   supersedeBlocks(blockIds: readonly string[]): void {
     this.#assertActive();
     for (const id of blockIds) {
@@ -325,6 +333,7 @@ export class DatabaseTransaction {
         ...(this.#uniqueKeyChanges === undefined
           ? {}
           : { uniqueKeyChanges: this.#uniqueKeyChanges }),
+        ...(this.#ftsChanges === undefined ? {} : { ftsChanges: this.#ftsChanges }),
         committedAt,
       });
       this.#record = {
@@ -397,15 +406,22 @@ export class TransactionManager {
   }
 
   /**
-   * Begins a transaction at the current manifest version and optionally reserves row ids in the
-   * same step. Stores implementing the atomic `beginTransaction` pay one storage round trip
-   * instead of the version-read/create/reserve sequence; the read-then-create fallback retries
-   * when the version it read is pruned before the record lands.
+   * Begins a transaction at the current manifest version and optionally reserves row ids and
+   * auto-increment values in the same step. Stores implementing the atomic `beginTransaction`
+   * pay one storage round trip instead of the version-read/create/reserve sequence; the
+   * read-then-create fallback retries when the version it read is pruned before the record lands.
    */
-  async beginWithReservation(reserveRowIds?: {
-    tableId: string;
-    count: number;
-  }): Promise<{ transaction: DatabaseTransaction; rowIds?: RowIdRange }> {
+  async beginWithReservation(
+    reserveRowIds?: {
+      tableId: string;
+      count: number;
+    },
+    reserveAutoIncrement?: { tableId: string; columnId: string; count: number; atLeast?: bigint },
+  ): Promise<{
+    transaction: DatabaseTransaction;
+    rowIds?: RowIdRange;
+    autoIncrementValues?: RowIdRange;
+  }> {
     const id = this.#createId();
     const batched = this.store.beginTransaction?.bind(this.store);
     if (batched !== undefined) {
@@ -422,10 +438,14 @@ export class TransactionManager {
           committedVersion: null,
         },
         ...(reserveRowIds === undefined ? {} : { reserveRowIds }),
+        ...(reserveAutoIncrement === undefined ? {} : { reserveAutoIncrement }),
       });
       return {
         transaction: new DatabaseTransaction(this.store, begun.record, this.#now),
         ...(begun.rowIds === undefined ? {} : { rowIds: begun.rowIds }),
+        ...(begun.autoIncrementValues === undefined
+          ? {}
+          : { autoIncrementValues: begun.autoIncrementValues }),
       };
     }
     for (;;) {
@@ -445,9 +465,24 @@ export class TransactionManager {
       try {
         await this.store.createTransaction(record);
         const transaction = new DatabaseTransaction(this.store, record, this.#now);
-        if (reserveRowIds === undefined) return { transaction };
-        const rowIds = await this.store.reserveRowIds(reserveRowIds.tableId, reserveRowIds.count);
-        return { transaction, rowIds };
+        const autoIncrementValues =
+          reserveAutoIncrement === undefined
+            ? undefined
+            : await this.store.reserveAutoIncrement(
+                reserveAutoIncrement.tableId,
+                reserveAutoIncrement.columnId,
+                reserveAutoIncrement.count,
+                reserveAutoIncrement.atLeast,
+              );
+        const rowIds =
+          reserveRowIds === undefined
+            ? undefined
+            : await this.store.reserveRowIds(reserveRowIds.tableId, reserveRowIds.count);
+        return {
+          transaction,
+          ...(rowIds === undefined ? {} : { rowIds }),
+          ...(autoIncrementValues === undefined ? {} : { autoIncrementValues }),
+        };
       } catch (error) {
         if (error instanceof SnapshotManifestMissingError) {
           continue;
@@ -604,7 +639,8 @@ export class TransactionManager {
         } catch (error) {
           if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
           const latest = await this.store.getGarbageCollectionJob(job.id);
-          if (latest === undefined) throw new Error(`Garbage collection job not found: ${job.id}`);
+          if (latest === undefined)
+            throw new Error(`Garbage collection job not found: ${job.id}`, { cause: error });
           job = latest;
         }
       }

@@ -11,6 +11,12 @@ import {
   type BlockStore,
   type BlockWrite,
   advanceGarbageCollectionJobRecord,
+  collectFtsCandidates,
+  invalidateUncoveredFtsColumns,
+  type FtsCandidates,
+  type FtsChanges,
+  type FtsColumnIndexRecord,
+  type FtsPosting,
   type GarbageCollectionJobRecord,
   GarbageCollectionJobConflictError,
   type GarbageCollectionStepResult,
@@ -54,6 +60,12 @@ export class MemoryBlockStore implements BlockStore {
   readonly #compactionJobs = new Map<string, CompactionJobRecord>();
   readonly #garbageCollectionJobs = new Map<string, GarbageCollectionJobRecord>();
   readonly #nextRowIds = new Map<string, bigint>();
+  readonly #nextAutoIncrement = new Map<string, bigint>();
+  readonly #ftsBases = new Map<
+    string,
+    { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number }
+  >();
+  readonly #ftsDeltas = new Map<string, Map<number, { postings: FtsPosting[]; totalTokens: number }>>();
   readonly #uniqueKeys = new Map<string, Set<string>>();
   readonly #tempRunPages = new Map<string, Uint8Array>();
   readonly #tempOwners = new Map<string, TempOwnerRecord>();
@@ -216,7 +228,10 @@ export class MemoryBlockStore implements BlockStore {
   async updateTable(
     id: string,
     expectedRevision: number,
-    update: { columns: TableColumnRecord[] },
+    update: {
+      columns?: TableColumnRecord[];
+      ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+    },
   ): Promise<TableRecord> {
     return this.#runAtomic(() => {
       const record = this.#tables.get(id);
@@ -224,15 +239,94 @@ export class MemoryBlockStore implements BlockStore {
       if (record === undefined || actualRevision !== expectedRevision) {
         throw new TableRecordConflictError(id, expectedRevision, actualRevision);
       }
-      validateTableColumns(update.columns);
+      if (update.columns !== undefined) validateTableColumns(update.columns);
+      const { ftsColumns: previousFts, ...base } = record;
+      const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
       const updated: TableRecord = {
-        ...record,
-        columns: structuredClone(update.columns),
+        ...base,
+        columns:
+          update.columns === undefined ? record.columns : structuredClone(update.columns),
+        ...(nextFts === null || nextFts === undefined
+          ? {}
+          : { ftsColumns: structuredClone(nextFts) }),
         revision: expectedRevision + 1,
       };
       this.#tables.set(id, updated);
       return structuredClone(updated);
     });
+  }
+
+  async writeFtsBase(
+    tableId: string,
+    columnId: string,
+    input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
+  ): Promise<void> {
+    return this.#runAtomic(() => {
+      const key = `${tableId}/${columnId}`;
+      this.#ftsBases.set(key, structuredClone(input));
+      const deltas = this.#ftsDeltas.get(key);
+      if (deltas !== undefined) {
+        for (const version of [...deltas.keys()]) {
+          if (version <= input.coversVersion) deltas.delete(version);
+        }
+      }
+    });
+  }
+
+  async readFtsCandidates(
+    tableId: string,
+    columnId: string,
+    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    upToVersion: number,
+  ): Promise<FtsCandidates & { deltaChunkCount: number; totalTokens: number }> {
+    const key = `${tableId}/${columnId}`;
+    const base = this.#ftsBases.get(key);
+    const deltas =
+      this.#ftsDeltas.get(key) ?? new Map<number, { postings: FtsPosting[]; totalTokens: number }>();
+    const chunkLists: Array<readonly FtsPosting[]> = [...(base?.chunks ?? [])];
+    let deltaChunkCount = 0;
+    let totalTokens = base?.totalTokens ?? 0;
+    for (const [version, delta] of deltas) {
+      if (version <= (base?.coversVersion ?? -1) || version > upToVersion) continue;
+      deltaChunkCount += 1;
+      totalTokens += delta.totalTokens;
+      chunkLists.push(delta.postings);
+    }
+    return { ...collectFtsCandidates(chunkLists, terms), deltaChunkCount, totalTokens };
+  }
+
+  /**
+   * Applies a commit's full-text deltas, and closes the stale-writer race: a commit adding
+   * segments to a table with an active index but no delta for one of its columns flips that
+   * column to "invalid" so a rebuild self-heals instead of the data commit failing.
+   */
+  #applyFtsChanges(
+    pendingSegments: readonly SegmentRecord[],
+    changes: FtsChanges | undefined,
+    version: number,
+  ): void {
+    const changedTableIds = new Set(pendingSegments.map((segment) => segment.tableId));
+    for (const tableId of changedTableIds) {
+      const record = this.#tables.get(tableId);
+      if (record === undefined) continue;
+      const covered = new Set(
+        changes?.tableId === tableId ? changes.columns.map((column) => column.columnId) : [],
+      );
+      const invalidated = invalidateUncoveredFtsColumns(record, covered);
+      if (invalidated !== undefined) this.#tables.set(record.id, invalidated);
+    }
+    if (changes === undefined) return;
+    for (const column of changes.columns) {
+      const key = `${changes.tableId}/${column.columnId}`;
+      const deltas =
+        this.#ftsDeltas.get(key) ??
+        new Map<number, { postings: FtsPosting[]; totalTokens: number }>();
+      deltas.set(version, {
+        postings: structuredClone(column.postings),
+        totalTokens: column.totalTokens,
+      });
+      this.#ftsDeltas.set(key, deltas);
+    }
   }
 
   async getTableByName(name: string): Promise<TableRecord | undefined> {
@@ -275,6 +369,31 @@ export class MemoryBlockStore implements BlockStore {
     const start = this.#nextRowIds.get(tableId) ?? 1n;
     const endExclusive = start + BigInt(count);
     this.#nextRowIds.set(tableId, endExclusive);
+    return { start, endExclusive };
+  }
+
+  async reserveAutoIncrement(
+    tableId: string,
+    columnId: string,
+    count: number,
+    atLeast?: bigint,
+  ): Promise<RowIdRange> {
+    validateAutoIncrementReservation(count, atLeast);
+    return this.#runAtomic(() => this.#reserveAutoIncrement(tableId, columnId, count, atLeast));
+  }
+
+  #reserveAutoIncrement(
+    tableId: string,
+    columnId: string,
+    count: number,
+    atLeast: bigint | undefined,
+  ): RowIdRange {
+    const key = `${tableId}/${columnId}`;
+    const current = this.#nextAutoIncrement.get(key) ?? 1n;
+    const floor = atLeast ?? 1n;
+    const start = current > floor ? current : floor;
+    const endExclusive = start + BigInt(count);
+    this.#nextAutoIncrement.set(key, endExclusive);
     return { start, endExclusive };
   }
 
@@ -386,7 +505,17 @@ export class MemoryBlockStore implements BlockStore {
         this.#nextRowIds.set(input.reserveRowIds.tableId, endExclusive);
         rowIds = { start: current, endExclusive };
       }
-      return { record: structuredClone(record), ...(rowIds === undefined ? {} : { rowIds }) };
+      let autoIncrementValues: RowIdRange | undefined;
+      if (input.reserveAutoIncrement !== undefined) {
+        const { tableId, columnId, count, atLeast } = input.reserveAutoIncrement;
+        validateAutoIncrementReservation(count, atLeast);
+        autoIncrementValues = this.#reserveAutoIncrement(tableId, columnId, count, atLeast);
+      }
+      return {
+        record: structuredClone(record),
+        ...(rowIds === undefined ? {} : { rowIds }),
+        ...(autoIncrementValues === undefined ? {} : { autoIncrementValues }),
+      };
     });
   }
 
@@ -610,6 +739,7 @@ export class MemoryBlockStore implements BlockStore {
           });
           this.#uniqueKeys.set(uniqueKeyChanges.tableId, existing);
         }
+        this.#applyFtsChanges(pendingSegments, input.ftsChanges, manifest.version);
         // Match the IndexedDB store's observable commit shape: the summary without blockIds.
         const { blockIds: _resolved, ...summary } = manifest;
         void _resolved;
@@ -1041,6 +1171,15 @@ function validateId(id: string): void {
 function validateCount(count: number): void {
   if (!Number.isSafeInteger(count) || count <= 0) {
     throw new RangeError("Row ID reservation count must be a positive whole number");
+  }
+}
+
+function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError("Auto-increment reservation count must be a non-negative whole number");
+  }
+  if (atLeast !== undefined && atLeast < 1n) {
+    throw new RangeError("Auto-increment bump target must be at least 1");
   }
 }
 

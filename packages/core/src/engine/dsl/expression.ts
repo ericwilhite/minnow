@@ -1,3 +1,4 @@
+import { validateFtsQuery } from "../fts.js";
 import {
   hasAggregate,
   type AggregateName,
@@ -380,6 +381,15 @@ export interface FunctionModule<in out TCtx> {
     unit: "year" | "month" | "day" | "hour" | "minute" | "second",
     value: ColumnReferenceOf<TCtx, Date> | Date | ExpressionWrapper<Date | null>,
   ): ExpressionWrapper<Date | null>;
+  /**
+   * Document-level BM25 relevance of the query against the listed columns ("*" = every
+   * non-boolean column of the scanned table), compiling to the same node as SQL
+   * `BM25(col, ...) AGAINST 'query'`. 0 when no term matches; null when every column is null.
+   */
+  bm25(
+    columns: "*" | ReadonlyArray<ColumnReferenceOf<TCtx, string | number | Date> & string>,
+    query: string,
+  ): ExpressionWrapper<number | null>;
 }
 
 function createFunctionModule<TCtx>(): FunctionModule<TCtx> {
@@ -419,6 +429,32 @@ function createFunctionModule<TCtx>(): FunctionModule<TCtx> {
     },
     dateTrunc: (unit, value) =>
       new ExpressionWrapper(call("DATE_TRUNC", [literalExpression(unit), operandAsRef(value)])),
+    bm25: (columns: "*" | readonly string[], query: string) =>
+      new ExpressionWrapper(buildFtsExpression("bm25", columns, query)),
+  };
+}
+
+/** Shared by eb.match and fn.bm25: validates and assembles the full-text plan node. */
+export function buildFtsExpression(
+  op: "match" | "bm25",
+  columns: "*" | readonly string[],
+  query: string,
+): Expression {
+  if (typeof query !== "string") {
+    throw new TypeError("Full-text search requires a string query");
+  }
+  validateFtsQuery(query);
+  if (columns !== "*" && columns.length === 0) {
+    throw new TypeError("Full-text search requires at least one column");
+  }
+  return {
+    kind: "fts",
+    op,
+    columns:
+      columns === "*"
+        ? "*"
+        : columns.map((reference): Expression => ({ kind: "column", reference })),
+    query,
   };
 }
 
@@ -555,6 +591,16 @@ export interface ExpressionBuilder<in out DB, in out TCtx> {
     upper: ValueOperand<ReferencedValue<TCtx, TRef & string>>,
   ): ExpressionWrapper<SqlBool>;
   exists(subquery: BlockCompilable): ExpressionWrapper<SqlBool>;
+  /**
+   * Document-level full-text MATCH, compiling to the same node as SQL
+   * `MATCH(col, ...) AGAINST 'query'`: every query term must appear in some listed column
+   * ("*" searches every non-boolean column of the scanned table); a term ending in `*`
+   * matches prefixes. Rows whose listed columns are all null are unknown, like LIKE on null.
+   */
+  match(
+    columns: "*" | ReadonlyArray<ColumnReferenceOf<TCtx, string | number | Date> & string>,
+    query: string,
+  ): ExpressionWrapper<SqlBool>;
   /** A column reference as an expression, for the rare value-position column comparison. */
   ref<TRef extends ColumnReference<TCtx>>(
     reference: TRef,
@@ -650,6 +696,8 @@ export function createExpressionBuilder<DB, TCtx>(
         block.limit ??= 1;
         return { kind: "exists", block, negated: false } satisfies Expression;
       }),
+    match: (columns: "*" | readonly string[], query: string) =>
+      new ExpressionWrapper(buildFtsExpression("match", columns, query)),
     ref: (reference: string) =>
       new ExpressionWrapper({ kind: "column", reference } satisfies Expression),
     val: (value: QueryValue) => new ExpressionWrapper(literalExpression(value)),

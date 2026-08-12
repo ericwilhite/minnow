@@ -37,8 +37,9 @@ import {
  * `returning(...)` rows); the idiomatic call is `executeTakeFirst()` / `executeTakeFirstOrThrow()`.
  * Inserts pad their rows against the schema and hand them to the engine's batch APIs
  * (`orReplace()` routes to the upsert path)
- * and `returning` echoes the written rows — faithful here because the engine has no defaults or
- * generated columns. Updates and deletes compile to the same mutation statements SQL produces and
+ * and `returning` echoes the written rows: the padded inputs overlaid with the engine's
+ * generated columns (defaults and auto-increment keys), so callers get generated ids back.
+ * Updates and deletes compile to the same mutation statements SQL produces and
  * run through the engine's read-keys-then-apply pipeline; their `returning` rows come back from
  * the statement's own snapshot (post-update values for updates, the deleted rows for deletes).
  */
@@ -59,11 +60,11 @@ export interface MutationServices {
   insertBatch(
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number }>;
+  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
   upsertBatch(
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number }>;
+  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
   runStatement(
     statement: CompiledStatement,
     options?: { returning?: readonly string[] | "*" },
@@ -177,12 +178,20 @@ export class InsertQueryBuilder<
     if (this.returningColumns === undefined) {
       return [{ numInsertedRows: result.rowCount } as TReturn];
     }
-    // Faithful echo: the engine has no defaults or generated columns, so the written rows are
-    // exactly the padded inputs, in insertion order.
+    // The written rows are the padded inputs overlaid with the engine's generated columns
+    // (defaults and auto-increment keys), in insertion order.
+    const generated = result.generatedColumns ?? {};
+    const written = padded.map((row, index) => {
+      const overlay = { ...row };
+      for (const [name, values] of Object.entries(generated)) {
+        overlay[name] = values[index] ?? null;
+      }
+      return overlay;
+    });
     const projected =
       this.returningColumns === "*"
-        ? padded
-        : padded.map((row) =>
+        ? written
+        : written.map((row) =>
             Object.fromEntries(
               (this.returningColumns as readonly string[]).map((name) => [name, row[name] ?? null]),
             ),

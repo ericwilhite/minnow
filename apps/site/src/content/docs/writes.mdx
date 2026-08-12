@@ -49,8 +49,13 @@ Worth knowing:
 
 - **`set({ ...patch })` skips `undefined` entries** — a spread-patch never accidentally nulls a
   column. Explicit `null` still writes NULL.
-- **`returning` is exact.** Inserts echo the written rows (there are no defaults or generated
-  columns to surprise you); updates return post-update values; deletes return the rows as read.
+- **`returning` is exact.** Inserts echo the written rows, including engine-generated values —
+  auto-increment keys and column defaults come back in the returned rows; updates return
+  post-update values; deletes return the rows as read.
+- **Null means generate.** For a default-bearing column, omitting the column or passing `null`
+  fills it (there is no "explicit NULL" for defaulted columns — they are always non-nullable);
+  any explicit value passes through untouched. Explicit values on an auto-increment key bump the
+  counter past their maximum, so imports with stable ids stay safe.
 - **A competing writer fails your statement with a typed error** instead of interleaving.
 - **Counts are plain numbers** (`numInsertedRows: number`), not bigints.
 

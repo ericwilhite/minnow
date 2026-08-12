@@ -62,11 +62,11 @@ export interface DslDriver {
   insertBatch(
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number }>;
+  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
   upsertBatch(
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number }>;
+  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
   runStatement(
     statement: CompiledStatement,
     options?: { returning?: readonly string[] | "*" },
@@ -116,6 +116,13 @@ export function createMinnow<DB>(driver: DslDriver, options: MinnowOptions = {})
 
 interface SharedLiveSet {
   set?: DriverLiveSet | undefined;
+}
+
+/** One db.search hit: the owning table, the row (without the score alias), and its BM25 score. */
+export interface SearchHit<DB> {
+  table: keyof DB & string;
+  row: Record<string, QueryValue>;
+  score: number;
 }
 
 export class Minnow<in out DB> {
@@ -219,6 +226,57 @@ export class Minnow<in out DB> {
       [...this.#ctes, { name, builder }],
       this.#liveBox,
     );
+  }
+
+  /**
+   * Zero-ceremony document search across tables: every searched table (all schema tables by
+   * default; `options.tables` narrows the set) runs a MATCH(*)-filtered, BM25-ordered scan,
+   * and the per-table hits merge into one relevance-ranked list. The facade must be created
+   * with `{ schema }` — the per-table column lists come from it.
+   */
+  async search(
+    query: string,
+    options: { tables?: ReadonlyArray<keyof DB & string>; limit?: number } = {},
+  ): Promise<SearchHit<DB>[]> {
+    const schemaTables = this.#options.schema?.tables;
+    if (schemaTables === undefined) {
+      throw new TypeError("search() needs the table columns: create the facade with { schema }");
+    }
+    const tableNames = options.tables ?? schemaTables.map(({ name }) => name as keyof DB & string);
+    const limit = options.limit ?? 10;
+    const perTable = await Promise.all(
+      tableNames.map(async (tableName) => {
+        const definition = schemaTables?.find(({ name }) => name === tableName);
+        if (definition === undefined) {
+          throw new TypeError(`search() needs the table's schema: ${tableName}`);
+        }
+        /* eslint-disable-next-line @typescript-eslint/no-explicit-any --
+           per-table column lists are only known at runtime; hits erase the row type anyway. */
+        const builder = this.selectFrom(tableName as any) as unknown as SelectQueryBuilder<
+          DB,
+          Record<string, AnyRow>,
+          Record<string, QueryValue>
+        >;
+        // The score is selected under an internal alias so hits can rank across tables, then
+        // stripped from the row; user-facing rows never carry a synthetic column.
+        const rows = await builder
+          .select((eb) => [
+            ...Object.keys(definition.columns),
+            eb.fn.bm25("*", query).as("(search score)"),
+          ])
+          .search(query)
+          .limit(limit)
+          .execute();
+        return rows.map((row) => {
+          const { "(search score)": score, ...rest } = row as Record<string, QueryValue>;
+          return { table: tableName, row: rest, score: typeof score === "number" ? score : 0 };
+        });
+      }),
+    );
+    return perTable
+      .flat()
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit);
   }
 
   /** @internal Raw-SQL escape hatch used by the `sql` template tag. */

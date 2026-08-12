@@ -152,10 +152,27 @@ export type AllColumnsRow<TCtx> =
 
 // --- Mutations ----------------------------------------------------------------------------------
 
-/** Insert rows require non-nullable columns and may omit nullable ones. */
+/**
+ * True when the column's value carries the HasDefault flavor — the engine can fill it. The
+ * detector probes for the phantom key, which plain primitives never have; `any` (whose keyof is
+ * every key) is excluded first.
+ */
+type IsGenerated<TValue> = 0 extends 1 & TValue
+  ? false
+  : "__minnowHasDefault" extends keyof NonNullable<TValue>
+    ? true
+    : false;
+
+type OptionalInsertKey<TRow, K extends keyof TRow> = null extends TRow[K]
+  ? true
+  : IsGenerated<TRow[K]>;
+
+/** Insert rows require non-nullable columns and may omit nullable or default-bearing ones. */
 export type InsertRowFor<TRow> = Simplify<
-  { [K in keyof TRow as null extends TRow[K] ? never : K]: TRow[K] } & {
-    [K in keyof TRow as null extends TRow[K] ? K : never]?: TRow[K] | undefined;
+  { [K in keyof TRow as true extends OptionalInsertKey<TRow, K> ? never : K]: TRow[K] } & {
+    [K in keyof TRow as true extends OptionalInsertKey<TRow, K> ? K : never]?:
+      | TRow[K]
+      | undefined;
   }
 >;
 

@@ -588,23 +588,23 @@ async function benchmarkLibraryWrites(
   const tables: LibraryTableMeasurement[] = [];
   const started = performance.now();
   let finalVersion = -1;
-  let probeDurationMs = 0;
-  let upsertMeasurement = {
-    sampleRows: 0,
-    insertedRows: 0,
-    updatedRows: 0,
-    finalRows: 0,
-    baseVersion: -1,
-    version: -1,
+  let probeDurationMs: number;
+  let upsertMeasurement: {
+    sampleRows: number;
+    insertedRows: number;
+    updatedRows: number;
+    finalRows: number;
+    baseVersion: number;
+    version: number;
   };
-  let mutationMeasurement = {
-    updatedRows: 0,
-    deletedRows: 0,
-    projectedRows: 0,
-    updateVersion: -1,
-    deleteVersion: null as number | null,
-    updateStoredBytes: 0,
-    deleteStoredBytes: 0,
+  let mutationMeasurement: {
+    updatedRows: number;
+    deletedRows: number;
+    projectedRows: number;
+    updateVersion: number;
+    deleteVersion: number | null;
+    updateStoredBytes: number;
+    deleteStoredBytes: number;
   };
 
   try {

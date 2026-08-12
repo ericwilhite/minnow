@@ -69,11 +69,93 @@ export interface PublishManifestInput {
 export const simpleDataTypes = ["boolean", "number", "string", "datetime"] as const;
 export type SimpleDataType = (typeof simpleDataTypes)[number];
 
+/**
+ * Declarative write-time default. Plain structured-clone-safe data: the spec crosses the
+ * worker postMessage boundary and persists in the catalog, so function defaults are
+ * unrepresentable by design.
+ */
+export type ColumnDefault =
+  | { kind: "uuid" }
+  | { kind: "nanoid" }
+  | { kind: "now" }
+  | { kind: "literal"; value: boolean | number | string }
+  | { kind: "autoincrement" };
+
 export interface TableColumnRecord {
   id: string;
   name: string;
   type: SimpleDataType;
   nullable: boolean;
+  /** Fills null-or-absent slots at insert time; never applied at read time. */
+  defaultValue?: ColumnDefault;
+}
+
+/**
+ * The single authority on which default declarations are legal, shared by the schema DSL's
+ * `table()` and the engine's `createTable` so the two entry points (and the wire path between
+ * them) can never drift: defaults require non-nullable columns, each generator has one column
+ * type, auto-increment is the number unique key, and the unique key never defaults to a
+ * constant.
+ */
+export function validateColumnDefault(
+  column: { name: string; type: SimpleDataType; nullable: boolean; isUniqueKey: boolean },
+  defaultValue: ColumnDefault,
+): void {
+  if (column.nullable) {
+    throw new TypeError(`Defaults require a non-nullable column: ${column.name}`);
+  }
+  switch (defaultValue.kind) {
+    case "uuid":
+    case "nanoid":
+      if (column.type !== "string") {
+        throw new TypeError(`Default ${defaultValue.kind} requires a string column: ${column.name}`);
+      }
+      return;
+    case "now":
+      if (column.type !== "datetime") {
+        throw new TypeError(`Default now requires a datetime column: ${column.name}`);
+      }
+      return;
+    case "autoincrement":
+      if (column.type !== "number") {
+        throw new TypeError(`Auto-increment requires a number column: ${column.name}`);
+      }
+      if (!column.isUniqueKey) {
+        throw new TypeError(`Auto-increment requires the unique key column: ${column.name}`);
+      }
+      return;
+    case "literal": {
+      const value = defaultValue.value;
+      if (column.type === "datetime") {
+        throw new TypeError(`Datetime columns default with now, not a literal: ${column.name}`);
+      }
+      if (typeof value !== column.type) {
+        throw new TypeError(`Default literal must be a ${column.type}: ${column.name}`);
+      }
+      if (typeof value === "number" && !Number.isFinite(value)) {
+        throw new TypeError(`Default literal must be finite: ${column.name}`);
+      }
+      if (column.isUniqueKey) {
+        throw new TypeError(`Unique key cannot default to a constant: ${column.name}`);
+      }
+      return;
+    }
+  }
+}
+
+export type FtsColumnIndexState = "building" | "ready" | "invalid";
+
+/**
+ * One column's persisted full-text index declaration. The index is a pruning accelerator, never
+ * ground truth: readers use it only in state "ready" with a matching tokenizer version, and the
+ * scan re-verifies every candidate, so a stale or missing index costs speed, not correctness.
+ */
+export interface FtsColumnIndexRecord {
+  storage: "fts-chunks-v1";
+  tokenizerVersion: number;
+  state: FtsColumnIndexState;
+  /** Manifest version the base build covers; commit deltas above it merge at read time. */
+  buildFromVersion: number;
 }
 
 export interface TableRecord {
@@ -83,6 +165,8 @@ export interface TableRecord {
   uniqueKeyColumnId?: string;
   uniqueKeyLookupReady?: boolean;
   uniqueKeyStorage?: "chunks-v1";
+  /** Full-text index state per column ID. Writers that see this emit commit deltas. */
+  ftsColumns?: Record<string, FtsColumnIndexRecord>;
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
   revision?: number;
@@ -519,11 +603,17 @@ export interface BeginTransactionInput {
   record: Omit<TransactionRecord, "snapshotVersion">;
   /** Reserve this many row ids for the table in the same atomic step. */
   reserveRowIds?: { tableId: string; count: number };
+  /**
+   * Reserve auto-increment values for the column in the same atomic step, first bumping the
+   * counter to at least `atLeast`. `count` may be 0 for a pure bump past explicit values.
+   */
+  reserveAutoIncrement?: { tableId: string; columnId: string; count: number; atLeast?: bigint };
 }
 
 export interface BeginTransactionResult {
   record: TransactionRecord;
   rowIds?: RowIdRange;
+  autoIncrementValues?: RowIdRange;
 }
 
 export interface StageTransactionArtifactsInput {
@@ -546,6 +636,7 @@ export interface CommitTransactionInput {
   expectedManifestVersion: number | null;
   removedBlockIds?: readonly string[];
   uniqueKeyChanges?: UniqueKeyChanges;
+  ftsChanges?: FtsChanges;
   committedAt: string;
 }
 
@@ -555,6 +646,96 @@ export interface UniqueKeyChanges {
   requireAbsent: boolean;
   remove?: boolean;
   storageMode?: "chunks-v1";
+}
+
+/** One term's postings within a commit delta or base chunk: parallel rowId/tf arrays. */
+export interface FtsPosting {
+  term: string;
+  rowIds: bigint[];
+  tf: number[];
+}
+
+/** One indexed column's contribution from one commit: postings for the commit's new rows. */
+export interface FtsColumnDelta {
+  columnId: string;
+  /** Term-sorted postings; rowIds ascending within each term. */
+  postings: FtsPosting[];
+  /** Total tokens the commit's rows contribute to this column — feeds exact BM25 statistics. */
+  totalTokens: number;
+}
+
+/**
+ * A commit's full-text index deltas, applied atomically with the manifest publish. The store
+ * also closes the stale-writer race here: a commit that adds segments to a table whose record
+ * indexes a column in state "building" or "ready" without carrying that column's delta flips
+ * the column to "invalid" (self-healing rebuild) rather than rejecting the data commit.
+ */
+export interface FtsChanges {
+  tableId: string;
+  columns: readonly FtsColumnDelta[];
+}
+
+/** The per-term candidate row IDs a full-text index lookup returns, aligned with the query. */
+export interface FtsCandidates {
+  /** Per requested term: ascending unique row IDs whose indexed column contained the term. */
+  rowIdsByTerm: Array<bigint[]>;
+}
+
+/**
+ * Shared candidate-merge core for both stores: fetching chunks is store-specific, but the
+ * term-match rule (exact, or prefix as a term range) and the sorted-unique row-id shape must
+ * never drift between backends — pruning would silently differ per store.
+ */
+export function collectFtsCandidates(
+  chunkLists: Iterable<readonly FtsPosting[]>,
+  terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+): FtsCandidates {
+  const sets = terms.map(() => new Set<bigint>());
+  for (const postings of chunkLists) {
+    for (const posting of postings) {
+      for (let index = 0; index < terms.length; index += 1) {
+        const term = terms[index];
+        if (term === undefined) continue;
+        const matches = term.prefix
+          ? posting.term.startsWith(term.term)
+          : posting.term === term.term;
+        if (!matches) continue;
+        const set = sets[index];
+        if (set !== undefined) for (const rowId of posting.rowIds) set.add(rowId);
+      }
+    }
+  }
+  return {
+    rowIdsByTerm: sets.map((set) =>
+      [...set].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+    ),
+  };
+}
+
+/**
+ * Shared stale-writer policy for both stores' commit steps: a commit that adds segments to a
+ * table with active full-text columns but no covering delta flips the uncovered columns to
+ * "invalid" (the index self-heals through a rebuild; the data commit itself always proceeds).
+ * Returns the updated record, or undefined when nothing changes.
+ */
+export function invalidateUncoveredFtsColumns(
+  record: TableRecord,
+  coveredColumnIds: ReadonlySet<string>,
+): TableRecord | undefined {
+  const ftsColumns = record.ftsColumns;
+  if (ftsColumns === undefined) return undefined;
+  let invalidated = false;
+  const next: Record<string, FtsColumnIndexRecord> = {};
+  for (const [columnId, state] of Object.entries(ftsColumns)) {
+    if (state.state !== "invalid" && !coveredColumnIds.has(columnId)) {
+      next[columnId] = { ...state, state: "invalid" };
+      invalidated = true;
+    } else {
+      next[columnId] = { ...state };
+    }
+  }
+  if (!invalidated) return undefined;
+  return { ...record, ftsColumns: next, revision: (record.revision ?? 0) + 1 };
 }
 
 export class UniqueKeyConflictError extends Error {
@@ -656,13 +837,51 @@ export interface BlockStore {
   updateTable(
     id: string,
     expectedRevision: number,
-    update: { columns: TableColumnRecord[] },
+    update: {
+      columns?: TableColumnRecord[];
+      /** Replaces the full-text index state map; null clears it. */
+      ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+    },
   ): Promise<TableRecord>;
+  /**
+   * Replaces one column's full-text base chunks (term-range partitioned, term-sorted within
+   * each chunk) and deletes commit deltas the new base covers. The caller flips the catalog
+   * state separately via updateTable; orphaned chunks from a lost race are overwritten by the
+   * next build.
+   */
+  writeFtsBase(
+    tableId: string,
+    columnId: string,
+    input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
+  ): Promise<void>;
+  /**
+   * Per-term candidate row IDs from the base chunks plus every commit delta at or below
+   * `upToVersion`, with the column's merged token total for exact BM25 statistics. Prefix
+   * terms match the term range [term, term + "￿"). Also reports the merged delta-chunk count
+   * so callers can schedule a rebuild when the tail grows.
+   */
+  readFtsCandidates(
+    tableId: string,
+    columnId: string,
+    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    upToVersion: number,
+  ): Promise<FtsCandidates & { deltaChunkCount: number; totalTokens: number }>;
   addSegment(record: SegmentRecord): Promise<void>;
   getSegment(id: string): Promise<SegmentRecord | undefined>;
   listSegments(tableId?: string): Promise<SegmentRecord[]>;
   removeSegment(id: string): Promise<void>;
   reserveRowIds(tableId: string, count: number): Promise<RowIdRange>;
+  /**
+   * Atomically reserves `count` auto-increment values for the column, first bumping the
+   * counter to at least `atLeast`. `count` may be 0 for a pure bump past explicit values.
+   * Reservations are never returned; aborted transactions leave gaps.
+   */
+  reserveAutoIncrement(
+    tableId: string,
+    columnId: string,
+    count: number,
+    atLeast?: bigint,
+  ): Promise<RowIdRange>;
   getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]>;
   getCurrentManifest(): Promise<Manifest | undefined>;
   /** The current version alone, without materializing the manifest's block list. */

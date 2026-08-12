@@ -33,6 +33,63 @@ class TestSpillStore implements QuerySpillStore {
 }
 
 describe("vector query execution", () => {
+  it("recomputes BM25 corpus statistics per execution instead of freezing them into the plan", () => {
+    const plan = compileQuery("SELECT id, BM25(text) AGAINST 'quick' AS score FROM rows");
+    const small = new Map<string, DatabaseRow[]>([["rows", [{ id: 1, text: "quick" }]]]);
+    const large = new Map<string, DatabaseRow[]>([
+      [
+        "rows",
+        [
+          { id: 1, text: "quick" },
+          { id: 2, text: "quick slow" },
+          { id: 3, text: "other words" },
+        ],
+      ],
+    ]);
+    const first = executeRowQuery(plan, small).rows;
+    // A different corpus must produce a different score for the same document — the plan
+    // object is shared, and stats must never persist across executions.
+    const second = executeRowQuery(plan, large).rows;
+    expect(second[0]?.score).not.toBe(first[0]?.score);
+    expect(executeRowQuery(plan, small).rows).toEqual(first);
+  });
+
+  it("accounts the full-text dictionary match tables at an exact budget", () => {
+    const rows: DatabaseRow[] = [
+      { title: "quick brown fox", body: "jumps high" },
+      { title: "lazy dog", body: "sleeps quick" },
+      { title: "quick fox again", body: null },
+    ];
+    const tables = new Map([["rows", rows]]);
+    const plan = compileQuery(
+      "SELECT title FROM rows WHERE MATCH(title, body) AGAINST 'quick fox'",
+    );
+    // Measure the exact peak, then prove the accounting is tight: the same query succeeds at
+    // the peak and fails one byte below it inside the match-table reservation.
+    const measured = createPreparedQuery(plan, tables, {});
+    const expected = measured.execute();
+    expect(expected.rows.map((row) => row.title)).toEqual(["quick brown fox", "quick fox again"]);
+    const peak = measured.memoryUsage.peakBytes;
+    measured.close();
+    expect(peak).toBeGreaterThan(0);
+
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: peak });
+    expect(exact.execute()).toEqual(expected);
+    exact.close();
+
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: peak - 1 });
+    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
+    below.close();
+
+    // The match tables themselves are part of the model: the title dictionary has 3 entries and
+    // the body dictionary 2 (null never enters a dictionary), reserving 4 bytes per entry
+    // beyond the plain projection's peak.
+    const plain = createPreparedQuery(compileQuery("SELECT title FROM rows"), tables, {});
+    plain.execute();
+    expect(peak).toBeGreaterThanOrEqual(plain.memoryUsage.peakBytes + (3 + 2) * 4);
+    plain.close();
+  });
+
   it("spills stable ORDER BY runs under a budget and removes every temp page", async () => {
     const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
       id: index,

@@ -211,6 +211,26 @@
       "example": "SELECT region FROM rows WHERE region LIKE 'w%'"
     },
     {
+      "id": "predicate.match",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE MATCH(region) AGAINST 'west'"
+    },
+    {
+      "id": "predicate.match-star",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE MATCH(*) AGAINST 'wes*'"
+    },
+    {
+      "id": "function.bm25",
+      "status": "supported",
+      "example": "SELECT region, BM25(region) AGAINST 'west' AS score FROM rows WHERE MATCH(region) AGAINST 'west' ORDER BY score DESC"
+    },
+    {
+      "id": "order-by.expression",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount > 0 ORDER BY amount * 2 DESC, region"
+    },
+    {
       "id": "where.between",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount BETWEEN 1 AND 5"
@@ -375,16 +395,10 @@
       "error": "Expected eof, found FULL"
     },
     {
-      "id": "order-by.expression",
-      "status": "unsupported",
-      "example": "SELECT region, amount FROM rows ORDER BY amount * 2",
-      "error": "ORDER BY requires a selected column or output alias"
-    },
-    {
       "id": "order-by.ordinal",
       "status": "unsupported",
       "example": "SELECT region, amount FROM rows ORDER BY 2",
-      "error": "ORDER BY requires a selected column or output alias"
+      "error": "ORDER BY ordinals are not supported"
     },
     {
       "id": "window.lag-lead",

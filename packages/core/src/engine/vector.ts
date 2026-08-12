@@ -11,6 +11,18 @@ import type {
   SelectItem,
 } from "./query.js";
 import { cachedListMembership, dateTruncValue, isScalarFunctionName, likeRegExp } from "./query.js";
+import {
+  bm25DocumentScore,
+  cachedQueryTerms,
+  FtsStatsAccumulator,
+  fullTermsMask,
+  renderDocumentValue,
+  termFrequencies,
+  termsMask,
+  tokenize,
+  type FtsQueryTerm,
+  type FtsStats,
+} from "./fts.js";
 import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
 import { ByteJoinIndex } from "./join-index.js";
 import {
@@ -115,6 +127,13 @@ export interface AsyncQueryExecutionOptions {
 
 export interface PrepareVectorQueryOptions {
   readonly memoryContext?: QueryMemoryContext;
+  /**
+   * Exact BM25 corpus statistics served by the persisted full-text index, keyed by each
+   * scoring node's compiled signature (`JSON.stringify` of the plan node). A bound node with
+   * served statistics skips its whole-scan corpus pass, which is also what makes streamed
+   * scans and index pruning legal for scoring plans.
+   */
+  readonly ftsStats?: ReadonlyMap<string, FtsStats>;
 }
 
 type BoundExpression =
@@ -162,7 +181,47 @@ type BoundExpression =
       branches: Array<{ when: BoundExpression; then: BoundExpression }>;
       otherwise?: BoundExpression;
       signature: string;
-    };
+    }
+  | BoundFtsExpression;
+
+interface BoundFtsExpression {
+  kind: "fts";
+  op: "match" | "bm25";
+  columns: Array<{
+    kind: "column";
+    source: number;
+    column: string;
+    vector: ColumnVector;
+    signature: string;
+  }>;
+  terms: FtsQueryTerm[];
+  /** Per column, the per-dictionary term table; null until the column's first string batch. */
+  caches: Array<FtsDictionaryCache | null>;
+  /** BM25 corpus statistics: index-served at bind, else one whole-scan pass on first use. */
+  stats?: FtsStats;
+  /** Reusable per-row document scratch — evaluation runs once per scanned row. */
+  scratchRow?: FtsRowScratch;
+  memory?: QueryMemoryContext;
+  signature: string;
+}
+
+/** The per-row document accumulation target, reused across rows to avoid hot-path garbage. */
+interface FtsRowScratch {
+  present: boolean;
+  mask: number;
+  length: number;
+  frequencies: number[];
+}
+
+interface FtsDictionaryCache {
+  dictionary: readonly string[] | undefined;
+  /** Per dictionary code: bitmask of query terms present in that entry's tokens. */
+  termMask: Uint32Array;
+  /** BM25 only — per dictionary code: token count and per-term frequencies (flattened). */
+  tokenCount?: Uint32Array;
+  termTf?: Uint32Array;
+  reservation?: QueryMemoryReservation;
+}
 
 interface BoundPredicate {
   readonly left: BoundExpression;
@@ -302,7 +361,7 @@ export function prepareVectorQuery(
     for (const table of new Set(inputTables.values())) {
       retainedMemory.reserve(columnarTablePayloadBytes(table), `Columnar table ${table.name}`);
     }
-    const bound = bindPlan(plan, inputTables, retainedMemory);
+    const bound = bindPlan(plan, inputTables, retainedMemory, options.ftsStats);
     let closed = false;
     return {
       get memoryUsage() {
@@ -438,7 +497,7 @@ function isValid(bitmap: Uint8Array, index: number): boolean {
   return ((bitmap[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0;
 }
 
-function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue {
+export function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue {
   if (rowIndex < 0 || rowIndex >= vector.length) return null;
   const window = vector.window;
   let slot = rowIndex;
@@ -480,6 +539,7 @@ function bindPlan(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
   memory: QueryMemoryContext,
+  ftsStats?: ReadonlyMap<string, FtsStats>,
 ): BoundPlan {
   const sources = [plan.base, ...plan.joins];
   const sourceTables = sources.map((source) => {
@@ -492,12 +552,16 @@ function bindPlan(
     throw new TypeError("Table aliases must be unique");
   const aggregateSpecs: AggregateSpec[] = [];
   const aggregateIndexes = new Map<string, number>();
+  const ftsBySignature = new Map<string, BoundFtsExpression>();
   const bind = (expression: Expression): BoundExpression =>
     bindExpression(
       expression,
       sources.map((source, index) => ({ alias: source.alias, table: sourceTables[index] })),
       aggregateSpecs,
       aggregateIndexes,
+      memory,
+      ftsBySignature,
+      ftsStats,
     );
   const select = plan.select.map((item) => ({
     expression: bind(item.expression),
@@ -608,10 +672,63 @@ function bindExpression(
   sources: ReadonlyArray<{ alias: string; table: ColumnarTable | undefined }>,
   aggregateSpecs: AggregateSpec[],
   aggregateIndexes: Map<string, number>,
+  memory?: QueryMemoryContext,
+  ftsBySignature?: Map<string, BoundFtsExpression>,
+  ftsStats?: ReadonlyMap<string, FtsStats>,
 ): BoundExpression {
   const signature = JSON.stringify(expression);
   if (expression.kind === "subquery") {
     throw new TypeError("Subqueries are only supported in WHERE, HAVING, SELECT, and IN");
+  }
+  if (expression.kind === "fts") {
+    // The canonical search shape evaluates the same node in WHERE, SELECT, and ORDER BY;
+    // sharing one bound node by signature means one set of dictionary tables, one corpus
+    // pass, and one budget reservation instead of three.
+    const shared = ftsBySignature?.get(signature);
+    if (shared !== undefined) return shared;
+    if (expression.op === "bm25" && sources.length > 1) {
+      throw new TypeError("BM25 requires a single-table query");
+    }
+    // Every engine entry expands "*" against its catalog before plans reach the executors.
+    if (expression.columns === "*") {
+      throw new TypeError("Full-text search columns must be expanded before binding");
+    }
+    const columns = expression.columns.map((columnExpression) => {
+      if (columnExpression.kind !== "column") {
+        throw new TypeError("Full-text search takes column references");
+      }
+      const bound = bindExpression(
+        columnExpression,
+        sources,
+        aggregateSpecs,
+        aggregateIndexes,
+        memory,
+        ftsBySignature,
+        ftsStats,
+      );
+      if (bound.kind !== "column") {
+        throw new TypeError("Full-text search takes column references");
+      }
+      if (bound.vector.kind === "boolean") {
+        throw new TypeError(
+          `Full-text search cannot search a boolean column: ${columnExpression.reference}`,
+        );
+      }
+      return bound;
+    });
+    const servedStats = ftsStats?.get(signature);
+    const bound: BoundFtsExpression = {
+      kind: "fts",
+      op: expression.op,
+      columns,
+      terms: cachedQueryTerms(expression.query),
+      caches: columns.map(() => null),
+      ...(servedStats === undefined ? {} : { stats: servedStats }),
+      ...(memory === undefined ? {} : { memory }),
+      signature,
+    };
+    ftsBySignature?.set(signature, bound);
+    return bound;
   }
   if (expression.kind === "window") {
     throw new TypeError("Window functions are only allowed in the select list");
@@ -620,7 +737,7 @@ function bindExpression(
     return {
       kind: "list",
       items: expression.items.map((item) =>
-        bindExpression(item, sources, aggregateSpecs, aggregateIndexes),
+        bindExpression(item, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
       ),
       signature,
     };
@@ -663,8 +780,8 @@ function bindExpression(
     return {
       kind: expression.kind,
       operator: expression.operator,
-      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes),
-      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes),
+      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
       signature,
     } as BoundExpression;
   }
@@ -672,15 +789,15 @@ function bindExpression(
     return {
       kind: "logical",
       operator: expression.operator,
-      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes),
-      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes),
+      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
       signature,
     };
   }
   if (expression.kind === "not") {
     return {
       kind: "not",
-      operand: bindExpression(expression.operand, sources, aggregateSpecs, aggregateIndexes),
+      operand: bindExpression(expression.operand, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
       signature,
     };
   }
@@ -688,19 +805,19 @@ function bindExpression(
     const otherwise =
       expression.otherwise === undefined
         ? undefined
-        : bindExpression(expression.otherwise, sources, aggregateSpecs, aggregateIndexes);
+        : bindExpression(expression.otherwise, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats);
     return {
       kind: "case",
       branches: expression.branches.map((branch) => ({
-        when: bindExpression(branch.when, sources, aggregateSpecs, aggregateIndexes),
-        then: bindExpression(branch.then, sources, aggregateSpecs, aggregateIndexes),
+        when: bindExpression(branch.when, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+        then: bindExpression(branch.then, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
       })),
       ...(otherwise === undefined ? {} : { otherwise }),
       signature,
     };
   }
   const arguments_ = expression.arguments.map((argument) =>
-    bindExpression(argument, sources, aggregateSpecs, aggregateIndexes),
+    bindExpression(argument, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
   );
   if (isScalarFunctionName(expression.name)) {
     return { kind: "call", name: expression.name, arguments: arguments_, signature };
@@ -750,7 +867,197 @@ function boundChildren(expression: BoundExpression): BoundExpression[] {
       ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
     ];
   }
+  if (expression.kind === "fts") return [...expression.columns];
   return [];
+}
+
+/**
+ * Rebuilds one string column's per-dictionary term table when the resident dictionary changes
+ * (streamed vectors swap dictionaries per window). Each dictionary entry tokenizes exactly once;
+ * rows then combine per-code masks. The table is real retained memory — one Uint32 per
+ * dictionary entry — so it reserves against the query budget, releasing the previous window's
+ * reservation on swap.
+ */
+function ensureFtsDictionaryCache(
+  expression: BoundFtsExpression,
+  columnIndex: number,
+  vector: StringVector,
+): FtsDictionaryCache {
+  let cache = expression.caches[columnIndex];
+  if (cache === null || cache === undefined) {
+    cache = { dictionary: undefined, termMask: new Uint32Array(0) };
+    expression.caches[columnIndex] = cache;
+  }
+  if (cache.dictionary !== vector.dictionary) {
+    const scoring = expression.op === "bm25";
+    const termCount = expression.terms.length;
+    // Match tables cost one Uint32 per entry; scoring adds a token count and per-term
+    // frequencies, all part of the modeled query memory.
+    const bytesPerEntry = 4 * (scoring ? termCount + 2 : 1);
+    cache.reservation?.release();
+    delete cache.reservation;
+    const reservation = expression.memory?.reserve(
+      vector.dictionary.length * bytesPerEntry,
+      "Full-text dictionary match table",
+    );
+    if (reservation !== undefined) cache.reservation = reservation;
+    const masks = new Uint32Array(vector.dictionary.length);
+    const tokenCount = scoring ? new Uint32Array(vector.dictionary.length) : undefined;
+    const termTf = scoring ? new Uint32Array(vector.dictionary.length * termCount) : undefined;
+    for (let code = 0; code < vector.dictionary.length; code += 1) {
+      const tokens = tokenize(vector.dictionary[code] ?? "");
+      masks[code] = termsMask(tokens, expression.terms);
+      if (tokenCount !== undefined) tokenCount[code] = tokens.length;
+      if (termTf !== undefined) {
+        const frequencies = termFrequencies(tokens, expression.terms);
+        for (let index = 0; index < termCount; index += 1) {
+          termTf[code * termCount + index] = frequencies[index] ?? 0;
+        }
+      }
+    }
+    cache.dictionary = vector.dictionary;
+    cache.termMask = masks;
+    if (tokenCount !== undefined) cache.tokenCount = tokenCount;
+    if (termTf !== undefined) cache.termTf = termTf;
+  }
+  return cache;
+}
+
+/**
+ * Resolves one column's row index for the three evaluation shapes without a per-row closure:
+ * batch evaluation carries per-source row arrays, join-loop evaluation one row index per
+ * source, and the statistics pass addresses vectors by absolute row.
+ */
+function ftsRowIndex(
+  column: { source: number },
+  batch: BatchRows | null,
+  rowsBySource: Int32Array | null,
+  row: number,
+): number {
+  if (batch !== null) return batch.rowsBySource[column.source]?.[row] ?? -1;
+  if (rowsBySource !== null) return rowsBySource[column.source] ?? -1;
+  return row;
+}
+
+/**
+ * One row's document accumulated over the bound columns — the single owner of the per-column
+ * rule (dictionary tables for strings, render-and-tokenize for numbers and datetimes) shared
+ * by matching, scoring, and the statistics pass, so the three can never drift. Writes into the
+ * node's reusable scratch (zero allocations per row for string columns) and returns it.
+ * `wantScores` additionally gathers token length and per-term frequencies, and only bm25
+ * nodes carry the dictionary tables for those; match-only accumulation may stop early once
+ * every term is covered.
+ */
+function accumulateFtsRow(
+  expression: BoundFtsExpression,
+  batch: BatchRows | null,
+  rowsBySource: Int32Array | null,
+  row: number,
+  wantScores: boolean,
+): FtsRowScratch {
+  const terms = expression.terms;
+  const into = (expression.scratchRow ??= {
+    present: false,
+    mask: 0,
+    length: 0,
+    frequencies: new Array<number>(terms.length).fill(0),
+  });
+  const fullMask = fullTermsMask(terms.length);
+  into.present = false;
+  into.mask = 0;
+  into.length = 0;
+  if (wantScores) into.frequencies.fill(0);
+  for (let index = 0; index < expression.columns.length; index += 1) {
+    const column = expression.columns[index];
+    if (column === undefined) continue;
+    const rowIndex = ftsRowIndex(column, batch, rowsBySource, row);
+    if (column.vector.kind === "string") {
+      const code = stringCodeAt(column.vector, rowIndex);
+      if (code === undefined) continue;
+      into.present = true;
+      if (terms.length === 0 && !wantScores) continue;
+      const cache = ensureFtsDictionaryCache(expression, index, column.vector);
+      into.mask |= cache.termMask[code] ?? 0;
+      if (wantScores) {
+        into.length += cache.tokenCount?.[code] ?? 0;
+        const termTf = cache.termTf;
+        if (termTf !== undefined) {
+          for (let term = 0; term < terms.length; term += 1) {
+            into.frequencies[term] =
+              (into.frequencies[term] ?? 0) + (termTf[code * terms.length + term] ?? 0);
+          }
+        }
+      }
+    } else {
+      const rendered = renderDocumentValue(vectorValue(column.vector, rowIndex));
+      if (rendered === undefined) continue;
+      into.present = true;
+      if (terms.length === 0 && !wantScores) continue;
+      const tokens = tokenize(rendered);
+      if (wantScores) {
+        into.length += tokens.length;
+        const partial = termFrequencies(tokens, terms);
+        for (let term = 0; term < terms.length; term += 1) {
+          const tf = partial[term] ?? 0;
+          into.frequencies[term] = (into.frequencies[term] ?? 0) + tf;
+          if (tf > 0) into.mask |= 1 << term;
+        }
+      } else {
+        into.mask |= termsMask(tokens, terms);
+      }
+    }
+    if (!wantScores && terms.length > 0 && (into.mask & fullMask) === fullMask) return into;
+  }
+  return into;
+}
+
+/**
+ * One whole-scan pass computing BM25 corpus statistics for a bound scoring node, feeding the
+ * shared accumulator so its definition (every row is a document; all-null rows have length 0)
+ * stays identical across producers. Requires a fully materialized scan; streamed scoring plans
+ * carry index-served statistics instead.
+ */
+function computeBoundFtsStats(expression: BoundFtsExpression): FtsStats {
+  for (const column of expression.columns) {
+    if (column.vector.window !== undefined) {
+      throw new TypeError("BM25 requires a materialized scan");
+    }
+  }
+  const rowCount = expression.columns[0]?.vector.length ?? 0;
+  const accumulator = new FtsStatsAccumulator(expression.terms);
+  for (let row = 0; row < rowCount; row += 1) {
+    const document = accumulateFtsRow(expression, null, null, row, true);
+    accumulator.addDocumentCounts(document.mask, document.length);
+  }
+  const stats = accumulator.stats;
+  expression.stats = stats;
+  return stats;
+}
+
+/** Document-level BM25 score for one row; null when every column is null. */
+function ftsBm25BatchValue(
+  expression: BoundFtsExpression,
+  batch: BatchRows | null,
+  rowsBySource: Int32Array | null,
+  row: number,
+): number | null {
+  const stats = expression.stats ?? computeBoundFtsStats(expression);
+  const document = accumulateFtsRow(expression, batch, rowsBySource, row, true);
+  if (!document.present) return null;
+  return bm25DocumentScore(document.frequencies, document.length, stats);
+}
+
+/** Document-level MATCH over the bound columns of one row; null when every column is null. */
+function ftsBatchTruth(
+  expression: BoundFtsExpression,
+  batch: BatchRows | null,
+  rowsBySource: Int32Array | null,
+  row: number,
+): boolean | null {
+  const document = accumulateFtsRow(expression, batch, rowsBySource, row, false);
+  if (!document.present) return null;
+  const fullMask = fullTermsMask(expression.terms.length);
+  return expression.terms.length > 0 && (document.mask & fullMask) === fullMask;
 }
 
 function expressionSources(expression: BoundExpression): Set<number> {
@@ -2586,6 +2893,9 @@ function evaluateFinalExpression(
   if (expression.kind === "column") {
     throw new TypeError("Selected column must appear in GROUP BY");
   }
+  if (expression.kind === "fts") {
+    throw new TypeError("Selected full-text expression must appear in GROUP BY");
+  }
   if (expression.kind === "binary") {
     return binaryValue(
       expression.operator,
@@ -2923,6 +3233,11 @@ function evaluateBatchExpression(
   if (expression.kind === "column") {
     return vectorValue(expression.vector, batch.rowsBySource[expression.source]?.[row] ?? -1);
   }
+  if (expression.kind === "fts") {
+    return expression.op === "match"
+      ? ftsBatchTruth(expression, batch, null, row)
+      : ftsBm25BatchValue(expression, batch, null, row);
+  }
   if (expression.kind === "binary") {
     return binaryValue(
       expression.operator,
@@ -2992,6 +3307,11 @@ function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Arra
   }
   if (expression.kind === "column") {
     return vectorValue(expression.vector, rowsBySource[expression.source] ?? -1);
+  }
+  if (expression.kind === "fts") {
+    return expression.op === "match"
+      ? ftsBatchTruth(expression, null, rowsBySource, 0)
+      : ftsBm25BatchValue(expression, null, rowsBySource, 0);
   }
   if (expression.kind === "binary") {
     return binaryValue(

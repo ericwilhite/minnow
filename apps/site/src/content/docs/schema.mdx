@@ -33,19 +33,52 @@ const rows = await db.selectFrom("people").selectAll().execute();
 ```
 
 There's a builder per column type — `column.boolean()`, `column.number()`, `column.string()`,
-`column.datetime()` — and four modifiers:
+`column.datetime()` — and six modifiers:
 
 - **`.unique()`** — marks the table's unique key (one non-null column).
 - **`.nullable()`** — permits NULL and widens the inferred type.
+- **`.autoIncrement()`** — generates monotonically increasing integers for omitted values from a
+  persistent per-table counter that stays atomic across tabs. Number unique-key columns only.
+  Explicit values are accepted and bump the counter past their maximum, so imports keep stable
+  ids.
+- **`.default(value)`** — fills omitted (or null) slots at insert time. On string columns
+  `"uuid"` and `"nanoid"` name generators (and are reserved as literals); datetime columns take
+  only `"now"`; any other value is a constant. Defaults require non-nullable columns, and the
+  engine reports generated values back — `returning` echoes them.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
   rather than a drop-and-add.
 - **`.references()`** — declares a relation. Checked when the schema is defined, stored as
   metadata; not enforced per write.
 
+```ts
+const notes = table("notes", {
+  id: column.number().unique().autoIncrement(),
+  slug: column.string().default("nanoid"),
+  status: column.string().default("draft"),
+  created: column.datetime().default("now"),
+  body: column.string(),
+});
+// Insert types make generated columns optional:
+await db.insertInto("notes").values({ body: "hello" }).returningAll().executeTakeFirstOrThrow();
+// { id: 1, slug: "V1StGXR8_Z5jdHi6B-myT", status: "draft", created: Date, body: "hello" }
+```
+
+`InferDatabase` carries the "engine can fill this" fact into insert types automatically. If you
+hand-write your `DB` interface instead, mark those columns with `Generated<T>` so inserts keep
+the omission (plain values stay assignable both ways):
+
+```ts
+interface DB {
+  notes: { id: Generated<number>; slug: Generated<string>; body: string };
+}
+```
+
 ## What migrate() does
 
 `migrate()` compares the live catalog with your declaration and applies the difference as
-deterministic, metadata-only steps: create table, add nullable column, rename, widen nullability.
+deterministic, metadata-only steps: create table, add nullable column, rename, widen nullability,
+and add/change/remove a column default (defaults are write-time only, so altering one never
+touches stored rows).
 
 - **Each step is atomic**, and the whole run is idempotent — an interrupted migration completes by
   re-running.
@@ -60,6 +93,7 @@ Rejected outright, rather than attempted:
 - unique-key changes
 - non-null tightening
 - non-nullable column additions
+- adding or removing `.autoIncrement()` (existing rows can't be backfilled into the counter)
 
 If you need one of those, that's a new table plus a deliberate application-level copy.
 

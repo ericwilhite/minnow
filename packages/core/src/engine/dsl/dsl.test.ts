@@ -1,8 +1,8 @@
 import { MemoryBlockStore } from "../../storage/index.js";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { MinnowDatabase } from "../database.js";
-import { compileQuery, type CompiledQuery } from "../query.js";
-import { column, schema, table } from "../schema.js";
+import { compileQuery, compileStatement, type CompiledQuery } from "../query.js";
+import { column, schema, table, type Generated } from "../schema.js";
 import { Minnow } from "./db.js";
 import { NoResultError, type SelectQueryBuilder } from "./select-query-builder.js";
 import { sql } from "./sql-tag.js";
@@ -422,6 +422,174 @@ describe("mutation builders", () => {
     await expect(db.insertInto("people").execute()).rejects.toThrow(
       "insertInto() requires values()",
     );
+  });
+
+  it("compiles match expressions to the SQL plan shape and matches at runtime", async () => {
+    const { db } = await seededDb();
+    expectPlanEquivalent(
+      db
+        .selectFrom("people")
+        .select(["name"])
+        .where((eb) => eb.match(["name", "city"], "ada lond*")),
+      "SELECT name FROM people WHERE MATCH(name, city) AGAINST 'ada lond*'",
+    );
+    expectPlanEquivalent(
+      db
+        .selectFrom("people")
+        .select(["name"])
+        .where((eb) => eb.match("*", "ada")),
+      "SELECT name FROM people WHERE MATCH(*) AGAINST 'ada'",
+    );
+    const found = await db
+      .selectFrom("people")
+      .select(["name"])
+      .where((eb) => eb.match(["name", "city"], "lond*"))
+      .execute();
+    expect(found).toEqual([{ name: "Ada" }]);
+    expect(() => db.selectFrom("people").selectAll().where((eb) => eb.match([], "x"))).toThrow(
+      "at least one column",
+    );
+  });
+
+  it("desugars search() to match + scored ordering with SQL plan parity", async () => {
+    const { db } = await seededDb();
+    // The ordering expression desugars into a hidden select item inside a projected-away
+    // derived block — identically for the builder and the equivalent SQL.
+    expectPlanEquivalent(
+      db.selectFrom("people").select(["name"]).search("ada lond*"),
+      "SELECT name FROM people WHERE MATCH(*) AGAINST 'ada lond*' ORDER BY BM25(*) AGAINST 'ada lond*' DESC",
+    );
+    expectPlanEquivalent(
+      db.selectFrom("people").select(["name"]).search("ada", { columns: ["name"] }),
+      "SELECT name FROM people WHERE MATCH(name) AGAINST 'ada' ORDER BY BM25(name) AGAINST 'ada' DESC",
+    );
+    // The row shape carries no synthetic score column, and repeated searches compose.
+    const hits = await db.selectFrom("people").select(["name"]).search("lond*").execute();
+    expect(hits).toEqual([{ name: "Ada" }]);
+    const repeated = await db
+      .selectFrom("people")
+      .select(["name"])
+      .search("ada")
+      .search("ada")
+      .execute();
+    expect(repeated).toEqual([{ name: "Ada" }]);
+    // Selecting the score yourself reuses the same expression for the ordering (no hidden
+    // duplicate work), and general ORDER BY expressions work outside search too.
+    const scored = await db
+      .selectFrom("people")
+      .select((eb) => ["name", eb.fn.bm25(["name"], "grace").as("relevance")])
+      .orderBy((eb) => eb.fn.bm25(["name"], "grace"), "desc")
+      .orderBy("name")
+      .execute();
+    expect(scored[0]?.name).toBe("Grace");
+    expect(scored[0]?.relevance ?? 0).toBeGreaterThan(0);
+    const arithmetic = await db
+      .selectFrom("people")
+      .select(["name"])
+      .orderBy((eb) => eb("score", "*", -1))
+      .executeTakeFirstOrThrow();
+    expect(arithmetic).toEqual({ name: "Katherine" });
+  });
+
+  it("merges ranked hits across tables through db.search()", async () => {
+    const { db } = await seededDb();
+    // "ada" appears in people.name and in orders.person — hits merge ranked across both tables.
+    const hits = await db.search("ada");
+    expect(hits.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(hits.map((hit) => hit.table))).toEqual(new Set(["people", "orders"]));
+    for (const hit of hits) {
+      expect(hit.score).toBeGreaterThan(0);
+      expect("(search score)" in hit.row).toBe(false);
+    }
+    const scores = hits.map((hit) => hit.score);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+    const limited = await db.search("ada", { tables: ["people"], limit: 1 });
+    expect(limited).toHaveLength(1);
+    expect(limited[0]?.table).toBe("people");
+    expect(limited[0]?.row.name).toBe("Ada");
+  });
+
+  it("keeps generated columns omissible in hand-declared DB interfaces via Generated<T>", async () => {
+    const notes = table("notes", {
+      id: column.number().unique().autoIncrement(),
+      body: column.string(),
+    });
+    const notesSchema = schema([notes]);
+    // The Kysely convention: a hand-written DB interface marks engine-filled columns itself
+    // instead of deriving the brand through InferDatabase.
+    interface HandDeclared {
+      notes: { id: Generated<number>; body: string };
+    }
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      rowsPerBlock: 8,
+      compression: "raw",
+    });
+    await database.migrate(notesSchema);
+    const db = new Minnow<HandDeclared>(database, { schema: notesSchema });
+    const written = await db
+      .insertInto("notes")
+      .values({ body: "hi" }) // id omissible thanks to the explicit brand
+      .returningAll()
+      .executeTakeFirstOrThrow();
+    expect(written).toEqual({ id: 1, body: "hi" });
+    // The flavor stays assignable both ways: plain literals compare and arithmetic works.
+    const found = await db.selectFrom("notes").select(["body"]).where("id", "=", 1).execute();
+    expect(found).toEqual([{ body: "hi" }]);
+  });
+
+  it("echoes generated columns from inserts, matching SQL RETURNING", async () => {
+    const notes = table("notes", {
+      id: column.number().unique().autoIncrement(),
+      slug: column.string().default("nanoid"),
+      body: column.string(),
+    });
+    const notesSchema = schema([notes]);
+    type NotesDB = InferDatabase<typeof notesSchema>;
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      rowsPerBlock: 8,
+      compression: "raw",
+    });
+    await database.migrate(notesSchema);
+    const db = new Minnow<NotesDB>(database, { schema: notesSchema });
+
+    // Default-bearing columns are omissible in values(); explicit values pass through. A mixed
+    // batch reserves once past its explicit maximum, so the omitted row generates 11, not 1.
+    const rows = await db
+      .insertInto("notes")
+      .values([{ body: "first" }, { body: "second", id: 10 }])
+      .returningAll()
+      .execute();
+    expect(rows.map((row) => row.id)).toEqual([11, 10]);
+    expect(rows.map((row) => row.body)).toEqual(["first", "second"]);
+    for (const row of rows) expect(row.slug).toMatch(/^[A-Za-z0-9_-]{21}$/);
+
+    const idOnly = await db
+      .insertInto("notes")
+      .values({ body: "third" })
+      .returning(["id"])
+      .executeTakeFirstOrThrow();
+    expect(idOnly).toEqual({ id: 12 });
+
+    // The flavored column type still takes plain values in predicates.
+    const found = await db
+      .selectFrom("notes")
+      .select(["id", "body"])
+      .where("id", "=", 10)
+      .execute();
+    expect(found).toEqual([{ id: 10, body: "second" }]);
+
+    // Parity: SQL RETURNING accepts generated columns absent from the INSERT column list and
+    // returns the same shape the builder echoes.
+    const viaSql = await database.runStatement(
+      compileStatement("INSERT INTO notes (body) VALUES ('fourth')"),
+      { returning: ["id", "body"] },
+    );
+    expect(viaSql).toMatchObject({ returnedRows: [{ id: 13, body: "fourth" }] });
+    await expect(
+      database.runStatement(compileStatement("INSERT INTO notes (body) VALUES ('x')"), {
+        returning: ["missing"],
+      }),
+    ).rejects.toThrow("INSERT returning column is not in the column list: missing");
   });
 });
 

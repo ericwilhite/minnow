@@ -40,11 +40,19 @@ function createFuzzer(seed: number): Fuzzer {
 
 const REGIONS = ["west", "east", "north", "south", null];
 const LABELS = ["a", "b", "c", null];
+const NOTE_WORDS = ["quick", "brown", "fox", "stone", "river", "moss", "42", "quiet"];
+
+function generateNotes(fuzzer: Fuzzer): string | null {
+  if (fuzzer.random() < 0.15) return null;
+  const words = Array.from({ length: 2 + fuzzer.int(3) }, () => fuzzer.pick(NOTE_WORDS));
+  return words.join(" ");
+}
 
 function generateRows(fuzzer: Fuzzer, count: number): DatabaseRow[] {
   return Array.from({ length: count }, () => ({
     region: fuzzer.pick(REGIONS),
     label: fuzzer.pick(LABELS),
+    notes: generateNotes(fuzzer),
     amount: fuzzer.random() < 0.1 ? null : fuzzer.int(20) - 5,
     ratio: fuzzer.random() < 0.1 ? null : Math.round(fuzzer.random() * 100) / 10,
     joined: fuzzer.random() < 0.15 ? null : new Date(Date.UTC(2026, 0, 1 + fuzzer.int(60))),
@@ -58,20 +66,30 @@ function generateDims(fuzzer: Fuzzer): DatabaseRow[] {
 }
 
 const NUMERIC_COLUMNS = ["amount", "ratio"];
-const ALL_COLUMNS = ["region", "label", "amount", "ratio", "joined"];
+const ALL_COLUMNS = ["region", "label", "notes", "amount", "ratio", "joined"];
 const COMPARISONS = ["=", "!=", ">", ">=", "<", "<="];
 
 const LIKE_PATTERNS = ["w%", "%st", "_est", "%e%", "north", "%nowhere%"];
+const MATCH_QUERIES = ["quick", "fox stone", "riv*", "moss quick", "zzz", "42", "qu* mo*", "  "];
 
 function generatePredicate(fuzzer: Fuzzer, qualifier: string, compound = true): string {
-  const kind = fuzzer.int(compound ? 9 : 6);
+  const kind = fuzzer.int(compound ? 10 : 7);
   if (kind === 6) {
-    return `(${generatePredicate(fuzzer, qualifier, false)} OR ${generatePredicate(fuzzer, qualifier, false)})`;
+    // Document MATCH: columns explicitly, or the whole row when unqualified (a qualified
+    // wildcard would be ambiguous under joins).
+    const columns =
+      qualifier === "" && fuzzer.random() < 0.3
+        ? "*"
+        : `${qualifier}notes${fuzzer.random() < 0.4 ? `, ${qualifier}region` : ""}`;
+    return `MATCH(${columns}) AGAINST '${fuzzer.pick(MATCH_QUERIES)}'`;
   }
   if (kind === 7) {
-    return `NOT (${generatePredicate(fuzzer, qualifier, false)})`;
+    return `(${generatePredicate(fuzzer, qualifier, false)} OR ${generatePredicate(fuzzer, qualifier, false)})`;
   }
   if (kind === 8) {
+    return `NOT (${generatePredicate(fuzzer, qualifier, false)})`;
+  }
+  if (kind === 9) {
     return `${qualifier}region ${fuzzer.random() < 0.5 ? "LIKE" : "NOT LIKE"} '${fuzzer.pick(LIKE_PATTERNS)}'`;
   }
   if (kind === 4) {
@@ -100,7 +118,18 @@ function generatePredicate(fuzzer: Fuzzer, qualifier: string, compound = true): 
 }
 
 function generateSql(fuzzer: Fuzzer): string {
-  const family = fuzzer.int(13);
+  const family = fuzzer.int(14);
+  if (family === 13) {
+    // BM25 scores are floats, but both executors derive them from the same integer counts, so
+    // canonicalRows compares them exactly. No LIMIT: relevance ties would make row selection
+    // under a limit legitimately ambiguous.
+    const columns = fuzzer.random() < 0.3 ? "*" : "notes, region";
+    const filtered =
+      fuzzer.random() < 0.5
+        ? ` WHERE MATCH(notes) AGAINST '${fuzzer.pick(MATCH_QUERIES)}'`
+        : "";
+    return `SELECT region, notes, BM25(${columns}) AGAINST '${fuzzer.pick(MATCH_QUERIES)}' AS score FROM rows${filtered}`;
+  }
   if (family === 10) {
     const grouped = fuzzer.random() < 0.5;
     return grouped

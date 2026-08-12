@@ -1,5 +1,7 @@
+import type { ColumnDefault } from "../storage/index.js";
 import {
   column,
+  columnWithDefaultSpec,
   schema,
   table,
   type AnyTable,
@@ -19,6 +21,7 @@ export interface WireColumn {
   readonly type: SchemaColumnType;
   readonly isNullable: boolean;
   readonly isUnique: boolean;
+  readonly defaultSpec?: ColumnDefault;
   readonly renamedFromName?: string;
   readonly reference?: { table: string; column: string };
 }
@@ -36,15 +39,22 @@ export type WireMigrationStep =
   | { kind: "create-table"; table: WireTable }
   | { kind: "add-column"; tableName: string; columnName: string; definition: WireColumn }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
-  | { kind: "widen-nullable"; tableName: string; columnName: string };
+  | { kind: "widen-nullable"; tableName: string; columnName: string }
+  | {
+      kind: "alter-default";
+      tableName: string;
+      columnName: string;
+      defaultValue: ColumnDefault | null;
+    };
 
-type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean>;
+type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean, boolean>;
 
 function serializeColumn(definition: AnyColumn): WireColumn {
   return {
     type: definition.type,
     isNullable: definition.isNullable,
     isUnique: definition.isUnique,
+    ...(definition.defaultSpec === undefined ? {} : { defaultSpec: { ...definition.defaultSpec } }),
     ...(definition.renamedFromName === undefined
       ? {}
       : { renamedFromName: definition.renamedFromName }),
@@ -94,6 +104,9 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
   if (wire.reference !== undefined) {
     builder = builder.references(wire.reference.table, wire.reference.column);
   }
+  // Rebuilt from the spec directly rather than through .default(), which would re-interpret the
+  // reserved generator names.
+  if (wire.defaultSpec !== undefined) builder = columnWithDefaultSpec(builder, wire.defaultSpec);
   return builder;
 }
 

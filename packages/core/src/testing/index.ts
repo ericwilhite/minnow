@@ -105,7 +105,7 @@ export class FaultInjectingBlockStore implements BlockStore {
   updateTable(
     id: string,
     expectedRevision: number,
-    update: { columns: TableColumnRecord[] },
+    update: Parameters<BlockStore["updateTable"]>[2],
   ): Promise<TableRecord> {
     return this.inner.updateTable(id, expectedRevision, update);
   }
@@ -128,6 +128,32 @@ export class FaultInjectingBlockStore implements BlockStore {
 
   reserveRowIds(tableId: string, count: number): Promise<RowIdRange> {
     return this.inner.reserveRowIds(tableId, count);
+  }
+
+  reserveAutoIncrement(
+    tableId: string,
+    columnId: string,
+    count: number,
+    atLeast?: bigint,
+  ): Promise<RowIdRange> {
+    return this.inner.reserveAutoIncrement(tableId, columnId, count, atLeast);
+  }
+
+  writeFtsBase(
+    tableId: string,
+    columnId: string,
+    input: Parameters<BlockStore["writeFtsBase"]>[2],
+  ): Promise<void> {
+    return this.inner.writeFtsBase(tableId, columnId, input);
+  }
+
+  readFtsCandidates(
+    tableId: string,
+    columnId: string,
+    terms: Parameters<BlockStore["readFtsCandidates"]>[2],
+    upToVersion: number,
+  ): ReturnType<BlockStore["readFtsCandidates"]> {
+    return this.inner.readFtsCandidates(tableId, columnId, terms, upToVersion);
   }
 
   getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]> {

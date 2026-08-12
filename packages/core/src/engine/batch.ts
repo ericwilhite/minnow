@@ -16,6 +16,12 @@ export type BatchRow = Readonly<Record<string, BatchValue>>;
 /** The columnar form: one array per column, all of the same length, aligned by index. */
 export interface ColumnarBatch {
   columns: Readonly<Record<string, readonly BatchValue[]>>;
+  /**
+   * The batch's row count when no column carries it — a pivot of rows whose every column is
+   * default-generated produces an empty column map, and the count would otherwise be lost
+   * across the worker boundary.
+   */
+  rowCount?: number;
 }
 
 /** What `insertBatch` and `upsertBatch` take: rows, or columns for a bulk load. */
@@ -46,5 +52,5 @@ export function toColumnarBatch(input: InsertBatchInput): ColumnarBatch {
       values[index] = row[name] ?? null;
     }
   }
-  return { columns: Object.fromEntries(columnsByName) };
+  return { columns: Object.fromEntries(columnsByName), rowCount: input.length };
 }

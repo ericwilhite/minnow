@@ -3,7 +3,13 @@ import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../stora
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import { QueryMemoryBudgetError } from "./memory.js";
-import { compileQuery, createPreparedQuery, executeQuery, executeRowQuery } from "./query.js";
+import {
+  compileQuery,
+  createPreparedQuery,
+  executeQuery,
+  executeRowQuery,
+  topLevelFtsMatchConjuncts,
+} from "./query.js";
 
 interface QueryStoreHarness {
   readonly store: BlockStore;
@@ -967,6 +973,49 @@ describe("public SQL queries", () => {
         input,
       ),
     ).toThrow("Recursive CTE exceeded");
+  });
+});
+
+describe("top-level full-text conjunct extraction", () => {
+  // Pins the pairing between splitCondition's predicate shape and the extraction that index
+  // pruning relies on: if a parser or optimizer change rewraps a bare MATCH conjunct, this
+  // fails loudly instead of pruning silently turning off.
+  it("extracts exactly the conjuncts every result row must satisfy", () => {
+    const single = compileQuery(
+      "SELECT a FROM rows WHERE MATCH(a, b) AGAINST 'quick fox' AND n > 1",
+    );
+    expect(topLevelFtsMatchConjuncts(single)).toEqual([
+      {
+        columns: [
+          { kind: "column", reference: "a" },
+          { kind: "column", reference: "b" },
+        ],
+        query: "quick fox",
+      },
+    ]);
+    const two = compileQuery(
+      "SELECT a FROM rows WHERE MATCH(a) AGAINST 'x' AND MATCH(b) AGAINST 'y'",
+    );
+    expect(topLevelFtsMatchConjuncts(two)).toHaveLength(2);
+    // Negated, OR-wrapped, and unexpanded-star matches are not guaranteed by every row.
+    expect(
+      topLevelFtsMatchConjuncts(
+        compileQuery("SELECT a FROM rows WHERE NOT (MATCH(a) AGAINST 'x')"),
+      ),
+    ).toEqual([]);
+    expect(
+      topLevelFtsMatchConjuncts(
+        compileQuery("SELECT a FROM rows WHERE MATCH(a) AGAINST 'x' OR n > 1"),
+      ),
+    ).toEqual([]);
+    expect(
+      topLevelFtsMatchConjuncts(compileQuery("SELECT a FROM rows WHERE MATCH(*) AGAINST 'x'")),
+    ).toEqual([]);
+    // The optimizer must preserve the conjunct through its rewrites.
+    const optimized = compileQuery(
+      "SELECT a FROM rows WHERE MATCH(a) AGAINST 'x' AND 1 + 1 = 2 AND n >= 0",
+    );
+    expect(topLevelFtsMatchConjuncts(optimized)).toHaveLength(1);
   });
 });
 

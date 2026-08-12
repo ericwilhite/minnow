@@ -1245,6 +1245,202 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("reserves monotone auto-increment ranges per column", async () => {
+      const store = await implementation.create();
+      expect(await store.reserveAutoIncrement("people", "id", 3)).toEqual({
+        start: 1n,
+        endExclusive: 4n,
+      });
+      expect(await store.reserveAutoIncrement("people", "id", 2)).toEqual({
+        start: 4n,
+        endExclusive: 6n,
+      });
+      // Counters are per column and independent of the row-id counter.
+      expect(await store.reserveAutoIncrement("people", "other", 1)).toEqual({
+        start: 1n,
+        endExclusive: 2n,
+      });
+      expect(await store.reserveRowIds("people", 1)).toEqual({ start: 1n, endExclusive: 2n });
+      store.close();
+    });
+
+    it("bumps the auto-increment counter past explicit values", async () => {
+      const store = await implementation.create();
+      // A pure bump reserves nothing but advances the counter past imported values.
+      expect(await store.reserveAutoIncrement("people", "id", 0, 101n)).toEqual({
+        start: 101n,
+        endExclusive: 101n,
+      });
+      expect(await store.reserveAutoIncrement("people", "id", 2)).toEqual({
+        start: 101n,
+        endExclusive: 103n,
+      });
+      // A bump below the stored counter is a no-op floor, never a rewind.
+      expect(await store.reserveAutoIncrement("people", "id", 1, 5n)).toEqual({
+        start: 103n,
+        endExclusive: 104n,
+      });
+      await expect(store.reserveAutoIncrement("people", "id", -1)).rejects.toThrow(
+        "non-negative whole number",
+      );
+      await expect(store.reserveAutoIncrement("people", "id", 1, 0n)).rejects.toThrow(
+        "at least 1",
+      );
+      store.close();
+    });
+
+    it("round-trips full-text base chunks and merges commit deltas", async () => {
+      const store = await implementation.create();
+      await store.writeFtsBase("articles", "title", {
+        coversVersion: 4,
+        chunks: [
+          [
+            { term: "alpha", rowIds: [1n, 3n], tf: [1, 2] },
+            { term: "beta", rowIds: [2n], tf: [1] },
+          ],
+          [{ term: "gamma", rowIds: [3n], tf: [1] }],
+        ],
+        totalTokens: 5,
+      });
+      const exact = await store.readFtsCandidates(
+        "articles",
+        "title",
+        [{ term: "alpha", prefix: false }],
+        10,
+      );
+      expect(exact.rowIdsByTerm).toEqual([[1n, 3n]]);
+      expect(exact.deltaChunkCount).toBe(0);
+      expect(exact.totalTokens).toBe(5);
+      // Prefix terms match a term range; ga* reaches into the second chunk.
+      const prefix = await store.readFtsCandidates(
+        "articles",
+        "title",
+        [
+          { term: "b", prefix: true },
+          { term: "ga", prefix: true },
+        ],
+        10,
+      );
+      expect(prefix.rowIdsByTerm).toEqual([[2n], [3n]]);
+      store.close();
+    });
+
+    it("applies full-text commit deltas atomically and flips stale writers to invalid", async () => {
+      const store = await implementation.create();
+      await store.addTable({
+        id: "articles-id",
+        name: "articles",
+        columns: [{ id: "title-id", name: "title", type: "string", nullable: false }],
+        ftsColumns: {
+          "title-id": {
+            storage: "fts-chunks-v1",
+            tokenizerVersion: 1,
+            state: "ready",
+            buildFromVersion: -1,
+          },
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        revision: 0,
+      });
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      const commitSegment = async (
+        ordinal: number,
+        expectedVersion: number | null,
+        withDelta: boolean,
+      ) => {
+        const transactionId = `fts-tx-${String(ordinal)}`;
+        const blockId = `fts-block-${String(ordinal)}`;
+        const segmentId = `fts-segment-${String(ordinal)}`;
+        await store.addBlock(blockId, Uint8Array.of(1));
+        await store.addSegment({
+          id: segmentId,
+          tableId: "articles-id",
+          transactionId,
+          rowCount: 1,
+          rowIdStart: BigInt(ordinal),
+          rowIdEndExclusive: BigInt(ordinal) + 1n,
+          columnBlockIds: { "title-id": [blockId] },
+          kind: "insert",
+          createdAt: timestamp,
+        });
+        await store.createTransaction({
+          id: transactionId,
+          snapshotVersion: expectedVersion,
+          pendingBlockIds: [blockId],
+          pendingSegmentIds: [segmentId],
+          status: "active",
+          revision: 0,
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          committedVersion: null,
+        });
+        return store.commitTransaction({
+          transactionId,
+          expectedTransactionRevision: 0,
+          expectedManifestVersion: expectedVersion,
+          changedTableIds: ["articles-id"],
+          ...(withDelta
+            ? {
+                ftsChanges: {
+                  tableId: "articles-id",
+                  columns: [
+                    {
+                      columnId: "title-id",
+                      postings: [
+                        { term: "quick", rowIds: [BigInt(ordinal)], tf: [1] },
+                      ],
+                      totalTokens: 1,
+                    },
+                  ],
+                },
+              }
+            : {}),
+          committedAt: timestamp,
+        });
+      };
+      const first = await commitSegment(1, null, true);
+      const merged = await store.readFtsCandidates(
+        "articles-id",
+        "title-id",
+        [{ term: "quick", prefix: false }],
+        first.version,
+      );
+      expect(merged.rowIdsByTerm).toEqual([[1n]]);
+      expect(merged.deltaChunkCount).toBe(1);
+      expect(merged.totalTokens).toBe(1);
+      expect((await store.getTable("articles-id"))?.ftsColumns?.["title-id"]?.state).toBe(
+        "ready",
+      );
+      // A commit that adds segments without a delta is a stale writer: the column flips to
+      // invalid in the same publish, and the data commit itself succeeds.
+      await commitSegment(2, first.version, false);
+      expect((await store.getTable("articles-id"))?.ftsColumns?.["title-id"]?.state).toBe(
+        "invalid",
+      );
+      store.close();
+    });
+
+    it("reserves row ids and auto-increment values while beginning a transaction", async () => {
+      const store = await implementation.create();
+      if (store.beginTransaction === undefined) {
+        store.close();
+        return;
+      }
+      const result = await store.beginTransaction({
+        record: activeTransaction("begin-reservations"),
+        reserveRowIds: { tableId: "people", count: 4 },
+        reserveAutoIncrement: { tableId: "people", columnId: "id", count: 2, atLeast: 10n },
+      });
+      expect(result.rowIds).toEqual({ start: 1n, endExclusive: 5n });
+      expect(result.autoIncrementValues).toEqual({ start: 10n, endExclusive: 12n });
+      // The bump landed atomically with the begin: later reservations continue past it.
+      expect(await store.reserveAutoIncrement("people", "id", 1)).toEqual({
+        start: 12n,
+        endExclusive: 13n,
+      });
+      store.close();
+    });
+
     it("creates and renews persistent leases", async () => {
       const store = await implementation.create();
       await store.createLease({
@@ -2947,6 +3143,37 @@ it("reserves row IDs atomically across IndexedDB connections", async () => {
   expect(ranges.map((range) => range.endExclusive - range.start)).toEqual([10n, 10n]);
   left.close();
   right.close();
+});
+
+it("reserves auto-increment values atomically across IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  const left = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const right = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const ranges = await Promise.all([
+    left.reserveAutoIncrement("events", "id", 10),
+    right.reserveAutoIncrement("events", "id", 10, 5n),
+  ]);
+  const starts = ranges.map((range) => range.start).sort((a, b) => (a < b ? -1 : 1));
+  // Disjoint ranges regardless of which connection won the race.
+  expect(starts[1]).toBeGreaterThanOrEqual((starts[0] ?? 0n) + 10n);
+  expect(ranges.map((range) => range.endExclusive - range.start)).toEqual([10n, 10n]);
+  left.close();
+  right.close();
+});
+
+it("persists the auto-increment counter across IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  let store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  await store.reserveAutoIncrement("events", "id", 7, 100n);
+  store.close();
+  store = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  expect(await store.reserveAutoIncrement("events", "id", 1)).toEqual({
+    start: 107n,
+    endExclusive: 108n,
+  });
+  store.close();
 });
 
 it("persists compaction checkpoints across IndexedDB connections", async () => {

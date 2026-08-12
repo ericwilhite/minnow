@@ -1,4 +1,9 @@
-import { type TableColumnRecord, type TableRecord } from "../storage/index.js";
+import {
+  validateColumnDefault,
+  type ColumnDefault,
+  type TableColumnRecord,
+  type TableRecord,
+} from "../storage/index.js";
 import { type BatchRow } from "./batch.js";
 
 /**
@@ -19,34 +24,101 @@ type ValueOf<TType extends SchemaColumnType> = TType extends "boolean"
       ? string
       : Date;
 
-export interface ColumnBuilder<TValue, TNullable extends boolean, TUnique extends boolean = false> {
+/**
+ * A flavored value: a column whose slot the engine can fill, so inserts may omit it. The brand
+ * is an optional phantom property — plain values stay assignable in both directions.
+ */
+export type HasDefault<TValue> = TValue & { readonly __minnowHasDefault?: true };
+
+/**
+ * The public name for the flavor, for hand-declared `DB` interfaces (the Kysely convention).
+ * `InferDatabase` applies it automatically from the schema; write it yourself only when you
+ * declare the row types by hand and want generated columns to stay omissible on insert:
+ *
+ * ```ts
+ * interface DB {
+ *   notes: { id: Generated<number>; slug: Generated<string>; body: string };
+ * }
+ * ```
+ */
+export type Generated<TValue> = HasDefault<TValue>;
+
+export interface ColumnBuilder<
+  TValue,
+  TNullable extends boolean,
+  TUnique extends boolean = false,
+  THasDefault extends boolean = false,
+> {
   readonly kind: "column";
   readonly type: SchemaColumnType;
   readonly isNullable: TNullable;
   readonly isUnique: TUnique;
+  readonly hasDefault: THasDefault;
+  readonly defaultSpec?: ColumnDefault;
   readonly renamedFromName?: string;
   readonly reference?: { table: string; column: string };
   /** Marks the column nullable; inserts may omit it and reads may return null. */
-  nullable(): ColumnBuilder<TValue, true, TUnique>;
+  nullable(): ColumnBuilder<TValue, true, TUnique, THasDefault>;
   /** Marks the table's unique key; exactly one non-nullable column may carry it. */
-  unique(): ColumnBuilder<TValue, TNullable, true>;
+  unique(): ColumnBuilder<TValue, TNullable, true, THasDefault>;
   /** Declares this column as the rename target of an existing catalog column. */
-  renamedFrom(name: string): ColumnBuilder<TValue, TNullable, TUnique>;
+  renamedFrom(name: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /** Declares a relation for catalog metadata and validation; not enforced at write time. */
-  references(table: string, column: string): ColumnBuilder<TValue, TNullable, TUnique>;
+  references(table: string, column: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
+  /**
+   * Fills null-or-absent slots at insert time. On string columns "uuid" and "nanoid" name
+   * generators (and are therefore reserved as literals); datetime columns accept only "now";
+   * any other value is a constant. Requires a non-nullable column.
+   */
+  default(
+    value: TValue extends Date ? "now" : TValue,
+  ): ColumnBuilder<TValue, TNullable, TUnique, true>;
+  /**
+   * Generates monotonically increasing integers for null-or-absent slots from a persistent
+   * per-table counter that is atomic across tabs. Explicit values are allowed and bump the
+   * counter past their maximum. Number unique-key columns only.
+   */
+  autoIncrement: TValue extends number
+    ? () => ColumnBuilder<TValue, TNullable, TUnique, true>
+    : never;
 }
 
-type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean>;
+type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean, boolean>;
+
+function defaultSpecFromArg(type: SchemaColumnType, value: unknown): ColumnDefault {
+  switch (type) {
+    case "datetime":
+      if (value !== "now") throw new TypeError('Datetime columns default with "now"');
+      return { kind: "now" };
+    case "string":
+      if (typeof value !== "string") throw new TypeError("Default literal must be a string");
+      if (value === "uuid") return { kind: "uuid" };
+      if (value === "nanoid") return { kind: "nanoid" };
+      return { kind: "literal", value };
+    case "number":
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw new TypeError("Default literal must be a finite number");
+      }
+      return { kind: "literal", value };
+    case "boolean":
+      if (typeof value !== "boolean") throw new TypeError("Default literal must be a boolean");
+      return { kind: "literal", value };
+  }
+}
 
 function createColumn<TType extends SchemaColumnType>(
   type: TType,
-  state: Partial<Pick<AnyColumn, "isNullable" | "isUnique" | "renamedFromName" | "reference">> = {},
+  state: Partial<
+    Pick<AnyColumn, "isNullable" | "isUnique" | "renamedFromName" | "reference" | "defaultSpec">
+  > = {},
 ): ColumnBuilder<ValueOf<TType>, false> {
   const base = {
     kind: "column" as const,
     type,
     isNullable: (state.isNullable ?? false) as false,
     isUnique: (state.isUnique ?? false) as false,
+    hasDefault: (state.defaultSpec !== undefined) as false,
+    ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
     ...(state.reference === undefined ? {} : { reference: state.reference }),
   };
@@ -66,7 +138,36 @@ function createColumn<TType extends SchemaColumnType>(
     renamedFrom: (name: string) => createColumn(type, { ...state, renamedFromName: name }),
     references: (table: string, referencedColumn: string) =>
       createColumn(type, { ...state, reference: { table, column: referencedColumn } }),
+    default: ((value: unknown) =>
+      createColumn(type, {
+        ...state,
+        defaultSpec: defaultSpecFromArg(type, value),
+      })) as unknown as ColumnBuilder<ValueOf<TType>, false>["default"],
+    autoIncrement: (() => {
+      if (type !== "number") {
+        throw new TypeError("Auto-increment requires a number column");
+      }
+      return createColumn(type, { ...state, defaultSpec: { kind: "autoincrement" } });
+    }) as unknown as ColumnBuilder<ValueOf<TType>, false>["autoIncrement"],
   };
+}
+
+/**
+ * Rebuilds a column carrying an exact default spec — the wire layer's escape hatch, since the
+ * public `.default()` interprets the reserved generator names and cannot express them as
+ * literals.
+ */
+export function columnWithDefaultSpec(
+  base: Pick<AnyColumn, "type" | "isNullable" | "isUnique" | "renamedFromName" | "reference">,
+  spec: ColumnDefault,
+): AnyColumn {
+  return createColumn(base.type, {
+    isNullable: base.isNullable,
+    isUnique: base.isUnique,
+    ...(base.renamedFromName === undefined ? {} : { renamedFromName: base.renamedFromName }),
+    ...(base.reference === undefined ? {} : { reference: base.reference }),
+    defaultSpec: spec,
+  }) as unknown as AnyColumn;
 }
 
 export const column = {
@@ -111,6 +212,19 @@ export function table<const TName extends string, TColumns extends Record<string
   if (uniqueEntry?.[1].isNullable === true) {
     throw new TypeError(`Table ${name} unique column must not be nullable: ${uniqueEntry[0]}`);
   }
+  for (const [columnName, definition] of entries) {
+    const spec = definition.defaultSpec;
+    if (spec === undefined) continue;
+    validateColumnDefault(
+      {
+        name: columnName,
+        type: definition.type,
+        nullable: definition.isNullable,
+        isUniqueKey: definition.isUnique,
+      },
+      spec,
+    );
+  }
   return {
     kind: "table",
     name,
@@ -127,7 +241,8 @@ export function table<const TName extends string, TColumns extends Record<string
         for (const [columnName, definition] of entries) {
           const columnValue = row[columnName];
           if (columnValue === undefined || columnValue === null) {
-            if (!definition.isNullable) {
+            // A default-bearing column may be omitted — the engine fills it at insert time.
+            if (!definition.isNullable && definition.defaultSpec === undefined) {
               issues.push({ message: `Missing non-nullable column`, path: [columnName] });
             }
             continue;
@@ -182,10 +297,12 @@ export function schema<TTables extends readonly AnyTable[]>(
 // --- Compile-time row types ---------------------------------------------------------------------
 
 type ColumnValue<TColumn> =
-  TColumn extends ColumnBuilder<infer TValue, infer TNullable, boolean>
-    ? TNullable extends true
-      ? TValue | null
-      : TValue
+  TColumn extends ColumnBuilder<infer TValue, infer TNullable, boolean, infer THasDefault>
+    ? THasDefault extends true
+      ? HasDefault<TNullable extends true ? TValue | null : TValue>
+      : TNullable extends true
+        ? TValue | null
+        : TValue
     : never;
 
 /** The complete row shape a read returns. */
@@ -197,12 +314,18 @@ type NullableKeys<TTable extends AnyTable> = {
   [K in keyof TTable["columns"]]: TTable["columns"][K]["isNullable"] extends true ? K : never;
 }[keyof TTable["columns"]];
 
-/** Insert rows require every non-nullable column and may omit nullable ones. */
+type DefaultKeys<TTable extends AnyTable> = {
+  [K in keyof TTable["columns"]]: TTable["columns"][K]["hasDefault"] extends true ? K : never;
+}[keyof TTable["columns"]];
+
+type OptionalInsertKeys<TTable extends AnyTable> = NullableKeys<TTable> | DefaultKeys<TTable>;
+
+/** Insert rows require every non-nullable column and may omit nullable or default-bearing ones. */
 export type InferInsertRow<TTable extends AnyTable> = Omit<
   InferRow<TTable>,
-  NullableKeys<TTable>
+  OptionalInsertKeys<TTable>
 > & {
-  [K in NullableKeys<TTable>]?: ColumnValue<TTable["columns"][K]>;
+  [K in OptionalInsertKeys<TTable>]?: ColumnValue<TTable["columns"][K]>;
 };
 
 /** Update changes may cover any column except the unique key. */
@@ -218,7 +341,13 @@ export type MigrationStep =
   | { kind: "create-table"; table: AnyTable }
   | { kind: "add-column"; tableName: string; columnName: string; definition: AnyColumn }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
-  | { kind: "widen-nullable"; tableName: string; columnName: string };
+  | { kind: "widen-nullable"; tableName: string; columnName: string }
+  | {
+      kind: "alter-default";
+      tableName: string;
+      columnName: string;
+      defaultValue: ColumnDefault | null;
+    };
 
 export interface MigrationPlan {
   steps: MigrationStep[];
@@ -304,6 +433,22 @@ export function planMigration(
           kind: "widen-nullable",
           tableName: tableDefinition.name,
           columnName,
+        });
+      }
+      if (!columnDefaultsEqual(existing.defaultValue, columnDefinition.defaultSpec)) {
+        if (
+          existing.defaultValue?.kind === "autoincrement" ||
+          columnDefinition.defaultSpec?.kind === "autoincrement"
+        ) {
+          throw new TypeError(
+            `Auto-increment cannot be added or removed after creation: ${tableDefinition.name}.${columnName}. Existing rows cannot be backfilled; recreate the table to change key generation.`,
+          );
+        }
+        steps.push({
+          kind: "alter-default",
+          tableName: tableDefinition.name,
+          columnName,
+          defaultValue: columnDefinition.defaultSpec ?? null,
         });
       }
     }
@@ -411,7 +556,24 @@ export function applyColumnSteps(
     if (step.kind === "widen-nullable") {
       const target = columns.find(({ name }) => name === step.columnName);
       if (target !== undefined) target.nullable = true;
+      continue;
+    }
+    if (step.kind === "alter-default") {
+      const target = columns.find(({ name }) => name === step.columnName);
+      if (target !== undefined) {
+        if (step.defaultValue === null) delete target.defaultValue;
+        else target.defaultValue = step.defaultValue;
+      }
     }
   }
   return columns;
+}
+
+function columnDefaultsEqual(
+  left: ColumnDefault | undefined,
+  right: ColumnDefault | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  return left.kind !== "literal" || right.kind !== "literal" || left.value === right.value;
 }

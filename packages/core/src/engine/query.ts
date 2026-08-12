@@ -1,4 +1,14 @@
 import type { DatabaseRow } from "./database.js";
+import {
+  cachedQueryTerms,
+  ftsBm25Row,
+  FtsStatsAccumulator,
+  ftsMatchTruth,
+  renderDocumentValue,
+  tokenize as ftsTokenize,
+  validateFtsQuery,
+  type FtsStats,
+} from "./fts.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { optimizePlan } from "./optimizer.js";
 import {
@@ -145,6 +155,23 @@ export type Expression =
       partitionBy: Expression[];
       orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
       argument?: Expression;
+    }
+  | {
+      kind: "fts";
+      op: "match" | "bm25";
+      /**
+       * Column references forming the document, or "*" for every searchable column of the
+       * single scan source. "*" stays unexpanded through compilation (both front ends emit the
+       * identical node — plan parity), and the engine expands it against the catalog at
+       * prepare time via expandFtsColumns.
+       */
+      columns: Expression[] | "*";
+      query: string;
+      /**
+       * Corpus statistics for BM25, annotated by the executor onto its cloned plan before
+       * evaluation; never set by compilation.
+       */
+      stats?: FtsStats;
     };
 
 export type WindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK" | AggregateName;
@@ -594,6 +621,21 @@ export function inferBlockSchema(
     }
     if (expression.kind === "wildcard") return "number";
     if (expression.kind === "column") return resolveColumnType(expression.reference);
+    if (expression.kind === "fts") {
+      if (expression.columns !== "*") {
+        for (const columnExpression of expression.columns) {
+          if (columnExpression.kind !== "column") {
+            throw new TypeError("Full-text search takes column references");
+          }
+          if (infer(columnExpression) === "boolean") {
+            throw new TypeError(
+              `Full-text search cannot search a boolean column: ${columnExpression.reference}`,
+            );
+          }
+        }
+      }
+      return expression.op === "match" ? "boolean" : "number";
+    }
     if (expression.kind === "binary") {
       for (const side of [expression.left, expression.right]) {
         const type = infer(side);
@@ -690,12 +732,38 @@ export function referencedColumns(
   return new Map([...requested].map(([table, columns]) => [table, [...columns]]));
 }
 
+/**
+ * Derives a schema-less table's searchable document columns for MATCH(*) expansion: every
+ * column that ever held a non-boolean value. Boolean-only and all-null columns contribute
+ * nothing to a document either way, so excluding them preserves match semantics exactly.
+ */
+function rowTableSearchableColumns(
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): (tableName: string) => readonly string[] | undefined {
+  return (tableName) => {
+    const rows = tables.get(tableName);
+    if (rows === undefined) return undefined;
+    const searchable = new Set<string>();
+    const booleans = new Set<string>();
+    for (const row of rows) {
+      for (const [name, value] of Object.entries(row)) {
+        if (typeof value === "boolean") booleans.add(name);
+        else if (value !== null) searchable.add(name);
+      }
+    }
+    return [...searchable].filter((name) => !booleans.has(name));
+  };
+}
+
 export function createPreparedQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
   options: QueryExecutionOptions = {},
 ): PreparedQuery {
   validateGrouping(plan);
+  // Every engine entry expands MATCH(*) exactly once, here against the row tables' own
+  // columns; past this point no executor sees the "*" sentinel.
+  plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
   for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
   plan = resolution.plan;
@@ -723,12 +791,16 @@ export function createPreparedColumnarQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
   memory: QueryMemoryContext = new QueryMemoryContext(),
+  options: { ftsStats?: ReadonlyMap<string, FtsStats> } = {},
 ): PreparedQuery {
   validateGrouping(plan);
   let closed = false;
   let prepared: PreparedVectorQuery | undefined;
   try {
-    prepared = prepareVectorQuery(plan, tables, { memoryContext: memory });
+    prepared = prepareVectorQuery(plan, tables, {
+      memoryContext: memory,
+      ...(options.ftsStats === undefined ? {} : { ftsStats: options.ftsStats }),
+    });
   } catch (error) {
     memory.close();
     throw error;
@@ -959,7 +1031,7 @@ export function createRecursiveCteState(base: QueryResult, all: boolean): Recurs
 }
 
 /** The direct child expressions of a node; subqueries and EXISTS scope their own blocks. */
-function childExpressions(expression: Expression): Expression[] {
+export function childExpressions(expression: Expression): Expression[] {
   if (expression.kind === "binary") return [expression.left, expression.right];
   if (expression.kind === "call") return [...expression.arguments];
   if (expression.kind === "list") return [...expression.items];
@@ -973,7 +1045,145 @@ function childExpressions(expression: Expression): Expression[] {
       ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
     ];
   }
+  if (expression.kind === "fts") return expression.columns === "*" ? [] : [...expression.columns];
   return [];
+}
+
+/**
+ * Visits every expression position of one block — select, predicates, HAVING, GROUP BY,
+ * ORDER BY, and join conditions — without descending into nested blocks. Every plan feature
+ * that scans "all expressions of a block" goes through here, so a future clause is added to
+ * one list instead of one per feature.
+ */
+export function forEachBlockExpression(
+  block: CompiledQuery,
+  visit: (expression: Expression) => void,
+): void {
+  for (const item of block.select) visit(item.expression);
+  for (const predicate of [...block.predicates, ...block.having]) {
+    visit(predicate.left);
+    visit(predicate.right);
+  }
+  block.groupBy.forEach(visit);
+  for (const order of block.orderBy) visit(order.expression);
+  for (const join of block.joins) {
+    visit(join.left);
+    visit(join.right);
+    if (join.on !== undefined) visit(join.on);
+  }
+}
+
+/** Visits every nested block of one block's sources (derived, union, windowed, recursive). */
+export function forEachNestedBlock(
+  block: CompiledQuery,
+  visit: (nested: CompiledQuery) => void,
+): void {
+  for (const source of [block.base, ...block.joins]) {
+    if (source.derived !== undefined) visit(source.derived);
+    if (source.union !== undefined) source.union.blocks.forEach(visit);
+    if (source.windowed !== undefined) visit(source.windowed.block);
+    if (source.recursive !== undefined) {
+      visit(source.recursive.base);
+      visit(source.recursive.step);
+    }
+  }
+}
+
+/** One top-level full-text MATCH conjunct of a plan, with its resolved column expressions. */
+export interface FtsMatchConjunct {
+  columns: Expression[];
+  query: string;
+}
+
+/**
+ * The plan's top-level `MATCH ... AGAINST` conjuncts — the ones index pruning may exploit,
+ * because every result row must satisfy them. This is the sole authority on how a bare MATCH
+ * appears in `plan.predicates`: `splitCondition` wraps non-comparison booleans as
+ * `IS TRUE` predicates, and a test pins that pairing so an optimizer or parser change that
+ * rewraps the conjunct fails loudly instead of silently disabling pruning. Unexpanded `"*"`
+ * documents and negated/OR-wrapped matches are deliberately excluded.
+ */
+export function topLevelFtsMatchConjuncts(plan: CompiledQuery): FtsMatchConjunct[] {
+  return plan.predicates.flatMap((predicate) =>
+    predicate.operator === "IS TRUE" &&
+    predicate.left.kind === "fts" &&
+    predicate.left.op === "match" &&
+    predicate.left.columns !== "*"
+      ? [{ columns: predicate.left.columns, query: predicate.left.query }]
+      : [],
+  );
+}
+
+/** True when any expression in the plan or its nested blocks is a full-text node. */
+export function planContainsFts(plan: CompiledQuery, op?: "match" | "bm25"): boolean {
+  let found = false;
+  const expressionHasFts = (expression: Expression): void => {
+    if (found) return;
+    if (expression.kind === "fts") {
+      found ||= op === undefined || expression.op === op;
+      return;
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      found ||= planContainsFts(expression.block, op);
+      return;
+    }
+    childExpressions(expression).forEach(expressionHasFts);
+  };
+  forEachNestedBlock(plan, (nested) => {
+    found ||= planContainsFts(nested, op);
+  });
+  if (!found) forEachBlockExpression(plan, expressionHasFts);
+  return found;
+}
+
+/**
+ * Expands every `MATCH(*)`/`BM25(*)` in the plan into the single scan source's searchable
+ * columns (string, number, datetime — booleans are excluded from documents), and enforces the
+ * v1 restriction that a full-text document draws from exactly one base table source. Runs at
+ * prepare time when the catalog is known. Copy-on-write: plans without full-text nodes pass
+ * through untouched, and full-text plans are cloned before rewriting — the input is often the
+ * compile cache's own copy (subquery resolution returns the original plan when it has nothing
+ * to resolve), and freezing an expansion into the cache would pin a stale column list across
+ * later migrations.
+ */
+export function expandFtsColumns(
+  plan: CompiledQuery,
+  searchableColumnsFor: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (!planContainsFts(plan)) return plan;
+  plan = structuredClone(plan);
+  const expand = (expression: Expression, block: CompiledQuery): void => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      expandBlock(expression.block);
+      return;
+    }
+    if (expression.kind !== "fts") {
+      for (const child of childExpressions(expression)) expand(child, block);
+      return;
+    }
+    if (block.base.derived !== undefined || block.base.union !== undefined) {
+      throw new TypeError("Full-text search requires a scanned base table");
+    }
+    if (expression.columns !== "*") return;
+    if (block.joins.length > 0) {
+      throw new TypeError(
+        "Full-text search over every column requires a single-table query; name the columns explicitly",
+      );
+    }
+    const names = searchableColumnsFor(block.base.table);
+    if (names === undefined || names.length === 0) {
+      throw new TypeError(`Full-text search found no searchable columns: ${block.base.table}`);
+    }
+    expression.columns = names.map((name) => ({ kind: "column", reference: name }));
+  };
+  const expandBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, expandBlock);
+    forEachBlockExpression(block, (expression) => {
+      expand(expression, block);
+    });
+  };
+  expandBlock(plan);
+  return plan;
 }
 
 /**
@@ -1216,10 +1426,18 @@ export function executeRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {
+  plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
   for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
-  plan = resolution.plan;
+  // Stats annotation writes into the plan; when resolution had nothing to clone, the plan is
+  // still the caller's (possibly cached) object, and frozen statistics would survive into later
+  // executions against different rows.
+  plan =
+    resolution.plan === plan && planContainsFts(plan, "bm25")
+      ? structuredClone(plan)
+      : resolution.plan;
   tables = resolveDerivedRowTables(plan, tables);
+  annotateRowFtsStats(plan, tables);
   let contexts: RowContext[] = (tables.get(plan.base.table) ?? []).map((row) => ({
     [plan.base.alias]: row,
   }));
@@ -1398,6 +1616,20 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       return evaluateBooleanExpression(expression, (nested) => evaluate(nested, context, group));
     case "exists":
       throw new TypeError("EXISTS subqueries must be resolved before evaluation");
+    case "fts": {
+      if (expression.columns === "*") {
+        throw new TypeError("Full-text search columns must be expanded before evaluation");
+      }
+      const values = expression.columns.map((column) => evaluate(column, context, group));
+      if (expression.op === "match") {
+        return ftsMatchTruth(cachedQueryTerms(expression.query), values);
+      }
+      const stats = expression.stats;
+      if (stats === undefined) {
+        throw new TypeError("BM25 corpus statistics are missing from the plan");
+      }
+      return ftsBm25Row(cachedQueryTerms(expression.query), values, stats);
+    }
     case "case": {
       for (const branch of expression.branches) {
         const matched = evaluateBooleanExpression(branch.when, (nested) =>
@@ -1708,6 +1940,49 @@ function comparisonHolds(
   return comparison <= 0;
 }
 
+/**
+ * Computes BM25 corpus statistics for every scoring node in the (already cloned) plan by one
+ * pass over the base table's rows, and annotates them onto the nodes before evaluation.
+ */
+function annotateRowFtsStats(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): void {
+  const annotate = (expression: Expression): void => {
+    if (expression.kind !== "fts") {
+      childExpressions(expression).forEach(annotate);
+      return;
+    }
+    if (expression.op !== "bm25" || expression.stats !== undefined) return;
+    if (plan.joins.length > 0) {
+      throw new TypeError("BM25 requires a single-table query");
+    }
+    if (expression.columns === "*") {
+      throw new TypeError("Full-text search columns must be expanded before evaluation");
+    }
+    const terms = cachedQueryTerms(expression.query);
+    const accumulator = new FtsStatsAccumulator(terms);
+    const columnNames = expression.columns.map((column) => {
+      if (column.kind !== "column") {
+        throw new TypeError("Full-text search takes column references");
+      }
+      return column.reference.split(".").at(-1) ?? column.reference;
+    });
+    for (const row of tables.get(plan.base.table) ?? []) {
+      const values = columnNames.map((name) => row[name]);
+      const tokens: string[] = [];
+      for (const value of values) {
+        const rendered = renderDocumentValue(value);
+        if (rendered === undefined) continue;
+        tokens.push(...ftsTokenize(rendered));
+      }
+      accumulator.addDocument(tokens);
+    }
+    expression.stats = accumulator.stats;
+  };
+  forEachBlockExpression(plan, annotate);
+}
+
 function resolveColumn(context: RowContext, reference: string): unknown {
   const parts = reference.split(".");
   if (parts.length === 2) {
@@ -1916,7 +2191,7 @@ class Parser {
     // unparenthesized last member the clause was greedily parsed into that member and lifts
     // out; after a parenthesized member it is still unparsed.
     const last = members[members.length - 1];
-    let orderBy: CompiledQuery["orderBy"] = [];
+    let orderBy: CompiledQuery["orderBy"];
     let limit: number | undefined;
     let offset: number | undefined;
     if (last !== undefined && !last.parenthesized) {
@@ -2505,6 +2780,24 @@ class Parser {
       block.limit ??= 1;
       return { kind: "exists", block, negated: false };
     }
+    if ((upper === "MATCH" || upper === "BM25") && this.#peek().text === "(") {
+      // MySQL-style full-text grammar for both nodes: MATCH(col, ... | *) AGAINST 'query' is
+      // the boolean document predicate, BM25(col, ... | *) AGAINST 'query' the relevance score.
+      const columns = this.#ftsColumns();
+      this.#keyword("AGAINST");
+      const queryToken = this.#peek();
+      if (queryToken.kind !== "string") {
+        throw new TypeError(`${upper} ... AGAINST requires a string literal query`);
+      }
+      this.#index += 1;
+      validateFtsQuery(queryToken.text);
+      return {
+        kind: "fts",
+        op: upper === "MATCH" ? "match" : "bm25",
+        columns,
+        query: queryToken.text,
+      };
+    }
     if (upper === "DATE" && this.#peek().kind === "string") {
       const date = new Date(`${this.#take("string").text}T00:00:00.000Z`);
       if (!Number.isFinite(date.getTime())) throw new TypeError("Invalid DATE literal");
@@ -2573,6 +2866,25 @@ class Parser {
     let reference = identifier;
     if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
     return { kind: "column", reference };
+  }
+
+  /** The parenthesized column set of a full-text expression: `(*)` or `(col[, col...])`. */
+  #ftsColumns(): Expression[] | "*" {
+    this.#expectPunctuation("(");
+    if (this.#peek().text === "*") {
+      this.#index += 1;
+      this.#expectPunctuation(")");
+      return "*";
+    }
+    const columns: Expression[] = [];
+    for (;;) {
+      let reference = this.#identifier();
+      if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
+      columns.push({ kind: "column", reference });
+      if (!this.#punctuation(",")) break;
+    }
+    this.#expectPunctuation(")");
+    return columns;
   }
 
   #overClause(): {
@@ -2672,6 +2984,9 @@ export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
 ): CompiledQuery {
+  if (parts.orderBy.some((order) => order.expression.kind !== "column")) {
+    return assembleOrderByExpressionBlock(parts, nextSequence);
+  }
   const { sql, base, joins, select, distinct, predicates, having, orderBy, limit, offset } = parts;
   const groupBy = [...parts.groupBy];
   if (distinct) {
@@ -2798,6 +3113,143 @@ export function compoundSelectBlock(
     orderBy: tail.orderBy,
     ...(tail.limit === undefined ? {} : { limit: tail.limit }),
     ...(tail.offset === undefined ? {} : { offset: tail.offset }),
+  };
+}
+
+/**
+ * Desugars ORDER BY expressions the way windows already hide their machinery: each expression
+ * either reuses a structurally identical select item's alias or becomes a hidden "(order N)"
+ * select item, the ordering (and LIMIT/OFFSET) applies inside that block, and an outer block
+ * projects only the visible aliases away from a derived source. Runs in the shared assembly,
+ * so the builder and SQL front ends produce identical plans. A wildcard select has no named
+ * output list to hide items behind, and DISTINCT's output would change if hidden expressions
+ * joined its grouping, so both keep the named-column restriction.
+ */
+function assembleOrderByExpressionBlock(
+  parts: SelectBlockParts,
+  nextSequence: () => number,
+): CompiledQuery {
+  if (parts.select.some((item) => item.expression.kind === "wildcard")) {
+    throw new TypeError(
+      "ORDER BY expressions require a named select list; SELECT * orders by column names only",
+    );
+  }
+  if (parts.distinct) {
+    throw new TypeError("SELECT DISTINCT orders by selected columns or output aliases only");
+  }
+  for (const order of parts.orderBy) {
+    if (order.expression.kind === "column") continue;
+    if (containsWindow(order.expression)) {
+      throw new TypeError("Window functions are only allowed in the select list");
+    }
+    // A bare literal is almost always a SQL ordinal (ORDER BY 2); sorting by a constant would
+    // silently do nothing, so reject it the way the engine always has.
+    if (order.expression.kind === "literal") {
+      throw new TypeError("ORDER BY ordinals are not supported; name the column or alias");
+    }
+  }
+  const selectSignatures = new Map(
+    parts.select.map((item) => [JSON.stringify(item.expression), item.alias] as const),
+  );
+  const hiddenItems: SelectItem[] = [];
+  const rewrittenOrder = parts.orderBy.map((order) => {
+    if (order.expression.kind === "column") return order;
+    const existingAlias = selectSignatures.get(JSON.stringify(order.expression));
+    if (existingAlias !== undefined) {
+      return {
+        expression: { kind: "column", reference: existingAlias } satisfies Expression,
+        direction: order.direction,
+      };
+    }
+    const alias = `(order ${String(hiddenItems.length + 1)})`;
+    hiddenItems.push({ expression: order.expression, alias });
+    return {
+      expression: { kind: "column", reference: alias } satisfies Expression,
+      direction: order.direction,
+    };
+  });
+  const inner = assembleSelectBlock(
+    { ...parts, select: [...parts.select, ...hiddenItems], orderBy: rewrittenOrder },
+    nextSequence,
+  );
+  // Every ordering expression matched a visible select item — no hidden columns, no wrap.
+  if (hiddenItems.length === 0) return inner;
+  const source = derivedTableSource(inner, "(ordered)", nextSequence);
+  return {
+    sql: parts.sql,
+    base: source,
+    joins: [],
+    select: parts.select.map((item) => ({
+      expression: { kind: "column", reference: item.alias } satisfies Expression,
+      alias: item.alias,
+    })),
+    predicates: [],
+    groupBy: [],
+    having: [],
+    orderBy: [],
+  };
+}
+
+/**
+ * Detects a pure projection wrapper over one derived block — the shape the ORDER-BY-expression
+ * desugar emits: no joins, filters, grouping, ordering, or paging of its own, and every select
+ * item passing an inner output alias through under the same name. Whole-plan strategies (the
+ * streamed scan today) run the inner block and project its result, so a hidden ordering column
+ * never changes which execution paths a query is eligible for — `.search()` performs the same
+ * whether or not the caller also selects the score.
+ */
+export function transparentProjectionSource(
+  plan: CompiledQuery,
+): { inner: CompiledQuery; aliases: string[] } | undefined {
+  if (
+    plan.joins.length > 0 ||
+    plan.predicates.length > 0 ||
+    plan.groupBy.length > 0 ||
+    plan.having.length > 0 ||
+    plan.orderBy.length > 0 ||
+    plan.limit !== undefined ||
+    plan.offset !== undefined
+  ) {
+    return undefined;
+  }
+  const inner = plan.base.derived;
+  if (
+    inner === undefined ||
+    plan.base.union !== undefined ||
+    plan.base.windowed !== undefined ||
+    plan.base.recursive !== undefined
+  ) {
+    return undefined;
+  }
+  if (inner.select[0]?.expression.kind === "wildcard") return undefined;
+  const innerAliases = new Set(inner.select.map((item) => item.alias));
+  const aliases: string[] = [];
+  for (const item of plan.select) {
+    if (
+      item.expression.kind !== "column" ||
+      item.expression.reference !== item.alias ||
+      !innerAliases.has(item.alias)
+    ) {
+      return undefined;
+    }
+    aliases.push(item.alias);
+  }
+  if (aliases.length === 0) return undefined;
+  return { inner, aliases };
+}
+
+/** Projects a result to a wrapper's visible aliases, preserving row order. */
+export function projectResultColumns(
+  result: QueryResult,
+  aliases: readonly string[],
+): QueryResult {
+  return {
+    columns: [...aliases],
+    rows: result.rows.map((row) => {
+      const projected: QueryRow = {};
+      for (const alias of aliases) projected[alias] = row[alias] ?? null;
+      return projected;
+    }),
   };
 }
 

@@ -16,6 +16,7 @@ import {
 } from "../query.js";
 import {
   buildBinaryCondition,
+  buildFtsExpression,
   createExpressionBuilder,
   isExpressionWrapper,
   ExpressionWrapper,
@@ -42,6 +43,7 @@ import {
   type JoinResult,
   type ReferencedValue,
   type RowFromSelections,
+  type ColumnReferenceOf,
   type Selection,
   type Simplify,
   type TableExpression,
@@ -305,6 +307,29 @@ export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements Blo
     return new SelectQueryBuilder(
       this.#with({ wheres: [...this.state.wheres, source] }),
       this.services,
+    );
+  }
+
+  /**
+   * Typeahead-friendly document search: filters to rows matching every query term and orders
+   * by BM25 relevance, descending. Pure sugar for
+   * `.where(eb.match(columns, query)).orderBy(fn.bm25(columns, query), "desc")` — the ordering
+   * expression rides as a hidden select item, so the row shape is exactly what you selected
+   * and repeated `.search()` calls compose. Wanting the score value is the only reason to also
+   * select `fn.bm25(...)`; execution (index pruning, streaming under a budget) is identical
+   * either way. Columns default to "*" (every non-boolean column of the scanned table); a
+   * named select list is required, since hidden ordering columns cannot ride along a wildcard.
+   */
+  search(
+    query: string,
+    options: {
+      columns?: "*" | ReadonlyArray<ColumnReferenceOf<TCtx, string | number | Date> & string>;
+    } = {},
+  ): SelectQueryBuilder<DB, TCtx, TRow> {
+    const columns = options.columns ?? "*";
+    return this.where((eb) => eb.match(columns, query)).orderBy(
+      new ExpressionWrapper<number | null>(buildFtsExpression("bm25", columns, query)),
+      "desc",
     );
   }
 

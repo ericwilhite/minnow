@@ -134,6 +134,37 @@ describe("MinnowDatabaseClient", () => {
     expect(await handle.rows()).toEqual([{ id: 1, name: "Ada", nickname: null }]);
   });
 
+  it("returns generated columns across the worker boundary", async () => {
+    const client = connect();
+    // Defaults declared through the schema DSL must survive serialization to the worker, and
+    // the generated values (including Dates) must survive the structured clone back.
+    const notes = table("notes", {
+      id: column.number().unique().autoIncrement(),
+      slug: column.string().default("nanoid"),
+      created: column.datetime().default("now"),
+      body: column.string(),
+    });
+    await client.migrate(schema([notes]));
+    const result = await client.insertBatch("notes", [{ body: "hello" }, { body: "there" }]);
+    expect(result.generatedColumns?.id).toEqual([1, 2]);
+    expect(result.generatedColumns?.slug?.[0]).toMatch(/^[A-Za-z0-9_-]{21}$/);
+    expect(result.generatedColumns?.created?.[0]).toBeInstanceOf(Date);
+    const rows = await client.readTable("notes");
+    expect(rows.map((row) => row.id).sort()).toEqual([1, 2]);
+
+    // A batch whose every column is generated still carries its row count across the boundary
+    // (the columnar pivot of empty rows would otherwise lose it).
+    const stamps = table("stamps", {
+      id: column.number().unique().autoIncrement(),
+      created: column.datetime().default("now"),
+    });
+    await client.migrate(schema([stamps]));
+    const empty = await client.insertBatch("stamps", [{}, {}]);
+    expect(empty.rowCount).toBe(2);
+    expect(empty.generatedColumns?.id).toEqual([1, 2]);
+    await client.close();
+  });
+
   it("runs compiled typed queries", async () => {
     const client = connect();
     await createPeopleTable(client);

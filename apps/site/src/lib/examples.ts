@@ -160,6 +160,54 @@ const written = await db
     },
   },
   {
+    id: "search",
+    title: "Generated keys, defaults, and zero-ceremony search",
+    code: `const notes = table("notes", {
+  id: column.number().unique().autoIncrement(),
+  slug: column.string().default("nanoid"),
+  body: column.string(),
+});
+await database.migrate(schema([notes]));
+
+await db.insertInto("notes").values([
+  { body: "The quick brown fox" },       // id and slug generate
+  { body: "Lazy dogs sleep quickly" },
+  { body: "Columnar storage layout" },
+]).execute();
+
+const hits = await db
+  .selectFrom("notes")
+  .select(["id", "body"])
+  .search("quick fo*") // every column is searchable; ranked by BM25, no index DDL
+  .execute(); // Array<{ id: number; body: string }>`,
+    run: async () => {
+      const database = freshDatabase();
+      const notes = table("notes", {
+        id: column.number().unique().autoIncrement(),
+        slug: column.string().default("nanoid"),
+        body: column.string(),
+      });
+      const notesSchema = schema([notes]);
+      type NotesDB = InferDatabase<typeof notesSchema>;
+      await database.migrate(notesSchema);
+      const db = createMinnow<NotesDB>(database, { schema: notesSchema });
+      await db
+        .insertInto("notes")
+        .values([
+          { body: "The quick brown fox" },
+          { body: "Lazy dogs sleep quickly" },
+          { body: "Columnar storage layout" },
+        ])
+        .execute();
+      const hits = await db
+        .selectFrom("notes")
+        .select(["id", "body"])
+        .search("quick fo*")
+        .execute();
+      return show(hits);
+    },
+  },
+  {
     id: "snapshot",
     title: "Prepared queries hold one immutable snapshot",
     code: `const prepared = await database.prepareQuery(
@@ -200,7 +248,13 @@ prepared.close();`,
 ];
 
 /** Typed-first ordering: the showcase leads with the best-practice API. */
-export const showcaseExamples: ShowcaseExample[] = ["typed", "builder", "sql", "snapshot"].map(
+export const showcaseExamples: ShowcaseExample[] = [
+  "typed",
+  "search",
+  "builder",
+  "sql",
+  "snapshot",
+].map(
   (id) => {
     const entry = entries.find((candidate) => candidate.id === id);
     if (entry === undefined) throw new Error(`Missing showcase example: ${id}`);

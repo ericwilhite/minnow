@@ -559,6 +559,33 @@ user-managed indexes.
 
 Workload telemetry may eventually drive compaction order, clustering, and auxiliary per-segment structures. These structures are derived and disposable; logical correctness does not depend on them.
 
+## Full-text search
+
+Search requires no declaration: any string, number, or datetime column is searchable on demand
+through the `MATCH(columns | *) AGAINST 'query'` predicate and the `BM25(...) AGAINST` relevance
+score (booleans are excluded from documents). A row's document is the union of its rendered
+column values under one deterministic tokenizer — NFKC + locale-independent lowercase,
+letter/number runs, CJK character bigrams — deliberately not `Intl.Segmenter`, whose output
+varies across ICU versions; any tokenizer change bumps `FTS_TOKENIZER_VERSION`, which persisted
+index metadata must match. Scan-mode matching exploits dictionary encoding (each distinct string
+tokenizes once per block into a per-term bitmask; rows compare integers) with every retained
+table reserved against the query memory budget. Every row is a BM25 document (all-null rows have
+length 0), which makes corpus statistics servable without a scan: a ready index provides exact
+document frequencies from posting unions and token totals from base-plus-delta merges, so
+indexed scoring queries prune and stream like plain matches; unindexed ones fall back to a
+one-time whole-scan statistics pass over a materialized scan.
+
+On top of the scan, a persisted per-column postings index (`fts-chunks-v1`, mirroring the
+unique-key chunk layout) acts as a pruning accelerator for append-only histories: searches on a
+table past a row threshold lazily schedule a background build, insert commits maintain the index
+with per-commit delta chunks written atomically inside the manifest publish, and a ready index
+prunes MATCH scans to candidate segments. It is never ground truth — the scan re-verifies every
+candidate, the catalog advertises `building`/`ready`/`invalid` per column, and any commit that
+adds segments without deltas (a stale writer, or any keyed mutation) atomically flips the column
+to `invalid` so the index self-heals through a rebuild while queries fall back to the scan.
+Folding is a rebuild at a newer version once the delta tail grows. Deferred: serving BM25
+statistics and top-k from postings, and indexing keyed-mutation histories.
+
 ## SQL, schema, ORM, and live queries
 
 SQL and the ORM converge on one typed logical plan:

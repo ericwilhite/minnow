@@ -749,6 +749,29 @@ tiers remain outstanding.
 - [x] Add date truncation and `COALESCE` so the monthly cohort and adjustment-burden reference
       queries compile; they are the only two the current surface cannot express.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
+- [x] Add auto-increment keys and declarative column defaults (`uuid`/`nanoid`/`now`/literals):
+      counters reserved atomically with transaction begin (cross-tab safe, explicit values bump
+      past their maximum), generated values echoed through `returning`/RETURNING, and
+      metadata-only `alter-default` migrations.
+- [x] Add zero-ceremony full-text search: document-level `MATCH(cols | *) AGAINST` and
+      `BM25(...) AGAINST` relevance over string/number/datetime columns with a deterministic
+      versioned tokenizer (NFKC, CJK bigrams, `*` prefixes), dictionary-code scan matching under
+      the query memory budget, and `.search()` / `db.search()` sugar with builder/SQL plan
+      parity.
+- [x] Add the persisted per-column full-text postings index (`fts-chunks-v1`) as a pruning
+      accelerator for append-only histories: per-commit delta chunks written atomically with the
+      manifest publish, a lazily scheduled background base build advertised through
+      `TableRecord` state (`building`/`ready`/`invalid` with the stale-writer/keyed-mutation
+      self-heal), segment-level MATCH pruning with scan re-verification, and fold-by-rebuild
+      once the delta tail grows.
+- [x] Serve exact BM25 statistics from full-text postings (per-term document frequency from
+      posting unions, token totals from base+delta merges, every row a document), keyed to the
+      scoring node's compiled signature and injected at bind — restoring index pruning for
+      scoring plans and lifting their streaming restriction; a limited ORDER BY retains only
+      the top rows, so ranked search is bounded by candidate segments plus k.
+- [ ] Extend full-text indexing to keyed-mutation histories via key-range partition rewrites,
+      and serve per-document scores directly from postings (row fetch-by-id) to skip candidate
+      segments entirely.
 
 ## Result recording
 

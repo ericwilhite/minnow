@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   IndexedDbBlockStore,
   MemoryBlockStore,
+  TableRecordConflictError,
   type BlockStore,
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
@@ -15,6 +16,7 @@ import { FaultInjectingBlockStore } from "../testing/index.js";
 import { TransactionManager } from "../transactions/index.js";
 import { QueryMemoryBudgetError } from "./memory.js";
 import type { QueryRow } from "./query.js";
+import { column, schema, table } from "./schema.js";
 import {
   attachLifecycleFlush,
   MinnowDatabase,
@@ -718,6 +720,657 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("round-trips column defaults through the catalog and validates them", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "notes",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "slug", type: "string", defaultValue: { kind: "nanoid" } },
+          { name: "guid", type: "string", defaultValue: { kind: "uuid" } },
+          { name: "status", type: "string", defaultValue: { kind: "literal", value: "draft" } },
+          { name: "created", type: "datetime", defaultValue: { kind: "now" } },
+        ],
+        uniqueKey: "id",
+      });
+      expect((await database.listTables())[0]?.columns).toEqual([
+        { name: "id", type: "number", nullable: false, defaultValue: { kind: "autoincrement" } },
+        { name: "slug", type: "string", nullable: false, defaultValue: { kind: "nanoid" } },
+        { name: "guid", type: "string", nullable: false, defaultValue: { kind: "uuid" } },
+        {
+          name: "status",
+          type: "string",
+          nullable: false,
+          defaultValue: { kind: "literal", value: "draft" },
+        },
+        { name: "created", type: "datetime", nullable: false, defaultValue: { kind: "now" } },
+      ]);
+
+      const create = (column: {
+        name: string;
+        type: "boolean" | "number" | "string" | "datetime";
+        nullable?: boolean;
+        defaultValue?: import("../storage/types.js").ColumnDefault;
+      }) =>
+        database.createTable({
+          name: `invalid_${column.name}`,
+          columns: [{ name: "key", type: "number" }, column],
+          uniqueKey: "key",
+        });
+      await expect(
+        create({ name: "a", type: "string", nullable: true, defaultValue: { kind: "uuid" } }),
+      ).rejects.toThrow("Defaults require a non-nullable column");
+      await expect(
+        create({ name: "b", type: "number", defaultValue: { kind: "uuid" } }),
+      ).rejects.toThrow("requires a string column");
+      await expect(
+        create({ name: "c", type: "string", defaultValue: { kind: "now" } }),
+      ).rejects.toThrow("requires a datetime column");
+      await expect(
+        create({ name: "d", type: "string", defaultValue: { kind: "autoincrement" } }),
+      ).rejects.toThrow("Auto-increment requires a number column");
+      await expect(
+        create({ name: "e", type: "number", defaultValue: { kind: "autoincrement" } }),
+      ).rejects.toThrow("Auto-increment requires the unique key column");
+      await expect(
+        create({ name: "f", type: "number", defaultValue: { kind: "literal", value: "x" } }),
+      ).rejects.toThrow("Default literal must be a number");
+      await expect(
+        create({
+          name: "g",
+          type: "number",
+          defaultValue: { kind: "literal", value: Number.POSITIVE_INFINITY },
+        }),
+      ).rejects.toThrow("Default literal must be finite");
+      await expect(
+        create({ name: "h", type: "datetime", defaultValue: { kind: "literal", value: 1 } }),
+      ).rejects.toThrow("Datetime columns default with now");
+      await expect(
+        database.createTable({
+          name: "invalid_key_literal",
+          columns: [
+            { name: "key", type: "string", defaultValue: { kind: "literal", value: "constant" } },
+          ],
+          uniqueKey: "key",
+        }),
+      ).rejects.toThrow("Unique key cannot default to a constant");
+      store.close();
+    });
+
+    it("fills defaults and auto-increment keys on insert", async () => {
+      const store = await implementation.create();
+      const stamped = new Date("2026-02-03T04:05:06.000Z");
+      const database = new MinnowDatabase(store, { now: () => stamped });
+      await database.createTable({
+        name: "notes",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "slug", type: "string", defaultValue: { kind: "nanoid" } },
+          { name: "guid", type: "string", defaultValue: { kind: "uuid" } },
+          { name: "status", type: "string", defaultValue: { kind: "literal", value: "draft" } },
+          { name: "created", type: "datetime", defaultValue: { kind: "now" } },
+        ],
+        uniqueKey: "id",
+      });
+      const result = await database.insertBatch("notes", [{}, {}, {}]);
+      expect(result.rowCount).toBe(3);
+      const generated = result.generatedColumns;
+      expect(generated?.id).toEqual([1, 2, 3]);
+      expect(generated?.status).toEqual(["draft", "draft", "draft"]);
+      expect(generated?.created).toEqual([stamped, stamped, stamped]);
+      for (const slug of generated?.slug ?? []) {
+        expect(slug).toMatch(/^[A-Za-z0-9_-]{21}$/);
+      }
+      for (const guid of generated?.guid ?? []) {
+        expect(guid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      }
+      expect(new Set(generated?.slug).size).toBe(3);
+      const rows = await database.readTable("notes");
+      expect(rows.map((row) => row.id).sort()).toEqual([1, 2, 3]);
+      expect(rows.map((row) => row.slug).sort()).toEqual([...(generated?.slug ?? [])].sort());
+      store.close();
+    });
+
+    it("passes explicit values through and bumps the counter past them", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "events",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "label", type: "string" },
+        ],
+        uniqueKey: "id",
+      });
+      // Import scenario: explicit-only inserts still advance the counter atomically.
+      const explicitOnly = await database.insertBatch("events", [
+        { id: 100, label: "imported" },
+      ]);
+      expect(explicitOnly.generatedColumns).toBeUndefined();
+      const generatedAfter = await database.insertBatch("events", [{ label: "fresh" }]);
+      expect(generatedAfter.generatedColumns?.id).toEqual([101]);
+      // A mixed batch: the generated value never collides with the batch's own explicit max.
+      const mixed = await database.insertBatch("events", [
+        { id: 200, label: "explicit" },
+        { label: "generated" },
+      ]);
+      expect(mixed.generatedColumns?.id).toEqual([200, 201]);
+      await expect(
+        database.insertBatch("events", [{ id: 100, label: "duplicate" }]),
+      ).rejects.toThrow(UniqueConstraintError);
+      store.close();
+    });
+
+    it("does not mutate caller-owned columnar vectors while filling", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "events",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "label", type: "string" },
+        ],
+        uniqueKey: "id",
+      });
+      const idVector: Array<number | null> = [5, null];
+      const result = await database.insertBatch("events", {
+        columns: { id: idVector, label: ["a", "b"] },
+      });
+      expect(result.generatedColumns?.id).toEqual([5, 6]);
+      expect(idVector).toEqual([5, null]);
+      store.close();
+    });
+
+    it("rejects unsafe auto-increment values and range overflow", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "events",
+        columns: [{ name: "id", type: "number", defaultValue: { kind: "autoincrement" } }],
+        uniqueKey: "id",
+      });
+      await expect(database.insertBatch("events", [{ id: 1.5 }])).rejects.toThrow(
+        "safe integer range",
+      );
+      await database.insertBatch("events", [{ id: Number.MAX_SAFE_INTEGER }]);
+      await expect(database.insertBatch("events", [{}])).rejects.toThrow(
+        "exhausted the safe integer range",
+      );
+      store.close();
+    });
+
+    it("generates fresh keys for upserts that omit the auto-increment column", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "events",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "label", type: "string" },
+        ],
+        uniqueKey: "id",
+      });
+      const first = await database.upsertBatch("events", [{ label: "created" }]);
+      expect(first.generatedColumns?.id).toEqual([1]);
+      expect(first.insertedRowCount).toBe(1);
+      const replaced = await database.upsertBatch("events", [{ id: 1, label: "replaced" }]);
+      expect(replaced.updatedRowCount).toBe(1);
+      expect(replaced.generatedColumns).toBeUndefined();
+      const fresh = await database.upsertBatch("events", [{ label: "fresh" }]);
+      expect(fresh.generatedColumns?.id).toEqual([2]);
+      expect(fresh.insertedRowCount).toBe(1);
+      expect((await database.readTable("events")).map((row) => row.label).sort()).toEqual([
+        "fresh",
+        "replaced",
+      ]);
+      store.close();
+    });
+
+    it("fills defaults for SQL inserts that omit default-bearing columns", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "notes",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "body", type: "string" },
+        ],
+        uniqueKey: "id",
+      });
+      await database.execute("INSERT INTO notes (body) VALUES ('first'), ('second')");
+      const rows = await database.readTable("notes");
+      expect(rows.map((row) => row.id).sort()).toEqual([1, 2]);
+      store.close();
+    });
+
+    it("still rejects nulls in non-default non-nullable columns", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "events",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "label", type: "string" },
+        ],
+        uniqueKey: "id",
+      });
+      await expect(database.insertBatch("events", [{ label: null }])).rejects.toThrow(
+        "label[0] cannot be null",
+      );
+      store.close();
+    });
+
+    it("matches documents across columns with MATCH ... AGAINST", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "articles",
+        columns: [
+          { name: "title", type: "string" },
+          { name: "body", type: "string", nullable: true },
+          { name: "views", type: "number" },
+          { name: "published", type: "datetime", nullable: true },
+          { name: "featured", type: "boolean" },
+        ],
+      });
+      await database.insertBatch("articles", [
+        {
+          title: "Quick start guide",
+          body: "The quick brown fox",
+          views: 42,
+          published: new Date("2026-08-12T00:00:00.000Z"),
+          featured: true,
+        },
+        {
+          title: "Database internals",
+          body: "Columnar storage layout",
+          views: 7,
+          published: null,
+          featured: false,
+        },
+        {
+          title: "Fox hunting quick tips",
+          body: null,
+          views: 99,
+          published: new Date("2025-01-01T00:00:00.000Z"),
+          featured: false,
+        },
+      ]);
+
+      // AND across terms, OR across columns: both terms must appear somewhere in the document.
+      const both = await database.query(
+        "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'quick fox' ORDER BY title",
+      );
+      expect(both.rows.map((row) => row.title)).toEqual([
+        "Fox hunting quick tips",
+        "Quick start guide",
+      ]);
+
+      const prefix = await database.query(
+        "SELECT title FROM articles WHERE MATCH(title) AGAINST 'databas*'",
+      );
+      expect(prefix.rows.map((row) => row.title)).toEqual(["Database internals"]);
+
+      // MATCH(*) searches numbers and datetimes through their canonical rendering.
+      const numeric = await database.query(
+        "SELECT title FROM articles WHERE MATCH(*) AGAINST '42'",
+      );
+      expect(numeric.rows.map((row) => row.title)).toEqual(["Quick start guide"]);
+      const year = await database.query(
+        "SELECT title FROM articles WHERE MATCH(*) AGAINST '2025'",
+      );
+      expect(year.rows.map((row) => row.title)).toEqual(["Fox hunting quick tips"]);
+
+      // A row whose listed columns are all NULL is unknown: NOT(unknown) stays unknown, so the
+      // null-bodied row is dropped rather than matched.
+      const negated = await database.query(
+        "SELECT title FROM articles WHERE NOT (MATCH(body) AGAINST 'fox')",
+      );
+      expect(negated.rows.map((row) => row.title)).toEqual(["Database internals"]);
+
+      const none = await database.query("SELECT title FROM articles WHERE MATCH(*) AGAINST '  '");
+      expect(none.rows).toEqual([]);
+
+      // The budgeted streamed scan takes the same path through sliding dictionary windows.
+      const streamed = await database.query(
+        "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'quick fox' ORDER BY title",
+        { executionMemoryBudgetBytes: 200_000 },
+      );
+      expect(streamed.rows).toEqual(both.rows);
+
+      await expect(
+        database.query("SELECT title FROM articles WHERE MATCH(featured) AGAINST 'x'"),
+      ).rejects.toThrow("boolean column");
+      await expect(
+        database.query("SELECT title FROM articles WHERE MATCH(title) AGAINST title"),
+      ).rejects.toThrow("string literal");
+
+      expect(await database.explain("SELECT title FROM articles WHERE MATCH(*) AGAINST 'fox'")).toContain(
+        "full-text MATCH evaluates via per-dictionary term tables",
+      );
+      store.close();
+    });
+
+    it("scores documents with BM25 ... AGAINST and orders by relevance", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "articles",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "title", type: "string" },
+          { name: "body", type: "string", nullable: true },
+        ],
+      });
+      await database.insertBatch("articles", [
+        { id: 1, title: "quick brown fox", body: "jumps high" },
+        { id: 2, title: "lazy dog", body: "sleeps quick" },
+        // Term frequencies sum across fields: "quick" twice in the title plus once implied by
+        // the shorter document pushes this row's score above row 1's.
+        { id: 3, title: "quick fox again quick", body: null },
+        { id: 4, title: "nothing here", body: "at all" },
+      ]);
+      const scored = await database.query(
+        "SELECT id, BM25(title, body) AGAINST 'quick fox' AS score FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY score DESC",
+      );
+      expect(scored.rows.map((row) => row.id)).toEqual([3, 1, 2]);
+      const scores = scored.rows.map((row) => row.score as number);
+      expect(scores[0]).toBeGreaterThan(scores[1] ?? 0);
+      expect(scores[1]).toBeGreaterThan(scores[2] ?? 0);
+      expect(scores[2]).toBeGreaterThan(0);
+
+      // Unmatched documents score 0; all-null documents are SQL null.
+      const all = await database.query(
+        "SELECT id, BM25(body) AGAINST 'quick' AS score FROM articles ORDER BY id",
+      );
+      expect(all.rows.map((row) => row.score === null || typeof row.score === "number")).toEqual([
+        true,
+        true,
+        true,
+        true,
+      ]);
+      expect(all.rows[3]?.score).toBe(0);
+      expect(all.rows[2]?.score).toBeNull();
+
+      // The budgeted path falls back to a materialized scan (never streams) and agrees.
+      const budgeted = await database.query(
+        "SELECT id, BM25(title, body) AGAINST 'quick fox' AS score FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY score DESC",
+        { executionMemoryBudgetBytes: 500_000 },
+      );
+      expect(budgeted.rows).toEqual(scored.rows);
+
+      expect(
+        await database.explain(
+          "SELECT id, BM25(*) AGAINST 'quick' AS score FROM articles ORDER BY score DESC",
+        ),
+      ).toContain("index pruning does not apply");
+      store.close();
+    });
+
+    it("builds a persisted full-text index, prunes scans, and merges live deltas", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "articles",
+        columns: [
+          { name: "title", type: "string" },
+          { name: "body", type: "string", nullable: true },
+        ],
+      });
+      await database.insertBatch("articles", [
+        { title: "quick brown fox", body: "jumps high" },
+        { title: "lazy dog", body: null },
+      ]);
+      await database.insertBatch("articles", [
+        { title: "columnar storage", body: "quick reads" },
+        { title: "manifest deltas", body: "cheap commits" },
+      ]);
+      const sql = "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY title";
+      const scanned = await database.query(sql);
+      expect(scanned.rows.map((row) => row.title)).toEqual(["columnar storage", "quick brown fox"]);
+
+      await database.buildFtsIndex("articles", "title");
+      await database.buildFtsIndex("articles", "body");
+      const record = (await store.listTables())[0];
+      const states = Object.values(record?.ftsColumns ?? {});
+      expect(states.map((state) => state.state)).toEqual(["ready", "ready"]);
+
+      // Same results through the index-pruned path, and the pruning is observable: a term
+      // confined to the second segment never materializes the first segment's blocks.
+      const indexed = await database.query(sql);
+      expect(indexed.rows).toEqual(scanned.rows);
+      const confined = await database.query(
+        "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'manifest'",
+      );
+      expect(confined.rows.map((row) => row.title)).toEqual(["manifest deltas"]);
+
+      // explain() reports the pruning a plan actually gets: a bare MATCH prunes, and a scoring
+      // plan prunes too once the index serves its exact corpus statistics.
+      const matchExplain = await database.explain(sql);
+      expect(matchExplain).toContain("index prunes the base scan");
+      const scoringExplain = await database.explain(
+        "SELECT title, BM25(title) AGAINST 'quick' AS score FROM articles WHERE MATCH(title) AGAINST 'quick' ORDER BY score DESC",
+      );
+      expect(scoringExplain).toContain("index prunes the base scan");
+      expect(scoringExplain).toContain("BM25 statistics come from the full-text index");
+
+      // Index-served statistics also lift the streaming restriction: a budgeted scoring query
+      // streams its scan and returns exactly the unbudgeted (and pre-index) results.
+      const scoringSql =
+        "SELECT title, BM25(title, body) AGAINST 'quick' AS score FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY score DESC, title";
+      const unbudgetedScores = await database.query(scoringSql);
+      const budgetedScores = await database.query(scoringSql, {
+        executionMemoryBudgetBytes: 500_000,
+      });
+      expect(budgetedScores.rows).toEqual(unbudgetedScores.rows);
+      expect(unbudgetedScores.rows.length).toBeGreaterThan(0);
+      // The .search() shape — ordering by an unselected score expression — streams identically:
+      // the desugared projection wrapper is transparent to the streamed path.
+      const searchSql =
+        "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY BM25(title, body) AGAINST 'quick' DESC, title";
+      const unbudgetedSearch = await database.query(searchSql);
+      const budgetedSearch = await database.query(searchSql, {
+        executionMemoryBudgetBytes: 500_000,
+      });
+      expect(budgetedSearch.rows).toEqual(unbudgetedSearch.rows);
+      expect(unbudgetedSearch.rows.map((row) => row.title)).toEqual(
+        unbudgetedScores.rows.map((row) => row.title),
+      );
+
+      // Writers that see the catalog entry maintain the index through commit deltas.
+      await database.insertBatch("articles", [{ title: "quick patch", body: null }]);
+      const merged = await database.query(sql);
+      expect(merged.rows.map((row) => row.title)).toEqual([
+        "columnar storage",
+        "quick brown fox",
+        "quick patch",
+      ]);
+      store.close();
+    });
+
+    it("invalidates the full-text index on keyed mutations and stays correct via scan", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "notes",
+        uniqueKey: "slug",
+        columns: [
+          { name: "slug", type: "string" },
+          { name: "body", type: "string" },
+        ],
+      });
+      await database.insertBatch("notes", [
+        { slug: "a", body: "quick fox" },
+        { slug: "b", body: "lazy dog" },
+      ]);
+      await database.buildFtsIndex("notes", "body");
+      expect(
+        Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state,
+      ).toBe("ready");
+      // An upsert emits no delta on purpose: the publish flips the column to invalid, and the
+      // query falls back to the always-correct scan, seeing the replaced document.
+      await database.upsertBatch("notes", [{ slug: "a", body: "silent owl" }]);
+      expect(
+        Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state,
+      ).toBe("invalid");
+      const rows = await database.query(
+        "SELECT slug FROM notes WHERE MATCH(body) AGAINST 'owl'",
+      );
+      expect(rows.rows.map((row) => row.slug)).toEqual(["a"]);
+      const gone = await database.query(
+        "SELECT slug FROM notes WHERE MATCH(body) AGAINST 'quick'",
+      );
+      expect(gone.rows).toEqual([]);
+      // Rebuilding on a keyed history is rejected explicitly.
+      await expect(database.buildFtsIndex("notes", "body")).rejects.toThrow(
+        "append-only tables",
+      );
+      store.close();
+    });
+
+    it("re-expands MATCH(*) after a migration adds a column", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.migrate(schema([table("posts", { title: column.string() })]));
+      await database.insertBatch("posts", [{ title: "alpha" }]);
+      const sql = "SELECT title FROM posts WHERE MATCH(*) AGAINST 'zebra'";
+      // Prime the plan cache with the pre-migration expansion of "*".
+      expect((await database.query(sql)).rows).toEqual([]);
+      await database.migrate(
+        schema([
+          table("posts", { title: column.string(), notes: column.string().nullable() }),
+        ]),
+      );
+      await database.insertBatch("posts", [{ title: "plain", notes: "a zebra hides here" }]);
+      // The cached compiled plan must keep "*": expansion re-runs against the live catalog, so
+      // the row matching only in the migrated-in column is found.
+      expect((await database.query(sql)).rows.map((row) => row.title)).toEqual(["plain"]);
+      store.close();
+    });
+
+    it("retries migrate when background catalog activity moves a table revision", async () => {
+      const store = await implementation.create();
+      let conflictsToInject = 1;
+      const database = new MinnowDatabase(
+        new (class extends FaultInjectingBlockStore {
+          override updateTable(
+            id: string,
+            expectedRevision: number,
+            update: Parameters<BlockStore["updateTable"]>[2],
+          ): ReturnType<BlockStore["updateTable"]> {
+            if (conflictsToInject > 0) {
+              conflictsToInject -= 1;
+              throw new TableRecordConflictError(id, expectedRevision, expectedRevision + 1);
+            }
+            return super.updateTable(id, expectedRevision, update);
+          }
+        })(store, () => undefined),
+      );
+      const v1 = table("posts", { title: column.string() });
+      await database.migrate(schema([v1]));
+      const v2 = table("posts", {
+        title: column.string(),
+        notes: column.string().nullable(),
+      });
+      // The first CAS loses (as if an index build stamped the record mid-migrate); the retry
+      // re-plans from fresh records and succeeds instead of surfacing the conflict.
+      const result = await database.migrate(schema([v2]));
+      expect(result.alteredTables).toEqual(["posts"]);
+      expect(conflictsToInject).toBe(0);
+      store.close();
+    });
+
+    it("agrees between indexed and scan-only search over a randomized corpus", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 4, compression: "raw" });
+      const words = ["quick", "brown", "fox", "stone", "river", "moss", "42", "quiet"];
+      let seed = 1234;
+      const random = () => {
+        // Deterministic LCG so both stores exercise the same corpus.
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+      };
+      await database.createTable({
+        name: "articles",
+        columns: [
+          { name: "title", type: "string" },
+          { name: "body", type: "string", nullable: true },
+        ],
+      });
+      const makeText = () =>
+        Array.from(
+          { length: 2 + Math.floor(random() * 3) },
+          () => words[Math.floor(random() * words.length)],
+        ).join(" ");
+      for (let batch = 0; batch < 4; batch += 1) {
+        await database.insertBatch(
+          "articles",
+          Array.from({ length: 10 }, () => ({
+            title: makeText(),
+            body: random() < 0.2 ? null : makeText(),
+          })),
+        );
+      }
+      const queries = [
+        "quick",
+        "fox stone",
+        "riv*",
+        "moss quick",
+        "zzz",
+        "qu* mo*",
+        "42 river",
+      ].map(
+        (query) =>
+          `SELECT title, body FROM articles WHERE MATCH(title, body) AGAINST '${query}' ORDER BY title, body`,
+      );
+      // BM25 scores must not move when the index appears: scoring plans see the whole corpus
+      // (index pruning is disabled for them), so scores stay identical before and after.
+      queries.push(
+        "SELECT title, body, BM25(title, body) AGAINST 'quick moss' AS score FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY title, body",
+      );
+      const scanned = [];
+      for (const sql of queries) scanned.push((await database.query(sql)).rows);
+      await database.buildFtsIndex("articles", "title");
+      await database.buildFtsIndex("articles", "body");
+      for (let index = 0; index < queries.length; index += 1) {
+        const indexed = await database.query(queries[index] ?? "");
+        expect(indexed.rows, queries[index]).toEqual(scanned[index]);
+      }
+      store.close();
+    });
+
+    it("schedules a lazy full-text index build once a searched table crosses the threshold", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, {
+        rowsPerBlock: 2,
+        compression: "raw",
+        ftsAutoIndexRows: 1,
+      });
+      await database.createTable({
+        name: "articles",
+        columns: [{ name: "title", type: "string" }],
+      });
+      await database.insertBatch("articles", [
+        { title: "quick brown fox" },
+        { title: "lazy dog" },
+      ]);
+      const sql = "SELECT title FROM articles WHERE MATCH(title) AGAINST 'quick'";
+      const first = await database.query(sql);
+      expect(first.rows.map((row) => row.title)).toEqual(["quick brown fox"]);
+      // The scan-mode search fired a background build; poll the catalog until it lands.
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const state = Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state;
+        if (state === "ready") break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(
+        Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state,
+      ).toBe("ready");
+      expect((await database.query(sql)).rows).toEqual(first.rows);
+      store.close();
+    });
+
     it("inserts and upserts an array of rows", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store);
@@ -1153,6 +1806,135 @@ it("keeps concurrent batch inserts from two browser connections", async () => {
   ]);
   leftStore.close();
   rightStore.close();
+});
+
+it("generates unique auto-increment keys across two IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  const leftStore = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const rightStore = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const left = new MinnowDatabase(leftStore);
+  const right = new MinnowDatabase(rightStore);
+  await left.createTable({
+    name: "events",
+    columns: [
+      { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+      { name: "source", type: "string" },
+    ],
+    uniqueKey: "id",
+  });
+
+  // Both connections race the manifest CAS; the loser rebases and its generated keys must
+  // survive the retry unchanged and stay globally unique.
+  const results = await Promise.all([
+    left.insertBatch("events", [{ source: "left" }, { source: "left" }, { source: "left" }]),
+    right.insertBatch("events", [{ source: "right" }, { source: "right" }]),
+  ]);
+  const ids = results.flatMap((result) => result.generatedColumns?.id ?? []);
+  expect(ids).toHaveLength(5);
+  expect(new Set(ids).size).toBe(5);
+  const rows = await left.readTable("events");
+  expect(rows.map((row) => row.id).sort((a, b) => Number(a) - Number(b))).toEqual(
+    [...ids].sort((a, b) => Number(a) - Number(b)),
+  );
+  leftStore.close();
+  rightStore.close();
+});
+
+it("streams a search-shaped query under a budget too small to materialize", async () => {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store, { rowsPerBlock: 512, compression: "raw" });
+  await database.createTable({
+    name: "docs",
+    columns: [{ name: "body", type: "string" }],
+  });
+  const words = ["quick", "brown", "fox", "stone", "river"];
+  const rowCount = 20_000;
+  await database.insertBatch("docs", {
+    columns: {
+      body: Array.from(
+        { length: rowCount },
+        (_, index) => `${words[index % 5]} ${words[(index + 1) % 5]} entry ${String(index)}`,
+      ),
+    },
+  });
+  await database.buildFtsIndex("docs", "body");
+  // The .search() shape: ordering by an unselected BM25 expression wraps the plan in a
+  // projection block. The budget is far below what materializing the scan needs, so this
+  // succeeds only if the wrapper is transparent to the streamed path.
+  const sql =
+    "SELECT body FROM docs WHERE MATCH(body) AGAINST 'quick' ORDER BY BM25(body) AGAINST 'quick' DESC, body LIMIT 5";
+  const budget = 192_000;
+  await expect(
+    database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
+  ).rejects.toThrow(QueryMemoryBudgetError);
+  const streamed = await database.query(sql, { executionMemoryBudgetBytes: budget });
+  expect(streamed.columns).toEqual(["body"]);
+  expect(streamed.rows).toHaveLength(5);
+  expect(streamed.rows).toEqual((await database.query(sql)).rows);
+  store.close();
+});
+
+it("maintains the full-text index across two IndexedDB connections", async () => {
+  const factory = new IDBFactory();
+  const name = crypto.randomUUID();
+  const leftStore = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const rightStore = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const left = new MinnowDatabase(leftStore, { rowsPerBlock: 2, compression: "raw" });
+  const right = new MinnowDatabase(rightStore, { rowsPerBlock: 2, compression: "raw" });
+  await left.createTable({
+    name: "articles",
+    columns: [{ name: "title", type: "string" }],
+  });
+  await left.insertBatch("articles", [{ title: "quick brown fox" }, { title: "lazy dog" }]);
+  await left.buildFtsIndex("articles", "title");
+  // The other connection reads the catalog fresh per write, sees the index, and emits deltas.
+  await right.insertBatch("articles", [{ title: "quick patch" }, { title: "slow release" }]);
+  const sql = "SELECT title FROM articles WHERE MATCH(title) AGAINST 'quick' ORDER BY title";
+  const viaLeft = await left.query(sql);
+  const viaRight = await right.query(sql);
+  expect(viaLeft.rows.map((row) => row.title)).toEqual(["quick brown fox", "quick patch"]);
+  expect(viaRight.rows).toEqual(viaLeft.rows);
+  expect(
+    Object.values((await leftStore.listTables())[0]?.ftsColumns ?? {})[0]?.state,
+  ).toBe("ready");
+  leftStore.close();
+  rightStore.close();
+});
+
+it("burns the reserved auto-increment range when a write aborts", async () => {
+  const store = new MemoryBlockStore();
+  let failNextBlockWrite = false;
+  // The fault-injecting proxy deliberately lacks beginTransaction, so this also exercises the
+  // fallback reservation path.
+  const faultStore = new FaultInjectingBlockStore(store, (point) => {
+    if (point === "afterBlockWrite" && failNextBlockWrite) {
+      failNextBlockWrite = false;
+      throw new Error("injected write failure");
+    }
+  });
+  const database = new MinnowDatabase(faultStore);
+  await database.createTable({
+    name: "events",
+    columns: [
+      { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+      { name: "label", type: "string" },
+    ],
+    uniqueKey: "id",
+  });
+  await database.insertBatch("events", [{ label: "first" }]);
+  failNextBlockWrite = true;
+  await expect(database.insertBatch("events", [{ label: "lost" }])).rejects.toThrow(
+    "injected write failure",
+  );
+  const result = await database.insertBatch("events", [{ label: "after" }]);
+  // Row 1 committed, the aborted write burned id 2, so the next generated key is 3.
+  expect(result.generatedColumns?.id).toEqual([3]);
+  expect((await database.readTable("events")).map((row) => row.label).sort()).toEqual([
+    "after",
+    "first",
+  ]);
+  store.close();
 });
 
 it("rechecks unique keys when two IndexedDB connections insert the same value", async () => {

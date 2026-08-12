@@ -17,6 +17,7 @@ import {
   type InferRow,
   type InferUpdateChanges,
 } from "./schema.js";
+import { deserializeSchema, serializeSchema } from "./schema-wire.js";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -79,6 +80,172 @@ describe("schema DSL", () => {
     } else {
       expect.unreachable("expected issues");
     }
+  });
+});
+
+const notes = table("notes", {
+  id: column.number().unique().autoIncrement(),
+  slug: column.string().default("nanoid"),
+  guid: column.string().default("uuid"),
+  status: column.string().default("draft"),
+  created: column.datetime().default("now"),
+  body: column.string(),
+  tags: column.string().nullable(),
+});
+
+describe("column defaults", () => {
+  it("carries default specs on builders", () => {
+    expect(notes.columns.id.defaultSpec).toEqual({ kind: "autoincrement" });
+    expect(notes.columns.slug.defaultSpec).toEqual({ kind: "nanoid" });
+    expect(notes.columns.guid.defaultSpec).toEqual({ kind: "uuid" });
+    expect(notes.columns.status.defaultSpec).toEqual({ kind: "literal", value: "draft" });
+    expect(notes.columns.created.defaultSpec).toEqual({ kind: "now" });
+    expect(notes.columns.body.defaultSpec).toBeUndefined();
+    expect(notes.columns.id.hasDefault).toBe(true);
+    expect(notes.columns.body.hasDefault).toBe(false);
+  });
+
+  it("rejects invalid default combinations explicitly", () => {
+    expect(() => table("bad", { a: column.string().default("x").nullable() })).toThrow(
+      "Defaults require a non-nullable column",
+    );
+    expect(() => table("bad", { a: column.number().autoIncrement(), b: column.string() })).toThrow(
+      "Auto-increment requires the unique key column",
+    );
+    expect(() =>
+      table("bad", { a: column.string().unique().default("constant") }),
+    ).toThrow("Unique key cannot default to a constant");
+    expect(() =>
+      (column.string() as unknown as { autoIncrement: () => unknown }).autoIncrement(),
+    ).toThrow("Auto-increment requires a number column");
+    expect(() => column.datetime().default("later" as "now")).toThrow(
+      'Datetime columns default with "now"',
+    );
+    expect(() => column.number().default(Number.NaN)).toThrow("finite number");
+  });
+
+  it("makes default-bearing columns optional in insert rows", () => {
+    type Insert = InferInsertRow<typeof notes>;
+    const minimal: Insert = { body: "hi" };
+    const explicit: Insert = { body: "hi", id: 5, status: "posted", tags: null };
+    expect([minimal, explicit]).toBeDefined();
+    // @ts-expect-error body has no default and stays required
+    const missing: Insert = { id: 1 };
+    expect(missing).toBeDefined();
+  });
+
+  it("accepts omitted default-bearing columns through the Standard Schema validator", () => {
+    const valid = notes["~standard"].validate({ body: "hi" });
+    expect("value" in valid).toBe(true);
+    const invalid = notes["~standard"].validate({});
+    if ("issues" in invalid) {
+      expect(invalid.issues.map(({ path }) => path[0])).toEqual(["body"]);
+    } else {
+      expect.unreachable("expected issues");
+    }
+  });
+
+  it("round-trips default specs through the wire format", () => {
+    const rebuilt = deserializeSchema(serializeSchema(schema([notes])));
+    const rebuiltColumns = rebuilt.tables[0]?.columns ?? {};
+    expect(
+      Object.fromEntries(
+        Object.entries(rebuiltColumns).map(([name, definition]) => [
+          name,
+          definition.defaultSpec ?? null,
+        ]),
+      ),
+    ).toEqual({
+      id: { kind: "autoincrement" },
+      slug: { kind: "nanoid" },
+      guid: { kind: "uuid" },
+      status: { kind: "literal", value: "draft" },
+      created: { kind: "now" },
+      body: null,
+      tags: null,
+    });
+    expect(rebuiltColumns.id?.isUnique).toBe(true);
+  });
+
+  it("plans default alterations and rejects auto-increment transitions", () => {
+    const current = [
+      {
+        id: "t",
+        name: "notes",
+        columns: [
+          {
+            id: "c1",
+            name: "id",
+            type: "number" as const,
+            nullable: false,
+            defaultValue: { kind: "autoincrement" as const },
+          },
+          { id: "c2", name: "status", type: "string" as const, nullable: false },
+        ],
+        uniqueKeyColumnId: "c1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    const idColumn = column.number().unique().autoIncrement();
+    const added = planMigration(
+      current,
+      schema([table("notes", { id: idColumn, status: column.string().default("draft") })]),
+    );
+    expect(added.steps).toEqual([
+      {
+        kind: "alter-default",
+        tableName: "notes",
+        columnName: "status",
+        defaultValue: { kind: "literal", value: "draft" },
+      },
+    ]);
+    const unchanged = planMigration(
+      current,
+      schema([table("notes", { id: idColumn, status: column.string() })]),
+    );
+    expect(unchanged.steps).toEqual([]);
+    const currentWithLiteral = [
+      {
+        ...current[0]!,
+        columns: [
+          current[0]!.columns[0]!,
+          { ...current[0]!.columns[1]!, defaultValue: { kind: "literal" as const, value: "x" } },
+        ],
+      },
+    ];
+    const removed = planMigration(
+      currentWithLiteral,
+      schema([table("notes", { id: idColumn, status: column.string() })]),
+    );
+    expect(removed.steps).toEqual([
+      { kind: "alter-default", tableName: "notes", columnName: "status", defaultValue: null },
+    ]);
+    expect(() =>
+      planMigration(
+        current,
+        schema([table("notes", { id: column.number().unique(), status: column.string() })]),
+      ),
+    ).toThrow("Auto-increment cannot be added or removed after creation");
+  });
+
+  it("applies default alterations through migrate and uses them on insert", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    const v1 = table("posts", {
+      id: column.number().unique().autoIncrement(),
+      status: column.string(),
+    });
+    await database.migrate(schema([v1]));
+    const v2 = table("posts", {
+      id: column.number().unique().autoIncrement(),
+      status: column.string().default("draft"),
+    });
+    const altered = await database.migrate(schema([v2]));
+    expect(altered.alteredTables).toEqual(["posts"]);
+    expect((await database.migrate(schema([v2]))).steps).toEqual([]);
+    const inserted = await database.insertBatch("posts", [{}]);
+    expect(inserted.generatedColumns).toEqual({ id: [1], status: ["draft"] });
+    store.close();
   });
 });
 

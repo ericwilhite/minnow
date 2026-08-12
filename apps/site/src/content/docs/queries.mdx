@@ -75,8 +75,58 @@ The conventions:
 | Windows          | `eb.rowNumber() / rank() / denseRank()` and aggregate `.over((o) => o.partitionBy(...).orderBy(...))`                                      |
 | Conditionals     | `eb.case().when(...).then(...).else(...).end()`                                                                                            |
 | Subqueries       | `eb.selectFrom(...)`, `eb.exists(...)`, and builders as `in` / comparison operands                                                         |
+| Full-text search | `eb.match(columns, query)`, `eb.fn.bm25(columns, query)`, `.search(query)`                                                                 |
 
 Result types don't lie: `sum` over an empty group is `null`, so its type is `number | null`.
+
+## Full-text search
+
+Any column is searchable — no index DDL, no schema marking. A search treats the row as one
+document: every query term must appear in *some* listed column (`"*"` means every non-boolean
+column), a term ending in `*` matches prefixes, and numbers and datetimes match through their
+canonical text (`42`, or `2026 08` for August 2026 — a datetime renders as its ISO instant).
+Matching is Unicode-aware and deterministic (NFKC + lowercase; CJK matches by character bigrams);
+there is no stemming — use `*` prefixes instead.
+
+```ts
+// The one-liner: filter by match, order by BM25 relevance. The ordering expression desugars
+// into a hidden select item, so the row shape is exactly what you selected.
+const hits = await db
+  .selectFrom("articles")
+  .select(["title"])
+  .search("quick fo*")
+  .limit(10)
+  .execute(); // Array<{ title: string }>
+
+// Want the score? Select it — the ordering reuses the same expression, computed once:
+await db
+  .selectFrom("articles")
+  .select((eb) => ["title", eb.fn.bm25(["title", "body"], "quick fox").as("score")])
+  .where((eb) => eb.match(["title", "body"], "quick fox"))
+  .orderBy("score", "desc")
+  .execute();
+// SELECT title, BM25(title, body) AGAINST 'quick fox' AS score FROM articles
+// WHERE MATCH(title, body) AGAINST 'quick fox' ORDER BY score DESC
+
+// Search every table at once; hits merge into one relevance-ranked list.
+const everywhere = await db.search("quick fox", { limit: 20 });
+// Array<{ table: string; row: {...}; score: number }>
+```
+
+Semantics worth knowing: a row whose listed columns are all NULL is *unknown* (dropped by
+`WHERE`, like `LIKE` on NULL); an empty query matches nothing; unmatched documents score `0`
+under BM25 while all-NULL ones score NULL. Scans evaluate matches against each block's string
+dictionary — every distinct value tokenizes once, rows compare integers — under the query memory
+budget. BM25 corpus statistics come from the persisted index when one is ready (exact, no extra
+scan) and from a one-time whole-scan pass otherwise, in which case the scoring query
+materializes its scan.
+
+Large append-only tables get a persisted index for free: once a searched table crosses ~4096
+rows, a background build starts, inserts maintain it atomically with each commit, and MATCH
+scans skip segments containing no candidates. The index is a pruning accelerator, never ground
+truth — every candidate is re-verified, and any keyed mutation (or a tab that predates the
+index) atomically invalidates it, so queries silently fall back to the scan and the index
+rebuilds itself. `database.buildFtsIndex(table, column)` warms one up eagerly.
 
 ## Derived tables, CTEs, set operations
 

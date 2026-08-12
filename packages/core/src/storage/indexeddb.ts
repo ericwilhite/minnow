@@ -12,6 +12,11 @@ import {
   advanceGarbageCollectionJobRecord,
   type BlockStore,
   type BlockWrite,
+  collectFtsCandidates,
+  invalidateUncoveredFtsColumns,
+  type FtsCandidates,
+  type FtsColumnIndexRecord,
+  type FtsPosting,
   type GarbageCollectionJobRecord,
   GarbageCollectionJobConflictError,
   type GarbageCollectionStepResult,
@@ -53,6 +58,7 @@ const CURRENT_MANIFEST_KEY = "manifest/current";
 const TABLE_ID_PREFIX = "table/id/";
 const TABLE_NAME_PREFIX = "table/name/";
 const ROW_ID_PREFIX = "row-id/";
+const AUTO_INCREMENT_PREFIX = "auto-increment/";
 const UNIQUE_KEY_CHUNK_INDEX = "unique-key-chunk-index";
 const UNIQUE_KEY_CHUNK = "unique-key-chunk";
 const UNIQUE_KEY_BASE = "unique-key-base";
@@ -63,6 +69,9 @@ const UNIQUE_KEY_BASE = "unique-key-base";
  * instead of a scan whose cost grows with every key ever written.
  */
 const UNIQUE_KEY_TAIL_CHUNK_LIMIT = 16;
+const FTS_BASE_INDEX_PREFIX = "fts-base-index/";
+const FTS_BASE_PREFIX = "fts-base/";
+const FTS_CHUNK_PREFIX = "fts-chunk/";
 const COMPACTION_JOB_KEY_PREFIX = "compaction-job/";
 const GARBAGE_COLLECTION_JOB_KEY_PREFIX = "garbage-collection-job/";
 const storageTextEncoder = new TextEncoder();
@@ -338,9 +347,12 @@ export class IndexedDbBlockStore implements BlockStore {
   async updateTable(
     id: string,
     expectedRevision: number,
-    update: { columns: TableColumnRecord[] },
+    update: {
+      columns?: TableColumnRecord[];
+      ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+    },
   ): Promise<TableRecord> {
-    validateTableColumns(update.columns);
+    if (update.columns !== undefined) validateTableColumns(update.columns);
     const transaction = this.#transaction("catalog", "readwrite");
     const store = transaction.objectStore("catalog");
     const idKey = `${TABLE_ID_PREFIX}${id}`;
@@ -352,14 +364,121 @@ export class IndexedDbBlockStore implements BlockStore {
       await ignoreAbort(transaction);
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
     }
+    const { ftsColumns: previousFts, ...base } = record;
+    const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
     const updated: TableRecord = {
-      ...record,
-      columns: structuredClone(update.columns),
+      ...base,
+      columns: update.columns === undefined ? record.columns : structuredClone(update.columns),
+      ...(nextFts === null || nextFts === undefined
+        ? {}
+        : { ftsColumns: structuredClone(nextFts) }),
       revision: expectedRevision + 1,
     };
     store.put(structuredClone(updated), idKey);
     await transactionDone(transaction);
     return updated;
+  }
+
+  async writeFtsBase(
+    tableId: string,
+    columnId: string,
+    input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
+  ): Promise<void> {
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const tocKey = `${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`;
+    const previous = (await requestResult(store.get(tocKey))) as FtsBaseToc | undefined;
+    const chunkPrefix = `${FTS_BASE_PREFIX}${tableId}/${columnId}/`;
+    const previousCount = previous?.boundaries.length ?? 0;
+    for (let ordinal = input.chunks.length; ordinal < previousCount; ordinal += 1) {
+      store.delete(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`);
+    }
+    const boundaries: Array<{ first: string; last: string }> = [];
+    input.chunks.forEach((chunk, ordinal) => {
+      boundaries.push({
+        first: chunk[0]?.term ?? "",
+        last: chunk[chunk.length - 1]?.term ?? "",
+      });
+      store.put(structuredClone(chunk), `${chunkPrefix}${String(ordinal).padStart(6, "0")}`);
+    });
+    store.put(
+      { coversVersion: input.coversVersion, boundaries, totalTokens: input.totalTokens },
+      tocKey,
+    );
+    // Commit deltas the base now covers are dead; drop their chunks and shrink the version list
+    // (mirroring the unique-key chunk index — no key-range scans in this environment).
+    const deltaIndexKey = ftsChunkIndexKey(tableId, columnId);
+    const deltaIndex = (await requestResult(store.get(deltaIndexKey))) as
+      | { versions: number[] }
+      | undefined;
+    const surviving: number[] = [];
+    for (const version of deltaIndex?.versions ?? []) {
+      if (version <= input.coversVersion) {
+        store.delete(ftsChunkKey(tableId, columnId, version));
+      } else {
+        surviving.push(version);
+      }
+    }
+    store.put({ versions: surviving }, deltaIndexKey);
+    await transactionDone(transaction);
+  }
+
+  async readFtsCandidates(
+    tableId: string,
+    columnId: string,
+    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    upToVersion: number,
+  ): Promise<FtsCandidates & { deltaChunkCount: number; totalTokens: number }> {
+    const transaction = this.#transaction("catalog", "readonly");
+    const store = transaction.objectStore("catalog");
+    const [toc, deltaIndex] = (await Promise.all([
+      requestResult(store.get(`${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`)),
+      requestResult(store.get(ftsChunkIndexKey(tableId, columnId))),
+    ])) as [FtsBaseToc | undefined, { versions: number[] } | undefined];
+    const chunkPrefix = `${FTS_BASE_PREFIX}${tableId}/${columnId}/`;
+    const wantedOrdinals = (toc?.boundaries ?? []).flatMap((boundary, ordinal) =>
+      terms.some((term) => {
+        const upper = term.prefix ? `${term.term}￿` : term.term;
+        return term.term <= boundary.last && upper >= boundary.first;
+      })
+        ? [ordinal]
+        : [],
+    );
+    const coversVersion = toc?.coversVersion ?? -1;
+    const wantedVersions = (deltaIndex?.versions ?? []).filter(
+      (version) => version > coversVersion && version <= upToVersion,
+    );
+    // One readonly transaction pipelines all chunk reads concurrently instead of paying an
+    // event-loop round trip per chunk.
+    const [baseChunks, deltaChunks] = await Promise.all([
+      Promise.all(
+        wantedOrdinals.map(
+          (ordinal) =>
+            requestResult(store.get(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`)) as
+              Promise<FtsPosting[] | undefined>,
+        ),
+      ),
+      Promise.all(
+        wantedVersions.map(
+          (version) =>
+            requestResult(store.get(ftsChunkKey(tableId, columnId, version))) as
+              Promise<FtsDeltaChunk | undefined>,
+        ),
+      ),
+    ]);
+    await transactionDone(transaction);
+    const present = deltaChunks.filter((chunk) => chunk !== undefined);
+    const chunkLists = [
+      ...baseChunks.filter((chunk) => chunk !== undefined),
+      ...present.map((chunk) => chunk.postings),
+    ];
+    const totalTokens =
+      (toc?.totalTokens ?? 0) + present.reduce((total, chunk) => total + chunk.totalTokens, 0);
+    return {
+      ...collectFtsCandidates(chunkLists, terms),
+      deltaChunkCount: present.length,
+      totalTokens,
+    };
   }
 
   async getTableByName(name: string): Promise<TableRecord | undefined> {
@@ -422,6 +541,24 @@ export class IndexedDbBlockStore implements BlockStore {
     const key = `${ROW_ID_PREFIX}${tableId}`;
     const current = (await requestResult(store.get(key))) as bigint | undefined;
     const start = current ?? 1n;
+    const endExclusive = start + BigInt(count);
+    store.put(endExclusive, key);
+    await transactionDone(transaction);
+    return { start, endExclusive };
+  }
+
+  async reserveAutoIncrement(
+    tableId: string,
+    columnId: string,
+    count: number,
+    atLeast?: bigint,
+  ): Promise<RowIdRange> {
+    validateAutoIncrementReservation(count, atLeast);
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const key = `${AUTO_INCREMENT_PREFIX}${tableId}/${columnId}`;
+    const current = (await requestResult(store.get(key))) as bigint | undefined;
+    const start = maxBigInt(current ?? 1n, atLeast ?? 1n);
     const endExclusive = start + BigInt(count);
     store.put(endExclusive, key);
     await transactionDone(transaction);
@@ -629,8 +766,23 @@ export class IndexedDbBlockStore implements BlockStore {
         catalog.put(endExclusive, key);
         rowIds = { start, endExclusive };
       }
+      let autoIncrementValues: RowIdRange | undefined;
+      if (input.reserveAutoIncrement !== undefined) {
+        const { tableId, columnId, count, atLeast } = input.reserveAutoIncrement;
+        validateAutoIncrementReservation(count, atLeast);
+        const key = `${AUTO_INCREMENT_PREFIX}${tableId}/${columnId}`;
+        const current = (await requestResult(catalog.get(key))) as bigint | undefined;
+        const start = maxBigInt(current ?? 1n, atLeast ?? 1n);
+        const endExclusive = start + BigInt(count);
+        catalog.put(endExclusive, key);
+        autoIncrementValues = { start, endExclusive };
+      }
       await transactionDone(transaction);
-      return { record: structuredClone(record), ...(rowIds === undefined ? {} : { rowIds }) };
+      return {
+        record: structuredClone(record),
+        ...(rowIds === undefined ? {} : { rowIds }),
+        ...(autoIncrementValues === undefined ? {} : { autoIncrementValues }),
+      };
     } catch (error) {
       abortIfActive(transaction);
       await ignoreAbort(transaction);
@@ -1039,6 +1191,42 @@ export class IndexedDbBlockStore implements BlockStore {
           if (uniqueKeyChanges.remove === true) catalog.delete(key);
           else catalog.put(manifest.version, key);
         });
+      }
+    }
+    // Full-text deltas apply atomically with the publish; a stale writer (one that committed
+    // segments to an indexed table without deltas) flips the affected columns to "invalid"
+    // instead of failing the data commit — the index self-heals through a rebuild.
+    const changedFtsTableIds = new Set(pendingSegments.map((segment) => segment.tableId));
+    for (const tableId of changedFtsTableIds) {
+      const tableValue: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
+      if (tableValue === undefined) continue;
+      const covered = new Set(
+        input.ftsChanges?.tableId === tableId
+          ? input.ftsChanges.columns.map((column) => column.columnId)
+          : [],
+      );
+      const invalidated = invalidateUncoveredFtsColumns(
+        structuredClone(tableValue) as TableRecord,
+        covered,
+      );
+      if (invalidated !== undefined) {
+        catalog.put(structuredClone(invalidated), `${TABLE_ID_PREFIX}${tableId}`);
+      }
+    }
+    if (input.ftsChanges !== undefined) {
+      for (const column of input.ftsChanges.columns) {
+        catalog.put(
+          structuredClone({
+            postings: column.postings,
+            totalTokens: column.totalTokens,
+          } satisfies FtsDeltaChunk),
+          ftsChunkKey(input.ftsChanges.tableId, column.columnId, manifest.version),
+        );
+        const indexKey = ftsChunkIndexKey(input.ftsChanges.tableId, column.columnId);
+        const chunkIndex = (await requestResult(catalog.get(indexKey))) as
+          | { versions: number[] }
+          | undefined;
+        catalog.put({ versions: [...(chunkIndex?.versions ?? []), manifest.version] }, indexKey);
       }
     }
     transactionStore.put(committed, committed.id);
@@ -2240,6 +2428,38 @@ function validateCount(count: number): void {
   if (!Number.isSafeInteger(count) || count <= 0) {
     throw new RangeError("Row ID reservation count must be a positive whole number");
   }
+}
+
+interface FtsBaseToc {
+  coversVersion: number;
+  boundaries: Array<{ first: string; last: string }>;
+  totalTokens: number;
+}
+
+interface FtsDeltaChunk {
+  postings: FtsPosting[];
+  totalTokens: number;
+}
+
+function ftsChunkKey(tableId: string, columnId: string, version: number): string {
+  return `${FTS_CHUNK_PREFIX}${tableId}/${columnId}/${String(version)}`;
+}
+
+function ftsChunkIndexKey(tableId: string, columnId: string): string {
+  return `${FTS_CHUNK_PREFIX}index/${tableId}/${columnId}`;
+}
+
+function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError("Auto-increment reservation count must be a non-negative whole number");
+  }
+  if (atLeast !== undefined && atLeast < 1n) {
+    throw new RangeError("Auto-increment bump target must be at least 1");
+  }
+}
+
+function maxBigInt(a: bigint, b: bigint): bigint {
+  return a > b ? a : b;
 }
 
 function validateTempRunPage(page: TempRunPage): void {
