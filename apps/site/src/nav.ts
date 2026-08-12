@@ -25,6 +25,7 @@ export const docsNav: NavSection[] = [
       { title: "Writes & transactions", href: "/docs/writes/" },
       { title: "Live queries", href: "/docs/live-queries/" },
       { title: "Workers & multi-tab", href: "/docs/workers/" },
+      { title: "Devtools", href: "/docs/devtools/" },
       { title: "Architecture", href: "/docs/architecture/" },
     ],
   },

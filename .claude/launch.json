@@ -9,6 +9,14 @@
       "autoPort": true
     },
     {
+      "name": "devtools-demo",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--port", "4180"],
+      "port": 4180,
+      "url": "http://localhost:4180",
+      "autoPort": true
+    },
+    {
       "name": "site",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--workspace", "@minnowdb/site"],

@@ -1,0 +1,117 @@
+---
+title: Devtools
+description: An embeddable SQL console for your database — a floating panel in dev, an inline playground in docs.
+---
+
+# Devtools
+
+<p class="lede">
+  A panel you drop into any app to run SQL against the database it is already using. It floats over
+  your page without blocking it, and every statement that changes data asks first.
+</p>
+
+## Install
+
+```bash
+npm install @minnowdb/devtools
+```
+
+## Mount it
+
+The panel attaches to a `MinnowDatabase`, a `MinnowDatabaseClient`, or the `Minnow` facade over
+either — it reaches the database behind a facade through [`db.driver`](/docs/api/).
+
+```ts
+import { mountMinnowDevtools } from "@minnowdb/devtools";
+
+if (import.meta.env.DEV) {
+  mountMinnowDevtools(db, { corner: "bottom-right" });
+}
+```
+
+That adds a launcher button in the corner. Click it, or press `Cmd/Ctrl + Shift + D`.
+
+Keep the mount behind a development check. The devtools are a separate package precisely so they
+can be left out of a production bundle.
+
+## Or use the element
+
+`<minnow-devtools>` is a custom element, so it works unchanged in React, Vue, Svelte, Solid, Astro,
+and plain HTML. Its shadow root keeps your styles out and its own styles in.
+
+```ts
+import { defineMinnowDevtools } from "@minnowdb/devtools";
+
+defineMinnowDevtools();
+document.querySelector("minnow-devtools").target = db;
+```
+
+```html
+<minnow-devtools corner="bottom-left" hotkey="mod+k"></minnow-devtools>
+```
+
+The database is a property rather than an attribute, because it is an object.
+
+## Options
+
+| Option         | Attribute       | Default             | What it does                                                   |
+| -------------- | --------------- | ------------------- | -------------------------------------------------------------- |
+| `mode`         | `mode`          | `"launcher"`        | `"launcher"` floats over the page; `"inline"` renders in flow. |
+| `corner`       | `corner`        | `"bottom-right"`    | Which corner the launcher and the opening panel use.           |
+| `hotkey`       | `hotkey`        | `"mod+shift+d"`     | Toggle shortcut. `mod` is Cmd or Ctrl. Empty turns it off.     |
+| `defaultOpen`  | `open`          | `false`             | Open on mount. Inline panels are always open.                  |
+| `zIndex`       | `z-index`       | `2147483000`        | Stacking against your own overlays.                            |
+| `permissions`  | `write`         | `{ write: true }`   | `write: false` refuses every statement that changes data.      |
+| `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                   |
+| `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                   |
+
+## The window
+
+It is a window, not a modal. There is no backdrop over your page and no focus trap — the app
+underneath stays fully clickable while the panel is open. Drag it by its title bar, resize it from
+the corner grip, and it reopens where you left it.
+
+Two badges in the title bar say what you are working with:
+
+- **worker** or **main thread** — a database built in the page runs queries on the main thread, so
+  a slow one will freeze it. The [worker client](/docs/workers/) does not.
+- **write on** or **read-only** — whether `permissions.write` allows changes.
+
+## Running statements
+
+`Cmd/Ctrl + Enter` runs. Queries return rows; anything that changes data is described and confirmed
+first:
+
+- The prompt names the table, the operation, and the statement itself before it runs.
+- An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
+- With `permissions.write: false`, the statement is refused outright and never reaches the database.
+
+What a statement does is read off the compiled plan, not its text, so a `SELECT` that merely
+mentions `DELETE` in a string literal is still a query.
+
+SQL that fails to compile is reported with the offending token selected in the editor — the
+position comes from [`SqlCompileError`](/docs/queries/#locating-a-compile-error).
+
+## Embedding a playground
+
+`mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
+panel, in flow, sized by its container:
+
+```ts
+mountMinnowDevtools(db, {
+  container: document.querySelector("#playground"),
+  mode: "inline",
+  initialQuery: "SELECT * FROM people",
+});
+```
+
+## Cleaning up
+
+`mountMinnowDevtools` returns a handle:
+
+```ts
+const devtools = mountMinnowDevtools(db);
+devtools.open();
+devtools.close();
+devtools.destroy(); // removes every listener and the element it created
+```

@@ -196,6 +196,23 @@ const db = createMinnow<DB>(client, { schema: appSchema });
 unreachable data. Both are durable, resumable, and cancellable, with `...Step()` variants you can
 advance one step at a time.
 
+### Devtools
+
+An embeddable SQL console for the database your app is already using. It is a separate package, so
+it never reaches a production bundle unless you put it there.
+
+```ts
+import { mountMinnowDevtools } from "@minnowdb/devtools";
+
+if (import.meta.env.DEV) mountMinnowDevtools(db);
+```
+
+A launcher appears in the corner (`Cmd/Ctrl + Shift + D`). The panel floats over your page without
+blocking it, every statement that changes data is described and confirmed first, and
+`permissions: { write: false }` refuses those statements outright. It also ships as
+`<minnow-devtools>`, a custom element that works in any framework. See
+[the devtools guide](apps/site/src/content/docs/devtools.mdx).
+
 ### Modules
 
 | Import                        | Contents                                            |
@@ -207,6 +224,7 @@ advance one step at a time.
 | `@minnowdb/core/testing`      | Test helpers                                        |
 | `@minnowdb/core/transactions` | Snapshots, leases, transaction manager              |
 | `@minnowdb/core/block-format` | Block encoding and decoding                         |
+| `@minnowdb/devtools`          | Embeddable SQL console panel                        |
 
 ---
 
