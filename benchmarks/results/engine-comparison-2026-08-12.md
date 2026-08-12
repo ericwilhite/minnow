@@ -63,3 +63,14 @@ query, medians reported. Raw JSON: `2026-08-12-engine-comparison-{chromium,firef
   separately for that reason.
 - The block-format v1 change means these databases are not readable by pre-2026-08-11
   builds; the comparison numbers are unaffected.
+
+## Same-day regression capture (after the streaming, join, and compaction features)
+
+A second capture on the same host and configuration
+(`2026-08-12-engine-comparison-l2-{chromium,firefox}.json`) after streamed keyed-mutation
+scans, the partitioned hash join, keyed multi-range L2 promotion, and lifetime
+write-amplification accounting landed. Every aggregate is within run-to-run noise of the
+morning capture (Chromium Minnow sums: prepares 154.0 → 163.0 ms, medians 29.2 → 29.3 ms,
+insert 1852 → 1849 ms; Firefox medians 36.0 → 35.8 ms), competitor aggregates likewise, and
+all 15 queries verified against the oracle on every engine in both browsers — the features
+are memory/compaction-path work and cost nothing on this workload.
