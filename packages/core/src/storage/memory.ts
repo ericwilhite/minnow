@@ -278,7 +278,9 @@ export class MemoryBlockStore implements BlockStore {
     columnId: string,
     terms: ReadonlyArray<{ term: string; prefix: boolean }>,
     upToVersion: number,
-  ): Promise<FtsCandidates & { deltaChunkCount: number; totalTokens: number }> {
+  ): Promise<
+    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+  > {
     const key = `${tableId}/${columnId}`;
     const base = this.#ftsBases.get(key);
     const deltas =
@@ -292,7 +294,12 @@ export class MemoryBlockStore implements BlockStore {
       totalTokens += delta.totalTokens;
       chunkLists.push(delta.postings);
     }
-    return { ...collectFtsCandidates(chunkLists, terms), deltaChunkCount, totalTokens };
+    return {
+      ...collectFtsCandidates(chunkLists, terms),
+      deltaChunkCount,
+      totalTokens,
+      coversVersion: base?.coversVersion ?? -1,
+    };
   }
 
   /**

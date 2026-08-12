@@ -428,7 +428,9 @@ export class IndexedDbBlockStore implements BlockStore {
     columnId: string,
     terms: ReadonlyArray<{ term: string; prefix: boolean }>,
     upToVersion: number,
-  ): Promise<FtsCandidates & { deltaChunkCount: number; totalTokens: number }> {
+  ): Promise<
+    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+  > {
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
     const [toc, deltaIndex] = (await Promise.all([
@@ -478,6 +480,7 @@ export class IndexedDbBlockStore implements BlockStore {
       ...collectFtsCandidates(chunkLists, terms),
       deltaChunkCount: present.length,
       totalTokens,
+      coversVersion,
     };
   }
 

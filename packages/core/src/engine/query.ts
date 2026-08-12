@@ -1271,6 +1271,11 @@ function containsWindow(expression: Expression): boolean {
   return childExpressions(expression).some(containsWindow);
 }
 
+function containsFtsExpression(expression: Expression): boolean {
+  if (expression.kind === "fts") return true;
+  return childExpressions(expression).some(containsFtsExpression);
+}
+
 /**
  * Appends window-function columns to an executed inner-block result. Rows sort stably by the
  * hidden partition and ordering aliases with the same comparison semantics as ORDER BY;
@@ -1426,6 +1431,7 @@ export function executeRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {
+  validateGrouping(plan);
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
   for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
@@ -2010,8 +2016,15 @@ function validateGrouping(plan: CompiledQuery): void {
   const groupExpressions = new Set(plan.groupBy.map((expression) => JSON.stringify(expression)));
   for (const item of plan.select) {
     if (hasAggregate(item.expression)) continue;
-    // A constant expression is the same for every group, as standard SQL allows.
-    if (expressionColumns(item.expression).length === 0) continue;
+    // A constant expression is the same for every group, as standard SQL allows. A full-text
+    // node is never constant — MATCH(*) carries no column children before expansion, but it
+    // reads every searchable column of its row.
+    if (
+      expressionColumns(item.expression).length === 0 &&
+      !containsFtsExpression(item.expression)
+    ) {
+      continue;
+    }
     if (!groupExpressions.has(JSON.stringify(item.expression))) {
       throw new TypeError(`Selected column must appear in GROUP BY: ${item.alias}`);
     }
@@ -3381,6 +3394,16 @@ function desugarWindows(
   for (const item of select) {
     const expression = item.expression;
     if (expression.kind !== "window") continue;
+    // Full-text nodes evaluate against a scanned base table; a window's hidden columns
+    // compute over the windowed wrapper where no such scan exists.
+    const windowInputs = [
+      ...expression.partitionBy,
+      ...expression.orderBy.map((order) => order.expression),
+      ...(expression.argument === undefined ? [] : [expression.argument]),
+    ];
+    if (windowInputs.some(containsFtsExpression)) {
+      throw new TypeError("Full-text MATCH and BM25 are not supported inside OVER(...)");
+    }
     const partitionAliases = expression.partitionBy.map((partition) => {
       hidden += 1;
       const alias = `(window ${String(hidden)})`;

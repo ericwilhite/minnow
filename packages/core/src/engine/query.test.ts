@@ -199,6 +199,39 @@ describe("public SQL queries", () => {
     ).toEqual([{ id: null, value: null }]);
   });
 
+  it("keeps a derived ORDER BY column that only a differently-aliased item projects", () => {
+    // Projection pruning must not drop `b AS y`: the derived block's ORDER BY names the
+    // source column, not the alias, and the ordering decides which rows survive the LIMIT.
+    const plan = compileQuery("SELECT x FROM (SELECT x AS x, b AS y FROM t ORDER BY b LIMIT 2) d");
+    const input = new Map([
+      [
+        "t",
+        [
+          { x: "third", b: 3 },
+          { x: "first", b: 1 },
+          { x: "fourth", b: 4 },
+          { x: "second", b: 2 },
+        ],
+      ],
+    ]);
+    expect(executeQuery(plan, input).rows).toEqual([{ x: "first" }, { x: "second" }]);
+    expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
+  });
+
+  it("rejects a grouped full-text select item missing from GROUP BY", () => {
+    // MATCH(*) carries no column children before expansion, but it is never constant across
+    // a group; both executors share this rejection through validateGrouping.
+    const input = new Map([["t", [{ x: "quick fox" }, { x: "lazy dog" }]]]);
+    for (const sql of [
+      "SELECT MATCH(*) AGAINST 'quick' AS m, COUNT(*) AS c FROM t",
+      "SELECT MATCH(x) AGAINST 'quick' AS m, COUNT(*) AS c FROM t",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(() => executeQuery(plan, input)).toThrow("must appear in GROUP BY");
+      expect(() => executeRowQuery(plan, input)).toThrow("must appear in GROUP BY");
+    }
+  });
+
   it("rejects unsafe and malformed statements", async () => {
     expect(() => compileQuery("DELETE FROM events")).toThrow("Expected SELECT");
     expect(() => compileQuery("SELECT * FROM events; SELECT * FROM events")).toThrow(

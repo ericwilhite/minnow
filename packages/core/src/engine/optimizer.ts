@@ -318,10 +318,18 @@ function pruneDerivedProjections(block: CompiledQuery): void {
     // The block's own ORDER BY resolves against its select aliases (including the hidden
     // "(order N)" items the ORDER-BY-expression desugar adds), so those outputs are
     // load-bearing even when the outer block never reads them.
+    const orderReferences = new Set<string>();
     for (const order of derived.orderBy) {
-      if (order.expression.kind === "column") referenced.add(order.expression.reference);
+      if (order.expression.kind === "column") orderReferences.add(order.expression.reference);
     }
-    const kept = derived.select.filter((item) => referenced.has(item.alias));
+    // An ORDER BY column can name either a select alias or the projected source column
+    // itself (`SELECT b AS y ... ORDER BY b`), so both spellings pin the item.
+    const kept = derived.select.filter(
+      (item) =>
+        referenced.has(item.alias) ||
+        orderReferences.has(item.alias) ||
+        (item.expression.kind === "column" && orderReferences.has(item.expression.reference)),
+    );
     if (kept.length === derived.select.length) continue;
     derived.select = kept.length > 0 ? kept : derived.select.slice(0, 1);
   }

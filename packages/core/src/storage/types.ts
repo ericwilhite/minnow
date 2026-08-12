@@ -857,15 +857,20 @@ export interface BlockStore {
   /**
    * Per-term candidate row IDs from the base chunks plus every commit delta at or below
    * `upToVersion`, with the column's merged token total for exact BM25 statistics. Prefix
-   * terms match the term range [term, term + "￿"). Also reports the merged delta-chunk count
-   * so callers can schedule a rebuild when the tail grows.
+   * terms match the term range [term, term + "￿"). Reports the merged delta-chunk count so
+   * callers can schedule a rebuild when the tail grows, and the base's covered version —
+   * a concurrent rebuild can publish a base ahead of a reader's snapshot, and a caller
+   * needing snapshot-exact statistics must detect `coversVersion > upToVersion` and fall
+   * back (candidates stay a safe superset either way).
    */
   readFtsCandidates(
     tableId: string,
     columnId: string,
     terms: ReadonlyArray<{ term: string; prefix: boolean }>,
     upToVersion: number,
-  ): Promise<FtsCandidates & { deltaChunkCount: number; totalTokens: number }>;
+  ): Promise<
+    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+  >;
   addSegment(record: SegmentRecord): Promise<void>;
   getSegment(id: string): Promise<SegmentRecord | undefined>;
   listSegments(tableId?: string): Promise<SegmentRecord[]>;

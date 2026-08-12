@@ -149,6 +149,8 @@ import {
 const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
 const NULL_STRING_VECTOR_CODE = 0xffffffff;
+/** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
+const FTS_FOLD_DELTA_CHUNKS = 16;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
@@ -583,6 +585,12 @@ export class MinnowDatabase {
    */
   readonly #planCache = new Map<string, CompiledQuery>();
   readonly #visibilityFingerprints = new WeakMap<SegmentVisibilityCatalog, Map<string, string>>();
+  readonly #visibleSegmentsMemo = new WeakMap<SegmentVisibilityCatalog, Map<string, SegmentRecord[]>>();
+  /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
+  readonly #ftsCandidatesMemo = new WeakMap<
+    Snapshot,
+    Map<string, Promise<FtsCandidatesResult>>
+  >();
   #sharedLease: SharedLeaseEntry | undefined;
   #sharedLeaseRenewal: Promise<void> | undefined;
 
@@ -1269,6 +1277,24 @@ export class MinnowDatabase {
     plan: CompiledQuery,
     options: QueryOptions = {},
   ): Promise<PreparedQuery> {
+    // The ORDER-BY-expression desugar's wrapper is projection-only: prepare the inner block
+    // directly (no derived materialization) and project each result to the visible aliases,
+    // so `.search()` costs the same whether or not the caller also selects the score.
+    const wrapper = transparentProjectionSource(plan);
+    if (wrapper !== undefined) {
+      const prepared = await this.#prepareCompiledPlan(wrapper.inner, options);
+      return {
+        sql: prepared.sql,
+        tables: prepared.tables,
+        get memoryUsage() {
+          return prepared.memoryUsage;
+        },
+        execute: () => projectResultColumns(prepared.execute(), wrapper.aliases),
+        executeAsync: async (asyncOptions) =>
+          projectResultColumns(await prepared.executeAsync(asyncOptions), wrapper.aliases),
+        close: () => prepared.close(),
+      };
+    }
     const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
     try {
       let columnarTables = new Map<string, ColumnarTable>();
@@ -1908,24 +1934,27 @@ export class MinnowDatabase {
         searchableFtsColumns(realTables.get(tableName)),
       );
     }
+    // The ORDER-BY-expression desugar's transparent wrapper executes as its inner block plus a
+    // projection, so every execution-path note reports against the inner block.
+    const reported = transparentProjectionSource(plan)?.inner ?? plan;
     const notes: string[] = [];
-    if (this.#canStreamPlanShape(plan, { executionMemoryBudgetBytes: 1 })) {
+    if (this.#canStreamPlanShape(reported, { executionMemoryBudgetBytes: 1 })) {
       notes.push("eligible to stream the base scan through resident block windows under a budget");
     } else {
       notes.push("materializes inputs at preparation");
     }
-    const table = plan.base.derived ?? plan.base.union ?? plan.base.windowed;
-    if (table === undefined && plan.joins.length === 0) {
-      const record = await this.#findTable(plan.base.table);
-      if (zonePredicates(plan, record).length > 0) {
+    const table = reported.base.derived ?? reported.base.union ?? reported.base.windowed;
+    if (table === undefined && reported.joins.length === 0) {
+      const record = await this.#findTable(reported.base.table);
+      if (zonePredicates(reported, record).length > 0) {
         notes.push("zone-map pruning applies to the unbudgeted scan");
       }
     }
-    if (blockHasSubqueries(plan)) notes.push("resolves uncorrelated subqueries at one snapshot");
-    if (planContainsFts(plan)) {
+    if (blockHasSubqueries(reported)) notes.push("resolves uncorrelated subqueries at one snapshot");
+    if (planContainsFts(reported)) {
       notes.push("full-text MATCH evaluates via per-dictionary term tables on the scan");
-      if (table === undefined && plan.joins.length === 0) {
-        const record = await this.#findTable(plan.base.table);
+      if (table === undefined && reported.joins.length === 0) {
+        const record = await this.#findTable(reported.base.table);
         const readyColumnIds = new Set(
           Object.entries(record.ftsColumns ?? {})
             .filter(
@@ -1937,7 +1966,7 @@ export class MinnowDatabase {
         const columnsByName = new Map(
           record.columns.map((column) => [column.name, column] as const),
         );
-        const scoringServed = [...this.#ftsBm25Nodes(plan).values()].every((node) =>
+        const scoringServed = [...this.#ftsBm25Nodes(reported).values()].every((node) =>
           node.columns.every((expression) => {
             if (expression.kind !== "column") return false;
             const column = columnsByName.get(
@@ -1946,7 +1975,7 @@ export class MinnowDatabase {
             return column !== undefined && readyColumnIds.has(column.id);
           }),
         );
-        const scoring = planContainsFts(plan, "bm25");
+        const scoring = planContainsFts(reported, "bm25");
         if (readyColumnIds.size > 0 && (!scoring || scoringServed)) {
           notes.push("a ready full-text index prunes the base scan to candidate segments");
         }
@@ -1957,7 +1986,7 @@ export class MinnowDatabase {
               : "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
           );
         }
-      } else if (planContainsFts(plan, "bm25")) {
+      } else if (planContainsFts(reported, "bm25")) {
         notes.push(
           "BM25 scoring reads the full scan for corpus statistics; index pruning does not apply",
         );
@@ -2220,12 +2249,22 @@ export class MinnowDatabase {
         transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
         segmentsByTable,
       };
+      // The fts invalidation flip commits atomically with its segments, so a record fetched
+      // after the segment reads above cannot claim "ready" for data those segments miss.
+      const freshBaseTable = planContainsFts(plan)
+        ? ((await this.store.getTable(baseTable.id)) ?? baseTable)
+        : baseTable;
       // Scoring needs corpus statistics: streamed windows cannot run the scan-side stats pass,
       // so a BM25 plan streams only when the index serves exact statistics; otherwise fall
       // back to the materialized path.
       const ftsStats = await this.#ftsIndexStats(
         plan,
-        new Map(tables.map((record) => [record.name, record])),
+        new Map(
+          tables.map((record) => [
+            record.name,
+            record.id === freshBaseTable.id ? freshBaseTable : record,
+          ]),
+        ),
         snapshot,
         visibility,
       );
@@ -2233,8 +2272,8 @@ export class MinnowDatabase {
       // The streamed scan honors the same index pruning as the materialized path; a budgeted
       // MATCH query must not silently pay the full scan just because it streams.
       const baseSegments = await this.#ftsPrunedSegments(
-        baseTable,
-        await this.#visibleSegmentRecords(baseTable, snapshot, visibility),
+        freshBaseTable,
+        await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility),
         plan,
         snapshot,
       );
@@ -5687,11 +5726,44 @@ export class MinnowDatabase {
   }
 
   /**
+   * One postings read per (column, terms) per snapshot: the statistics service and the segment
+   * pruner ask for the same candidates in the canonical search shape, and sharing the promise
+   * both halves the index I/O and guarantees the two make identical freshness decisions.
+   */
+  #readFtsCandidatesMemoized(
+    snapshot: Snapshot,
+    tableId: string,
+    columnId: string,
+    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    upToVersion: number,
+  ): Promise<FtsCandidatesResult> {
+    let memo = this.#ftsCandidatesMemo.get(snapshot);
+    if (memo === undefined) {
+      memo = new Map();
+      this.#ftsCandidatesMemo.set(snapshot, memo);
+    }
+    const key = `${tableId}\u0000${columnId}\u0000${String(upToVersion)}\u0000${terms
+      .map((term) => `${term.term}${term.prefix ? "*" : ""}`)
+      .join("\u0000")}`;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    // Shared leases live across queries at one version; results are version-deterministic, but
+    // candidate arrays can be large, so the memo sheds wholesale rather than growing unbounded.
+    if (memo.size >= 64) memo.clear();
+    const read = this.store.readFtsCandidates(tableId, columnId, terms, upToVersion);
+    memo.set(key, read);
+    return read;
+  }
+
+  /**
    * Exact BM25 corpus statistics from the postings index, keyed by node signature, or
    * undefined when any scoring node cannot be served (the scan then computes its own).
    * docCount is the visible row count (every row is a document); per-term document frequency
    * is the size of the union of the term's posting row ids across the document's columns; and
-   * token totals merge from the base plus commit deltas. All exact for append-only histories.
+   * token totals merge from the base plus commit deltas. All exact for append-only histories —
+   * including under time travel or a concurrent rebuild, because a base covering a version
+   * ahead of this snapshot disqualifies the index here (and, through the shared reads, in the
+   * pruner) rather than mixing corpora.
    */
   async #ftsIndexStats(
     plan: CompiledQuery,
@@ -5720,10 +5792,11 @@ export class MinnowDatabase {
       if (columns.some((column) => column === undefined)) return undefined;
       const perColumn = await Promise.all(
         (columns as TableColumnRecord[]).map((column) =>
-          this.store.readFtsCandidates(table.id, column.id, terms, upToVersion),
+          this.#readFtsCandidatesMemoized(snapshot, table.id, column.id, terms, upToVersion),
         ),
       );
-      if (perColumn.some((result) => result.deltaChunkCount > 16)) {
+      if (perColumn.some((result) => result.coversVersion > upToVersion)) return undefined;
+      if (perColumn.some((result) => result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS)) {
         this.#scheduleFtsBuilds(table, columns as TableColumnRecord[], segments, true);
       }
       const dfByTerm = terms.map(
@@ -5782,11 +5855,20 @@ export class MinnowDatabase {
       const upToVersion = snapshot.version ?? -1;
       const perColumn = await Promise.all(
         resolved.map((column) =>
-          this.store.readFtsCandidates(table.id, column.id, terms, upToVersion),
+          this.#readFtsCandidatesMemoized(snapshot, table.id, column.id, terms, upToVersion),
         ),
       );
+      // A base rebuilt past this snapshot yields a candidate SUPERSET — safe for match-only
+      // pruning, but a scoring plan's statistics would have bailed on the same shared reads,
+      // so pruning must bail with them to keep "pruned ⟹ statistics served".
+      if (
+        planContainsFts(plan, "bm25") &&
+        perColumn.some((result) => result.coversVersion > upToVersion)
+      ) {
+        return segments;
+      }
       // A long delta tail re-merges on every read; folding is just a rebuild at a newer version.
-      if (perColumn.some((result) => result.deltaChunkCount > 16)) {
+      if (perColumn.some((result) => result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS)) {
         this.#scheduleFtsBuilds(table, resolved, segments, true);
       }
       // Document semantics over sorted candidate arrays: per term, union across the document's
@@ -5876,7 +5958,14 @@ export class MinnowDatabase {
           ...(projectedKey ? { uniqueKey: projectedKey } : {}),
         };
       }
-      const predicates = plan === undefined ? [] : zonePredicates(plan, table);
+      // Zone-map pruning shrinks the scan the same way index pruning does, so a scoring plan
+      // whose statistics come from the scan (no index serving it) must see the whole corpus.
+      const zonePruningAllowed =
+        plan === undefined ||
+        !planContainsFts(plan, "bm25") ||
+        this.#ftsIndexServesScoring(plan, table, visibleSegments);
+      const predicates =
+        plan === undefined || !zonePruningAllowed ? [] : zonePredicates(plan, table);
       if (predicates.length > 0) {
         const prunedKey =
           `prn\u0000${table.id}\u0000${fingerprint}\u0000` +
@@ -6454,6 +6543,30 @@ export class MinnowDatabase {
     snapshot: Snapshot,
     catalog?: SegmentVisibilityCatalog,
   ): Promise<SegmentRecord[]> {
+    // One prepare asks for the same table's visible segments several times (statistics,
+    // fingerprints, materialization); the visibility catalog is per-prepare state, so the
+    // filtered-and-sorted result memoizes on it, like #visibilityFingerprints.
+    if (catalog !== undefined) {
+      let memo = this.#visibleSegmentsMemo.get(catalog);
+      if (memo === undefined) {
+        memo = new Map<string, SegmentRecord[]>();
+        this.#visibleSegmentsMemo.set(catalog, memo);
+      }
+      const key = `${table.id}\u0000${String(snapshot.version ?? -1)}`;
+      const cached = memo.get(key);
+      if (cached !== undefined) return cached;
+      const computed = await this.#visibleSegmentRecordsUncached(table, snapshot, catalog);
+      memo.set(key, computed);
+      return computed;
+    }
+    return this.#visibleSegmentRecordsUncached(table, snapshot, catalog);
+  }
+
+  async #visibleSegmentRecordsUncached(
+    table: TableRecord,
+    snapshot: Snapshot,
+    catalog?: SegmentVisibilityCatalog,
+  ): Promise<SegmentRecord[]> {
     const segments =
       catalog?.segmentsByTable.get(table.id) ?? (await this.store.listSegments(table.id));
     const transactions =
@@ -6816,14 +6929,34 @@ function unionSortedRowIds(arrays: ReadonlyArray<readonly bigint[]>): bigint[] {
   const nonEmpty = arrays.filter((array) => array.length > 0);
   if (nonEmpty.length === 0) return [];
   if (nonEmpty.length === 1) return [...(nonEmpty[0] ?? [])];
-  const merged = ([] as bigint[])
-    .concat(...(nonEmpty as bigint[][]))
-    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
-  const unique: bigint[] = [];
-  for (const rowId of merged) {
-    if (unique.length === 0 || unique[unique.length - 1] !== rowId) unique.push(rowId);
+  // Pairwise linear merges: inputs are already sorted, so no comparison sort is needed.
+  let merged: readonly bigint[] = nonEmpty[0] ?? [];
+  for (let index = 1; index < nonEmpty.length; index += 1) {
+    const other = nonEmpty[index] ?? [];
+    const result: bigint[] = [];
+    let leftIndex = 0;
+    let rightIndex = 0;
+    while (leftIndex < merged.length && rightIndex < other.length) {
+      const left = merged[leftIndex] ?? 0n;
+      const right = other[rightIndex] ?? 0n;
+      const next = left <= right ? left : right;
+      if (left <= right) leftIndex += 1;
+      if (right <= left) rightIndex += 1;
+      if (result.length === 0 || result[result.length - 1] !== next) result.push(next);
+    }
+    while (leftIndex < merged.length) {
+      const value = merged[leftIndex] ?? 0n;
+      if (result.length === 0 || result[result.length - 1] !== value) result.push(value);
+      leftIndex += 1;
+    }
+    while (rightIndex < other.length) {
+      const value = other[rightIndex] ?? 0n;
+      if (result.length === 0 || result[result.length - 1] !== value) result.push(value);
+      rightIndex += 1;
+    }
+    merged = result;
   }
-  return unique;
+  return merged as bigint[];
 }
 
 /** Two-pointer intersection of sorted row-id arrays. */
@@ -6923,6 +7056,9 @@ function buildFtsColumnDeltas(
     return [{ columnId, postings: sortedFtsPostings(byTerm), totalTokens }];
   });
 }
+
+/** One column's postings read: candidates plus the freshness/fold metadata callers gate on. */
+type FtsCandidatesResult = Awaited<ReturnType<BlockStore["readFtsCandidates"]>>;
 
 /** The columns a MATCH(*) document draws from: everything except booleans. */
 function searchableFtsColumns(table: TableRecord | undefined): readonly string[] | undefined {

@@ -1229,6 +1229,63 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("keeps BM25 corpus statistics exact when zone maps could prune the scan", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "readings",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "note", type: "string" },
+        ],
+      });
+      // Two segments with disjoint id ranges: the range predicate could zone-prune the
+      // second, which would corrupt scan-computed corpus statistics (docCount, df).
+      await database.insertBatch("readings", [
+        { id: 1, note: "quick fox" },
+        { id: 2, note: "quick quick brown" },
+      ]);
+      await database.insertBatch("readings", [
+        { id: 10, note: "lazy dog" },
+        { id: 11, note: "quiet river" },
+      ]);
+      const prunable = await database.query(
+        "SELECT id, BM25(note) AGAINST 'quick' AS score FROM readings WHERE id <= 2 AND MATCH(note) AGAINST 'quick' ORDER BY id",
+      );
+      // The arithmetic spelling of the same predicate never zone-prunes; whole-table
+      // statistics must make the two spellings score identically.
+      const unprunable = await database.query(
+        "SELECT id, BM25(note) AGAINST 'quick' AS score FROM readings WHERE id + 0 <= 2 AND MATCH(note) AGAINST 'quick' ORDER BY id",
+      );
+      expect(prunable.rows).toEqual(unprunable.rows);
+      expect(prunable.rows).toHaveLength(2);
+      store.close();
+    });
+
+    it("time-travel BM25 ignores an index built past the queried version", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "docs",
+        columns: [{ name: "body", type: "string" }],
+      });
+      const first = await database.insertBatch("docs", [
+        { body: "quick fox" },
+        { body: "lazy dog" },
+      ]);
+      const sql =
+        "SELECT body, BM25(body) AGAINST 'quick' AS score FROM docs WHERE MATCH(body) AGAINST 'quick' ORDER BY body";
+      const before = await database.query(sql, { version: first.version });
+      // More rows and an index covering them: the index's statistics describe a corpus the
+      // queried version cannot see, so time travel must fall back to scan statistics.
+      await database.insertBatch("docs", [{ body: "quick quick quick" }, { body: "quiet" }]);
+      await database.buildFtsIndex("docs", "body");
+      const after = await database.query(sql, { version: first.version });
+      expect(after).toEqual(before);
+      expect(after.rows).toHaveLength(1);
+      store.close();
+    });
+
     it("re-expands MATCH(*) after a migration adds a column", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
@@ -6663,7 +6720,9 @@ for (const implementation of implementations()) {
       "WITH scaled AS (SELECT region, amount * 2 AS doubled FROM cte_sales) SELECT doubled FROM scaled WHERE doubled > 10",
     );
     expect(explained).toContain("where (amount * 2) > 10");
-    expect(explained).toContain("-- materializes inputs at preparation");
+    // After predicate pushdown the outer block is a pure projection wrapper, which executes
+    // as its inner filtered scan — a streamable shape.
+    expect(explained).toContain("-- eligible to stream");
     expect(
       await database.explain("SELECT SUM(amount) AS total FROM cte_sales WHERE amount > 5"),
     ).toContain("-- eligible to stream");

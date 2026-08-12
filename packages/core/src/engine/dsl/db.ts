@@ -258,17 +258,33 @@ export class Minnow<in out DB> {
           Record<string, QueryValue>
         >;
         // The score is selected under an internal alias so hits can rank across tables, then
-        // stripped from the row; user-facing rows never carry a synthetic column.
-        const rows = await builder
-          .select((eb) => [
-            ...Object.keys(definition.columns),
-            eb.fn.bm25("*", query).as("(search score)"),
-          ])
-          .search(query)
-          .limit(limit)
-          .execute();
+        // stripped from the row; user-facing rows never carry a synthetic column. The alias
+        // grows parentheses until it collides with no real column name.
+        const columnNames = Object.keys(definition.columns);
+        let scoreAlias = "(search score)";
+        while (columnNames.includes(scoreAlias)) scoreAlias = `(${scoreAlias})`;
+        let rows: Record<string, QueryValue>[];
+        try {
+          rows = await builder
+            .select((eb) => [...columnNames, eb.fn.bm25("*", query).as(scoreAlias)])
+            .search(query)
+            .limit(limit)
+            .execute();
+        } catch (error) {
+          // A schema can list tables that don't exist yet or hold nothing searchable; those
+          // tables simply contribute no hits. Anything else is a real failure.
+          const message = error instanceof Error ? error.message : "";
+          if (
+            message.startsWith("Table not found:") ||
+            message.startsWith("Unknown table:") ||
+            message.includes("no searchable columns")
+          ) {
+            return [];
+          }
+          throw error;
+        }
         return rows.map((row) => {
-          const { "(search score)": score, ...rest } = row as Record<string, QueryValue>;
+          const { [scoreAlias]: score, ...rest } = row;
           return { table: tableName, row: rest, score: typeof score === "number" ? score : 0 };
         });
       }),

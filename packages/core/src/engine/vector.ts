@@ -220,6 +220,8 @@ interface FtsDictionaryCache {
   /** BM25 only — per dictionary code: token count and per-term frequencies (flattened). */
   tokenCount?: Uint32Array;
   termTf?: Uint32Array;
+  /** Sticky: once a scored read upgrades the cache, later window rebuilds keep scoring. */
+  scoring?: boolean;
   reservation?: QueryMemoryReservation;
 }
 
@@ -717,12 +719,18 @@ function bindExpression(
       return bound;
     });
     const servedStats = ftsStats?.get(signature);
+    // `.search()` evaluates a MATCH and a BM25 node over the same columns and query; the
+    // per-dictionary term tables depend only on columns + query, so the twin ops share one
+    // cache array (scoring fields upgrade lazily on the first scored use).
+    const sibling = ftsBySignature?.get(
+      JSON.stringify({ ...expression, op: expression.op === "match" ? "bm25" : "match" }),
+    );
     const bound: BoundFtsExpression = {
       kind: "fts",
       op: expression.op,
       columns,
       terms: cachedQueryTerms(expression.query),
-      caches: columns.map(() => null),
+      caches: sibling?.caches ?? columns.map(() => null),
       ...(servedStats === undefined ? {} : { stats: servedStats }),
       ...(memory === undefined ? {} : { memory }),
       signature,
@@ -882,18 +890,23 @@ function ensureFtsDictionaryCache(
   expression: BoundFtsExpression,
   columnIndex: number,
   vector: StringVector,
+  scoring: boolean,
 ): FtsDictionaryCache {
   let cache = expression.caches[columnIndex];
   if (cache === null || cache === undefined) {
     cache = { dictionary: undefined, termMask: new Uint32Array(0) };
     expression.caches[columnIndex] = cache;
   }
-  if (cache.dictionary !== vector.dictionary) {
-    const scoring = expression.op === "bm25";
+  // A cache built for matching upgrades in place when scoring first needs the same
+  // dictionary's token counts and frequencies (twin MATCH/BM25 nodes share cache arrays).
+  // Scoring demand is sticky: once a scored read upgrades, later window rebuilds tokenize
+  // once and build both tables instead of a mask-only pass plus an immediate upgrade.
+  if (cache.dictionary !== vector.dictionary || (scoring && cache.termTf === undefined)) {
+    const withScores = scoring || cache.scoring === true;
     const termCount = expression.terms.length;
     // Match tables cost one Uint32 per entry; scoring adds a token count and per-term
     // frequencies, all part of the modeled query memory.
-    const bytesPerEntry = 4 * (scoring ? termCount + 2 : 1);
+    const bytesPerEntry = 4 * (withScores ? termCount + 2 : 1);
     cache.reservation?.release();
     delete cache.reservation;
     const reservation = expression.memory?.reserve(
@@ -902,8 +915,10 @@ function ensureFtsDictionaryCache(
     );
     if (reservation !== undefined) cache.reservation = reservation;
     const masks = new Uint32Array(vector.dictionary.length);
-    const tokenCount = scoring ? new Uint32Array(vector.dictionary.length) : undefined;
-    const termTf = scoring ? new Uint32Array(vector.dictionary.length * termCount) : undefined;
+    const tokenCount = withScores ? new Uint32Array(vector.dictionary.length) : undefined;
+    const termTf = withScores
+      ? new Uint32Array(vector.dictionary.length * termCount)
+      : undefined;
     for (let code = 0; code < vector.dictionary.length; code += 1) {
       const tokens = tokenize(vector.dictionary[code] ?? "");
       masks[code] = termsMask(tokens, expression.terms);
@@ -917,8 +932,13 @@ function ensureFtsDictionaryCache(
     }
     cache.dictionary = vector.dictionary;
     cache.termMask = masks;
+    // A mask-only rebuild must not leave a previous dictionary's scoring tables behind: the
+    // next scored read checks `termTf === undefined` to decide whether to upgrade.
     if (tokenCount !== undefined) cache.tokenCount = tokenCount;
+    else delete cache.tokenCount;
     if (termTf !== undefined) cache.termTf = termTf;
+    else delete cache.termTf;
+    cache.scoring = withScores;
   }
   return cache;
 }
@@ -976,7 +996,7 @@ function accumulateFtsRow(
       if (code === undefined) continue;
       into.present = true;
       if (terms.length === 0 && !wantScores) continue;
-      const cache = ensureFtsDictionaryCache(expression, index, column.vector);
+      const cache = ensureFtsDictionaryCache(expression, index, column.vector, wantScores);
       into.mask |= cache.termMask[code] ?? 0;
       if (wantScores) {
         into.length += cache.tokenCount?.[code] ?? 0;
