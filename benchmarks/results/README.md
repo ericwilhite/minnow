@@ -61,3 +61,12 @@ prepare-cost reduction that landed after that run: one batched catalog read, a s
 reader lease, and a byte-bounded prepare cache keyed by visible segment ids. Summed prepare fell
 2.1× in Chromium and 2.8× in Firefox with execution medians unchanged, and a repeated prepare of
 the same statement fell from 426 ms summed to 44 ms in the main-thread harness.
+
+The 2026-08-12 re-capture (`engine-comparison-2026-08-12.md`, raw
+`2026-08-12-engine-comparison-{chromium,firefox}.json`) records the optimization passes that
+followed: memory-accounting and executor kernels, the plan and decoded-block caches, block-format
+v1 header-only pruning, atomic write staging, log-structured unique keys, and delta manifests.
+Against the previous day's optimized capture, Minnow's scale-10 dataset insert ran 1.85× faster in
+Chromium (1.24× Firefox), summed prepares fell a further 1.45×/1.21×, and summed execution medians
+improved 1.31×/1.27×, with competitor aggregates unchanged within noise and all 15 queries
+oracle-verified everywhere.
