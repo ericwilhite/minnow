@@ -978,7 +978,10 @@ export class MinnowDatabase {
     const started = performance.now();
     const rowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     const logicalBytes = estimateBatchBytes(input);
-    const transaction = await this.#transactions.begin();
+    const { transaction, rowIds: reservedRowIds } = await this.#transactions.beginWithReservation({
+      tableId: table.id,
+      count: rowCount,
+    });
     if (keys !== undefined) {
       transaction.setUniqueKeyChanges({
         tableId: table.id,
@@ -1003,7 +1006,7 @@ export class MinnowDatabase {
         kind === "insert" && keys !== undefined
           ? { inserted: keys.size, updated: 0 }
           : await this.#classifyKeys(table, transaction.snapshotVersion, kind, keys);
-      const rowIds = await this.store.reserveRowIds(table.id, rowCount);
+      const rowIds = reservedRowIds ?? (await this.store.reserveRowIds(table.id, rowCount));
       for (const column of table.columns) {
         const values = input.columns[column.name] ?? [];
         const blockIds: string[] = [];

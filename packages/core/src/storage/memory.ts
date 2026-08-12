@@ -1,4 +1,6 @@
 import {
+  type BeginTransactionInput,
+  type BeginTransactionResult,
   type CommitTransactionInput,
   type CompactionJobRecord,
   CompactionJobConflictError,
@@ -360,6 +362,32 @@ export class MemoryBlockStore implements BlockStore {
       }
     });
     return result;
+  }
+
+  async beginTransaction(input: BeginTransactionInput): Promise<BeginTransactionResult> {
+    if (input.record.pendingBlockIds.length > 0 || input.record.pendingSegmentIds.length > 0) {
+      throw new TypeError("A fresh transaction cannot begin with pending artifacts");
+    }
+    return this.#runAtomic(() => {
+      const record: TransactionRecord = {
+        ...structuredClone(input.record),
+        snapshotVersion: this.#currentVersion,
+      };
+      assertSnapshotAvailable(record.snapshotVersion, this.#manifests, this.#blocks);
+      if (this.#transactions.has(record.id)) {
+        throw new Error(`Transaction already exists: ${record.id}`);
+      }
+      this.#transactions.set(record.id, record);
+      let rowIds: RowIdRange | undefined;
+      if (input.reserveRowIds !== undefined) {
+        validateCount(input.reserveRowIds.count);
+        const current = this.#nextRowIds.get(input.reserveRowIds.tableId) ?? 1n;
+        const endExclusive = current + BigInt(input.reserveRowIds.count);
+        this.#nextRowIds.set(input.reserveRowIds.tableId, endExclusive);
+        rowIds = { start: current, endExclusive };
+      }
+      return { record: structuredClone(record), ...(rowIds === undefined ? {} : { rowIds }) };
+    });
   }
 
   async createTransaction(record: TransactionRecord): Promise<void> {

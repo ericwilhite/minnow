@@ -6,6 +6,7 @@ import {
   type LeaseKind,
   type LeaseRecord,
   type ManifestSummary,
+  type RowIdRange,
   type SegmentRecord,
   SnapshotManifestMissingError,
   type TransactionRecord,
@@ -392,7 +393,41 @@ export class TransactionManager {
   }
 
   async begin(): Promise<DatabaseTransaction> {
+    return (await this.beginWithReservation()).transaction;
+  }
+
+  /**
+   * Begins a transaction at the current manifest version and optionally reserves row ids in the
+   * same step. Stores implementing the atomic `beginTransaction` pay one storage round trip
+   * instead of the version-read/create/reserve sequence; the read-then-create fallback retries
+   * when the version it read is pruned before the record lands.
+   */
+  async beginWithReservation(reserveRowIds?: {
+    tableId: string;
+    count: number;
+  }): Promise<{ transaction: DatabaseTransaction; rowIds?: RowIdRange }> {
     const id = this.#createId();
+    const batched = this.store.beginTransaction?.bind(this.store);
+    if (batched !== undefined) {
+      const timestamp = this.#now().toISOString();
+      const begun = await batched({
+        record: {
+          id,
+          pendingBlockIds: [],
+          pendingSegmentIds: [],
+          status: "active",
+          revision: 0,
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          committedVersion: null,
+        },
+        ...(reserveRowIds === undefined ? {} : { reserveRowIds }),
+      });
+      return {
+        transaction: new DatabaseTransaction(this.store, begun.record, this.#now),
+        ...(begun.rowIds === undefined ? {} : { rowIds: begun.rowIds }),
+      };
+    }
     for (;;) {
       const currentVersion = await this.store.getCurrentManifestVersion();
       const timestamp = this.#now().toISOString();
@@ -409,7 +444,10 @@ export class TransactionManager {
       };
       try {
         await this.store.createTransaction(record);
-        return new DatabaseTransaction(this.store, record, this.#now);
+        const transaction = new DatabaseTransaction(this.store, record, this.#now);
+        if (reserveRowIds === undefined) return { transaction };
+        const rowIds = await this.store.reserveRowIds(reserveRowIds.tableId, reserveRowIds.count);
+        return { transaction, rowIds };
       } catch (error) {
         if (error instanceof SnapshotManifestMissingError) {
           continue;

@@ -1,4 +1,6 @@
 import {
+  type BeginTransactionInput,
+  type BeginTransactionResult,
   type CommitTransactionInput,
   type CompactionJobRecord,
   CompactionJobConflictError,
@@ -600,6 +602,40 @@ export class IndexedDbBlockStore implements BlockStore {
     await transactionDone(transaction);
     this.#manifestCache = { version: manifest.version, blockIds: new Set(manifest.blockIds) };
     return manifest;
+  }
+
+  async beginTransaction(input: BeginTransactionInput): Promise<BeginTransactionResult> {
+    if (input.record.pendingBlockIds.length > 0 || input.record.pendingSegmentIds.length > 0) {
+      throw new TypeError("A fresh transaction cannot begin with pending artifacts");
+    }
+    const transaction = this.#transaction(["transactions", "manifests", "catalog"], "readwrite");
+    try {
+      const catalog = transaction.objectStore("catalog");
+      const current = (await requestResult(catalog.get(CURRENT_MANIFEST_KEY))) as
+        number | undefined;
+      const record: TransactionRecord = {
+        ...structuredClone(input.record),
+        snapshotVersion: current ?? null,
+      };
+      await assertSnapshotAvailableInTransaction(transaction, record.snapshotVersion);
+      transaction.objectStore("transactions").add(record, record.id);
+      let rowIds: RowIdRange | undefined;
+      if (input.reserveRowIds !== undefined) {
+        validateCount(input.reserveRowIds.count);
+        const key = `${ROW_ID_PREFIX}${input.reserveRowIds.tableId}`;
+        const currentRowId = (await requestResult(catalog.get(key))) as bigint | undefined;
+        const start = currentRowId ?? 1n;
+        const endExclusive = start + BigInt(input.reserveRowIds.count);
+        catalog.put(endExclusive, key);
+        rowIds = { start, endExclusive };
+      }
+      await transactionDone(transaction);
+      return { record: structuredClone(record), ...(rowIds === undefined ? {} : { rowIds }) };
+    } catch (error) {
+      abortIfActive(transaction);
+      await ignoreAbort(transaction);
+      throw error;
+    }
   }
 
   async createTransaction(record: TransactionRecord): Promise<void> {

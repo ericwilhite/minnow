@@ -508,6 +508,18 @@ export interface TransactionRecordUpdate {
   committedVersion?: number | null;
 }
 
+export interface BeginTransactionInput {
+  /** Record to create; the store stamps `snapshotVersion` with the current manifest version. */
+  record: Omit<TransactionRecord, "snapshotVersion">;
+  /** Reserve this many row ids for the table in the same atomic step. */
+  reserveRowIds?: { tableId: string; count: number };
+}
+
+export interface BeginTransactionResult {
+  record: TransactionRecord;
+  rowIds?: RowIdRange;
+}
+
 export interface StageTransactionArtifactsInput {
   transactionId: string;
   expectedRevision: number;
@@ -663,6 +675,12 @@ export interface BlockStore {
   ): Promise<StoragePage<Manifest, number>>;
   publishManifest(input: PublishManifestInput): Promise<Manifest>;
   createTransaction(record: TransactionRecord): Promise<void>;
+  /**
+   * Optional: reads the current manifest version, creates the transaction record pinned to it,
+   * and optionally reserves row ids, all in one atomic storage transaction — one round trip
+   * instead of three. Callers fall back to the individual calls when this is absent.
+   */
+  beginTransaction?(input: BeginTransactionInput): Promise<BeginTransactionResult>;
   getTransaction(id: string): Promise<TransactionRecord | undefined>;
   getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>>;
   listTransactions(): Promise<TransactionRecord[]>;
