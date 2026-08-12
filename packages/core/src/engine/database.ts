@@ -92,6 +92,7 @@ import {
   type PreparedQuery,
   type QueryResult,
   type QueryRow,
+  type QueryValue,
   type SqlColumnSchema,
 } from "./query.js";
 import {
@@ -109,6 +110,7 @@ import {
   type SchemaDefinition,
 } from "./schema.js";
 import {
+  columnarTableFromRows,
   createColumnarTable,
   type ColumnarTable,
   type ColumnVector,
@@ -1991,59 +1993,64 @@ export class MinnowDatabase {
         segmentsByTable,
       };
       const baseSegments = await this.#visibleSegmentRecords(baseTable, snapshot, visibility);
-      const scanSegments = baseSegments.filter((segment) => {
-        const kind = segment.kind ?? "insert";
-        return kind === "insert" || kind === "base";
-      });
-      const mutationSegments = baseSegments.filter(
-        (segment) => segment.kind === "update" || segment.kind === "delete",
+      const baseView = this.#streamedViewFactory(
+        baseTable,
+        projectedBaseColumns,
+        baseSegments,
+        snapshot,
       );
-      // Upsert segments interleave new rows into slot order at their segment position, so those
-      // histories keep the materialized path (compaction folds them into full-row base segments).
-      if (scanSegments.length + mutationSegments.length !== baseSegments.length) return undefined;
-      const streamedKeyColumn = getUniqueKeyColumn(baseTable);
-      if (mutationSegments.length > 0) {
-        if (streamedKeyColumn === undefined) return undefined;
-        // The key replay is block-driven over every segment, so the key column must have blocks
-        // wherever rows exist; older histories without that shape keep the materialized path.
-        const keyBlocksPresent = baseSegments.every(
-          (segment) =>
-            segment.rowCount === 0 ||
-            (segment.columnBlockIds[streamedKeyColumn.id]?.length ?? 0) > 0,
-        );
-        if (!keyBlocksPresent) return undefined;
+      if (baseView === undefined) return undefined;
+
+      // A single unordered/ungrouped inner equi-join whose build side is too big to materialize
+      // executes as a partitioned hash join: each pass keeps one hash partition of the build
+      // rows resident and re-streams both inputs, so memory stays bounded by partition size.
+      const partitionedShape = partitionedJoinShape(plan);
+      if (partitionedShape !== undefined && options.executionMemoryBudgetBytes !== undefined) {
+        const buildTable = tables.find((table) => table.name === partitionedShape.buildTableName);
+        if (buildTable !== undefined) {
+          const requestedBuildColumns = columns.get(buildTable.name) ?? [];
+          const projectedBuildColumns =
+            requestedBuildColumns.length === 0
+              ? []
+              : resolveReadColumns(buildTable, requestedBuildColumns);
+          if (
+            projectedBuildColumns.some((column) => column.name === partitionedShape.buildKeyName)
+          ) {
+            const buildSegments = await this.#visibleSegmentRecords(
+              buildTable,
+              snapshot,
+              visibility,
+            );
+            const buildView = this.#streamedViewFactory(
+              buildTable,
+              projectedBuildColumns,
+              buildSegments,
+              snapshot,
+            );
+            const budget = options.executionMemoryBudgetBytes;
+            const estimate = estimatedColumnarBytes(buildSegments, projectedBuildColumns);
+            if (buildView !== undefined && estimate > budget / 4) {
+              return this.#runPartitionedJoin(
+                plan,
+                budget,
+                estimate,
+                baseView,
+                buildView,
+                buildTable.name,
+                partitionedShape.buildKeyName,
+              );
+            }
+          }
+        }
       }
-      // A projected column absent from an older segment reads as NULL through the materialized
-      // null-fill; the streaming loader is block-driven, so those plans keep the materialized path.
-      const columnsPresent = projectedBaseColumns.every((column) =>
-        scanSegments.every((segment) => segment.columnBlockIds[column.id] !== undefined),
-      );
-      if (!columnsPresent) return undefined;
-      const rowCount = scanSegments.reduce((total, segment) => total + segment.rowCount, 0);
+
       const runStreamedExecution = async (attempt: {
         spill: boolean;
       }): Promise<QueryResult | undefined> => {
         const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
         let prepared: PreparedQuery | undefined;
         try {
-          const streamed =
-            mutationSegments.length > 0 && streamedKeyColumn !== undefined
-              ? await this.#createStreamedMutationTable(
-                  baseTable,
-                  streamedKeyColumn,
-                  projectedBaseColumns,
-                  baseSegments,
-                  snapshot,
-                  memory,
-                )
-              : this.#createStreamedTable(
-                  baseTable,
-                  projectedBaseColumns,
-                  scanSegments,
-                  snapshot,
-                  rowCount,
-                  memory,
-                );
+          const streamed = await baseView.create(memory);
           const inputTables = new Map<string, ColumnarTable>([[baseTable.name, streamed.table]]);
           for (const table of tables) {
             if (table.name === baseTable.name) continue;
@@ -2090,6 +2097,191 @@ export class MinnowDatabase {
       }
       return runStreamedExecution({ spill: true });
     });
+  }
+
+  /**
+   * Checks a table's visible history for streamed-scan eligibility and returns a factory that
+   * builds a fresh forward-only streamed view per attempt or pass. Append/base histories stream
+   * directly; update/delete keyed histories stream through the mutation replay; histories with
+   * upsert segments (which interleave new rows into slot order at their segment position) and
+   * shapes whose blocks cannot back a block-driven loader return undefined so the caller keeps
+   * the materialized path.
+   */
+  #streamedViewFactory(
+    table: TableRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+  ):
+    | {
+        create: (memory: QueryMemoryContext) => Promise<{
+          table: ColumnarTable;
+          load: (start: number, length: number) => Promise<void>;
+        }>;
+      }
+    | undefined {
+    const scanSegments = segments.filter((segment) => {
+      const kind = segment.kind ?? "insert";
+      return kind === "insert" || kind === "base";
+    });
+    const mutationSegments = segments.filter(
+      (segment) => segment.kind === "update" || segment.kind === "delete",
+    );
+    if (scanSegments.length + mutationSegments.length !== segments.length) return undefined;
+    const keyColumn = getUniqueKeyColumn(table);
+    if (mutationSegments.length > 0) {
+      if (keyColumn === undefined) return undefined;
+      // The key replay is block-driven over every segment, so the key column must have blocks
+      // wherever rows exist; older histories without that shape keep the materialized path.
+      const keyBlocksPresent = segments.every(
+        (segment) =>
+          segment.rowCount === 0 || (segment.columnBlockIds[keyColumn.id]?.length ?? 0) > 0,
+      );
+      if (!keyBlocksPresent) return undefined;
+    }
+    // A projected column absent from an older segment reads as NULL through the materialized
+    // null-fill; the streaming loader is block-driven, so those plans keep the materialized path.
+    const columnsPresent = projectedColumns.every((column) =>
+      scanSegments.every((segment) => segment.columnBlockIds[column.id] !== undefined),
+    );
+    if (!columnsPresent) return undefined;
+    const scanRowCount = scanSegments.reduce((total, segment) => total + segment.rowCount, 0);
+    return {
+      create: async (memory: QueryMemoryContext) =>
+        mutationSegments.length > 0 && keyColumn !== undefined
+          ? this.#createStreamedMutationTable(
+              table,
+              keyColumn,
+              projectedColumns,
+              segments,
+              snapshot,
+              memory,
+            )
+          : this.#createStreamedTable(
+              table,
+              projectedColumns,
+              scanSegments,
+              snapshot,
+              scanRowCount,
+              memory,
+            ),
+    };
+  }
+
+  /**
+   * Executes a single unordered/ungrouped inner equi-join whose build side is too big to
+   * materialize under the budget. Grace-style partition-by-rescan: pass i re-streams the build
+   * table and keeps resident only rows whose join-key hash falls in partition i (about one
+   * P-th of the build, reserved as usual), then runs the unchanged plan against a fresh
+   * streamed base scan. Equal keys share a partition, so each inner match occurs in exactly
+   * one pass and the union of pass results is the join; build rows with NULL or NaN keys can
+   * never match and drop at partition time. Row order across passes is implementation-defined,
+   * like any unordered query. The rescans trade time for bounded memory; the decoded-block
+   * cache keeps repeat decodes cheap.
+   */
+  async #runPartitionedJoin(
+    plan: CompiledQuery,
+    budgetBytes: number,
+    estimatedBuildBytes: number,
+    baseView: {
+      create: (memory: QueryMemoryContext) => Promise<{
+        table: ColumnarTable;
+        load: (start: number, length: number) => Promise<void>;
+      }>;
+    },
+    buildView: {
+      create: (memory: QueryMemoryContext) => Promise<{
+        table: ColumnarTable;
+        load: (start: number, length: number) => Promise<void>;
+      }>;
+    },
+    buildTableName: string,
+    buildKeyName: string,
+  ): Promise<QueryResult> {
+    // One partition should fit in an eighth of the budget: the resident partition briefly
+    // exists twice (boxed rows, then their vectors) and shares the budget with both streamed
+    // windows and the accumulating result.
+    let partitions = 2;
+    while (partitions < 64 && estimatedBuildBytes / partitions > budgetBytes / 8) partitions *= 2;
+    const { limit, offset, ...strippedPlan } = plan;
+    const wantedRows = (offset ?? 0) + (limit ?? Number.POSITIVE_INFINITY);
+    const root = new QueryMemoryContext(budgetBytes);
+    try {
+      const combined: QueryRow[] = [];
+      for (let partition = 0; partition < partitions; partition += 1) {
+        if (combined.length >= wantedRows) break;
+        const passMemory = root.createChild();
+        let prepared: PreparedQuery | undefined;
+        try {
+          // The boxed rows live only until their vectors are built; a nested context releases
+          // them so each partition is charged once while the pass executes.
+          const collectMemory = passMemory.createChild();
+          const buildScanMemory = collectMemory.createChild();
+          const build = await buildView.create(buildScanMemory);
+          let buildRows: DatabaseRow[] = [];
+          const buildColumns = [...build.table.columns.entries()];
+          // Small steps keep the collection windows a minor budget term next to the resident
+          // partition itself.
+          const step = 1_024;
+          for (let start = 0; start < build.table.rowCount; start += step) {
+            const length = Math.min(step, build.table.rowCount - start);
+            await build.load(start, length);
+            const keyVector = build.table.columns.get(buildKeyName);
+            if (keyVector === undefined) {
+              throw new Error(`Join key column is missing: ${buildTableName}.${buildKeyName}`);
+            }
+            for (let row = start; row < start + length; row += 1) {
+              const key = columnVectorValueAt(keyVector, row);
+              if (key === null || (typeof key === "number" && Number.isNaN(key))) continue;
+              if (joinPartitionOf(key, partitions) !== partition) continue;
+              const buildRow: DatabaseRow = {};
+              for (const [name, vector] of buildColumns) {
+                buildRow[name] = columnVectorValueAt(vector, row);
+              }
+              collectMemory.tally(
+                estimateRowBytes(buildRow) + 2 * QUERY_ROW_OVERHEAD_BYTES,
+                "Partitioned join build rows",
+              );
+              buildRows.push(buildRow);
+            }
+          }
+          buildScanMemory.close();
+          if (buildRows.length === 0) {
+            collectMemory.close();
+            continue;
+          }
+          const buildInput = columnarTableFromRows(buildTableName, buildRows);
+          buildRows = [];
+          const streamedBase = await baseView.create(passMemory);
+          const inputTables = new Map<string, ColumnarTable>([
+            [buildTableName, buildInput],
+            [streamedBase.table.name, streamedBase.table],
+          ]);
+          prepared = createPreparedColumnarQuery(strippedPlan, inputTables, passMemory);
+          collectMemory.close();
+          const result = await prepared.executeAsync({ loadScanWindow: streamedBase.load });
+          for (const row of result.rows) {
+            if (combined.length >= wantedRows) break;
+            root.tally(
+              estimateRowBytes(row) + QUERY_ROW_OVERHEAD_BYTES,
+              "Partitioned join result rows",
+            );
+            combined.push(row);
+          }
+        } finally {
+          prepared?.close();
+          passMemory.close();
+        }
+      }
+      const startRow = offset ?? 0;
+      const rows =
+        startRow > 0 || limit !== undefined
+          ? combined.slice(startRow, limit === undefined ? undefined : startRow + limit)
+          : combined;
+      return { columns: plan.select.map((item) => item.alias), rows };
+    } finally {
+      root.close();
+    }
   }
 
   /**
@@ -6428,6 +6620,117 @@ function copyColumnVectorValue(
     targetDictionaryIndex.set(value, targetCode);
   }
   target.codes[targetRow] = targetCode;
+}
+
+/** Rough per-row bookkeeping overhead used when tallying retained row objects. */
+const QUERY_ROW_OVERHEAD_BYTES = 16;
+
+/** Reads one value from a (possibly windowed) column vector as a query value. */
+function columnVectorValueAt(vector: ColumnVector, rowIndex: number): QueryValue {
+  const window = vector.window;
+  let slot = rowIndex;
+  if (window !== undefined) {
+    slot = rowIndex - window.start;
+    if (slot < 0 || slot >= window.length) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+  }
+  if (!bitmapHasValue(vector.validity, slot)) return null;
+  if (vector.kind === "boolean") return vector.values[slot] === 1;
+  if (vector.kind === "number") return vector.values[slot] ?? 0;
+  if (vector.kind === "datetime") return new Date(vector.values[slot] ?? 0);
+  const code = vector.codes[slot] ?? NULL_STRING_VECTOR_CODE;
+  return code === NULL_STRING_VECTOR_CODE ? null : (vector.dictionary[code] ?? null);
+}
+
+const joinHashScratch = new DataView(new ArrayBuffer(8));
+
+/**
+ * Hash-partitions a join key so values the executor's equi-join treats as equal share a
+ * partition: datetimes hash as their epoch milliseconds exactly like numbers (the executor
+ * compares them coerced), -0 folds to 0, and strings hash their UTF-16 code units. The
+ * partition count is a power of two.
+ */
+function joinPartitionOf(value: Exclude<QueryValue, null>, partitions: number): number {
+  let hash = 0x811c9dc5;
+  const mix = (word: number): void => {
+    hash = Math.imul(hash ^ word, 0x01000193) >>> 0;
+  };
+  if (typeof value === "string") {
+    for (let index = 0; index < value.length; index += 1) mix(value.charCodeAt(index));
+    mix(0x53);
+  } else if (typeof value === "boolean") {
+    mix(value ? 1 : 0);
+    mix(0x42);
+  } else {
+    const numeric = value instanceof Date ? value.getTime() : value;
+    joinHashScratch.setFloat64(0, numeric === 0 ? 0 : numeric, true);
+    mix(joinHashScratch.getUint32(0, true));
+    mix(joinHashScratch.getUint32(4, true));
+    mix(0x4e);
+  }
+  // Multiplicative mixing only propagates input variation toward high bits (small integers as
+  // float64 vary in no low word bits at all), so a final avalanche folds the high bits back
+  // down before the low-bit partition mask.
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x85ebca6b) >>> 0;
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 0xc2b2ae35) >>> 0;
+  hash ^= hash >>> 16;
+  return (hash >>> 0) & (partitions - 1);
+}
+
+/**
+ * Detects the partitioned-join eligible shape: exactly one inner equi-join with no ON residue,
+ * ungrouped and unordered (grouped joins need partial aggregation, ordered joins a final
+ * re-sort pass), non-wildcard select, and both join sides written as qualified bare columns —
+ * one resolving to the joined table (the build side) and one to the base.
+ */
+function partitionedJoinShape(
+  plan: CompiledQuery,
+): { buildTableName: string; buildKeyName: string } | undefined {
+  const join = plan.joins[0];
+  if (plan.joins.length !== 1 || join === undefined) return undefined;
+  if (join.kind !== "inner" || join.on !== undefined) return undefined;
+  if (compiledPlanIsGrouped(plan) || plan.orderBy.length > 0) return undefined;
+  if (plan.select.some((item) => item.expression.kind === "wildcard")) return undefined;
+  const buildNames = new Set([join.table, join.alias]);
+  const baseNames = new Set([plan.base.table, plan.base.alias]);
+  const sideOf = (expression: Expression): "build" | "base" | undefined => {
+    if (expression.kind !== "column") return undefined;
+    const parts = expression.reference.split(".");
+    if (parts.length !== 2) return undefined;
+    if (buildNames.has(parts[0] ?? "")) return "build";
+    if (baseNames.has(parts[0] ?? "")) return "base";
+    return undefined;
+  };
+  const leftSide = sideOf(join.left);
+  const rightSide = sideOf(join.right);
+  const buildExpression =
+    leftSide === "build" && rightSide === "base"
+      ? join.left
+      : leftSide === "base" && rightSide === "build"
+        ? join.right
+        : undefined;
+  if (buildExpression?.kind !== "column") return undefined;
+  const buildKeyName = buildExpression.reference.split(".")[1] ?? "";
+  if (buildKeyName.length === 0) return undefined;
+  return { buildTableName: join.table, buildKeyName };
+}
+
+/** Crude resident-size guess used only to pick a strategy; reservations gate real memory. */
+function estimatedColumnarBytes(
+  segments: readonly SegmentRecord[],
+  columns: readonly TableColumnRecord[],
+): number {
+  let rows = 0;
+  for (const segment of segments) {
+    const kind = segment.kind ?? "insert";
+    if (kind === "insert" || kind === "base") rows += segment.rowCount;
+  }
+  let rowWidth = 0;
+  for (const column of columns) rowWidth += column.type === "string" ? 32 : 8;
+  return rows * Math.max(rowWidth, 1);
 }
 
 function columnVectorKeyToken(type: SimpleDataType, vector: ColumnVector, row: number): string {

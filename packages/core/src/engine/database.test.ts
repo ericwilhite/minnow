@@ -14,6 +14,7 @@ import {
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { TransactionManager } from "../transactions/index.js";
 import { QueryMemoryBudgetError } from "./memory.js";
+import type { QueryRow } from "./query.js";
 import {
   attachLifecycleFlush,
   MinnowDatabase,
@@ -5012,6 +5013,151 @@ for (const implementation of [
         );
       }
     }
+    store.close();
+  });
+
+  it(`${implementation.name} partitions an inner join whose build side exceeds the budget`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 1_024 });
+    await database.createTable({
+      name: "build_side",
+      columns: [
+        { name: "id", type: "number", nullable: true },
+        { name: "payload", type: "string" },
+      ],
+    });
+    await database.createTable({
+      name: "probe_side",
+      uniqueKey: "pid",
+      columns: [
+        { name: "pid", type: "number" },
+        { name: "build_id", type: "number" },
+        { name: "score", type: "number" },
+      ],
+    });
+    // 30k build rows: every third id duplicated (fanout), some null keys (never match), payloads
+    // distinct so sorted comparisons are total.
+    const buildCount = 30_000;
+    await database.insertBatch("build_side", {
+      columns: {
+        id: Array.from({ length: buildCount }, (_, index) =>
+          index % 97 === 0 ? null : index % 3 === 0 ? index - (index % 2) : index,
+        ),
+        payload: Array.from(
+          { length: buildCount },
+          (_, index) => `payload-${String(index).padStart(6, "0")}-${"x".repeat(24)}`,
+        ),
+      },
+    });
+    // 4k probe rows referencing build ids, including misses beyond the build range.
+    const probeCount = 4_000;
+    await database.insertBatch("probe_side", {
+      columns: {
+        pid: Array.from({ length: probeCount }, (_, index) => index),
+        build_id: Array.from({ length: probeCount }, (_, index) => (index * 7) % 40_000),
+        score: Array.from({ length: probeCount }, (_, index) => index % 100),
+      },
+    });
+    const sql =
+      "SELECT p.pid AS pid, j.payload AS payload, p.score AS score " +
+      "FROM probe_side p JOIN build_side j ON p.build_id = j.id WHERE p.score >= 25";
+    const expected = await database.query(sql);
+    const probe = await database.prepareQuery(sql);
+    const budget = probe.memoryUsage.peakBytes - 1;
+    probe.close();
+    // The materialized path genuinely cannot prepare under this budget...
+    await expect(
+      database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
+    ).rejects.toThrow(QueryMemoryBudgetError);
+    // ...while the partitioned join returns the same multiset (row order across partitions is
+    // implementation-defined, like any unordered query).
+    const budgeted = await database.query(sql, { executionMemoryBudgetBytes: budget });
+    const sorted = (rows: QueryRow[]) =>
+      rows
+        .slice()
+        .sort(
+          (left, right) =>
+            Number(left.pid) - Number(right.pid) ||
+            String(left.payload).localeCompare(String(right.payload)),
+        );
+    expect(budgeted.columns).toEqual(expected.columns);
+    expect(sorted(budgeted.rows)).toEqual(sorted(expected.rows));
+    expect(budgeted.rows.length).toBeGreaterThan(0);
+
+    // LIMIT under the budget returns exactly that many rows, all from the expected multiset.
+    const limited = await database.query(`${sql} LIMIT 40`, {
+      executionMemoryBudgetBytes: budget,
+    });
+    expect(limited.rows).toHaveLength(40);
+    const expectedKeys = new Set(
+      expected.rows.map((row) => `${String(row.pid)}|${String(row.payload)}`),
+    );
+    for (const row of limited.rows) {
+      expect(expectedKeys.has(`${String(row.pid)}|${String(row.payload)}`)).toBe(true);
+    }
+
+    // An ordered join is outside the partitioned slice and keeps today's budget failure.
+    await expect(
+      database.query(`${sql} ORDER BY pid`, { executionMemoryBudgetBytes: budget }),
+    ).rejects.toThrow(QueryMemoryBudgetError);
+    store.close();
+  });
+
+  it(`${implementation.name} partitions a join over a build side with mutation history`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 512 });
+    await database.createTable({
+      name: "dim",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    await database.createTable({
+      name: "fact",
+      uniqueKey: "fid",
+      columns: [
+        { name: "fid", type: "number" },
+        { name: "dim_id", type: "number" },
+      ],
+    });
+    const dimCount = 12_000;
+    await database.insertBatch("dim", {
+      columns: {
+        id: Array.from({ length: dimCount }, (_, index) => index),
+        label: Array.from(
+          { length: dimCount },
+          (_, index) => `dim-${String(index)}-${"y".repeat(20)}`,
+        ),
+      },
+    });
+    const relabeled = Array.from({ length: 300 }, (_, index) => index * 11);
+    await database.updateBatch("dim", {
+      keys: relabeled,
+      changes: { label: relabeled.map((key) => `relabeled-${String(key)}`) },
+    });
+    await database.deleteBatch("dim", {
+      keys: Array.from({ length: 150 }, (_, index) => 6_000 + index * 5),
+    });
+    await database.insertBatch("fact", {
+      columns: {
+        fid: Array.from({ length: 3_000 }, (_, index) => index),
+        dim_id: Array.from({ length: 3_000 }, (_, index) => (index * 13) % 13_000),
+      },
+    });
+    const sql = "SELECT f.fid AS fid, d.label AS label FROM fact f JOIN dim d ON f.dim_id = d.id";
+    const expected = await database.query(sql);
+    const probe = await database.prepareQuery(sql);
+    const budget = probe.memoryUsage.peakBytes - 1;
+    probe.close();
+    await expect(
+      database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
+    ).rejects.toThrow(QueryMemoryBudgetError);
+    const budgeted = await database.query(sql, { executionMemoryBudgetBytes: budget });
+    const byFid = (rows: QueryRow[]) =>
+      rows.slice().sort((left, right) => Number(left.fid) - Number(right.fid));
+    expect(byFid(budgeted.rows)).toEqual(byFid(expected.rows));
     store.close();
   });
 

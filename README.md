@@ -253,6 +253,11 @@ queries keep the materialized path. Under an explicit budget the streaming path 
 8A zone-map pruning, so a pruned-eligible predicate reads more blocks than the pruned path would in
 exchange for the bounded working set.
 
+A single unordered/ungrouped inner equi-join whose build side is too big to materialize under the
+budget executes as a partitioned hash join: each pass keeps one hash partition of the build rows
+resident (about a P-th of the build side, reserved as usual) and re-streams both inputs, so equal
+keys meet in exactly one pass and memory stays bounded by partition size at the cost of P rescans.
+
 Phase 7E-C extends the same scan window to the probe side of joined plans. The base table streams
 while every join build side is materialized in full at the same leased snapshot, including keyed
 mutation replay on a build table. A self-join keeps the materialized path because the base table

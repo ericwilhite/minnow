@@ -693,12 +693,21 @@ larger/repeated benchmark tiers remain outstanding.
       segments keep the materialized path because upsert-new rows interleave into slot order at
       their segment position (compaction folds upserts into full-row base segments, so the
       restriction shrinks over a table's lifecycle).
-- [ ] Spill hash-join build sides. Design sketch (2026-08-11): partition the build rows by
-      join-key hash into the existing value-carrying spill pages and probe partition by
-      partition — the same shape as the partitioned hash-aggregate spill, reusing its page
-      format and owner leases. The build table must avoid full materialization at prepare, so
-      the partitioning belongs at the database layer like the streamed scan; slots behind
-      `executionMemoryBudgetBytes`, unbudgeted plans keep the materialized path.
+- [x] Partition oversized hash-join build sides (2026-08-12). Implemented as
+      partition-by-rescan rather than the sketched spill pages, with the same bounded-memory
+      guarantee and no new persistent format: for a single unordered/ungrouped inner equi-join
+      whose build side's size estimate exceeds a quarter of the budget, each of P passes
+      (power of two sized so a partition fits in an eighth of the budget, capped at 64)
+      re-streams the build table keeping resident only rows whose avalanche-mixed join-key hash
+      falls in the pass's partition, then runs the unchanged plan against a fresh streamed base
+      scan. Equal keys share a partition, so each inner match occurs in exactly one pass;
+      NULL/NaN build keys drop at partition time; datetimes hash as their epoch milliseconds so
+      coerced equality keeps partitions aligned; LIMIT/OFFSET strip per pass and re-apply after
+      early-stopping collection. Both inputs stream through the existing block-aligned windows
+      (mutation histories included), the decoded-block cache keeps the P rescans cheap, and row
+      order across passes is implementation-defined like any unordered query. Grouped joins
+      await partial aggregation (Phase 9), ordered joins a final re-sort pass, and left joins a
+      per-pass probe-ownership filter.
 - [x] Add SELECT DISTINCT, HAVING, IN, uncorrelated subqueries, CTEs, derived tables,
       UNION/UNION ALL, and ROW_NUMBER/RANK/DENSE_RANK windows to the SQL surface.
 - [x] Add SQL mutations through execute() with keyed read-then-mutate semantics.
