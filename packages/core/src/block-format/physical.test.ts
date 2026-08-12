@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildPhysicalColumnFromRanges,
   concatenatePhysicalColumns,
+  crc32,
   decodeBlock,
   decodeColumn,
   decodePhysicalBlock,
@@ -15,6 +16,13 @@ import {
   validatePhysicalColumn,
 } from "./index.js";
 import type { ColumnInput, Compression, LogicalType, PhysicalColumnPayload } from "./index.js";
+
+/** Recomputes the block envelope checksum after a test mutates header or metadata bytes. */
+function resignEnvelope(block: Uint8Array): void {
+  const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  const metadataLength = view.getUint32(24, true);
+  view.setUint32(4, crc32(block.subarray(8, 40 + metadataLength)), true);
+}
 
 const columns: ColumnInput[] = [
   {
@@ -237,17 +245,25 @@ it("preserves canonical null counts and numeric metadata in physical block heade
   expect(decoded.column.nullCount).toBe(1);
   expect(decoded.column.metadata.zoneMap).toEqual({ min: -4, max: 8 });
 
+  // Raw header corruption is caught by the envelope checksum before any field is trusted.
+  const unsignedCorruption = new Uint8Array(block);
+  new DataView(unsignedCorruption.buffer).setUint32(20, 2, true);
+  await expect(decodePhysicalBlock(unsignedCorruption)).rejects.toThrow("envelope checksum");
+
+  // A consistently re-signed wrong header still fails the payload cross-checks on decode.
   const wrongNullCount = new Uint8Array(block);
-  new DataView(wrongNullCount.buffer).setUint32(16, 2, true);
+  new DataView(wrongNullCount.buffer).setUint32(20, 2, true);
+  resignEnvelope(wrongNullCount);
   await expect(decodePhysicalBlock(wrongNullCount)).rejects.toThrow("null count");
 
   const wrongMetadata = new Uint8Array(block);
   const description = decoded.description;
-  const metadataLength = wrongMetadata.byteLength - 36 - description.storedLength;
-  const metadata = new TextDecoder().decode(wrongMetadata.subarray(36, 36 + metadataLength));
+  const metadataLength = wrongMetadata.byteLength - 40 - description.storedLength;
+  const metadata = new TextDecoder().decode(wrongMetadata.subarray(40, 40 + metadataLength));
   const maxCharacter = metadata.lastIndexOf("8");
   expect(maxCharacter).toBeGreaterThanOrEqual(0);
-  wrongMetadata[36 + maxCharacter] = "9".charCodeAt(0);
+  wrongMetadata[40 + maxCharacter] = "9".charCodeAt(0);
+  resignEnvelope(wrongMetadata);
   await expect(decodePhysicalBlock(wrongMetadata)).rejects.toThrow("metadata");
 });
 

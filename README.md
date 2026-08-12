@@ -18,8 +18,10 @@ Numeric widths and physical encodings are storage details, not schema choices ex
 
 ## Library write API
 
-The library can now save real tables and column-based batches. A table uses only the four data types
-above. Inserts validate column names, row counts, null values, and value types before writing.
+The library can now save real tables and batches of rows. A table uses only the four data types
+above. Inserts take an array of row objects — or, for bulk loads that already hold columns, a
+`{ columns }` batch — and validate column names, row counts, null values, and value types before
+writing.
 
 ```ts
 const database = new MinnowDatabase(store);
@@ -34,21 +36,15 @@ await database.createTable({
   ],
 });
 
-const result = await database.insertBatch("people", {
-  columns: {
-    name: ["Ada", "Grace"],
-    score: [10, 20],
-    joined: [new Date(), null],
-  },
-});
+const result = await database.insertBatch("people", [
+  { name: "Ada", score: 10, joined: new Date() },
+  { name: "Grace", score: 20 },
+]);
 
-await database.upsertBatch("people", {
-  columns: {
-    name: ["Grace", "Katherine"],
-    score: [25, 30],
-    joined: [new Date(), new Date()],
-  },
-});
+await database.upsertBatch("people", [
+  { name: "Grace", score: 25, joined: new Date() },
+  { name: "Katherine", score: 30, joined: new Date() },
+]);
 
 await database.updateBatch("people", {
   keys: ["Grace", "Katherine"],
@@ -192,8 +188,9 @@ needed to recover the live-row count. The executor still materializes result row
 
 Phase 7B-A adds a deliberately scoped query-memory model. `query()` and `prepareQuery()` accept
 `executionMemoryBudgetBytes`; prepared queries expose `{ budgetBytes, usedBytes, peakBytes }` through
-`memoryUsage`. The model reserves retained typed-vector payloads (including validity, codes, and UTF-8
-dictionary bytes), join row indexes, scan row-index batches, selection/build arrays, and chunked join
+`memoryUsage`. The model reserves retained typed-vector payloads (including validity, codes, and
+dictionary string bytes, accounted at one byte per UTF-16 code unit), join row indexes, scan
+row-index batches, selection/build arrays, and chunked join
 fan-out buffers. A reservation that would exceed the configured budget throws
 `QueryMemoryBudgetError`; typed executor buffers reserve before allocation, and logical group/result
 state reserves before it is retained by the operator. Temporary reservations are released after each

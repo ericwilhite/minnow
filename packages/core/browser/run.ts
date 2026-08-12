@@ -141,9 +141,11 @@ window.runTransactionBrowserTest = async () => {
     name: "events",
     columns: [{ name: "happened", type: "datetime" }],
   });
-  const batch = await database.insertBatch("people", {
-    columns: { name: ["Ada", "Grace", "Linus"], score: [10, 20, 30] },
-  });
+  const batch = await database.insertBatch("people", [
+    { name: "Ada", score: 10 },
+    { name: "Grace", score: 20 },
+    { name: "Linus", score: 30 },
+  ]);
   const aggregateSql = "SELECT COUNT(*) AS count, SUM(score) AS total FROM people";
   const preparedPeople = await database.prepareQuery(aggregateSql);
   const prunedNames = (

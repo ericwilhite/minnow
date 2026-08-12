@@ -15,8 +15,28 @@ import type {
 } from "./types.js";
 
 const MAGIC = Uint8Array.of(0x42, 0x52, 0x44, 0x42);
-const VERSION = 0;
-const HEADER_LENGTH = 36;
+/**
+ * Version 1 layout (all integers little-endian):
+ *
+ *    0  magic "BRDB"
+ *    4  envelope checksum: crc32 over bytes [8, headerLength + metadataLength)
+ *    8  format version (u16)
+ *   10  header length (u16)
+ *   12  logical type id (u8), 13 physical encoding id (u8), 14 codec id (u8), 15 flags (u8)
+ *   16  row count (u32)
+ *   20  null count (u32)
+ *   24  metadata length (u32)
+ *   28  encoded length (u32)
+ *   32  stored length (u32)
+ *   36  payload checksum: crc32 over the uncompressed encoded payload
+ *
+ * The envelope checksum authenticates every header field and the metadata JSON, so header-only
+ * reads (zone-map pruning, block inventories) can trust derived statistics without paying the
+ * decompress-and-revalidate cost of the payload.
+ */
+const VERSION = 1;
+const HEADER_LENGTH = 40;
+const ENVELOPE_CHECKSUM_START = 8;
 const MAX_BLOCK_LENGTH = MAX_PHYSICAL_COLUMN_BYTE_LENGTH;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -70,7 +90,7 @@ export async function encodeBlock(
     {
       type: input.type,
       rowCount: input.values.length,
-      nullCount: input.values.filter((value) => value === null).length,
+      nullCount: encoded.nullCount,
       bytes: encoded.bytes,
       metadata: encoded.metadata,
     },
@@ -99,20 +119,25 @@ async function encodeValidatedPhysicalBlock(
   const output = new Uint8Array(HEADER_LENGTH + metadata.byteLength + stored.byteLength);
   output.set(MAGIC);
   const view = new DataView(output.buffer);
-  view.setUint16(4, VERSION, true);
-  view.setUint16(6, HEADER_LENGTH, true);
-  view.setUint8(8, typeIds[input.type]);
-  view.setUint8(9, typeIds[input.type]); // physical encoding v0 mirrors the logical type
-  view.setUint8(10, codecIds[compression]);
-  view.setUint8(11, 0);
-  view.setUint32(12, input.rowCount, true);
-  view.setUint32(16, input.nullCount, true);
-  view.setUint32(20, metadata.byteLength, true);
-  view.setUint32(24, input.bytes.byteLength, true);
-  view.setUint32(28, stored.byteLength, true);
-  view.setUint32(32, crc32(input.bytes), true);
+  view.setUint16(8, VERSION, true);
+  view.setUint16(10, HEADER_LENGTH, true);
+  view.setUint8(12, typeIds[input.type]);
+  view.setUint8(13, typeIds[input.type]); // the physical encoding mirrors the logical type
+  view.setUint8(14, codecIds[compression]);
+  view.setUint8(15, 0);
+  view.setUint32(16, input.rowCount, true);
+  view.setUint32(20, input.nullCount, true);
+  view.setUint32(24, metadata.byteLength, true);
+  view.setUint32(28, input.bytes.byteLength, true);
+  view.setUint32(32, stored.byteLength, true);
+  view.setUint32(36, crc32(input.bytes), true);
   output.set(metadata, HEADER_LENGTH);
   output.set(stored, HEADER_LENGTH + metadata.byteLength);
+  view.setUint32(
+    4,
+    crc32(output.subarray(ENVELOPE_CHECKSUM_START, HEADER_LENGTH + metadata.byteLength)),
+    true,
+  );
   return output;
 }
 
@@ -160,29 +185,35 @@ export function inspectBlock(bytes: Uint8Array): BlockDescription {
   if (bytes.byteLength < HEADER_LENGTH) throw new Error("Truncated block header");
   if (!MAGIC.every((byte, index) => bytes[index] === byte)) throw new Error("Invalid block magic");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const formatVersion = view.getUint16(4, true);
+  const formatVersion = view.getUint16(8, true);
   if (formatVersion !== VERSION) {
     throw new Error(`Unsupported block version ${String(formatVersion)}`);
   }
-  if (view.getUint16(6, true) !== HEADER_LENGTH) throw new Error("Invalid block header length");
-  const type = typesById.get(view.getUint8(8));
-  if (type === undefined) throw new Error("Unknown logical type");
-  if (view.getUint8(9) !== typeIds[type]) throw new Error("Unsupported physical encoding");
-  const compression = codecsById.get(view.getUint8(10));
-  if (compression === undefined) throw new Error("Unknown compression codec");
-  if (view.getUint8(11) !== 0) throw new Error("Unsupported mandatory block flags");
-  const rowCount = view.getUint32(12, true);
-  const nullCount = view.getUint32(16, true);
-  if (nullCount > rowCount) throw new Error("Null count exceeds row count");
-  const metadataLength = view.getUint32(20, true);
-  const encodedLength = view.getUint32(24, true);
-  const storedLength = view.getUint32(28, true);
+  if (view.getUint16(10, true) !== HEADER_LENGTH) throw new Error("Invalid block header length");
+  const metadataLength = view.getUint32(24, true);
+  const encodedLength = view.getUint32(28, true);
+  const storedLength = view.getUint32(32, true);
   assertLength(metadataLength, "metadata");
   assertLength(encodedLength, "encoded payload");
   assertLength(storedLength, "stored payload");
   if (HEADER_LENGTH + metadataLength + storedLength !== bytes.byteLength) {
     throw new Error("Block length mismatch");
   }
+  // Verified before any header field is trusted: the envelope checksum covers every field after
+  // itself plus the metadata JSON, making header-only reads safe against silent corruption.
+  const envelope = crc32(bytes.subarray(ENVELOPE_CHECKSUM_START, HEADER_LENGTH + metadataLength));
+  if (envelope !== view.getUint32(4, true)) {
+    throw new Error("Block envelope checksum mismatch");
+  }
+  const type = typesById.get(view.getUint8(12));
+  if (type === undefined) throw new Error("Unknown logical type");
+  if (view.getUint8(13) !== typeIds[type]) throw new Error("Unsupported physical encoding");
+  const compression = codecsById.get(view.getUint8(14));
+  if (compression === undefined) throw new Error("Unknown compression codec");
+  if (view.getUint8(15) !== 0) throw new Error("Unsupported mandatory block flags");
+  const rowCount = view.getUint32(16, true);
+  const nullCount = view.getUint32(20, true);
+  if (nullCount > rowCount) throw new Error("Null count exceeds row count");
   let parsedMetadata: unknown;
   try {
     parsedMetadata = JSON.parse(
@@ -200,7 +231,7 @@ export function inspectBlock(bytes: Uint8Array): BlockDescription {
     nullCount,
     encodedLength,
     storedLength,
-    checksum: view.getUint32(32, true),
+    checksum: view.getUint32(36, true),
     metadata,
   };
 }

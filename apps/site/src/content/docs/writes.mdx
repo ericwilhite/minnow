@@ -1,12 +1,12 @@
 ---
 title: Writes & transactions
-description: Typed mutations, column batches, buffered writers, and maintenance.
+description: Typed mutations, batch writes, buffered writers, and maintenance.
 ---
 
 # Writes & transactions
 
 <p class="lede">
-  Two layers, one pipeline: typed mutation builders on top, column batches underneath. Every write
+  Two layers, one pipeline: typed mutation builders on top, batch writes underneath. Every write
   validates before it stores anything, and published data is never edited in place.
 </p>
 
@@ -76,25 +76,19 @@ await database.createTable({
 
 ## Batch writes
 
-Columns in, one commit out. Inserts validate names, types, nulls, and row counts before anything
-is stored:
+Rows in, one commit out. Inserts validate names, types, nulls, and row counts before anything is
+stored:
 
 ```ts
-const result = await database.insertBatch("people", {
-  columns: {
-    name: ["Ada", "Grace"],
-    score: [10, 20],
-    joined: [new Date(), null],
-  },
-});
+const result = await database.insertBatch("people", [
+  { name: "Ada", score: 10, joined: new Date() },
+  { name: "Grace", score: 20 }, // nullable columns can be left out
+]);
 
-await database.upsertBatch("people", {
-  columns: {
-    name: ["Grace", "Katherine"],
-    score: [25, 30],
-    joined: [new Date(), new Date()],
-  },
-});
+await database.upsertBatch("people", [
+  { name: "Grace", score: 25, joined: new Date() },
+  { name: "Katherine", score: 30, joined: new Date() },
+]);
 
 await database.updateBatch("people", {
   keys: ["Grace", "Katherine"],
@@ -107,8 +101,30 @@ await database.deleteBatch("people", { keys: ["Ada"] });
 - **`upsertBatch`** updates rows matching the unique key and inserts the rest.
 - **`updateBatch`** writes only the key and the changed columns; missing keys are rejected.
 - **`deleteBatch`** deletes by unique key.
+- A column no row mentions is an error, not a null fill — omitting `score` entirely fails with
+  `Missing column: score`. Leaving it out of _some_ rows writes null there, which a non-nullable
+  column rejects.
 - Every result carries metrics: rows, blocks, bytes, timings, retries, rows per second, write
   amplification.
+
+### The columnar form
+
+The engine stores columns, so `insertBatch` and `upsertBatch` also take a batch that is already
+pivoted. It skips building a row object per row — worth it for bulk loads, and for data that
+arrives as columns already:
+
+```ts
+await database.insertBatch("people", {
+  columns: {
+    name: ["Ada", "Grace"],
+    score: [10, 20],
+    joined: [new Date(), null],
+  },
+});
+```
+
+Every column must be present and every array the same length; there is no padding here. Both
+forms take the same validation and the same commit path.
 
 ## Reading tables
 

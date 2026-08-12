@@ -2,6 +2,8 @@ import type { BlockMetadata, ColumnInput, DecodedColumn, LogicalType } from "./t
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
+// The on-disk format is little-endian; bulk Float64 writes use platform order when they match.
+const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 
 function bitmapLength(rows: number): number {
   return Math.ceil(rows / 8);
@@ -16,16 +18,22 @@ function hasBit(bitmap: Uint8Array, index: number): boolean {
   return ((bitmap[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0;
 }
 
-export function encodeColumn(input: ColumnInput): { bytes: Uint8Array; metadata: BlockMetadata } {
+export function encodeColumn(input: ColumnInput): {
+  bytes: Uint8Array;
+  metadata: BlockMetadata;
+  nullCount: number;
+} {
   // Index loops throughout: forEach/map skip holes in sparse arrays, which would desynchronize
   // the validity bitmap from the value payload and persist a corrupt block. A hole reads as
   // undefined and is rejected like any other non-value.
   const rowCount = input.values.length;
   const validity = new Uint8Array(bitmapLength(rowCount));
+  let nullCount = 0;
   for (let index = 0; index < rowCount; index += 1) {
     const value = input.values[index];
     if (value === undefined) throw new TypeError("Column values cannot be undefined");
     if (value !== null) setBit(validity, index);
+    else nullCount += 1;
   }
 
   switch (input.type) {
@@ -34,27 +42,28 @@ export function encodeColumn(input: ColumnInput): { bytes: Uint8Array; metadata:
       for (let index = 0; index < rowCount; index += 1) {
         if (input.values[index] === true) setBit(values, index);
       }
-      return { bytes: join(validity, values), metadata: {} };
+      return { bytes: join(validity, values), metadata: {}, nullCount };
     }
     case "number": {
-      const buffer = new ArrayBuffer(rowCount * Float64Array.BYTES_PER_ELEMENT);
-      const view = new DataView(buffer);
+      const values = new Float64Array(rowCount);
+      const view = PLATFORM_LITTLE_ENDIAN ? undefined : new DataView(values.buffer);
       let min = Number.POSITIVE_INFINITY;
       let max = Number.NEGATIVE_INFINITY;
       for (let index = 0; index < rowCount; index += 1) {
         const value = input.values[index];
         if (value === null || value === undefined) continue;
         if (!Number.isFinite(value)) throw new TypeError("Number values must be finite");
-        view.setFloat64(index * 8, value, true);
+        if (view === undefined) values[index] = value;
+        else view.setFloat64(index * 8, value, true);
         min = Math.min(min, value);
         max = Math.max(max, value);
       }
       const metadata = min === Number.POSITIVE_INFINITY ? {} : { zoneMap: { min, max } };
-      return { bytes: join(validity, new Uint8Array(buffer)), metadata };
+      return { bytes: join(validity, new Uint8Array(values.buffer)), metadata, nullCount };
     }
     case "datetime": {
-      const buffer = new ArrayBuffer(rowCount * Float64Array.BYTES_PER_ELEMENT);
-      const view = new DataView(buffer);
+      const values = new Float64Array(rowCount);
+      const view = PLATFORM_LITTLE_ENDIAN ? undefined : new DataView(values.buffer);
       let min = Number.POSITIVE_INFINITY;
       let max = Number.NEGATIVE_INFINITY;
       for (let index = 0; index < rowCount; index += 1) {
@@ -63,37 +72,37 @@ export function encodeColumn(input: ColumnInput): { bytes: Uint8Array; metadata:
         const milliseconds = value.getTime();
         if (!Number.isFinite(milliseconds))
           throw new TypeError("Datetime values must be valid Dates");
-        view.setFloat64(index * 8, milliseconds, true);
+        if (view === undefined) values[index] = milliseconds;
+        else view.setFloat64(index * 8, milliseconds, true);
         min = Math.min(min, milliseconds);
         max = Math.max(max, milliseconds);
       }
       const metadata = min === Number.POSITIVE_INFINITY ? {} : { zoneMap: { min, max } };
-      return { bytes: join(validity, new Uint8Array(buffer)), metadata };
+      return { bytes: join(validity, new Uint8Array(values.buffer)), metadata, nullCount };
     }
     case "string": {
-      const encoded: Array<Uint8Array | null> = new Array<Uint8Array | null>(rowCount).fill(null);
-      let contentLength = 0;
+      // Every value UTF-8-encodes once, directly into a shared worst-case scratch (three bytes
+      // per UTF-16 code unit bounds any UTF-8 expansion) instead of allocating a throwaway
+      // buffer per string and copying it into place afterwards.
+      let capacity = 0;
       for (let index = 0; index < rowCount; index += 1) {
         const value = input.values[index];
-        if (value === null || value === undefined) continue;
-        const bytes = textEncoder.encode(value);
-        encoded[index] = bytes;
-        contentLength += bytes.byteLength;
+        if (value !== null && value !== undefined) capacity += value.length * 3;
       }
       const offsets = new Uint32Array(rowCount + 1);
-      const content = new Uint8Array(contentLength);
+      const content = new Uint8Array(capacity);
       let offset = 0;
       for (let index = 0; index < rowCount; index += 1) {
-        const bytes = encoded[index];
-        if (bytes !== null && bytes !== undefined) {
-          content.set(bytes, offset);
-          offset += bytes.byteLength;
+        const value = input.values[index];
+        if (value !== null && value !== undefined) {
+          offset += textEncoder.encodeInto(value, content.subarray(offset)).written;
         }
         offsets[index + 1] = offset;
       }
       return {
-        bytes: join(validity, new Uint8Array(offsets.buffer), content),
+        bytes: join(validity, new Uint8Array(offsets.buffer), content.subarray(0, offset)),
         metadata: {},
+        nullCount,
       };
     }
   }

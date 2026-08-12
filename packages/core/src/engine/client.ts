@@ -16,6 +16,7 @@ import {
   protocolVersion,
   type SerializedError,
 } from "../worker-protocol/index.js";
+import { toColumnarBatch, type BatchRow, type InsertBatchInput } from "./batch.js";
 import type {
   BatchValue,
   BufferedFlushResult,
@@ -34,7 +35,6 @@ import type {
   ExecuteResult,
   GarbageCollectionProgress,
   GarbageCollectionResult,
-  InsertBatchInput,
   InsertBatchResult,
   QueryOptions,
   QuerySpillCleanupOptions,
@@ -212,24 +212,22 @@ export class MinnowDatabaseClient {
   }
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
-    return (await this.#call("insertBatch", [tableName, input])) as InsertBatchResult;
+    // Pivoted here rather than in the worker: the columnar form is the cheaper structured clone,
+    // and it keeps the worker protocol's payload shape the same whichever form the caller used.
+    const batch = toColumnarBatch(input);
+    return (await this.#call("insertBatch", [tableName, batch])) as InsertBatchResult;
   }
 
-  async insert(
-    tableName: string,
-    row: Readonly<Record<string, BatchValue>>,
-  ): Promise<InsertBatchResult> {
+  async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
     return (await this.#call("insert", [tableName, row])) as InsertBatchResult;
   }
 
   async upsertBatch(tableName: string, input: InsertBatchInput): Promise<UpsertBatchResult> {
-    return (await this.#call("upsertBatch", [tableName, input])) as UpsertBatchResult;
+    const batch = toColumnarBatch(input);
+    return (await this.#call("upsertBatch", [tableName, batch])) as UpsertBatchResult;
   }
 
-  async upsert(
-    tableName: string,
-    row: Readonly<Record<string, BatchValue>>,
-  ): Promise<UpsertBatchResult> {
+  async upsert(tableName: string, row: BatchRow): Promise<UpsertBatchResult> {
     return (await this.#call("upsert", [tableName, row])) as UpsertBatchResult;
   }
 

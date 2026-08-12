@@ -1,4 +1,11 @@
 import {
+  toColumnarBatch,
+  type BatchRow,
+  type BatchValue,
+  type ColumnarBatch,
+  type InsertBatchInput,
+} from "./batch.js";
+import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
@@ -109,7 +116,6 @@ import {
   type VectorWindow,
 } from "./vector.js";
 
-const sizeTextEncoder = new TextEncoder();
 // The on-disk format is little-endian; the bulk Float64 copy reads platform order.
 const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -123,6 +129,8 @@ const DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION = 16;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 const INTERNAL_READ_LEASE_TTL_MS = 60_000;
+/** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
+const PLAN_CACHE_LIMIT = 512;
 
 type PhysicalCompactionRewritePlan = RechunkCompactionRewritePlan | MergeCompactionRewritePlan;
 
@@ -190,11 +198,7 @@ export interface CreateTableInput {
   uniqueKey?: string;
 }
 
-export type BatchValue = boolean | number | string | Date | null;
-
-export interface InsertBatchInput {
-  columns: Readonly<Record<string, readonly BatchValue[]>>;
-}
+export type { BatchRow, BatchValue, ColumnarBatch, InsertBatchInput } from "./batch.js";
 
 export interface InsertBatchResult {
   tableName: string;
@@ -521,6 +525,13 @@ export class MinnowDatabase {
   /** Insertion order doubles as LRU order; hits re-insert their entry. */
   readonly #prepareCache = new Map<string, { payload: unknown; bytes: number }>();
   #prepareCacheUsedBytes = 0;
+  /**
+   * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
+   * optimization — subquery resolution and CTE expansion clone before rewriting and join
+   * reordering spreads into fresh objects — so a hit shares the cached plan across executions
+   * and skips tokenize/parse/optimize entirely.
+   */
+  readonly #planCache = new Map<string, CompiledQuery>();
   readonly #visibilityFingerprints = new WeakMap<SegmentVisibilityCatalog, Map<string, string>>();
   #sharedLease: SharedLeaseEntry | undefined;
   #sharedLeaseRenewal: Promise<void> | undefined;
@@ -610,9 +621,10 @@ export class MinnowDatabase {
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
     const table = await this.#findTable(tableName);
-    const rowCount = validateBatch(table, input);
-    const keys = batchKeys(table, input);
-    const result = await this.#writeBatch(table, input, "insert", keys);
+    const batch = toColumnarBatch(input);
+    const rowCount = validateBatch(table, batch);
+    const keys = batchKeys(table, batch);
+    const result = await this.#writeBatch(table, batch, "insert", keys);
     return {
       tableName: result.tableName,
       segmentId: result.segmentId,
@@ -624,11 +636,8 @@ export class MinnowDatabase {
     };
   }
 
-  async insert(
-    tableName: string,
-    row: Readonly<Record<string, BatchValue>>,
-  ): Promise<InsertBatchResult> {
-    return this.insertBatch(tableName, rowToBatch(row));
+  async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
+    return this.insertBatch(tableName, [row]);
   }
 
   async upsertBatch(tableName: string, input: InsertBatchInput): Promise<UpsertBatchResult> {
@@ -637,18 +646,16 @@ export class MinnowDatabase {
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
     }
-    const rowCount = validateBatch(table, input);
-    const keys = batchKeys(table, input);
+    const batch = toColumnarBatch(input);
+    const rowCount = validateBatch(table, batch);
+    const keys = batchKeys(table, batch);
     if (keys === undefined) throw new Error("Unique key metadata is missing");
-    const result = await this.#writeBatch(table, input, "upsert", keys);
+    const result = await this.#writeBatch(table, batch, "upsert", keys);
     return { ...result, rowCount };
   }
 
-  async upsert(
-    tableName: string,
-    row: Readonly<Record<string, BatchValue>>,
-  ): Promise<UpsertBatchResult> {
-    return this.upsertBatch(tableName, rowToBatch(row));
+  async upsert(tableName: string, row: BatchRow): Promise<UpsertBatchResult> {
+    return this.upsertBatch(tableName, [row]);
   }
 
   async updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult> {
@@ -963,7 +970,7 @@ export class MinnowDatabase {
 
   async #writeBatch(
     table: TableRecord,
-    input: InsertBatchInput,
+    input: ColumnarBatch,
     kind: "insert" | "upsert",
     keys: Map<string, Exclude<BatchValue, null>> | undefined,
   ): Promise<UpsertBatchResult> {
@@ -1114,7 +1121,23 @@ export class MinnowDatabase {
    * Repeated execute() calls measure query execution without including storage I/O.
    */
   async prepareQuery(sql: string, options: QueryOptions = {}): Promise<PreparedQuery> {
-    return this.#prepareCompiledPlan(compileQuery(sql), options);
+    return this.#prepareCompiledPlan(this.#compileCached(sql), options);
+  }
+
+  #compileCached(sql: string): CompiledQuery {
+    const cached = this.#planCache.get(sql);
+    if (cached !== undefined) {
+      this.#planCache.delete(sql);
+      this.#planCache.set(sql, cached);
+      return cached;
+    }
+    const plan = compileQuery(sql);
+    this.#planCache.set(sql, plan);
+    if (this.#planCache.size > PLAN_CACHE_LIMIT) {
+      const oldest = this.#planCache.keys().next().value;
+      if (oldest !== undefined) this.#planCache.delete(oldest);
+    }
+    return plan;
   }
 
   async #prepareCompiledPlan(
@@ -1488,12 +1511,12 @@ export class MinnowDatabase {
       options.spillPageRows === undefined
         ? undefined
         : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
-    const plan = compileQuery(sql);
+    const plan = this.#compileCached(sql);
     if (this.#canStreamPlanShape(plan, options)) {
       const streamed = await this.#queryStreamed(plan, options, spillPageRows);
       if (streamed !== undefined) return streamed;
     }
-    const prepared = await this.prepareQuery(sql, options);
+    const prepared = await this.#prepareCompiledPlan(plan, options);
     try {
       const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
       if (!spill) return prepared.execute();
@@ -1609,7 +1632,7 @@ export class MinnowDatabase {
         currentVersion: () => this.store.getCurrentManifestVersion(),
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
         dependencyTableIds: async (query) => {
-          const plan = typeof query === "string" ? compileQuery(query) : query.plan;
+          const plan = typeof query === "string" ? this.#compileCached(query) : query.plan;
           const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
@@ -1712,7 +1735,7 @@ export class MinnowDatabase {
    * the prepared execution would choose, without executing it.
    */
   async explain(sql: string): Promise<string> {
-    const plan = compileQuery(sql);
+    const plan = this.#compileCached(sql);
     const notes: string[] = [];
     if (this.#canStreamPlanShape(plan, { executionMemoryBudgetBytes: 1 })) {
       notes.push("eligible to stream the base scan through resident block windows under a budget");
@@ -4918,7 +4941,7 @@ export class MinnowDatabase {
       return undefined;
     }
     const storedBlocks = new Map<string, Uint8Array>();
-    const decodedPredicateBlocks = new Map<string, DecodedPhysicalBlock>();
+    const predicateBlockDescriptions = new Map<string, ReturnType<typeof inspectBlock>>();
     const predicateBlockIds = [
       ...new Set(
         segments.flatMap((segment) =>
@@ -4930,21 +4953,15 @@ export class MinnowDatabase {
       await this.#renewInternalLeaseIfNeeded(snapshot);
       const ids = predicateBlockIds.slice(start, start + 16);
       const blocks = await this.store.getBlocks(ids);
-      const decoded = await Promise.all(
-        blocks.map(async (bytes, index) => {
-          const id = ids[index] ?? "";
-          if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-          return decodePhysicalBlock(bytes);
-        }),
-      );
       for (let index = 0; index < ids.length; index += 1) {
         const id = ids[index] ?? "";
         const bytes = blocks[index];
-        const physical = decoded[index];
         if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-        if (physical === undefined) throw new Error(`Visible block is missing: ${id}`);
         storedBlocks.set(id, bytes);
-        decodedPredicateBlocks.set(id, physical);
+        // Header and metadata only: zone-map elimination must not pay the decompress,
+        // checksum, and payload-validation cost of blocks it is about to discard. The
+        // surviving blocks are decoded (and fully verified) during materialization.
+        predicateBlockDescriptions.set(id, inspectBlock(bytes));
       }
     }
 
@@ -4969,9 +4986,8 @@ export class MinnowDatabase {
         let canMatch = true;
         for (const predicate of predicates) {
           const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
-          const decoded = decodedPredicateBlocks.get(blockId);
-          if (decoded === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-          const { description } = decoded;
+          const description = predicateBlockDescriptions.get(blockId);
+          if (description === undefined) throw new Error(`Visible block is missing: ${blockId}`);
           if (description.type !== predicate.column.type) {
             throw new Error(`Column type mismatch: ${predicate.column.name}`);
           }
@@ -5023,7 +5039,6 @@ export class MinnowDatabase {
           candidateRowCount,
           storedBlocks,
           expectedRows,
-          decodedPredicateBlocks,
         ),
       );
     }
@@ -5099,7 +5114,6 @@ export class MinnowDatabase {
     rowCount: number,
     storedBlocks?: Map<string, Uint8Array>,
     expectedRows?: ReadonlyMap<string, number>,
-    decodedPhysicalBlocks?: ReadonlyMap<string, DecodedPhysicalBlock>,
   ): Promise<ColumnVector> {
     const validity = new Uint8Array(Math.ceil(rowCount / 8));
     const values =
@@ -5126,35 +5140,50 @@ export class MinnowDatabase {
       for (let start = 0; start < blockIds.length; start += 16) {
         await this.#renewInternalLeaseIfNeeded(snapshot);
         const ids = blockIds.slice(start, start + 16);
-        let blocks: Array<Uint8Array | undefined>;
-        if (storedBlocks === undefined) {
-          blocks = await this.store.getBlocks(ids);
-        } else {
-          const uncachedIds = ids.filter((id) => !storedBlocks.has(id));
-          const uncachedBlocks =
-            uncachedIds.length === 0 ? [] : await this.store.getBlocks(uncachedIds);
-          for (let index = 0; index < uncachedIds.length; index += 1) {
-            const id = uncachedIds[index] ?? "";
-            const bytes = uncachedBlocks[index];
-            if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-            storedBlocks.set(id, bytes);
+        // Block content is immutable, so the decoded physical form caches by id alone: after a
+        // commit changes the visible segment set (which invalidates every assembled vector
+        // fingerprint), the unchanged blocks skip the store fetch, decompression, checksum,
+        // and payload validation, and re-preparation only pays vector assembly.
+        const decodedBlocks = new Array<DecodedPhysicalBlock | undefined>(ids.length);
+        const pendingIndexes: number[] = [];
+        const fetchIds: string[] = [];
+        for (let index = 0; index < ids.length; index += 1) {
+          const id = ids[index] ?? "";
+          const cached = this.#cacheGet(`dpb\u0000${id}`) as DecodedPhysicalBlock | undefined;
+          if (cached !== undefined) {
+            decodedBlocks[index] = cached;
+            continue;
           }
-          blocks = ids.map((id) => storedBlocks.get(id));
+          pendingIndexes.push(index);
+          if (storedBlocks?.has(id) !== true) fetchIds.push(id);
         }
-        const decodedBlocks = await Promise.all(
-          blocks.map(async (bytes, index) => {
-            const blockId = ids[index] ?? "";
-            if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-            const decoded =
-              decodedPhysicalBlocks?.get(blockId) ?? (await decodePhysicalBlock(bytes));
-            const expected = expectedRows?.get(blockId);
-            if (expected !== undefined && decoded.column.rowCount !== expected) {
-              throw new Error(`Column block row count mismatch: ${column.name}`);
-            }
-            return decoded;
-          }),
-        );
-        for (const decoded of decodedBlocks) {
+        const bytesById = storedBlocks ?? new Map<string, Uint8Array>();
+        if (fetchIds.length > 0) {
+          const fetched = await this.store.getBlocks(fetchIds);
+          for (let index = 0; index < fetchIds.length; index += 1) {
+            const id = fetchIds[index] ?? "";
+            const bytes = fetched[index];
+            if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+            bytesById.set(id, bytes);
+          }
+        }
+        for (const index of pendingIndexes) {
+          const id = ids[index] ?? "";
+          const bytes = bytesById.get(id);
+          if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+          const decoded = await decodePhysicalBlock(bytes);
+          this.#cachePut(`dpb\u0000${id}`, decoded, bytes.byteLength);
+          decodedBlocks[index] = decoded;
+        }
+        for (let index = 0; index < decodedBlocks.length; index += 1) {
+          const decoded = decodedBlocks[index];
+          if (decoded === undefined) {
+            throw new Error(`Visible block is missing: ${ids[index] ?? ""}`);
+          }
+          const expected = expectedRows?.get(ids[index] ?? "");
+          if (expected !== undefined && decoded.column.rowCount !== expected) {
+            throw new Error(`Column block row count mismatch: ${column.name}`);
+          }
           if (decoded.column.type !== column.type) {
             throw new Error(`Column type mismatch: ${column.name}`);
           }
@@ -5421,11 +5450,10 @@ export class BufferedTableWriter {
     this.#clearTimer();
     const rows = this.#rows.splice(0);
     this.#estimatedBytes = 0;
-    const batch = rowsToBatch(rows);
     const operation =
       this.#mode === "upsert"
-        ? this.database.upsertBatch(this.tableName, batch)
-        : this.database.insertBatch(this.tableName, batch);
+        ? this.database.upsertBatch(this.tableName, rows)
+        : this.database.insertBatch(this.tableName, rows);
     this.#inFlight = operation;
     try {
       return await operation;
@@ -5520,7 +5548,7 @@ function validateName(name: string, kind: string): string {
   return trimmed;
 }
 
-function validateBatch(table: TableRecord, input: InsertBatchInput): number {
+function validateBatch(table: TableRecord, input: ColumnarBatch): number {
   const expected = new Set(table.columns.map((column) => column.name));
   for (const name of Object.keys(input.columns)) {
     if (!expected.has(name)) throw new TypeError(`Unknown column: ${name}`);
@@ -5618,7 +5646,7 @@ function getUniqueKeyColumn(table: TableRecord): TableColumnRecord | undefined {
 
 function batchKeys(
   table: TableRecord,
-  input: InsertBatchInput,
+  input: ColumnarBatch,
 ): Map<string, Exclude<BatchValue, null>> | undefined {
   const keyColumn = getUniqueKeyColumn(table);
   if (keyColumn === undefined) return undefined;
@@ -7224,7 +7252,7 @@ function estimateRowBytes(row: Readonly<Record<string, BatchValue>>): number {
   return estimateValuesBytes(Object.values(row));
 }
 
-function estimateBatchBytes(input: InsertBatchInput): number {
+function estimateBatchBytes(input: ColumnarBatch): number {
   return Object.values(input.columns).reduce(
     (total, values) => total + estimateValuesBytes(values),
     0,
@@ -7234,7 +7262,10 @@ function estimateBatchBytes(input: InsertBatchInput): number {
 function estimateValuesBytes(values: readonly BatchValue[]): number {
   let bytes = 0;
   for (const value of values) {
-    if (typeof value === "string") bytes += 4 + sizeTextEncoder.encode(value).byteLength;
+    // One byte per UTF-16 code unit approximates the UTF-8 payload (exact for ASCII) without
+    // encoding the string just to measure it — this estimate feeds metrics and flush
+    // thresholds, not the physical format.
+    if (typeof value === "string") bytes += 4 + value.length;
     else if (typeof value === "number" || value instanceof Date) bytes += 8;
     else bytes += 1;
   }
@@ -7265,21 +7296,6 @@ function createWriteMetrics(input: {
     totalMs: input.totalMs,
     retries: input.retries,
     rowsPerSecond: input.rows / Math.max(input.totalMs / 1_000, 0.000_001),
-  };
-}
-
-function rowsToBatch(rows: ReadonlyArray<Readonly<Record<string, BatchValue>>>): InsertBatchInput {
-  const names = new Set(rows.flatMap((row) => Object.keys(row)));
-  return {
-    columns: Object.fromEntries(
-      [...names].map((name) => [name, rows.map((row) => Reflect.get(row, name))]),
-    ),
-  };
-}
-
-function rowToBatch(row: Readonly<Record<string, BatchValue>>): InsertBatchInput {
-  return {
-    columns: Object.fromEntries(Object.entries(row).map(([name, value]) => [name, [value]])),
   };
 }
 

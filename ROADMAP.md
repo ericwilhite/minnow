@@ -64,6 +64,24 @@ medians were unchanged and repeated same-statement prepares fell to millisecond 
 executor now backs the public subset; memory-accounted execution, statistics, broader SQL, and
 cost-based optimization remain planned in Phases 7–13.
 
+A 2026-08-11 optimization pass (measured with a Node/vite-node micro-benchmark over
+`MemoryBlockStore` at 200k rows — not browser evidence; the reference suite should be re-captured
+before publishing numbers) reworked the hot paths without changing the public API. Query memory
+accounting drops its per-row reservation objects and per-string UTF-8 encodes in favor of an
+aggregated tally at one byte per UTF-16 code unit; the same estimate now backs write metrics'
+logical bytes. A 512-statement LRU plan cache removes the double SQL compile per `query()`. The
+block format moved to version 1, whose envelope checksum authenticates the header and metadata
+JSON, letting zone-map pruning trust statistics header-only instead of decompressing and
+revalidating predicate blocks it is about to discard. Decoded physical blocks now cache by
+immutable block id inside the `prepareCacheBytes` budget, so a commit that invalidates every
+assembled-vector fingerprint re-pays vector assembly but not fetch/decompress/validate. Result
+projection builds rows by direct property assignment, ORDER BY extracts sort keys once per row and
+shares one `Intl.Collator`, the raw codec no longer copies in either direction, string encode
+writes through `encodeInto` into a single content buffer, and the row-to-column pivot reads each
+row object once. Micro-benchmark medians: ordered scans and wide string projections 3–6× faster,
+repeated filtered queries up to 10× faster, single-batch insert throughput about 2× (322k to
+~650k rows/s), and post-commit re-preparation ~25% faster with zero store reads.
+
 Initial matrix:
 
 - compressed block targets: 256 KiB, 512 KiB, 1 MiB, 2 MiB, 4 MiB;

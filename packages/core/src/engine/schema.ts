@@ -1,4 +1,5 @@
 import { type TableColumnRecord, type TableRecord } from "../storage/index.js";
+import { type BatchRow } from "./batch.js";
 
 /**
  * Typed schema DSL and catalog migration planning. Column builders carry compile-time value and
@@ -328,14 +329,8 @@ type UniqueKeyValue<TTable extends AnyTable> = {
 type ColumnArrays<TShape> = { [K in keyof TShape]: ReadonlyArray<TShape[K]> };
 
 interface TypedTableDatabase {
-  insertBatch(
-    tableName: string,
-    input: { columns: Readonly<Record<string, readonly unknown[]>> },
-  ): Promise<unknown>;
-  upsertBatch(
-    tableName: string,
-    input: { columns: Readonly<Record<string, readonly unknown[]>> },
-  ): Promise<unknown>;
+  insertBatch(tableName: string, rows: readonly BatchRow[]): Promise<unknown>;
+  upsertBatch(tableName: string, rows: readonly BatchRow[]): Promise<unknown>;
   updateBatch(
     tableName: string,
     input: {
@@ -369,12 +364,16 @@ export function typedTable<TTable extends AnyTable>(
   rows(): Promise<Array<InferRow<TTable>>>;
 } {
   const columnNames = Object.keys(definition.columns);
-  const pivot = (rows: ReadonlyArray<Record<string, unknown>>) =>
-    Object.fromEntries(columnNames.map((name) => [name, rows.map((row) => row[name] ?? null)]));
+  // Pads every schema column, so omitting a nullable one is an explicit null rather than a
+  // "Missing column" error from the engine.
+  const pad = (rows: ReadonlyArray<Record<string, unknown>>): BatchRow[] =>
+    rows.map(
+      (row) => Object.fromEntries(columnNames.map((name) => [name, row[name] ?? null])) as BatchRow,
+    );
   return {
     definition,
-    insert: (rows) => database.insertBatch(definition.name, { columns: pivot(rows) }),
-    upsert: (rows) => database.upsertBatch(definition.name, { columns: pivot(rows) }),
+    insert: (rows) => database.insertBatch(definition.name, pad(rows)),
+    upsert: (rows) => database.upsertBatch(definition.name, pad(rows)),
     update: (input) =>
       database.updateBatch(definition.name, {
         keys: input.keys,

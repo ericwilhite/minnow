@@ -125,6 +125,9 @@ new MinnowDatabase(store: BlockStore, options?: MinnowDatabaseOptions)
 
 `MinnowDatabaseOptions` covers `compression`, `rowsPerBlock`, `maxCommitRetries`,
 `spillOwnerLeaseMs`, `prepareCacheBytes`, and deterministic seams (`now`, `createId`).
+`prepareCacheBytes` (default 64 MiB) bounds one shared LRU holding assembled column vectors,
+decoded blocks, zone-pruned projections, and derived-block results, and `0` disables it; compiled
+SQL plans are cached separately by statement text.
 
 | Group      | Methods                                                                                                                    |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------- |

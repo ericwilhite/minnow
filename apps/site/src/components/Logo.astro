@@ -50,16 +50,37 @@ const droplets = [
   {
     water && (
       <defs>
-        <clipPath id="minnow-water-clip">
-          <rect x="0" y="0" width="72" height="56" rx="3" />
-        </clipPath>
+        {/* Fade the water out at the sides and toward the bottom, so it reads as
+            open water rather than a tank. Luminance mask: white keeps, black cuts. */}
+        <linearGradient id="minnow-fade-x" x1="0" y1="0" x2="72" y2="0" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#000" />
+          <stop offset="0.22" stop-color="#fff" />
+          <stop offset="0.78" stop-color="#fff" />
+          <stop offset="1" stop-color="#000" />
+        </linearGradient>
+        <linearGradient id="minnow-fade-y" x1="0" y1="26" x2="0" y2="56" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#fff" />
+          <stop offset="0.45" stop-color="#fff" />
+          <stop offset="1" stop-color="#000" />
+        </linearGradient>
+        <mask id="minnow-water-clip" maskUnits="userSpaceOnUse" x="0" y="0" width="72" height="56">
+          <rect x="0" y="0" width="72" height="56" fill="url(#minnow-fade-x)" />
+          <rect
+            x="0"
+            y="0"
+            width="72"
+            height="56"
+            fill="url(#minnow-fade-y)"
+            style="mix-blend-mode:multiply"
+          />
+        </mask>
       </defs>
     )
   }
 
   {
     water && (
-      <g class="water-back" clip-path="url(#minnow-water-clip)">
+      <g class="water-back" mask="url(#minnow-water-clip)">
         <g class="wave wave-back">
           <path d={wave(28.5, -3, -1)} />
         </g>
@@ -91,7 +112,7 @@ const droplets = [
 
   {
     water && (
-      <g class="water-front" clip-path="url(#minnow-water-clip)">
+      <g class="water-front" mask="url(#minnow-water-clip)">
         <g class="splash">
           {droplets.map((d) => (
             <circle

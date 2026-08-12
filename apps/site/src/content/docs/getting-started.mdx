@@ -85,17 +85,14 @@ Two things are true of every write:
 
 ## The SQL and batch layer
 
-The builders compile onto raw SQL and column batches. Use that layer directly for bulk loads and
+The builders compile onto raw SQL and batch writes. Use that layer directly for bulk loads and
 ad-hoc SQL:
 
 ```ts
-await database.insertBatch("people", {
-  columns: {
-    name: ["Katherine", "Linus"],
-    score: [30, 25],
-    joined: [new Date(), null],
-  },
-});
+await database.insertBatch("people", [
+  { name: "Katherine", score: 30, joined: new Date() },
+  { name: "Linus", score: 25 },
+]);
 
 const resultSet = await database.query(`
   SELECT score, COUNT(*) AS people

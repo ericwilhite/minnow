@@ -134,7 +134,7 @@ class GzipVariantCheckpointFaultMemoryBlockStore extends CheckpointFaultMemoryBl
     }
     const variant = new Uint8Array(bytes);
     const view = new DataView(variant.buffer, variant.byteOffset, variant.byteLength);
-    const storedOffset = 36 + view.getUint32(20, true);
+    const storedOffset = 40 + view.getUint32(24, true);
     if (variant[storedOffset] !== 0x1f || variant[storedOffset + 1] !== 0x8b) {
       throw new Error("Expected a gzip compaction payload");
     }
@@ -705,6 +705,57 @@ for (const implementation of implementations()) {
       expect(bytes).toBeDefined();
       if (bytes !== undefined)
         expect((await decodeBlock(bytes)).column.values).toEqual(["Ada", "Grace"]);
+      store.close();
+    });
+
+    it("inserts and upserts an array of rows", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "people",
+        uniqueKey: "name",
+        columns: [
+          { name: "name", type: "string" },
+          { name: "score", type: "number" },
+          { name: "joined", type: "datetime", nullable: true },
+        ],
+      });
+      const joined = new Date("2026-01-01");
+      const result = await database.insertBatch("people", [
+        { name: "Ada", score: 10, joined },
+        // A nullable column left out of a row is written as null, not rejected.
+        { name: "Grace", score: 20 },
+      ]);
+      expect(result).toMatchObject({ tableName: "people", rowCount: 2 });
+      expect(await database.readTable("people")).toEqual([
+        { name: "Ada", score: 10, joined },
+        { name: "Grace", score: 20, joined: null },
+      ]);
+
+      await database.upsertBatch("people", [
+        { name: "Grace", score: 25, joined },
+        { name: "Linus", score: 30, joined: null },
+      ]);
+      expect(await database.readTable("people")).toEqual([
+        { name: "Ada", score: 10, joined },
+        { name: "Grace", score: 25, joined },
+        { name: "Linus", score: 30, joined: null },
+      ]);
+
+      // A column no row mentions is still missing; one a row omits pads to null and then fails
+      // the column's own nullability check.
+      await expect(database.insertBatch("people", [{ name: "Katherine", joined }])).rejects.toThrow(
+        "Missing column: score",
+      );
+      await expect(
+        database.insertBatch("people", [
+          { name: "Katherine", score: 40, joined },
+          { name: "Barbara", joined },
+        ]),
+      ).rejects.toThrow("score[1] cannot be null");
+      await expect(database.insertBatch("people", [])).rejects.toThrow(
+        "A batch needs at least one row",
+      );
       store.close();
     });
 
@@ -4486,7 +4537,7 @@ it("does not round a binary write-amplification ratio up by one output byte", as
   };
 
   const belowStats = await seed("l2_binary_ratio_below");
-  expect(belowStats.storedBytes).toBe(200);
+  expect(belowStats.storedBytes).toBe(220);
   expect(
     await database.compactTable("l2_binary_ratio_below", {
       ...options,
@@ -4495,12 +4546,12 @@ it("does not round a binary write-amplification ratio up by one output byte", as
   ).toMatchObject({
     compacted: false,
     skipReason: "write-amplification-budget",
-    maximumOutputStoredBytes: 39,
-    plannedOutputStoredBytesUpperBound: 40,
+    maximumOutputStoredBytes: 43,
+    plannedOutputStoredBytesUpperBound: 44,
   });
 
   const exactStats = await seed("l2_binary_ratio_exact");
-  expect(exactStats.storedBytes).toBe(200);
+  expect(exactStats.storedBytes).toBe(220);
   expect(
     await database.compactTable("l2_binary_ratio_exact", {
       ...options,
@@ -4508,9 +4559,9 @@ it("does not round a binary write-amplification ratio up by one output byte", as
     }),
   ).toMatchObject({
     compacted: true,
-    maximumOutputStoredBytes: 40,
-    plannedOutputStoredBytesUpperBound: 40,
-    outputStoredBytes: 40,
+    maximumOutputStoredBytes: 44,
+    plannedOutputStoredBytesUpperBound: 44,
+    outputStoredBytes: 44,
   });
   store.close();
 });
@@ -4854,10 +4905,9 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
       "SELECT label FROM pruned_metrics WHERE DATE '2026-01-07' <= recordedAt ORDER BY label",
     ),
   ).toEqual({ columns: ["label"], rows: [{ label: "eight" }, { label: "seven" }] });
-  expect(store.blockIdsRead.flat()).toEqual([
-    ...(segment.columnBlockIds[recordedAtColumn.id] ?? []),
-    (segment.columnBlockIds[labelColumn.id] ?? [])[3],
-  ]);
+  // The surviving label block decoded during the first query is served from the decoded-block
+  // cache, so only the new predicate column's blocks reach the store.
+  expect(store.blockIdsRead.flat()).toEqual(segment.columnBlockIds[recordedAtColumn.id] ?? []);
 
   store.blockReadCalls = 0;
   store.blockIdsRead = [];
@@ -4865,7 +4915,9 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
     columns: ["score"],
     rows: [{ score: 7 }],
   });
-  expect(store.blockIdsRead.flat()).toHaveLength(8);
+  // Full scan over both columns (4 blocks each), minus the score and label blocks already in
+  // the decoded-block cache from the pruned queries above.
+  expect(store.blockIdsRead.flat()).toHaveLength(6);
   store.close();
 });
 

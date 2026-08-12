@@ -111,7 +111,15 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     const transaction = this.#transaction("blocks", "readwrite");
     const store = transaction.objectStore("blocks");
-    blocks.forEach((block) => store.add(new Uint8Array(block.bytes), block.id));
+    for (const block of blocks) {
+      // Structured clone serializes a view's entire underlying buffer, so only a partial view
+      // needs compacting first; a whole-buffer view clones exactly once inside add().
+      const bytes =
+        block.bytes.byteOffset === 0 && block.bytes.byteLength === block.bytes.buffer.byteLength
+          ? block.bytes
+          : block.bytes.slice();
+      store.add(bytes, block.id);
+    }
     await transactionDone(transaction);
   }
 
@@ -1437,8 +1445,10 @@ async function ignoreAbort(transaction: IDBTransaction): Promise<void> {
 }
 
 function asBytes(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return new Uint8Array(value);
-  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  // Every IndexedDB get deserializes a fresh, unshared value, so the bytes return without a
+  // defensive copy; wrapping an ArrayBuffer in a view is also zero-copy.
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
   throw new Error("Stored block is not binary data");
 }
 

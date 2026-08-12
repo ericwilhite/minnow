@@ -35,7 +35,8 @@ import {
 /**
  * Kysely-style mutation builders. `execute()` returns an array (one result object, or the
  * `returning(...)` rows); the idiomatic call is `executeTakeFirst()` / `executeTakeFirstOrThrow()`.
- * Inserts pivot into the engine's columnar batch APIs (`orReplace()` routes to the upsert path)
+ * Inserts pad their rows against the schema and hand them to the engine's batch APIs
+ * (`orReplace()` routes to the upsert path)
  * and `returning` echoes the written rows — faithful here because the engine has no defaults or
  * generated columns. Updates and deletes compile to the same mutation statements SQL produces and
  * run through the engine's read-keys-then-apply pipeline; their `returning` rows come back from
@@ -57,11 +58,11 @@ export interface DeleteResult {
 export interface MutationServices {
   insertBatch(
     tableName: string,
-    input: { columns: Readonly<Record<string, readonly QueryValue[]>> },
+    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
   ): Promise<{ rowCount: number }>;
   upsertBatch(
     tableName: string,
-    input: { columns: Readonly<Record<string, readonly QueryValue[]>> },
+    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
   ): Promise<{ rowCount: number }>;
   runStatement(
     statement: CompiledStatement,
@@ -170,12 +171,9 @@ export class InsertQueryBuilder<
     const padded = this.rows.map((row) =>
       Object.fromEntries(names.map((name) => [name, (row[name] ?? null) as QueryValue])),
     );
-    const pivoted = Object.fromEntries(
-      names.map((name) => [name, padded.map((row) => row[name] ?? null)]),
-    );
     const result = this.replaceOnConflict
-      ? await this.services.upsertBatch(this.table, { columns: pivoted })
-      : await this.services.insertBatch(this.table, { columns: pivoted });
+      ? await this.services.upsertBatch(this.table, padded)
+      : await this.services.insertBatch(this.table, padded);
     if (this.returningColumns === undefined) {
       return [{ numInsertedRows: result.rowCount } as TReturn];
     }

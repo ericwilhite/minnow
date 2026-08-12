@@ -42,8 +42,9 @@ instead of many small ones:
 - Data is packed into **compressed columnar blocks** — one column for a group of rows, roughly a
   megabyte before compression.
 - No row is ever its own IndexedDB entry, and no table is one giant entry.
-- Each block carries a **checksum** and min/max stats, so queries can skip blocks that can't
-  match a filter. There are no user-managed indexes.
+- Each block carries **checksums** (one over the payload, one over the header and its statistics)
+  and min/max stats, so queries can skip blocks that can't match a filter without even
+  decompressing them. There are no user-managed indexes.
 
 Columns beat rows here because most reads touch a few columns across many rows: filter, aggregate,
 scan. Similar values sit together, so they compress well, and queries fetch only the columns they
@@ -101,6 +102,11 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   is allocated. Under a budget, sorts and grouped aggregations spill to durable temp pages instead
   of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.
 - Spill pages are lease-protected, so a query abandoned by a dead tab gets cleaned up.
+- Repeated work is cached at three levels, all inside one byte-bounded budget
+  (`prepareCacheBytes`): compiled plans by SQL text, decoded blocks by immutable block id, and
+  assembled column vectors by exact visible-segment fingerprint. A commit invalidates the
+  fingerprints, but unchanged blocks stay decoded — re-preparing after a small write costs
+  re-assembly, not re-fetch and re-decompression.
 
 The budget is a model, not a heap meter, and not every operator can spill yet — see
 [what we don't claim](#what-we-dont-claim).
@@ -157,8 +163,9 @@ so your own tests can crash the engine on purpose too.
   blowups; it is not a hard cap on the heap.
 - **No big-dataset performance claims** until real browser measurements back them. The
   [benchmarks](/benchmarks/) publish what has been measured, methodology included.
-- **The version-zero block format may change.** Formats only ever grow (new codecs get new IDs;
-  old bytes are never reinterpreted), but this early format carries no compatibility promise.
+- **The early block format may change.** Formats only ever grow (new codecs get new IDs; old
+  bytes are never reinterpreted), but this early format — currently version 1, whose header and
+  statistics are independently checksummed — carries no compatibility promise yet.
 - **No index DDL.** Skipping comes from block statistics. That's a feature, not a gap.
 
 One working rule sits behind all of this: each layer advances only when measurements support it —

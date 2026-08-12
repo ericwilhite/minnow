@@ -96,9 +96,11 @@ No row is stored as an individual IndexedDB value, and no entire table is stored
 
 ### Binary block container
 
-Every block starts with a fixed-width, little-endian header containing:
+Every block starts with a fixed-width, little-endian header (format version 1) containing:
 
-- magic bytes and format version;
+- magic bytes;
+- an envelope checksum over every following header field and the metadata JSON;
+- format version;
 - logical type and encoding ID;
 - compression codec ID;
 - row count and null count;
@@ -106,7 +108,12 @@ Every block starts with a fixed-width, little-endian header containing:
 - checksum of the uncompressed encoded payload;
 - optional zone-map statistics in extensible metadata.
 
-Readers reject unknown mandatory versions, invalid lengths, unsupported codecs, and checksum mismatches. Published formats are append-only: new codecs or metadata use new IDs/versioned extensions rather than silently changing old bytes.
+The envelope checksum authenticates the header and metadata independently of the payload, so
+header-only readers (zone-map pruning, block inventories) can trust row counts and derived
+statistics without decompressing and revalidating the column bytes. Readers reject unknown
+mandatory versions, invalid lengths, unsupported codecs, and both checksum mismatches. Published
+formats are append-only: new codecs or metadata use new IDs/versioned extensions rather than
+silently changing old bytes.
 
 Initial codecs are intentionally small:
 
@@ -429,7 +436,11 @@ interface Batch {
 ```
 
 Phase 7B-A adds one shared modeled memory context to each prepared vector query. Retained vector
-payloads reserve their validity/value/code arrays and UTF-8 dictionary bytes. Join lookup row indexes,
+payloads reserve their validity/value/code arrays and dictionary string bytes (accounted at one
+byte per UTF-16 code unit — exact for Latin-1 strings and O(1) to measure, rather than encoding
+every string just to weigh it). Result rows, grouped output, and spill pages are tallied against
+the same budget through an aggregated per-context counter instead of one retained reservation
+object per row. Join lookup row indexes,
 2,048-row scan indexes, unique-join selection/build arrays, duplicate fan-out workspaces, and joined
 row-index batches reserve before their modeled executor buffers are allocated. Child contexts release
 temporary reservations after every execution path; the prepared query retains its vectors and lookup
@@ -495,18 +506,20 @@ all browser heap.
 
 ## Automatic data skipping
 
-Phase 8A uses the existing physical block row count, null count, and numeric/datetime min/max zone map
+Phase 8A uses the physical block row count, null count, and numeric/datetime min/max zone map
 for a conservative scan fast path. A single append/base table with simple `AND`-combined
-column-to-literal predicates first fetches, decompresses, checksum-verifies, and validates predicate
-blocks before trusting their derived metadata. Impossible row groups are rejected before logical
-vector materialization; candidate predicate vectors are evaluated into a typed row selection. Only
-projected blocks from candidate groups are then loaded, and exact
-matches are compacted into the retained table vectors. Block-count or row-window mismatches fail back
-or fail closed rather than risking cross-column misalignment.
+column-to-literal predicates fetches predicate blocks and reads only their envelope-checksummed
+headers: the format's envelope checksum authenticates the header fields and metadata JSON, so
+zone maps are trusted without decompressing or revalidating payloads, and a pruned block is never
+physically decoded. Impossible row groups are rejected before logical vector materialization;
+candidate predicate vectors are evaluated into a typed row selection, and the surviving blocks are
+fully decoded (payload checksum and physical validation included) during materialization. Only
+projected blocks from candidate groups are then loaded, and exact matches are compacted into the
+retained table vectors. Block-count or row-window mismatches fail back or fail closed rather than
+risking cross-column misalignment.
 
-This does not yet provide an authenticated header-only IndexedDB access path: predicate block values
-are fetched and physically decoded because version-zero metadata JSON has no independent checksum.
-Joins, mutation snapshots, strings, computed predicates,
+Predicate block values are still fetched as complete IndexedDB records — the store has no
+header-only read primitive yet. Joins, mutation snapshots, strings, computed predicates,
 and other layouts retain the full scan. Approximate distinct counts, dictionary membership, Bloom
 filters, segment summaries, and broader cost-based pruning remain future work. There are no
 user-managed indexes.

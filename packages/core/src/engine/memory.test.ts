@@ -47,6 +47,29 @@ describe("query memory context", () => {
     expect(() => child.reserve(1, "closed")).toThrow("Query memory context is closed");
   });
 
+  it("tallies bytes without reservation objects and releases them on close", () => {
+    const root = new QueryMemoryContext(16);
+    const child = root.createChild();
+    child.tally(4, "result row");
+    child.tally(6, "result row");
+    expect(root.usage).toEqual({ budgetBytes: 16, usedBytes: 10, peakBytes: 10 });
+
+    let error: unknown;
+    try {
+      child.tally(7, "overflow row");
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(QueryMemoryBudgetError);
+    expect(error).toMatchObject({ requestedBytes: 7, usedBytes: 10, budgetBytes: 16 });
+    expect(root.usage).toEqual({ budgetBytes: 16, usedBytes: 10, peakBytes: 10 });
+
+    child.close();
+    expect(root.usage).toEqual({ budgetBytes: 16, usedBytes: 0, peakBytes: 10 });
+    expect(() => child.tally(1, "closed")).toThrow("Query memory context is closed");
+    root.close();
+  });
+
   it("rejects invalid budgets and reservation sizes", () => {
     for (const value of [-1, 0.5, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
       expect(() => new QueryMemoryContext(value)).toThrow(RangeError);

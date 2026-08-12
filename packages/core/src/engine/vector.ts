@@ -455,12 +455,10 @@ function columnarTablePayloadBytes(table: ColumnarTable): number {
     total = safeMemorySum(total, vector.validity.byteLength, "Column vector payload");
     if (vector.kind === "string") {
       total = safeMemorySum(total, vector.codes.byteLength, "Column vector payload");
+      // One byte per UTF-16 code unit, matching queryValuePayloadBytes: exact for Latin-1
+      // and O(1) per entry instead of a throwaway UTF-8 encode of the whole dictionary.
       for (const value of vector.dictionary) {
-        total = safeMemorySum(
-          total,
-          vectorTextEncoder.encode(value).byteLength,
-          "String dictionary payload",
-        );
+        total = safeMemorySum(total, value.length, "String dictionary payload");
       }
     } else {
       total = safeMemorySum(total, vector.values.byteLength, "Column vector payload");
@@ -1111,7 +1109,7 @@ async function executeBoundPlanWithHashSpill(
                 spillRow[`a${String(index)}`] =
                   raw === null || raw === undefined ? null : asQueryValue(raw);
               }
-              batchMemory.reserve(queryRowPayloadBytes(spillRow), "Hash spill value row");
+              batchMemory.tally(queryRowPayloadBytes(spillRow), "Hash spill value row");
               const partition = hashQueryValues(groupValues) & (partitionCount - 1);
               const rows = partitionBuffers.get(partition) ?? [];
               rows.push(spillRow);
@@ -1356,7 +1354,7 @@ function projectFilteredBatch(
   for (let row = 0; row < batch.length; row += 1) {
     if (!passesPredicates(plan, batch, row)) continue;
     const resultRow = projectBatchRow(plan, batch, row);
-    memory.reserve(queryRowPayloadBytes(resultRow), "Spill result row");
+    memory.tally(queryRowPayloadBytes(resultRow), "Spill result row");
     output.push(resultRow);
   }
 }
@@ -1406,11 +1404,11 @@ async function mergeSpillRuns(
         (leftRow !== undefined && compareOrderedRows(leftRow, rightRow, orderBy) <= 0)
       ) {
         const row = required(leftRow, "Left spill row is missing");
-        outputMemory.reserve(queryRowPayloadBytes(row), "Spill merge output row");
+        outputMemory.tally(queryRowPayloadBytes(row), "Spill merge output row");
         outputPage.push(row);
         leftRow = await leftReader.next();
       } else {
-        outputMemory.reserve(queryRowPayloadBytes(rightRow), "Spill merge output row");
+        outputMemory.tally(queryRowPayloadBytes(rightRow), "Spill merge output row");
         outputPage.push(rightRow);
         rightRow = await rightReader.next();
       }
@@ -1566,7 +1564,10 @@ function finishResult(
     const ordering = memory.reserve(
       safeMemoryProduct(
         rows.length,
-        Uint32Array.BYTES_PER_ELEMENT * 2 + Uint8Array.BYTES_PER_ELEMENT,
+        Uint32Array.BYTES_PER_ELEMENT * 2 +
+          Uint8Array.BYTES_PER_ELEMENT +
+          // One reference slot per extracted sort key (stableSortRows key columns).
+          plan.orderBy.length * QUERY_REFERENCE_BYTES,
         "Ordering typed scratch",
       ),
       "Ordering typed scratch",
@@ -1930,7 +1931,7 @@ class ResultSink {
   add(batch: BatchRows, row: number): void {
     if (this.#capacity === undefined) {
       const resultRow = projectBatchRow(this.#plan, batch, row);
-      this.#memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
+      this.#memory.tally(queryRowPayloadBytes(resultRow), "Accumulated result row");
       this.#rows.push(resultRow);
       return;
     }
@@ -1957,7 +1958,7 @@ class ResultSink {
     for (const entry of this.#selection) {
       scanIndex[0] = entry.sourceRow;
       const resultRow = projectBatchRow(this.#plan, batch, 0);
-      this.#memory.reserve(queryRowPayloadBytes(resultRow), "Accumulated result row");
+      this.#memory.tally(queryRowPayloadBytes(resultRow), "Accumulated result row");
       rows.push(resultRow);
     }
     return rows;
@@ -2433,13 +2434,11 @@ function finishGroups(
     ) {
       continue;
     }
-    const row = Object.fromEntries(
-      plan.select.map((item) => [
-        item.alias,
-        asQueryValue(evaluateFinalExpression(plan, item.expression, group)),
-      ]),
-    );
-    memory.reserve(queryRowPayloadBytes(row), "Accumulated grouped result row");
+    const row: QueryRow = {};
+    for (const item of plan.select) {
+      row[item.alias] = asQueryValue(evaluateFinalExpression(plan, item.expression, group));
+    }
+    memory.tally(queryRowPayloadBytes(row), "Accumulated grouped result row");
     rows.push(row);
   }
   return rows;
@@ -2532,28 +2531,29 @@ function evaluateFinalExpression(
   return value;
 }
 
+/**
+ * Builds one result row by direct property assignment in stable select order: every projected
+ * row shares one hidden class and the per-row tuple/array churn of an entries-based build never
+ * exists. This runs once per surviving row, so it is the hottest allocation site of a query.
+ */
 function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryRow {
+  const result: QueryRow = {};
   if (!plan.wildcard) {
-    return Object.fromEntries(
-      plan.select.map((item) => [
-        item.alias,
-        asQueryValue(evaluateBatchExpression(plan, item.expression, batch, row)),
-      ]),
-    );
+    for (const item of plan.select) {
+      result[item.alias] = asQueryValue(evaluateBatchExpression(plan, item.expression, batch, row));
+    }
+    return result;
   }
-  const values: Array<[string, QueryValue]> = [];
   const multiple = plan.sourceTables.length > 1;
   for (let source = 0; source < plan.sourceTables.length; source += 1) {
     const table = required(plan.sourceTables[source], "Wildcard source table is missing");
     const rowIndex = batch.rowsBySource[source]?.[row] ?? -1;
+    const prefix = multiple ? `${plan.sourceAliases[source] ?? ""}.` : "";
     for (const [name, vector] of table.columns) {
-      values.push([
-        multiple ? `${plan.sourceAliases[source] ?? ""}.${name}` : name,
-        vectorValue(vector, rowIndex),
-      ]);
+      result[multiple ? prefix + name : name] = vectorValue(vector, rowIndex);
     }
   }
-  return Object.fromEntries(values);
+  return result;
 }
 
 function wildcardColumnNames(plan: BoundPlan): string[] {
@@ -3014,11 +3014,25 @@ function stableSortRows(
   for (let index = 0; index < indexes.length; index += 1) indexes[index] = index;
   let source = indexes;
   let target = scratch;
+  // Sort keys are extracted once per row: the merge performs O(n log n) comparisons, and
+  // re-reading string-keyed row properties (plus Date unboxing) inside every comparison
+  // dominates the sort for wide inputs. The keys land in one flat array in row-major order.
+  const termCount = orderBy.length;
+  const keys = new Array<unknown>(rows.length * termCount);
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = required(rows[index], "Ordering row is missing");
+    for (let term = 0; term < termCount; term += 1) {
+      const order = required(orderBy[term], "Order term is missing");
+      keys[index * termCount + term] = comparable(row[order.outputName]);
+    }
+  }
   const compareIndexes = (leftIndex: number, rightIndex: number): number => {
-    const left = required(rows[leftIndex], "Ordering row is missing");
-    const right = required(rows[rightIndex], "Ordering row is missing");
-    for (const order of orderBy) {
-      const comparison = compareValues(left[order.outputName], right[order.outputName]);
+    for (let term = 0; term < termCount; term += 1) {
+      const order = required(orderBy[term], "Order term is missing");
+      const comparison = compareComparables(
+        keys[leftIndex * termCount + term],
+        keys[rightIndex * termCount + term],
+      );
       if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
     }
     return 0;
@@ -3063,9 +3077,17 @@ function stableSortRows(
   }
 }
 
+/**
+ * Shares one default-locale collator across all string comparisons: `left.localeCompare(right)`
+ * with no arguments is specified to order identically, but re-resolves locale data per call.
+ */
+const defaultCollator = new Intl.Collator();
+
 function compareValues(left: unknown, right: unknown): number {
-  const a = comparable(left);
-  const b = comparable(right);
+  return compareComparables(comparable(left), comparable(right));
+}
+
+function compareComparables(a: unknown, b: unknown): number {
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;
@@ -3074,7 +3096,7 @@ function compareValues(left: unknown, right: unknown): number {
     if (Number.isNaN(b)) return -1;
     return a - b;
   }
-  if (typeof a === "string" && typeof b === "string") return a.localeCompare(b);
+  if (typeof a === "string" && typeof b === "string") return defaultCollator.compare(a, b);
   if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
   throw new TypeError("Values must have comparable SQL types");
 }
@@ -3118,11 +3140,9 @@ function queryValuePayloadBytes(value: QueryValue): number {
   if (typeof value === "number" || value instanceof Date) {
     return QUERY_VALUE_TAG_BYTES + Float64Array.BYTES_PER_ELEMENT;
   }
-  return safeMemorySum(
-    QUERY_VALUE_TAG_BYTES,
-    vectorTextEncoder.encode(value).byteLength,
-    "String query value payload",
-  );
+  // Accounted as one byte per UTF-16 code unit: exact for the dominant Latin-1 case, O(1)
+  // instead of a per-value UTF-8 encode that allocates a throwaway buffer per string.
+  return safeMemorySum(QUERY_VALUE_TAG_BYTES, value.length, "String query value payload");
 }
 
 function safeMemorySum(left: number, right: number, label: string): number {

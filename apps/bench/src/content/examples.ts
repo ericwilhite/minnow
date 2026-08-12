@@ -47,7 +47,7 @@ async function typedDb(): Promise<{ database: MinnowDatabase; db: Minnow<DB> }> 
 const entries: ShowcaseExample[] = [
   {
     id: "sql",
-    title: "Tables, column batches, SQL",
+    title: "Tables, batch writes, SQL",
     code: `const database = new MinnowDatabase(store);
 
 await database.createTable({
@@ -59,12 +59,12 @@ await database.createTable({
   ],
 });
 
-await database.insertBatch("people", {
-  columns: {
-    name: ["Ada", "Grace", "Katherine", "Linus"],
-    score: [10, 25, 30, 25],
-  },
-});
+await database.insertBatch("people", [
+  { name: "Ada", score: 10 },
+  { name: "Grace", score: 25 },
+  { name: "Katherine", score: 30 },
+  { name: "Linus", score: 25 },
+]);
 
 const result = await database.query(\`
   SELECT score, COUNT(*) AS people
@@ -83,12 +83,12 @@ const result = await database.query(\`
           { name: "score", type: "number" },
         ],
       });
-      await database.insertBatch("people", {
-        columns: {
-          name: ["Ada", "Grace", "Katherine", "Linus"],
-          score: [10, 25, 30, 25],
-        },
-      });
+      await database.insertBatch("people", [
+        { name: "Ada", score: 10 },
+        { name: "Grace", score: 25 },
+        { name: "Katherine", score: 30 },
+        { name: "Linus", score: 25 },
+      ]);
       const result = await database.query(`
         SELECT score, COUNT(*) AS people
         FROM people
@@ -167,9 +167,7 @@ const written = await db
 );
 const before = prepared.execute().rows; // [{ people: 2 }]
 
-await database.insertBatch("people", {
-  columns: { name: ["Margaret"], score: [40] },
-});
+await database.insertBatch("people", [{ name: "Margaret", score: 40 }]);
 
 const stillBefore = prepared.execute().rows; // [{ people: 2 }] — same snapshot
 const after = (await database.query(
@@ -186,14 +184,13 @@ prepared.close();`,
           { name: "score", type: "number" },
         ],
       });
-      await database.insertBatch("people", {
-        columns: { name: ["Ada", "Grace"], score: [10, 25] },
-      });
+      await database.insertBatch("people", [
+        { name: "Ada", score: 10 },
+        { name: "Grace", score: 25 },
+      ]);
       const prepared = await database.prepareQuery("SELECT COUNT(*) AS people FROM people");
       const before = prepared.execute().rows;
-      await database.insertBatch("people", {
-        columns: { name: ["Margaret"], score: [40] },
-      });
+      await database.insertBatch("people", [{ name: "Margaret", score: 40 }]);
       const stillBefore = prepared.execute().rows;
       const after = (await database.query("SELECT COUNT(*) AS people FROM people")).rows;
       prepared.close();

@@ -30,6 +30,7 @@ export class QueryMemoryContext {
   readonly #parent: QueryMemoryContext | undefined;
   readonly #children = new Set<QueryMemoryContext>();
   readonly #reservations = new Set<QueryMemoryReservation>();
+  #talliedBytes = 0;
   #closed = false;
 
   constructor(budgetBytes: number = Number.MAX_SAFE_INTEGER, parent?: QueryMemoryContext) {
@@ -72,11 +73,38 @@ export class QueryMemoryContext {
     return reservation;
   }
 
+  /**
+   * Reserves bytes that live until this context closes, without a per-call reservation object.
+   * The hot accumulation paths (result rows, spill pages) reserve once per row; tracking each
+   * row as a retained `QueryMemoryReservation` in a Set costs O(result rows) live objects on
+   * top of the rows themselves. Tallied bytes share the same budget and error semantics as
+   * `reserve` and are released together when the context closes.
+   */
+  tally(bytes: number, label: string): void {
+    this.#assertOpen();
+    validateMemoryBytes(bytes, "Query memory reservation");
+    const nextUsed = this.#state.usedBytes + bytes;
+    if (!Number.isSafeInteger(nextUsed) || nextUsed > this.#state.budgetBytes) {
+      throw new QueryMemoryBudgetError(
+        label,
+        bytes,
+        this.#state.usedBytes,
+        this.#state.budgetBytes,
+      );
+    }
+    this.#state.usedBytes = nextUsed;
+    this.#state.peakBytes = Math.max(this.#state.peakBytes, nextUsed);
+    this.#talliedBytes += bytes;
+  }
+
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
     for (const child of [...this.#children]) child.close();
     for (const reservation of [...this.#reservations]) reservation.release();
+    this.#state.usedBytes -= this.#talliedBytes;
+    this.#talliedBytes = 0;
+    if (this.#state.usedBytes < 0) throw new Error("Query memory accounting underflow");
     if (this.#parent !== undefined) this.#parent.#children.delete(this);
   }
 

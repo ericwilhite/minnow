@@ -61,11 +61,11 @@ export interface DslDriver {
   run<TRow>(query: { kind: "typed-query"; plan: CompiledQuery; __row?: TRow }): Promise<TRow[]>;
   insertBatch(
     tableName: string,
-    input: { columns: Readonly<Record<string, readonly QueryValue[]>> },
+    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
   ): Promise<{ rowCount: number }>;
   upsertBatch(
     tableName: string,
-    input: { columns: Readonly<Record<string, readonly QueryValue[]>> },
+    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
   ): Promise<{ rowCount: number }>;
   runStatement(
     statement: CompiledStatement,
@@ -182,8 +182,8 @@ export class Minnow<in out DB> {
   #mutationServices(): MutationServices {
     const schemaTables = this.#options.schema?.tables;
     return {
-      insertBatch: (tableName, input) => this.#driver.insertBatch(tableName, input),
-      upsertBatch: (tableName, input) => this.#driver.upsertBatch(tableName, input),
+      insertBatch: (tableName, rows) => this.#driver.insertBatch(tableName, rows),
+      upsertBatch: (tableName, rows) => this.#driver.upsertBatch(tableName, rows),
       runStatement: (statement, options) => this.#driver.runStatement(statement, options),
       tableColumns: (tableName) => {
         const definition = schemaTables?.find(({ name }) => name === tableName);

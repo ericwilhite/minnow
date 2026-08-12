@@ -43,10 +43,13 @@ switching layers never changes behavior.
 ## Write in batches, not loops
 
 Every commit publishes data and updates the manifest; a loop of single-row inserts pays that full
-cost per row. Hand the engine columns, or let the buffered writer batch for you:
+cost per row. Hand the engine the whole batch, or let the buffered writer batch for you:
 
 ```ts
-// Bulk load: one commit, columnar from the start.
+// Bulk load: one commit for every row.
+await database.insertBatch("events", events);
+
+// Already holding columns? Pass them and skip the pivot.
 await database.insertBatch("events", { columns: { id: ids, at: dates, kind: kinds } });
 
 // Event streams: rows in, batches out.

@@ -13,18 +13,21 @@ export interface CompressionMemoryBound {
   readonly scratchBytes: number;
 }
 
-function copy(bytes: Uint8Array): Uint8Array {
-  return new Uint8Array(bytes);
-}
-
+/**
+ * The raw codec returns its input view unchanged in both directions: callers treat compressed
+ * and decompressed payloads as read-only (encode copies the payload into the block envelope,
+ * decode consumers only read or copy out), so a full-payload defensive copy per block would be
+ * pure overhead on the default compression path. The returned view may share the caller's
+ * buffer at a non-zero byte offset.
+ */
 export const rawCodec: CompressionCodec = {
   id: "raw",
   compress(bytes) {
-    return Promise.resolve(copy(bytes));
+    return Promise.resolve(bytes);
   },
   decompress(bytes, expectedLength) {
     if (bytes.byteLength !== expectedLength) throw new Error("Raw payload length mismatch");
-    return Promise.resolve(copy(bytes));
+    return Promise.resolve(bytes);
   },
 };
 

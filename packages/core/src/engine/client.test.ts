@@ -67,13 +67,11 @@ describe("MinnowDatabaseClient", () => {
     const client = connect();
     await client.ready();
     await createPeopleTable(client);
-    const inserted = await client.insertBatch("people", {
-      columns: {
-        id: [1, 2],
-        name: ["Ada", "Grace"],
-        joined: [new Date("2024-01-02T03:04:05Z"), new Date("2024-06-07T08:09:10Z")],
-      },
-    });
+    // Rows here, columns in the typed-query test below: both forms cross the worker boundary.
+    const inserted = await client.insertBatch("people", [
+      { id: 1, name: "Ada", joined: new Date("2024-01-02T03:04:05Z") },
+      { id: 2, name: "Grace", joined: new Date("2024-06-07T08:09:10Z") },
+    ]);
     expect(inserted.rowCount).toBe(2);
     const result = await client.query("SELECT name, joined FROM people ORDER BY name");
     expect(result.rows.map((row) => row.name)).toEqual(["Ada", "Grace"]);
