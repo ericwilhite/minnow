@@ -4930,6 +4930,120 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   store.close();
 });
 
+for (const implementation of [
+  { name: "memory", create: async (): Promise<BlockStore> => new MemoryBlockStore() },
+  {
+    name: "indexeddb",
+    create: async (): Promise<BlockStore> =>
+      IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
+  },
+]) {
+  it(`${implementation.name} streams keyed-mutation scans through a budget too small to materialize`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 512 });
+    await database.createTable({
+      name: "mutated",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    const total = 20_000;
+    for (let start = 0; start < total; start += 5_000) {
+      await database.insertBatch("mutated", {
+        columns: {
+          id: Array.from({ length: 5_000 }, (_, index) => start + index),
+          label: Array.from(
+            { length: 5_000 },
+            (_, index) => `label-${String((start + index) % 97)}`,
+          ),
+          score: Array.from({ length: 5_000 }, (_, index) => (start + index) % 1_000),
+        },
+      });
+    }
+    // First update wave, then deletions, then an overlapping update (last writer wins), then a
+    // re-insert of deleted keys (they must reappear at their new slot position, not the old one).
+    const updatedKeys = Array.from({ length: 400 }, (_, index) => index * 20);
+    await database.updateBatch("mutated", {
+      keys: updatedKeys,
+      changes: {
+        score: updatedKeys.map((key) => key + 100_000),
+        label: updatedKeys.map((key) => `updated-${String(key)}`),
+      },
+    });
+    const deletedKeys = Array.from({ length: 200 }, (_, index) => 12_000 + index * 3);
+    await database.deleteBatch("mutated", { keys: deletedKeys });
+    const secondUpdateKeys = updatedKeys.slice(0, 100);
+    await database.updateBatch("mutated", {
+      keys: secondUpdateKeys,
+      changes: { score: secondUpdateKeys.map((key) => key + 500_000) },
+    });
+    await database.insertBatch("mutated", [
+      { id: deletedKeys[0] ?? 1, label: "reborn", score: -1 },
+    ]);
+
+    const statements = [
+      "SELECT id, label, score FROM mutated WHERE score >= 100000",
+      "SELECT label, COUNT(*) AS n, SUM(score) AS s FROM mutated GROUP BY label ORDER BY label",
+      "SELECT id, score FROM mutated ORDER BY score DESC, id LIMIT 50",
+      "SELECT COUNT(*) AS n FROM mutated",
+    ];
+    for (const sql of statements) {
+      const expected = await database.query(sql);
+      const probe = await database.prepareQuery(sql);
+      const materializedPeak = probe.memoryUsage.peakBytes;
+      probe.close();
+      if (materializedPeak > 4_096) {
+        // One byte under this statement's materialized prepare peak: the materialized path
+        // genuinely cannot run under the budget...
+        const budget = materializedPeak - 1;
+        await expect(
+          database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
+        ).rejects.toThrow(QueryMemoryBudgetError);
+        // ...while the streamed keyed-mutation path returns identical rows in identical order.
+        expect(await database.query(sql, { executionMemoryBudgetBytes: budget })).toEqual(expected);
+      } else {
+        // Metadata-only shapes (a bare COUNT(*)) prepare with ~zero accounted bytes; pin the
+        // streamed path's result equality under an ordinary budget instead.
+        expect(await database.query(sql, { executionMemoryBudgetBytes: 1_000_000 })).toEqual(
+          expected,
+        );
+      }
+    }
+    store.close();
+  });
+
+  it(`${implementation.name} keeps upsert histories on the materialized path with correct results`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 128 });
+    await database.createTable({
+      name: "upserted",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "score", type: "number" },
+      ],
+    });
+    await database.insertBatch("upserted", {
+      columns: {
+        id: Array.from({ length: 1_000 }, (_, index) => index),
+        score: Array.from({ length: 1_000 }, (_, index) => index),
+      },
+    });
+    await database.upsertBatch("upserted", [
+      { id: 5, score: 999 },
+      { id: 2_000, score: 1 },
+    ]);
+    await database.deleteBatch("upserted", { keys: [7] });
+    const sql = "SELECT id, score FROM upserted WHERE score > 500";
+    const expected = await database.query(sql);
+    expect(await database.query(sql, { executionMemoryBudgetBytes: 8_000_000 })).toEqual(expected);
+    store.close();
+  });
+}
+
 it("indexeddb folds unique-key chunk tails into base records and keeps conflict detection", async () => {
   const store = await IndexedDbBlockStore.open({
     name: crypto.randomUUID(),

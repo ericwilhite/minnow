@@ -683,16 +683,22 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Stream the joined probe side with build sides materialized at the same leased snapshot.
 - [x] Spill unordered grouped state through the value-carrying partitions.
 - [x] Add SELECT DISTINCT as compiled grouping and HAVING as shared group-finishing filters.
-- [ ] Stream keyed-mutation scan inputs and spill hash-join build sides.
-      Design sketch (2026-08-11): keyed-mutation replay currently materializes per-segment
-      vectors plus a key-token map before compaction into live rows; streaming it means replaying
-      key visibility first (keys plus tombstones only, one bounded pass over key columns) into a
-      typed live-row selection, then feeding the selected base rows through the existing
-      block-aligned resident-window scan. Spilling a join build side means partitioning the build
-      rows by join-key hash into the existing value-carrying spill pages and probing partition by
-      partition — the same shape as the partitioned hash-aggregate spill, reusing its page format
-      and owner leases. Both slot behind `executionMemoryBudgetBytes` exactly like the streamed
-      base scan; unbudgeted plans keep the materialized paths.
+- [x] Stream keyed-mutation scan inputs (2026-08-12): a budgeted scan over a keyed history of
+      update and delete segments now replays key visibility into resident state bounded by the
+      mutation size — mutation key/changed-column vectors, a dead-row bitmap, and per-slot patch
+      references, built from one block-at-a-time pass over the scan segments' key columns
+      tracking only mutation-touched tokens — and streams the base rows through the existing
+      block-aligned resident window, compacting dead rows and overlaying patches per window. Row
+      order and values are exactly the materialized replay's; histories containing upsert
+      segments keep the materialized path because upsert-new rows interleave into slot order at
+      their segment position (compaction folds upserts into full-row base segments, so the
+      restriction shrinks over a table's lifecycle).
+- [ ] Spill hash-join build sides. Design sketch (2026-08-11): partition the build rows by
+      join-key hash into the existing value-carrying spill pages and probe partition by
+      partition — the same shape as the partitioned hash-aggregate spill, reusing its page
+      format and owner leases. The build table must avoid full materialization at prepare, so
+      the partitioning belongs at the database layer like the streamed scan; slots behind
+      `executionMemoryBudgetBytes`, unbudgeted plans keep the materialized path.
 - [x] Add SELECT DISTINCT, HAVING, IN, uncorrelated subqueries, CTEs, derived tables,
       UNION/UNION ALL, and ROW_NUMBER/RANK/DENSE_RANK windows to the SQL surface.
 - [x] Add SQL mutations through execute() with keyed read-then-mutate semantics.

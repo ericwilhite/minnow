@@ -243,9 +243,13 @@ its rows resident, forward-only, decoding whole physical blocks, reserving the r
 typed bytes before allocation and its measured per-window string dictionary bytes before
 installation, and releasing the superseded window afterward. Global aggregates, unordered and
 order-spilled scans, and grouped-unordered plans over tables far larger than the configured budget
-now complete instead of failing at preparation. Keyed mutation snapshots of the scanned base table,
-prepared queries, and unbudgeted or spill-disabled queries
-keep the materialized path. Under an explicit budget the streaming path takes precedence over Phase
+now complete instead of failing at preparation. A keyed history of update and delete segments
+streams too: the mutations replay into resident state bounded by their own size (a dead-row bitmap
+plus per-slot patch references over the resident mutation vectors, built from one bounded pass over
+the scan segments' key columns tracking only mutation-touched tokens), and the streamed window
+compacts dead rows and overlays patches, reproducing the materialized replay's rows and order
+exactly. Histories containing upsert segments, prepared queries, and unbudgeted or spill-disabled
+queries keep the materialized path. Under an explicit budget the streaming path takes precedence over Phase
 8A zone-map pruning, so a pruned-eligible predicate reads more blocks than the pruned path would in
 exchange for the bounded working set.
 

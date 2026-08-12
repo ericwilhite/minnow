@@ -1991,32 +1991,59 @@ export class MinnowDatabase {
         segmentsByTable,
       };
       const baseSegments = await this.#visibleSegmentRecords(baseTable, snapshot, visibility);
-      const appendOnly = baseSegments.every((segment) => {
+      const scanSegments = baseSegments.filter((segment) => {
         const kind = segment.kind ?? "insert";
         return kind === "insert" || kind === "base";
       });
-      if (!appendOnly) return undefined;
+      const mutationSegments = baseSegments.filter(
+        (segment) => segment.kind === "update" || segment.kind === "delete",
+      );
+      // Upsert segments interleave new rows into slot order at their segment position, so those
+      // histories keep the materialized path (compaction folds them into full-row base segments).
+      if (scanSegments.length + mutationSegments.length !== baseSegments.length) return undefined;
+      const streamedKeyColumn = getUniqueKeyColumn(baseTable);
+      if (mutationSegments.length > 0) {
+        if (streamedKeyColumn === undefined) return undefined;
+        // The key replay is block-driven over every segment, so the key column must have blocks
+        // wherever rows exist; older histories without that shape keep the materialized path.
+        const keyBlocksPresent = baseSegments.every(
+          (segment) =>
+            segment.rowCount === 0 ||
+            (segment.columnBlockIds[streamedKeyColumn.id]?.length ?? 0) > 0,
+        );
+        if (!keyBlocksPresent) return undefined;
+      }
       // A projected column absent from an older segment reads as NULL through the materialized
       // null-fill; the streaming loader is block-driven, so those plans keep the materialized path.
       const columnsPresent = projectedBaseColumns.every((column) =>
-        baseSegments.every((segment) => segment.columnBlockIds[column.id] !== undefined),
+        scanSegments.every((segment) => segment.columnBlockIds[column.id] !== undefined),
       );
       if (!columnsPresent) return undefined;
-      const rowCount = baseSegments.reduce((total, segment) => total + segment.rowCount, 0);
+      const rowCount = scanSegments.reduce((total, segment) => total + segment.rowCount, 0);
       const runStreamedExecution = async (attempt: {
         spill: boolean;
       }): Promise<QueryResult | undefined> => {
         const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
         let prepared: PreparedQuery | undefined;
         try {
-          const streamed = this.#createStreamedTable(
-            baseTable,
-            projectedBaseColumns,
-            baseSegments,
-            snapshot,
-            rowCount,
-            memory,
-          );
+          const streamed =
+            mutationSegments.length > 0 && streamedKeyColumn !== undefined
+              ? await this.#createStreamedMutationTable(
+                  baseTable,
+                  streamedKeyColumn,
+                  projectedBaseColumns,
+                  baseSegments,
+                  snapshot,
+                  memory,
+                )
+              : this.#createStreamedTable(
+                  baseTable,
+                  projectedBaseColumns,
+                  scanSegments,
+                  snapshot,
+                  rowCount,
+                  memory,
+                );
           const inputTables = new Map<string, ColumnarTable>([[baseTable.name, streamed.table]]);
           for (const table of tables) {
             if (table.name === baseTable.name) continue;
@@ -2156,6 +2183,306 @@ export class MinnowDatabase {
       table: {
         name: table.name,
         rowCount,
+        columns: new Map(states.map((state) => [state.column.name, state.vector])),
+      },
+      load,
+    };
+  }
+
+  /**
+   * Builds a streamed view of a keyed table whose visible history contains update and delete
+   * segments (no upserts — those interleave new rows into slot order and keep the materialized
+   * path). Mutation deltas are the small part of such a history, so they replay into resident
+   * state — a dead-row bitmap over the base rows plus per-slot column patches referencing the
+   * resident update vectors — while the base rows stream through the existing block-aligned
+   * inner window. The outer view compacts dead rows and overlays patches per window, producing
+   * exactly the materialized replay's rows in exactly its order.
+   *
+   * The replay tracks only mutation-touched key tokens, so its memory is bounded by the
+   * mutation size, not the table; the duplicate-key corruption guard consequently only fires
+   * for touched keys on this path.
+   */
+  async #createStreamedMutationTable(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    baseSegments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+    memory: QueryMemoryContext,
+  ): Promise<{ table: ColumnarTable; load: (start: number, length: number) => Promise<void> }> {
+    const scanSegments = baseSegments.filter((segment) => {
+      const kind = segment.kind ?? "insert";
+      return kind === "insert" || kind === "base";
+    });
+
+    // Phase A: materialize each mutation segment's key vector (and an update's changed
+    // projected columns) — resident and reserved, bounded by the mutation history's size.
+    const mutationKeyVectors = new Map<string, ColumnVector>();
+    const mutationChangedVectors = new Map<string, Map<string, ColumnVector>>();
+    const touched = new Set<string>();
+    for (const segment of baseSegments) {
+      const kind = segment.kind ?? "insert";
+      if (kind !== "update" && kind !== "delete") continue;
+      const keyVector = await this.#materializeAppendColumnVector(
+        keyColumn,
+        [segment],
+        snapshot,
+        segment.rowCount,
+      );
+      memory.reserve(columnVectorRetainedBytes(keyVector), "Streamed mutation replay");
+      mutationKeyVectors.set(segment.id, keyVector);
+      for (let row = 0; row < segment.rowCount; row += 1) {
+        touched.add(columnVectorKeyToken(keyColumn.type, keyVector, row));
+      }
+      if (kind === "update") {
+        const changed = new Map<string, ColumnVector>();
+        for (const column of projectedColumns) {
+          if (column.id === keyColumn.id) continue;
+          if ((segment.columnBlockIds[column.id]?.length ?? 0) === 0) continue;
+          const vector = await this.#materializeAppendColumnVector(
+            column,
+            [segment],
+            snapshot,
+            segment.rowCount,
+          );
+          memory.reserve(columnVectorRetainedBytes(vector), "Streamed mutation replay");
+          changed.set(column.id, vector);
+        }
+        mutationChangedVectors.set(segment.id, changed);
+      }
+    }
+
+    // Phase B: one bounded pass over the scan segments' key blocks — a single block resident
+    // at a time — recording, per scan segment, the touched tokens and their absolute slots.
+    const touchedByScanSegment = new Map<string, Array<{ token: string; slot: number }>>();
+    let baseRows = 0;
+    for (const segment of scanSegments) {
+      const entries: Array<{ token: string; slot: number }> = [];
+      touchedByScanSegment.set(segment.id, entries);
+      let segmentRows = 0;
+      for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
+        await this.#renewInternalLeaseIfNeeded(snapshot);
+        const bytes = await this.store.getBlock(blockId);
+        if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+        const decoded = await decodePhysicalBlock(bytes);
+        if (decoded.column.type !== keyColumn.type) {
+          throw new Error(`Column type mismatch: ${keyColumn.name}`);
+        }
+        const rows = decoded.column.rowCount;
+        const validity = new Uint8Array(Math.ceil(rows / 8));
+        const values =
+          keyColumn.type === "boolean"
+            ? new Uint8Array(rows)
+            : keyColumn.type === "string"
+              ? undefined
+              : new Float64Array(rows);
+        const codes = keyColumn.type === "string" ? new Uint32Array(rows) : undefined;
+        codes?.fill(NULL_STRING_VECTOR_CODE);
+        const builder = new StringDictionaryBuilder();
+        appendPhysicalColumnToVector(decoded.column, 0, validity, values, codes, builder);
+        const blockVector = (
+          codes !== undefined
+            ? {
+                kind: "string",
+                length: rows,
+                validity,
+                codes,
+                dictionary: builder.dictionary,
+              }
+            : { kind: keyColumn.type, length: rows, validity, values }
+        ) as ColumnVector;
+        for (let row = 0; row < rows; row += 1) {
+          const token = columnVectorKeyToken(keyColumn.type, blockVector, row);
+          if (touched.has(token)) entries.push({ token, slot: baseRows + segmentRows + row });
+        }
+        segmentRows += rows;
+      }
+      if (segmentRows !== segment.rowCount) {
+        throw new Error(`Column row count mismatch: ${keyColumn.name}`);
+      }
+      baseRows += segment.rowCount;
+      memory.tally(entries.length * 64, "Streamed mutation replay");
+    }
+
+    // Replay in visible segment order, exactly like the materialized path: a delete unmaps the
+    // key (a later insert re-adds at a new slot), an update requires a live mapped key and
+    // patches per changed column with last-writer-wins.
+    const dead = new Uint8Array(Math.ceil(baseRows / 8));
+    memory.reserve(dead.byteLength, "Streamed mutation replay");
+    const tokenSlot = new Map<string, number>();
+    const patches = new Map<number, Map<string, { vector: ColumnVector; row: number }>>();
+    let deadCount = 0;
+    for (const segment of baseSegments) {
+      const kind = segment.kind ?? "insert";
+      if (kind === "insert" || kind === "base") {
+        for (const entry of touchedByScanSegment.get(segment.id) ?? []) {
+          if (tokenSlot.has(entry.token)) {
+            throw new Error(`Stored table contains a duplicate unique key: ${table.name}`);
+          }
+          tokenSlot.set(entry.token, entry.slot);
+        }
+        continue;
+      }
+      const keyVector = mutationKeyVectors.get(segment.id);
+      if (keyVector === undefined) {
+        throw new Error(`Mutation segment key vector is missing: ${segment.id}`);
+      }
+      if (kind === "delete") {
+        for (let row = 0; row < segment.rowCount; row += 1) {
+          const token = columnVectorKeyToken(keyColumn.type, keyVector, row);
+          const slot = tokenSlot.get(token);
+          if (slot !== undefined && !bitmapHasValue(dead, slot)) {
+            setBitmapValue(dead, slot);
+            deadCount += 1;
+            patches.delete(slot);
+          }
+          tokenSlot.delete(token);
+        }
+        continue;
+      }
+      const changed = mutationChangedVectors.get(segment.id) ?? new Map<string, ColumnVector>();
+      for (let row = 0; row < segment.rowCount; row += 1) {
+        const token = columnVectorKeyToken(keyColumn.type, keyVector, row);
+        const slot = tokenSlot.get(token);
+        if (slot === undefined) {
+          throw new Error(`Update segment references a missing key: ${segment.id}`);
+        }
+        let slotPatches = patches.get(slot);
+        if (slotPatches === undefined) {
+          slotPatches = new Map();
+          patches.set(slot, slotPatches);
+        }
+        for (const [columnId, vector] of changed) slotPatches.set(columnId, { vector, row });
+      }
+    }
+    memory.tally(patches.size * 96 + tokenSlot.size * 64, "Streamed mutation replay");
+
+    const outputRows = baseRows - deadCount;
+    const inner = this.#createStreamedTable(
+      table,
+      projectedColumns,
+      scanSegments,
+      snapshot,
+      baseRows,
+      memory,
+    );
+    interface OuterColumnState {
+      column: TableColumnRecord;
+      vector: ColumnVector;
+      reservations: QueryMemoryReservation[];
+    }
+    const states: OuterColumnState[] = projectedColumns.map((column) => ({
+      column,
+      vector: createStreamedColumnVector(column.type, outputRows),
+      reservations: [],
+    }));
+    // Forward-only cursor: cursorOutput live rows exist strictly before base row cursorBase.
+    let cursorOutput = 0;
+    let cursorBase = 0;
+    const load = async (start: number, length: number): Promise<void> => {
+      const end = Math.min(start + length, outputRows);
+      const window = states[0]?.vector.window;
+      if (window !== undefined && start >= window.start && end <= window.start + window.length) {
+        return;
+      }
+      if (window !== undefined && start < window.start) {
+        throw new Error(`Streamed scan moved backward: ${table.name}`);
+      }
+      while (cursorOutput < start && cursorBase < baseRows) {
+        if (!bitmapHasValue(dead, cursorBase)) cursorOutput += 1;
+        cursorBase += 1;
+      }
+      const baseStart = cursorBase;
+      let scanBase = cursorBase;
+      let scanOutput = cursorOutput;
+      const liveBaseRows: number[] = [];
+      while (scanOutput < end && scanBase < baseRows) {
+        if (!bitmapHasValue(dead, scanBase)) {
+          liveBaseRows.push(scanBase);
+          scanOutput += 1;
+        }
+        scanBase += 1;
+      }
+      if (scanOutput < end) throw new Error(`Column row count mismatch: ${table.name}`);
+      if (scanBase > baseStart) await inner.load(baseStart, scanBase - baseStart);
+      const windowRows = end - start;
+      for (const state of states) {
+        const innerVector = inner.table.columns.get(state.column.name);
+        const innerWindow = innerVector?.window;
+        if (innerVector === undefined || innerWindow === undefined) {
+          throw new Error(`Streamed column is missing: ${state.column.name}`);
+        }
+        const validityBytes = Math.ceil(windowRows / 8);
+        const typedBytes =
+          validityBytes +
+          (state.column.type === "boolean"
+            ? windowRows
+            : state.column.type === "string"
+              ? windowRows * Uint32Array.BYTES_PER_ELEMENT
+              : windowRows * Float64Array.BYTES_PER_ELEMENT);
+        const replacements: QueryMemoryReservation[] = [];
+        try {
+          replacements.push(memory.reserve(typedBytes, `Streamed window ${state.column.name}`));
+          const validity = new Uint8Array(validityBytes);
+          const values =
+            state.column.type === "boolean"
+              ? new Uint8Array(windowRows)
+              : state.column.type === "string"
+                ? undefined
+                : new Float64Array(windowRows);
+          const codes = state.column.type === "string" ? new Uint32Array(windowRows) : undefined;
+          codes?.fill(NULL_STRING_VECTOR_CODE);
+          const dictionary: string[] = [];
+          const dictionaryIndex = new Map<string, number>();
+          const target = (
+            codes !== undefined
+              ? { kind: "string", length: windowRows, validity, codes, dictionary }
+              : { kind: state.column.type, length: windowRows, validity, values }
+          ) as ColumnVector;
+          for (let index = 0; index < liveBaseRows.length; index += 1) {
+            const baseRow = liveBaseRows[index] ?? 0;
+            const patch = patches.get(baseRow)?.get(state.column.id);
+            if (patch !== undefined) {
+              copyColumnVectorValue(patch.vector, patch.row, target, index, dictionaryIndex);
+            } else {
+              copyColumnVectorValue(
+                innerVector,
+                baseRow - innerWindow.start,
+                target,
+                index,
+                dictionaryIndex,
+              );
+            }
+          }
+          let dictionaryBytes = 0;
+          for (const value of dictionary) dictionaryBytes += value.length;
+          if (dictionaryBytes > 0) {
+            replacements.push(
+              memory.reserve(dictionaryBytes, `Streamed window ${state.column.name}`),
+            );
+          }
+          const mutable = state.vector as unknown as MutableStreamedVectorFields;
+          mutable.validity = validity;
+          if (values !== undefined) mutable.values = values;
+          if (codes !== undefined) {
+            mutable.codes = codes;
+            mutable.dictionary = dictionary;
+          }
+          mutable.window = { start, length: windowRows };
+        } catch (error) {
+          for (const replacement of replacements) replacement.release();
+          throw error;
+        }
+        for (const previous of state.reservations) previous.release();
+        state.reservations = replacements;
+      }
+      cursorOutput = end;
+      cursorBase = scanBase;
+    };
+    return {
+      table: {
+        name: table.name,
+        rowCount: outputRows,
         columns: new Map(states.map((state) => [state.column.name, state.vector])),
       },
       load,
