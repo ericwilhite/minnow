@@ -3,7 +3,19 @@ import { sqlColumn, sqlLiteral, type ColumnType } from "../sql/literal.js";
 
 /** Every comparison the engine's WHERE clause supports, in the forms a column filter needs. */
 export type FilterOperator =
-  "=" | "!=" | ">" | ">=" | "<" | "<=" | "like" | "in" | "between" | "is null" | "is not null";
+  | "="
+  | "!="
+  | "contains"
+  | "starts with"
+  | ">"
+  | ">="
+  | "<"
+  | "<="
+  | "like"
+  | "in"
+  | "between"
+  | "is null"
+  | "is not null";
 
 export interface Filter {
   column: string;
@@ -19,16 +31,26 @@ interface OperatorSpec {
   arity: 0 | 1 | 2 | "many";
   /** Types the operator is offered for. */
   types?: readonly ColumnType[];
+  /** Shown in the value box, so the accepted shape is visible before anything is typed. */
+  hint?: string;
 }
 
+/**
+ * Declaration order is menu order, so the substring searches sit next to equality where they are
+ * looked for. `contains` and `starts with` exist because a bare `LIKE` is an exact match — typing
+ * `crea` into a raw LIKE finds nothing, which reads as a broken filter rather than as SQL working
+ * exactly as specified. They add the wildcards; `like` stays for patterns written by hand.
+ */
 const operators: Record<FilterOperator, OperatorSpec> = {
   "=": { label: "=", arity: 1 },
   "!=": { label: "≠", arity: 1 },
+  contains: { label: "contains", arity: 1, types: ["string"], hint: "crea" },
+  "starts with": { label: "starts with", arity: 1, types: ["string"], hint: "crea" },
   ">": { label: ">", arity: 1, types: ["number", "string", "datetime"] },
   ">=": { label: "≥", arity: 1, types: ["number", "string", "datetime"] },
   "<": { label: "<", arity: 1, types: ["number", "string", "datetime"] },
   "<=": { label: "≤", arity: 1, types: ["number", "string", "datetime"] },
-  like: { label: "like", arity: 1, types: ["string"] },
+  like: { label: "like", arity: 1, types: ["string"], hint: "%crea%" },
   in: { label: "in", arity: "many" },
   between: { label: "between", arity: 2, types: ["number", "string", "datetime"] },
   "is null": { label: "is null", arity: 0 },
@@ -50,6 +72,10 @@ export function operatorArity(operator: FilterOperator): 0 | 1 | 2 | "many" {
   return operators[operator].arity;
 }
 
+export function operatorHint(operator: FilterOperator): string | undefined {
+  return operators[operator].hint;
+}
+
 /** A filter missing the values its operator needs is skipped rather than compiled into nonsense. */
 export function isComplete(filter: Filter): boolean {
   const arity = operatorArity(filter.operator);
@@ -68,6 +94,12 @@ function renderFilter(table: string, filter: Filter): string {
       return `${column} IS NOT NULL`;
     case "like":
       return `${column} LIKE ${literal(0)}`;
+    // The wildcards are added here rather than typed. `_` and `%` inside the value stay live —
+    // the engine's LIKE has no escape character, so there is nothing to neutralise them with.
+    case "contains":
+      return `${column} LIKE ${sqlLiteral(`%${String(filter.values[0] ?? "")}%`, "string")}`;
+    case "starts with":
+      return `${column} LIKE ${sqlLiteral(`${String(filter.values[0] ?? "")}%`, "string")}`;
     case "in":
       return `${column} IN (${filter.values
         .map((value) => sqlLiteral(value, filter.type))

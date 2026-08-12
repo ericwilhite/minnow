@@ -74,9 +74,18 @@ nullability, and which one is the unique key. Pick a table to browse it.
 table's own order. The unique key is appended to every sort, so rows with equal values keep a
 stable order instead of shuffling between pages.
 
-**Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `<`, `≤`, `>`, `≥`, `like`, `in`,
-`between`, `is null`, `is not null`, offered per column type. Values are converted to the column's
-type before they reach SQL, so `score > 10` compares numbers. Filters combine with AND.
+**Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `contains`, `starts with`, `<`, `≤`,
+`>`, `≥`, `like`, `in`, `between`, `is null`, `is not null`, offered per column type. Values are
+converted to the column's type before they reach SQL, so `score > 10` compares numbers. Filters
+combine with AND.
+
+For text, **`contains` is the one you usually want** — it adds the wildcards, so `crea` finds
+`created`. `like` takes a pattern exactly as written, which is standard SQL: `like crea` matches
+only the string `crea`, and you need `%crea%` to search inside a value. The value box hints which
+one you are in.
+
+Both are case-sensitive, and `_` and `%` inside a `contains` value stay live as wildcards — the
+engine's `LIKE` has no escape character, so there is nothing to switch them off with.
 
 **Paging.** Rows load as you scroll. Where it can, the explorer asks for "the rows after the last
 one I saw" rather than "skip the first N", so reading deep into a table costs the same as reading

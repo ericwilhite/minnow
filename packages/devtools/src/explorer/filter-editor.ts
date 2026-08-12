@@ -7,6 +7,7 @@ import {
   describeFilter,
   isComplete,
   operatorArity,
+  operatorHint,
   operatorLabel,
   operatorsFor,
   type Filter,
@@ -82,10 +83,13 @@ export function createFilterBar(onChange: () => void): FilterBar {
   }
 
   function renderValueInputs(): void {
-    const arity = operatorArity(operatorSelect.value as FilterOperator);
+    const operator = operatorSelect.value as FilterOperator;
+    const arity = operatorArity(operator);
     valueInput.hidden = arity === 0;
     secondInput.hidden = arity !== 2;
-    valueInput.placeholder = arity === "many" ? "a, b, c" : "value";
+    // The hint carries the shape — `%crea%` for a raw pattern, a bare word for `contains` — so the
+    // difference between the two is visible before anything is typed.
+    valueInput.placeholder = operatorHint(operator) ?? (arity === "many" ? "a, b, c" : "value");
   }
 
   function renderChips(): void {
