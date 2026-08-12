@@ -246,7 +246,7 @@ export async function runStorageBenchmark(
       persistedStatus === "committed" &&
       persistedDataTransaction?.committedVersion === committedManifest.version &&
       currentManifest?.version === committedManifest.version &&
-      committedManifest.blockIds.length === blockIds.length;
+      currentManifest.blockIds.length === blockIds.length;
     const dataCommitCheck: TransactionCheckMeasurement = {
       id: "data-commit",
       label: "Journaled atomic commit",
@@ -403,7 +403,7 @@ async function benchmarkTransactions(
     await loser.rebase();
     const rebasedManifest = await loser.commit();
     const rebaseDuration = performance.now() - rebaseStarted;
-    const rebasedBlocks = rebasedManifest.blockIds;
+    const rebasedBlocks = (await firstStore.getManifest(rebasedManifest.version))?.blockIds ?? [];
     const rebasePassed =
       rebasedManifest.version === 2 &&
       ["base", "left", "right"].every((id) => rebasedBlocks.includes(id));
@@ -537,7 +537,10 @@ async function benchmarkTransactions(
       responseTransaction.status === "committed" &&
       recoveredRecord?.status === "committed" &&
       recoveredRecord.committedVersion === recoveredManifest.version &&
-      recoveredManifest.blockIds.includes("response-lost");
+      ((await firstStore.getManifest(recoveredManifest.version))?.blockIds.includes(
+        "response-lost",
+      ) ??
+        false);
     checks.push({
       id: "lost-response",
       label: "Lost commit response is reconciled",

@@ -93,11 +93,16 @@ unique-key lookup became log-structured with a sixteen-chunk tail folded into pe
 at commit time. Sustained small-batch inserts over fake-indexeddb (100-row batches, quartile
 ms/batch over 800 commits) went from 10.0 → 29.1 → 49.0 → 69.6 (linear per-commit growth) to
 13.1 → 21.7 → 29.7 → 37.4; the crossover sits near 250 commits and the gap keeps widening. The
-residual per-commit growth is the full-manifest rewrite: every commit re-sorts and rewrites the
-complete live block-id list and re-reads it at snapshot load, so commit cost still scales with
-total database size. A delta-manifest format (periodic full snapshots plus per-commit
-adds/removes) is the identified fix, but it touches snapshot loading, GC reachability, manifest
-pruning, and the fault-injection invariants together, so it deserves its own pass. COALESCE and
+residual per-commit growth was the full-manifest rewrite: every commit re-sorted and rewrote the
+complete live block-id list and re-read it at snapshot load, so commit cost still scaled with
+total database size. A third same-day pass landed the delta-manifest format: manifests store as
+checkpoint-every-32 plus per-commit added/removed ids, reads resolve through the chain (public
+`Manifest` views are unchanged), `CommitTransactionInput` carries only the delta, commit returns
+a `ManifestSummary`, snapshot/lease validation walks the record chain instead of probing every
+live block, and GC reachability and pruning resolve with one ascending pass over the (tombstoned,
+never-deleted) records. The same 800-commit fake-indexeddb curve flattened to
+9.7 → 11.6 → 12.5 → 13.1 ms/batch — 5.3× faster at the tail than the original and no longer
+growing linearly per commit. COALESCE and
 DATE_TRUNC turned out to be fully implemented (parser through executor and the SQL feature
 matrix), so their checklist item is now ticked; streaming keyed-mutation scan inputs and spilling
 hash-join build sides remain the open executor checkbox.

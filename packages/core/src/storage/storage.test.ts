@@ -37,6 +37,54 @@ function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
 }
 
 for (const implementation of stores()) {
+  it(`${implementation.name} resolves manifests identically across delta chains and checkpoints`, async () => {
+    const store = await implementation.create();
+    // 70 commits cross two checkpoint intervals; each adds one block, and every third commit
+    // also supersedes the block from two commits earlier, so deltas carry removals too.
+    const expectedByVersion: string[][] = [];
+    const live = new Set<string>();
+    for (let index = 0; index < 70; index += 1) {
+      const blockId = `chain-block-${String(index).padStart(3, "0")}`;
+      await store.addBlock(blockId, Uint8Array.of(index));
+      const removed =
+        index >= 2 && index % 3 === 0 ? [`chain-block-${String(index - 2).padStart(3, "0")}`] : [];
+      const removable = removed.filter((id) => live.has(id));
+      await store.createTransaction({
+        ...activeTransaction(`chain-transaction-${String(index)}`),
+        snapshotVersion: index === 0 ? null : index - 1,
+        pendingBlockIds: [blockId],
+      });
+      await store.commitTransaction({
+        transactionId: `chain-transaction-${String(index)}`,
+        expectedTransactionRevision: 0,
+        expectedManifestVersion: index === 0 ? null : index - 1,
+        ...(removable.length === 0 ? {} : { removedBlockIds: removable }),
+        committedAt: "2026-01-01T00:00:00.000Z",
+      });
+      for (const id of removable) live.delete(id);
+      live.add(blockId);
+      expectedByVersion.push([...live].sort());
+    }
+    // Every historical version resolves to its exact block set, from either read path.
+    for (const version of [0, 1, 30, 31, 32, 33, 63, 64, 65, 69]) {
+      expect((await store.getManifest(version))?.blockIds).toEqual(expectedByVersion[version]);
+    }
+    expect((await store.getCurrentManifest())?.blockIds).toEqual(expectedByVersion[69]);
+    const listed = await store.listManifests();
+    expect(listed).toHaveLength(70);
+    for (const manifest of listed) {
+      expect(manifest.blockIds).toEqual(expectedByVersion[manifest.version]);
+    }
+    const page = await store.listManifestPage(40, 10);
+    expect(page.records.map((manifest) => manifest.version)).toEqual([
+      41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    ]);
+    for (const manifest of page.records) {
+      expect(manifest.blockIds).toEqual(expectedByVersion[manifest.version]);
+    }
+    store.close();
+  });
+
   it(`${implementation.name} isolates, clones, and removes temp run pages`, async () => {
     const store = await implementation.create();
     const bytes = Uint8Array.of(1, 2, 3);
@@ -596,10 +644,6 @@ async function createReadyCompaction(
       transactionId,
       expectedTransactionRevision: 0,
       expectedManifestVersion: sourceManifest.version,
-      blockIds: [
-        ...sourceManifest.blockIds.filter((blockId) => blockId !== sourceBlockId),
-        outputBlockId,
-      ],
       removedBlockIds: [sourceBlockId],
       committedAt: "2026-01-01T00:00:01.000Z",
     },
@@ -631,7 +675,6 @@ async function createSupersededStorage(store: BlockStore, prefix: string): Promi
     transactionId: oldTransactionId,
     expectedTransactionRevision: 0,
     expectedManifestVersion: null,
-    blockIds: [oldBlockId],
     committedAt: timestamp,
   });
 
@@ -659,7 +702,6 @@ async function createSupersededStorage(store: BlockStore, prefix: string): Promi
     transactionId: currentTransactionId,
     expectedTransactionRevision: 0,
     expectedManifestVersion: 0,
-    blockIds: [currentBlockId],
     removedBlockIds: [oldBlockId],
     committedAt: "2026-01-01T00:00:01.000Z",
   });
@@ -770,7 +812,6 @@ for (const implementation of stores()) {
         transactionId: "state-transaction",
         expectedTransactionRevision: 0,
         expectedManifestVersion: null,
-        blockIds: ["state-block"],
         committedAt: timestamp,
       });
 
@@ -1058,7 +1099,6 @@ for (const implementation of stores()) {
         transactionId: "segment-transaction",
         expectedTransactionRevision: 0,
         expectedManifestVersion: null,
-        blockIds: ["segment-block"],
         committedAt: timestamp,
       });
 
@@ -2534,7 +2574,6 @@ for (const implementation of stores()) {
         transactionId: `${prefix}/tail-transaction`,
         expectedTransactionRevision: 0,
         expectedManifestVersion: compactedManifest.version,
-        blockIds: [...compactedManifest.blockIds, `${prefix}/tail-block`],
         committedAt: "2026-01-01T00:00:02.000Z",
       });
       expect((await store.getCompactionJob(job.id))?.state).toBe("ready");
@@ -2671,7 +2710,6 @@ for (const implementation of stores()) {
         transactionId: "first-transaction",
         expectedTransactionRevision: 0,
         expectedManifestVersion: null,
-        blockIds: ["first"],
         uniqueKeyChanges: {
           tableId: "accounts",
           keyTokens: ["string:ada@example.com"],
@@ -2703,7 +2741,6 @@ for (const implementation of stores()) {
           transactionId: "second-transaction",
           expectedTransactionRevision: 0,
           expectedManifestVersion: 0,
-          blockIds: ["first", "second"],
           uniqueKeyChanges: {
             tableId: "accounts",
             keyTokens: ["string:ada@example.com"],

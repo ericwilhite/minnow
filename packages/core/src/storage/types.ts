@@ -10,10 +10,10 @@ export const storeNames = [
   "gc",
 ] as const;
 
-export interface Manifest {
+/** The manifest fields every commit publishes; `Manifest` adds the resolved block list. */
+export interface ManifestSummary {
   version: number;
   previousVersion: number | null;
-  blockIds: string[];
   createdAt: string;
   /**
    * Table IDs whose logical content this commit changed; empty means a logical no-change such as
@@ -23,6 +23,40 @@ export interface Manifest {
   changedTableIds?: string[];
   /** A pruned descriptor remains readable for commit reconciliation but cannot be pinned. */
   prunedAt?: string;
+}
+
+export interface Manifest extends ManifestSummary {
+  blockIds: string[];
+}
+
+/**
+ * The stored manifest shape: a checkpoint carries the complete sorted block list; a delta
+ * carries only this commit's added and removed ids plus its distance from the checkpoint below
+ * it. Reads resolve a version by walking back to the nearest checkpoint and applying deltas
+ * forward, so publishing a commit writes O(changed blocks) instead of rewriting every live
+ * block id. Records are never physically deleted (pruning tombstones them via `prunedAt`), so a
+ * chain below any readable version always resolves.
+ */
+export interface StoredManifestRecord extends ManifestSummary {
+  blockIds?: string[];
+  addedBlockIds?: string[];
+  removedBlockIds?: string[];
+  /** Deltas since the checkpoint below; 0 on checkpoints. */
+  deltaDepth?: number;
+}
+
+/** Every this-many commits the store writes a full checkpoint instead of a delta. */
+export const MANIFEST_CHECKPOINT_INTERVAL = 32;
+
+/** Applies one stored record to a running block set (checkpoint replaces, delta mutates). */
+export function applyManifestRecord(blockIds: Set<string>, record: StoredManifestRecord): void {
+  if (record.blockIds !== undefined) {
+    blockIds.clear();
+    for (const id of record.blockIds) blockIds.add(id);
+    return;
+  }
+  for (const id of record.removedBlockIds ?? []) blockIds.delete(id);
+  for (const id of record.addedBlockIds ?? []) blockIds.add(id);
 }
 
 export interface PublishManifestInput {
@@ -482,12 +516,16 @@ export interface StageTransactionArtifactsInput {
   updatedAt: string;
 }
 
+/**
+ * The commit input carries only the change: added blocks are the transaction's journaled pending
+ * blocks, removals are the superseded ids. The store derives the published manifest from its
+ * stored base, so commit cost scales with the delta rather than the database's total block count.
+ */
 export interface CommitTransactionInput {
   transactionId: string;
   changedTableIds?: readonly string[];
   expectedTransactionRevision: number;
   expectedManifestVersion: number | null;
-  blockIds: readonly string[];
   removedBlockIds?: readonly string[];
   uniqueKeyChanges?: UniqueKeyChanges;
   committedAt: string;
@@ -644,7 +682,8 @@ export interface BlockStore {
    * crash. Callers fall back to those calls when this is absent.
    */
   stageTransactionArtifacts?(input: StageTransactionArtifactsInput): Promise<TransactionRecord>;
-  commitTransaction(input: CommitTransactionInput): Promise<Manifest>;
+  /** Publishes the next version; the summary omits the block list, which commits never need. */
+  commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary>;
   createLease(record: LeaseRecord): Promise<void>;
   getLease(id: string): Promise<LeaseRecord | undefined>;
   listLeases(): Promise<LeaseRecord[]>;

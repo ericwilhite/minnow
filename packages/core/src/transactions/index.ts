@@ -5,7 +5,7 @@ import {
   LeaseConflictError,
   type LeaseKind,
   type LeaseRecord,
-  type Manifest,
+  type ManifestSummary,
   type SegmentRecord,
   SnapshotManifestMissingError,
   type TransactionRecord,
@@ -307,20 +307,16 @@ export class DatabaseTransaction {
     }
   }
 
-  async commit(): Promise<Manifest> {
+  async commit(): Promise<ManifestSummary> {
     this.#assertActive();
-    const base = await this.snapshot();
-    const blockIds = [
-      ...base.listBlockIds().filter((id) => !this.#supersededBlockIds.has(id)),
-      ...this.#record.pendingBlockIds,
-    ];
+    // The store derives the published manifest from its stored base plus this delta, so the
+    // commit neither loads nor rebuilds the full block list.
     const committedAt = this.now().toISOString();
     try {
       const manifest = await this.store.commitTransaction({
         transactionId: this.id,
         expectedTransactionRevision: this.#record.revision,
         expectedManifestVersion: this.#record.snapshotVersion,
-        blockIds,
         changedTableIds: this.#logicallyUnchanged ? [] : [...this.#changedTableIds],
         ...(this.#supersededBlockIds.size === 0
           ? {}

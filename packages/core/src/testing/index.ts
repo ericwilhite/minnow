@@ -9,6 +9,7 @@ import type {
   CommitTransactionInput,
   LeaseRecord,
   Manifest,
+  ManifestSummary,
   PublishManifestInput,
   QueryCatalogState,
   RowIdRange,
@@ -188,7 +189,7 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.updateTransaction(id, expectedRevision, update);
   }
 
-  async commitTransaction(input: CommitTransactionInput): Promise<Manifest> {
+  async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
     await this.inject("beforeTransactionCommit");
     const manifest = await this.inner.commitTransaction(input);
     await this.inject("afterTransactionCommit");

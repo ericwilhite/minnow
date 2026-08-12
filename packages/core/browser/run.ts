@@ -121,8 +121,10 @@ window.runTransactionBrowserTest = async () => {
   const recoveryTransaction = await new TransactionManager(recoveryStore).begin();
   await recoveryTransaction.stageBlock("saved", Uint8Array.of(3));
   const recoveredManifest = await recoveryTransaction.commit();
+  const recoveredBlockIds =
+    (await recoveryStore.getManifest(recoveredManifest.version))?.blockIds ?? [];
   const lostResponseRecovered =
-    recoveredManifest.blockIds.includes("saved") && recoveryTransaction.status === "committed";
+    recoveredBlockIds.includes("saved") && recoveryTransaction.status === "committed";
   recoveryStore.close();
   await deleteDatabase(recoveryName);
 

@@ -15,6 +15,7 @@ import {
   type LeaseRecord,
   LeaseConflictError,
   type Manifest,
+  type ManifestSummary,
   type PublishManifestInput,
   type QueryCatalogState,
   type RowIdRange,
@@ -477,10 +478,10 @@ export class MemoryBlockStore implements BlockStore {
     });
   }
 
-  async commitTransaction(input: CommitTransactionInput): Promise<Manifest> {
-    let resolveResult: (manifest: Manifest) => void;
+  async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
+    let resolveResult: (manifest: ManifestSummary) => void;
     let rejectResult: (reason: unknown) => void;
-    const result = new Promise<Manifest>((resolve, reject) => {
+    const result = new Promise<ManifestSummary>((resolve, reject) => {
       resolveResult = resolve;
       rejectResult = reject;
     });
@@ -522,10 +523,12 @@ export class MemoryBlockStore implements BlockStore {
           }
         }
         const removedBlockIdSet = new Set(removedBlockIds);
-        assertBlockSet(input.blockIds, [
+        // The published list derives from the stored base plus this commit's delta; the memory
+        // store keeps full manifests internally since cloning in memory is cheap.
+        const nextBlockIds = [
           ...baseBlockIds.filter((id) => !removedBlockIdSet.has(id)),
           ...transaction.pendingBlockIds,
-        ]);
+        ];
         for (const id of transaction.pendingBlockIds) {
           if (!this.#blocks.has(id)) throw new Error(`Manifest references missing block: ${id}`);
         }
@@ -550,7 +553,7 @@ export class MemoryBlockStore implements BlockStore {
         }
         const manifest = createManifest({
           expectedVersion: input.expectedManifestVersion,
-          blockIds: input.blockIds,
+          blockIds: nextBlockIds,
           createdAt: input.committedAt,
           ...(input.changedTableIds === undefined
             ? {}
@@ -579,7 +582,10 @@ export class MemoryBlockStore implements BlockStore {
           });
           this.#uniqueKeys.set(uniqueKeyChanges.tableId, existing);
         }
-        resolveResult(structuredClone(manifest));
+        // Match the IndexedDB store's observable commit shape: the summary without blockIds.
+        const { blockIds: _resolved, ...summary } = manifest;
+        void _resolved;
+        resolveResult(structuredClone(summary));
       } catch (error) {
         rejectResult(error);
       }
@@ -1007,17 +1013,6 @@ function validateId(id: string): void {
 function validateCount(count: number): void {
   if (!Number.isSafeInteger(count) || count <= 0) {
     throw new RangeError("Row ID reservation count must be a positive whole number");
-  }
-}
-
-function assertBlockSet(actual: readonly string[], expected: readonly string[]): void {
-  const actualSet = new Set(actual);
-  const expectedSet = new Set(expected);
-  if (
-    actualSet.size !== expectedSet.size ||
-    [...expectedSet].some((blockId) => !actualSet.has(blockId))
-  ) {
-    throw new Error("Transaction manifest does not match its snapshot and pending blocks");
   }
 }
 

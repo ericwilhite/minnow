@@ -165,7 +165,7 @@ for (const implementation of implementations()) {
       await loser.rebase();
       const manifest = await loser.commit();
       expect(manifest.version).toBe(1);
-      expect(manifest.blockIds).toEqual(["left", "right"]);
+      expect((await store.getManifest(manifest.version))?.blockIds).toEqual(["left", "right"]);
       store.close();
     });
 
@@ -182,7 +182,7 @@ for (const implementation of implementations()) {
       replacement.supersedeBlocks(["old"]);
       const manifest = await replacement.commit();
 
-      expect(manifest.blockIds).toEqual(["new"]);
+      expect((await store.getManifest(manifest.version))?.blockIds).toEqual(["new"]);
       expect(oldSnapshot.listBlockIds()).toEqual(["old"]);
       expect(await oldSnapshot.getBlock("old")).toEqual(Uint8Array.of(1));
       expect(await store.getBlock("old")).toEqual(Uint8Array.of(1));
@@ -536,7 +536,7 @@ it("reconciles a successful commit when the response is lost", async () => {
   await transaction.stageBlock("saved", Uint8Array.of(1));
   const manifest = await transaction.commit();
 
-  expect(manifest.blockIds).toEqual(["saved"]);
+  expect((await store.getManifest(manifest.version))?.blockIds).toEqual(["saved"]);
   expect(transaction.status).toBe("committed");
   expect((await inner.getTransaction(transaction.id))?.status).toBe("committed");
 });
@@ -676,7 +676,9 @@ it("resumes an active transaction and reconciles an existing immutable block", a
   expect(resumed.pendingSegmentIds).toEqual(["written-segment-before-checkpoint"]);
 
   const manifest = await resumed.commit();
-  expect(manifest.blockIds).toEqual(["written-before-checkpoint"]);
+  expect((await store.getManifest(manifest.version))?.blockIds).toEqual([
+    "written-before-checkpoint",
+  ]);
   await expect(manager.resume(transaction.id)).rejects.toBeInstanceOf(TransactionClosedError);
   store.close();
 });

@@ -64,7 +64,9 @@ later. Nothing is ever edited in place.
 ## How a write commits
 
 Readers see the database through a **manifest** — the list of exactly which blocks make up
-version N. A commit publishes version N + 1, in strict order:
+version N. Physically each commit stores only what changed (a full checkpoint lands every 32
+versions), so publishing costs the size of the change, not the size of the database. A commit
+publishes version N + 1, in strict order:
 
 ```
 1. encode and compress the new blocks

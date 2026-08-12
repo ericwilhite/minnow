@@ -143,6 +143,17 @@ Large immutable values live in `blocks`; small transactional control data lives 
 
 Each transaction records a transaction ID, snapshot manifest version, pending blocks, and a compact change set. Readers resolve all data through one immutable manifest.
 
+Manifests store as a checkpoint-plus-delta chain: every commit writes only its added and removed
+block ids, and every thirty-second version (or any explicitly published manifest) writes the
+complete sorted list. A version resolves by walking `previousVersion` links to the nearest
+checkpoint and replaying deltas forward; pruned records keep their content as tombstones, so the
+chain below any readable version always resolves. Commit cost therefore scales with the change
+rather than the database's total block count, and the committing store keeps one in-memory
+resolved set that advances in place. Block existence is verified inductively: each commit proves
+its own pending blocks exist before publishing, and garbage collection only deletes blocks
+unreachable from every non-pruned manifest, so opening a transaction or lease validates the
+record chain instead of probing every live block.
+
 Commit follows this order:
 
 ```text

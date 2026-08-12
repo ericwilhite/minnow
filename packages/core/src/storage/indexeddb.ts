@@ -15,7 +15,11 @@ import {
   type GarbageCollectionStepResult,
   type LeaseRecord,
   LeaseConflictError,
+  MANIFEST_CHECKPOINT_INTERVAL,
   type Manifest,
+  type ManifestSummary,
+  type StoredManifestRecord,
+  applyManifestRecord,
   type PublishManifestInput,
   type QueryCatalogState,
   type RowIdRange,
@@ -86,6 +90,12 @@ export interface IndexedDbBlockStoreOptions {
 export class IndexedDbBlockStore implements BlockStore {
   readonly #db: IDBDatabase;
   readonly #durability: IDBTransactionDurability;
+  /**
+   * The most recently resolved manifest block set, advanced in place as this instance commits.
+   * Purely a memoization of immutable records: a miss (fresh instance, or another tab moved the
+   * version) re-resolves from storage inside the committing transaction.
+   */
+  #manifestCache: { version: number; blockIds: Set<string> } | undefined;
 
   private constructor(db: IDBDatabase, durability: IDBTransactionDurability) {
     this.#db = db;
@@ -488,27 +498,32 @@ export class IndexedDbBlockStore implements BlockStore {
 
   async getCurrentManifest(): Promise<Manifest | undefined> {
     const transaction = this.#transaction(["catalog", "manifests"], "readonly");
+    const manifestStore = transaction.objectStore("manifests");
     const version = (await requestResult(
       transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY),
     )) as number | undefined;
+    const value: unknown =
+      version === undefined ? undefined : await requestResult(manifestStore.get(version));
     const manifest =
-      version === undefined
+      value === undefined
         ? undefined
-        : ((await requestResult(transaction.objectStore("manifests").get(version))) as
-            Manifest | undefined);
+        : await resolveManifestInTransaction(manifestStore, asStoredManifestRecord(value));
     await transactionDone(transaction);
     if (version !== undefined && manifest === undefined)
       throw new Error("Current manifest is missing");
-    return manifest === undefined ? undefined : structuredClone(manifest);
+    return manifest;
   }
 
   async getManifest(version: number): Promise<Manifest | undefined> {
     const transaction = this.#transaction("manifests", "readonly");
-    const value: unknown = await requestResult<unknown>(
-      transaction.objectStore("manifests").get(version),
-    );
+    const manifestStore = transaction.objectStore("manifests");
+    const value: unknown = await requestResult<unknown>(manifestStore.get(version));
+    const manifest =
+      value === undefined
+        ? undefined
+        : await resolveManifestInTransaction(manifestStore, asStoredManifestRecord(value));
     await transactionDone(transaction);
-    return value === undefined ? undefined : asManifest(value);
+    return manifest;
   }
 
   async listManifests(): Promise<Manifest[]> {
@@ -517,18 +532,40 @@ export class IndexedDbBlockStore implements BlockStore {
       transaction.objectStore("manifests").getAll(),
     );
     await transactionDone(transaction);
-    return values.map(asManifest).sort((left, right) => left.version - right.version);
+    const records = values
+      .map(asStoredManifestRecord)
+      .sort((left, right) => left.version - right.version);
+    // Versions are dense in ascending key order, so one running set resolves every record.
+    const blockIds = new Set<string>();
+    return records.map((record) => {
+      applyManifestRecord(blockIds, record);
+      return manifestView(record, blockIds);
+    });
   }
 
   async listManifestPage(afterVersion: number | null, limit: number) {
     validatePageLimit(limit);
     const transaction = this.#transaction("manifests", "readonly");
-    const records = await readCursorPage(
-      transaction.objectStore("manifests"),
+    const manifestStore = transaction.objectStore("manifests");
+    const stored = await readCursorPage(
+      manifestStore,
       limit,
-      asManifest,
+      asStoredManifestRecord,
       (key) => typeof key === "number" && (afterVersion === null || key > afterVersion),
     );
+    // Resolve the first record by chain walk, then advance the same set across the page.
+    const records: Manifest[] = [];
+    let blockIds: Set<string> | undefined;
+    let resolvedVersion = Number.NaN;
+    for (const record of stored) {
+      if (blockIds === undefined || record.previousVersion !== resolvedVersion) {
+        blockIds = await resolveManifestBlockSetInTransaction(manifestStore, record);
+      } else {
+        applyManifestRecord(blockIds, record);
+      }
+      resolvedVersion = record.version;
+      records.push(manifestView(record, blockIds));
+    }
     await transactionDone(transaction);
     return {
       records,
@@ -555,10 +592,13 @@ export class IndexedDbBlockStore implements BlockStore {
         throw new Error(`Manifest references missing block: ${id}`);
       }
     }
+    // A published manifest carries its complete list, so it stores as a checkpoint and any
+    // delta chain above it starts fresh.
     const manifest = createManifest(input);
     transaction.objectStore("manifests").add(manifest, manifest.version);
     catalog.put(manifest.version, CURRENT_MANIFEST_KEY);
     await transactionDone(transaction);
+    this.#manifestCache = { version: manifest.version, blockIds: new Set(manifest.blockIds) };
     return manifest;
   }
 
@@ -723,7 +763,7 @@ export class IndexedDbBlockStore implements BlockStore {
     }
   }
 
-  async commitTransaction(input: CommitTransactionInput): Promise<Manifest> {
+  async commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary> {
     const transaction = this.#transaction(
       ["blocks", "catalog", "manifests", "transactions", "segments"],
       "readwrite",
@@ -759,44 +799,56 @@ export class IndexedDbBlockStore implements BlockStore {
       throw new Error("Transaction snapshot does not match the expected manifest");
     }
 
-    const baseManifest =
+    const manifestStore = transaction.objectStore("manifests");
+    const baseRecord =
       input.expectedManifestVersion === null
         ? undefined
-        : ((await requestResult(
-            transaction.objectStore("manifests").get(input.expectedManifestVersion),
-          )) as Manifest | undefined);
-    const baseBlockIds = baseManifest?.blockIds ?? [];
-    if (input.expectedManifestVersion !== null && baseManifest === undefined) {
+        : await (async () => {
+            const value: unknown = await requestResult(
+              manifestStore.get(input.expectedManifestVersion ?? -1),
+            );
+            return value === undefined ? undefined : asStoredManifestRecord(value);
+          })();
+    if (input.expectedManifestVersion !== null && baseRecord === undefined) {
       transaction.abort();
       await ignoreAbort(transaction);
       throw new Error(`Snapshot manifest is missing: ${String(input.expectedManifestVersion)}`);
     }
-    const removedBlockIds = [...new Set(input.removedBlockIds ?? [])];
-    const baseBlockIdSet = new Set(baseBlockIds);
-    const invalidRemovedBlock = removedBlockIds.find((id) => !baseBlockIdSet.has(id));
-    if (invalidRemovedBlock !== undefined) {
-      transaction.abort();
-      await ignoreAbort(transaction);
-      throw new Error(
-        `Cannot supersede a block outside the transaction snapshot: ${invalidRemovedBlock}`,
-      );
-    }
+    const removedBlockIds = [...new Set(input.removedBlockIds ?? [])].sort();
     const pendingRemovedBlock = removedBlockIds.find((id) => record.pendingBlockIds.includes(id));
     if (pendingRemovedBlock !== undefined) {
       transaction.abort();
       await ignoreAbort(transaction);
       throw new Error(`Cannot supersede a pending block: ${pendingRemovedBlock}`);
     }
-    const removedBlockIdSet = new Set(removedBlockIds);
-    if (
-      !sameBlockSet(input.blockIds, [
-        ...baseBlockIds.filter((id) => !removedBlockIdSet.has(id)),
-        ...record.pendingBlockIds,
-      ])
-    ) {
-      transaction.abort();
-      await ignoreAbort(transaction);
-      throw new Error("Transaction manifest does not match its snapshot and pending blocks");
+    // The resolved base block set is needed only to validate removals and to write checkpoints;
+    // an ordinary delta commit with no removals never materializes it. The instance cache makes
+    // the removal/checkpoint path O(delta) when this store published the base version.
+    const baseDepth =
+      baseRecord === undefined || baseRecord.blockIds !== undefined
+        ? 0
+        : (baseRecord.deltaDepth ?? 0);
+    const writesCheckpoint =
+      baseRecord === undefined || baseDepth + 1 >= MANIFEST_CHECKPOINT_INTERVAL;
+    let baseBlockIdSet: Set<string> | undefined;
+    let cacheOwnsBaseSet = false;
+    if (removedBlockIds.length > 0 || writesCheckpoint) {
+      if (this.#manifestCache?.version === input.expectedManifestVersion) {
+        baseBlockIdSet = this.#manifestCache.blockIds;
+        cacheOwnsBaseSet = true;
+      } else if (baseRecord === undefined) {
+        baseBlockIdSet = new Set();
+      } else {
+        baseBlockIdSet = await resolveManifestBlockSetInTransaction(manifestStore, baseRecord);
+      }
+      const invalidRemovedBlock = removedBlockIds.find((id) => !baseBlockIdSet?.has(id));
+      if (invalidRemovedBlock !== undefined) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new Error(
+          `Cannot supersede a block outside the transaction snapshot: ${invalidRemovedBlock}`,
+        );
+      }
     }
 
     const blockStore = transaction.objectStore("blocks");
@@ -863,18 +915,37 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
 
-    const manifest = createManifest({
-      expectedVersion: input.expectedManifestVersion,
-      blockIds: input.blockIds,
+    const addedBlockIds = [...new Set(record.pendingBlockIds)].sort();
+    const summary: ManifestSummary = {
+      version: input.expectedManifestVersion === null ? 0 : input.expectedManifestVersion + 1,
+      previousVersion: input.expectedManifestVersion,
       createdAt: input.committedAt,
-      ...(input.changedTableIds === undefined ? {} : { changedTableIds: input.changedTableIds }),
-    });
+      ...(input.changedTableIds === undefined
+        ? {}
+        : { changedTableIds: [...input.changedTableIds] }),
+    };
+    let checkpointBlockIds: Set<string> | undefined;
+    let manifestRecord: StoredManifestRecord;
+    if (writesCheckpoint) {
+      checkpointBlockIds = new Set(baseBlockIdSet);
+      for (const id of removedBlockIds) checkpointBlockIds.delete(id);
+      for (const id of addedBlockIds) checkpointBlockIds.add(id);
+      manifestRecord = { ...summary, blockIds: [...checkpointBlockIds].sort() };
+    } else {
+      manifestRecord = {
+        ...summary,
+        addedBlockIds,
+        removedBlockIds,
+        deltaDepth: baseDepth + 1,
+      };
+    }
+    const manifest = summary;
     const committed = updateTransactionRecord(record, {
       status: "committed",
       committedVersion: manifest.version,
       updatedAt: input.committedAt,
     });
-    transaction.objectStore("manifests").add(manifest, manifest.version);
+    manifestStore.add(manifestRecord, manifest.version);
     catalog.put(manifest.version, CURRENT_MANIFEST_KEY);
     for (const segment of pendingSegments) {
       segmentStore.put(
@@ -936,6 +1007,20 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     transactionStore.put(committed, committed.id);
     await transactionDone(transaction);
+    // Advance the resolved-set cache only after the durable commit succeeded. A checkpoint
+    // commit already built the new set; a delta commit with a resolved base applies the delta
+    // in place (the cache owns that set from here on).
+    if (checkpointBlockIds !== undefined) {
+      this.#manifestCache = { version: manifest.version, blockIds: checkpointBlockIds };
+    } else if (baseBlockIdSet !== undefined || cacheOwnsBaseSet) {
+      const blockIds = baseBlockIdSet ?? new Set<string>();
+      for (const id of removedBlockIds) blockIds.delete(id);
+      for (const id of addedBlockIds) blockIds.add(id);
+      this.#manifestCache = { version: manifest.version, blockIds };
+    } else {
+      // No resolved base was materialized; a later removal or checkpoint commit will resolve.
+      this.#manifestCache = undefined;
+    }
     return manifest;
   }
 
@@ -1283,7 +1368,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (version === undefined) throw new Error("Garbage collection manifest cursor is invalid");
         const manifestValue: unknown = await requestResult(manifestStore.get(version));
         if (manifestValue === undefined) missingManifestVersions.push(version);
-        else if (asManifest(manifestValue).prunedAt !== undefined) {
+        else if (asStoredManifestRecord(manifestValue).prunedAt !== undefined) {
           alreadyPrunedManifestVersions.push(version);
         } else if (
           await isManifestVersionPinnedInTransaction(
@@ -1295,7 +1380,12 @@ export class IndexedDbBlockStore implements BlockStore {
         )
           retainedManifestVersions.push(version);
         else {
-          manifestStore.put({ ...asManifest(manifestValue), prunedAt: input.updatedAt }, version);
+          // The tombstone keeps the record's full content (checkpoint list or delta) so chains
+          // above it keep resolving; it only stops counting as a reachability root.
+          manifestStore.put(
+            { ...asStoredManifestRecord(manifestValue), prunedAt: input.updatedAt },
+            version,
+          );
           prunedManifestVersions.push(version);
         }
         manifestIndex += 1;
@@ -1542,8 +1632,63 @@ function asBytes(value: unknown): Uint8Array {
   throw new Error("Stored block is not binary data");
 }
 
-function asManifest(value: unknown): Manifest {
-  return structuredClone(value) as Manifest;
+function asStoredManifestRecord(value: unknown): StoredManifestRecord {
+  return structuredClone(value) as StoredManifestRecord;
+}
+
+/** Builds the resolved public view of one stored record from its resolved block set. */
+function manifestView(record: StoredManifestRecord, blockIds: ReadonlySet<string>): Manifest {
+  return {
+    version: record.version,
+    previousVersion: record.previousVersion,
+    blockIds: [...blockIds].sort(),
+    createdAt: record.createdAt,
+    ...(record.changedTableIds === undefined
+      ? {}
+      : { changedTableIds: [...record.changedTableIds] }),
+    ...(record.prunedAt === undefined ? {} : { prunedAt: record.prunedAt }),
+  };
+}
+
+/**
+ * Resolves one stored record's complete block set by walking `previousVersion` links down to
+ * the nearest checkpoint and replaying the deltas forward. Pruned records keep their content,
+ * so the chain below any readable version always exists; a missing link is corruption.
+ */
+async function resolveManifestBlockSetInTransaction(
+  manifestStore: IDBObjectStore,
+  record: StoredManifestRecord,
+): Promise<Set<string>> {
+  const chain: StoredManifestRecord[] = [record];
+  let cursor = record;
+  while (cursor.blockIds === undefined) {
+    if (cursor.previousVersion === null) {
+      throw new Error(
+        `Manifest delta chain has no checkpoint below version ${String(record.version)}`,
+      );
+    }
+    const value: unknown = await requestResult(manifestStore.get(cursor.previousVersion));
+    if (value === undefined) {
+      throw new Error(
+        `Manifest delta chain is broken at version ${String(cursor.previousVersion)}`,
+      );
+    }
+    cursor = asStoredManifestRecord(value);
+    chain.push(cursor);
+  }
+  const blockIds = new Set<string>();
+  for (let index = chain.length - 1; index >= 0; index -= 1) {
+    const link = chain[index];
+    if (link !== undefined) applyManifestRecord(blockIds, link);
+  }
+  return blockIds;
+}
+
+async function resolveManifestInTransaction(
+  manifestStore: IDBObjectStore,
+  record: StoredManifestRecord,
+): Promise<Manifest> {
+  return manifestView(record, await resolveManifestBlockSetInTransaction(manifestStore, record));
 }
 
 function asTransactionRecord(value: unknown): TransactionRecord {
@@ -1572,20 +1717,28 @@ function asLeaseRecord(value: unknown): LeaseRecord {
   return structuredClone(value) as LeaseRecord;
 }
 
+/**
+ * Verifies the snapshot at `version` is readable: the record exists, is not pruned, and its
+ * delta chain down to a checkpoint is intact. Block existence is verified inductively — every
+ * commit proves its own added blocks exist before publishing, and garbage collection only
+ * deletes blocks unreachable from every non-pruned manifest — so this stays O(chain) instead of
+ * probing every live block on each transaction and lease creation.
+ */
 async function assertSnapshotAvailableInTransaction(
   transaction: IDBTransaction,
   version: number | null,
 ): Promise<void> {
   if (version === null) return;
-  const value: unknown = await requestResult(transaction.objectStore("manifests").get(version));
+  const manifestStore = transaction.objectStore("manifests");
+  const value: unknown = await requestResult(manifestStore.get(version));
   if (value === undefined) throw new SnapshotManifestMissingError(version);
-  const manifest = asManifest(value);
-  if (manifest.prunedAt !== undefined) throw new SnapshotManifestMissingError(version);
-  const blockStore = transaction.objectStore("blocks");
-  for (const id of manifest.blockIds) {
-    if ((await requestResult(blockStore.getKey(id))) === undefined) {
-      throw new SnapshotManifestMissingError(version);
-    }
+  let cursor = asStoredManifestRecord(value);
+  if (cursor.prunedAt !== undefined) throw new SnapshotManifestMissingError(version);
+  while (cursor.blockIds === undefined) {
+    if (cursor.previousVersion === null) throw new SnapshotManifestMissingError(version);
+    const linkValue: unknown = await requestResult(manifestStore.get(cursor.previousVersion));
+    if (linkValue === undefined) throw new SnapshotManifestMissingError(version);
+    cursor = asStoredManifestRecord(linkValue);
   }
 }
 
@@ -1663,15 +1816,32 @@ async function assertPendingArtifactsAvailableInTransaction(
   }
 }
 
+/**
+ * After pruning, every remaining manifest must still be fully readable. One ascending pass
+ * resolves the whole chain with a single running set (pruned records still contribute their
+ * deltas), unions the blocks referenced by any remaining manifest, and verifies each referenced
+ * block once instead of once per manifest.
+ */
 async function assertRemainingManifestRecordsAvailable(
   transaction: IDBTransaction,
   newlyPrunedVersions: ReadonlySet<number>,
 ): Promise<void> {
-  await visitObjectStoreSequentially(transaction.objectStore("manifests"), async (value) => {
-    const manifest = asManifest(value);
-    if (manifest.prunedAt !== undefined || newlyPrunedVersions.has(manifest.version)) return;
-    await assertSnapshotAvailableInTransaction(transaction, manifest.version);
+  const running = new Set<string>();
+  const referenced = new Map<string, number>();
+  await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value) => {
+    const record = asStoredManifestRecord(value);
+    applyManifestRecord(running, record);
+    if (record.prunedAt !== undefined || newlyPrunedVersions.has(record.version)) return;
+    for (const id of running) {
+      if (!referenced.has(id)) referenced.set(id, record.version);
+    }
   });
+  const blockStore = transaction.objectStore("blocks");
+  for (const [id, version] of referenced) {
+    if ((await requestResult(blockStore.getKey(id))) === undefined) {
+      throw new SnapshotManifestMissingError(version);
+    }
+  }
 }
 
 function compactionJobKey(id: string): string {
@@ -1748,16 +1918,18 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   job: GarbageCollectionJobRecord,
 ): Promise<void> {
   const manifestStore = transaction.objectStore("manifests");
+  const candidateManifestBlockIds: Array<Set<string>> = [];
   for (const version of job.candidateManifestVersions) {
-    if ((await requestResult(manifestStore.getKey(version))) === undefined) {
+    const value: unknown = await requestResult(manifestStore.get(version));
+    if (value === undefined) {
       throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
     }
+    candidateManifestBlockIds.push(
+      await resolveManifestBlockSetInTransaction(manifestStore, asStoredManifestRecord(value)),
+    );
   }
   const blockHasProvenance = async (id: string): Promise<boolean> => {
-    for (const version of job.candidateManifestVersions) {
-      const value: unknown = await requestResult(manifestStore.get(version));
-      if (value !== undefined && asManifest(value).blockIds.includes(id)) return true;
-    }
+    if (candidateManifestBlockIds.some((blockIds) => blockIds.has(id))) return true;
     const transactionProven = await visitObjectStoreSequentially(
       transaction.objectStore("transactions"),
       (value) => {
@@ -1901,11 +2073,26 @@ async function collectBoundedPhysicalRootsInTransaction(
 
   const directBlockRoots = new Set<string>();
   const directSegmentRoots = new Set<string>();
-  await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value) => {
-    const manifest = asManifest(value);
-    if (manifest.prunedAt !== undefined || newlyPrunedVersions.has(manifest.version)) return;
-    for (const id of manifest.blockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
-  });
+  // One ascending pass resolves every manifest with a running set (pruned records still apply
+  // their deltas so the chain stays coherent); a probed block roots when it is a member at any
+  // version that still counts.
+  {
+    const running = new Set<string>();
+    const unrooted = new Set(probeBlockIds);
+    await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value) => {
+      const record = asStoredManifestRecord(value);
+      applyManifestRecord(running, record);
+      if (record.prunedAt !== undefined || newlyPrunedVersions.has(record.version)) return;
+      if (unrooted.size === 0) return true;
+      for (const id of unrooted) {
+        if (running.has(id)) {
+          directBlockRoots.add(id);
+          unrooted.delete(id);
+        }
+      }
+      return false;
+    });
+  }
 
   const ownerTransactionIds = new Set(
     [...relatedSegments.values()].map((segment) => segment.transactionId),
@@ -2231,15 +2418,6 @@ function asUniqueKeyChunk(value: unknown): UniqueKeyChunk {
     throw new Error("Unique-key chunk is invalid");
   }
   return { addedTokens, removedTokens };
-}
-
-function sameBlockSet(actual: readonly string[], expected: readonly string[]): boolean {
-  const actualSet = new Set(actual);
-  const expectedSet = new Set(expected);
-  return (
-    actualSet.size === expectedSet.size &&
-    [...expectedSet].every((blockId) => actualSet.has(blockId))
-  );
 }
 
 function getGlobalIndexedDb(): IDBFactory | undefined {
