@@ -474,6 +474,14 @@ export interface TransactionRecordUpdate {
   committedVersion?: number | null;
 }
 
+export interface StageTransactionArtifactsInput {
+  transactionId: string;
+  expectedRevision: number;
+  blocks: readonly BlockWrite[];
+  segments: readonly SegmentRecord[];
+  updatedAt: string;
+}
+
 export interface CommitTransactionInput {
   transactionId: string;
   changedTableIds?: readonly string[];
@@ -629,6 +637,13 @@ export interface BlockStore {
     expectedRevision: number,
     update: TransactionRecordUpdate,
   ): Promise<TransactionRecord>;
+  /**
+   * Optional: stages blocks and segments and journals them on the transaction record in one
+   * atomic storage transaction. Must be equivalent to addBlocks + addSegment(s) + one
+   * updateTransaction appending the new ids, with no intermediate state observable after a
+   * crash. Callers fall back to those calls when this is absent.
+   */
+  stageTransactionArtifacts?(input: StageTransactionArtifactsInput): Promise<TransactionRecord>;
   commitTransaction(input: CommitTransactionInput): Promise<Manifest>;
   createLease(record: LeaseRecord): Promise<void>;
   getLease(id: string): Promise<LeaseRecord | undefined>;

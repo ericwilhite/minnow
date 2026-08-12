@@ -858,6 +858,7 @@ export class MinnowDatabase {
     try {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, keys);
       const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
+      const batchBlockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
       for (const column of columns) {
         const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
         const blockIds: string[] = [];
@@ -890,25 +891,25 @@ export class MinnowDatabase {
         columnBlockIds[column.id] = blockIds;
         storedBytes += sumBytes(blockWrites);
         blockCount += blockWrites.length;
-        const blocksStageStarted = performance.now();
-        await transaction.stageBlocks(blockWrites);
-        stageMs += performance.now() - blocksStageStarted;
+        batchBlockWrites.push(...blockWrites);
       }
-      const segmentStageStarted = performance.now();
-      await transaction.stageSegment({
-        id: segmentId,
-        tableId: table.id,
-        transactionId: transaction.id,
-        rowCount: input.keys.length,
-        rowIdStart: 0n,
-        rowIdEndExclusive: 0n,
-        columnBlockIds,
-        kind: "update",
-        keyColumnId: keyColumn.id,
-        level: 0,
-        createdAt: this.#now().toISOString(),
-      });
-      stageMs += performance.now() - segmentStageStarted;
+      const stageStarted = performance.now();
+      await transaction.stageArtifacts(batchBlockWrites, [
+        {
+          id: segmentId,
+          tableId: table.id,
+          transactionId: transaction.id,
+          rowCount: input.keys.length,
+          rowIdStart: 0n,
+          rowIdEndExclusive: 0n,
+          columnBlockIds,
+          kind: "update",
+          keyColumnId: keyColumn.id,
+          level: 0,
+          createdAt: this.#now().toISOString(),
+        },
+      ]);
+      stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
@@ -1031,10 +1032,6 @@ export class MinnowDatabase {
         batchBlockWrites.push(...blockWrites);
       }
 
-      const blocksStageStarted = performance.now();
-      await transaction.stageBlocks(batchBlockWrites);
-      stageMs += performance.now() - blocksStageStarted;
-
       const segment: SegmentRecord = {
         id: segmentId,
         tableId: table.id,
@@ -1048,9 +1045,9 @@ export class MinnowDatabase {
         level: 0,
         createdAt: this.#now().toISOString(),
       };
-      const segmentStageStarted = performance.now();
-      await transaction.stageSegment(segment);
-      stageMs += performance.now() - segmentStageStarted;
+      const stageStarted = performance.now();
+      await transaction.stageArtifacts(batchBlockWrites, [segment]);
+      stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();

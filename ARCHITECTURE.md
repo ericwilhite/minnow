@@ -176,11 +176,20 @@ of silently discarding the span metadata.
 
 Tables with a unique key keep a small persistent key lookup in IndexedDB. The key changes and new manifest version commit together, so another tab cannot observe one without the other. Older tables that do not have this lookup remain correct by using a table scan until they are rebuilt.
 
-Block storage supports bulk reads and writes. Insert/upsert batches encode one column at a time and
-coalesce their produced blocks into one IndexedDB block transaction and one journal update; update
-batches currently stage a column at a time. A materialized read fetches projected blocks for each
-visible segment in windows of up to 16 block IDs and retains a unique-key column when delta replay
-needs it.
+The chunked lookup is log-structured: each key-changing commit appends one delta chunk (O(1) per
+commit regardless of batch size), and when the tail passes sixteen chunks, the committing
+transaction folds tail and current changes into per-key base records atomically with the manifest
+publication. Existence probes are then point `getKey` reads against the base plus a replay of the
+bounded tail in commit order, so lookup cost stops growing with the number of keys ever written —
+previously every commit deserialized and scanned every chunk in the table's history.
+
+Block storage supports bulk reads and writes. Insert, upsert, and update batches encode one column
+at a time, coalesce every produced block, and stage blocks, segment record, and journal update in
+one atomic storage transaction (`stageTransactionArtifacts`), falling back to the sequential
+block-write/journal/segment/journal shape on stores that do not implement it — the journal
+invariant (a journaled artifact always exists) is identical either way. A materialized read fetches
+projected blocks for each visible segment in windows of up to 16 block IDs and retains a unique-key
+column when delta replay needs it.
 
 An age-triggered buffered flush is a drain request rather than a single attempt. If another batch is
 already committing, the timer waits for it and then flushes rows accepted in the meantime; lifecycle

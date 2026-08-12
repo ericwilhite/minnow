@@ -14,12 +14,19 @@ import { cachedListMembership, dateTruncValue, isScalarFunctionName, likeRegExp 
 import { ByteGroupIndex, type GroupIndexKey } from "./group-index.js";
 import { ByteJoinIndex } from "./join-index.js";
 import {
+  QueryMemoryBudgetError,
   QueryMemoryContext,
   type QueryMemoryReservation,
   type QueryMemoryUsage,
 } from "./memory.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
+/**
+ * Upper bound on the direct-address slot space for compound dictionary-code grouping: 65,536
+ * slots reserve 512 KiB of references, small against the default budget while covering typical
+ * categorical column combinations.
+ */
+const MULTI_CODE_GROUP_SLOT_CAP = 65_536;
 const HASH_SPILL_SCAN_CHUNK_ROWS = 512;
 const NULL_STRING_CODE = 0xffffffff;
 const QUERY_REFERENCE_BYTES = 8;
@@ -193,6 +200,8 @@ interface AggregateSpec {
   readonly argument: BoundExpression;
   /** Set for MIN/MAX/COUNT over a bare datetime column: aggregate on raw epoch milliseconds. */
   readonly rawDatetime?: { source: number; vector: DateTimeVector };
+  /** Set for any aggregate over a bare number column: read the typed vector directly. */
+  readonly rawNumber?: { source: number; vector: NumberVector };
 }
 
 interface GroupState {
@@ -707,10 +716,15 @@ function bindExpression(
       argument.vector.kind === "datetime"
         ? { source: argument.source, vector: argument.vector }
         : undefined;
+    const rawNumber =
+      argument.kind === "column" && argument.vector.kind === "number"
+        ? { source: argument.source, vector: argument.vector }
+        : undefined;
     aggregateSpecs.push({
       name: expression.name,
       argument,
       ...(rawDatetime === undefined ? {} : { rawDatetime }),
+      ...(rawNumber === undefined ? {} : { rawNumber }),
     });
   }
   return {
@@ -2155,10 +2169,35 @@ class GroupAccumulator {
   readonly #plan: BoundPlan;
   readonly #memory: QueryMemoryContext;
   readonly #index: ByteGroupIndex<GroupState>;
-  readonly #codeStates: Array<GroupState | undefined> | undefined;
-  readonly #ordered: GroupState[] | undefined;
+  #codeStates: Array<GroupState | undefined> | undefined;
+  #ordered: GroupState[] | undefined;
   readonly #codeColumns: ReadonlyArray<{ source: number; vector: StringVector } | undefined>;
+  #multiCodeColumns: ReadonlyArray<{ source: number; vector: StringVector }> | undefined;
+  readonly #multiCodeScratch: number[] = [];
   readonly #keyScratch: GroupIndexKey[] = [];
+  // The miss factories live on the accumulator and read the pending row through these fields, so
+  // the per-row lookup never allocates a capturing closure; execution is synchronous, so the
+  // pending row cannot change while a factory runs.
+  #pendingBatch: BatchRows | undefined;
+  #pendingRow = 0;
+  #pendingSingleValue: QueryValue = null;
+  readonly #createPendingSingle = (): GroupState =>
+    createGroupState([this.#pendingSingleValue], this.#plan, this.#memory);
+  readonly #createPendingCompound = (): GroupState =>
+    createGroupState(
+      this.#plan.groupBy.map((expression) =>
+        asQueryValue(
+          evaluateBatchExpression(
+            this.#plan,
+            expression,
+            required(this.#pendingBatch, "Pending group batch is missing"),
+            this.#pendingRow,
+          ),
+        ),
+      ),
+      this.#plan,
+      this.#memory,
+    );
 
   constructor(plan: BoundPlan, memory: QueryMemoryContext) {
     this.#plan = plan;
@@ -2190,6 +2229,29 @@ class GroupAccumulator {
               : undefined,
           )
         : [];
+    // When every compound key column is dictionary-coded and the combined code space is small,
+    // group lookup skips hashing entirely: the codes multiply into one direct array slot. Each
+    // column contributes (dictionary size + 1) slots, the extra one for NULL. Falls back to the
+    // byte index when the slot space is too large or its reservation exceeds the query budget.
+    if (this.#codeColumns.length > 1 && this.#codeColumns.every((column) => column !== undefined)) {
+      const columns = this.#codeColumns as ReadonlyArray<{ source: number; vector: StringVector }>;
+      let slots = 1;
+      for (const column of columns) slots *= column.vector.dictionary.length + 1;
+      if (Number.isSafeInteger(slots) && slots <= MULTI_CODE_GROUP_SLOT_CAP) {
+        try {
+          memory.reserve(
+            safeMemoryProduct(slots, QUERY_REFERENCE_BYTES, "Group code slots"),
+            "Group code slots",
+          );
+        } catch (error) {
+          if (!(error instanceof QueryMemoryBudgetError)) throw error;
+          return;
+        }
+        this.#multiCodeColumns = columns;
+        this.#codeStates = new Array<GroupState | undefined>(slots).fill(undefined);
+        this.#ordered = [];
+      }
+    }
   }
 
   /** Resolves the group state for one row, creating it on first touch. */
@@ -2216,6 +2278,37 @@ class GroupAccumulator {
     if (plan.groupBy.length === 0) {
       return required(this.#index.getEmpty(), "Grouped query state is missing");
     }
+    const multiCode = this.#multiCodeColumns;
+    if (multiCode !== undefined && this.#codeStates !== undefined) {
+      let slot = 0;
+      for (let index = 0; index < multiCode.length; index += 1) {
+        const column = required(multiCode[index], "Group code column is missing");
+        const vector = column.vector;
+        const sourceRow = batch.rowsBySource[column.source]?.[row] ?? -1;
+        let code = vector.dictionary.length;
+        if (sourceRow >= 0 && sourceRow < vector.length && isValid(vector.validity, sourceRow)) {
+          const rawCode = vector.codes[sourceRow] ?? NULL_STRING_CODE;
+          if (rawCode !== NULL_STRING_CODE) code = rawCode;
+        }
+        this.#multiCodeScratch[index] = code;
+        slot = slot * (vector.dictionary.length + 1) + code;
+      }
+      let state = this.#codeStates[slot];
+      if (state === undefined) {
+        const groupValues: QueryValue[] = [];
+        for (let index = 0; index < multiCode.length; index += 1) {
+          const vector = required(multiCode[index], "Group code column is missing").vector;
+          const code = this.#multiCodeScratch[index] ?? vector.dictionary.length;
+          groupValues.push(
+            code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null),
+          );
+        }
+        state = createGroupState(groupValues, plan, this.#memory);
+        this.#codeStates[slot] = state;
+        this.#ordered?.push(state);
+      }
+      return state;
+    }
     if (plan.groupBy.length === 1) {
       const groupValue = asQueryValue(
         evaluateBatchExpression(
@@ -2225,9 +2318,8 @@ class GroupAccumulator {
           row,
         ),
       );
-      return this.#index.getOrInsertOne(groupKey(groupValue), () =>
-        createGroupState([groupValue], plan, this.#memory),
-      );
+      this.#pendingSingleValue = groupValue;
+      return this.#index.getOrInsertOne(groupKey(groupValue), this.#createPendingSingle);
     }
     // The scratch array carries this row's keys without a per-row allocation; the create callback
     // re-evaluates the group expressions, which runs once per distinct group.
@@ -2253,15 +2345,9 @@ class GroupAccumulator {
       );
     }
     this.#keyScratch.length = plan.groupBy.length;
-    return this.#index.getOrInsert(this.#keyScratch, () =>
-      createGroupState(
-        plan.groupBy.map((expression) =>
-          asQueryValue(evaluateBatchExpression(plan, expression, batch, row)),
-        ),
-        plan,
-        this.#memory,
-      ),
-    );
+    this.#pendingBatch = batch;
+    this.#pendingRow = row;
+    return this.#index.getOrInsert(this.#keyScratch, this.#createPendingCompound);
   }
 
   values(): readonly GroupState[] {
@@ -2334,9 +2420,34 @@ function updateAggregates(
         spec,
         state,
         index,
-        rawDatetimeValue(spec.rawDatetime.vector, sourceRow),
+        rawFloat64Value(spec.rawDatetime.vector, sourceRow),
         memory,
       );
+      continue;
+    }
+    // A bare number column reads its Float64Array slot directly and accumulates SUM/AVG into
+    // the typed sums array, so the per-row value never crosses an interpreter dispatch and the
+    // common accumulation path stays unboxed. MIN/MAX keep applyAggregateValue's comparison
+    // semantics (including NaN ordering) through compareValues.
+    if (spec.rawNumber !== undefined) {
+      const sourceRow = batch.rowsBySource[spec.rawNumber.source]?.[row] ?? -1;
+      const value = rawFloat64Value(spec.rawNumber.vector, sourceRow);
+      if (value !== null) {
+        state.counts[index] = (state.counts[index] ?? 0) + 1;
+        if (spec.name === "SUM" || spec.name === "AVG") {
+          state.sums[index] = (state.sums[index] ?? 0) + value;
+        } else if (spec.name === "MIN") {
+          const current = state.values[index];
+          if (current === undefined || compareValues(value, current) < 0) {
+            replaceAggregateValue(state, index, value, "MIN aggregate value", memory);
+          }
+        } else if (spec.name === "MAX") {
+          const current = state.values[index];
+          if (current === undefined || compareValues(value, current) > 0) {
+            replaceAggregateValue(state, index, value, "MAX aggregate value", memory);
+          }
+        }
+      }
       continue;
     }
     const value =
@@ -2347,8 +2458,8 @@ function updateAggregates(
   }
 }
 
-/** Reads a datetime slot as its raw epoch milliseconds without boxing, or null when invalid. */
-function rawDatetimeValue(vector: DateTimeVector, rowIndex: number): number | null {
+/** Reads a float64 slot (number value or raw epoch milliseconds) unboxed, or null when invalid. */
+function rawFloat64Value(vector: NumberVector | DateTimeVector, rowIndex: number): number | null {
   if (rowIndex < 0 || rowIndex >= vector.length) return null;
   const window = vector.window;
   let slot = rowIndex;

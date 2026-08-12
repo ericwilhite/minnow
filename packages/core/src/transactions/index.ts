@@ -188,6 +188,39 @@ export class DatabaseTransaction {
   }
 
   /**
+   * Stages blocks and segments in one journal step. When the store implements the atomic
+   * combined operation this is a single storage transaction instead of the four the sequential
+   * shape costs (block writes, journal update, segment writes, journal update); either way the
+   * observable journal invariant is identical — a journaled artifact always exists.
+   */
+  async stageArtifacts(
+    blocks: readonly BlockWrite[],
+    segments: readonly SegmentRecord[],
+  ): Promise<void> {
+    this.#assertActive();
+    for (const segment of segments) {
+      if (segment.transactionId !== this.id) {
+        throw new Error(`Segment ${segment.id} belongs to another transaction`);
+      }
+    }
+    const batched = this.store.stageTransactionArtifacts?.bind(this.store);
+    if (batched === undefined) {
+      await this.stageBlocks(blocks);
+      for (const segment of segments) await this.stageSegment(segment);
+      return;
+    }
+    if (blocks.length === 0 && segments.length === 0) return;
+    this.#record = await batched({
+      transactionId: this.id,
+      expectedRevision: this.#record.revision,
+      blocks,
+      segments,
+      updatedAt: this.now().toISOString(),
+    });
+    for (const segment of segments) this.#changedTableIds.add(segment.tableId);
+  }
+
+  /**
    * Adds already-persisted immutable blocks to this transaction's journal.
    *
    * Resumable background jobs use this to reconcile the narrow crash window

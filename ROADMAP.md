@@ -82,6 +82,26 @@ row object once. Micro-benchmark medians: ordered scans and wide string projecti
 repeated filtered queries up to 10× faster, single-batch insert throughput about 2× (322k to
 ~650k rows/s), and post-commit re-preparation ~25% faster with zero store reads.
 
+A same-day second round targeted the profiled residuals. Grouped queries went 2.7× faster
+(27.4 → 10.1 ms at 200k rows): compound GROUP BY over dictionary-coded string columns now
+direct-addresses a combined-code slot array (no hashing, capped at 65,536 slots with a byte-index
+fallback), group-state miss factories stopped allocating a closure per row, and aggregates over
+bare number columns read their Float64Array slots without interpreter dispatch. On the write path,
+staging became one atomic storage transaction (`stageTransactionArtifacts`: blocks + segment +
+journal, with a sequential fallback that fault injection deliberately exercises), and the chunked
+unique-key lookup became log-structured with a sixteen-chunk tail folded into per-key base records
+at commit time. Sustained small-batch inserts over fake-indexeddb (100-row batches, quartile
+ms/batch over 800 commits) went from 10.0 → 29.1 → 49.0 → 69.6 (linear per-commit growth) to
+13.1 → 21.7 → 29.7 → 37.4; the crossover sits near 250 commits and the gap keeps widening. The
+residual per-commit growth is the full-manifest rewrite: every commit re-sorts and rewrites the
+complete live block-id list and re-reads it at snapshot load, so commit cost still scales with
+total database size. A delta-manifest format (periodic full snapshots plus per-commit
+adds/removes) is the identified fix, but it touches snapshot loading, GC reachability, manifest
+pruning, and the fault-injection invariants together, so it deserves its own pass. COALESCE and
+DATE_TRUNC turned out to be fully implemented (parser through executor and the SQL feature
+matrix), so their checklist item is now ticked; streaming keyed-mutation scan inputs and spilling
+hash-join build sides remain the open executor checkbox.
+
 Initial matrix:
 
 - compressed block targets: 256 KiB, 512 KiB, 1 MiB, 2 MiB, 4 MiB;
@@ -655,6 +675,15 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Spill unordered grouped state through the value-carrying partitions.
 - [x] Add SELECT DISTINCT as compiled grouping and HAVING as shared group-finishing filters.
 - [ ] Stream keyed-mutation scan inputs and spill hash-join build sides.
+      Design sketch (2026-08-11): keyed-mutation replay currently materializes per-segment
+      vectors plus a key-token map before compaction into live rows; streaming it means replaying
+      key visibility first (keys plus tombstones only, one bounded pass over key columns) into a
+      typed live-row selection, then feeding the selected base rows through the existing
+      block-aligned resident-window scan. Spilling a join build side means partitioning the build
+      rows by join-key hash into the existing value-carrying spill pages and probing partition by
+      partition — the same shape as the partitioned hash-aggregate spill, reusing its page format
+      and owner leases. Both slot behind `executionMemoryBudgetBytes` exactly like the streamed
+      base scan; unbudgeted plans keep the materialized paths.
 - [x] Add SELECT DISTINCT, HAVING, IN, uncorrelated subqueries, CTEs, derived tables,
       UNION/UNION ALL, and ROW_NUMBER/RANK/DENSE_RANK windows to the SQL surface.
 - [x] Add SQL mutations through execute() with keyed read-then-mutate semantics.
@@ -676,7 +705,7 @@ larger/repeated benchmark tiers remain outstanding.
 - [x] Show optimized `explain()` plans and the checked-in SQL feature matrix in the dashboard.
 - [x] Record whole-agent memory and JavaScript heap for the storage run and for all four compared
       engines, sampled on the main thread.
-- [ ] Add date truncation and `COALESCE` so the monthly cohort and adjustment-burden reference
+- [x] Add date truncation and `COALESCE` so the monthly cohort and adjustment-burden reference
       queries compile; they are the only two the current surface cannot express.
 - [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
 

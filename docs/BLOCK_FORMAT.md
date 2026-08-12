@@ -1,32 +1,36 @@
-# Experimental block format version 0
+# Experimental block format version 1
 
-Version 0 is little-endian and intentionally has no compatibility promise. Callers choose only a
+Version 1 is little-endian and intentionally has no compatibility promise. Callers choose only a
 logical type (`boolean`, `number`, `string`, or `datetime`) and compression. Physical encodings are
 owned by the format implementation.
 
 ## Header
 
-The fixed header is 36 bytes:
+The fixed header is 40 bytes:
 
-| Offset | Width | Field                                      |
-| -----: | ----: | ------------------------------------------ |
-|      0 |     4 | ASCII magic `BRDB`                         |
-|      4 |     2 | format version (`0`)                       |
-|      6 |     2 | header length (`36`)                       |
-|      8 |     1 | logical type ID                            |
-|      9 |     1 | physical encoding ID                       |
-|     10 |     1 | compression ID                             |
-|     11 |     1 | mandatory flags; must be zero              |
-|     12 |     4 | row count                                  |
-|     16 |     4 | null count                                 |
-|     20 |     4 | metadata byte length                       |
-|     24 |     4 | uncompressed encoded byte length           |
-|     28 |     4 | stored payload byte length                 |
-|     32 |     4 | CRC-32 of the uncompressed encoded payload |
+| Offset | Width | Field                                                                  |
+| -----: | ----: | ---------------------------------------------------------------------- |
+|      0 |     4 | ASCII magic `BRDB`                                                     |
+|      4 |     4 | envelope CRC-32 over bytes `[8, header length + metadata byte length)` |
+|      8 |     2 | format version (`1`)                                                   |
+|     10 |     2 | header length (`40`)                                                   |
+|     12 |     1 | logical type ID                                                        |
+|     13 |     1 | physical encoding ID                                                   |
+|     14 |     1 | compression ID                                                         |
+|     15 |     1 | mandatory flags; must be zero                                          |
+|     16 |     4 | row count                                                              |
+|     20 |     4 | null count                                                             |
+|     24 |     4 | metadata byte length                                                   |
+|     28 |     4 | uncompressed encoded byte length                                       |
+|     32 |     4 | stored payload byte length                                             |
+|     36 |     4 | CRC-32 of the uncompressed encoded payload                             |
 
-The header is followed by UTF-8 JSON metadata and then the compressed payload. Decoders validate
-all identifiers, counts, lengths, metadata, decompressed size, and checksum before decoding values.
-The current implementation caps each metadata or payload section at 64 MiB.
+The header is followed by UTF-8 JSON metadata and then the compressed payload. The envelope
+checksum authenticates every header field after itself plus the metadata JSON, so header-only
+readers (zone-map pruning, block inventories) can trust row counts and derived statistics without
+decompressing the payload. Decoders verify the envelope before trusting any field, then validate
+all identifiers, counts, lengths, metadata, decompressed size, and the payload checksum before
+decoding values. The current implementation caps each metadata or payload section at 64 MiB.
 
 ## Logical encodings
 
@@ -42,7 +46,7 @@ users to choose between integer widths or changing the logical `number` type.
 
 The block-format package exposes physical operations for storage rewrites that must avoid
 JavaScript row-object materialization. `decodePhysicalBlock()` decompresses, checksum-verifies, and
-validates a block while retaining its version-zero physical payload. `validatePhysicalColumn()`
+validates a block while retaining its physical payload. `validatePhysicalColumn()`
 checks an uncompressed payload directly. `measurePhysicalColumnRanges()` computes the exact output
 allocation and canonical metadata for half-open row ranges; `buildPhysicalColumnFromRanges()`,
 `slicePhysicalColumn()`, and `concatenatePhysicalColumns()` construct the corresponding bitmaps,

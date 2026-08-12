@@ -84,6 +84,15 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
     }
     return super.updateTransaction(id, expectedRevision, update);
   }
+
+  override async stageTransactionArtifacts(
+    input: Parameters<NonNullable<MemoryBlockStore["stageTransactionArtifacts"]>>[0],
+  ) {
+    if (input.blocks.length > 0) this.blockWriteCalls += 1;
+    const updated = await super.stageTransactionArtifacts(input);
+    this.pendingBlockJournalSizes.push(updated.pendingBlockIds.length);
+    return updated;
+  }
 }
 
 class ReplacementRestageFaultMemoryBlockStore extends CountingMemoryBlockStore {
@@ -4918,6 +4927,47 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   // Full scan over both columns (4 blocks each), minus the score and label blocks already in
   // the decoded-block cache from the pruned queries above.
   expect(store.blockIdsRead.flat()).toHaveLength(6);
+  store.close();
+});
+
+it("indexeddb folds unique-key chunk tails into base records and keeps conflict detection", async () => {
+  const store = await IndexedDbBlockStore.open({
+    name: crypto.randomUUID(),
+    indexedDB: new IDBFactory(),
+  });
+  const database = new MinnowDatabase(store);
+  await database.createTable({
+    name: "folded",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "string" },
+      { name: "value", type: "number" },
+    ],
+  });
+  // 20 single-row commits cross the 16-chunk fold threshold, so early keys live in folded
+  // base records while late keys are still in tail chunks.
+  for (let index = 0; index < 20; index += 1) {
+    await database.insertBatch("folded", [{ id: `key-${String(index)}`, value: index }]);
+  }
+  await expect(database.insertBatch("folded", [{ id: "key-0", value: 99 }])).rejects.toThrow(
+    UniqueConstraintError,
+  );
+  await expect(database.insertBatch("folded", [{ id: "key-19", value: 99 }])).rejects.toThrow(
+    UniqueConstraintError,
+  );
+  // Removal and re-insert cross the fold boundary in both directions.
+  await database.deleteBatch("folded", { keys: ["key-0"] });
+  await database.insertBatch("folded", [{ id: "key-0", value: 100 }]);
+  // Upsert classification sees folded and tail keys alike.
+  const upserted = await database.upsertBatch("folded", [
+    { id: "key-1", value: 200 },
+    { id: "brand-new", value: 1 },
+  ]);
+  expect(upserted).toMatchObject({ insertedRowCount: 1, updatedRowCount: 1 });
+  expect(await database.query("SELECT COUNT(*) AS n FROM folded")).toEqual({
+    columns: ["n"],
+    rows: [{ n: 21 }],
+  });
   store.close();
 });
 

@@ -22,6 +22,7 @@ import {
   type RunGarbageCollectionStepInput,
   type SegmentRecord,
   SnapshotManifestMissingError,
+  type StageTransactionArtifactsInput,
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
@@ -48,6 +49,14 @@ const TABLE_NAME_PREFIX = "table/name/";
 const ROW_ID_PREFIX = "row-id/";
 const UNIQUE_KEY_CHUNK_INDEX = "unique-key-chunk-index";
 const UNIQUE_KEY_CHUNK = "unique-key-chunk";
+const UNIQUE_KEY_BASE = "unique-key-base";
+/**
+ * Tail length at which a commit folds the chunk tail into per-key base records. Appending one
+ * chunk per commit keeps commits O(1), but every lookup must deserialize the whole tail; the
+ * fold bounds that at this many chunk records plus point `getKey` probes against the base,
+ * instead of a scan whose cost grows with every key ever written.
+ */
+const UNIQUE_KEY_TAIL_CHUNK_LIMIT = 16;
 const COMPACTION_JOB_KEY_PREFIX = "compaction-job/";
 const GARBAGE_COLLECTION_JOB_KEY_PREFIX = "garbage-collection-job/";
 const storageTextEncoder = new TextEncoder();
@@ -653,6 +662,67 @@ export class IndexedDbBlockStore implements BlockStore {
     }
   }
 
+  async stageTransactionArtifacts(
+    input: StageTransactionArtifactsInput,
+  ): Promise<TransactionRecord> {
+    const ids = new Set<string>();
+    for (const block of input.blocks) {
+      if (block.id.length === 0) throw new TypeError("Block ID cannot be empty");
+      if (ids.has(block.id)) throw new Error(`Block already exists: ${block.id}`);
+      ids.add(block.id);
+    }
+    const transaction = this.#transaction(["blocks", "segments", "transactions"], "readwrite");
+    try {
+      const transactionStore = transaction.objectStore("transactions");
+      const value: unknown = await requestResult<unknown>(
+        transactionStore.get(input.transactionId),
+      );
+      const current = value === undefined ? undefined : asTransactionRecord(value);
+      if (current?.revision !== input.expectedRevision) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new TransactionRecordConflictError(
+          input.transactionId,
+          input.expectedRevision,
+          current?.revision ?? null,
+        );
+      }
+      const update: TransactionRecordUpdate = {
+        pendingBlockIds: [...current.pendingBlockIds, ...input.blocks.map((block) => block.id)],
+        pendingSegmentIds: [
+          ...current.pendingSegmentIds,
+          ...input.segments.map((segment) => segment.id),
+        ],
+        updatedAt: input.updatedAt,
+      };
+      assertGenericTransactionUpdateAllowed(current, update);
+      const updated = updateTransactionRecord(current, update);
+      // Only previously journaled artifacts need existence probes: the ones added below commit
+      // or fail atomically with the journal update itself.
+      await assertPendingArtifactsAvailableInTransaction(transaction, current);
+      const blockStore = transaction.objectStore("blocks");
+      for (const block of input.blocks) {
+        const bytes =
+          block.bytes.byteOffset === 0 && block.bytes.byteLength === block.bytes.buffer.byteLength
+            ? block.bytes
+            : block.bytes.slice();
+        blockStore.add(bytes, block.id);
+      }
+      const segmentStore = transaction.objectStore("segments");
+      for (const segment of input.segments) {
+        const normalized = normalizeSegmentRecord(segment);
+        segmentStore.add(normalized, normalized.id);
+      }
+      transactionStore.put(updated, input.transactionId);
+      await transactionDone(transaction);
+      return structuredClone(updated);
+    } catch (error) {
+      abortIfActive(transaction);
+      await ignoreAbort(transaction);
+      throw error;
+    }
+  }
+
   async commitTransaction(input: CommitTransactionInput): Promise<Manifest> {
     const transaction = this.#transaction(
       ["blocks", "catalog", "manifests", "transactions", "segments"],
@@ -830,11 +900,31 @@ export class IndexedDbBlockStore implements BlockStore {
               : [],
         };
         if (chunk.addedTokens.length > 0 || chunk.removedTokens.length > 0) {
-          catalog.put(chunk, uniqueKeyChunkKey(uniqueKeyChanges.tableId, manifest.version));
-          catalog.put(
-            [...(chunkState?.versions ?? []), manifest.version],
-            uniqueKeyChunkIndexKey(uniqueKeyChanges.tableId),
-          );
+          const tableId = uniqueKeyChanges.tableId;
+          const index = chunkState?.index ?? { versions: [], hasBase: false };
+          if (index.versions.length + 1 > UNIQUE_KEY_TAIL_CHUNK_LIMIT) {
+            // Fold the tail plus this commit's changes into per-key base records, atomically
+            // with the manifest publication. Chunks replay in commit order so later removals
+            // and re-adds land on the final state.
+            for (const tail of [...(chunkState?.chunks ?? []), chunk]) {
+              for (const token of tail.addedTokens) {
+                catalog.put(manifest.version, uniqueKeyBaseKey(tableId, token));
+              }
+              for (const token of tail.removedTokens) {
+                catalog.delete(uniqueKeyBaseKey(tableId, token));
+              }
+            }
+            for (const version of index.versions) {
+              catalog.delete(uniqueKeyChunkKey(tableId, version));
+            }
+            catalog.put({ versions: [], hasBase: true }, uniqueKeyChunkIndexKey(tableId));
+          } else {
+            catalog.put(chunk, uniqueKeyChunkKey(tableId, manifest.version));
+            catalog.put(
+              { versions: [...index.versions, manifest.version], hasBase: index.hasBase },
+              uniqueKeyChunkIndexKey(tableId),
+            );
+          }
         }
       } else {
         uniqueKeyChanges.keyTokens.forEach((token) => {
@@ -2064,30 +2154,70 @@ function uniqueKeyChunkKey(tableId: string, version: number): IDBValidKey {
   return [UNIQUE_KEY_CHUNK, tableId, version];
 }
 
+function uniqueKeyBaseKey(tableId: string, keyToken: string): IDBValidKey {
+  return [UNIQUE_KEY_BASE, tableId, keyToken];
+}
+
+/**
+ * Resolves which of the requested tokens exist: point probes against the folded base records,
+ * then the bounded chunk tail applied in commit order (an add in a later chunk revives a token
+ * a base fold removed, a removal hides a base token). The full tail chunks return with the
+ * answer so a folding commit can replay them without re-reading.
+ */
+interface UniqueKeyChunkIndex {
+  versions: number[];
+  /** True once a fold has written per-key base records; probes skip them until then. */
+  hasBase: boolean;
+}
+
+/** Accepts the legacy bare-array shape (tail only, no base) and the current object shape. */
+function asUniqueKeyChunkIndex(value: unknown): UniqueKeyChunkIndex {
+  const versionsOf = (candidate: unknown): number[] =>
+    Array.isArray(candidate)
+      ? candidate.filter((entry): entry is number => Number.isSafeInteger(entry))
+      : [];
+  if (Array.isArray(value)) return { versions: versionsOf(value), hasBase: false };
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return { versions: versionsOf(record.versions), hasBase: record.hasBase === true };
+  }
+  return { versions: [], hasBase: false };
+}
+
 async function readChunkedUniqueKeys(
   store: IDBObjectStore,
   tableId: string,
   requestedTokens: readonly string[],
-): Promise<{ existing: Set<string>; versions: number[] }> {
-  const rawVersions: unknown = await requestResult(store.get(uniqueKeyChunkIndexKey(tableId)));
-  const versions = Array.isArray(rawVersions)
-    ? rawVersions.filter((value): value is number => Number.isSafeInteger(value))
-    : [];
-  const chunks = await Promise.all(
-    versions.map((version) =>
-      requestResult<unknown>(store.get(uniqueKeyChunkKey(tableId, version))),
+): Promise<{ existing: Set<string>; index: UniqueKeyChunkIndex; chunks: UniqueKeyChunk[] }> {
+  const rawIndex: unknown = await requestResult(store.get(uniqueKeyChunkIndexKey(tableId)));
+  const index = asUniqueKeyChunkIndex(rawIndex);
+  const [chunkValues, baseKeys] = await Promise.all([
+    Promise.all(
+      index.versions.map((version) =>
+        requestResult<unknown>(store.get(uniqueKeyChunkKey(tableId, version))),
+      ),
     ),
-  );
+    index.hasBase
+      ? Promise.all(
+          requestedTokens.map((token) =>
+            requestResult(store.getKey(uniqueKeyBaseKey(tableId, token))),
+          ),
+        )
+      : Promise.resolve([]),
+  ]);
   const requested = new Set(requestedTokens);
   const existing = new Set<string>();
-  for (const value of chunks) {
-    const chunk = asUniqueKeyChunk(value);
+  requestedTokens.forEach((token, position) => {
+    if (baseKeys[position] !== undefined) existing.add(token);
+  });
+  const chunks = chunkValues.map(asUniqueKeyChunk);
+  for (const chunk of chunks) {
     for (const token of chunk.addedTokens) {
       if (requested.has(token)) existing.add(token);
     }
     for (const token of chunk.removedTokens) existing.delete(token);
   }
-  return { existing, versions };
+  return { existing, index, chunks };
 }
 
 function asUniqueKeyChunk(value: unknown): UniqueKeyChunk {

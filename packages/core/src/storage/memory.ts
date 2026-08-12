@@ -21,6 +21,7 @@ import {
   type RunGarbageCollectionStepInput,
   type SegmentRecord,
   SnapshotManifestMissingError,
+  type StageTransactionArtifactsInput,
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
@@ -425,6 +426,53 @@ export class MemoryBlockStore implements BlockStore {
         update.pendingSegmentIds !== undefined,
       );
       this.#transactions.set(id, updated);
+      return structuredClone(updated);
+    });
+  }
+
+  async stageTransactionArtifacts(
+    input: StageTransactionArtifactsInput,
+  ): Promise<TransactionRecord> {
+    return this.#runAtomic(() => {
+      const ids = new Set<string>();
+      for (const block of input.blocks) {
+        validateId(block.id);
+        if (ids.has(block.id) || this.#blocks.has(block.id)) {
+          throw new Error(`Block already exists: ${block.id}`);
+        }
+        ids.add(block.id);
+      }
+      for (const segment of input.segments) {
+        if (this.#segments.has(segment.id)) {
+          throw new Error(`Segment already exists: ${segment.id}`);
+        }
+      }
+      const current = this.#transactions.get(input.transactionId);
+      if (current?.revision !== input.expectedRevision) {
+        throw new TransactionRecordConflictError(
+          input.transactionId,
+          input.expectedRevision,
+          current?.revision ?? null,
+        );
+      }
+      const update: TransactionRecordUpdate = {
+        pendingBlockIds: [...current.pendingBlockIds, ...input.blocks.map((block) => block.id)],
+        pendingSegmentIds: [
+          ...current.pendingSegmentIds,
+          ...input.segments.map((segment) => segment.id),
+        ],
+        updatedAt: input.updatedAt,
+      };
+      assertGenericTransactionUpdateAllowed(current, update);
+      const updated = updateTransactionRecord(current, update);
+      // Only previously journaled artifacts need existence checks; the new ones land with the
+      // journal update in this same atomic step.
+      assertPendingArtifactsAvailable(current, this.#blocks, this.#segments, true, true);
+      for (const block of input.blocks) this.#blocks.set(block.id, new Uint8Array(block.bytes));
+      for (const segment of input.segments) {
+        this.#segments.set(segment.id, normalizeSegmentRecord(segment));
+      }
+      this.#transactions.set(input.transactionId, updated);
       return structuredClone(updated);
     });
   }
