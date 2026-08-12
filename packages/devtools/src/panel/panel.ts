@@ -11,12 +11,20 @@ import {
   type Size,
 } from "./window.js";
 
+export interface PanelView {
+  id: string;
+  label: string;
+  node: HTMLElement;
+  /** Called the first time the view is shown, for work worth deferring until then. */
+  onFirstShow?(): void;
+}
+
 export interface PanelDeps {
   options: ResolvedDevtoolsOptions;
   /** Shown as a badge, so a query that freezes the page explains itself. */
   offMainThread: boolean;
-  /** The view filling the panel below the title bar. */
-  content: HTMLElement;
+  /** The views the panel switches between, in tab order. The first one starts selected. */
+  views: readonly PanelView[];
   /** The confirmation layer, stacked above the content inside the panel. */
   overlay: HTMLElement;
   onClose(): void;
@@ -74,10 +82,41 @@ export function createPanel(deps: PanelDeps): Panel {
     ? "Statements that change data run after you confirm them."
     : "permissions.write is off; statements that change data are refused.";
 
+  const shown = new Set<string>();
+  const tabs = el("div", { class: "tabs", attrs: { role: "tablist" } });
+  const buttons = deps.views.map((view) => {
+    const tab = el("button", {
+      class: "tab",
+      type: "button",
+      text: view.label,
+      attrs: { role: "tab", "aria-selected": "false" },
+    });
+    tab.addEventListener("click", () => {
+      select(view.id);
+    });
+    return tab;
+  });
+  tabs.append(...buttons);
+
+  /** Only the selected view is in the layout; the others keep their state but take no space. */
+  function select(id: string): void {
+    deps.views.forEach((view, index) => {
+      const active = view.id === id;
+      view.node.hidden = !active;
+      buttons[index]?.classList.toggle("on", active);
+      buttons[index]?.setAttribute("aria-selected", String(active));
+      if (active && !shown.has(view.id)) {
+        shown.add(view.id);
+        view.onFirstShow?.();
+      }
+    });
+  }
+
   const close = iconButton("winbtn", "Close devtools", icons.close);
   const titlebar = el("div", { class: "titlebar" }, [
     el("span", { class: "mark" }, [icon(icons.fish)]),
     title,
+    tabs,
     el("span", { class: "spacer" }),
     threadBadge,
     writeBadge,
@@ -87,7 +126,7 @@ export function createPanel(deps: PanelDeps): Panel {
   const grip = el("span", { class: "grip", attrs: { "aria-hidden": "true" } }, [icon(icons.grip)]);
   const node = el("div", { class: `panel ${floating ? "floating" : "inline"}` }, [
     titlebar,
-    deps.content,
+    ...deps.views.map((view) => view.node),
     deps.overlay,
   ]);
   if (floating) node.append(grip);
@@ -188,6 +227,7 @@ export function createPanel(deps: PanelDeps): Panel {
     schedulePaint();
   };
   window.addEventListener("resize", onWindowResize);
+  select(deps.views[0]?.id ?? "");
 
   return {
     node,

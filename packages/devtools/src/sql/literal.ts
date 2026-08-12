@@ -1,0 +1,94 @@
+import type { QueryValue } from "@minnowdb/core";
+
+/** The four logical column types, mirrored from the catalog. */
+export type ColumnType = "boolean" | "number" | "string" | "datetime";
+
+/**
+ * The engine has no bound parameters, so every filter value the explorer sends is text inside the
+ * statement. This module is the only place that turns a value into that text; nothing else in the
+ * package concatenates a value into SQL. Keeping it in one tested function is what stops an
+ * apostrophe in a name from turning into a syntax error — or into a different query.
+ */
+export function sqlLiteral(value: QueryValue, type: ColumnType): string {
+  if (value === null) return "NULL";
+  switch (type) {
+    case "string":
+      return quoteString(String(value));
+    case "number": {
+      const numeric = typeof value === "number" ? value : Number(value);
+      if (!Number.isFinite(numeric)) {
+        throw new TypeError(`Not a finite number: ${String(value)}`);
+      }
+      return String(numeric);
+    }
+    case "boolean":
+      return value === true || value === "true" || value === 1 ? "TRUE" : "FALSE";
+    case "datetime":
+      return `DATE ${quoteString(toDateOnly(value))}`;
+  }
+}
+
+/** SQL escapes a quote by doubling it; there is no backslash escape to worry about. */
+function quoteString(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+/**
+ * `DATE '2026-08-12'` is the only datetime literal the engine parses — it appends midnight UTC
+ * itself and rejects anything carrying a time. Comparisons against a datetime column are therefore
+ * day-granular, which callers must account for rather than discover.
+ */
+export function toDateOnly(value: QueryValue): string {
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (!Number.isFinite(date.getTime())) throw new TypeError(`Not a date: ${String(value)}`);
+  return date.toISOString().slice(0, 10);
+}
+
+/** Whether a cursor can address this type exactly. Day-granular datetimes cannot. */
+export function isExactlyComparable(type: ColumnType): boolean {
+  return type !== "datetime";
+}
+
+const identifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function checkName(kind: string, name: string): string {
+  if (!identifier.test(name)) throw new TypeError(`Unsupported ${kind} name: ${name}`);
+  return name;
+}
+
+/**
+ * A column inside WHERE, always qualified. The engine has no quoted identifiers, so a column named
+ * after a keyword — `case`, `when` — only parses with its table in front of it; qualifying every
+ * column means the explorer never has to know which names are special.
+ */
+export function sqlColumn(table: string, column: string): string {
+  return `${checkName("table", table)}.${checkName("column", column)}`;
+}
+
+/**
+ * A column inside ORDER BY, never qualified.
+ *
+ * ORDER BY resolves against the output aliases of the select, and `SELECT *` emits them
+ * unqualified. A qualified reference matches nothing there — and the engine does not reject it,
+ * it returns the rows unordered. Sorting therefore has to use bare names, and the safety
+ * qualifying bought in WHERE is not available here.
+ */
+export function sqlOrderColumn(column: string): string {
+  return checkName("column", column);
+}
+
+/**
+ * Words the expression parser claims before it can see a column of the same name. Only names that
+ * are special on their own matter: a column called `count` or `date` parses fine in ORDER BY,
+ * because those forms need a `(` or a string after them, and ORDER BY never supplies one.
+ */
+const reservedBareWords = new Set(["case", "not", "true", "false", "null", "exists"]);
+
+/**
+ * Whether a column can be sorted on at all. One named `case` cannot: bare, the parser reads it as
+ * the start of a CASE expression, and qualified, ORDER BY silently ignores it. Refusing to sort is
+ * the only honest answer — the alternative is rows in an order nobody asked for.
+ */
+export function isSortable(column: string): boolean {
+  return identifier.test(column) && !reservedBareWords.has(column.toLowerCase());
+}

@@ -15,6 +15,9 @@ if (import.meta.env.DEV) mountMinnowDevtools(db);
 
 A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
 
+- **Browse your data** — tables and columns down the left, a windowed grid on the right with
+  sortable headers and typed filters. Rows load as you scroll, by cursor rather than offset
+  wherever the table allows it, so reading deep into a table stays as fast as reading the start.
 - **Attaches to what you already have** — a `MinnowDatabase`, a `MinnowDatabaseClient`, or the
   `Minnow` facade over either.
 - **Framework-agnostic** — also ships as `<minnow-devtools>`, a custom element with a shadow root,

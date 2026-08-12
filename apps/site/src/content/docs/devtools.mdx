@@ -65,6 +65,31 @@ The database is a property rather than an attribute, because it is an object.
 | `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                   |
 | `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                   |
 
+## Browsing data
+
+The **Data** tab lists your tables down the left, each expanding to its columns with their types,
+nullability, and which one is the unique key. Pick a table to browse it.
+
+**Sorting.** Click a column header to sort ascending, again for descending, again to return to the
+table's own order. The unique key is appended to every sort, so rows with equal values keep a
+stable order instead of shuffling between pages.
+
+**Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `<`, `≤`, `>`, `≥`, `like`, `in`,
+`between`, `is null`, `is not null`, offered per column type. Values are converted to the column's
+type before they reach SQL, so `score > 10` compares numbers. Filters combine with AND.
+
+**Paging.** Rows load as you scroll. Where it can, the explorer asks for "the rows after the last
+one I saw" rather than "skip the first N", so reading deep into a table costs the same as reading
+the start of it. The status bar always says which it is using.
+
+A cursor needs a total order it can address exactly, so the explorer counts from the start instead
+when the table has no unique key, when the sort column is nullable (no comparison matches NULL), or
+when it is a datetime (the engine's date literals carry no time of day). Both give the same rows;
+one just gets slower the further in you go.
+
+**Counting.** `COUNT(*)` scans the whole table, so it runs alongside the first page rather than
+delaying it. Until it lands, the status bar says how many rows are loaded.
+
 ## The window
 
 It is a window, not a modal. There is no backdrop over your page and no focus trap — the app
@@ -79,7 +104,7 @@ Two badges in the title bar say what you are working with:
 
 ## Running statements
 
-`Cmd/Ctrl + Enter` runs. Queries return rows; anything that changes data is described and confirmed
+The **Query** tab is a SQL console over the same database. `Cmd/Ctrl + Enter` runs. Queries return rows; anything that changes data is described and confirmed
 first:
 
 - The prompt names the table, the operation, and the statement itself before it runs.

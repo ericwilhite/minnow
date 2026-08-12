@@ -1,5 +1,6 @@
 import { createConfirmLayer } from "./confirm.js";
 import { createConsole } from "./console.js";
+import { createExplorer } from "./explorer/explorer.js";
 import { matchesHotkey } from "./hotkey.js";
 import { resolveOptions, type DevtoolsOptions } from "./options.js";
 import { createLauncher } from "./panel/launcher.js";
@@ -48,6 +49,7 @@ export function createDevtools(
   adoptStyles(root);
 
   const confirm = createConfirmLayer();
+  const explorer = createExplorer(target);
   const view = createConsole({
     target,
     confirm,
@@ -57,7 +59,18 @@ export function createDevtools(
   const panel = createPanel({
     options: resolved,
     offMainThread: runsOffMainThread(target),
-    content: view.node,
+    views: [
+      {
+        id: "data",
+        label: "Data",
+        node: explorer.node,
+        // The catalog is only read once the tab is actually looked at.
+        onFirstShow: () => {
+          void explorer.refresh();
+        },
+      },
+      { id: "query", label: "Query", node: view.node },
+    ],
     overlay: confirm.node,
     onClose: () => {
       close();

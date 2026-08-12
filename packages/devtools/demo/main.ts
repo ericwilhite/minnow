@@ -41,6 +41,50 @@ await db
   ])
   .execute();
 
+/**
+ * A wide, keyless table and a big keyed one, so the explorer's two hard cases — no cursor to page
+ * with, and far more rows than fit in the DOM — are both reachable from the demo.
+ */
+const wideColumns = Array.from({ length: 40 }, (_, index) => ({
+  name: `metric_${String(index).padStart(2, "0")}`,
+  type: "number" as const,
+}));
+await database.createTable({
+  name: "readings",
+  columns: [{ name: "sensor", type: "string" }, ...wideColumns],
+});
+
+const bulk = Number(new URLSearchParams(location.search).get("rows") ?? "20000");
+await database.createTable({
+  name: "events",
+  uniqueKey: "event_id",
+  columns: [
+    { name: "event_id", type: "number" },
+    { name: "kind", type: "string" },
+    { name: "amount", type: "number" },
+    { name: "note", type: "string", nullable: true },
+    { name: "at", type: "datetime" },
+  ],
+});
+const kinds = ["created", "paid", "shipped", "refunded", "cancelled"];
+const writer = database.bufferedWriter("events", { maxRows: 5000 });
+for (let index = 0; index < bulk; index += 1) {
+  await writer.add({
+    event_id: index,
+    kind: kinds[index % kinds.length] ?? "created",
+    amount: Math.round((index % 997) * 13.5 * 100) / 100,
+    note: index % 11 === 0 ? null : `note ${String(index % 250)}`,
+    at: new Date(Date.UTC(2026, 0, 1 + (index % 28))),
+  });
+}
+await writer.close();
+
+for (let index = 0; index < 200; index += 1) {
+  const row: Record<string, number | string> = { sensor: `sensor ${String(index % 12)}` };
+  for (const column of wideColumns) row[column.name] = Math.round(Math.sin(index) * 1000) / 10;
+  await database.insert("readings", row);
+}
+
 // Attaching the facade proves the driver accessor: the panel unwraps it to the database itself.
 const devtools = mountMinnowDevtools(db, {
   corner: "bottom-right",
