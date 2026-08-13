@@ -117,6 +117,17 @@
       "example": "SELECT region, COUNT(*) AS count FROM rows GROUP BY region"
     },
     {
+      "id": "group-by.rollup",
+      "status": "supported",
+      "example": "SELECT region, SUM(amount) AS total FROM rows GROUP BY ROLLUP(region)",
+      "notes": "ROLLUP/CUBE/GROUPING SETS desugar into a UNION ALL of grouped blocks. The GROUPING() marker is deliberately unsupported, so rollup NULLs and data NULLs are indistinguishable. SQLite itself has none of these."
+    },
+    {
+      "id": "group-by.grouping-sets",
+      "status": "supported",
+      "example": "SELECT region, active, COUNT(*) AS c FROM rows GROUP BY GROUPING SETS ((region), (active), ())"
+    },
+    {
       "id": "having",
       "status": "supported",
       "example": "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING COUNT(*) > 1"
@@ -255,6 +266,24 @@
       "notes": "Null-safe: NULL is not distinct from NULL."
     },
     {
+      "id": "predicate.boolean-test",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE active IS TRUE OR active IS UNKNOWN",
+      "notes": "IS [NOT] TRUE/FALSE/UNKNOWN never return UNKNOWN; they desugar to null-safe comparisons."
+    },
+    {
+      "id": "predicate.like-escape",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region LIKE 'we!%st' ESCAPE '!' OR region LIKE 'we%'",
+      "notes": "ESCAPE makes the next pattern character literal, wildcards included."
+    },
+    {
+      "id": "predicate.quantified",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount > ALL (SELECT amount FROM dims)",
+      "notes": "ANY/SOME/ALL with full three-valued logic; correlated forms are rejected. SQLite itself has no quantified comparisons."
+    },
+    {
       "id": "predicate.ilike",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region ILIKE 'WE%'",
@@ -284,6 +313,12 @@
       "id": "where.between",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount BETWEEN 1 AND 5"
+    },
+    {
+      "id": "where.between-symmetric",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE amount BETWEEN SYMMETRIC 5 AND 1",
+      "notes": "SYMMETRIC accepts the bounds in either order."
     },
     {
       "id": "where.is-null",
@@ -343,6 +378,12 @@
       "status": "supported",
       "example": "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM rows UNION ALL SELECT v + 1 FROM n WHERE v < 6) SELECT v FROM n",
       "notes": "Linear delta recursion with UNION or UNION ALL, capped at 10,000 iterations and 1,000,000 rows. Plain WITH still rejects self-references."
+    },
+    {
+      "id": "mutation.with-cte",
+      "status": "supported",
+      "example": "WITH totals AS (SELECT MAX(score) AS top FROM keyed) DELETE FROM keyed WHERE score >= (SELECT top FROM totals) RETURNING name",
+      "notes": "WITH precedes INSERT/UPDATE/DELETE; the CTEs are visible to the statement's queries and subqueries."
     },
     {
       "id": "set.intersect",
@@ -436,11 +477,23 @@
       "example": "SELECT 1 + 1 AS two, UPPER('minnow') AS name"
     },
     {
+      "id": "select.values",
+      "status": "supported",
+      "example": "SELECT v.column1 AS n, v.column2 AS tag FROM (VALUES (1, 'one'), (2, 'two')) v",
+      "notes": "VALUES works standalone, as a set-operation member, and as a derived table with AS alias(col, ...) renaming; columns default to column1..columnN."
+    },
+    {
       "id": "limit.parameter",
       "status": "supported",
       "example": "SELECT region, amount FROM rows ORDER BY region NULLS LAST, amount LIMIT $1 OFFSET $2",
       "params": [2, 1],
       "notes": "LIMIT and OFFSET take placeholders; the plan re-binds per execution like any parameter."
+    },
+    {
+      "id": "limit.fetch-first",
+      "status": "supported",
+      "example": "SELECT amount FROM rows ORDER BY amount OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY",
+      "notes": "The standard fetch clause is a spelling of LIMIT; SQLite itself only speaks LIMIT."
     },
     {
       "id": "offset.standalone",

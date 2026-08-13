@@ -80,6 +80,83 @@ const themes = { light: "github-light", dark: "github-dark" } as const;
       ))
     }
   </div>
+
+  <h2 id="deliberate-omissions">Deliberate omissions</h2>
+  <p>
+    Minnow targets SQL:2016 wherever the standard makes sense inside a browser worker. The
+    features below are omitted on purpose — each is a consequence of the runtime or the engine's
+    design, not an oversight. Everything here fails with an explicit error if you write it.
+  </p>
+
+  <h3>Because the browser is the runtime</h3>
+  <ul>
+    <li>
+      <strong>Access control</strong> (roles, GRANT/REVOKE, row-level security) — a Minnow
+      database lives inside one origin's storage and is reachable only by that origin's code. The
+      browser sandbox is the security boundary; SQL-level identity would be theater.
+    </li>
+    <li>
+      <strong>Sessions, connections, and cursors</strong> — there is one engine in one worker.
+      Queries return complete results over immutable snapshots; there is no connection to hold a
+      cursor open on.
+    </li>
+    <li>
+      <strong>Isolation levels</strong> (SET TRANSACTION ISOLATION LEVEL) — every read is
+      snapshot-isolated and writes serialize through MVCC commit. There is no weaker level to
+      opt into, so the knob does not exist.
+    </li>
+    <li>
+      <strong>Session time zones</strong> (SET TIME ZONE, AT TIME ZONE) — datetimes are stored
+      and computed as UTC instants. A session time zone would make the same query return
+      different rows on different machines, which an offline-capable local database cannot
+      tolerate. Convert for display in your UI layer.
+    </li>
+    <li>
+      <strong>Locale collation</strong> (COLLATE) — strings compare and sort in codepoint order,
+      identically in every browser. Locale-aware collation would bundle ICU tables or depend on
+      host-locale behavior that differs across devices; use the client layer for display sorting.
+    </li>
+    <li>
+      <strong>Stored procedures, SQL/PSM, and user-defined functions</strong> — the language for
+      extending Minnow is JavaScript, in the same process, with types. Registering JS functions
+      into SQL would make query results depend on code the engine cannot snapshot or replay.
+    </li>
+    <li>
+      <strong>Triggers</strong> — trigger logic would run per-tab in whichever tab happened to
+      write, which is exactly the class of bug live queries exist to avoid. Subscribe to a live
+      query and react in application code instead.
+    </li>
+    <li>
+      <strong>SQL-level BEGIN/COMMIT/SAVEPOINT</strong> — transactions are the engine's
+      programmatic API, and each SQL statement is atomic. Holding an open interactive
+      transaction across await points in a browser tab (which can be frozen or killed at any
+      moment) invites lost work; the engine's write path is designed around that reality.
+    </li>
+  </ul>
+
+  <h3>Engine-design decisions</h3>
+  <ul>
+    <li>
+      <strong>Keyless UPDATE/DELETE</strong> — mutation segments address rows by unique key;
+      tables without one are append-only by construction.
+    </li>
+    <li>
+      <strong>Correlated NOT IN and non-equality correlation</strong> — correlated subqueries
+      decorrelate into joins at compile time, which requires equality keys; NOT IN's NULL
+      semantics cannot survive that rewrite. NOT EXISTS expresses the same intent.
+    </li>
+    <li>
+      <strong>GROUPING()</strong> — ROLLUP/CUBE/GROUPING SETS desugar into unions, so the
+      grouping marker has nothing to read; rollup NULLs and data NULLs are indistinguishable.
+    </li>
+  </ul>
+
+  <h3>Not yet, rather than never</h3>
+  <p>
+    MERGE (ON CONFLICT covers upserting), LATERAL, SQL/JSON functions, and named WINDOW clauses
+    have no browser-shaped reason to be missing — they are simply not built yet, and each rejects
+    with an explicit error today.
+  </p>
 </Docs>
 
 <style>

@@ -124,6 +124,38 @@ calls reuse it. The supported and rejected surface is checked in at
 entry and a conformance test that keeps it honest. **Unsupported syntax fails explicitly** rather
 than being silently reinterpreted.
 
+#### Deliberate omissions from the SQL standard
+
+Minnow targets SQL:2016 wherever it makes sense inside a browser worker. Some parts of the
+standard do not, and those are decisions, not gaps — the
+[full list with reasons](https://minnowdb.dev/docs/sql/#deliberate-omissions) is part of the docs.
+The short version:
+
+- **No access control, roles, or GRANT** — the browser origin sandbox is the security boundary;
+  there is exactly one "user".
+- **No sessions, cursors, or isolation-level selection** — every read is a stable snapshot and
+  writes serialize through MVCC; there is no weaker level to select.
+- **No session time zones** — datetimes are UTC instants, always, so a query returns the same
+  rows on every machine.
+- **No locale collation** — strings compare in codepoint order in every browser; locale-aware
+  ordering would ship ICU tables and make results depend on the host locale.
+- **No stored procedures, UDFs, or triggers** — extensibility lives in JavaScript around the
+  engine, and reactivity is what live queries are for.
+- **SQL-level `BEGIN`/`COMMIT` stays out** — transactions are the engine's programmatic API;
+  statements are individually atomic.
+
+Everything else in the standard that is missing (MERGE, LATERAL, `GROUPING()`, SQL/JSON) is
+catalogued as not-yet-implemented rather than never, and rejects with an explicit error.
+
+#### Performance
+
+A checked-in performance gate (`npm run test:perf`) times a seeded 200k-row suite on the full
+Minnow pipeline against native SQLite (`node:sqlite`) and fails on regression past the recorded
+per-query ratios in [`perf-baseline.json`](packages/core/perf-baseline.json). Scans, grouped and
+DISTINCT aggregation, and windows currently run 2–7× faster than native SQLite; top-N ordering
+is the one query class still behind it (about 1.5×, and ahead of the Wasm SQLite builds browsers
+actually run — the in-browser comparison lives on the bench site).
+
 ### Full-text search
 
 Any column is searchable — no index DDL, no schema marking. A search treats the row as one

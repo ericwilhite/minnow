@@ -15,8 +15,10 @@ import {
   distinctFromComparison,
   explicitNullOrder,
   isScalarFunctionName,
-  likeRegExp,
+  likeMatches,
   orderOutputName,
+  parseQuantified,
+  quantifiedComparison,
   scalarFunctionValue,
 } from "./query.js";
 import {
@@ -174,6 +176,7 @@ type BoundExpression =
       operator: PredicateOperator;
       left: BoundExpression;
       right: BoundExpression;
+      escape?: string;
       signature: string;
     }
   | {
@@ -237,8 +240,11 @@ interface BoundPredicate {
   readonly left: BoundExpression;
   readonly operator: PredicateOperator;
   readonly right: BoundExpression;
+  readonly escape?: string;
   /** Dictionary-code rewrite for string equality against a literal; codes compare per row. */
   readonly dictionaryEquality?: DictionaryEquality;
+  /** Dictionary-level LIKE against a literal pattern: one match pass per dictionary. */
+  readonly dictionaryLike?: DictionaryLike;
 }
 
 interface DictionaryEquality {
@@ -247,6 +253,16 @@ interface DictionaryEquality {
   readonly value: string;
   readonly negated: boolean;
   readonly cache: { dictionary: readonly string[] | undefined; code: number };
+}
+
+interface DictionaryLike {
+  readonly source: number;
+  readonly vector: StringVector;
+  readonly pattern: string;
+  readonly caseInsensitive: boolean;
+  readonly escape?: string;
+  readonly negated: boolean;
+  readonly cache: { dictionary: readonly string[] | undefined; matches: Uint8Array };
 }
 
 interface BoundJoin {
@@ -590,9 +606,12 @@ function bindPlan(
       left: bind(predicate.left),
       operator: predicate.operator,
       right: bind(predicate.right),
+      ...(predicate.escape === undefined ? {} : { escape: predicate.escape }),
     };
     const dictionaryEquality = detectDictionaryEquality(bound);
-    return dictionaryEquality === undefined ? bound : { ...bound, dictionaryEquality };
+    if (dictionaryEquality !== undefined) return { ...bound, dictionaryEquality };
+    const dictionaryLike = detectDictionaryLike(bound);
+    return dictionaryLike === undefined ? bound : { ...bound, dictionaryLike };
   });
   const having = plan.having.map((predicate) => ({
     left: bind(predicate.left),
@@ -836,6 +855,9 @@ function bindExpression(
         ftsBySignature,
         ftsStats,
       ),
+      ...(expression.kind === "condition" && expression.escape !== undefined
+        ? { escape: expression.escape }
+        : {}),
       signature,
     } as BoundExpression;
   }
@@ -3116,6 +3138,38 @@ function detectDictionaryEquality(predicate: BoundPredicate): DictionaryEquality
   return undefined;
 }
 
+/** Detects `stringColumn LIKE 'literal'` (and NOT/ILIKE) for dictionary-level matching. */
+function detectDictionaryLike(predicate: BoundPredicate): DictionaryLike | undefined {
+  const operator = predicate.operator;
+  if (
+    operator !== "LIKE" &&
+    operator !== "NOT LIKE" &&
+    operator !== "ILIKE" &&
+    operator !== "NOT ILIKE"
+  ) {
+    return undefined;
+  }
+  const column = predicate.left;
+  const literal = predicate.right;
+  if (
+    column.kind !== "column" ||
+    column.vector.kind !== "string" ||
+    literal.kind !== "literal" ||
+    typeof literal.value !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    source: column.source,
+    vector: column.vector,
+    pattern: literal.value,
+    caseInsensitive: operator === "ILIKE" || operator === "NOT ILIKE",
+    ...(predicate.escape === undefined ? {} : { escape: predicate.escape }),
+    negated: operator === "NOT LIKE" || operator === "NOT ILIKE",
+    cache: { dictionary: undefined, matches: new Uint8Array(0) },
+  };
+}
+
 function stringCodeAt(vector: StringVector, rowIndex: number): number | undefined {
   if (rowIndex < 0 || rowIndex >= vector.length) return undefined;
   const window = vector.window;
@@ -3188,6 +3242,20 @@ function booleanTruth(
       if (sawNull) return null;
       return operator === "NOT IN";
     }
+    {
+      const quantified = parseQuantified(operator);
+      if (quantified !== undefined) {
+        if (expression.right.kind !== "list") {
+          throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
+        }
+        return quantifiedComparison(
+          quantified.comparison,
+          quantified.quantifier,
+          evaluateValue(expression.left),
+          expression.right.items.map((item) => evaluateValue(item)),
+        );
+      }
+    }
     if (
       operator === "LIKE" ||
       operator === "NOT LIKE" ||
@@ -3202,8 +3270,11 @@ function booleanTruth(
       if (typeof value !== "string" || typeof pattern !== "string") {
         throw new TypeError("LIKE requires string operands");
       }
-      const matched = likeRegExp(pattern, operator === "ILIKE" || operator === "NOT ILIKE").test(
+      const matched = likeMatches(
+        pattern,
         value,
+        operator === "ILIKE" || operator === "NOT ILIKE",
+        expression.escape,
       );
       return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
     }
@@ -3234,7 +3305,12 @@ function booleanTruth(
 }
 
 function predicateTruth(
-  predicate: { left: BoundExpression; operator: PredicateOperator; right: BoundExpression },
+  predicate: {
+    left: BoundExpression;
+    operator: PredicateOperator;
+    right: BoundExpression;
+    escape?: string;
+  },
   evaluateValue: (expression: BoundExpression) => unknown,
 ): boolean {
   if (predicate.operator === "IS TRUE") {
@@ -3247,6 +3323,7 @@ function predicateTruth(
         operator: predicate.operator,
         left: predicate.left,
         right: predicate.right,
+        ...(predicate.escape === undefined ? {} : { escape: predicate.escape }),
         signature: "",
       },
       evaluateValue,
@@ -3271,10 +3348,30 @@ function evaluateBatchPredicate(
     const matches = fast.cache.code >= 0 && code === fast.cache.code;
     return fast.negated ? !matches : matches;
   }
+  const like = predicate.dictionaryLike;
+  if (like !== undefined) {
+    const code = stringCodeAt(like.vector, batch.rowsBySource[like.source]?.[row] ?? -1);
+    if (code === undefined) return false;
+    if (like.cache.dictionary !== like.vector.dictionary) {
+      like.cache.dictionary = like.vector.dictionary;
+      const matches = new Uint8Array(like.vector.dictionary.length);
+      like.vector.dictionary.forEach((entry, index) => {
+        matches[index] = likeMatches(like.pattern, entry, like.caseInsensitive, like.escape)
+          ? 1
+          : 0;
+      });
+      like.cache.matches = matches;
+    }
+    const matched = like.cache.matches[code] === 1;
+    return like.negated ? !matched : matched;
+  }
   if (
     predicate.operator === "IS TRUE" ||
     predicate.operator === "LIKE" ||
-    predicate.operator === "NOT LIKE"
+    predicate.operator === "NOT LIKE" ||
+    predicate.operator === "ILIKE" ||
+    predicate.operator === "NOT ILIKE" ||
+    parseQuantified(predicate.operator) !== undefined
   ) {
     return predicateTruth(predicate, (nested) => evaluateBatchExpression(plan, nested, batch, row));
   }
@@ -3481,8 +3578,10 @@ function comparisonValue(
     if (typeof leftValue !== "string" || typeof rightValue !== "string") {
       throw new TypeError("LIKE requires string operands");
     }
-    const matched = likeRegExp(rightValue, operator === "ILIKE" || operator === "NOT ILIKE").test(
+    const matched = likeMatches(
+      rightValue,
       leftValue,
+      operator === "ILIKE" || operator === "NOT ILIKE",
     );
     return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
   }

@@ -438,6 +438,32 @@ const templates: Template[] = [
     sql: `SELECT id, SUM(amount) FILTER (WHERE label LIKE '${pick(rng, patterns)}') OVER (PARTITION BY region ORDER BY id) AS running FROM data`,
     ordered: false,
   }),
+  () => ({
+    sql: `SELECT id FROM data WHERE active IS TRUE ORDER BY id`,
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT id FROM data WHERE active IS NOT TRUE ORDER BY id LIMIT 25`,
+    ordered: true,
+  }),
+  (rng) => ({
+    // Exercises the dictionary-level LIKE fast paths: prefix, suffix, containment, equality.
+    sql: `SELECT COUNT(*) AS n FROM data WHERE label LIKE '${pick(rng, ["e%", "%o", "%lt%", "echo", "_o%"] as const)}'`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT COUNT(*) AS n FROM data WHERE label LIKE 'a!%%' ESCAPE '!'`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT v.column1 AS n, v.column2 AS tag FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) v ORDER BY n`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id, x.column2 AS tag FROM data d JOIN (VALUES ('west', 'W'), ('east', 'E')) x ON x.column1 = d.region WHERE d.id <= ? ORDER BY id`,
+    params: [20 + Math.floor(rng() * 40)],
+    ordered: true,
+  }),
 ];
 
 function buildCorpus(): Case[] {

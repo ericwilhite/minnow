@@ -1,0 +1,13 @@
+{
+  "rows": 200000,
+  "thresholds": {
+    "count-star": 3.09,
+    "filter-scan": 0.4,
+    "group-aggregate": 0.29,
+    "top-n": 2.41,
+    "join-aggregate": 1.52,
+    "like-scan": 1.48,
+    "window-running": 0.85,
+    "distinct-aggregate": 0.23
+  }
+}

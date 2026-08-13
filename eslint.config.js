@@ -39,7 +39,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["*.js", "*.ts", "**/*.mjs"],
+    files: ["*.js", "*.ts", "**/*.mjs", "scripts/**/*.mts"],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: { globals: { ...globals.node } },
   },
@@ -52,6 +52,7 @@ export default tseslint.config(
       "apps/bench/vite.config.ts",
       "apps/site/tests/serve-dist.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
+      "scripts/perf-gate.mts",
     ],
     rules: { "no-restricted-imports": "off" },
   },

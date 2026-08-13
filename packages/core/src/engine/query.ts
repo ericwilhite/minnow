@@ -359,7 +359,14 @@ export type Expression =
     }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }
-  | { kind: "condition"; operator: PredicateOperator; left: Expression; right: Expression }
+  | {
+      kind: "condition";
+      operator: PredicateOperator;
+      left: Expression;
+      right: Expression;
+      /** LIKE/ILIKE escape character, from LIKE ... ESCAPE 'c'. */
+      escape?: string;
+    }
   | { kind: "logical"; operator: "and" | "or"; left: Expression; right: Expression }
   | { kind: "not"; operand: Expression }
   | { kind: "exists"; block: CompiledQuery; negated: boolean }
@@ -507,6 +514,8 @@ const MAX_RECURSIVE_ROWS = 1_000_000;
 
 export type PredicateOperator =
   | ComparisonOperator
+  | `${ComparisonOperator} ANY`
+  | `${ComparisonOperator} ALL`
   | "IN"
   | "NOT IN"
   | "IS NULL"
@@ -523,6 +532,8 @@ export interface Predicate {
   left: Expression;
   operator: PredicateOperator;
   right: Expression;
+  /** LIKE/ILIKE escape character, carried from the parsed condition. */
+  escape?: string;
 }
 
 export interface CompiledQuery {
@@ -619,12 +630,17 @@ const clauseKeywords = new Set([
   "ORDER",
   "LIMIT",
   "OFFSET",
+  "FETCH",
   "INTERSECT",
   "EXCEPT",
   "JOIN",
   "INNER",
   "LEFT",
+  "RIGHT",
+  "FULL",
+  "CROSS",
   "UNION",
+  "RETURNING",
 ]);
 const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
 
@@ -756,6 +772,16 @@ export function compileStatement(sql: string): CompiledStatement {
       parser = new Parser(tokens);
       return parser.parseCreateTable();
     }
+    if (keyword === "WITH") {
+      parser = new Parser(tokens);
+      const statement = parser.parseStatementWithCtes();
+      if (statement !== undefined) {
+        if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
+        return statement;
+      }
+      // Plain WITH ... SELECT: fall through to the ordinary query route below.
+      parser = undefined;
+    }
     const plan = compileQuery(text);
     return plan.parameterCount === undefined
       ? { kind: "select", sql: text }
@@ -868,7 +894,9 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
       rewrite(expression.left, (next) => (expression.left = next));
       const right = expression.right;
       if (
-        (expression.operator === "IN" || expression.operator === "NOT IN") &&
+        (expression.operator === "IN" ||
+          expression.operator === "NOT IN" ||
+          parseQuantified(expression.operator) !== undefined) &&
         right.kind === "subquery"
       ) {
         collectBlock(right.block);
@@ -912,7 +940,9 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
       rewrite(predicate.left, (next) => (predicate.left = next));
       const right = predicate.right;
       if (
-        (predicate.operator === "IN" || predicate.operator === "NOT IN") &&
+        (predicate.operator === "IN" ||
+          predicate.operator === "NOT IN" ||
+          parseQuantified(predicate.operator) !== undefined) &&
         right.kind === "subquery"
       ) {
         collectBlock(right.block);
@@ -2679,7 +2709,12 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
       evaluateBooleanExpression(predicate.left, (nested) => evaluate(nested, context)) === true
     );
   }
-  if (predicate.operator === "LIKE" || predicate.operator === "NOT LIKE") {
+  if (
+    predicate.operator === "LIKE" ||
+    predicate.operator === "NOT LIKE" ||
+    predicate.operator === "ILIKE" ||
+    predicate.operator === "NOT ILIKE"
+  ) {
     return (
       evaluateBooleanExpression(
         {
@@ -2687,6 +2722,7 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
           operator: predicate.operator,
           left: predicate.left,
           right: predicate.right,
+          ...(predicate.escape === undefined ? {} : { escape: predicate.escape }),
         },
         (nested) => evaluate(nested, context),
       ) === true
@@ -2706,6 +2742,22 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
       evaluate(predicate.left, context),
       predicate.right.items.map((item) => evaluate(item, context)),
     );
+  }
+  {
+    const quantified = parseQuantified(predicate.operator);
+    if (quantified !== undefined) {
+      if (predicate.right.kind !== "list") {
+        throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
+      }
+      return (
+        quantifiedComparison(
+          quantified.comparison,
+          quantified.quantifier,
+          evaluate(predicate.left, context),
+          predicate.right.items.map((item) => evaluate(item, context)),
+        ) === true
+      );
+    }
   }
   return comparisonHolds(
     predicate.operator,
@@ -2774,16 +2826,28 @@ export function cachedListMembership(
 const likeCache = new Map<string, RegExp>();
 
 /** Compiles a LIKE pattern (% = any run, _ = any character) to an anchored RegExp, cached. */
-export function likeRegExp(pattern: string, caseInsensitive = false): RegExp {
-  const key = caseInsensitive ? `i ${pattern}` : pattern;
+export function likeRegExp(pattern: string, caseInsensitive = false, escape?: string): RegExp {
+  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""}${pattern}`;
   const cached = likeCache.get(key);
   if (cached !== undefined) return cached;
   let source = "^";
+  let escaped = false;
   for (const character of pattern) {
+    if (escaped) {
+      // The character after the escape is literal, wildcards included.
+      source += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      escaped = false;
+      continue;
+    }
+    if (escape !== undefined && character === escape) {
+      escaped = true;
+      continue;
+    }
     if (character === "%") source += "[\\s\\S]*";
     else if (character === "_") source += "[\\s\\S]";
     else source += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
+  if (escaped) throw new TypeError("LIKE pattern ends with a dangling escape character");
   source += "$";
   const regExp = new RegExp(source, caseInsensitive ? "i" : "");
   if (likeCache.size >= 128) likeCache.clear();
@@ -2844,6 +2908,94 @@ function extractDatePart(field: string, value: unknown): number | null {
     default:
       return value.getUTCDay();
   }
+}
+
+type LikeMatcher = (value: string) => boolean;
+const likeMatcherCache = new Map<string, LikeMatcher>();
+
+/**
+ * A compiled LIKE matcher. Patterns shaped `abc%`, `%abc`, `%abc%`, and `abc` skip the regular
+ * expression entirely — prefix/suffix/containment string scans are several times faster and
+ * dominate real workloads — and everything else falls back to the anchored RegExp.
+ */
+export function likeMatches(
+  pattern: string,
+  value: string,
+  caseInsensitive = false,
+  escape?: string,
+): boolean {
+  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""} ${pattern}`;
+  let matcher = likeMatcherCache.get(key);
+  if (matcher === undefined) {
+    matcher = buildLikeMatcher(pattern, caseInsensitive, escape);
+    if (likeMatcherCache.size >= 128) likeMatcherCache.clear();
+    likeMatcherCache.set(key, matcher);
+  }
+  return matcher(value);
+}
+
+function buildLikeMatcher(
+  pattern: string,
+  caseInsensitive: boolean,
+  escape: string | undefined,
+): LikeMatcher {
+  if (escape === undefined && !pattern.includes("_")) {
+    const leading = pattern.startsWith("%");
+    const trailing = pattern.endsWith("%");
+    const body = pattern.slice(leading ? 1 : 0, trailing ? pattern.length - 1 : undefined);
+    if (!body.includes("%")) {
+      const needle = caseInsensitive ? body.toLowerCase() : body;
+      const fold = caseInsensitive
+        ? (value: string) => value.toLowerCase()
+        : (value: string) => value;
+      if (leading && trailing) return (value) => fold(value).includes(needle);
+      if (trailing) return (value) => fold(value).startsWith(needle);
+      if (leading) return (value) => fold(value).endsWith(needle);
+      return (value) => fold(value) === needle;
+    }
+  }
+  const regExp = likeRegExp(pattern, caseInsensitive, escape);
+  return (value) => regExp.test(value);
+}
+
+/** Splits a quantified operator like "> ANY" into its comparison and quantifier. */
+export function parseQuantified(
+  operator: PredicateOperator,
+): { comparison: ComparisonOperator; quantifier: "any" | "all" } | undefined {
+  if (operator.endsWith(" ANY")) {
+    return { comparison: operator.slice(0, -4) as ComparisonOperator, quantifier: "any" };
+  }
+  if (operator.endsWith(" ALL")) {
+    return { comparison: operator.slice(0, -4) as ComparisonOperator, quantifier: "all" };
+  }
+  return undefined;
+}
+
+/**
+ * SQL quantified comparison over a resolved value list, with three-valued logic: an empty list
+ * is false for ANY and true for ALL before any comparison happens; otherwise NULL operands make
+ * the result unknown unless a definite answer exists.
+ */
+export function quantifiedComparison(
+  comparison: ComparisonOperator,
+  quantifier: "any" | "all",
+  left: unknown,
+  values: readonly unknown[],
+): boolean | null {
+  if (values.length === 0) return quantifier === "all";
+  if (left === null || left === undefined) return null;
+  let sawNull = false;
+  for (const value of values) {
+    if (value === null || value === undefined) {
+      sawNull = true;
+      continue;
+    }
+    const holds = comparisonHolds(comparison, left, value);
+    if (quantifier === "any" && holds) return true;
+    if (quantifier === "all" && !holds) return false;
+  }
+  if (sawNull) return null;
+  return quantifier === "all";
 }
 
 /** Null-safe distinctness: NULL is not distinct from NULL, and distinct from every value. */
@@ -2907,6 +3059,20 @@ export function evaluateBooleanExpression(
       if (sawNull) return null;
       return operator === "NOT IN";
     }
+    {
+      const quantified = parseQuantified(operator);
+      if (quantified !== undefined) {
+        if (expression.right.kind !== "list") {
+          throw new TypeError("ANY/ALL subqueries must be resolved before evaluation");
+        }
+        return quantifiedComparison(
+          quantified.comparison,
+          quantified.quantifier,
+          evaluateValue(expression.left),
+          expression.right.items.map((item) => evaluateValue(item)),
+        );
+      }
+    }
     if (
       operator === "LIKE" ||
       operator === "NOT LIKE" ||
@@ -2921,8 +3087,11 @@ export function evaluateBooleanExpression(
       if (typeof value !== "string" || typeof pattern !== "string") {
         throw new TypeError("LIKE requires string operands");
       }
-      const matched = likeRegExp(pattern, operator === "ILIKE" || operator === "NOT ILIKE").test(
+      const matched = likeMatches(
+        pattern,
         value,
+        operator === "ILIKE" || operator === "NOT ILIKE",
+        expression.escape,
       );
       return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
     }
@@ -2981,8 +3150,10 @@ function comparisonHolds(
     if (typeof leftValue !== "string" || typeof rightValue !== "string") {
       throw new TypeError("LIKE requires string operands");
     }
-    const matched = likeRegExp(rightValue, operator === "ILIKE" || operator === "NOT ILIKE").test(
+    const matched = likeMatches(
+      rightValue,
       leftValue,
+      operator === "ILIKE" || operator === "NOT ILIKE",
     );
     return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
   }
@@ -3153,7 +3324,9 @@ function compareValues(left: unknown, right: unknown): number {
     if (Number.isNaN(b)) return -1;
     return a - b;
   }
-  if (typeof a === "string" && typeof b === "string") return a.localeCompare(b);
+  // Codepoint order, not locale collation: identical in every browser and matching SQLite's
+  // byte order for ASCII. Locale-aware ordering is a deliberate omission — see the docs.
+  if (typeof a === "string" && typeof b === "string") return a < b ? -1 : 1;
   if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
   throw new TypeError("Values must have comparable SQL types");
 }
@@ -3201,37 +3374,52 @@ class Parser {
 
   constructor(private readonly tokens: Token[]) {}
 
-  parse(sql: string): CompiledQuery {
-    if (this.#isKeyword("WITH")) {
-      this.#keyword("WITH");
-      let recursive = false;
-      if (this.#isKeyword("RECURSIVE")) {
-        this.#keyword("RECURSIVE");
-        recursive = true;
-      }
-      for (;;) {
-        const name = this.#identifier();
-        if (
-          this.#ctes.has(name) ||
-          this.#ctesInProgress.has(name) ||
-          this.#recursiveCtes.has(name)
-        ) {
-          throw new TypeError(`Duplicate CTE name: ${name}`);
-        }
-        this.#keyword("AS");
-        this.#expectPunctuation("(");
-        if (recursive) {
-          this.#recursiveCte(name);
-        } else {
-          this.#ctesInProgress.add(name);
-          const block = this.#selectBlock("(cte)");
-          this.#ctesInProgress.delete(name);
-          this.#expectPunctuation(")");
-          this.#ctes.set(name, block);
-        }
-        if (!this.#punctuation(",")) break;
-      }
+  #withClause(): void {
+    if (!this.#isKeyword("WITH")) return;
+    this.#keyword("WITH");
+    let recursive = false;
+    if (this.#isKeyword("RECURSIVE")) {
+      this.#keyword("RECURSIVE");
+      recursive = true;
     }
+    for (;;) {
+      const name = this.#identifier();
+      if (this.#ctes.has(name) || this.#ctesInProgress.has(name) || this.#recursiveCtes.has(name)) {
+        throw new TypeError(`Duplicate CTE name: ${name}`);
+      }
+      this.#keyword("AS");
+      this.#expectPunctuation("(");
+      if (recursive) {
+        this.#recursiveCte(name);
+      } else {
+        this.#ctesInProgress.add(name);
+        const block = this.#selectBlock("(cte)");
+        this.#ctesInProgress.delete(name);
+        this.#expectPunctuation(")");
+        this.#ctes.set(name, block);
+      }
+      if (!this.#punctuation(",")) break;
+    }
+  }
+
+  /**
+   * A statement opening with WITH: the CTEs parse first, and a following INSERT/UPDATE/DELETE
+   * becomes a mutation whose subqueries see them. Returns undefined for a plain WITH ... SELECT,
+   * which the caller routes through the query pipeline.
+   */
+  parseStatementWithCtes(): CompiledStatement | undefined {
+    this.#withClause();
+    const token = this.#peek();
+    const keyword =
+      token.kind === "identifier" && token.quoted !== true ? token.text.toUpperCase() : "";
+    if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
+      return this.parseMutation(keyword);
+    }
+    return undefined;
+  }
+
+  parse(sql: string): CompiledQuery {
+    this.#withClause();
     // INTERSECT binds tighter than UNION and EXCEPT, per the SQL standard.
     const firstTerm = this.#setTerm(sql);
     let plan = firstTerm.block;
@@ -3314,7 +3502,7 @@ class Parser {
       delete last.block.limitParameter;
       delete last.block.offsetParameter;
     } else {
-      tail = { orderBy: this.#orderByClause(), ...this.#limitClause(), ...this.#offsetClause() };
+      tail = { orderBy: this.#orderByClause(), ...this.#tailClauses() };
     }
     return compoundSelectBlock(
       sql,
@@ -3631,9 +3819,12 @@ class Parser {
 
   #unionMember(sql: string): { block: CompiledQuery; parenthesized: boolean } {
     if (this.#punctuation("(")) {
-      const block = this.#selectBlock(sql);
+      const block = this.#isKeyword("VALUES") ? this.#valuesBlock() : this.#selectBlock(sql);
       this.#expectPunctuation(")");
       return { block, parenthesized: true };
+    }
+    if (this.#isKeyword("VALUES")) {
+      return { block: this.#valuesBlock(), parenthesized: false };
     }
     return { block: this.#selectBlock(sql), parenthesized: false };
   }
@@ -3669,23 +3860,63 @@ class Parser {
   }
 
   #limitClause(): { limit?: number; limitParameter?: number } {
-    if (!this.#isKeyword("LIMIT")) return {};
-    this.#keyword("LIMIT");
+    if (this.#isKeyword("LIMIT")) {
+      this.#keyword("LIMIT");
+      if (this.#peek().kind === "parameter") {
+        const parameter = this.#parameterExpression();
+        return parameter.kind === "parameter" ? { limitParameter: parameter.index } : {};
+      }
+      return { limit: validateLimit(Number(this.#take("number").text)) };
+    }
+    return {};
+  }
+
+  /** The standard fetch clause: FETCH FIRST|NEXT [n] ROW|ROWS ONLY, a spelling of LIMIT. */
+  #fetchClause(): { limit?: number; limitParameter?: number } {
+    if (!this.#isKeyword("FETCH")) return {};
+    this.#keyword("FETCH");
+    if (this.#isKeyword("FIRST")) this.#keyword("FIRST");
+    else this.#keyword("NEXT");
+    let result: { limit?: number; limitParameter?: number } = { limit: 1 };
     if (this.#peek().kind === "parameter") {
       const parameter = this.#parameterExpression();
-      return parameter.kind === "parameter" ? { limitParameter: parameter.index } : {};
+      if (parameter.kind === "parameter") result = { limitParameter: parameter.index };
+    } else if (this.#peek().kind === "number") {
+      result = { limit: validateLimit(Number(this.#take("number").text)) };
     }
-    return { limit: validateLimit(Number(this.#take("number").text)) };
+    if (this.#isKeyword("ROWS")) this.#keyword("ROWS");
+    else this.#keyword("ROW");
+    this.#keyword("ONLY");
+    return result;
   }
 
   #offsetClause(): { offset?: number; offsetParameter?: number } {
     if (!this.#isKeyword("OFFSET")) return {};
     this.#keyword("OFFSET");
+    let result: { offset?: number; offsetParameter?: number };
     if (this.#peek().kind === "parameter") {
       const parameter = this.#parameterExpression();
-      return parameter.kind === "parameter" ? { offsetParameter: parameter.index } : {};
+      result = parameter.kind === "parameter" ? { offsetParameter: parameter.index } : {};
+    } else {
+      result = { offset: validateOffset(Number(this.#take("number").text)) };
     }
-    return { offset: validateOffset(Number(this.#take("number").text)) };
+    // The standard allows OFFSET n ROW[S].
+    if (this.#isKeyword("ROWS")) this.#keyword("ROWS");
+    else if (this.#isKeyword("ROW")) this.#keyword("ROW");
+    return result;
+  }
+
+  /** LIMIT/OFFSET in either dialect order: LIMIT n [OFFSET m], or OFFSET m [FETCH FIRST ...]. */
+  #tailClauses(): {
+    limit?: number;
+    limitParameter?: number;
+    offset?: number;
+    offsetParameter?: number;
+  } {
+    if (this.#isKeyword("LIMIT")) {
+      return { ...this.#limitClause(), ...this.#offsetClause() };
+    }
+    return { ...this.#offsetClause(), ...this.#fetchClause() };
   }
 
   #selectBlock(sql: string): CompiledQuery {
@@ -3806,10 +4037,15 @@ class Parser {
       predicates.push(...splitCondition(this.#expression()));
     }
     const groupBy: Expression[] = [];
+    let groupingSets: Expression[][] | undefined;
     if (this.#isKeyword("GROUP")) {
       this.#keyword("GROUP");
       this.#keyword("BY");
-      groupBy.push(...this.#expressionList());
+      if (this.#isKeyword("GROUPING") || this.#isKeyword("ROLLUP") || this.#isKeyword("CUBE")) {
+        groupingSets = this.#groupingSets();
+      } else {
+        groupBy.push(...this.#expressionList());
+      }
     }
     const having: Predicate[] = [];
     if (this.#isKeyword("HAVING")) {
@@ -3829,11 +4065,54 @@ class Parser {
         groupBy,
         having,
         orderBy,
-        ...this.#limitClause(),
-        ...this.#offsetClause(),
+        ...this.#tailClauses(),
+        ...(groupingSets === undefined ? {} : { groupingSets }),
       },
       this.nextDerivedSequence,
     );
+  }
+
+  /** GROUPING SETS ((a,b),(a),()), ROLLUP(a,b), or CUBE(a,b), expanded to grouping lists. */
+  #groupingSets(): Expression[][] {
+    if (this.#isKeyword("GROUPING")) {
+      this.#keyword("GROUPING");
+      this.#keyword("SETS");
+      this.#expectPunctuation("(");
+      const sets: Expression[][] = [];
+      for (;;) {
+        this.#expectPunctuation("(");
+        const set: Expression[] = [];
+        if (!this.#punctuation(")")) {
+          set.push(...this.#expressionList());
+          this.#expectPunctuation(")");
+        }
+        sets.push(set);
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+      return sets;
+    }
+    const cube = this.#isKeyword("CUBE");
+    this.#keyword(cube ? "CUBE" : "ROLLUP");
+    this.#expectPunctuation("(");
+    const columns = this.#expressionList();
+    this.#expectPunctuation(")");
+    if (columns.length === 0) throw new TypeError("ROLLUP/CUBE take at least one expression");
+    if (cube) {
+      if (columns.length > 5) {
+        throw new TypeError("CUBE supports at most 5 expressions (32 grouping sets)");
+      }
+      const sets: Expression[][] = [];
+      for (let mask = (1 << columns.length) - 1; mask >= 0; mask -= 1) {
+        sets.push(columns.filter((_, index) => (mask & (1 << index)) !== 0));
+      }
+      return sets;
+    }
+    const sets: Expression[][] = [];
+    for (let length = columns.length; length >= 0; length -= 1) {
+      sets.push(columns.slice(0, length));
+    }
+    return sets;
   }
 
   #selectList(): SelectItem[] {
@@ -3906,12 +4185,81 @@ class Parser {
     }
   }
 
+  /** VALUES (…), (…) desugars into FROM-less selects over dual, unioned with UNION ALL. */
+  #valuesBlock(): CompiledQuery {
+    this.#keyword("VALUES");
+    const blocks: CompiledQuery[] = [];
+    let width: number | undefined;
+    for (;;) {
+      this.#expectPunctuation("(");
+      const row: Expression[] = [];
+      for (;;) {
+        row.push(this.#expression());
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+      if (row.some((expression) => expression.kind === "wildcard")) {
+        throw new TypeError("VALUES rows take scalar expressions");
+      }
+      if (width === undefined) width = row.length;
+      else if (row.length !== width) throw new TypeError("VALUES rows must share one width");
+      blocks.push({
+        sql: "(values)",
+        base: { table: DUAL_TABLE, alias: DUAL_TABLE },
+        joins: [],
+        select: row.map((expression, index) => ({
+          expression,
+          alias: `column${String(index + 1)}`,
+        })),
+        predicates: [],
+        groupBy: [],
+        having: [],
+        orderBy: [],
+      });
+      if (!this.#punctuation(",")) break;
+    }
+    const first = blocks[0];
+    if (blocks.length === 1 && first !== undefined) return first;
+    return compoundSelectBlock(
+      "(values)",
+      blocks,
+      blocks.slice(1).map(() => "union all" as const),
+      { orderBy: [] },
+      this.nextDerivedSequence,
+    );
+  }
+
+  /** Renames a derived table's output columns from an AS alias(name, ...) list. */
+  #applyColumnAliases(derived: CompiledQuery): void {
+    const names: string[] = [];
+    for (;;) {
+      names.push(this.#identifier());
+      if (!this.#punctuation(",")) break;
+    }
+    this.#expectPunctuation(")");
+    // Set-operation output takes the first member's aliases, so renaming targets it.
+    const target =
+      derived.base.union !== undefined && derived.select[0]?.expression.kind === "wildcard"
+        ? derived.base.union.blocks[0]
+        : derived;
+    if (target?.select.length !== names.length) {
+      throw new TypeError("Column alias list must match the derived table's column count");
+    }
+    names.forEach((name, index) => {
+      const item = target.select[index];
+      if (item !== undefined) item.alias = name;
+    });
+  }
+
   #source(): TableSource {
     if (this.#punctuation("(")) {
-      const derived = this.#selectBlock("(derived)");
+      const derived = this.#isKeyword("VALUES")
+        ? this.#valuesBlock()
+        : this.#selectBlock("(derived)");
       this.#expectPunctuation(")");
       const alias = this.#sourceAlias();
       if (alias === undefined) throw new TypeError("A derived table requires an alias");
+      if (this.#punctuation("(")) this.#applyColumnAliases(derived);
       return this.#derivedSource(derived, alias);
     }
     const table = this.#identifier();
@@ -4010,6 +4358,26 @@ class Parser {
           right: this.#additive(),
         };
       }
+      // IS [NOT] TRUE/FALSE never return UNKNOWN, which is exactly null-safe (in)equality.
+      if (this.#isKeyword("TRUE") || this.#isKeyword("FALSE")) {
+        const truth = this.#isKeyword("TRUE");
+        this.#keyword(truth ? "TRUE" : "FALSE");
+        return {
+          kind: "condition",
+          operator: negatedIs ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM",
+          left,
+          right: { kind: "literal", value: truth },
+        };
+      }
+      if (this.#isKeyword("UNKNOWN")) {
+        this.#keyword("UNKNOWN");
+        return {
+          kind: "condition",
+          operator: negatedIs ? "IS NOT NULL" : "IS NULL",
+          left,
+          right: { kind: "literal", value: null },
+        };
+      }
       const token = this.#peek();
       if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
         throw new TypeError(`Expected NULL, found ${token.text || "end of query"}`);
@@ -4038,16 +4406,32 @@ class Parser {
     }
     if (this.#isKeyword("BETWEEN")) {
       this.#keyword("BETWEEN");
+      let symmetric = false;
+      if (this.#isKeyword("SYMMETRIC")) {
+        this.#keyword("SYMMETRIC");
+        symmetric = true;
+      } else if (this.#isKeyword("ASYMMETRIC")) {
+        this.#keyword("ASYMMETRIC");
+      }
       const lower = this.#additive();
       this.#keyword("AND");
       const upper = this.#additive();
       // BETWEEN is inclusive-range sugar; the AND here binds at comparison level by the grammar.
-      const range: Expression = {
+      const rangeOver = (low: Expression, high: Expression): Expression => ({
         kind: "logical",
         operator: "and",
-        left: { kind: "condition", operator: ">=", left, right: lower },
-        right: { kind: "condition", operator: "<=", left: structuredClone(left), right: upper },
-      };
+        left: { kind: "condition", operator: ">=", left: structuredClone(left), right: low },
+        right: { kind: "condition", operator: "<=", left: structuredClone(left), right: high },
+      });
+      // SYMMETRIC also accepts the bounds reversed.
+      const range: Expression = symmetric
+        ? {
+            kind: "logical",
+            operator: "or",
+            left: rangeOver(lower, upper),
+            right: rangeOver(structuredClone(upper), structuredClone(lower)),
+          }
+        : rangeOver(lower, upper);
       return negated ? { kind: "not", operand: range } : range;
     }
     if (this.#isKeyword("IN")) {
@@ -4066,19 +4450,53 @@ class Parser {
       }
       return { kind: "condition", operator, left, right: { kind: "list", items } };
     }
-    if (this.#isKeyword("LIKE")) {
-      this.#keyword("LIKE");
-      const operator: PredicateOperator = negated ? "NOT LIKE" : "LIKE";
-      return { kind: "condition", operator, left, right: this.#additive() };
-    }
-    if (this.#isKeyword("ILIKE")) {
-      this.#keyword("ILIKE");
-      const operator: PredicateOperator = negated ? "NOT ILIKE" : "ILIKE";
-      return { kind: "condition", operator, left, right: this.#additive() };
+    if (this.#isKeyword("LIKE") || this.#isKeyword("ILIKE")) {
+      const insensitive = this.#isKeyword("ILIKE");
+      this.#keyword(insensitive ? "ILIKE" : "LIKE");
+      const operator: PredicateOperator = insensitive
+        ? negated
+          ? "NOT ILIKE"
+          : "ILIKE"
+        : negated
+          ? "NOT LIKE"
+          : "LIKE";
+      const pattern = this.#additive();
+      let escape: string | undefined;
+      if (this.#isKeyword("ESCAPE")) {
+        this.#keyword("ESCAPE");
+        const token = this.#take("string");
+        if (Array.from(token.text).length !== 1) {
+          throw new TypeError("LIKE ESCAPE takes a single character");
+        }
+        escape = token.text;
+      }
+      return {
+        kind: "condition",
+        operator,
+        left,
+        right: pattern,
+        ...(escape === undefined ? {} : { escape }),
+      };
     }
     const token = this.#peek();
     if (token.kind === "operator" && ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)) {
       const operator = this.#comparison();
+      if (this.#isKeyword("ANY") || this.#isKeyword("SOME") || this.#isKeyword("ALL")) {
+        const all = this.#isKeyword("ALL");
+        this.#keyword(this.#isKeyword("ANY") ? "ANY" : all ? "ALL" : "SOME");
+        this.#expectPunctuation("(");
+        if (!this.#isKeyword("SELECT")) {
+          throw new TypeError("ANY/ALL take a subquery");
+        }
+        const block = this.#selectBlock("(quantified subquery)");
+        this.#expectPunctuation(")");
+        return {
+          kind: "condition",
+          operator: `${operator} ${all ? "ALL" : "ANY"}`,
+          left,
+          right: { kind: "subquery", block },
+        };
+      }
       return { kind: "condition", operator, left, right: this.#additive() };
     }
     return left;
@@ -4659,6 +5077,82 @@ export interface SelectBlockParts {
   offset?: number;
   limitParameter?: number;
   offsetParameter?: number;
+  /** GROUP BY GROUPING SETS/ROLLUP/CUBE: the grouping lists to union; groupBy is then unused. */
+  groupingSets?: Expression[][];
+}
+
+/**
+ * GROUPING SETS desugar: one grouped block per set, combined with UNION ALL. A grouped column
+ * absent from a member's set projects as NULLIF(expr, expr) — always NULL, but carrying the
+ * expression's type through schema inference. The GROUPING() marker function is deliberately
+ * unsupported, so rollup NULLs and data NULLs are indistinguishable; the docs call this out.
+ */
+function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
+  const { groupingSets, limit, offset, limitParameter, offsetParameter, ...blockParts } = parts;
+  const sets = groupingSets ?? [];
+  if (parts.distinct) {
+    throw new TypeError("GROUPING SETS cannot be combined with SELECT DISTINCT");
+  }
+  for (const predicate of parts.having) {
+    for (const side of [predicate.left, predicate.right]) {
+      if (!hasAggregate(side) && expressionColumns(side).length > 0) {
+        throw new TypeError(
+          "HAVING with GROUPING SETS supports aggregate and literal conditions only",
+        );
+      }
+    }
+  }
+  const signatureOf = (expression: Expression): string => JSON.stringify(expression);
+  const universe = new Set(sets.flat().map(signatureOf));
+  const members = sets.map((set) => {
+    const setSignatures = new Set(set.map(signatureOf));
+    const select = blockParts.select.map((item) => {
+      if (hasAggregate(item.expression)) return item;
+      const signature = signatureOf(item.expression);
+      if (setSignatures.has(signature) || !universe.has(signature)) return item;
+      // MIN over an always-NULL argument: legal in a grouped select, NULL in every group, and
+      // typed like the original expression through MIN's carry and NULLIF's first argument.
+      return {
+        alias: item.alias,
+        expression: {
+          kind: "call",
+          name: "MIN",
+          arguments: [
+            {
+              kind: "call",
+              name: "NULLIF",
+              arguments: [structuredClone(item.expression), structuredClone(item.expression)],
+            },
+          ],
+        } satisfies Expression,
+      };
+    });
+    return assembleSelectBlock(
+      {
+        ...blockParts,
+        sql: "(grouping set)",
+        select,
+        groupBy: structuredClone(set),
+        orderBy: [],
+      },
+      nextSequence,
+    );
+  });
+  const first = members[0];
+  if (members.length === 1 && first !== undefined) return first;
+  return compoundSelectBlock(
+    parts.sql,
+    members,
+    members.slice(1).map(() => "union all" as const),
+    {
+      orderBy: parts.orderBy,
+      ...(limit === undefined ? {} : { limit }),
+      ...(offset === undefined ? {} : { offset }),
+      ...(limitParameter === undefined ? {} : { limitParameter }),
+      ...(offsetParameter === undefined ? {} : { offsetParameter }),
+    },
+    nextSequence,
+  );
 }
 
 /** Validates and assembles one select block, applying every parser desugar. */
@@ -4761,6 +5255,9 @@ export function assembleSelectBlock(
   parts = { ...parts, orderBy: resolveOrderByOrdinals(parts.orderBy, parts.select) };
   if (parts.joins.some((join) => join.full === true)) {
     return desugarFullJoin(parts, nextSequence);
+  }
+  if (parts.groupingSets !== undefined && parts.groupingSets.length > 0) {
+    return desugarGroupingSets(parts, nextSequence);
   }
   if (parts.orderBy.some((order) => order.expression.kind !== "column")) {
     return assembleOrderByExpressionBlock(parts, nextSequence);
@@ -5249,7 +5746,14 @@ export function splitCondition(expression: Expression): Predicate[] {
     return [...splitCondition(expression.left), ...splitCondition(expression.right)];
   }
   if (expression.kind === "condition") {
-    return [{ left: expression.left, operator: expression.operator, right: expression.right }];
+    return [
+      {
+        left: expression.left,
+        operator: expression.operator,
+        right: expression.right,
+        ...(expression.escape === undefined ? {} : { escape: expression.escape }),
+      },
+    ];
   }
   return [{ left: expression, operator: "IS TRUE", right: { kind: "literal", value: null } }];
 }
