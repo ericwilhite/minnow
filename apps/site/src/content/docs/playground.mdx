@@ -1,0 +1,78 @@
+---
+title: Playground
+description: A real database running in this page — browse the tables, edit rows, and run SQL.
+---
+
+import Playground from "../../components/Playground.astro";
+
+# Playground
+
+<p class="lede">
+  A Minnow database running in this page, with the same devtools panel you can embed in your own
+  app. Nothing is sent anywhere and nothing is saved.
+</p>
+
+<Playground />
+
+## What is in it
+
+Two tables, joined by `customer_id`:
+
+| Table       | Rows | Columns                                                                  |
+| ----------- | ---- | ------------------------------------------------------------------------ |
+| `customers` | 8    | `customer_id` (key), `name`, `segment`, `city?`, `joined`                |
+| `orders`    | 60   | `order_id` (key), `customer_id`, `status`, `total`, `note?`, `placed_at` |
+
+`city` and `note` are nullable, so `IS NULL` and the paging fallback both have something to show.
+
+## Things to try
+
+Group and join — the query it opens with:
+
+```sql
+SELECT c.segment, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+FROM customers c
+JOIN orders o ON o.customer_id = c.customer_id
+WHERE o.status = 'paid'
+GROUP BY c.segment
+ORDER BY revenue DESC
+```
+
+Search across every column of a table, without an index or any schema marking:
+
+```sql
+SELECT name, city FROM customers WHERE MATCH(*) AGAINST 'bos*'
+```
+
+Write something, and watch the confirmation spell out what it is about to do:
+
+```sql
+UPDATE orders SET status = 'paid' WHERE order_id = 3
+```
+
+Then open the **Data** tab: pick `orders` from the rail, sort by clicking a header, add a filter,
+and double-click a cell to edit it. Every change asks first.
+
+Try something the engine does not support and the editor will underline it as you type, and say
+what stands in for it:
+
+```sql
+INSERT INTO customers (name) SELECT name FROM customers
+```
+
+## Embedding one
+
+This is `@minnowdb/devtools` in `inline` mode, pointed at a database built with
+`MemoryBlockStore`:
+
+```ts
+import { mountMinnowDevtools } from "@minnowdb/devtools";
+
+mountMinnowDevtools(database, {
+  container: document.querySelector("#playground"),
+  mode: "inline",
+  initialQuery: "SELECT * FROM customers",
+});
+```
+
+The same panel floats over your own app in `launcher` mode — see [Devtools](/docs/devtools/).

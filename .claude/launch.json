@@ -17,6 +17,13 @@
       "autoPort": true
     },
     {
+      "name": "site-preview",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "preview", "--workspace", "@minnowdb/site", "--", "--port", "4322"],
+      "port": 4322,
+      "autoPort": true
+    },
+    {
       "name": "site",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--workspace", "@minnowdb/site"],

@@ -212,7 +212,8 @@ sortable headers and typed filters, edit records inline, or run SQL in the conso
 floats over your page without blocking it, every change is described and confirmed first, and
 `permissions: { write: false }` refuses those statements outright. It also ships as
 `<minnow-devtools>`, a custom element that works in any framework. See
-[the devtools guide](apps/site/src/content/docs/devtools.mdx).
+[the devtools guide](apps/site/src/content/docs/devtools.mdx), or run the docs site and open
+`/docs/playground/` to try the panel against a database running in the page.
 
 ### Modules
 

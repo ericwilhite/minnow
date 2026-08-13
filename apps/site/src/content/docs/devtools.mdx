@@ -216,7 +216,8 @@ everything. History is namespaced by `storageKey`, so two panels on a page keep 
 ## Embedding a playground
 
 `mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
-panel, in flow, sized by its container:
+panel, in flow, sized by its container. The [playground](/docs/playground/) is exactly this,
+pointed at an in-memory database:
 
 ```ts
 mountMinnowDevtools(db, {
