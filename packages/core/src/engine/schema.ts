@@ -167,7 +167,7 @@ export function columnWithDefaultSpec(
     ...(base.renamedFromName === undefined ? {} : { renamedFromName: base.renamedFromName }),
     ...(base.reference === undefined ? {} : { reference: base.reference }),
     defaultSpec: spec,
-  }) as unknown as AnyColumn;
+  });
 }
 
 export const column = {

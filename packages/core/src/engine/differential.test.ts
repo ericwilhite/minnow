@@ -125,9 +125,7 @@ function generateSql(fuzzer: Fuzzer): string {
     // under a limit legitimately ambiguous.
     const columns = fuzzer.random() < 0.3 ? "*" : "notes, region";
     const filtered =
-      fuzzer.random() < 0.5
-        ? ` WHERE MATCH(notes) AGAINST '${fuzzer.pick(MATCH_QUERIES)}'`
-        : "";
+      fuzzer.random() < 0.5 ? ` WHERE MATCH(notes) AGAINST '${fuzzer.pick(MATCH_QUERIES)}'` : "";
     return `SELECT region, notes, BM25(${columns}) AGAINST '${fuzzer.pick(MATCH_QUERIES)}' AS score FROM rows${filtered}`;
   }
   if (family === 10) {

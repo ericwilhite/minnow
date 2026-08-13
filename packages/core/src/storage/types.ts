@@ -108,7 +108,9 @@ export function validateColumnDefault(
     case "uuid":
     case "nanoid":
       if (column.type !== "string") {
-        throw new TypeError(`Default ${defaultValue.kind} requires a string column: ${column.name}`);
+        throw new TypeError(
+          `Default ${defaultValue.kind} requires a string column: ${column.name}`,
+        );
       }
       return;
     case "now":
@@ -678,7 +680,7 @@ export interface FtsChanges {
 /** The per-term candidate row IDs a full-text index lookup returns, aligned with the query. */
 export interface FtsCandidates {
   /** Per requested term: ascending unique row IDs whose indexed column contained the term. */
-  rowIdsByTerm: Array<bigint[]>;
+  rowIdsByTerm: bigint[][];
 }
 
 /**

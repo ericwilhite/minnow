@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  isExactlyComparable,
-  isSortable,
-  sqlColumn,
-  sqlLiteral,
-  sqlOrderColumn,
-} from "./literal.js";
+import { isExactlyComparable, isSortable, sqlColumn, sqlLiteral } from "./literal.js";
 
 describe("sqlLiteral", () => {
   it("doubles a quote instead of ending the string early", () => {
@@ -56,30 +50,16 @@ describe("sqlColumn", () => {
   });
 });
 
-describe("sqlOrderColumn", () => {
-  it("leaves the name bare, because ORDER BY resolves against output aliases", () => {
-    expect(sqlOrderColumn("name")).toBe("name");
-  });
-
-  it("still refuses anything that is not an identifier", () => {
-    expect(() => sqlOrderColumn("name DESC, id")).toThrow(TypeError);
-  });
-});
-
 describe("isSortable", () => {
-  it("rejects names the expression parser claims for itself", () => {
-    expect(isSortable("case")).toBe(false);
-    expect(isSortable("NOT")).toBe(false);
-    expect(isSortable("null")).toBe(false);
-    expect(isSortable("exists")).toBe(false);
+  it("allows keyword names, which qualifying in ORDER BY makes sortable", () => {
+    for (const column of ["case", "NOT", "null", "exists", "count", "date", "when", "order"]) {
+      expect(isSortable(column)).toBe(true);
+    }
   });
 
-  it("allows names that are only special with a paren or a string after them", () => {
-    // ORDER BY never supplies either, so these parse as plain columns.
-    expect(isSortable("count")).toBe(true);
-    expect(isSortable("date")).toBe(true);
-    expect(isSortable("when")).toBe(true);
-    expect(isSortable("order")).toBe(true);
+  it("refuses a name this package cannot render as SQL", () => {
+    expect(isSortable("name DESC, id")).toBe(false);
+    expect(isSortable("")).toBe(false);
   });
 });
 

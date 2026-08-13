@@ -8,9 +8,14 @@ import type {
   QueryRow,
   QueryValue,
   ScalarFunctionName,
-  SelectItem,
 } from "./query.js";
-import { cachedListMembership, dateTruncValue, isScalarFunctionName, likeRegExp } from "./query.js";
+import {
+  cachedListMembership,
+  dateTruncValue,
+  isScalarFunctionName,
+  likeRegExp,
+  orderOutputName,
+} from "./query.js";
 import {
   bm25DocumentScore,
   cachedQueryTerms,
@@ -631,12 +636,16 @@ function bindPlan(
     );
   });
 
-  const orderBy = plan.orderBy.map(({ expression, direction }) => {
-    const outputName = orderOutputName(expression, plan.select);
-    if (outputName === undefined)
-      throw new TypeError("ORDER BY requires a selected column or output alias");
-    return { outputName, direction };
-  });
+  // A wildcard select projects the materialized columns of each source, so ORDER BY resolves
+  // against those same names.
+  const orderSources = sources.map((source, index) => ({
+    alias: source.alias,
+    columns: [...(sourceTables[index]?.columns.keys() ?? [])],
+  }));
+  const orderBy = plan.orderBy.map(({ expression, direction }) => ({
+    outputName: orderOutputName(expression, plan.select, orderSources),
+    direction,
+  }));
   const grouped = groupBy.length > 0 || aggregateSpecs.length > 0;
   // A single bare string-column GROUP BY can group on dictionary codes: identical values share a
   // code within one materialized vector, so a code-indexed slot table replaces per-row hashing.
@@ -745,7 +754,15 @@ function bindExpression(
     return {
       kind: "list",
       items: expression.items.map((item) =>
-        bindExpression(item, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+        bindExpression(
+          item,
+          sources,
+          aggregateSpecs,
+          aggregateIndexes,
+          memory,
+          ftsBySignature,
+          ftsStats,
+        ),
       ),
       signature,
     };
@@ -788,8 +805,24 @@ function bindExpression(
     return {
       kind: expression.kind,
       operator: expression.operator,
-      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
-      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+      left: bindExpression(
+        expression.left,
+        sources,
+        aggregateSpecs,
+        aggregateIndexes,
+        memory,
+        ftsBySignature,
+        ftsStats,
+      ),
+      right: bindExpression(
+        expression.right,
+        sources,
+        aggregateSpecs,
+        aggregateIndexes,
+        memory,
+        ftsBySignature,
+        ftsStats,
+      ),
       signature,
     } as BoundExpression;
   }
@@ -797,15 +830,39 @@ function bindExpression(
     return {
       kind: "logical",
       operator: expression.operator,
-      left: bindExpression(expression.left, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
-      right: bindExpression(expression.right, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+      left: bindExpression(
+        expression.left,
+        sources,
+        aggregateSpecs,
+        aggregateIndexes,
+        memory,
+        ftsBySignature,
+        ftsStats,
+      ),
+      right: bindExpression(
+        expression.right,
+        sources,
+        aggregateSpecs,
+        aggregateIndexes,
+        memory,
+        ftsBySignature,
+        ftsStats,
+      ),
       signature,
     };
   }
   if (expression.kind === "not") {
     return {
       kind: "not",
-      operand: bindExpression(expression.operand, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+      operand: bindExpression(
+        expression.operand,
+        sources,
+        aggregateSpecs,
+        aggregateIndexes,
+        memory,
+        ftsBySignature,
+        ftsStats,
+      ),
       signature,
     };
   }
@@ -813,19 +870,51 @@ function bindExpression(
     const otherwise =
       expression.otherwise === undefined
         ? undefined
-        : bindExpression(expression.otherwise, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats);
+        : bindExpression(
+            expression.otherwise,
+            sources,
+            aggregateSpecs,
+            aggregateIndexes,
+            memory,
+            ftsBySignature,
+            ftsStats,
+          );
     return {
       kind: "case",
       branches: expression.branches.map((branch) => ({
-        when: bindExpression(branch.when, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
-        then: bindExpression(branch.then, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+        when: bindExpression(
+          branch.when,
+          sources,
+          aggregateSpecs,
+          aggregateIndexes,
+          memory,
+          ftsBySignature,
+          ftsStats,
+        ),
+        then: bindExpression(
+          branch.then,
+          sources,
+          aggregateSpecs,
+          aggregateIndexes,
+          memory,
+          ftsBySignature,
+          ftsStats,
+        ),
       })),
       ...(otherwise === undefined ? {} : { otherwise }),
       signature,
     };
   }
   const arguments_ = expression.arguments.map((argument) =>
-    bindExpression(argument, sources, aggregateSpecs, aggregateIndexes, memory, ftsBySignature, ftsStats),
+    bindExpression(
+      argument,
+      sources,
+      aggregateSpecs,
+      aggregateIndexes,
+      memory,
+      ftsBySignature,
+      ftsStats,
+    ),
   );
   if (isScalarFunctionName(expression.name)) {
     return { kind: "call", name: expression.name, arguments: arguments_, signature };
@@ -916,9 +1005,7 @@ function ensureFtsDictionaryCache(
     if (reservation !== undefined) cache.reservation = reservation;
     const masks = new Uint32Array(vector.dictionary.length);
     const tokenCount = withScores ? new Uint32Array(vector.dictionary.length) : undefined;
-    const termTf = withScores
-      ? new Uint32Array(vector.dictionary.length * termCount)
-      : undefined;
+    const termTf = withScores ? new Uint32Array(vector.dictionary.length * termCount) : undefined;
     for (let code = 0; code < vector.dictionary.length; code += 1) {
       const tokens = tokenize(vector.dictionary[code] ?? "");
       masks[code] = termsMask(tokens, expression.terms);
@@ -3419,22 +3506,6 @@ function comparisonValue(
   if (operator === ">=") return comparison >= 0;
   if (operator === "<") return comparison < 0;
   return comparison <= 0;
-}
-
-function orderOutputName(
-  expression: Expression,
-  select: readonly SelectItem[],
-): string | undefined {
-  if (expression.kind !== "column") return undefined;
-  // A wildcard select exposes source columns under their own names, so bare references order by
-  // the matching output column directly.
-  if (select[0]?.expression.kind === "wildcard") return expression.reference;
-  const selected = select.find(
-    (item) =>
-      (item.expression.kind === "column" && item.expression.reference === expression.reference) ||
-      (!expression.reference.includes(".") && item.alias === expression.reference),
-  );
-  return selected?.alias;
 }
 
 function comparable(value: unknown): unknown {

@@ -42,15 +42,13 @@ describe("pagingMode", () => {
 });
 
 describe("buildPageQuery", () => {
-  it("orders by the key, unqualified so ORDER BY can resolve it", () => {
-    // A qualified ORDER BY matches none of `SELECT *`'s output aliases, and the engine returns
-    // the rows unordered rather than rejecting it — so the clause must use bare names.
+  it("orders by the key, qualified like every other column reference", () => {
     expect(buildPageQuery({ table: keyed, filters: [], limit: 50 })).toBe(
-      "SELECT * FROM people ORDER BY id LIMIT 50",
+      "SELECT * FROM people ORDER BY people.id LIMIT 50",
     );
   });
 
-  it("refuses to order by a name the parser reads as something else", () => {
+  it("sorts a keyword-named column, which only qualifying makes parseable", () => {
     const awkward: TableInfo = {
       name: "logs",
       uniqueKey: "id",
@@ -59,8 +57,8 @@ describe("buildPageQuery", () => {
         { name: "case", type: "string", nullable: false, isUniqueKey: false },
       ],
     };
-    // Bare, `case` starts a CASE expression; qualified, ORDER BY drops it. Sorting falls back to
-    // the key rather than quietly returning rows in an order nobody asked for.
+    // Bare, `case` starts a CASE expression; qualified, the engine resolves it against the
+    // wildcard's source table.
     expect(
       buildPageQuery({
         table: awkward,
@@ -68,7 +66,7 @@ describe("buildPageQuery", () => {
         sort: { column: "case", direction: "asc" },
         limit: 5,
       }),
-    ).toBe("SELECT * FROM logs ORDER BY id LIMIT 5");
+    ).toBe("SELECT * FROM logs ORDER BY logs.case, logs.id LIMIT 5");
   });
 
   it("appends the key so a sort on another column is still a total order", () => {
@@ -79,7 +77,7 @@ describe("buildPageQuery", () => {
         sort: { column: "name", direction: "desc" },
         limit: 50,
       }),
-    ).toBe("SELECT * FROM people ORDER BY name DESC, id DESC LIMIT 50");
+    ).toBe("SELECT * FROM people ORDER BY people.name DESC, people.id DESC LIMIT 50");
   });
 
   it("writes the row-value comparison out by hand", () => {
@@ -93,7 +91,7 @@ describe("buildPageQuery", () => {
       }),
     ).toBe(
       "SELECT * FROM people WHERE (people.name > 'Ada' OR (people.name = 'Ada' AND people.id > 7))" +
-        " ORDER BY name, id LIMIT 50",
+        " ORDER BY people.name, people.id LIMIT 50",
     );
   });
 
@@ -106,7 +104,7 @@ describe("buildPageQuery", () => {
         cursor: [12],
         limit: 10,
       }),
-    ).toBe("SELECT * FROM people WHERE people.id < 12 ORDER BY id DESC LIMIT 10");
+    ).toBe("SELECT * FROM people WHERE people.id < 12 ORDER BY people.id DESC LIMIT 10");
   });
 
   it("ignores a cursor it cannot honour and counts from the start instead", () => {
@@ -122,7 +120,7 @@ describe("buildPageQuery", () => {
     ];
     expect(buildPageQuery({ table: keyed, filters, cursor: [4], limit: 20 })).toBe(
       "SELECT * FROM people WHERE (people.city = 'London') AND (people.name LIKE 'A%')" +
-        " AND people.id > 4 ORDER BY id LIMIT 20",
+        " AND people.id > 4 ORDER BY people.id LIMIT 20",
     );
   });
 
@@ -246,6 +244,29 @@ describe("against the engine", () => {
     const counted = await database.query(buildCountQuery(table, filters));
     expect(rows.length).toBeGreaterThan(0);
     expect(counted.rows[0]?.row_count).toBe(rows.length);
+  });
+
+  it("cursors through a keyword-named column, which only qualifying makes parseable", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 64 });
+    await database.createTable({
+      name: "logs",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "case", type: "string" },
+      ],
+    });
+    for (let index = 0; index < 120; index += 1) {
+      await database.insert("logs", { id: index, case: `case ${String(index % 7)}` });
+    }
+    const [table] = toCatalog(await database.listTables());
+    if (table === undefined) throw new Error("missing table");
+    const sort: Sort = { column: "case", direction: "asc" };
+    expect(pagingMode(table, sort)).toBe("keyset");
+    const rows = await readAll(database, table, sort);
+    expect(new Set(rows.map((row) => row.id)).size).toBe(120);
+    const cases = rows.map((row) => String(row.case));
+    expect(cases).toEqual([...cases].sort());
   });
 
   it("filters a datetime by day, the only granularity the engine parses", async () => {

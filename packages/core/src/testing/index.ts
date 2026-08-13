@@ -16,7 +16,6 @@ import type {
   RunGarbageCollectionStepInput,
   SegmentRecord,
   StoragePage,
-  TableColumnRecord,
   TableRecord,
   TempOwnerRecord,
   TempRunPage,

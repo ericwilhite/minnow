@@ -64,7 +64,7 @@ function emitRun(tokens: string[], run: string): void {
     pushToken(tokens, run);
     return;
   }
-  const characters = [...run];
+  const characters = Array.from(run);
   let start = 0;
   while (start < characters.length) {
     const isCjk = CJK.test(characters[start] ?? "");
@@ -195,7 +195,10 @@ export function ftsMatchTruth(
  * Per-term frequencies of the query's terms in one token list, aligned with the term order.
  * A document matches when every slot is non-zero.
  */
-export function termFrequencies(tokens: readonly string[], terms: readonly FtsQueryTerm[]): number[] {
+export function termFrequencies(
+  tokens: readonly string[],
+  terms: readonly FtsQueryTerm[],
+): number[] {
   const frequencies = new Array<number>(terms.length).fill(0);
   for (const token of tokens) {
     for (let index = 0; index < terms.length; index += 1) {
@@ -224,7 +227,8 @@ export function bm25Score(
   const averageLength = totalTokens / docCount;
   const normalized =
     (tf * (BM25_K1 + 1)) /
-    (tf + BM25_K1 * (1 - BM25_B + (BM25_B * docLength) / (averageLength === 0 ? 1 : averageLength)));
+    (tf +
+      BM25_K1 * (1 - BM25_B + (BM25_B * docLength) / (averageLength === 0 ? 1 : averageLength)));
   return idf * normalized;
 }
 
@@ -254,7 +258,11 @@ export class FtsStatsAccumulator {
 
   constructor(terms: readonly FtsQueryTerm[]) {
     this.#terms = terms;
-    this.#stats = { docCount: 0, totalTokens: 0, dfByTerm: new Array<number>(terms.length).fill(0) };
+    this.#stats = {
+      docCount: 0,
+      totalTokens: 0,
+      dfByTerm: new Array<number>(terms.length).fill(0),
+    };
   }
 
   /** Adds one document; an all-null row contributes a document of length 0. */

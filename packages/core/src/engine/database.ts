@@ -587,12 +587,12 @@ export class MinnowDatabase {
    */
   readonly #planCache = new Map<string, CompiledQuery>();
   readonly #visibilityFingerprints = new WeakMap<SegmentVisibilityCatalog, Map<string, string>>();
-  readonly #visibleSegmentsMemo = new WeakMap<SegmentVisibilityCatalog, Map<string, SegmentRecord[]>>();
-  /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
-  readonly #ftsCandidatesMemo = new WeakMap<
-    Snapshot,
-    Map<string, Promise<FtsCandidatesResult>>
+  readonly #visibleSegmentsMemo = new WeakMap<
+    SegmentVisibilityCatalog,
+    Map<string, SegmentRecord[]>
   >();
+  /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
+  readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
   #sharedLeaseRenewal: Promise<void> | undefined;
 
@@ -621,7 +621,9 @@ export class MinnowDatabase {
     }
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
     if (!Number.isSafeInteger(this.#ftsAutoIndexRows) || this.#ftsAutoIndexRows < 0) {
-      throw new RangeError("Full-text auto-index row threshold must be a non-negative whole number");
+      throw new RangeError(
+        "Full-text auto-index row threshold must be a non-negative whole number",
+      );
     }
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
@@ -715,10 +717,7 @@ export class MinnowDatabase {
   }
 
   /** Pivots, fills pure defaults, and validates — the shared front half of insert and upsert. */
-  #fillDefaults(
-    table: TableRecord,
-    input: InsertBatchInput,
-  ): FilledBatch & { rowCount: number } {
+  #fillDefaults(table: TableRecord, input: InsertBatchInput): FilledBatch & { rowCount: number } {
     const pivoted = toColumnarBatch(input);
     // The pivot stamps rowCount, so an all-default batch keeps its row count even after the
     // columnar form crossed the worker boundary.
@@ -1074,18 +1073,21 @@ export class MinnowDatabase {
     const started = performance.now();
     const rowCount = input.columns[table.columns[0]?.name ?? ""]?.length ?? 0;
     const logicalBytes = estimateBatchBytes(input);
-    const { transaction, rowIds: reservedRowIds, autoIncrementValues } =
-      await this.#transactions.beginWithReservation(
-        { tableId: table.id, count: rowCount },
-        autoIncrement === undefined
-          ? undefined
-          : {
-              tableId: table.id,
-              columnId: autoIncrement.column.id,
-              count: autoIncrement.missingIndexes.length,
-              atLeast: autoIncrement.atLeast,
-            },
-      );
+    const {
+      transaction,
+      rowIds: reservedRowIds,
+      autoIncrementValues,
+    } = await this.#transactions.beginWithReservation(
+      { tableId: table.id, count: rowCount },
+      autoIncrement === undefined
+        ? undefined
+        : {
+            tableId: table.id,
+            columnId: autoIncrement.column.id,
+            count: autoIncrement.missingIndexes.length,
+            atLeast: autoIncrement.atLeast,
+          },
+    );
     let resolvedKeys = keys;
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
@@ -1932,9 +1934,7 @@ export class MinnowDatabase {
     // the catalog exactly as preparation does (copy-on-write — the cache keeps "*").
     if (planContainsFts(plan)) {
       const realTables = await this.#findRealBlockTables(plan);
-      plan = expandFtsColumns(plan, (tableName) =>
-        searchableFtsColumns(realTables.get(tableName)),
-      );
+      plan = expandFtsColumns(plan, (tableName) => searchableFtsColumns(realTables.get(tableName)));
     }
     // The ORDER-BY-expression desugar's transparent wrapper executes as its inner block plus a
     // projection, so every execution-path note reports against the inner block.
@@ -1952,7 +1952,8 @@ export class MinnowDatabase {
         notes.push("zone-map pruning applies to the unbudgeted scan");
       }
     }
-    if (blockHasSubqueries(reported)) notes.push("resolves uncorrelated subqueries at one snapshot");
+    if (blockHasSubqueries(reported))
+      notes.push("resolves uncorrelated subqueries at one snapshot");
     if (planContainsFts(reported)) {
       notes.push("full-text MATCH evaluates via per-dictionary term tables on the scan");
       if (table === undefined && reported.joins.length === 0) {
@@ -2061,7 +2062,7 @@ export class MinnowDatabase {
           : {
               returnedRows: statement.rows.map((row, rowIndex) =>
                 Object.fromEntries(
-                  (returningColumns ?? []).map((name) => [
+                  returningColumns.map((name) => [
                     name,
                     generated[name]?.[rowIndex] ?? row[statement.columns.indexOf(name)] ?? null,
                   ]),
@@ -5828,10 +5829,7 @@ export class MinnowDatabase {
     // the scan-side stats pass would measure a shrunken corpus and scores would change the
     // moment an index appeared. The shared predicate keeps this in lockstep with the stats
     // service reading the same catalog snapshot.
-    if (
-      planContainsFts(plan, "bm25") &&
-      !this.#ftsIndexServesScoring(plan, table, segments)
-    ) {
+    if (planContainsFts(plan, "bm25") && !this.#ftsIndexServesScoring(plan, table, segments)) {
       return segments;
     }
     const columnsByName = new Map(table.columns.map((column) => [column.name, column] as const));
@@ -6815,12 +6813,7 @@ function validateName(name: string, kind: string): string {
   return trimmed;
 }
 
-
-function validateBatch(
-  table: TableRecord,
-  input: ColumnarBatch,
-  pendingColumn?: string,
-): number {
+function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?: string): number {
   const expected = new Set(table.columns.map((column) => column.name));
   for (const name of Object.keys(input.columns)) {
     if (!expected.has(name)) throw new TypeError(`Unknown column: ${name}`);
@@ -7065,9 +7058,7 @@ type FtsCandidatesResult = Awaited<ReturnType<BlockStore["readFtsCandidates"]>>;
 /** The columns a MATCH(*) document draws from: everything except booleans. */
 function searchableFtsColumns(table: TableRecord | undefined): readonly string[] | undefined {
   if (table === undefined) return undefined;
-  return table.columns
-    .filter((column) => column.type !== "boolean")
-    .map((column) => column.name);
+  return table.columns.filter((column) => column.type !== "boolean").map((column) => column.name);
 }
 
 function getUniqueKeyColumn(table: TableRecord): TableColumnRecord | undefined {

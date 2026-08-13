@@ -28,19 +28,19 @@ description: Every public export of @minnowdb/core, organized by entry point.
 
 From `@minnowdb/core`. See [Schema & migrations](/docs/schema/).
 
-| Export                                                                                                   | Description                                                                                                              |
-| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `table(name, columns)`                                                                                   | Defines a table from column builders. The result carries inferred row types and a Standard Schema `~standard` validator. |
-| `column.boolean() / number() / string() / datetime()`                                                    | Column builders for the four logical types.                                                                              |
-| `.unique() / .nullable() / .renamedFrom() / .references()`                                               | Column modifiers: unique key, NULL widening, stable-ID rename, declared relation.                                        |
+| Export                                                                                                   | Description                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `table(name, columns)`                                                                                   | Defines a table from column builders. The result carries inferred row types and a Standard Schema `~standard` validator.                               |
+| `column.boolean() / number() / string() / datetime()`                                                    | Column builders for the four logical types.                                                                                                            |
+| `.unique() / .nullable() / .renamedFrom() / .references()`                                               | Column modifiers: unique key, NULL widening, stable-ID rename, declared relation.                                                                      |
 | `.autoIncrement() / .default(value)`                                                                     | Generated values: a persistent cross-tab counter for number unique keys, and `"uuid"` / `"nanoid"` / `"now"` / literal defaults filled at insert time. |
-| `schema([tables])`                                                                                       | Bundles table definitions into a `SchemaDefinition` for `migrate()` and the facade.                                      |
-| `typedTable(database, tableDef)`                                                                         | Thin schema-typed handle over the batch APIs.                                                                            |
-| `planMigration(catalog, definition)`                                                                     | Computes the metadata-only `MigrationPlan` that `migrate()` executes.                                                    |
-| `InferDatabase<S>`                                                                                       | Maps a schema to the `DB` type parameter of `Minnow`.                                                                    |
-| `InferRow / InferInsertRow / InferUpdateChanges`                                                         | Per-table select / insert / keyed-update shapes.                                                                         |
-| `Generated<T>`                                                                                           | Marks engine-filled columns in hand-declared `DB` interfaces so inserts keep the omission; `InferDatabase` applies it automatically. |
-| `SchemaDefinition, TableSchema, AnyTable, ColumnBuilder, SchemaColumnType, MigrationStep, MigrationPlan` | Supporting types.                                                                                                        |
+| `schema([tables])`                                                                                       | Bundles table definitions into a `SchemaDefinition` for `migrate()` and the facade.                                                                    |
+| `typedTable(database, tableDef)`                                                                         | Thin schema-typed handle over the batch APIs.                                                                                                          |
+| `planMigration(catalog, definition)`                                                                     | Computes the metadata-only `MigrationPlan` that `migrate()` executes.                                                                                  |
+| `InferDatabase<S>`                                                                                       | Maps a schema to the `DB` type parameter of `Minnow`.                                                                                                  |
+| `InferRow / InferInsertRow / InferUpdateChanges`                                                         | Per-table select / insert / keyed-update shapes.                                                                                                       |
+| `Generated<T>`                                                                                           | Marks engine-filled columns in hand-declared `DB` interfaces so inserts keep the omission; `InferDatabase` applies it automatically.                   |
+| `SchemaDefinition, TableSchema, AnyTable, ColumnBuilder, SchemaColumnType, MigrationStep, MigrationPlan` | Supporting types.                                                                                                                                      |
 
 ## Typed facade
 
@@ -63,20 +63,20 @@ From `@minnowdb/core`. See [Typed queries](/docs/queries/) and [Writes](/docs/wr
 
 `execute()` resolves to typed rows; the row type accretes through the chain.
 
-| Method                                                    | Description                                                                                                      |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `innerJoin / leftJoin(table, lhs, rhs)`                   | Joins; callback form gets a `JoinBuilder` with `on(...)` / `onRef(...)`. Left-joined columns widen to `\| null`. |
-| `where(lhs, op, rhs)` / `where((eb) => ...)`              | Filters; string LHS is a column reference, RHS is a value.                                                       |
-| `having(...)`                                             | Post-aggregation filter, same forms as `where`.                                                                  |
+| Method                                                    | Description                                                                                                                                                               |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `innerJoin / leftJoin(table, lhs, rhs)`                   | Joins; callback form gets a `JoinBuilder` with `on(...)` / `onRef(...)`. Left-joined columns widen to `\| null`.                                                          |
+| `where(lhs, op, rhs)` / `where((eb) => ...)`              | Filters; string LHS is a column reference, RHS is a value.                                                                                                                |
+| `having(...)`                                             | Post-aggregation filter, same forms as `where`.                                                                                                                           |
 | `groupBy(cols)` / `orderBy(col \| expr, dir?)`            | Grouping and ordering; ORDER BY takes a selected column, an output alias, or any expression (desugared to a hidden select item — wildcard selects order by columns only). |
-| `limit(n)` / `offset(n)` / `distinct()`                   | Row-set modifiers.                                                                                               |
-| `select([...])` / `select((eb) => [...])` / `selectAll()` | Projections; string and expression selections may be mixed across repeated calls.                                |
-| `search(query, { columns? })`                             | Filters by `eb.match` and orders by BM25 relevance descending; the row shape is untouched (select `fn.bm25` yourself to read the score). Columns default to `"*"`. |
-| `union / unionAll / intersect / except(other)`            | Set operations; member row types must match.                                                                     |
-| `as(alias)`                                               | Turns the query into a derived table for `selectFrom` / joins.                                                   |
-| `compile()`                                               | The typed plan envelope — the same object `.execute()` runs and `.live()` subscribes.                            |
-| `execute / executeTakeFirst / executeTakeFirstOrThrow()`  | Run and return `TRow[]`, the first row or `undefined`, or throw `NoResultError`.                                 |
-| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/live-queries/).                                    |
+| `limit(n)` / `offset(n)` / `distinct()`                   | Row-set modifiers.                                                                                                                                                        |
+| `select([...])` / `select((eb) => [...])` / `selectAll()` | Projections; string and expression selections may be mixed across repeated calls.                                                                                         |
+| `search(query, { columns? })`                             | Filters by `eb.match` and orders by BM25 relevance descending; the row shape is untouched (select `fn.bm25` yourself to read the score). Columns default to `"*"`.        |
+| `union / unionAll / intersect / except(other)`            | Set operations; member row types must match.                                                                                                                              |
+| `as(alias)`                                               | Turns the query into a derived table for `selectFrom` / joins.                                                                                                            |
+| `compile()`                                               | The typed plan envelope — the same object `.execute()` runs and `.live()` subscribes.                                                                                     |
+| `execute / executeTakeFirst / executeTakeFirstOrThrow()`  | Run and return `TRow[]`, the first row or `undefined`, or throw `NoResultError`.                                                                                          |
+| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/live-queries/).                                                                                             |
 
 ### Mutation builders
 

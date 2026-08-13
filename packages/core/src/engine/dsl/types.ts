@@ -170,9 +170,7 @@ type OptionalInsertKey<TRow, K extends keyof TRow> = null extends TRow[K]
 /** Insert rows require non-nullable columns and may omit nullable or default-bearing ones. */
 export type InsertRowFor<TRow> = Simplify<
   { [K in keyof TRow as true extends OptionalInsertKey<TRow, K> ? never : K]: TRow[K] } & {
-    [K in keyof TRow as true extends OptionalInsertKey<TRow, K> ? K : never]?:
-      | TRow[K]
-      | undefined;
+    [K in keyof TRow as true extends OptionalInsertKey<TRow, K> ? K : never]?: TRow[K] | undefined;
   }
 >;
 

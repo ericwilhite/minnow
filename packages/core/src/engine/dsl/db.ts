@@ -247,7 +247,7 @@ export class Minnow<in out DB> {
   async search(
     query: string,
     options: { tables?: ReadonlyArray<keyof DB & string>; limit?: number } = {},
-  ): Promise<SearchHit<DB>[]> {
+  ): Promise<Array<SearchHit<DB>>> {
     const schemaTables = this.#options.schema?.tables;
     if (schemaTables === undefined) {
       throw new TypeError("search() needs the table columns: create the facade with { schema }");
@@ -256,7 +256,7 @@ export class Minnow<in out DB> {
     const limit = options.limit ?? 10;
     const perTable = await Promise.all(
       tableNames.map(async (tableName) => {
-        const definition = schemaTables?.find(({ name }) => name === tableName);
+        const definition = schemaTables.find(({ name }) => name === tableName);
         if (definition === undefined) {
           throw new TypeError(`search() needs the table's schema: ${tableName}`);
         }
@@ -273,7 +273,7 @@ export class Minnow<in out DB> {
         const columnNames = Object.keys(definition.columns);
         let scoreAlias = "(search score)";
         while (columnNames.includes(scoreAlias)) scoreAlias = `(${scoreAlias})`;
-        let rows: Record<string, QueryValue>[];
+        let rows: Array<Record<string, QueryValue>>;
         try {
           rows = await builder
             .select((eb) => [...columnNames, eb.fn.bm25("*", query).as(scoreAlias)])

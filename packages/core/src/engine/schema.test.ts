@@ -112,9 +112,9 @@ describe("column defaults", () => {
     expect(() => table("bad", { a: column.number().autoIncrement(), b: column.string() })).toThrow(
       "Auto-increment requires the unique key column",
     );
-    expect(() =>
-      table("bad", { a: column.string().unique().default("constant") }),
-    ).toThrow("Unique key cannot default to a constant");
+    expect(() => table("bad", { a: column.string().unique().default("constant") })).toThrow(
+      "Unique key cannot default to a constant",
+    );
     expect(() =>
       (column.string() as unknown as { autoIncrement: () => unknown }).autoIncrement(),
     ).toThrow("Auto-increment requires a number column");
@@ -168,24 +168,22 @@ describe("column defaults", () => {
   });
 
   it("plans default alterations and rejects auto-increment transitions", () => {
-    const current = [
-      {
-        id: "t",
-        name: "notes",
-        columns: [
-          {
-            id: "c1",
-            name: "id",
-            type: "number" as const,
-            nullable: false,
-            defaultValue: { kind: "autoincrement" as const },
-          },
-          { id: "c2", name: "status", type: "string" as const, nullable: false },
-        ],
-        uniqueKeyColumnId: "c1",
-        createdAt: "2026-01-01T00:00:00.000Z",
-      },
-    ];
+    const idRecord = {
+      id: "c1",
+      name: "id",
+      type: "number" as const,
+      nullable: false,
+      defaultValue: { kind: "autoincrement" as const },
+    };
+    const statusRecord = { id: "c2", name: "status", type: "string" as const, nullable: false };
+    const notesRecord = {
+      id: "t",
+      name: "notes",
+      columns: [idRecord, statusRecord],
+      uniqueKeyColumnId: "c1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const current = [notesRecord];
     const idColumn = column.number().unique().autoIncrement();
     const added = planMigration(
       current,
@@ -206,10 +204,10 @@ describe("column defaults", () => {
     expect(unchanged.steps).toEqual([]);
     const currentWithLiteral = [
       {
-        ...current[0]!,
+        ...notesRecord,
         columns: [
-          current[0]!.columns[0]!,
-          { ...current[0]!.columns[1]!, defaultValue: { kind: "literal" as const, value: "x" } },
+          idRecord,
+          { ...statusRecord, defaultValue: { kind: "literal" as const, value: "x" } },
         ],
       },
     ];

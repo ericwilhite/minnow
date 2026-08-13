@@ -16,7 +16,8 @@ const NANOID_ALPHABET = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjkl
 export function nanoid(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(21));
   let id = "";
-  for (const byte of bytes) id += NANOID_ALPHABET[byte & 63];
+  // `charAt` over indexing: the mask keeps the index in range, and it types as `string`.
+  for (const byte of bytes) id += NANOID_ALPHABET.charAt(byte & 63);
   return id;
 }
 
@@ -47,9 +48,7 @@ export function fillColumnDefaults(
   const defaultColumns = table.columns.filter((column) => column.defaultValue !== undefined);
   if (defaultColumns.length === 0) return { batch: input, generated: new Map() };
   const rowCount =
-    knownRowCount ??
-    Object.values(input.columns).find((values) => values.length > 0)?.length ??
-    0;
+    knownRowCount ?? Object.values(input.columns).find((values) => values.length > 0)?.length ?? 0;
   if (rowCount === 0) return { batch: input, generated: new Map() };
   const columns: Record<string, readonly BatchValue[]> = { ...input.columns };
   const generated = new Map<string, BatchValue[]>();
@@ -77,9 +76,7 @@ export function fillColumnDefaults(
       }
       if (missingIndexes.length > 0) {
         columns[column.name] =
-          provided === undefined
-            ? new Array<BatchValue>(rowCount).fill(null)
-            : [...provided];
+          provided === undefined ? new Array<BatchValue>(rowCount).fill(null) : [...provided];
       }
       autoIncrement = { column, missingIndexes, atLeast: maxExplicit + 1n };
       continue;

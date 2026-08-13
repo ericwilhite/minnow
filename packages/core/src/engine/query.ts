@@ -1177,9 +1177,9 @@ export function planContainsFts(plan: CompiledQuery, op?: "match" | "bm25"): boo
     childExpressions(expression).forEach(expressionHasFts);
   };
   forEachNestedBlock(plan, (nested) => {
-    found ||= planContainsFts(nested, op);
+    if (!found) found = planContainsFts(nested, op);
   });
-  if (!found) forEachBlockExpression(plan, expressionHasFts);
+  forEachBlockExpression(plan, expressionHasFts);
   return found;
 }
 
@@ -1533,12 +1533,19 @@ export function executeRowQuery(
     rows = contexts.map((context) => project(plan.select, context));
   }
   if (plan.orderBy.length > 0) {
-    const sortColumns = plan.orderBy.map(({ expression, direction }) => {
-      const outputName = orderOutputName(expression, plan.select);
-      if (outputName === undefined)
-        throw new TypeError("ORDER BY requires a selected column or output alias");
-      return { outputName, multiplier: direction === "desc" ? -1 : 1 };
-    });
+    // Only a wildcard select needs the source shapes: every other select resolves against its
+    // own output aliases.
+    const orderSources =
+      plan.select[0]?.expression.kind === "wildcard"
+        ? [plan.base, ...plan.joins].map((source) => ({
+            alias: source.alias,
+            columns: rowTableColumnNames(tables.get(source.table) ?? []),
+          }))
+        : [];
+    const sortColumns = plan.orderBy.map(({ expression, direction }) => ({
+      outputName: orderOutputName(expression, plan.select, orderSources),
+      multiplier: direction === "desc" ? -1 : 1,
+    }));
     rows.sort((left, right) => {
       for (const { outputName, multiplier } of sortColumns) {
         const comparison = compareValues(left[outputName], right[outputName]);
@@ -1558,20 +1565,78 @@ export function executeRowQuery(
   return { columns, rows };
 }
 
-function orderOutputName(
+/** One ORDER BY resolution source: an alias and the columns a wildcard select exposes from it. */
+export interface OrderSourceShape {
+  readonly alias: string;
+  readonly columns: readonly string[];
+}
+
+/**
+ * Resolves one ORDER BY reference to the output column that carries its values, throwing when
+ * nothing matches. Dropping an unresolved sort key silently would return rows in an arbitrary
+ * order with no sign of the problem, which paging built on ORDER BY turns into skipped and
+ * repeated rows.
+ */
+export function orderOutputName(
   expression: Expression,
   select: readonly SelectItem[],
+  sources: readonly OrderSourceShape[],
+): string {
+  const resolved = resolveOrderOutputName(expression, select, sources);
+  if (resolved !== undefined) return resolved;
+  const target = expression.kind === "column" ? `: ${expression.reference}` : "";
+  throw new TypeError(`ORDER BY requires a selected column or output alias${target}`);
+}
+
+function resolveOrderOutputName(
+  expression: Expression,
+  select: readonly SelectItem[],
+  sources: readonly OrderSourceShape[],
 ): string | undefined {
   if (expression.kind !== "column") return undefined;
-  // A wildcard select exposes source columns under their own names, so bare references order by
-  // the matching output column directly.
-  if (select[0]?.expression.kind === "wildcard") return expression.reference;
+  // A wildcard select names its outputs after the source columns: bare from one source, and
+  // `alias.column` from several. A reference is rewritten into that naming rather than looked up
+  // verbatim, so `SELECT * FROM people ORDER BY people.name` orders by the `name` output.
+  if (select[0]?.expression.kind === "wildcard") {
+    return wildcardOrderOutputName(expression.reference, sources);
+  }
   const selected = select.find(
     (item) =>
       (item.expression.kind === "column" && item.expression.reference === expression.reference) ||
       (!expression.reference.includes(".") && item.alias === expression.reference),
   );
   return selected?.alias;
+}
+
+function wildcardOrderOutputName(
+  reference: string,
+  sources: readonly OrderSourceShape[],
+): string | undefined {
+  const prefixed = sources.length > 1;
+  const separator = reference.indexOf(".");
+  if (separator === -1) {
+    // One source keeps the column's own name; unknown names are rejected by column resolution
+    // before execution, so no shape lookup is needed here.
+    if (!prefixed) return reference;
+    const matches = sources.filter((source) => source.columns.includes(reference));
+    const match = matches.length === 1 ? matches[0] : undefined;
+    return match === undefined ? undefined : `${match.alias}.${reference}`;
+  }
+  const alias = reference.slice(0, separator);
+  const column = reference.slice(separator + 1);
+  const source = sources.find((candidate) => candidate.alias === alias);
+  if (source === undefined) return undefined;
+  // A source with no known columns is one whose shape the caller could not supply (a row table
+  // with no rows), so only a column known to be absent is rejected.
+  if (source.columns.length > 0 && !source.columns.includes(column)) return undefined;
+  return prefixed ? `${alias}.${column}` : column;
+}
+
+/** Column names a row table exposes, as the union of its rows' keys. */
+function rowTableColumnNames(rows: readonly DatabaseRow[]): string[] {
+  const names = new Set<string>();
+  for (const row of rows) for (const name of Object.keys(row)) names.add(name);
+  return [...names];
 }
 
 function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]): RowContext[] {
@@ -3311,10 +3376,7 @@ export function transparentProjectionSource(
 }
 
 /** Projects a result to a wrapper's visible aliases, preserving row order. */
-export function projectResultColumns(
-  result: QueryResult,
-  aliases: readonly string[],
-): QueryResult {
+export function projectResultColumns(result: QueryResult, aliases: readonly string[]): QueryResult {
   return {
     columns: [...aliases],
     rows: result.rows.map((row) => {

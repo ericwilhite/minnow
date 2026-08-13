@@ -463,9 +463,12 @@ describe("mutation builders", () => {
       .where((eb) => eb.match(["name", "city"], "lond*"))
       .execute();
     expect(found).toEqual([{ name: "Ada" }]);
-    expect(() => db.selectFrom("people").selectAll().where((eb) => eb.match([], "x"))).toThrow(
-      "at least one column",
-    );
+    expect(() =>
+      db
+        .selectFrom("people")
+        .selectAll()
+        .where((eb) => eb.match([], "x")),
+    ).toThrow("at least one column");
   });
 
   it("desugars search() to match + scored ordering with SQL plan parity", async () => {
@@ -477,7 +480,10 @@ describe("mutation builders", () => {
       "SELECT name FROM people WHERE MATCH(*) AGAINST 'ada lond*' ORDER BY BM25(*) AGAINST 'ada lond*' DESC",
     );
     expectPlanEquivalent(
-      db.selectFrom("people").select(["name"]).search("ada", { columns: ["name"] }),
+      db
+        .selectFrom("people")
+        .select(["name"])
+        .search("ada", { columns: ["name"] }),
       "SELECT name FROM people WHERE MATCH(name) AGAINST 'ada' ORDER BY BM25(name) AGAINST 'ada' DESC",
     );
     // The row shape carries no synthetic score column, and repeated searches compose.

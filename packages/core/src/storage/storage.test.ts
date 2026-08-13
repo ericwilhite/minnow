@@ -1283,9 +1283,7 @@ for (const implementation of stores()) {
       await expect(store.reserveAutoIncrement("people", "id", -1)).rejects.toThrow(
         "non-negative whole number",
       );
-      await expect(store.reserveAutoIncrement("people", "id", 1, 0n)).rejects.toThrow(
-        "at least 1",
-      );
+      await expect(store.reserveAutoIncrement("people", "id", 1, 0n)).rejects.toThrow("at least 1");
       store.close();
     });
 
@@ -1386,9 +1384,7 @@ for (const implementation of stores()) {
                   columns: [
                     {
                       columnId: "title-id",
-                      postings: [
-                        { term: "quick", rowIds: [BigInt(ordinal)], tf: [1] },
-                      ],
+                      postings: [{ term: "quick", rowIds: [BigInt(ordinal)], tf: [1] }],
                       totalTokens: 1,
                     },
                   ],
@@ -1408,9 +1404,7 @@ for (const implementation of stores()) {
       expect(merged.rowIdsByTerm).toEqual([[1n]]);
       expect(merged.deltaChunkCount).toBe(1);
       expect(merged.totalTokens).toBe(1);
-      expect((await store.getTable("articles-id"))?.ftsColumns?.["title-id"]?.state).toBe(
-        "ready",
-      );
+      expect((await store.getTable("articles-id"))?.ftsColumns?.["title-id"]?.state).toBe("ready");
       // A commit that adds segments without a delta is a stale writer: the column flips to
       // invalid in the same publish, and the data commit itself succeeds.
       await commitSegment(2, first.version, false);

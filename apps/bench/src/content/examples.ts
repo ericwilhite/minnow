@@ -254,10 +254,8 @@ export const showcaseExamples: ShowcaseExample[] = [
   "builder",
   "sql",
   "snapshot",
-].map(
-  (id) => {
-    const entry = entries.find((candidate) => candidate.id === id);
-    if (entry === undefined) throw new Error(`Missing showcase example: ${id}`);
-    return entry;
-  },
-);
+].map((id) => {
+  const entry = entries.find((candidate) => candidate.id === id);
+  if (entry === undefined) throw new Error(`Missing showcase example: ${id}`);
+  return entry;
+});

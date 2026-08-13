@@ -409,8 +409,7 @@ export class IndexedDbBlockStore implements BlockStore {
     // (mirroring the unique-key chunk index — no key-range scans in this environment).
     const deltaIndexKey = ftsChunkIndexKey(tableId, columnId);
     const deltaIndex = (await requestResult(store.get(deltaIndexKey))) as
-      | { versions: number[] }
-      | undefined;
+      { versions: number[] } | undefined;
     const surviving: number[] = [];
     for (const version of deltaIndex?.versions ?? []) {
       if (version <= input.coversVersion) {
@@ -456,15 +455,17 @@ export class IndexedDbBlockStore implements BlockStore {
       Promise.all(
         wantedOrdinals.map(
           (ordinal) =>
-            requestResult(store.get(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`)) as
-              Promise<FtsPosting[] | undefined>,
+            requestResult(
+              store.get(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`),
+            ) as Promise<FtsPosting[] | undefined>,
         ),
       ),
       Promise.all(
         wantedVersions.map(
           (version) =>
-            requestResult(store.get(ftsChunkKey(tableId, columnId, version))) as
-              Promise<FtsDeltaChunk | undefined>,
+            requestResult(store.get(ftsChunkKey(tableId, columnId, version))) as Promise<
+              FtsDeltaChunk | undefined
+            >,
         ),
       ),
     ]);
@@ -1227,8 +1228,7 @@ export class IndexedDbBlockStore implements BlockStore {
         );
         const indexKey = ftsChunkIndexKey(input.ftsChanges.tableId, column.columnId);
         const chunkIndex = (await requestResult(catalog.get(indexKey))) as
-          | { versions: number[] }
-          | undefined;
+          { versions: number[] } | undefined;
         catalog.put({ versions: [...(chunkIndex?.versions ?? []), manifest.version] }, indexKey);
       }
     }

@@ -220,6 +220,90 @@ describe("public SQL queries", () => {
     expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
   });
 
+  it("orders a wildcard select by a qualified column reference", async () => {
+    // A wildcard select names its outputs after the source columns, so a qualified ORDER BY
+    // reference has to be rewritten into that naming. Looking it up verbatim used to match no
+    // output column at all, leaving the rows in insertion order with no error raised.
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 4 });
+    await database.createTable({
+      name: "people",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "name", type: "string" },
+      ],
+    });
+    for (let id = 0; id < 10; id += 1) {
+      await database.insert("people", { id, name: `p${String(id % 3)}` });
+    }
+    const sorted = ["p0/0", "p0/3", "p0/6", "p0/9", "p1/1", "p1/4", "p1/7", "p2/2", "p2/5", "p2/8"];
+    for (const sql of [
+      "SELECT * FROM people ORDER BY name, id LIMIT 10",
+      "SELECT * FROM people ORDER BY people.name, people.id LIMIT 10",
+      "SELECT * FROM people p ORDER BY p.name, p.id LIMIT 10",
+    ]) {
+      const result = await database.query(sql);
+      expect(result.rows.map((row) => `${String(row.name)}/${String(row.id)}`)).toEqual(sorted);
+    }
+
+    // Several sources prefix the outputs instead, so a bare reference resolves the other way.
+    await database.createTable({
+      name: "pets",
+      uniqueKey: "pet_id",
+      columns: [
+        { name: "pet_id", type: "number" },
+        { name: "owner", type: "number" },
+        { name: "pet_name", type: "string" },
+      ],
+    });
+    for (let petId = 0; petId < 5; petId += 1) {
+      await database.insert("pets", {
+        pet_id: petId,
+        owner: 9 - petId,
+        pet_name: `pet${String(petId)}`,
+      });
+    }
+    const petNames = ["pet0", "pet1", "pet2", "pet3", "pet4"];
+    for (const sql of [
+      "SELECT * FROM people JOIN pets ON people.id = pets.owner ORDER BY pet_name",
+      "SELECT * FROM people JOIN pets ON people.id = pets.owner ORDER BY pets.pet_name",
+      "SELECT * FROM people o JOIN pets t ON o.id = t.owner ORDER BY t.pet_name",
+    ]) {
+      const result = await database.query(sql);
+      expect(result.rows.map((row) => row["pets.pet_name"] ?? row["t.pet_name"])).toEqual(petNames);
+    }
+
+    // A qualified reference that resolves to nothing is rejected, never dropped.
+    await expect(database.query("SELECT * FROM people ORDER BY people.nope")).rejects.toThrow(
+      "Unknown column: people.nope",
+    );
+    await expect(database.query("SELECT * FROM people p ORDER BY people.name")).rejects.toThrow(
+      "Unknown table alias: people",
+    );
+
+    // Both executors resolve the same way, including for a schema-less row table.
+    const plan = compileQuery("SELECT * FROM t ORDER BY t.x DESC");
+    const input = new Map([
+      [
+        "t",
+        [
+          { x: 1, y: "a" },
+          { x: 3, y: "b" },
+          { x: 2, y: "c" },
+        ],
+      ],
+    ]);
+    expect(executeQuery(plan, input).rows).toEqual([
+      { x: 3, y: "b" },
+      { x: 2, y: "c" },
+      { x: 1, y: "a" },
+    ]);
+    expect(executeRowQuery(plan, input)).toEqual(executeQuery(plan, input));
+    expect(() => executeRowQuery(compileQuery("SELECT * FROM t ORDER BY u.x"), input)).toThrow(
+      "ORDER BY requires a selected column or output alias: u.x",
+    );
+  });
+
   it("rejects a grouped full-text select item missing from GROUP BY", () => {
     // MATCH(*) carries no column children before expansion, but it is never constant across
     // a group; both executors share this rejection through validateGrouping.

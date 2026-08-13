@@ -82,7 +82,7 @@ Result types don't lie: `sum` over an empty group is `null`, so its type is `num
 ## Full-text search
 
 Any column is searchable — no index DDL, no schema marking. A search treats the row as one
-document: every query term must appear in *some* listed column (`"*"` means every non-boolean
+document: every query term must appear in _some_ listed column (`"*"` means every non-boolean
 column), a term ending in `*` matches prefixes, and numbers and datetimes match through their
 canonical text (`42`, or `2026 08` for August 2026 — a datetime renders as its ISO instant).
 Matching is Unicode-aware and deterministic (NFKC + lowercase; CJK matches by character bigrams);
@@ -113,7 +113,7 @@ const everywhere = await db.search("quick fox", { limit: 20 });
 // Array<{ table: string; row: {...}; score: number }>
 ```
 
-Semantics worth knowing: a row whose listed columns are all NULL is *unknown* (dropped by
+Semantics worth knowing: a row whose listed columns are all NULL is _unknown_ (dropped by
 `WHERE`, like `LIKE` on NULL); an empty query matches nothing; unmatched documents score `0`
 under BM25 while all-NULL ones score NULL. Scans evaluate matches against each block's string
 dictionary — every distinct value tokenizes once, rows compare integers — under the query memory
@@ -219,4 +219,5 @@ on `MinnowDatabaseClient` too.
 > Writes get the same treatment — `insertInto` / `updateTable` / `deleteFrom` with `returning`,
 > in [Writes & transactions](/docs/writes/). The full supported-SQL list is the
 > [feature matrix](/docs/sql/). Known limits: correlated subqueries compile but fail at execution
-> (subqueries resolve at one snapshot), and ORDER BY must name a selected column or output alias.
+> (subqueries resolve at one snapshot), and ORDER BY must name a selected column or output alias —
+> over `SELECT *` that is any source column, qualified (`people.name`, `p.name`) or not.

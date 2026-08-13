@@ -844,9 +844,7 @@ for (const implementation of implementations()) {
         uniqueKey: "id",
       });
       // Import scenario: explicit-only inserts still advance the counter atomically.
-      const explicitOnly = await database.insertBatch("events", [
-        { id: 100, label: "imported" },
-      ]);
+      const explicitOnly = await database.insertBatch("events", [{ id: 100, label: "imported" }]);
       expect(explicitOnly.generatedColumns).toBeUndefined();
       const generatedAfter = await database.insertBatch("events", [{ label: "fresh" }]);
       expect(generatedAfter.generatedColumns?.id).toEqual([101]);
@@ -1017,9 +1015,7 @@ for (const implementation of implementations()) {
         "SELECT title FROM articles WHERE MATCH(*) AGAINST '42'",
       );
       expect(numeric.rows.map((row) => row.title)).toEqual(["Quick start guide"]);
-      const year = await database.query(
-        "SELECT title FROM articles WHERE MATCH(*) AGAINST '2025'",
-      );
+      const year = await database.query("SELECT title FROM articles WHERE MATCH(*) AGAINST '2025'");
       expect(year.rows.map((row) => row.title)).toEqual(["Fox hunting quick tips"]);
 
       // A row whose listed columns are all NULL is unknown: NOT(unknown) stays unknown, so the
@@ -1046,9 +1042,9 @@ for (const implementation of implementations()) {
         database.query("SELECT title FROM articles WHERE MATCH(title) AGAINST title"),
       ).rejects.toThrow("string literal");
 
-      expect(await database.explain("SELECT title FROM articles WHERE MATCH(*) AGAINST 'fox'")).toContain(
-        "full-text MATCH evaluates via per-dictionary term tables",
-      );
+      expect(
+        await database.explain("SELECT title FROM articles WHERE MATCH(*) AGAINST 'fox'"),
+      ).toContain("full-text MATCH evaluates via per-dictionary term tables");
       store.close();
     });
 
@@ -1126,7 +1122,8 @@ for (const implementation of implementations()) {
         { title: "columnar storage", body: "quick reads" },
         { title: "manifest deltas", body: "cheap commits" },
       ]);
-      const sql = "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY title";
+      const sql =
+        "SELECT title FROM articles WHERE MATCH(title, body) AGAINST 'quick' ORDER BY title";
       const scanned = await database.query(sql);
       expect(scanned.rows.map((row) => row.title)).toEqual(["columnar storage", "quick brown fox"]);
 
@@ -1205,27 +1202,21 @@ for (const implementation of implementations()) {
         { slug: "b", body: "lazy dog" },
       ]);
       await database.buildFtsIndex("notes", "body");
-      expect(
-        Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state,
-      ).toBe("ready");
+      expect(Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state).toBe(
+        "ready",
+      );
       // An upsert emits no delta on purpose: the publish flips the column to invalid, and the
       // query falls back to the always-correct scan, seeing the replaced document.
       await database.upsertBatch("notes", [{ slug: "a", body: "silent owl" }]);
-      expect(
-        Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state,
-      ).toBe("invalid");
-      const rows = await database.query(
-        "SELECT slug FROM notes WHERE MATCH(body) AGAINST 'owl'",
+      expect(Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state).toBe(
+        "invalid",
       );
+      const rows = await database.query("SELECT slug FROM notes WHERE MATCH(body) AGAINST 'owl'");
       expect(rows.rows.map((row) => row.slug)).toEqual(["a"]);
-      const gone = await database.query(
-        "SELECT slug FROM notes WHERE MATCH(body) AGAINST 'quick'",
-      );
+      const gone = await database.query("SELECT slug FROM notes WHERE MATCH(body) AGAINST 'quick'");
       expect(gone.rows).toEqual([]);
       // Rebuilding on a keyed history is rejected explicitly.
-      await expect(database.buildFtsIndex("notes", "body")).rejects.toThrow(
-        "append-only tables",
-      );
+      await expect(database.buildFtsIndex("notes", "body")).rejects.toThrow("append-only tables");
       store.close();
     });
 
@@ -1295,9 +1286,7 @@ for (const implementation of implementations()) {
       // Prime the plan cache with the pre-migration expansion of "*".
       expect((await database.query(sql)).rows).toEqual([]);
       await database.migrate(
-        schema([
-          table("posts", { title: column.string(), notes: column.string().nullable() }),
-        ]),
+        schema([table("posts", { title: column.string(), notes: column.string().nullable() })]),
       );
       await database.insertBatch("posts", [{ title: "plain", notes: "a zebra hides here" }]);
       // The cached compiled plan must keep "*": expansion re-runs against the live catalog, so
@@ -1408,10 +1397,7 @@ for (const implementation of implementations()) {
         name: "articles",
         columns: [{ name: "title", type: "string" }],
       });
-      await database.insertBatch("articles", [
-        { title: "quick brown fox" },
-        { title: "lazy dog" },
-      ]);
+      await database.insertBatch("articles", [{ title: "quick brown fox" }, { title: "lazy dog" }]);
       const sql = "SELECT title FROM articles WHERE MATCH(title) AGAINST 'quick'";
       const first = await database.query(sql);
       expect(first.rows.map((row) => row.title)).toEqual(["quick brown fox"]);
@@ -1421,9 +1407,9 @@ for (const implementation of implementations()) {
         if (state === "ready") break;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      expect(
-        Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state,
-      ).toBe("ready");
+      expect(Object.values((await store.listTables())[0]?.ftsColumns ?? {})[0]?.state).toBe(
+        "ready",
+      );
       expect((await database.query(sql)).rows).toEqual(first.rows);
       store.close();
     });
@@ -1906,12 +1892,13 @@ it("streams a search-shaped query under a budget too small to materialize", asyn
     columns: [{ name: "body", type: "string" }],
   });
   const words = ["quick", "brown", "fox", "stone", "river"];
+  const wordAt = (index: number): string => words[index % words.length] ?? "";
   const rowCount = 20_000;
   await database.insertBatch("docs", {
     columns: {
       body: Array.from(
         { length: rowCount },
-        (_, index) => `${words[index % 5]} ${words[(index + 1) % 5]} entry ${String(index)}`,
+        (_, index) => `${wordAt(index)} ${wordAt(index + 1)} entry ${String(index)}`,
       ),
     },
   });
@@ -1922,9 +1909,9 @@ it("streams a search-shaped query under a budget too small to materialize", asyn
   const sql =
     "SELECT body FROM docs WHERE MATCH(body) AGAINST 'quick' ORDER BY BM25(body) AGAINST 'quick' DESC, body LIMIT 5";
   const budget = 192_000;
-  await expect(
-    database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
-  ).rejects.toThrow(QueryMemoryBudgetError);
+  await expect(database.prepareQuery(sql, { executionMemoryBudgetBytes: budget })).rejects.toThrow(
+    QueryMemoryBudgetError,
+  );
   const streamed = await database.query(sql, { executionMemoryBudgetBytes: budget });
   expect(streamed.columns).toEqual(["body"]);
   expect(streamed.rows).toHaveLength(5);
@@ -1952,9 +1939,9 @@ it("maintains the full-text index across two IndexedDB connections", async () =>
   const viaRight = await right.query(sql);
   expect(viaLeft.rows.map((row) => row.title)).toEqual(["quick brown fox", "quick patch"]);
   expect(viaRight.rows).toEqual(viaLeft.rows);
-  expect(
-    Object.values((await leftStore.listTables())[0]?.ftsColumns ?? {})[0]?.state,
-  ).toBe("ready");
+  expect(Object.values((await leftStore.listTables())[0]?.ftsColumns ?? {})[0]?.state).toBe(
+    "ready",
+  );
   leftStore.close();
   rightStore.close();
 });

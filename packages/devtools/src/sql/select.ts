@@ -1,13 +1,7 @@
 import type { QueryRow, QueryValue } from "@minnowdb/core";
 import { findColumn, type TableInfo } from "../explorer/catalog.js";
 import { renderFilters, type Filter } from "../explorer/filters.js";
-import {
-  isExactlyComparable,
-  isSortable,
-  sqlColumn,
-  sqlLiteral,
-  sqlOrderColumn,
-} from "./literal.js";
+import { isExactlyComparable, isSortable, sqlColumn, sqlLiteral } from "./literal.js";
 
 export interface Sort {
   column: string;
@@ -54,8 +48,8 @@ export function pagingMode(table: TableInfo, sort?: Sort): PagingMode {
 }
 
 /**
- * The ordering actually sent: the chosen column, then the key so the order is total. A column the
- * parser will not read as a column is dropped rather than sent — see `isSortable`.
+ * The ordering actually sent: the chosen column, then the key so the order is total. A name this
+ * package cannot render as SQL is dropped rather than sent — see `isSortable`.
  */
 function orderColumns(table: TableInfo, sort?: Sort): Sort[] {
   const key =
@@ -103,10 +97,11 @@ function whereClause(parts: ReadonlyArray<string | undefined>): string {
   return kept.length === 0 ? "" : ` WHERE ${kept.join(" AND ")}`;
 }
 
-function orderClause(order: readonly Sort[]): string {
+/** Qualified, like every other column reference: it is what lets a keyword name be sorted on. */
+function orderClause(table: string, order: readonly Sort[]): string {
   if (order.length === 0) return "";
   const rendered = order.map(
-    (sort) => `${sqlOrderColumn(sort.column)}${sort.direction === "desc" ? " DESC" : ""}`,
+    (sort) => `${sqlColumn(table, sort.column)}${sort.direction === "desc" ? " DESC" : ""}`,
   );
   return ` ORDER BY ${rendered.join(", ")}`;
 }
@@ -125,7 +120,7 @@ export function buildPageQuery(request: PageRequest): string {
   const offset = mode === "offset" ? (request.offset ?? 0) : 0;
   const tail =
     offset > 0 ? ` LIMIT ${String(limit)} OFFSET ${String(offset)}` : ` LIMIT ${String(limit)}`;
-  return `SELECT * FROM ${table.name}${whereClause([filterSql, cursorSql])}${orderClause(order)}${tail}`;
+  return `SELECT * FROM ${table.name}${whereClause([filterSql, cursorSql])}${orderClause(table.name, order)}${tail}`;
 }
 
 /** Counting scans the whole table, so callers ask for it separately and never wait on it. */

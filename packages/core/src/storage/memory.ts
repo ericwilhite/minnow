@@ -65,7 +65,10 @@ export class MemoryBlockStore implements BlockStore {
     string,
     { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number }
   >();
-  readonly #ftsDeltas = new Map<string, Map<number, { postings: FtsPosting[]; totalTokens: number }>>();
+  readonly #ftsDeltas = new Map<
+    string,
+    Map<number, { postings: FtsPosting[]; totalTokens: number }>
+  >();
   readonly #uniqueKeys = new Map<string, Set<string>>();
   readonly #tempRunPages = new Map<string, Uint8Array>();
   readonly #tempOwners = new Map<string, TempOwnerRecord>();
@@ -244,8 +247,7 @@ export class MemoryBlockStore implements BlockStore {
       const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
       const updated: TableRecord = {
         ...base,
-        columns:
-          update.columns === undefined ? record.columns : structuredClone(update.columns),
+        columns: update.columns === undefined ? record.columns : structuredClone(update.columns),
         ...(nextFts === null || nextFts === undefined
           ? {}
           : { ftsColumns: structuredClone(nextFts) }),
@@ -284,7 +286,8 @@ export class MemoryBlockStore implements BlockStore {
     const key = `${tableId}/${columnId}`;
     const base = this.#ftsBases.get(key);
     const deltas =
-      this.#ftsDeltas.get(key) ?? new Map<number, { postings: FtsPosting[]; totalTokens: number }>();
+      this.#ftsDeltas.get(key) ??
+      new Map<number, { postings: FtsPosting[]; totalTokens: number }>();
     const chunkLists: Array<readonly FtsPosting[]> = [...(base?.chunks ?? [])];
     let deltaChunkCount = 0;
     let totalTokens = base?.totalTokens ?? 0;

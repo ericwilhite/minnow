@@ -57,38 +57,21 @@ function checkName(kind: string, name: string): string {
 }
 
 /**
- * A column inside WHERE, always qualified. The engine has no quoted identifiers, so a column named
- * after a keyword — `case`, `when` — only parses with its table in front of it; qualifying every
- * column means the explorer never has to know which names are special.
+ * A column reference, always qualified — in WHERE and in ORDER BY alike. The engine has no quoted
+ * identifiers, so a column named after a keyword — `case`, `null` — only parses with its table in
+ * front of it; qualifying every column means the explorer never has to know which names are
+ * special. ORDER BY resolves a qualified reference against the source table of `SELECT *`, so the
+ * same form serves both clauses.
  */
 export function sqlColumn(table: string, column: string): string {
   return `${checkName("table", table)}.${checkName("column", column)}`;
 }
 
 /**
- * A column inside ORDER BY, never qualified.
- *
- * ORDER BY resolves against the output aliases of the select, and `SELECT *` emits them
- * unqualified. A qualified reference matches nothing there — and the engine does not reject it,
- * it returns the rows unordered. Sorting therefore has to use bare names, and the safety
- * qualifying bought in WHERE is not available here.
- */
-export function sqlOrderColumn(column: string): string {
-  return checkName("column", column);
-}
-
-/**
- * Words the expression parser claims before it can see a column of the same name. Only names that
- * are special on their own matter: a column called `count` or `date` parses fine in ORDER BY,
- * because those forms need a `(` or a string after them, and ORDER BY never supplies one.
- */
-const reservedBareWords = new Set(["case", "not", "true", "false", "null", "exists"]);
-
-/**
- * Whether a column can be sorted on at all. One named `case` cannot: bare, the parser reads it as
- * the start of a CASE expression, and qualified, ORDER BY silently ignores it. Refusing to sort is
- * the only honest answer — the alternative is rows in an order nobody asked for.
+ * Whether a column can be sorted on at all. Qualifying covers every keyword name, so only a name
+ * this module cannot render — one that is not a bare identifier — is refused. Sorting is dropped
+ * rather than attempted for those, because rows in an order nobody asked for are worse than none.
  */
 export function isSortable(column: string): boolean {
-  return identifier.test(column) && !reservedBareWords.has(column.toLowerCase());
+  return identifier.test(column);
 }
