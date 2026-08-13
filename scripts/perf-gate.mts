@@ -318,8 +318,12 @@ duckdb.closeSync();
 
 console.log(`\nSQL performance gate — ${String(ROWS)} rows, median of ${String(RUNS)} runs`);
 console.log(
-  "query                minnow(ms)   sqlite(ms) ratio    pglite(ms) ratio    duckdb(ms) ratio",
+  "query                minnow(ms)      sqlite(ms)            pglite(ms)            duckdb(ms)",
 );
+const versus = (minnowMs: number, engineMs: number): string => {
+  const ratio = minnowMs / engineMs;
+  return ratio <= 1 ? `${(1 / ratio).toFixed(1)}x faster` : `${ratio.toFixed(1)}x slower`;
+};
 const failures: string[] = [];
 const newThresholds: Baseline["thresholds"] = {};
 for (const result of results) {
@@ -331,7 +335,9 @@ for (const result of results) {
     newThresholds[result.name][engine] = Number((ratio * MARGIN).toFixed(2));
     const threshold = baseline?.thresholds[result.name]?.[engine];
     const flag = threshold !== undefined && ratio > threshold ? "!" : " ";
-    line.push(`${engineMs.toFixed(2).padStart(13)} ${ratio.toFixed(2).padStart(5)}${flag}`);
+    line.push(
+      `${engineMs.toFixed(2).padStart(10)} ${versus(result.minnowMs, engineMs).padStart(11)}${flag}`,
+    );
     if (threshold !== undefined && ratio > threshold) {
       failures.push(
         `${result.name} vs ${engine}: ratio ${ratio.toFixed(2)} exceeds threshold ${String(threshold)}`,

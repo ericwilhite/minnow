@@ -273,6 +273,11 @@ interface BoundJoin {
   readonly lookup: JoinLookup;
   /** Nested-loop fallback for non-equi or multi-key ON conditions; lookup is unused when set. */
   readonly loop?: { condition: BoundExpression; rowCount: number };
+  /**
+   * Per-dictionary-code build rows when the probe is a bare dictionary string column: each
+   * distinct probe value hits the hash lookup once, and every other row is an array read.
+   */
+  codeLookup?: { dictionary: readonly string[]; rows: Int32Array };
 }
 
 interface BoundSelectItem {
@@ -2260,13 +2265,47 @@ function joinUniqueBatch(
     const selectedRows = new Uint32Array(input.length);
     const buildRows = new Int32Array(input.length);
     let outputLength = 0;
-    for (let row = 0; row < input.length; row += 1) {
-      const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
-      const buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
-      if (buildRow < 0 && join.kind === "inner") continue;
-      selectedRows[outputLength] = row;
-      buildRows[outputLength] = buildRow;
-      outputLength += 1;
+    const probe = join.probe;
+    const dictProbe =
+      probe.kind === "column" && probe.vector.kind === "string" && probe.vector.window === undefined
+        ? { source: probe.source, vector: probe.vector }
+        : undefined;
+    if (dictProbe !== undefined) {
+      const vector = dictProbe.vector;
+      if (join.codeLookup?.dictionary !== vector.dictionary) {
+        // -2 marks "not resolved yet"; -1 is a genuine miss.
+        join.codeLookup = {
+          dictionary: vector.dictionary,
+          rows: new Int32Array(vector.dictionary.length).fill(-2),
+        };
+      }
+      const cache = join.codeLookup.rows;
+      const probeRows = input.rowsBySource[dictProbe.source];
+      for (let row = 0; row < input.length; row += 1) {
+        const sourceRow = probeRows?.[row] ?? -1;
+        const code = stringCodeAt(vector, sourceRow);
+        let buildRow = -1;
+        if (code !== undefined) {
+          buildRow = cache[code] ?? -2;
+          if (buildRow === -2) {
+            buildRow = join.lookup.firstRow(vector.dictionary[code] ?? "");
+            cache[code] = buildRow;
+          }
+        }
+        if (buildRow < 0 && join.kind === "inner") continue;
+        selectedRows[outputLength] = row;
+        buildRows[outputLength] = buildRow;
+        outputLength += 1;
+      }
+    } else {
+      for (let row = 0; row < input.length; row += 1) {
+        const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
+        const buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
+        if (buildRow < 0 && join.kind === "inner") continue;
+        selectedRows[outputLength] = row;
+        buildRows[outputLength] = buildRow;
+        outputLength += 1;
+      }
     }
     if (outputLength === input.length) {
       selectedReservation.release();
@@ -2362,6 +2401,10 @@ class ResultSink {
   readonly #selection: DeferredTopRow[] = [];
   readonly #keyScratch: QueryValue[] = [];
   #threshold: DeferredTopRow | undefined;
+  /** The threshold's first order key as an unboxed float, when the fast reject applies. */
+  #thresholdFirst: number | null | undefined;
+  readonly #fastFirstKey:
+    { vector: NumberVector | DateTimeVector; source: number; desc: boolean } | undefined;
   #selectionBytes = 0;
   #selectionReservedBytes = 0;
   #seq = 0;
@@ -2386,6 +2429,24 @@ class ResultSink {
     this.#keyExpressions = keyExpressions;
     this.#deferred =
       bounded && keyExpressions !== undefined && plan.joins.length === 0 && stableScan;
+    // A bare numeric/datetime first order key rejects most rows with one unboxed comparison
+    // against the current cut line, before any generic key evaluation or allocation. NULLs and
+    // explicit NULLS placement fall through to the full comparison, so semantics are untouched.
+    const firstKey = keyExpressions?.[0];
+    const firstOrder = plan.orderBy[0];
+    this.#fastFirstKey =
+      firstKey !== undefined &&
+      firstOrder !== undefined &&
+      firstOrder.nulls === undefined &&
+      firstKey.kind === "column" &&
+      (firstKey.vector.kind === "number" || firstKey.vector.kind === "datetime") &&
+      firstKey.vector.window === undefined
+        ? {
+            vector: firstKey.vector,
+            source: firstKey.source,
+            desc: firstOrder.direction === "desc",
+          }
+        : undefined;
   }
 
   /** Rows accepted so far; only meaningful for the unbounded early-limit check. */
@@ -2430,6 +2491,18 @@ class ResultSink {
   }
 
   #addDeferred(batch: BatchRows, row: number): void {
+    const fast = this.#fastFirstKey;
+    if (fast !== undefined && this.#thresholdFirst !== undefined && this.#thresholdFirst !== null) {
+      const value = rawFloat64Value(fast.vector, batch.rowsBySource[fast.source]?.[row] ?? -1);
+      if (value !== null) {
+        const comparison = fast.desc ? this.#thresholdFirst - value : value - this.#thresholdFirst;
+        // Strictly worse on the first key is strictly worse overall; the row cannot survive.
+        if (comparison > 0) {
+          this.#seq += 1;
+          return;
+        }
+      }
+    }
     this.#evaluateKeys(batch, row);
     const seq = this.#seq;
     this.#seq += 1;
@@ -2483,6 +2556,17 @@ class ResultSink {
     for (const entry of this.#selection) retainedBytes += entry.bytes;
     this.#selectionBytes = retainedBytes;
     this.#threshold = this.#selection[capacity - 1];
+    const first = this.#threshold?.keys[0];
+    this.#thresholdFirst =
+      first === undefined
+        ? undefined
+        : first === null
+          ? null
+          : typeof first === "number"
+            ? first
+            : first instanceof Date
+              ? first.getTime()
+              : undefined;
   }
 
   #addEager(batch: BatchRows, row: number): void {
@@ -2652,10 +2736,13 @@ class GroupAccumulator {
       this.#memory,
     );
 
+  readonly #fastAggregatesCache: Array<{ kind: "star" | "column"; sums: boolean }> | undefined;
+
   constructor(plan: BoundPlan, memory: QueryMemoryContext) {
     this.#plan = plan;
     this.#memory = memory;
     this.#index = new ByteGroupIndex<GroupState>(memory);
+    this.#fastAggregatesCache = plan.grouped ? this.#fastAggregates() : undefined;
     if (plan.grouped && plan.groupBy.length === 0) {
       this.#index.setEmpty(createGroupState([], plan, memory));
     }
@@ -2705,6 +2792,108 @@ class GroupAccumulator {
         this.#ordered = [];
       }
     }
+  }
+
+  /**
+   * Fast aggregate specs for the batch kernel: every aggregate is COUNT(*) or a bare numeric
+   * column under COUNT/SUM/AVG. MIN/MAX keep the generic path for its comparison and memory
+   * accounting semantics. Undefined when any aggregate needs the generic path.
+   */
+  #fastAggregates(): Array<{ kind: "star" | "column"; sums: boolean }> | undefined {
+    const specs: Array<{ kind: "star" | "column"; sums: boolean }> = [];
+    for (const spec of this.#plan.aggregates) {
+      if (spec.argument.kind === "wildcard" && spec.name === "COUNT") {
+        specs.push({ kind: "star", sums: false });
+        continue;
+      }
+      if (
+        spec.rawNumber !== undefined &&
+        (spec.name === "COUNT" || spec.name === "SUM" || spec.name === "AVG")
+      ) {
+        specs.push({ kind: "column", sums: spec.name !== "COUNT" });
+        continue;
+      }
+      return undefined;
+    }
+    return specs;
+  }
+
+  /**
+   * The batch kernel for dictionary-coded single-column grouping (or the global group) over
+   * COUNT/SUM/AVG aggregates: one pass with unboxed reads and no per-row dispatch. Returns false
+   * when the plan shape needs the generic per-row path.
+   */
+  consumeFast(batch: BatchRows, passes: (row: number) => boolean, hasPredicates: boolean): boolean {
+    const plan = this.#plan;
+    const codeGrouping = plan.codeGrouping;
+    const globalGroup = plan.groupBy.length === 0;
+    if (!globalGroup && (codeGrouping === undefined || this.#codeStates === undefined)) {
+      return false;
+    }
+    const specs = this.#fastAggregatesCache;
+    if (specs === undefined) return false;
+    // The purest shape — global COUNT(*) with no predicates — needs no row loop at all.
+    if (globalGroup && !hasPredicates && specs.every((spec) => spec.kind === "star")) {
+      const state = required(this.#index.getEmpty(), "Grouped query state is missing");
+      for (let index = 0; index < specs.length; index += 1) {
+        state.counts[index] = (state.counts[index] ?? 0) + batch.length;
+      }
+      return true;
+    }
+    const groupRows =
+      codeGrouping === undefined ? undefined : batch.rowsBySource[codeGrouping.source];
+    const groupVector = codeGrouping?.vector;
+    const states = this.#codeStates;
+    const nullCode = groupVector?.dictionary.length ?? 0;
+    const aggregates = plan.aggregates;
+    const globalState = globalGroup
+      ? required(this.#index.getEmpty(), "Grouped query state is missing")
+      : undefined;
+    for (let row = 0; row < batch.length; row += 1) {
+      if (hasPredicates && !passes(row)) continue;
+      let state = globalState;
+      if (state === undefined && groupVector !== undefined && states !== undefined) {
+        const sourceRow = groupRows?.[row] ?? -1;
+        let code = nullCode;
+        if (
+          sourceRow >= 0 &&
+          sourceRow < groupVector.length &&
+          isValid(groupVector.validity, sourceRow)
+        ) {
+          const rawCode = groupVector.codes[sourceRow] ?? NULL_STRING_CODE;
+          if (rawCode !== NULL_STRING_CODE) code = rawCode;
+        }
+        state = states[code];
+        if (state === undefined) {
+          const value = code === nullCode ? null : (groupVector.dictionary[code] ?? null);
+          state = createGroupState([value], plan, this.#memory);
+          states[code] = state;
+          this.#ordered?.push(state);
+        }
+      }
+      if (state === undefined) return false;
+      const counts = state.counts;
+      const sums = state.sums;
+      for (let index = 0; index < specs.length; index += 1) {
+        const spec = specs[index];
+        if (spec === undefined) continue;
+        if (spec.kind === "star") {
+          counts[index] = (counts[index] ?? 0) + 1;
+          continue;
+        }
+        const raw = aggregates[index]?.rawNumber;
+        if (raw === undefined) continue;
+        const value = rawFloat64Value(raw.vector, batch.rowsBySource[raw.source]?.[row] ?? -1);
+        if (value === null) continue;
+        counts[index] = (counts[index] ?? 0) + 1;
+        if (spec.sums) sums[index] = (sums[index] ?? 0) + value;
+      }
+    }
+    return true;
+  }
+
+  get fastAggregatesCache(): Array<{ kind: "star" | "column"; sums: boolean }> | undefined {
+    return this.#fastAggregatesCache;
   }
 
   /** Resolves the group state for one row, creating it on first touch. */
@@ -2815,6 +3004,16 @@ function consumeBatch(
   output: ResultSink,
   memory: QueryMemoryContext,
 ): void {
+  if (
+    plan.grouped &&
+    groups.consumeFast(
+      batch,
+      (row) => passesPredicates(plan, batch, row),
+      plan.predicates.length > 0,
+    )
+  ) {
+    return;
+  }
   for (let row = 0; row < batch.length; row += 1) {
     if (!passesPredicates(plan, batch, row)) continue;
     if (plan.grouped) {
@@ -3170,6 +3369,38 @@ function detectDictionaryLike(predicate: BoundPredicate): DictionaryLike | undef
   };
 }
 
+/**
+ * Match table for one (dictionary, pattern) pair, cached across queries on the dictionary's
+ * identity: repeated LIKE scans over a cached columnar table pay the per-entry match once ever.
+ */
+const dictionaryLikeCache = new WeakMap<readonly string[], Map<string, Uint8Array>>();
+
+function dictionaryLikeMatches(
+  dictionary: readonly string[],
+  pattern: string,
+  caseInsensitive: boolean,
+  escape: string | undefined,
+): Uint8Array {
+  let patterns = dictionaryLikeCache.get(dictionary);
+  if (patterns === undefined) {
+    patterns = new Map();
+    dictionaryLikeCache.set(dictionary, patterns);
+  }
+  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""} ${pattern}`;
+  let matches = patterns.get(key);
+  if (matches === undefined) {
+    matches = new Uint8Array(dictionary.length);
+    for (let index = 0; index < dictionary.length; index += 1) {
+      matches[index] = likeMatches(pattern, dictionary[index] ?? "", caseInsensitive, escape)
+        ? 1
+        : 0;
+    }
+    if (patterns.size >= 32) patterns.clear();
+    patterns.set(key, matches);
+  }
+  return matches;
+}
+
 function stringCodeAt(vector: StringVector, rowIndex: number): number | undefined {
   if (rowIndex < 0 || rowIndex >= vector.length) return undefined;
   const window = vector.window;
@@ -3354,13 +3585,12 @@ function evaluateBatchPredicate(
     if (code === undefined) return false;
     if (like.cache.dictionary !== like.vector.dictionary) {
       like.cache.dictionary = like.vector.dictionary;
-      const matches = new Uint8Array(like.vector.dictionary.length);
-      like.vector.dictionary.forEach((entry, index) => {
-        matches[index] = likeMatches(like.pattern, entry, like.caseInsensitive, like.escape)
-          ? 1
-          : 0;
-      });
-      like.cache.matches = matches;
+      like.cache.matches = dictionaryLikeMatches(
+        like.vector.dictionary,
+        like.pattern,
+        like.caseInsensitive,
+        like.escape,
+      );
     }
     const matched = like.cache.matches[code] === 1;
     return like.negated ? !matched : matched;
