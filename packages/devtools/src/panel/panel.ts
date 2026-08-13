@@ -1,8 +1,11 @@
 import { el, iconButton, icon, icons } from "../dom.js";
 import type { ResolvedDevtoolsOptions } from "../options.js";
+import { readFlag, writeFlag } from "../storage.js";
+import { draggable } from "./drag.js";
 import {
   clampToViewport,
   cornerRect,
+  maximizedRect,
   moveBy,
   parseRect,
   preferredSize,
@@ -123,6 +126,7 @@ export function createPanel(deps: PanelDeps): Panel {
     });
   }
 
+  const maximize = iconButton("winbtn", "Maximize", icons.maximize);
   const close = iconButton("winbtn", "Close devtools", icons.close);
   const titlebar = el("div", { class: "titlebar" }, [
     el("span", { class: "mark" }, [icon(icons.fish)]),
@@ -132,7 +136,7 @@ export function createPanel(deps: PanelDeps): Panel {
     threadBadge,
     writeBadge,
   ]);
-  if (floating) titlebar.append(close);
+  if (floating) titlebar.append(maximize, close);
 
   const grip = el("span", { class: "grip", attrs: { "aria-hidden": "true" } }, [icon(icons.grip)]);
   // The rail sits beside every view rather than inside one, because the schema is as useful for
@@ -156,9 +160,21 @@ export function createPanel(deps: PanelDeps): Panel {
   close.addEventListener("click", () => {
     deps.onClose();
   });
+  maximize.addEventListener("click", () => {
+    setMaximized(!maximized);
+  });
+  // Double-clicking the title bar toggles too, the way a window manager does.
+  titlebar.addEventListener("dblclick", (event) => {
+    if (event.target instanceof Element && event.target.closest("button, input, select, a")) return;
+    setMaximized(!maximized);
+  });
 
   let rect: Rect | undefined;
   let frame = 0;
+  const maximizedKey = `${options.storageKey}:maximized`;
+  let maximized = floating && readFlag(maximizedKey, false);
+  /** Where to go back to. The stored rect keeps the real geometry, never the maximized one. */
+  let restoreRect: Rect | undefined;
 
   function paint(): void {
     if (rect === undefined || !floating) return;
@@ -180,66 +196,68 @@ export function createPanel(deps: PanelDeps): Panel {
   function layout(): void {
     if (!floating) return;
     const bounds = viewport();
-    rect ??=
+    restoreRect ??=
       readStoredRect(options.storageKey) ??
       cornerRect(options.corner, bounds, preferredSize(bounds));
-    rect = clampToViewport(rect, bounds);
+    restoreRect = clampToViewport(restoreRect, bounds);
+    rect = maximized ? maximizedRect(bounds) : restoreRect;
+    applyMaximizedChrome();
+    paint();
+  }
+
+  function applyMaximizedChrome(): void {
+    node.classList.toggle("maximized", maximized);
+    maximize.title = maximized ? "Restore" : "Maximize";
+    maximize.setAttribute("aria-label", maximize.title);
+    maximize.replaceChildren(icon(maximized ? icons.restore : icons.maximize));
+  }
+
+  /**
+   * Maximizing keeps the window's own geometry aside rather than overwriting it, so restoring
+   * returns to the size it was actually left at — including across a reload.
+   */
+  function setMaximized(next: boolean): void {
+    if (!floating || maximized === next) return;
+    if (next && rect !== undefined) restoreRect = rect;
+    maximized = next;
+    writeFlag(maximizedKey, maximized);
+    const bounds = viewport();
+    rect = maximized
+      ? maximizedRect(bounds)
+      : clampToViewport(restoreRect ?? maximizedRect(bounds), bounds);
+    applyMaximizedChrome();
     paint();
   }
 
   /**
-   * One gesture handler for both the drag and the resize: they differ only in which transform
-   * they apply to the rect.
-   *
-   * The move and end listeners go on the window rather than the handle, so the gesture survives
-   * the pointer leaving the title bar — which it does immediately on any real drag. Pointer
-   * capture is a best-effort addition on top: it keeps the host page's elements from reacting to
-   * a pointer that is mid-drag, but it throws for a pointer the browser does not consider active,
-   * and losing it must not cost the drag.
+   * Moving and resizing differ only in which transform they apply to the rect. Neither is offered
+   * while maximized: the window fills the screen, so there is nowhere to drag it to, and the
+   * restore control is right there in the title bar.
    */
   function gesture(
     handle: HTMLElement,
     apply: (start: Rect, dx: number, dy: number, bounds: Size) => Rect,
     activeClass?: string,
   ): void {
-    handle.addEventListener("pointerdown", (event: PointerEvent) => {
-      if (event.button !== 0 || rect === undefined) return;
-      // The title bar is both a drag handle and a toolbar. Starting a drag calls preventDefault,
-      // which cancels the click that would otherwise follow — so a press that lands on a control
-      // is left alone and never becomes a drag.
-      if (event.target instanceof Element && event.target.closest("button, input, select, a")) {
-        return;
-      }
-      const start = rect;
-      const originX = event.clientX;
-      const originY = event.clientY;
-      const bounds = viewport();
-      const { pointerId } = event;
-      let captured = false;
-      try {
-        handle.setPointerCapture(pointerId);
-        captured = true;
-      } catch {
-        // Not an active pointer; the window listeners below carry the gesture regardless.
-      }
-      if (activeClass !== undefined) handle.classList.add(activeClass);
-      event.preventDefault();
-
-      const move = (moved: PointerEvent): void => {
-        rect = apply(start, moved.clientX - originX, moved.clientY - originY, bounds);
+    let start: Rect | undefined;
+    let bounds: Size = { width: 0, height: 0 };
+    draggable(handle, {
+      onStart: () => {
+        if (rect === undefined || maximized) return false;
+        start = rect;
+        bounds = viewport();
+        if (activeClass !== undefined) handle.classList.add(activeClass);
+        return true;
+      },
+      onMove: (dx, dy) => {
+        if (start === undefined) return;
+        rect = apply(start, dx, dy, bounds);
         schedulePaint();
-      };
-      const end = (): void => {
-        window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", end);
-        window.removeEventListener("pointercancel", end);
-        if (captured) handle.releasePointerCapture(pointerId);
+      },
+      onEnd: () => {
         if (activeClass !== undefined) handle.classList.remove(activeClass);
         if (rect !== undefined) writeStoredRect(options.storageKey, rect);
-      };
-      window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", end);
-      window.addEventListener("pointercancel", end);
+      },
     });
   }
 
@@ -259,7 +277,9 @@ export function createPanel(deps: PanelDeps): Panel {
 
   const onWindowResize = (): void => {
     if (rect === undefined) return;
-    rect = clampToViewport(rect, viewport());
+    const bounds = viewport();
+    rect = maximized ? maximizedRect(bounds) : clampToViewport(rect, bounds);
+    if (!maximized) restoreRect = rect;
     schedulePaint();
   };
   window.addEventListener("resize", onWindowResize);

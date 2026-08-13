@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   clampToViewport,
   cornerRect,
+  maximizedRect,
   minimumSize,
   moveBy,
   parseRect,
   preferredSize,
   resizeBy,
+  resizeSplit,
 } from "./window.js";
 
 const desktop = { width: 1440, height: 900 };
@@ -130,6 +132,32 @@ describe("resizeBy", () => {
     expect(resizeBy(rect, "se", 5000, 5000, desktop).width).toBe(desktop.width - rect.x);
     expect(resizeBy(rect, "w", -5000, 0, desktop).x).toBe(0);
     expect(resizeBy(rect, "n", 0, -5000, desktop).y).toBe(0);
+  });
+});
+
+describe("maximizedRect", () => {
+  it("fills the viewport from the origin", () => {
+    expect(maximizedRect(desktop)).toEqual({ x: 0, y: 0, width: 1440, height: 900 });
+  });
+});
+
+describe("resizeSplit", () => {
+  const minimums = { top: 60, bottom: 120 };
+
+  it("moves the divider by the drag", () => {
+    expect(resizeSplit(200, 50, 600, minimums)).toBe(250);
+    expect(resizeSplit(200, -50, 600, minimums)).toBe(150);
+  });
+
+  it("keeps a minimum for each pane rather than collapsing either", () => {
+    expect(resizeSplit(200, -5000, 600, minimums)).toBe(minimums.top);
+    expect(resizeSplit(200, 5000, 600, minimums)).toBe(600 - minimums.bottom);
+  });
+
+  it("gives the top pane away first when the container cannot hold both", () => {
+    // 100px of room, and the results alone want 120: the editor keeps its floor and the
+    // container scrolls rather than the divider landing at a negative height.
+    expect(resizeSplit(80, 0, 100, minimums)).toBe(minimums.top);
   });
 });
 

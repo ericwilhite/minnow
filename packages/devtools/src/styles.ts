@@ -130,6 +130,10 @@ button { font: inherit; color: inherit; }
   overflow: hidden;
 }
 .panel.floating { position: fixed; }
+/* Filling the screen, the window drops its rounded corners the way a maximized one does. */
+.panel.maximized { border-radius: 0; }
+.panel.maximized .grip, .panel.maximized .resize-edge { display: none; }
+.panel.maximized .titlebar { cursor: default; }
 .panel.inline { position: relative; width: 100%; height: 520px; }
 
 .titlebar {
@@ -584,14 +588,28 @@ input.mini.value { width: 110px; }
 .console { display: flex; min-height: 0; container: mdt-console / inline-size; }
 .console-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
-.editor-slot {
+.editor-slot { flex: none; min-height: 60px; display: flex; overflow: hidden; }
+
+/* The divider is a hairline with a taller target around it, so it is easy to grab but not loud. */
+.splitter {
   flex: none;
-  height: 32%;
-  min-height: 100px;
-  display: flex;
-  overflow: hidden;
-  border-bottom: 1px solid var(--mdt-border);
+  height: 7px;
+  margin-top: -3px;
+  position: relative;
+  cursor: ns-resize;
+  touch-action: none;
+  z-index: 1;
 }
+.splitter::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 3px;
+  height: 1px;
+  background: var(--mdt-border);
+}
+.splitter:hover::after, .splitter.dragging::after { background: var(--mdt-accent); height: 2px; }
 .editor-slot > * { flex: 1; min-width: 0; }
 
 .editor {

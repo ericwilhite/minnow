@@ -4,7 +4,10 @@ import { button, el, icon, icons } from "./dom.js";
 import { createTextareaEditor, type EditorSchema, type SqlEditor } from "./editor/editor.js";
 import { createHistoryRail } from "./history/rail.js";
 import { createHistoryStore, type HistoryEntry } from "./history/store.js";
+import { draggable } from "./panel/drag.js";
+import { resizeSplit } from "./panel/window.js";
 import { createGrid } from "./results/grid.js";
+import { readStored, writeStored } from "./storage.js";
 import { changesData, classifyStatement, summarize, writeBlockedMessage } from "./statements.js";
 import type { DevtoolsTarget } from "./target.js";
 
@@ -83,6 +86,14 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     },
   });
 
+  const splitter = el("div", {
+    class: "splitter",
+    attrs: {
+      role: "separator",
+      "aria-orientation": "horizontal",
+      "aria-label": "Resize the editor",
+    },
+  });
   const main = el("div", { class: "console-main" }, [
     el("div", { class: "toolbar" }, [
       run,
@@ -90,11 +101,46 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
       el("span", { class: "spacer" }),
     ]),
     editorSlot,
+    splitter,
     notice,
     grid.node,
     status,
   ]);
   const node = el("div", { class: "console" }, [main, historyRail.node]);
+
+  /**
+   * The editor's share of the console, dragged by the splitter. Stored in pixels rather than a
+   * fraction: the editor wants a number of lines, and that should not change because the panel
+   * got taller.
+   */
+  const splitKey = `${deps.storageKey}:editor-height`;
+  const storedHeight = Number(readStored(splitKey) ?? "");
+  let editorHeight = Number.isFinite(storedHeight) && storedHeight > 0 ? storedHeight : 170;
+
+  function applySplit(): void {
+    editorSlot.style.height = `${String(Math.round(editorHeight))}px`;
+  }
+
+  let splitStart = 0;
+  draggable(splitter, {
+    onStart: () => {
+      splitStart = editorSlot.getBoundingClientRect().height;
+      splitter.classList.add("dragging");
+      return true;
+    },
+    onMove: (_dx, dy) => {
+      editorHeight = resizeSplit(splitStart, dy, main.getBoundingClientRect().height, {
+        top: 60,
+        bottom: 120,
+      });
+      applySplit();
+    },
+    onEnd: () => {
+      splitter.classList.remove("dragging");
+      writeStored(splitKey, String(Math.round(editorHeight)));
+    },
+  });
+  applySplit();
 
   grid.setMessage("Run a query to see rows here.");
   renderHistory();
@@ -236,6 +282,9 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
         editor.destroy();
         editor = upgraded;
         editorSlot = slot;
+        // The new slot carries none of the old one's inline height, so the split has to be
+        // reapplied or the editor drops to its floor the moment CodeMirror arrives.
+        applySplit();
       } catch {
         // The chunk can be blocked or absent. The textarea it replaces is still there and still
         // runs queries, so this costs highlighting and completion, never the console.

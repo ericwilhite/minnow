@@ -114,6 +114,26 @@ export function resizeBy(
   return { x, y, width, height };
 }
 
+/** The whole viewport, which is what maximizing fills. */
+export function maximizedRect(viewport: Size): Rect {
+  return { x: 0, y: 0, width: viewport.width, height: viewport.height };
+}
+
+/**
+ * A horizontal split: how tall the top pane should be after dragging the divider. Both panes keep
+ * a minimum, so the divider stops rather than collapsing either one to nothing — and if the
+ * container is too short to honour both, the top pane gives way first.
+ */
+export function resizeSplit(
+  topHeight: number,
+  delta: number,
+  containerHeight: number,
+  minimums: { top: number; bottom: number },
+): number {
+  const highest = containerHeight - minimums.bottom;
+  return clamp(topHeight + delta, minimums.top, Math.max(highest, minimums.top));
+}
+
 /** A stored rect, or undefined when nothing usable is saved. Bad JSON is treated as absent. */
 export function parseRect(raw: string | null): Rect | undefined {
   if (raw === null) return undefined;
