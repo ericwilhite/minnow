@@ -141,11 +141,15 @@ function sqliteFixture(): DatabaseSync {
 
 // --- Query corpus -------------------------------------------------------------------------------
 
+type OracleName = "sqlite" | "pglite" | "duckdb";
+
 interface Case {
   sql: string;
   params?: QueryValue[];
   /** Compare row order exactly; requires an ORDER BY ending in a unique key. */
   ordered: boolean;
+  /** Oracles to skip, each for a documented semantic or dialect divergence. */
+  skip?: readonly OracleName[];
 }
 
 type Template = (rng: () => number) => Case;
@@ -347,6 +351,8 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT id, CAST(amount AS INTEGER) AS whole, CAST(id AS TEXT) AS label, CAST('42.5' AS REAL) AS parsed FROM data ORDER BY id`,
     ordered: true,
+    // PostgreSQL and DuckDB round float-to-integer casts; Minnow truncates, matching SQLite.
+    skip: ["pglite", "duckdb"],
   }),
   (rng) => ({
     sql: `SELECT "id", "data"."amount" AS "amt" FROM "data" WHERE "amount" >= ? ORDER BY "id"`,
@@ -356,6 +362,9 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT id, region FROM data ORDER BY region, id`,
     ordered: true,
+    // Default NULL ordering: Minnow matches SQLite (NULLs first ascending); PostgreSQL and
+    // DuckDB default to NULLs last. Explicit NULLS FIRST/LAST agrees on all engines.
+    skip: ["pglite", "duckdb"],
   }),
   (rng) => ({
     sql:
@@ -412,6 +421,8 @@ const templates: Template[] = [
     sql: `SELECT id, REPLACE(label, 'a', 'o') AS r, LTRIM(RTRIM('  ' || label || '  ')) AS t, INSTR(label, ?) AS i FROM data ORDER BY id`,
     params: [pick(rng, ["a", "o", "lt", "zz"] as const)],
     ordered: true,
+    // PostgreSQL spells INSTR as strpos.
+    skip: ["pglite"],
   }),
   (rng) => ({
     sql: `SELECT region, COUNT(*) FILTER (WHERE amount > ?) AS big, SUM(amount) FILTER (WHERE active = TRUE) AS active_total FROM data GROUP BY region`,
@@ -458,11 +469,38 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT v.column1 AS n, v.column2 AS tag FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) v ORDER BY n`,
     ordered: true,
+    // DuckDB names bare VALUES columns col0..colN; Minnow follows PostgreSQL/SQLite.
+    skip: ["duckdb"],
+  }),
+  () => ({
+    sql: `SELECT v.n AS n, v.tag AS tag FROM (VALUES (1, 'one'), (2, 'two')) AS v(n, tag) ORDER BY n`,
+    ordered: true,
+    // SQLite has no derived-table column alias lists; PostgreSQL and DuckDB check this one.
+    skip: ["sqlite"],
   }),
   (rng) => ({
     sql: `SELECT d.id AS id, x.column2 AS tag FROM data d JOIN (VALUES ('west', 'W'), ('east', 'E')) x ON x.column1 = d.region WHERE d.id <= ? ORDER BY id`,
     params: [20 + Math.floor(rng() * 40)],
     ordered: true,
+    // DuckDB names bare VALUES columns col0..colN; Minnow follows PostgreSQL/SQLite.
+    skip: ["duckdb"],
+  }),
+  // The next three exercise features SQLite lacks; PGlite and DuckDB are the oracles.
+  (rng) => ({
+    sql: `SELECT id FROM data WHERE amount > ALL (SELECT rank + ? FROM dims) ORDER BY id`,
+    params: [Math.floor(rng() * 200) / 4],
+    ordered: true,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    sql: `SELECT region FROM data INTERSECT ALL SELECT region FROM dims`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    sql: `SELECT region, SUM(amount) AS total FROM data WHERE region IS NOT NULL GROUP BY ROLLUP(region)`,
+    ordered: false,
+    skip: ["sqlite"],
   }),
 ];
 
@@ -481,9 +519,14 @@ function normalize(value: unknown): unknown {
   if (value === true) return 1;
   if (value === false) return 0;
   if (value instanceof Date) return value.toISOString();
+  if (typeof value === "bigint") return normalize(Number(value));
   if (typeof value === "number") {
     if (Object.is(value, -0)) return 0;
     return Number(value.toFixed(9));
+  }
+  // DuckDB returns timestamp values as {micros} wrappers.
+  if (typeof value === "object" && value !== null && "micros" in value) {
+    return new Date(Number((value as { micros: bigint }).micros) / 1000).toISOString();
   }
   return value;
 }
@@ -522,20 +565,126 @@ function sqliteParams(params: QueryValue[] | undefined): Array<string | number |
   });
 }
 
+// --- Oracles ------------------------------------------------------------------------------------
+
+interface Oracle {
+  readonly name: OracleName;
+  execute(testCase: Case): Promise<Array<Record<string, unknown>>>;
+  close(): Promise<void> | void;
+}
+
+function sqliteOracle(): Oracle {
+  const database = sqliteFixture();
+  return {
+    name: "sqlite",
+    execute: (testCase) =>
+      Promise.resolve(
+        database.prepare(testCase.sql).all(...sqliteParams(testCase.params)) as Array<
+          Record<string, unknown>
+        >,
+      ),
+    close: () => {
+      database.close();
+    },
+  };
+}
+
+/** Rewrites `?` placeholders to PostgreSQL's `$n`; corpus strings never contain `?`. */
+function positionalToNumbered(sql: string): string {
+  let index = 0;
+  return sql.replace(/\?/g, () => `$${String((index += 1))}`);
+}
+
+async function pgliteOracle(): Promise<Oracle> {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const database = await PGlite.create();
+  await database.exec(
+    `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+  );
+  await database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
+  for (const row of fixture) {
+    await database.query(`INSERT INTO data VALUES ($1, $2, $3, $4, $5, $6)`, [
+      row.id,
+      row.region,
+      row.amount,
+      row.active,
+      row.joined,
+      row.label,
+    ]);
+  }
+  for (const dim of dims) {
+    await database.query(`INSERT INTO dims VALUES ($1, $2, $3)`, [dim.region, dim.label, dim.rank]);
+  }
+  // int8 and numeric arrive as numbers, so counts and numeric-typed math compare directly.
+  const parsers = { 20: (value: string) => Number(value), 1700: (value: string) => Number(value) };
+  return {
+    name: "pglite",
+    execute: async (testCase) => {
+      const result = await database.query(
+        positionalToNumbered(testCase.sql),
+        (testCase.params ?? []) as unknown[],
+        { parsers },
+      );
+      return result.rows as Array<Record<string, unknown>>;
+    },
+    close: () => database.close(),
+  };
+}
+
+async function duckdbOracle(): Promise<Oracle> {
+  const { DuckDBInstance } = await import("@duckdb/node-api");
+  const instance = await DuckDBInstance.create(":memory:");
+  const connection = await instance.connect();
+  await connection.run(
+    `CREATE TABLE data (id INTEGER, region TEXT, amount DOUBLE, active BOOLEAN, joined TIMESTAMPTZ, label TEXT)`,
+  );
+  await connection.run(`CREATE TABLE dims (region TEXT, label TEXT, rank DOUBLE)`);
+  const literal = (value: QueryValue): string => {
+    if (value === null) return "NULL";
+    if (value instanceof Date) return `'${value.toISOString()}'`;
+    if (typeof value === "string") return `'${value.replaceAll("'", "''")}'`;
+    if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+    return String(value);
+  };
+  const dataRows = fixture
+    .map(
+      (row) =>
+        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label].map(literal).join(", ")})`,
+    )
+    .join(", ");
+  await connection.run(`INSERT INTO data VALUES ${dataRows}`);
+  const dimRows = dims
+    .map((dim) => `(${[dim.region, dim.label, dim.rank].map(literal).join(", ")})`)
+    .join(", ");
+  await connection.run(`INSERT INTO dims VALUES ${dimRows}`);
+  return {
+    name: "duckdb",
+    execute: async (testCase) => {
+      const params = (testCase.params ?? []).map((value) =>
+        value instanceof Date ? value.toISOString() : value,
+      );
+      const reader = await connection.runAndReadAll(testCase.sql, params);
+      return reader.getRowObjects();
+    },
+    close: () => {
+      connection.closeSync();
+    },
+  };
+}
+
 // --- The harness --------------------------------------------------------------------------------
 
-describe("SQL conformance against SQLite", () => {
-  it("agrees on the generated corpus across all execution paths", async () => {
+describe("SQL conformance against SQLite, PGlite, and DuckDB", () => {
+  it("agrees on the generated corpus across all execution paths and oracles", async () => {
     const corpus = buildCorpus();
     const database = await minnowFixture();
-    const oracle = sqliteFixture();
+    const oracles: Oracle[] = [sqliteOracle(), await pgliteOracle(), await duckdbOracle()];
     const failures: string[] = [];
     try {
       for (const [index, testCase] of corpus.entries()) {
         const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
         let vectorized: QueryResult;
         let rowExecutor: QueryResult;
-        let oracleRows: Array<Record<string, unknown>>;
         try {
           vectorized = await database.query(
             testCase.sql,
@@ -545,32 +694,43 @@ describe("SQL conformance against SQLite", () => {
             bindPlanParameters(compileQuery(testCase.sql), testCase.params),
             rowTables,
           );
-          oracleRows = oracle.prepare(testCase.sql).all(...sqliteParams(testCase.params));
         } catch (error) {
-          failures.push(`${caseLabel}\n  threw: ${String(error)}`);
+          failures.push(`${caseLabel}\n  minnow threw: ${String(error)}`);
           continue;
         }
         const vectorKeys = resultKeys(vectorized.rows, testCase.ordered);
         const rowKeys = resultKeys(rowExecutor.rows, testCase.ordered);
-        const oracleKeys = resultKeys(oracleRows, testCase.ordered);
         if (vectorKeys.join("\n") !== rowKeys.join("\n")) {
           failures.push(
             `${caseLabel}\n${diffSummary("vectorized vs row executor", vectorKeys, rowKeys)}`,
           );
         }
-        if (vectorKeys.join("\n") !== oracleKeys.join("\n")) {
-          failures.push(`${caseLabel}\n${diffSummary("minnow vs sqlite", vectorKeys, oracleKeys)}`);
+        for (const oracle of oracles) {
+          if (testCase.skip?.includes(oracle.name)) continue;
+          let oracleRows: Array<Record<string, unknown>>;
+          try {
+            oracleRows = await oracle.execute(testCase);
+          } catch (error) {
+            failures.push(`${caseLabel}\n  ${oracle.name} threw: ${String(error)}`);
+            continue;
+          }
+          const oracleKeys = resultKeys(oracleRows, testCase.ordered);
+          if (vectorKeys.join("\n") !== oracleKeys.join("\n")) {
+            failures.push(
+              `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, vectorKeys, oracleKeys)}`,
+            );
+          }
         }
       }
     } finally {
-      oracle.close();
+      for (const oracle of oracles) await oracle.close();
     }
     expect(corpus.length).toBeGreaterThan(300);
     if (failures.length > 0) {
       expect.fail(
         `${String(failures.length)} of ${String(corpus.length)} conformance cases diverged:\n\n` +
-          failures.slice(0, 8).join("\n\n"),
+          failures.slice(0, 10).join("\n\n"),
       );
     }
-  }, 120_000);
+  }, 240_000);
 });

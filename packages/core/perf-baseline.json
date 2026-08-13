@@ -1,13 +1,45 @@
 {
   "rows": 200000,
   "thresholds": {
-    "count-star": 3.09,
-    "filter-scan": 0.4,
-    "group-aggregate": 0.29,
-    "top-n": 2.41,
-    "join-aggregate": 1.52,
-    "like-scan": 1.48,
-    "window-running": 0.85,
-    "distinct-aggregate": 0.23
+    "count-star": {
+      "sqlite": 2.07,
+      "pglite": 0.02,
+      "duckdb": 1.15
+    },
+    "filter-scan": {
+      "sqlite": 0.44,
+      "pglite": 0.17,
+      "duckdb": 1.32
+    },
+    "group-aggregate": {
+      "sqlite": 0.29,
+      "pglite": 0.42,
+      "duckdb": 6.43
+    },
+    "top-n": {
+      "sqlite": 2.41,
+      "pglite": 0.75,
+      "duckdb": 15.72
+    },
+    "join-aggregate": {
+      "sqlite": 1.6,
+      "pglite": 1.42,
+      "duckdb": 16.75
+    },
+    "like-scan": {
+      "sqlite": 1.45,
+      "pglite": 0.77,
+      "duckdb": 8
+    },
+    "window-running": {
+      "sqlite": 0.82,
+      "pglite": 0.25,
+      "duckdb": 2.5
+    },
+    "distinct-aggregate": {
+      "sqlite": 0.26,
+      "pglite": 0.15,
+      "duckdb": 4.52
+    }
   }
 }

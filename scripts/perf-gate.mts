@@ -1,10 +1,11 @@
 /**
  * The SQL performance gate: a seeded dataset and query suite timed on the full MinnowDatabase
- * pipeline and on SQLite (node:sqlite, an in-memory native build — a deliberately harsh
- * baseline, since the browser competitor is SQLite compiled to Wasm and slower than this).
+ * pipeline against three engines — native SQLite (node:sqlite), PGlite (Wasm Postgres), and
+ * DuckDB (native vectorized OLAP). Native builds are a deliberately harsh baseline: the
+ * browser competitors are the Wasm builds, which run slower than what is measured here.
  *
- * Each query's minnow/sqlite time ratio must stay at or below the checked-in threshold in
- * packages/core/perf-baseline.json. Thresholds pin the current ratio with headroom, so the
+ * Each query's minnow/engine time ratio must stay at or below the checked-in threshold in
+ * packages/core/perf-baseline.json. Thresholds pin the current ratios with headroom, so the
  * gate catches regressions rather than machine differences; a missing baseline bootstraps one
  * from the current run. Run with --update to rewrite thresholds after intentional changes.
  */
@@ -189,9 +190,102 @@ sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
   for (const entry of DIMS) dim.run(entry.region, entry.label, entry.rank);
 }
 
+function sqlLiteral(value: unknown): string {
+  if (value === null) return "NULL";
+  if (typeof value === "string") return `'${value.replaceAll("'", "''")}'`;
+  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  return String(value);
+}
+
+function positionalToNumbered(sql: string): string {
+  let index = 0;
+  return sql.replace(/\?/g, () => `$${String((index += 1))}`);
+}
+
+console.log("loading pglite...");
+const { PGlite } = await import("@electric-sql/pglite");
+const pglite = await PGlite.create();
+await pglite.exec(
+  `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+);
+await pglite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
+for (let start = 0; start < rows.length; start += 2000) {
+  const batch = rows
+    .slice(start, start + 2000)
+    .map(
+      (row) =>
+        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
+          .map(sqlLiteral)
+          .join(", ")})`,
+    )
+    .join(", ");
+  await pglite.exec(`INSERT INTO data VALUES ${batch}`);
+}
+await pglite.exec(
+  `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
+);
+
+console.log("loading duckdb...");
+const { DuckDBInstance } = await import("@duckdb/node-api");
+const duckdbInstance = await DuckDBInstance.create(":memory:");
+const duckdb = await duckdbInstance.connect();
+await duckdb.run(
+  `CREATE TABLE data (id INTEGER, region TEXT, amount DOUBLE, active BOOLEAN, joined TIMESTAMPTZ, label TEXT)`,
+);
+await duckdb.run(`CREATE TABLE dims (region TEXT, label TEXT, rank DOUBLE)`);
+for (let start = 0; start < rows.length; start += 2000) {
+  const batch = rows
+    .slice(start, start + 2000)
+    .map(
+      (row) =>
+        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
+          .map(sqlLiteral)
+          .join(", ")})`,
+    )
+    .join(", ");
+  await duckdb.run(`INSERT INTO data VALUES ${batch}`);
+}
+await duckdb.run(
+  `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
+);
+
+async function timePglite(query: PerfQuery): Promise<number> {
+  const sql = positionalToNumbered(query.sql);
+  const params = [...(query.params ?? [])];
+  for (let index = 0; index < WARMUP; index += 1) await pglite.query(sql, params);
+  const samples: number[] = [];
+  for (let index = 0; index < RUNS; index += 1) {
+    const started = performance.now();
+    await pglite.query(sql, params);
+    samples.push(performance.now() - started);
+  }
+  return median(samples);
+}
+
+async function timeDuckdb(query: PerfQuery): Promise<number> {
+  const params = [...(query.params ?? [])];
+  const prepared = await duckdb.prepare(query.sql);
+  const readAll = async (): Promise<void> => {
+    prepared.bind(params as never);
+    const reader = await prepared.runAndReadAll();
+    reader.getRowObjects();
+  };
+  for (let index = 0; index < WARMUP; index += 1) await readAll();
+  const samples: number[] = [];
+  for (let index = 0; index < RUNS; index += 1) {
+    const started = performance.now();
+    await readAll();
+    samples.push(performance.now() - started);
+  }
+  return median(samples);
+}
+
+type EngineName = "sqlite" | "pglite" | "duckdb";
+const ENGINES: readonly EngineName[] = ["sqlite", "pglite", "duckdb"];
+
 interface Baseline {
   rows: number;
-  thresholds: Record<string, number>;
+  thresholds: Record<string, Partial<Record<EngineName, number>>>;
 }
 
 const update = process.argv.includes("--update");
@@ -199,35 +293,52 @@ const baseline: Baseline | undefined = existsSync(BASELINE_PATH)
   ? (JSON.parse(readFileSync(BASELINE_PATH, "utf8")) as Baseline)
   : undefined;
 
-const results: Array<{ name: string; minnowMs: number; sqliteMs: number; ratio: number }> = [];
+interface Result {
+  name: string;
+  minnowMs: number;
+  engineMs: Record<EngineName, number>;
+}
+
+const results: Result[] = [];
 for (const query of QUERIES) {
   const minnowMs = await timeMinnow(minnow, query);
-  const sqliteMs = timeSqlite(sqlite, query);
-  results.push({ name: query.name, minnowMs, sqliteMs, ratio: minnowMs / sqliteMs });
+  results.push({
+    name: query.name,
+    minnowMs,
+    engineMs: {
+      sqlite: timeSqlite(sqlite, query),
+      pglite: await timePglite(query),
+      duckdb: await timeDuckdb(query),
+    },
+  });
 }
 sqlite.close();
+await pglite.close();
+duckdb.closeSync();
 
 console.log(`\nSQL performance gate — ${String(ROWS)} rows, median of ${String(RUNS)} runs`);
-console.log("query               minnow(ms)  sqlite(ms)   ratio  threshold");
+console.log(
+  "query                minnow(ms)   sqlite(ms) ratio    pglite(ms) ratio    duckdb(ms) ratio",
+);
 const failures: string[] = [];
-const newThresholds: Record<string, number> = {};
+const newThresholds: Baseline["thresholds"] = {};
 for (const result of results) {
-  const threshold = baseline?.thresholds[result.name];
-  newThresholds[result.name] = Number((result.ratio * MARGIN).toFixed(2));
-  const status =
-    threshold === undefined ? "  (new)" : result.ratio <= threshold ? "  ok" : "  REGRESSION";
-  console.log(
-    `${result.name.padEnd(20)}${result.minnowMs.toFixed(2).padStart(10)}${result.sqliteMs
-      .toFixed(2)
-      .padStart(12)}${result.ratio.toFixed(2).padStart(8)}${String(threshold ?? "-").padStart(
-      9,
-    )}${status}`,
-  );
-  if (threshold !== undefined && result.ratio > threshold) {
-    failures.push(
-      `${result.name}: ratio ${result.ratio.toFixed(2)} exceeds threshold ${String(threshold)}`,
-    );
+  const line: string[] = [result.name.padEnd(20), result.minnowMs.toFixed(2).padStart(11)];
+  newThresholds[result.name] = {};
+  for (const engine of ENGINES) {
+    const engineMs = result.engineMs[engine];
+    const ratio = result.minnowMs / engineMs;
+    newThresholds[result.name][engine] = Number((ratio * MARGIN).toFixed(2));
+    const threshold = baseline?.thresholds[result.name]?.[engine];
+    const flag = threshold !== undefined && ratio > threshold ? "!" : " ";
+    line.push(`${engineMs.toFixed(2).padStart(13)} ${ratio.toFixed(2).padStart(5)}${flag}`);
+    if (threshold !== undefined && ratio > threshold) {
+      failures.push(
+        `${result.name} vs ${engine}: ratio ${ratio.toFixed(2)} exceeds threshold ${String(threshold)}`,
+      );
+    }
   }
+  console.log(line.join(""));
 }
 
 if (baseline === undefined || update) {

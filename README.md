@@ -150,11 +150,16 @@ catalogued as not-yet-implemented rather than never, and rejects with an explici
 #### Performance
 
 A checked-in performance gate (`npm run test:perf`) times a seeded 200k-row suite on the full
-Minnow pipeline against native SQLite (`node:sqlite`) and fails on regression past the recorded
-per-query ratios in [`perf-baseline.json`](packages/core/perf-baseline.json). Scans, grouped and
-DISTINCT aggregation, and windows currently run 2–7× faster than native SQLite; top-N ordering
-is the one query class still behind it (about 1.5×, and ahead of the Wasm SQLite builds browsers
-actually run — the in-browser comparison lives on the bench site).
+Minnow pipeline against three engines — native SQLite (`node:sqlite`), PGlite, and native
+DuckDB — and fails on regression past the recorded per-query ratios in
+[`perf-baseline.json`](packages/core/perf-baseline.json). Where things stand: Minnow beats
+PGlite on every measured query (2–100×), beats native SQLite on scans, grouping, DISTINCT
+aggregation, and windows (2–7×) with top-N ordering the one class behind it (~1.5×), and even
+edges native DuckDB on selective scans and count — while DuckDB, a native vectorized OLAP
+engine, remains 3–12× faster on heavy aggregation and joins. Those DuckDB gaps are the
+optimization roadmap, and the gate keeps every ratio from quietly getting worse. The comparisons
+here are against native builds on purpose; the Wasm builds browsers actually run are slower, and
+the live in-browser comparison is on the bench site.
 
 ### Full-text search
 

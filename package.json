@@ -24,6 +24,7 @@
     "test:perf": "vite-node scripts/perf-gate.mts"
   },
   "devDependencies": {
+    "@duckdb/node-api": "^1.5.5-r.4",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
