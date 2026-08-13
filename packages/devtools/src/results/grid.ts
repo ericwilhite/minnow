@@ -1,5 +1,5 @@
 import type { QueryRow, QueryValue } from "@minnowdb/core";
-import { el } from "../dom.js";
+import { el, iconButton, icons } from "../dom.js";
 
 export interface GridColumn {
   name: string;
@@ -358,6 +358,29 @@ export function createGrid(deps: GridDeps = {}): Grid {
 
       const holder = el("div", { class: "cell-edit" }, [input]);
       holder.style.gridColumn = String(position + 1);
+
+      const commit = (): void => {
+        const text = input.value;
+        closeEdit();
+        editor.onCommit(text);
+      };
+      const cancel = (): void => {
+        closeEdit();
+        editor.onCancel();
+      };
+
+      // The keys alone are not an interface: someone who types a value and reaches for the mouse
+      // needs somewhere to click, and an edit that vanished because focus moved reads as the
+      // editor being broken. These are anchored to the row's end so a narrow column still has
+      // room for them.
+      const save = iconButton("cell-action save", "Save this change (Enter)", icons.check);
+      const discard = iconButton("cell-action", "Discard this change (Esc)", icons.close);
+      save.addEventListener("click", commit);
+      discard.addEventListener("click", cancel);
+
+      // Anchored to the cell being edited rather than to the row: the row runs the full width of
+      // the table, which on a wide one is off the side of the viewport entirely.
+      holder.append(el("div", { class: "cell-actions" }, [save, discard]));
       const node = el("div", { class: "grid-row editing" }, [holder]);
       node.style.gridTemplateColumns = template;
       node.style.transform = `translateY(${String(index * rowHeight)}px)`;
@@ -365,20 +388,11 @@ export function createGrid(deps: GridDeps = {}): Grid {
       input.addEventListener("keydown", (event) => {
         if (event.key === "Enter") {
           event.preventDefault();
-          const text = input.value;
-          closeEdit();
-          editor.onCommit(text);
+          commit();
         } else if (event.key === "Escape") {
           event.preventDefault();
-          closeEdit();
-          editor.onCancel();
+          cancel();
         }
-      });
-      // Clicking away is a cancel, not a silent commit: a change only happens on purpose.
-      input.addEventListener("blur", () => {
-        if (editing?.input !== input) return;
-        closeEdit();
-        editor.onCancel();
       });
 
       sizer.append(node);

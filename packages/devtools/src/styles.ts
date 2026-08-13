@@ -466,7 +466,7 @@ input.mini.value { width: 110px; }
 .grid-row.sel { background: var(--mdt-accent-bg); }
 .grid-row.sel:hover { background: var(--mdt-accent-bg); }
 .grid-row.editing { background: var(--mdt-bg); z-index: 2; border-bottom-color: transparent; }
-.cell-edit { display: flex; align-items: center; padding: 0 4px; }
+.cell-edit { position: relative; display: flex; align-items: center; padding: 0 4px; }
 .cell-input {
   width: 100%;
   font: inherit;
@@ -480,6 +480,34 @@ input.mini.value { width: 110px; }
   box-shadow: 0 0 0 3px var(--mdt-accent-bg);
 }
 .cell-input:focus { outline: none; }
+
+/* Anchored to the row's end, so a 90px numeric column still has somewhere to put them. */
+.cell-actions {
+  position: absolute;
+  left: 100%;
+  top: 0;
+  height: 100%;
+  padding-left: 4px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.cell-action {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--mdt-border-strong);
+  border-radius: 5px;
+  background: var(--mdt-bg);
+  color: var(--mdt-text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cell-action svg { width: 12px; height: 12px; }
+.cell-action:hover { background: var(--mdt-bg-hover); color: var(--mdt-text); }
+.cell-action.save { border-color: var(--mdt-accent); color: var(--mdt-accent); }
+.cell-action.save:hover { background: var(--mdt-accent-bg); }
 
 .cell.number { text-align: right; font-variant-numeric: tabular-nums; }
 .cell.null { color: var(--mdt-text-faint); font-style: italic; }
