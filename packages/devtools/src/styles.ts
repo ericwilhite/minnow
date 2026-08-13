@@ -489,14 +489,23 @@ input.mini.value { width: 110px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .hint { font-family: var(--mdt-mono); font-size: 10.5px; color: var(--mdt-text-faint); }
 
-.editor {
+.console { flex: 1; display: flex; min-height: 0; }
+.console-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+.editor-slot {
   flex: none;
-  height: 34%;
-  min-height: 96px;
+  height: 32%;
+  min-height: 100px;
+  display: flex;
+  overflow: hidden;
+  border-bottom: 1px solid var(--mdt-border);
+}
+.editor-slot > * { flex: 1; min-width: 0; }
+
+.editor {
   width: 100%;
   resize: none;
   border: none;
-  border-bottom: 1px solid var(--mdt-border);
   padding: 10px 12px;
   background: var(--mdt-bg);
   color: var(--mdt-text);
@@ -506,6 +515,78 @@ input.mini.value { width: 110px; }
   tab-size: 2;
 }
 .editor:focus { outline: none; box-shadow: inset 0 0 0 2px var(--mdt-accent-bg); }
+
+/* --- history ---------------------------------------------------------------------------------- */
+
+.history {
+  width: 214px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--mdt-border);
+}
+.history-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 6px 10px;
+  border-bottom: 1px solid var(--mdt-border);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--mdt-text-faint);
+}
+.hclear {
+  border: none;
+  background: transparent;
+  color: var(--mdt-text-faint);
+  cursor: pointer;
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+.hclear:hover { background: var(--mdt-bg-hover); color: var(--mdt-text); }
+.hlist { flex: 1; overflow: auto; min-height: 0; }
+.hempty { padding: 12px 10px; font-size: 11.5px; color: var(--mdt-text-faint); line-height: 1.5; }
+.hitem {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-bottom: 1px solid var(--mdt-border);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.hitem:hover { background: var(--mdt-bg-hover); }
+.hitem.on { background: var(--mdt-accent-bg); }
+.hsql {
+  font-family: var(--mdt-mono);
+  font-size: 10.5px;
+  color: var(--mdt-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.hmeta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--mdt-mono);
+  font-size: 9.5px;
+  color: var(--mdt-text-faint);
+}
+/* The outcome gives way; the age never wraps, so a long error message cannot break the line. */
+.houtcome { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hmeta > span:last-child { flex: none; white-space: nowrap; }
+.hitem.failed .houtcome { color: var(--mdt-danger); }
 
 .notice {
   flex: none;

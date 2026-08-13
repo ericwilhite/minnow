@@ -26,6 +26,8 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
   Drag by the title bar, resize from the corner grip, and it reopens where you left it.
 - **Edit records** — double-click a cell, select a row to delete it, or add one through a typed
   form. Values are validated against the column's type before anything is confirmed.
+- **Query with completion** — a CodeMirror console whose completion comes from your own catalog,
+  loaded only when the query tab is first opened. The last 50 runs are kept beside it.
 - **Changes are confirmed first** — the prompt names the table, the key, and the before and after
   values. An `UPDATE` or `DELETE` with no `WHERE` is called out as hitting every row.
 - **`permissions: { write: false }`** refuses statements that change data before they reach the

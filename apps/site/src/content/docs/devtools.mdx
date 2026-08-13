@@ -138,8 +138,15 @@ Two badges in the title bar say what you are working with:
 
 ## Running statements
 
-The **Query** tab is a SQL console over the same database. `Cmd/Ctrl + Enter` runs. Queries return
-rows; anything that changes data is described and confirmed first:
+The **Query** tab is a SQL console over the same database, with syntax highlighting and completion
+drawn from your own catalog: type a table name and its columns are offered, `events.` narrows to
+that table's columns. `Cmd/Ctrl + Enter` runs.
+
+The editor loads the first time you open the tab, not when the panel mounts — the launcher and the
+data explorer never pay for it. Until it arrives (and if it fails to arrive at all) the console is a
+plain text box that runs queries exactly the same way.
+
+Queries return rows; anything that changes data is described and confirmed first:
 
 - The prompt names the table, the operation, and the statement itself before it runs.
 - An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
@@ -150,6 +157,16 @@ mentions `DELETE` in a string literal is still a query.
 
 SQL that fails to compile is reported with the offending token selected in the editor — the
 position comes from [`SqlCompileError`](/docs/queries/#locating-a-compile-error).
+
+## History
+
+The last 50 runs are kept beside the console, newest first, each with its row count, timing, and
+age — or its error message, in red, if it failed. Click one to put it back in the editor.
+
+The query text and those timings persist, so history survives a reload. Result sets do not: fifty
+of them would exhaust the storage quota on the first wide query, so recent rows are cached in
+memory only and a recalled entry offers to run again once its rows have aged out. **Clear** forgets
+everything. History is namespaced by `storageKey`, so two panels on a page keep their own.
 
 ## Embedding a playground
 

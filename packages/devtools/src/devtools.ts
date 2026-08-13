@@ -53,8 +53,10 @@ export function createDevtools(
   const view = createConsole({
     target,
     confirm,
+    root,
     write: resolved.write,
     initialQuery: resolved.initialQuery,
+    storageKey: resolved.storageKey,
   });
   const panel = createPanel({
     options: resolved,
@@ -69,7 +71,15 @@ export function createDevtools(
           void explorer.refresh();
         },
       },
-      { id: "query", label: "Query", node: view.node },
+      {
+        id: "query",
+        label: "Query",
+        node: view.node,
+        // CodeMirror and the catalog are fetched here, so the panel opens without them.
+        onFirstShow: () => {
+          void view.upgrade();
+        },
+      },
     ],
     overlay: confirm.node,
     onClose: () => {
