@@ -11,10 +11,10 @@ export interface Rect extends Size {
 }
 
 /**
- * Below this the panel stops being usable. The width has to carry three columns — the schema rail,
- * the view, and the history — so it is the sum of their minimums rather than a round number.
+ * Below this the panel stops being usable. The sidebars drop out on their own as the panel
+ * narrows, so this only has to leave room for the view itself.
  */
-export const minimumSize: Size = { width: 720, height: 320 };
+export const minimumSize: Size = { width: 500, height: 320 };
 
 /** Gap between the panel and the viewport edge when it first opens. */
 const openMargin = 24;

@@ -53,7 +53,16 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     deps.write && isEditableTarget(target) ? target : undefined;
 
   const status = el("div", { class: "statusbar" });
-  const crumb = el("span", { class: "crumb", text: "Pick a table" });
+  /**
+   * The rail drops out of the layout on a narrow panel, so the toolbar carries its own way to
+   * choose a table. It is the only route to one when the rail is away, and a shortcut when it is
+   * not.
+   */
+  const tablePicker = el("select", {
+    class: "mini table-picker",
+    attrs: { "aria-label": "Table" },
+  });
+  const crumb = el("span", { class: "crumb-meta", text: "" });
   const addRow = button("btn mini", "Add row");
   const deleteRow = button("btn mini danger", "Delete row");
   const banner = el("div", { class: "banner" });
@@ -84,7 +93,13 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   });
 
   const main = el("div", { class: "explorer-main" }, [
-    el("div", { class: "toolbar" }, [crumb, el("span", { class: "spacer" }), addRow, deleteRow]),
+    el("div", { class: "toolbar" }, [
+      tablePicker,
+      crumb,
+      el("span", { class: "spacer" }),
+      addRow,
+      deleteRow,
+    ]),
     banner,
     filterBar.node,
     grid.node,
@@ -334,13 +349,9 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     filterBar.setTable(current);
     insertForm.close();
     updateRowActions();
-    crumb.replaceChildren(
-      el("span", { text: name }),
-      el("span", {
-        class: "crumb-meta",
-        text: current.uniqueKey === undefined ? "no unique key" : `key: ${current.uniqueKey}`,
-      }),
-    );
+    tablePicker.value = name;
+    crumb.textContent =
+      current.uniqueKey === undefined ? "no unique key" : `key: ${current.uniqueKey}`;
     await reload();
   }
 
@@ -350,6 +361,14 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
    */
   async function setCatalog(next: readonly TableInfo[]): Promise<void> {
     catalog = [...next];
+    tablePicker.replaceChildren(
+      ...catalog.map((entry) => {
+        const option = el("option", { text: entry.name });
+        option.value = entry.name;
+        return option;
+      }),
+    );
+    tablePicker.hidden = catalog.length === 0;
     if (catalog.length === 0) {
       table = undefined;
       grid.setMessage("This database has no tables yet.");
@@ -364,6 +383,9 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     if (table !== undefined) insertForm.open(table);
   });
   deleteRow.addEventListener("click", requestDelete);
+  tablePicker.addEventListener("change", () => {
+    void open(tablePicker.value);
+  });
 
   grid.setMessage("Pick a table to browse it.");
   addRow.hidden = true;

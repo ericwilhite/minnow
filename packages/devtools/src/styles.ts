@@ -180,7 +180,8 @@ button { font: inherit; color: inherit; }
 .winbtn svg { width: 14px; height: 14px; }
 
 .body { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-.panel-body { flex: 1; display: flex; min-height: 0; }
+/* Size containers, so the sidebars react to the panel's width rather than the browser's. */
+.panel-body { flex: 1; display: flex; min-height: 0; container: mdt-panel / inline-size; }
 .views { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .views > * { flex: 1; min-height: 0; }
 
@@ -242,6 +243,18 @@ button { font: inherit; color: inherit; }
 .side.collapsed { width: 30px; }
 .side.collapsed > .side-head, .side.collapsed > .rail-list, .side.collapsed > .hlist { display: none; }
 .side.collapsed > .side-stub { display: flex; }
+
+/*
+ * Narrow enough and a sidebar stops earning its width, so it leaves entirely — a collapsed strip
+ * would only be a control that cannot be used. The table picker in the Data toolbar is what keeps
+ * tables reachable while the rail is away.
+ */
+@container mdt-panel (max-width: 600px) {
+  .rail { display: none; }
+}
+@container mdt-console (max-width: 620px) {
+  .history { display: none; }
+}
 
 /* --- explorer ------------------------------------------------------------------------------- */
 
@@ -337,7 +350,8 @@ button { font: inherit; color: inherit; }
 .col-key { font-size: 9.5px; color: var(--mdt-warn); }
 
 .crumb { font-family: var(--mdt-mono); font-size: 12.5px; display: flex; align-items: center; gap: 8px; }
-.crumb-meta { font-size: 11px; color: var(--mdt-text-faint); }
+.crumb-meta { font-family: var(--mdt-mono); font-size: 11px; color: var(--mdt-text-faint); }
+.table-picker { max-width: 180px; }
 
 .filters {
   flex: none;
@@ -561,7 +575,7 @@ input.mini.value { width: 110px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .hint { font-family: var(--mdt-mono); font-size: 10.5px; color: var(--mdt-text-faint); }
 
-.console { display: flex; min-height: 0; }
+.console { display: flex; min-height: 0; container: mdt-console / inline-size; }
 .console-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 .editor-slot {
