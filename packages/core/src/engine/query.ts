@@ -435,6 +435,14 @@ export type CompiledStatement =
       table: string;
       columns: string[];
       rows: InsertValue[][];
+      /** INSERT ... SELECT source; `rows` is then empty and fills at execution. */
+      query?: CompiledQuery;
+      /**
+       * ON CONFLICT (column) DO NOTHING skips rows whose key exists; "replace" is
+       * DO UPDATE SET with every inserted column drawn from EXCLUDED — whole-row upsert.
+       */
+      onConflict?: { column: string; action: "nothing" | "replace" };
+      returning?: string[] | "*";
       parameterCount?: number;
     }
   | {
@@ -442,12 +450,14 @@ export type CompiledStatement =
       table: string;
       assignments: Array<{ column: string; expression: Expression }>;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+      returning?: string[] | "*";
       parameterCount?: number;
     }
   | {
       kind: "delete";
       table: string;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+      returning?: string[] | "*";
       parameterCount?: number;
     };
 
@@ -847,6 +857,7 @@ export function bindStatementParameters(
   const clone = structuredClone(statement);
   delete clone.parameterCount;
   if (clone.kind === "insert") {
+    if (clone.query !== undefined) bindBlock(clone.query, values);
     clone.rows = clone.rows.map((row) =>
       row.map((value) => (isParameterSlot(value) ? (values[value.parameter] ?? null) : value)),
     );
@@ -2692,6 +2703,23 @@ class Parser {
     if (new Set(columns).size !== columns.length) {
       throw new TypeError("INSERT columns must be unique");
     }
+    if (this.#isKeyword("SELECT")) {
+      const query = optimizePlan(this.#selectBlock("(insert select)"));
+      if (query.select.some((item) => item.expression.kind === "wildcard")) {
+        throw new TypeError("INSERT ... SELECT requires an explicit select list");
+      }
+      if (query.select.length !== columns.length) {
+        throw new TypeError("INSERT ... SELECT must produce exactly the insert column count");
+      }
+      return {
+        kind: "insert",
+        table,
+        columns,
+        rows: [],
+        query,
+        ...this.#returningClause(),
+      };
+    }
     this.#keyword("VALUES");
     const rows: InsertValue[][] = [];
     for (;;) {
@@ -2708,7 +2736,80 @@ class Parser {
       rows.push(values);
       if (!this.#punctuation(",")) break;
     }
-    return { kind: "insert", table, columns, rows };
+    return {
+      kind: "insert",
+      table,
+      columns,
+      rows,
+      ...this.#onConflictClause(columns),
+      ...this.#returningClause(),
+    };
+  }
+
+  #onConflictClause(columns: readonly string[]): {
+    onConflict?: { column: string; action: "nothing" | "replace" };
+  } {
+    if (!this.#isKeyword("ON")) return {};
+    this.#keyword("ON");
+    this.#keyword("CONFLICT");
+    this.#expectPunctuation("(");
+    const column = this.#identifier();
+    this.#expectPunctuation(")");
+    this.#keyword("DO");
+    if (this.#isKeyword("NOTHING")) {
+      this.#keyword("NOTHING");
+      return { onConflict: { column, action: "nothing" } };
+    }
+    this.#keyword("UPDATE");
+    this.#keyword("SET");
+    const assigned = new Set<string>();
+    for (;;) {
+      const target = this.#identifier();
+      this.#operator("=");
+      const value = this.#expression();
+      const parts = value.kind === "column" ? value.reference.split(".") : [];
+      if (parts.length !== 2 || parts[0]?.toUpperCase() !== "EXCLUDED" || parts[1] !== target) {
+        throw new TypeError(
+          "ON CONFLICT DO UPDATE supports assignments of the form column = EXCLUDED.column",
+        );
+      }
+      if (assigned.has(target)) {
+        throw new TypeError(`ON CONFLICT DO UPDATE sets a column twice: ${target}`);
+      }
+      assigned.add(target);
+      if (!this.#punctuation(",")) break;
+    }
+    // Anything short of every inserted column would need merge-update semantics; the engine's
+    // upsert replaces whole rows, so the statement must be explicit about that.
+    for (const name of columns) {
+      if (name !== column && !assigned.has(name)) {
+        throw new TypeError(
+          `ON CONFLICT DO UPDATE must set every inserted column from EXCLUDED; missing: ${name}`,
+        );
+      }
+    }
+    for (const name of assigned) {
+      if (!columns.includes(name)) {
+        throw new TypeError(`ON CONFLICT DO UPDATE sets a column that is not inserted: ${name}`);
+      }
+    }
+    return { onConflict: { column, action: "replace" } };
+  }
+
+  /** RETURNING * or RETURNING col, ... — the engine's runStatement implements the semantics. */
+  #returningClause(): { returning?: string[] | "*" } {
+    if (!this.#isKeyword("RETURNING")) return {};
+    this.#keyword("RETURNING");
+    if (this.#peek().text === "*") {
+      this.#index += 1;
+      return { returning: "*" };
+    }
+    const columns: string[] = [];
+    for (;;) {
+      columns.push(this.#identifier());
+      if (!this.#punctuation(",")) break;
+    }
+    return { returning: columns };
   }
 
   #updateStatement(): CompiledStatement {
@@ -2729,14 +2830,16 @@ class Parser {
     if (new Set(assignments.map(({ column }) => column)).size !== assignments.length) {
       throw new TypeError("UPDATE assignments must set each column once");
     }
-    return { kind: "update", table, assignments, predicates: this.#mutationPredicates() };
+    const predicates = this.#mutationPredicates();
+    return { kind: "update", table, assignments, predicates, ...this.#returningClause() };
   }
 
   #deleteStatement(): CompiledStatement {
     this.#keyword("DELETE");
     this.#keyword("FROM");
     const table = this.#identifier();
-    return { kind: "delete", table, predicates: this.#mutationPredicates() };
+    const predicates = this.#mutationPredicates();
+    return { kind: "delete", table, predicates, ...this.#returningClause() };
   }
 
   #mutationPredicates(): Array<{

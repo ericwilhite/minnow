@@ -215,6 +215,24 @@
       "notes": "Requires a unique-key table."
     },
     {
+      "id": "mutation.returning",
+      "status": "supported",
+      "example": "DELETE FROM keyed WHERE name = 'x' RETURNING name, score",
+      "notes": "RETURNING works on INSERT, UPDATE, and DELETE; inserts echo written values, updates return post-update values, deletes the rows as read."
+    },
+    {
+      "id": "mutation.upsert",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('x', 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
+      "notes": "Whole-row upsert: DO UPDATE must set every inserted column from EXCLUDED, and the conflict target is the unique key."
+    },
+    {
+      "id": "mutation.insert-do-nothing",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('x', 9), ('z', 1) ON CONFLICT (name) DO NOTHING",
+      "notes": "Rows whose key already exists at the statement's snapshot are skipped."
+    },
+    {
       "id": "where.or",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'"
@@ -366,7 +384,7 @@
       "status": "unsupported",
       "example": "UPDATE rows SET amount = 1",
       "error": "UPDATE requires a table with a unique key",
-      "notes": "Requires execution against a catalog."
+      "notes": "Deliberate: mutation segments address rows by unique key, so tables without one cannot be updated or deleted through any API."
     },
     {
       "id": "transaction.begin",
@@ -453,10 +471,9 @@
     },
     {
       "id": "mutation.insert-select",
-      "status": "unsupported",
-      "example": "INSERT INTO keyed (name, score) SELECT name, score FROM keyed",
-      "error": "Expected VALUES, found SELECT",
-      "notes": "INSERT takes a VALUES list only; it cannot read from a query."
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score) SELECT name || '2' AS name, score + 1 AS score FROM keyed",
+      "notes": "The SELECT runs at one snapshot and materializes before the batch write."
     }
   ]
 }

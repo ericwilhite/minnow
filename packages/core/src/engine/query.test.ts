@@ -1280,10 +1280,11 @@ describe("compile error positions", () => {
   });
 
   it("locates statement failures too", () => {
-    const sql = "  INSERT INTO t (a) SELECT a FROM t";
+    // INSERT ... SELECT is a statement now, so the failing keyword is a misspelled one.
+    const sql = "  INSERT INTO t (a) SELEC a FROM t";
     expect(failurePoint(() => compileStatement(sql), sql)).toEqual({
-      at: "SELECT",
-      message: "Expected VALUES, found SELECT",
+      at: "SELEC",
+      message: "Expected VALUES, found SELEC",
     });
   });
 

@@ -61,7 +61,7 @@ describe("the shipped matrix", () => {
   it("explains the failures that a devtools user is most likely to hit", () => {
     const index = buildFailureIndex(matrix.features);
     for (const message of [
-      "Expected VALUES, found SELECT",
+      "Correlated NOT IN subqueries are not supported; use NOT EXISTS",
       "UPDATE requires a table with a unique key",
       "Unsupported function: LAG",
       "DISTINCT is only supported inside COUNT",

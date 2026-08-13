@@ -519,7 +519,14 @@ export interface QuerySpillCleanupResult {
 
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
-  | { kind: "insert"; table: string; rowCount: number; version: number; returnedRows?: QueryRow[] }
+  | {
+      kind: "insert";
+      table: string;
+      rowCount: number;
+      /** Absent when the statement affected no rows (an INSERT ... SELECT of an empty set). */
+      version?: number;
+      returnedRows?: QueryRow[];
+    }
   | { kind: "update"; table: string; rowCount: number; version?: number; returnedRows?: QueryRow[] }
   | {
       kind: "delete";
@@ -2049,6 +2056,77 @@ export class MinnowDatabase {
     return this.runStatement(bindStatementParameters(statement, params));
   }
 
+  /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
+  async #filterConflictingInsertRows(
+    statement: Extract<CompiledStatement, { kind: "insert" }>,
+  ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
+    const table = await this.#findTable(statement.table);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
+      throw new TypeError(
+        `ON CONFLICT targets the table's unique key column: ${keyColumn?.name ?? "(none)"}`,
+      );
+    }
+    const keyIndex = statement.columns.indexOf(keyColumn.name);
+    if (keyIndex === -1) return statement;
+    const keys = statement.rows.map((row) => boundInsertValue(row[keyIndex] ?? null));
+    const plan: CompiledQuery = {
+      sql: "(on conflict do nothing)",
+      base: { table: table.name, alias: table.name },
+      joins: [],
+      select: [{ expression: { kind: "column", reference: keyColumn.name }, alias: "key" }],
+      predicates: [
+        {
+          left: { kind: "column", reference: keyColumn.name },
+          operator: "IN",
+          right: { kind: "list", items: keys.map((value) => ({ kind: "literal", value })) },
+        },
+      ],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    };
+    const prepared = await this.#prepareCompiledPlan(plan);
+    let existing: Set<QueryValue | string>;
+    try {
+      existing = new Set(
+        prepared.execute().rows.map((row) => {
+          const value = row.key ?? null;
+          return value instanceof Date ? value.toISOString() : value;
+        }),
+      );
+    } finally {
+      prepared.close();
+    }
+    return {
+      ...statement,
+      rows: statement.rows.filter((row) => {
+        const value = boundInsertValue(row[keyIndex] ?? null);
+        return !existing.has(value instanceof Date ? value.toISOString() : value);
+      }),
+    };
+  }
+
+  /** Runs an INSERT ... SELECT source at one snapshot and materializes it as literal rows. */
+  async #materializeInsertSelect(
+    statement: Extract<CompiledStatement, { kind: "insert" }>,
+  ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
+    if (statement.query === undefined) return statement;
+    const prepared = await this.#prepareCompiledPlan(statement.query);
+    let result: QueryResult;
+    try {
+      result = prepared.execute();
+    } finally {
+      prepared.close();
+    }
+    const { query, ...rest } = statement;
+    void query;
+    return {
+      ...rest,
+      rows: result.rows.map((row) => result.columns.map((column) => row[column] ?? null)),
+    };
+  }
+
   /**
    * Executes an already-compiled statement — the typed mutation builders call this directly with
    * the same statement structures SQL parses into, sharing every validation and conflict rule.
@@ -2063,12 +2141,42 @@ export class MinnowDatabase {
     if (statement.kind === "select") {
       return { kind: "rows", result: await this.query(statement.sql) };
     }
+    // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
+    if (statement.returning !== undefined && options.returning === undefined) {
+      options = { ...options, returning: statement.returning };
+    }
+    if (statement.kind === "insert" && statement.query !== undefined) {
+      statement = await this.#materializeInsertSelect(statement);
+    }
+    if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
+      statement = await this.#filterConflictingInsertRows(statement);
+    }
+    if (statement.kind === "insert" && statement.rows.length === 0) {
+      return {
+        kind: "insert",
+        table: statement.table,
+        rowCount: 0,
+        ...(options.returning === undefined ? {} : { returnedRows: [] }),
+      };
+    }
     if (statement.kind === "insert") {
+      const viaUpsert = statement.onConflict?.action === "replace";
+      if (viaUpsert) {
+        const table = await this.#findTable(statement.table);
+        const keyColumn = getUniqueKeyColumn(table);
+        if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
+          throw new TypeError(
+            `ON CONFLICT targets the table's unique key column: ${keyColumn?.name ?? "(none)"}`,
+          );
+        }
+      }
       const columns: Record<string, BatchValue[]> = {};
       statement.columns.forEach((column, index) => {
         columns[column] = statement.rows.map((row) => boundInsertValue(row[index] ?? null));
       });
-      const result = await this.insertBatch(statement.table, { columns });
+      const result = viaUpsert
+        ? await this.upsertBatch(statement.table, { columns })
+        : await this.insertBatch(statement.table, { columns });
       let returningColumns: readonly string[] | undefined;
       if (options.returning !== undefined) {
         // A default-bearing column may be returned even when the column list omits it — the

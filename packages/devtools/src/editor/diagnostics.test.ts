@@ -38,13 +38,13 @@ describe("diagnose", () => {
 
   it("appends what the matrix knows, when it knows something", () => {
     const explain = (message: string): string | undefined =>
-      message.includes("VALUES") ? "insert-select is not supported: VALUES only." : undefined;
-    const [explained] = diagnose("INSERT INTO t (a) SELECT a FROM t", explain);
-    expect(explained?.message).toContain("Expected VALUES");
-    expect(explained?.message).toContain("VALUES only.");
+      message.includes("LAG") ? "LAG is on the roadmap." : undefined;
+    const [explained] = diagnose("SELECT LAG(a) OVER (ORDER BY a) AS p FROM t", explain);
+    expect(explained?.message).toContain("Unsupported function: LAG");
+    expect(explained?.message).toContain("on the roadmap.");
 
     // Nothing to add leaves the compiler's own message alone.
-    const [plain] = diagnose("INSERT INTO t (a) SELECT a FROM t", () => undefined);
-    expect(plain?.message).toBe("Expected VALUES, found SELECT");
+    const [plain] = diagnose("SELECT LAG(a) OVER (ORDER BY a) AS p FROM t", () => undefined);
+    expect(plain?.message).toBe("Unsupported function: LAG");
   });
 });
