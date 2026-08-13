@@ -30,6 +30,7 @@ export const styles = `
   --mdt-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
     sans-serif;
   --mdt-header-h: 33px;
+  --mdt-control-h: 24px;
   --mdt-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
 
   font-family: var(--mdt-sans);
@@ -267,7 +268,8 @@ button { font: inherit; color: inherit; }
   font: inherit;
   font-family: var(--mdt-mono);
   font-size: 11.5px;
-  padding: 3px 7px;
+  height: 22px;
+  padding: 0 7px;
   border-radius: 5px;
   color: var(--mdt-text);
   background: var(--mdt-bg-code);
@@ -387,14 +389,15 @@ button { font: inherit; color: inherit; }
   border-radius: 4px;
 }
 .chip-x:hover { background: var(--mdt-bg-active); color: var(--mdt-danger); }
-.btn.mini { font-size: 11px; padding: 2px 8px; }
+.btn.mini { height: 22px; font-size: 11px; padding: 0 8px; }
 .btn.dashed { border-style: dashed; color: var(--mdt-text-faint); }
 .filter-editor { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 select.mini, input.mini {
+  height: 22px;
   font: inherit;
   font-family: var(--mdt-mono);
   font-size: 11px;
-  padding: 2px 5px;
+  padding: 0 5px;
   border-radius: 5px;
   color: var(--mdt-text);
   background: var(--mdt-bg);
@@ -553,13 +556,16 @@ input.mini.value { width: 110px; }
   border-bottom: 1px solid var(--mdt-border);
 }
 
+/* An explicit height rather than padding, so every control sits centred in a 33px header row. */
 .btn {
+  height: var(--mdt-control-h);
   font-size: 12px;
+  line-height: 1;
   color: var(--mdt-text-secondary);
   background: transparent;
   border: 1px solid var(--mdt-border-strong);
   border-radius: 6px;
-  padding: 4px 10px;
+  padding: 0 10px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
