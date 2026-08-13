@@ -18,6 +18,7 @@ export const styles = `
   --mdt-border-strong: rgba(55, 53, 47, 0.2);
   --mdt-accent: #2383e2;
   --mdt-accent-bg: rgba(35, 131, 226, 0.09);
+  --mdt-selection: rgba(35, 131, 226, 0.28);
   --mdt-danger: #c4433f;
   --mdt-danger-bg: rgba(235, 87, 87, 0.1);
   --mdt-warn: #a86a1c;
@@ -28,6 +29,7 @@ export const styles = `
     rgba(15, 15, 15, 0.2) 0 9px 24px;
   --mdt-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
     sans-serif;
+  --mdt-header-h: 33px;
   --mdt-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
 
   font-family: var(--mdt-sans);
@@ -50,6 +52,7 @@ export const styles = `
     --mdt-border-strong: rgba(255, 255, 255, 0.2);
     --mdt-accent: #529cca;
     --mdt-accent-bg: rgba(82, 156, 202, 0.14);
+    --mdt-selection: rgba(82, 156, 202, 0.42);
     --mdt-danger: #ff7369;
     --mdt-danger-bg: rgba(255, 115, 105, 0.14);
     --mdt-warn: #d9a33f;
@@ -88,6 +91,12 @@ export const styles = `
 
 /* Every layout rule below sets display, which would otherwise beat the hidden attribute. */
 [hidden] { display: none !important; }
+
+/*
+ * Selected text keeps the panel's own foreground. Left to the host page or the browser default,
+ * a dark panel gets a light selection behind light text and the words disappear.
+ */
+::selection { background: var(--mdt-selection); color: var(--mdt-text); }
 
 button { font: inherit; color: inherit; }
 
@@ -171,6 +180,9 @@ button { font: inherit; color: inherit; }
 .winbtn svg { width: 14px; height: 14px; }
 
 .body { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.panel-body { flex: 1; display: flex; min-height: 0; }
+.views { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.views > * { flex: 1; min-height: 0; }
 
 .tabs { display: flex; gap: 2px; margin-left: 4px; }
 .tab {
@@ -185,27 +197,65 @@ button { font: inherit; color: inherit; }
 .tab:hover { background: var(--mdt-bg-hover); }
 .tab.on { background: var(--mdt-bg-active); color: var(--mdt-text); }
 
-/* --- explorer ------------------------------------------------------------------------------- */
+/* --- sidebars ------------------------------------------------------------------------------- */
 
-.explorer { flex: 1; display: flex; min-height: 0; }
-.explorer-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-
-.rail {
-  width: 210px;
+.side { flex: none; display: flex; flex-direction: column; min-height: 0; }
+.side-head {
   flex: none;
   display: flex;
-  flex-direction: column;
-  min-height: 0;
-  border-right: 1px solid var(--mdt-border);
+  align-items: center;
+  gap: 6px;
+  height: var(--mdt-header-h);
+  padding: 0 4px 0 10px;
+  border-bottom: 1px solid var(--mdt-border);
 }
-.rail-top { padding: 8px; border-bottom: 1px solid var(--mdt-border); }
+.side-title {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--mdt-text-faint);
+}
+.side-toggle {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mdt-text-faint);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.side-toggle:hover { background: var(--mdt-bg-hover); color: var(--mdt-text); }
+.side-toggle svg { width: 14px; height: 14px; }
+
+/* Collapsed, a sidebar keeps a narrow strip so the way back is always visible. */
+.side-stub {
+  display: none;
+  height: var(--mdt-header-h);
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid var(--mdt-border);
+}
+.side.collapsed { width: 30px; }
+.side.collapsed > .side-head, .side.collapsed > .rail-list, .side.collapsed > .hlist { display: none; }
+.side.collapsed > .side-stub { display: flex; }
+
+/* --- explorer ------------------------------------------------------------------------------- */
+
+.explorer-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+.rail { width: 210px; border-right: 1px solid var(--mdt-border); }
 .rail-search {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   font: inherit;
   font-family: var(--mdt-mono);
-  font-size: 12px;
-  padding: 5px 8px;
-  border-radius: 6px;
+  font-size: 11.5px;
+  padding: 3px 7px;
+  border-radius: 5px;
   color: var(--mdt-text);
   background: var(--mdt-bg-code);
   border: 1px solid var(--mdt-border);
@@ -220,24 +270,39 @@ button { font: inherit; color: inherit; }
 }
 .rail-empty { padding: 12px; font-size: 12px; color: var(--mdt-text-faint); }
 
-.tnode {
+/* Expanding and opening are separate targets: a table can be inspected without being loaded. */
+.tnode { display: flex; align-items: stretch; width: 100%; color: var(--mdt-text-secondary); }
+.tnode-toggle {
+  flex: none;
+  width: 22px;
+  border: none;
+  background: transparent;
+  color: var(--mdt-text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+.tnode-toggle:hover { color: var(--mdt-text); background: var(--mdt-bg-hover); }
+.tnode-open {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  padding: 4px 10px 4px 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 10px 4px 2px;
   border: none;
   background: transparent;
   cursor: pointer;
   font-size: 12.5px;
-  color: var(--mdt-text-secondary);
+  color: inherit;
   text-align: left;
 }
-.tnode:hover { background: var(--mdt-bg-hover); }
+.tnode-open:hover { background: var(--mdt-bg-hover); }
 .tnode.on { background: var(--mdt-accent-bg); color: var(--mdt-accent); }
 .tnode-icon { display: flex; flex: none; color: var(--mdt-text-faint); }
 .tnode-icon svg { width: 14px; height: 14px; stroke-width: 1.6; }
-.tnode:hover .tnode-icon { color: var(--mdt-text-secondary); }
+.tnode-open:hover .tnode-icon { color: var(--mdt-text-secondary); }
 .tnode.on .tnode-icon { color: var(--mdt-accent); }
 .tnode-name { font-family: var(--mdt-mono); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .tnode-meta { font-family: var(--mdt-mono); font-size: 10.5px; color: var(--mdt-text-faint); }
@@ -256,11 +321,17 @@ button { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   gap: 6px;
+  width: 100%;
   padding: 2.5px 10px 2.5px 26px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
   font-family: var(--mdt-mono);
   font-size: 11.5px;
   color: var(--mdt-text-secondary);
+  text-align: left;
 }
+.col:hover { background: var(--mdt-bg-hover); color: var(--mdt-text); }
 .col-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .col-type { font-size: 10.5px; color: var(--mdt-text-faint); }
 .col-key { font-size: 9.5px; color: var(--mdt-warn); }
@@ -463,7 +534,8 @@ input.mini.value { width: 110px; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 10px;
+  height: var(--mdt-header-h);
+  padding: 0 10px;
   border-bottom: 1px solid var(--mdt-border);
 }
 
@@ -489,7 +561,7 @@ input.mini.value { width: 110px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .hint { font-family: var(--mdt-mono); font-size: 10.5px; color: var(--mdt-text-faint); }
 
-.console { flex: 1; display: flex; min-height: 0; }
+.console { display: flex; min-height: 0; }
 .console-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 .editor-slot {
@@ -518,26 +590,7 @@ input.mini.value { width: 110px; }
 
 /* --- history ---------------------------------------------------------------------------------- */
 
-.history {
-  width: 214px;
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  border-left: 1px solid var(--mdt-border);
-}
-.history-head {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px 6px 10px;
-  border-bottom: 1px solid var(--mdt-border);
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  color: var(--mdt-text-faint);
-}
+.history { width: 214px; border-left: 1px solid var(--mdt-border); }
 .hclear {
   border: none;
   background: transparent;
@@ -667,6 +720,23 @@ tr:hover td { background: var(--mdt-bg-hover); }
 }
 .grip svg { width: 12px; height: 12px; }
 .panel.inline .grip { display: none; }
+
+/*
+ * Invisible strips over each boundary. They sit just inside the panel so the whole edge is a
+ * target without the window needing a visible frame; the corner grip stays as the obvious one.
+ */
+.resize-edge { position: absolute; touch-action: none; z-index: 4; }
+.resize-n, .resize-s { left: 8px; right: 8px; height: 6px; cursor: ns-resize; }
+.resize-e, .resize-w { top: 8px; bottom: 8px; width: 6px; cursor: ew-resize; }
+.resize-n { top: 0; }
+.resize-s { bottom: 0; }
+.resize-e { right: 0; }
+.resize-w { left: 0; }
+.resize-ne, .resize-nw, .resize-sw { width: 12px; height: 12px; }
+.resize-ne { top: 0; right: 0; cursor: nesw-resize; }
+.resize-nw { top: 0; left: 0; cursor: nwse-resize; }
+.resize-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.panel.inline .resize-edge { display: none; }
 
 .scrim {
   position: absolute;

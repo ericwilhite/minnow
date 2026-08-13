@@ -44,9 +44,29 @@
         font-size: 13px;
         opacity: 0.7;
       }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 20px;
+        font-size: 13px;
+        opacity: 0.8;
+      }
+      .controls select {
+        font: inherit;
+        padding: 3px 6px;
+      }
     </style>
   </head>
   <body>
+    <div class="controls">
+      <label for="theme">Panel theme</label>
+      <select id="theme">
+        <option value="">Follow the system</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </div>
     <h1>Host page</h1>
     <p>
       The devtools panel floats over this page. Everything here must stay clickable while the panel

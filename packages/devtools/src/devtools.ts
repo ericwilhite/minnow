@@ -1,6 +1,8 @@
 import { createConfirmLayer } from "./confirm.js";
 import { createConsole } from "./console.js";
+import { toCatalog } from "./explorer/catalog.js";
 import { createExplorer } from "./explorer/explorer.js";
+import { createSchemaRail } from "./explorer/tree.js";
 import { matchesHotkey } from "./hotkey.js";
 import { resolveOptions, type DevtoolsOptions } from "./options.js";
 import { createLauncher } from "./panel/launcher.js";
@@ -58,34 +60,61 @@ export function createDevtools(
     initialQuery: resolved.initialQuery,
     storageKey: resolved.storageKey,
   });
+
+  /**
+   * The rail is shared, so what it does depends on which view is open: while writing a query it
+   * contributes names to the text, and while browsing it opens the table.
+   */
+  const rail = createSchemaRail({
+    storageKey: resolved.storageKey,
+    onPickTable: (table) => {
+      if (panel.activeView() === "query") view.insert(table.name);
+      else void explorer.open(table.name);
+    },
+    onPickColumn: (table, column) => {
+      if (panel.activeView() === "query") view.insert(`${table.name}.${column.name}`);
+      else void explorer.open(table.name);
+    },
+  });
+
   const panel = createPanel({
     options: resolved,
     offMainThread: runsOffMainThread(target),
+    rail: rail.node,
+    // The console leads: writing a query is what the panel is opened for most often.
     views: [
-      {
-        id: "data",
-        label: "Data",
-        node: explorer.node,
-        // The catalog is only read once the tab is actually looked at.
-        onFirstShow: () => {
-          void explorer.refresh();
-        },
-      },
       {
         id: "query",
         label: "Query",
         node: view.node,
-        // CodeMirror and the catalog are fetched here, so the panel opens without them.
+        // CodeMirror is fetched here, so the panel opens without it.
         onFirstShow: () => {
           void view.upgrade();
         },
       },
+      { id: "data", label: "Data", node: explorer.node },
     ],
     overlay: confirm.node,
     onClose: () => {
       close();
     },
   });
+
+  /** Read once for the whole panel: the rail, the explorer, and completion share one catalog. */
+  async function loadCatalog(): Promise<void> {
+    try {
+      const catalog = toCatalog(await target.listTables());
+      rail.setCatalog(catalog);
+      view.setSchema(
+        Object.fromEntries(
+          catalog.map((table) => [table.name, table.columns.map((column) => column.name)]),
+        ),
+      );
+      await explorer.setCatalog(catalog);
+    } catch (error) {
+      rail.setError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   const launcher =
     resolved.mode === "launcher"
@@ -99,6 +128,8 @@ export function createDevtools(
 
   let open = false;
   let destroyed = false;
+  /** The catalog is read when the panel is first opened, never at mount. */
+  let catalogLoaded = false;
 
   function setOpen(next: boolean): void {
     if (destroyed || open === next) return;
@@ -107,6 +138,10 @@ export function createDevtools(
     launcher?.setOpen(next);
     if (next) {
       panel.layout();
+      if (!catalogLoaded) {
+        catalogLoaded = true;
+        void loadCatalog();
+      }
       view.focus();
     } else {
       confirm.dismiss();

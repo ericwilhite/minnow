@@ -13,10 +13,9 @@ import {
 } from "../sql/select.js";
 import { isEditableTarget, type DevtoolsTarget, type EditableTarget } from "../target.js";
 import { formatForInput, inputHint, parseInput } from "../values.js";
-import { findTable, toCatalog, type TableInfo } from "./catalog.js";
+import { findTable, type TableInfo } from "./catalog.js";
 import { createFilterBar } from "./filter-editor.js";
 import { createInsertForm } from "./insert-form.js";
-import { createSchemaRail } from "./tree.js";
 import {
   applyCellEdit,
   applyDelete,
@@ -30,8 +29,10 @@ import {
 
 export interface ExplorerView {
   node: HTMLElement;
-  /** Loads the catalog; safe to call again to pick up new tables. */
-  refresh(): Promise<void>;
+  /** Replaces the tables this view knows about, reopening whatever was open. */
+  setCatalog(catalog: readonly TableInfo[]): Promise<void>;
+  /** Opens a table by name, for the rail. */
+  open(table: string): Promise<void>;
 }
 
 export interface ExplorerDeps {
@@ -76,9 +77,6 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   const filterBar = createFilterBar(() => {
     void reload();
   });
-  const rail = createSchemaRail((name) => {
-    void open(name);
-  });
   const insertForm = createInsertForm({
     onSubmit: (values) => {
       void commitInsert(values);
@@ -93,7 +91,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     insertForm.node,
     status,
   ]);
-  const node = el("div", { class: "explorer" }, [rail.node, main]);
+  const node = main;
 
   let catalog: TableInfo[] = [];
   let table: TableInfo | undefined;
@@ -333,7 +331,6 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     if (current === undefined) return;
     table = current;
     sort = undefined;
-    rail.setSelected(name);
     filterBar.setTable(current);
     insertForm.close();
     updateRowActions();
@@ -347,20 +344,20 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     await reload();
   }
 
-  async function refresh(): Promise<void> {
-    try {
-      catalog = toCatalog(await target.listTables());
-      rail.setCatalog(catalog);
-      if (catalog.length === 0) {
-        grid.setMessage("This database has no tables yet.");
-        setStatus("no tables");
-        return;
-      }
-      const reopened = table === undefined ? undefined : findTable(catalog, table.name);
-      await open((reopened ?? catalog[0])?.name ?? "");
-    } catch (error) {
-      rail.setError(error instanceof Error ? error.message : String(error));
+  /**
+   * The catalog is loaded once for the whole panel and handed down, so the rail, the completion,
+   * and this view can never disagree about what the tables are.
+   */
+  async function setCatalog(next: readonly TableInfo[]): Promise<void> {
+    catalog = [...next];
+    if (catalog.length === 0) {
+      table = undefined;
+      grid.setMessage("This database has no tables yet.");
+      setStatus("no tables");
+      return;
     }
+    const reopened = table === undefined ? undefined : findTable(catalog, table.name);
+    await open((reopened ?? catalog[0])?.name ?? "");
   }
 
   addRow.addEventListener("click", () => {
@@ -372,5 +369,5 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   addRow.hidden = true;
   deleteRow.hidden = true;
 
-  return { node, refresh };
+  return { node, setCatalog, open };
 }

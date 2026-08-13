@@ -23,8 +23,12 @@ export interface ConsoleDeps {
 export interface ConsoleView {
   node: HTMLElement;
   focus(): void;
-  /** Loads the real editor and the catalog. Called the first time the tab is shown. */
+  /** Loads the real editor. Called the first time the tab is shown. */
   upgrade(): Promise<void>;
+  /** Feeds completion from the panel's shared catalog. */
+  setSchema(schema: EditorSchema): void;
+  /** Drops text in at the caret — how the rail contributes to a query. */
+  insert(text: string): void;
 }
 
 function describeExecuteResult(result: ExecuteResult): string {
@@ -57,6 +61,7 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   const status = el("div", { class: "statusbar" }, [el("span", { text: "ready" })]);
 
   const historyRail = createHistoryRail({
+    storageKey: deps.storageKey,
     onPick: (entry) => {
       selectedEntry = entry.id;
       editor.setValue(entry.sql);
@@ -197,30 +202,25 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     }
   }
 
-  /** Table name to columns, for completion. A catalog that fails to load costs completion only. */
-  async function readSchema(): Promise<EditorSchema> {
-    try {
-      const tables = await deps.target.listTables();
-      return Object.fromEntries(
-        tables.map((table) => [table.name, table.columns.map((column) => column.name)]),
-      );
-    } catch {
-      return {};
-    }
-  }
-
   run.addEventListener("click", () => {
     void execute();
   });
+
+  let schema: EditorSchema = {};
 
   return {
     node,
     focus: () => {
       editor.focus();
     },
+    setSchema: (next) => {
+      schema = next;
+      editor.setSchema(next);
+    },
+    insert: (text) => {
+      editor.insert(text);
+    },
     upgrade: async () => {
-      const schema = await readSchema();
-      editor.setSchema(schema);
       try {
         const { loadCodeMirrorEditor } = await import("./editor/codemirror.js");
         const upgraded = await loadCodeMirrorEditor({

@@ -1,4 +1,5 @@
-import { button, el } from "../dom.js";
+import { button, el, iconButton, icons } from "../dom.js";
+import { readFlag, writeFlag } from "../storage.js";
 import { describeAge, describeOutcome, historyLimit, type HistoryEntry } from "./store.js";
 
 export interface HistoryRail {
@@ -7,6 +8,8 @@ export interface HistoryRail {
 }
 
 export interface HistoryRailDeps {
+  /** Namespaces the remembered collapsed state. */
+  storageKey: string;
   /** Loads the entry back into the editor, with its rows if they are still cached. */
   onPick(entry: HistoryEntry): void;
   onClear(): void;
@@ -18,14 +21,33 @@ export interface HistoryRailDeps {
 export function createHistoryRail(deps: HistoryRailDeps): HistoryRail {
   const list = el("div", { class: "hlist" });
   const clear = button("hclear", "Clear", { title: "Forget every remembered query" });
-  const node = el("div", { class: "history" }, [
-    el("div", { class: "history-head" }, [
-      el("span", { text: "History" }),
+  const collapse = iconButton("side-toggle", "Hide the history", icons.chevronRight);
+  const expand = iconButton("side-toggle", "Show the history", icons.chevronLeft);
+  const node = el("div", { class: "history side" }, [
+    el("div", { class: "side-head" }, [
+      el("span", { class: "side-title", text: "History" }),
       el("span", { class: "spacer" }),
       clear,
+      collapse,
     ]),
+    el("div", { class: "side-stub" }, [expand]),
     list,
   ]);
+
+  const collapsedKey = `${deps.storageKey}:history-collapsed`;
+  let collapsed = readFlag(collapsedKey, false);
+  node.classList.toggle("collapsed", collapsed);
+
+  for (const [control, next] of [
+    [collapse, true],
+    [expand, false],
+  ] as const) {
+    control.addEventListener("click", () => {
+      collapsed = next;
+      writeFlag(collapsedKey, collapsed);
+      node.classList.toggle("collapsed", collapsed);
+    });
+  }
 
   clear.addEventListener("click", () => {
     deps.onClear();

@@ -10,8 +10,11 @@ export interface Rect extends Size {
   y: number;
 }
 
-/** Below this the panel stops being usable: the toolbar wraps and the results lose their columns. */
-export const minimumSize: Size = { width: 460, height: 300 };
+/**
+ * Below this the panel stops being usable. The width has to carry three columns — the schema rail,
+ * the view, and the history — so it is the sum of their minimums rather than a round number.
+ */
+export const minimumSize: Size = { width: 720, height: 320 };
 
 /** Gap between the panel and the viewport edge when it first opens. */
 const openMargin = 24;
@@ -23,7 +26,7 @@ function clamp(value: number, low: number, high: number): number {
 /** The size a freshly opened panel takes: roomy, but never larger than the window it floats in. */
 export function preferredSize(viewport: Size): Size {
   return {
-    width: clamp(Math.round(viewport.width * 0.62), minimumSize.width, viewport.width - 2 * 8),
+    width: clamp(Math.round(viewport.width * 0.72), minimumSize.width, viewport.width - 2 * 8),
     height: clamp(Math.round(viewport.height * 0.7), minimumSize.height, viewport.height - 2 * 8),
   };
 }
@@ -69,22 +72,46 @@ export function moveBy(rect: Rect, dx: number, dy: number, viewport: Size): Rect
   return clampToViewport({ ...rect, x: rect.x + dx, y: rect.y + dy }, viewport);
 }
 
-/** Resize from the bottom-right grip: the origin is fixed, so only the size changes. */
-export function resizeBy(rect: Rect, dx: number, dy: number, viewport: Size): Rect {
-  return {
-    x: rect.x,
-    y: rect.y,
-    width: clamp(
-      rect.width + dx,
-      minimumSize.width,
-      Math.max(viewport.width - rect.x, minimumSize.width),
-    ),
-    height: clamp(
-      rect.height + dy,
+/** Which boundary is being dragged. The compass letters are the edges the handle sits on. */
+export type ResizeEdge = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
+
+/**
+ * Resize from any edge or corner.
+ *
+ * The two directions are independent, and each has two cases: dragging the right or bottom moves
+ * only the size, while dragging the left or top moves the origin and the size together so the
+ * opposite edge stays put. The minimum is what stops a leading edge from crossing its partner.
+ */
+export function resizeBy(
+  rect: Rect,
+  edge: ResizeEdge,
+  dx: number,
+  dy: number,
+  viewport: Size,
+): Rect {
+  let { x, y, width, height } = rect;
+
+  if (edge.includes("e")) {
+    width = clamp(width + dx, minimumSize.width, Math.max(viewport.width - x, minimumSize.width));
+  } else if (edge.includes("w")) {
+    const right = x + width;
+    x = clamp(x + dx, 0, right - minimumSize.width);
+    width = right - x;
+  }
+
+  if (edge.includes("s")) {
+    height = clamp(
+      height + dy,
       minimumSize.height,
-      Math.max(viewport.height - rect.y, minimumSize.height),
-    ),
-  };
+      Math.max(viewport.height - y, minimumSize.height),
+    );
+  } else if (edge.includes("n")) {
+    const bottom = y + height;
+    y = clamp(y + dy, 0, bottom - minimumSize.height);
+    height = bottom - y;
+  }
+
+  return { x, y, width, height };
 }
 
 /** A stored rect, or undefined when nothing usable is saved. Bad JSON is treated as absent. */

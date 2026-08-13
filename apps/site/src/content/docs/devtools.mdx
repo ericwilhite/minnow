@@ -65,10 +65,23 @@ The database is a property rather than an attribute, because it is an object.
 | `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                   |
 | `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                   |
 
+## The schema rail
+
+Your tables sit down the left of both tabs, each expanding to its columns with their types,
+nullability, and which one is the unique key. Knowing what a column is called is as useful for
+writing a query as it is for browsing a table, so the rail never goes away.
+
+What clicking does follows the tab you are on:
+
+- On **Query**, a table or column name is inserted at the caret — `orders`, or `orders.total` —
+  spaced from whatever precedes it.
+- On **Data**, a table opens in the grid.
+
+The chevron expands a table either way, so you can read its columns without loading it.
+
 ## Browsing data
 
-The **Data** tab lists your tables down the left, each expanding to its columns with their types,
-nullability, and which one is the unique key. Pick a table to browse it.
+The **Data** tab browses one table at a time. Pick it from the rail.
 
 **Sorting.** Click a column header to sort ascending, again for descending, again to return to the
 table's own order. The unique key is appended to every sort, so rows with equal values keep a
@@ -127,8 +140,13 @@ landed.
 ## The window
 
 It is a window, not a modal. There is no backdrop over your page and no focus trap — the app
-underneath stays fully clickable while the panel is open. Drag it by its title bar, resize it from
-the corner grip, and it reopens where you left it.
+underneath stays fully clickable while the panel is open. Drag it by its title bar and resize it
+from any edge or corner; dragging a left or top edge holds the opposite one still, the way a
+window manager does.
+
+Both sidebars collapse to a narrow strip with the chevron in their header, which is how you give
+the editor or the grid the full width. The panel reopens where you left it, with the same sidebars
+collapsed.
 
 Two badges in the title bar say what you are working with:
 

@@ -22,11 +22,24 @@ describe("cornerRect", () => {
     expect(cornerRect("top-left", desktop, size)).toEqual({ x: 24, y: 24, ...size });
   });
 
-  it("still fits a panel larger than the viewport", () => {
+  it("anchors to the origin on a viewport too small to hold the minimum", () => {
+    // Three columns cannot be squeezed into a phone. The panel keeps its usable width and starts
+    // at the origin, so the rail and the view are reachable, rather than shrinking to nothing.
     const rect = cornerRect("bottom-right", { width: 500, height: 340 }, desktop);
+    expect(rect.x).toBe(0);
+    expect(rect.y).toBe(0);
+    expect(rect.width).toBe(minimumSize.width);
+  });
+
+  it("fits a panel that is merely larger than asked for", () => {
+    const rect = cornerRect(
+      "bottom-right",
+      { width: 1200, height: 800 },
+      { width: 2000, height: 900 },
+    );
     expect(rect.x).toBeGreaterThanOrEqual(0);
     expect(rect.y).toBeGreaterThanOrEqual(0);
-    expect(rect.width).toBeLessThanOrEqual(500);
+    expect(rect.x + rect.width).toBeLessThanOrEqual(1200);
   });
 });
 
@@ -59,35 +72,64 @@ describe("clampToViewport", () => {
 
 describe("moveBy", () => {
   it("moves without resizing and stops at the edges", () => {
-    const rect = { x: 100, y: 100, width: 600, height: 400 };
-    expect(moveBy(rect, 50, -30, desktop)).toEqual({ x: 150, y: 70, width: 600, height: 400 });
+    const rect = { x: 100, y: 100, width: 800, height: 400 };
+    expect(moveBy(rect, 50, -30, desktop)).toEqual({ x: 150, y: 70, width: 800, height: 400 });
     const pinned = moveBy(rect, -1000, -1000, desktop);
-    expect(pinned).toEqual({ x: 0, y: 0, width: 600, height: 400 });
+    expect(pinned).toEqual({ x: 0, y: 0, width: 800, height: 400 });
     expect(moveBy(rect, 5000, 5000, desktop)).toEqual({
-      x: desktop.width - 600,
+      x: desktop.width - 800,
       y: desktop.height - 400,
-      width: 600,
+      width: 800,
       height: 400,
     });
   });
 });
 
 describe("resizeBy", () => {
-  const rect = { x: 100, y: 100, width: 600, height: 400 };
+  const rect = { x: 100, y: 100, width: 800, height: 400 };
 
-  it("keeps the origin fixed", () => {
-    const resized = resizeBy(rect, 120, 60, desktop);
-    expect(resized.x).toBe(100);
-    expect(resized.y).toBe(100);
-    expect(resized).toMatchObject({ width: 720, height: 460 });
+  it("grows down and right from the bottom-right corner, origin fixed", () => {
+    const resized = resizeBy(rect, "se", 120, 60, desktop);
+    expect(resized).toEqual({ x: 100, y: 100, width: 920, height: 460 });
   });
 
-  it("refuses to shrink below the usable minimum", () => {
-    expect(resizeBy(rect, -5000, -5000, desktop)).toMatchObject(minimumSize);
+  it("moves the origin when a leading edge is dragged, keeping the far edge still", () => {
+    // Dragging the left edge right by 50 must shrink the panel, not move it.
+    const west = resizeBy(rect, "w", 50, 0, desktop);
+    expect(west).toEqual({ x: 150, y: 100, width: 750, height: 400 });
+    expect(west.x + west.width).toBe(rect.x + rect.width);
+
+    const north = resizeBy(rect, "n", 40, 40, desktop);
+    expect(north).toEqual({ x: 100, y: 140, width: 800, height: 360 });
+    expect(north.y + north.height).toBe(rect.y + rect.height);
+  });
+
+  it("changes only the axis its edge belongs to", () => {
+    expect(resizeBy(rect, "e", 60, 999, desktop)).toEqual({ ...rect, width: 860 });
+    expect(resizeBy(rect, "s", 999, 60, desktop)).toEqual({ ...rect, height: 460 });
+  });
+
+  it("resizes both axes from a corner", () => {
+    expect(resizeBy(rect, "nw", -50, -40, desktop)).toEqual({
+      x: 50,
+      y: 60,
+      width: 850,
+      height: 440,
+    });
+  });
+
+  it("refuses to shrink below the usable minimum, from either side", () => {
+    expect(resizeBy(rect, "se", -5000, -5000, desktop)).toMatchObject(minimumSize);
+    const west = resizeBy(rect, "w", 5000, 0, desktop);
+    expect(west.width).toBe(minimumSize.width);
+    // The far edge held, so the origin is what moved.
+    expect(west.x + west.width).toBe(rect.x + rect.width);
   });
 
   it("stops at the viewport edge rather than growing off screen", () => {
-    expect(resizeBy(rect, 5000, 5000, desktop).width).toBe(desktop.width - rect.x);
+    expect(resizeBy(rect, "se", 5000, 5000, desktop).width).toBe(desktop.width - rect.x);
+    expect(resizeBy(rect, "w", -5000, 0, desktop).x).toBe(0);
+    expect(resizeBy(rect, "n", 0, -5000, desktop).y).toBe(0);
   });
 });
 

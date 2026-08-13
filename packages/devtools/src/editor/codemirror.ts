@@ -1,4 +1,4 @@
-import type { EditorSchema, SqlEditor, SqlEditorDeps } from "./editor.js";
+import { spaced, type EditorSchema, type SqlEditor, type SqlEditorDeps } from "./editor.js";
 
 export interface CodeMirrorDeps extends SqlEditorDeps {
   /**
@@ -36,9 +36,22 @@ const themeSpec = {
   },
   ".cm-activeLine": { backgroundColor: "var(--mdt-bg-hover)" },
   ".cm-activeLineGutter": { backgroundColor: "transparent", color: "var(--mdt-text-secondary)" },
-  ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
-    backgroundColor: "var(--mdt-accent-bg)",
+  // drawSelection paints the selection as its own layer, so this is the colour that shows.
+  ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
+    backgroundColor: "var(--mdt-selection)",
   },
+  "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
+    backgroundColor: "var(--mdt-selection)",
+  },
+  // The base theme re-enables the native selection on focused content with `highlight !important`
+  // — the system colour, which is near-white and buries the text on a dark panel. The drawn layer
+  // is already showing, so the native one is turned off in every state it tries to appear in.
+  [[
+    ".cm-content ::selection",
+    ".cm-line ::selection",
+    ".cm-content :focus::selection",
+    ".cm-content :focus ::selection",
+  ].join(", ")]: { backgroundColor: "transparent !important" },
   ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--mdt-accent)" },
   ".cm-tooltip": {
     backgroundColor: "var(--mdt-bg)",
@@ -64,6 +77,14 @@ const themeSpec = {
     marginLeft: "8px",
   },
 };
+
+/** The panel's own resolution order: the host's `theme` attribute, else the viewer's setting. */
+function prefersDark(root: ShadowRoot): boolean {
+  const theme = root.host.getAttribute("theme");
+  if (theme === "dark") return true;
+  if (theme === "light") return false;
+  return globalThis.matchMedia("(prefers-color-scheme: dark)").matches;
+}
 
 /**
  * Loads CodeMirror and builds the editor. Everything here is behind one dynamic import, so the
@@ -130,7 +151,10 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
           ...commands.historyKeymap,
           ...autocomplete.completionKeymap,
         ]),
-        EditorView.theme(themeSpec),
+        // Tells CodeMirror which half of its base theme to apply. Every colour that matters is
+        // overridden above, but the base theme still decides things like the tooltip's own
+        // borders, and it defaults to light.
+        EditorView.theme(themeSpec, { dark: prefersDark(deps.root) }),
       ],
     }),
   });
@@ -151,6 +175,16 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
       editorView.focus();
       editorView.dispatch({
         selection: { anchor: Math.min(from, end), head: end },
+        scrollIntoView: true,
+      });
+    },
+    insert: (text) => {
+      const { from, to } = editorView.state.selection.main;
+      const insert = spaced(editorView.state.doc.sliceString(Math.max(0, from - 1), from), text);
+      editorView.focus();
+      editorView.dispatch({
+        changes: { from, to, insert },
+        selection: { anchor: from + insert.length },
         scrollIntoView: true,
       });
     },

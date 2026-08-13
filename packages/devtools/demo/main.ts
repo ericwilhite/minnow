@@ -92,6 +92,14 @@ const devtools = mountMinnowDevtools(db, {
   initialQuery: "SELECT name, score, city FROM people ORDER BY score DESC",
 });
 
+// The panel reads `theme` off its host element, so both palettes are reachable without changing
+// the operating system's setting.
+const themeSelect = document.querySelector<HTMLSelectElement>("#theme");
+themeSelect?.addEventListener("change", () => {
+  if (themeSelect.value === "") devtools.element.removeAttribute("theme");
+  else devtools.element.setAttribute("theme", themeSelect.value);
+});
+
 const log = document.querySelector("#log");
 let clicks = 0;
 document.querySelector("#ping")?.addEventListener("click", () => {
