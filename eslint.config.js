@@ -44,12 +44,14 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node } },
   },
   {
-    // Bench engines compare against SQLite/PGlite on purpose; the site test server is a
-    // Node process that never ships.
+    // Bench engines compare against SQLite/PGlite on purpose, the conformance harness uses
+    // node:sqlite as its differential oracle, and the site test server is a Node process
+    // that never ships.
     files: [
       "apps/bench/src/engines/**/*.ts",
       "apps/bench/vite.config.ts",
       "apps/site/tests/serve-dist.mjs",
+      "packages/core/src/engine/sql-conformance.test.ts",
     ],
     rules: { "no-restricted-imports": "off" },
   },

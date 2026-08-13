@@ -31,6 +31,8 @@ npm install @minnowdb/core
   in idle time instead of blocking the page.
 - **Our own engine** — parser, planner, optimizer, and executor are implemented here. No SQLite or
   DuckDB underneath.
+- **Differentially tested** — every test run executes a seeded query corpus through the engine's
+  two executors and through SQLite as an oracle; the results must agree.
 
 ## Quick start
 
