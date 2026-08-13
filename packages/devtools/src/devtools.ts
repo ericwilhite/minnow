@@ -145,7 +145,10 @@ export function createDevtools(
         catalogLoaded = true;
         void loadCatalog();
       }
-      view.focus();
+      // Focus follows the view that is actually showing; focusing the console while the data
+      // grid is up left a keyboard user outside the panel with nothing selected.
+      if (panel.activeView() === "query") view.focus();
+      else panel.focusActiveView();
     } else {
       confirm.dismiss();
     }

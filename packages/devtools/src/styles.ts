@@ -12,16 +12,16 @@ export const styles = `
   --mdt-bg-active: rgba(55, 53, 47, 0.1);
   --mdt-bg-code: #f7f6f3;
   --mdt-text: rgb(55, 53, 47);
-  --mdt-text-secondary: rgba(55, 53, 47, 0.65);
-  --mdt-text-faint: rgba(55, 53, 47, 0.45);
+  --mdt-text-secondary: rgba(55, 53, 47, 0.78);
+  --mdt-text-faint: rgba(55, 53, 47, 0.70);
   --mdt-border: rgba(55, 53, 47, 0.12);
   --mdt-border-strong: rgba(55, 53, 47, 0.2);
-  --mdt-accent: #2383e2;
+  --mdt-accent: #1667c0;
   --mdt-accent-bg: rgba(35, 131, 226, 0.09);
   --mdt-selection: rgba(35, 131, 226, 0.28);
   --mdt-danger: #c4433f;
   --mdt-danger-bg: rgba(235, 87, 87, 0.1);
-  --mdt-warn: #a86a1c;
+  --mdt-warn: #8a5511;
   --mdt-warn-bg: rgba(203, 145, 47, 0.14);
   --mdt-ok: #1c7c54;
   --mdt-ok-bg: rgba(28, 124, 84, 0.1);
@@ -47,8 +47,8 @@ export const styles = `
     --mdt-bg-active: rgba(255, 255, 255, 0.09);
     --mdt-bg-code: #262626;
     --mdt-text: rgba(255, 255, 255, 0.81);
-    --mdt-text-secondary: rgba(255, 255, 255, 0.46);
-    --mdt-text-faint: rgba(255, 255, 255, 0.3);
+    --mdt-text-secondary: rgba(255, 255, 255, 0.62);
+    --mdt-text-faint: rgba(255, 255, 255, 0.5);
     --mdt-border: rgba(255, 255, 255, 0.11);
     --mdt-border-strong: rgba(255, 255, 255, 0.2);
     --mdt-accent: #529cca;
@@ -72,8 +72,8 @@ export const styles = `
   --mdt-bg-active: rgba(255, 255, 255, 0.09);
   --mdt-bg-code: #262626;
   --mdt-text: rgba(255, 255, 255, 0.81);
-  --mdt-text-secondary: rgba(255, 255, 255, 0.46);
-  --mdt-text-faint: rgba(255, 255, 255, 0.3);
+  --mdt-text-secondary: rgba(255, 255, 255, 0.62);
+  --mdt-text-faint: rgba(255, 255, 255, 0.5);
   --mdt-border: rgba(255, 255, 255, 0.11);
   --mdt-border-strong: rgba(255, 255, 255, 0.2);
   --mdt-accent: #529cca;
@@ -421,6 +421,10 @@ input.mini.value { width: 110px; }
   border-bottom: 1px solid var(--mdt-border-strong);
 }
 .grid-th {
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: none;
   display: flex;
   align-items: baseline;
   gap: 5px;
@@ -510,7 +514,21 @@ input.mini.value { width: 110px; }
 .cell-action.save:hover { background: var(--mdt-accent-bg); }
 
 .cell.number { text-align: right; font-variant-numeric: tabular-nums; }
-.cell.null { color: var(--mdt-text-faint); font-style: italic; }
+/*
+ * A real NULL and the four-letter string that spells it were both rendered as the word NULL,
+ * separated only by italics — a distinction that disappears at a glance. The tint carries it
+ * instead, so the difference does not depend on noticing a slant.
+ */
+.cell.null > span, td.null > span {
+  font-style: italic;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--mdt-bg-active);
+  color: var(--mdt-text-secondary);
+}
+.cell.null { color: var(--mdt-text-faint); }
 .cell.boolean { color: var(--mdt-text-secondary); }
 .grid-message { padding: 18px 12px; font-size: 12.5px; color: var(--mdt-text-faint); }
 
@@ -788,7 +806,7 @@ td {
   text-overflow: ellipsis;
 }
 td.number { text-align: right; font-variant-numeric: tabular-nums; }
-td.null { color: var(--mdt-text-faint); font-style: italic; }
+td.null { color: var(--mdt-text-faint); }
 tr:hover td { background: var(--mdt-bg-hover); }
 
 .statusbar {

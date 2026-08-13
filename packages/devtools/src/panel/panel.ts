@@ -44,6 +44,8 @@ export interface Panel {
   /** Which view is showing, so shared chrome can act on the right one. */
   activeView(): string;
   show(id: string): void;
+  /** Moves keyboard focus into the showing view, for when the panel opens. */
+  focusActiveView(): void;
   destroy(): void;
 }
 
@@ -100,7 +102,7 @@ export function createPanel(deps: PanelDeps): Panel {
       class: "tab",
       type: "button",
       text: view.label,
-      attrs: { role: "tab", "aria-selected": "false" },
+      attrs: { role: "tab", "aria-selected": "false", "aria-controls": `mdt-view-${view.id}` },
     });
     tab.addEventListener("click", () => {
       select(view.id);
@@ -149,11 +151,19 @@ export function createPanel(deps: PanelDeps): Panel {
       deps.views.map((view) => view.node),
     ),
   ]);
-  const node = el("div", { class: `panel ${floating ? "floating" : "inline"}` }, [
-    titlebar,
-    body,
-    deps.overlay,
-  ]);
+  for (const view of deps.views) {
+    view.node.id = `mdt-view-${view.id}`;
+    view.node.setAttribute("role", "tabpanel");
+    view.node.setAttribute("aria-label", view.label);
+  }
+  const node = el(
+    "div",
+    {
+      class: `panel ${floating ? "floating" : "inline"}`,
+      attrs: { role: "region", "aria-label": "Minnow devtools" },
+    },
+    [titlebar, body, deps.overlay],
+  );
   if (floating) node.append(grip);
   node.style.zIndex = String(options.zIndex);
 
@@ -290,6 +300,13 @@ export function createPanel(deps: PanelDeps): Panel {
     layout,
     activeView: () => active,
     show: select,
+    focusActiveView: () => {
+      const view = deps.views.find((candidate) => candidate.id === active);
+      const target = view?.node.querySelector<HTMLElement>(
+        "button:not([disabled]), input, select, textarea, [tabindex]",
+      );
+      target?.focus();
+    },
     destroy: () => {
       window.removeEventListener("resize", onWindowResize);
       if (frame !== 0) cancelAnimationFrame(frame);

@@ -181,7 +181,16 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
 
       const rows: QueryRow[] = page.rows;
       if (append) grid.appendRows(rows);
-      else grid.setRows(rows);
+      else if (rows.length === 0) {
+        // An empty grid with only a small "0 rows" in the status bar reads as something having
+        // gone wrong. Say which of the two empties it is, since one of them has an obvious fix.
+        grid.setRows([]);
+        grid.setMessage(
+          filterBar.filters().length > 0
+            ? "No rows match these filters. Remove one to widen the search."
+            : `${current.name} has no rows yet.`,
+        );
+      } else grid.setRows(rows);
       // Replacing the rows drops the selection, so the row actions have to be re-derived or
       // Delete row stays enabled with nothing to delete.
       updateRowActions();

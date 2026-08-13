@@ -122,15 +122,25 @@ export function createGrid(deps: GridDeps = {}): Grid {
             el("span", { class: "grid-sort", text: column.sorted === "asc" ? "↑" : "↓" }),
           );
         }
+        const sortable = column.sortable === true && deps.onSort !== undefined;
         const cell = el(
-          "div",
+          sortable ? "button" : "div",
           {
             class: `grid-th${column.sortable === true ? " sortable" : ""}${column.sorted === undefined ? "" : " sorted"}`,
-            ...(column.sortable === true ? {} : { title: `${column.name} cannot be sorted` }),
+            ...(sortable ? { type: "button" } : { title: `${column.name} cannot be sorted` }),
+            attrs: {
+              role: "columnheader",
+              ...(column.sorted === undefined
+                ? {}
+                : { "aria-sort": column.sorted === "asc" ? "ascending" : "descending" }),
+              ...(sortable ? { "aria-label": `Sort by ${column.name}` } : {}),
+            },
           },
           children,
         );
-        if (column.sortable === true && deps.onSort !== undefined) {
+        // A real button rather than a div with a click handler, so sorting is reachable by
+        // keyboard and announced as something that can be pressed.
+        if (sortable) {
           cell.addEventListener("click", () => {
             deps.onSort?.(column.name);
           });
@@ -170,9 +180,13 @@ export function createGrid(deps: GridDeps = {}): Grid {
       const cell = cells[column];
       const name = columns[column]?.name;
       if (cell === undefined || name === undefined) continue;
-      const { text, className } = formatValue(row[name] ?? null);
+      const value = row[name] ?? null;
+      const { text, className } = formatValue(value);
       cell.className = className;
-      cell.textContent = text;
+      // NULL is rendered as its own marker rather than as the word, so a string reading "NULL"
+      // cannot be mistaken for the absence of a value.
+      if (value === null) cell.replaceChildren(el("span", { text: "NULL" }));
+      else cell.textContent = text;
       if (text.length > 24) (cell as HTMLElement).title = text;
       else (cell as HTMLElement).removeAttribute("title");
     }
