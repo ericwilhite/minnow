@@ -24,6 +24,7 @@ export interface WireColumn {
   readonly defaultSpec?: ColumnDefault;
   readonly renamedFromName?: string;
   readonly reference?: { table: string; column: string };
+  readonly enumValues?: readonly string[];
 }
 
 export interface WireTable {
@@ -40,6 +41,7 @@ export type WireMigrationStep =
   | { kind: "add-column"; tableName: string; columnName: string; definition: WireColumn }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
   | { kind: "widen-nullable"; tableName: string; columnName: string }
+  | { kind: "widen-enum"; tableName: string; columnName: string; enumValues: string[] | null }
   | {
       kind: "alter-default";
       tableName: string;
@@ -59,6 +61,7 @@ function serializeColumn(definition: AnyColumn): WireColumn {
       ? {}
       : { renamedFromName: definition.renamedFromName }),
     ...(definition.reference === undefined ? {} : { reference: { ...definition.reference } }),
+    ...(definition.enumValues === undefined ? {} : { enumValues: [...definition.enumValues] }),
   };
 }
 
@@ -97,7 +100,13 @@ export function serializeMigrationSteps(steps: readonly MigrationStep[]): WireMi
 }
 
 function deserializeColumn(wire: WireColumn): AnyColumn {
-  let builder: AnyColumn = column[wire.type]();
+  if (wire.enumValues !== undefined && wire.type !== "string") {
+    throw new TypeError(`Enum values require a string column, got ${wire.type}`);
+  }
+  let builder: AnyColumn =
+    wire.enumValues === undefined
+      ? column[wire.type]()
+      : column.enum(wire.enumValues as readonly [string, ...string[]]);
   if (wire.isNullable) builder = builder.nullable();
   if (wire.isUnique) builder = builder.unique();
   if (wire.renamedFromName !== undefined) builder = builder.renamedFrom(wire.renamedFromName);

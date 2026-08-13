@@ -72,11 +72,10 @@ export type SimpleDataType = (typeof simpleDataTypes)[number];
 /**
  * Declarative write-time default. Plain structured-clone-safe data: the spec crosses the
  * worker postMessage boundary and persists in the catalog, so function defaults are
- * unrepresentable by design.
+ * unrepresentable by design — the schema DSL carries those separately (`ColumnBuilder.defaultFn`)
+ * and the typed facade fills them before a batch reaches the engine.
  */
 export type ColumnDefault =
-  | { kind: "uuid" }
-  | { kind: "nanoid" }
   | { kind: "now" }
   | { kind: "literal"; value: boolean | number | string }
   | { kind: "autoincrement" };
@@ -88,31 +87,56 @@ export interface TableColumnRecord {
   nullable: boolean;
   /** Fills null-or-absent slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
+  /**
+   * String columns only: the closed set of values writes must draw from. Physically the column
+   * stays a plain string column; the set is write-time validation metadata, so widening it (or
+   * dropping it) is catalog-only while narrowing it is rejected by migration planning.
+   */
+  enumValues?: string[];
+}
+
+/**
+ * The single authority on which enum declarations are legal, shared by the schema DSL's
+ * `column.enum()` and the engine's `createTable`: at least one value, every value a non-empty
+ * string, no duplicates. Returns a defensive copy.
+ */
+export function validateEnumValues(values: readonly string[], context: string): string[] {
+  if (values.length === 0) {
+    throw new TypeError(`An enum needs at least one value: ${context}`);
+  }
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new TypeError(`Enum values must be non-empty strings: ${context}`);
+    }
+    if (seen.has(value)) {
+      throw new TypeError(`Duplicate enum value: ${context} has "${value}" twice`);
+    }
+    seen.add(value);
+  }
+  return [...values];
 }
 
 /**
  * The single authority on which default declarations are legal, shared by the schema DSL's
  * `table()` and the engine's `createTable` so the two entry points (and the wire path between
- * them) can never drift: defaults require non-nullable columns, each generator has one column
- * type, auto-increment is the number unique key, and the unique key never defaults to a
- * constant.
+ * them) can never drift: defaults require non-nullable columns, "now" is datetime-only,
+ * auto-increment is the number unique key, and the unique key never defaults to a constant.
  */
 export function validateColumnDefault(
-  column: { name: string; type: SimpleDataType; nullable: boolean; isUniqueKey: boolean },
+  column: {
+    name: string;
+    type: SimpleDataType;
+    nullable: boolean;
+    isUniqueKey: boolean;
+    enumValues?: readonly string[];
+  },
   defaultValue: ColumnDefault,
 ): void {
   if (column.nullable) {
     throw new TypeError(`Defaults require a non-nullable column: ${column.name}`);
   }
   switch (defaultValue.kind) {
-    case "uuid":
-    case "nanoid":
-      if (column.type !== "string") {
-        throw new TypeError(
-          `Default ${defaultValue.kind} requires a string column: ${column.name}`,
-        );
-      }
-      return;
     case "now":
       if (column.type !== "datetime") {
         throw new TypeError(`Default now requires a datetime column: ${column.name}`);
@@ -137,11 +161,23 @@ export function validateColumnDefault(
       if (typeof value === "number" && !Number.isFinite(value)) {
         throw new TypeError(`Default literal must be finite: ${column.name}`);
       }
+      if (
+        column.enumValues !== undefined &&
+        typeof value === "string" &&
+        !column.enumValues.includes(value)
+      ) {
+        throw new TypeError(`Default must be one of the enum values: ${column.name}`);
+      }
       if (column.isUniqueKey) {
         throw new TypeError(`Unique key cannot default to a constant: ${column.name}`);
       }
       return;
     }
+    // The wire path can hand this untyped data (including specs from removed generator kinds).
+    default:
+      throw new TypeError(
+        `Unknown default kind: ${String((defaultValue as { kind?: unknown }).kind)}`,
+      );
   }
 }
 

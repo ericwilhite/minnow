@@ -81,6 +81,43 @@ describe("InferDatabase", () => {
   });
 });
 
+describe("enum columns", () => {
+  const tasks = table("tasks", {
+    id: column.number().unique(),
+    state: column.enum(["todo", "doing", "done"]),
+  });
+  const taskSchema = schema([tasks]);
+  type TaskDB = InferDatabase<typeof taskSchema>;
+
+  it("types selects and inserts with the literal union and validates writes", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const db = new Minnow<TaskDB>(database, { schema: taskSchema });
+    await database.migrate(taskSchema);
+    await db
+      .insertInto("tasks")
+      .values([
+        { id: 1, state: "todo" },
+        { id: 2, state: "doing" },
+      ])
+      .execute();
+    // @ts-expect-error a value outside the enum is a compile error
+    const bad = db.insertInto("tasks").values([{ id: 3, state: "later" }]);
+    await expect(bad.execute()).rejects.toThrow("state[0] must be one of: todo, doing, done");
+
+    const rows = await db
+      .selectFrom("tasks")
+      .where("state", "=", "doing")
+      .select(["id", "state"])
+      .execute();
+    expectTypeOf(rows).toEqualTypeOf<Array<{ id: number; state: "todo" | "doing" | "done" }>>();
+    expect(rows).toEqual([{ id: 2, state: "doing" }]);
+
+    await expect(
+      db.updateTable("tasks").set({ state: "later" as "done" }).where("id", "=", 1).execute(),
+    ).rejects.toThrow("must be one of: todo, doing, done");
+  });
+});
+
 describe("driver access", () => {
   it("hands back the driver the facade was created with", () => {
     const { db, database } = createDb();
@@ -563,7 +600,7 @@ describe("mutation builders", () => {
   it("echoes generated columns from inserts, matching SQL RETURNING", async () => {
     const notes = table("notes", {
       id: column.number().unique().autoIncrement(),
-      slug: column.string().default("nanoid"),
+      slug: column.string().default(() => `s-${crypto.randomUUID()}`),
       body: column.string(),
     });
     const notesSchema = schema([notes]);
@@ -575,16 +612,18 @@ describe("mutation builders", () => {
     await database.migrate(notesSchema);
     const db = new Minnow<NotesDB>(database, { schema: notesSchema });
 
-    // Default-bearing columns are omissible in values(); explicit values pass through. A mixed
+    // Default-bearing columns are omissible in values(); explicit values pass through. The
+    // function default fills slug in the facade, before the batch reaches the engine. A mixed
     // batch reserves once past its explicit maximum, so the omitted row generates 11, not 1.
     const rows = await db
       .insertInto("notes")
-      .values([{ body: "first" }, { body: "second", id: 10 }])
+      .values([{ body: "first" }, { body: "second", id: 10, slug: "explicit" }])
       .returningAll()
       .execute();
     expect(rows.map((row) => row.id)).toEqual([11, 10]);
     expect(rows.map((row) => row.body)).toEqual(["first", "second"]);
-    for (const row of rows) expect(row.slug).toMatch(/^[A-Za-z0-9_-]{21}$/);
+    expect(rows[0]?.slug).toMatch(/^s-/);
+    expect(rows[1]?.slug).toBe("explicit");
 
     const idOnly = await db
       .insertInto("notes")
@@ -602,16 +641,18 @@ describe("mutation builders", () => {
     expect(found).toEqual([{ id: 10, body: "second" }]);
 
     // Parity: SQL RETURNING accepts generated columns absent from the INSERT column list and
-    // returns the same shape the builder echoes.
+    // returns the same shape the builder echoes. A function default lives in the facade, so
+    // the SQL path must name the column explicitly.
     const viaSql = await database.runStatement(
-      compileStatement("INSERT INTO notes (body) VALUES ('fourth')"),
+      compileStatement("INSERT INTO notes (slug, body) VALUES ('sql-slug', 'fourth')"),
       { returning: ["id", "body"] },
     );
     expect(viaSql).toMatchObject({ returnedRows: [{ id: 13, body: "fourth" }] });
     await expect(
-      database.runStatement(compileStatement("INSERT INTO notes (body) VALUES ('x')"), {
-        returning: ["missing"],
-      }),
+      database.runStatement(
+        compileStatement("INSERT INTO notes (slug, body) VALUES ('sql-slug-2', 'x')"),
+        { returning: ["missing"] },
+      ),
     ).rejects.toThrow("INSERT returning column is not in the column list: missing");
   });
 });

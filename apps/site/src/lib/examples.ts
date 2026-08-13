@@ -164,7 +164,7 @@ const written = await db
     title: "Generated keys, defaults, and zero-ceremony search",
     code: `const notes = table("notes", {
   id: column.number().unique().autoIncrement(),
-  slug: column.string().default("nanoid"),
+  slug: column.string().default(() => crypto.randomUUID().slice(0, 8)),
   body: column.string(),
 });
 await database.migrate(schema([notes]));
@@ -184,7 +184,7 @@ const hits = await db
       const database = freshDatabase();
       const notes = table("notes", {
         id: column.number().unique().autoIncrement(),
-        slug: column.string().default("nanoid"),
+        slug: column.string().default(() => crypto.randomUUID().slice(0, 8)),
         body: column.string(),
       });
       const notesSchema = schema([notes]);

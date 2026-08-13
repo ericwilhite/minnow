@@ -74,7 +74,9 @@ const rows = await db
 ```
 
 There are **four column types on purpose**: `boolean`, `number`, `string`, `datetime`. Numeric
-widths, encodings, and row IDs are the engine's job, not schema choices.
+widths, encodings, and row IDs are the engine's job, not schema choices. `column.enum([...])`
+is a string column restricted to a closed value set — typed as the literal union and validated
+on every write.
 
 ---
 
@@ -89,7 +91,7 @@ widths, encodings, and row IDs are the engine's job, not schema choices.
 | `.unique()`               | The table's unique key — one non-nullable column                   |
 | `.nullable()`             | Permits NULL and widens the inferred type                          |
 | `.autoIncrement()`        | Cross-tab atomic counter for number unique keys                    |
-| `.default(value)`         | `"uuid"`, `"nanoid"`, `"now"`, or a literal, filled at insert time |
+| `.default(value \| fn)`   | A literal or `"now"` filled engine-side; a function (`() => ulid()`) filled by the typed facade |
 | `.renamedFrom(name)`      | Rename via stable column ID — metadata only, not a drop-and-add    |
 | `.references(table, col)` | Declared relation, stored as catalog metadata                      |
 

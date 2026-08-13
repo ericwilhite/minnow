@@ -51,6 +51,7 @@ import {
   type BlockStore,
   type ColumnDefault,
   validateColumnDefault,
+  validateEnumValues,
   type FtsColumnDelta,
   type FtsColumnIndexRecord,
   type FtsPosting,
@@ -224,6 +225,8 @@ export interface ColumnDefinition {
   nullable?: boolean;
   /** Fills null-or-absent slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
+  /** String columns only: the closed set of values writes must draw from. */
+  enumValues?: readonly string[];
 }
 
 export interface CreateTableInput {
@@ -642,12 +645,18 @@ export class MinnowDatabase {
       if (!simpleDataTypes.includes(column.type)) {
         throw new TypeError(`Unsupported data type: ${column.type}`);
       }
+      if (column.enumValues !== undefined && column.type !== "string") {
+        throw new TypeError(`Enum values require a string column: ${columnName}`);
+      }
       return {
         id: this.#createId(),
         name: columnName,
         type: column.type,
         nullable: column.nullable ?? false,
         ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+        ...(column.enumValues === undefined
+          ? {}
+          : { enumValues: validateEnumValues(column.enumValues, columnName) }),
       };
     });
     const uniqueKeyColumn =
@@ -689,6 +698,7 @@ export class MinnowDatabase {
           type: column.type,
           nullable: column.nullable,
           ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+          ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
         })),
         ...(uniqueKey === undefined ? {} : { uniqueKey }),
       };
@@ -1901,6 +1911,9 @@ export class MinnowDatabase {
             ...(columnDefinition.defaultSpec === undefined
               ? {}
               : { defaultValue: columnDefinition.defaultSpec }),
+            ...(columnDefinition.enumValues === undefined
+              ? {}
+              : { enumValues: columnDefinition.enumValues }),
           })),
         });
         createdTables.push(step.table.name);
@@ -6916,6 +6929,15 @@ function validateValue(column: TableColumnRecord, value: BatchValue, index: numb
     (column.type === "datetime" && value instanceof Date && Number.isFinite(value.getTime()));
   if (!valid) {
     throw new TypeError(`${column.name}[${String(index)}] must be ${column.type}`);
+  }
+  if (
+    column.enumValues !== undefined &&
+    typeof value === "string" &&
+    !column.enumValues.includes(value)
+  ) {
+    throw new TypeError(
+      `${column.name}[${String(index)}] must be one of: ${column.enumValues.join(", ")}`,
+    );
   }
 }
 

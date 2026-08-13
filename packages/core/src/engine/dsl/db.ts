@@ -206,6 +206,16 @@ export class Minnow<in out DB> {
         const definition = schemaTables?.find(({ name }) => name === tableName);
         return definition === undefined ? undefined : Object.keys(definition.columns);
       },
+      columnDefaultFns: (tableName) => {
+        const definition = schemaTables?.find(({ name }) => name === tableName);
+        if (definition === undefined) return undefined;
+        let fns: Record<string, () => QueryValue> | undefined;
+        for (const [name, columnDefinition] of Object.entries(definition.columns)) {
+          const fill = columnDefinition.defaultFn;
+          if (fill !== undefined) (fns ??= {})[name] = fill;
+        }
+        return fns;
+      },
     };
   }
 

@@ -727,8 +727,6 @@ for (const implementation of implementations()) {
         name: "notes",
         columns: [
           { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
-          { name: "slug", type: "string", defaultValue: { kind: "nanoid" } },
-          { name: "guid", type: "string", defaultValue: { kind: "uuid" } },
           { name: "status", type: "string", defaultValue: { kind: "literal", value: "draft" } },
           { name: "created", type: "datetime", defaultValue: { kind: "now" } },
         ],
@@ -736,8 +734,6 @@ for (const implementation of implementations()) {
       });
       expect((await database.listTables())[0]?.columns).toEqual([
         { name: "id", type: "number", nullable: false, defaultValue: { kind: "autoincrement" } },
-        { name: "slug", type: "string", nullable: false, defaultValue: { kind: "nanoid" } },
-        { name: "guid", type: "string", nullable: false, defaultValue: { kind: "uuid" } },
         {
           name: "status",
           type: "string",
@@ -759,11 +755,20 @@ for (const implementation of implementations()) {
           uniqueKey: "key",
         });
       await expect(
-        create({ name: "a", type: "string", nullable: true, defaultValue: { kind: "uuid" } }),
+        create({
+          name: "a",
+          type: "string",
+          nullable: true,
+          defaultValue: { kind: "literal", value: "x" },
+        }),
       ).rejects.toThrow("Defaults require a non-nullable column");
       await expect(
-        create({ name: "b", type: "number", defaultValue: { kind: "uuid" } }),
-      ).rejects.toThrow("requires a string column");
+        create({
+          name: "b",
+          type: "string",
+          defaultValue: { kind: "uuid" } as unknown as import("../storage/types.js").ColumnDefault,
+        }),
+      ).rejects.toThrow("Unknown default kind: uuid");
       await expect(
         create({ name: "c", type: "string", defaultValue: { kind: "now" } }),
       ).rejects.toThrow("requires a datetime column");
@@ -798,6 +803,89 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("round-trips enum columns through the catalog and validates every write", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "tickets",
+        columns: [
+          { name: "id", type: "number" },
+          {
+            name: "status",
+            type: "string",
+            enumValues: ["open", "closed"],
+            defaultValue: { kind: "literal", value: "open" },
+          },
+          { name: "severity", type: "string", nullable: true, enumValues: ["low", "high"] },
+        ],
+        uniqueKey: "id",
+      });
+      expect((await database.listTables())[0]?.columns).toEqual([
+        { name: "id", type: "number", nullable: false },
+        {
+          name: "status",
+          type: "string",
+          nullable: false,
+          defaultValue: { kind: "literal", value: "open" },
+          enumValues: ["open", "closed"],
+        },
+        { name: "severity", type: "string", nullable: true, enumValues: ["low", "high"] },
+      ]);
+
+      await database.insertBatch("tickets", {
+        columns: { id: [1, 2], status: ["open", "closed"], severity: ["low", null] },
+      });
+      await expect(
+        database.insertBatch("tickets", {
+          columns: { id: [3], status: ["reopened"], severity: [null] },
+        }),
+      ).rejects.toThrow("status[0] must be one of: open, closed");
+      await expect(
+        database.upsertBatch("tickets", {
+          columns: { id: [1], status: ["open"], severity: ["medium"] },
+        }),
+      ).rejects.toThrow("severity[0] must be one of: low, high");
+      await expect(
+        database.updateBatch("tickets", { keys: [1], changes: { status: ["reopened"] } }),
+      ).rejects.toThrow("status[0] must be one of: open, closed");
+      await expect(database.execute('UPDATE tickets SET status = \'gone\' WHERE id = 1')).rejects.toThrow(
+        "status[0] must be one of: open, closed",
+      );
+
+      await expect(
+        database.createTable({
+          name: "bad_type",
+          columns: [{ name: "state", type: "number", enumValues: ["a"] }],
+        }),
+      ).rejects.toThrow("Enum values require a string column: state");
+      await expect(
+        database.createTable({
+          name: "bad_empty",
+          columns: [{ name: "state", type: "string", enumValues: [] }],
+        }),
+      ).rejects.toThrow("An enum needs at least one value: state");
+      await expect(
+        database.createTable({
+          name: "bad_duplicate",
+          columns: [{ name: "state", type: "string", enumValues: ["a", "a"] }],
+        }),
+      ).rejects.toThrow('Duplicate enum value: state has "a" twice');
+      await expect(
+        database.createTable({
+          name: "bad_default",
+          columns: [
+            {
+              name: "state",
+              type: "string",
+              enumValues: ["a", "b"],
+              defaultValue: { kind: "literal", value: "c" },
+            },
+          ],
+        }),
+      ).rejects.toThrow("Default must be one of the enum values: state");
+      store.close();
+    });
+
     it("fills defaults and auto-increment keys on insert", async () => {
       const store = await implementation.create();
       const stamped = new Date("2026-02-03T04:05:06.000Z");
@@ -806,8 +894,6 @@ for (const implementation of implementations()) {
         name: "notes",
         columns: [
           { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
-          { name: "slug", type: "string", defaultValue: { kind: "nanoid" } },
-          { name: "guid", type: "string", defaultValue: { kind: "uuid" } },
           { name: "status", type: "string", defaultValue: { kind: "literal", value: "draft" } },
           { name: "created", type: "datetime", defaultValue: { kind: "now" } },
         ],
@@ -819,16 +905,8 @@ for (const implementation of implementations()) {
       expect(generated?.id).toEqual([1, 2, 3]);
       expect(generated?.status).toEqual(["draft", "draft", "draft"]);
       expect(generated?.created).toEqual([stamped, stamped, stamped]);
-      for (const slug of generated?.slug ?? []) {
-        expect(slug).toMatch(/^[A-Za-z0-9_-]{21}$/);
-      }
-      for (const guid of generated?.guid ?? []) {
-        expect(guid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-      }
-      expect(new Set(generated?.slug).size).toBe(3);
       const rows = await database.readTable("notes");
       expect(rows.map((row) => row.id).sort()).toEqual([1, 2, 3]);
-      expect(rows.map((row) => row.slug).sort()).toEqual([...(generated?.slug ?? [])].sort());
       store.close();
     });
 

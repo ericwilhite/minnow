@@ -1,5 +1,6 @@
 import {
   validateColumnDefault,
+  validateEnumValues,
   type ColumnDefault,
   type TableColumnRecord,
   type TableRecord,
@@ -55,6 +56,14 @@ export interface ColumnBuilder<
   readonly isUnique: TUnique;
   readonly hasDefault: THasDefault;
   readonly defaultSpec?: ColumnDefault;
+  /**
+   * A userland default generator. Never persisted and never sent to the engine — the typed
+   * facade (`insertInto`, `typedTable`) calls it for omitted-or-null slots before the batch
+   * crosses the boundary, so untyped write paths (raw batches, SQL) do not see it.
+   */
+  readonly defaultFn?: () => TValue;
+  /** Present on `column.enum()` builders: the closed set of values writes must draw from. */
+  readonly enumValues?: readonly string[];
   readonly renamedFromName?: string;
   readonly reference?: { table: string; column: string };
   /** Marks the column nullable; inserts may omit it and reads may return null. */
@@ -66,12 +75,18 @@ export interface ColumnBuilder<
   /** Declares a relation for catalog metadata and validation; not enforced at write time. */
   references(table: string, column: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /**
-   * Fills null-or-absent slots at insert time. On string columns "uuid" and "nanoid" name
-   * generators (and are therefore reserved as literals); datetime columns accept only "now";
-   * any other value is a constant. Requires a non-nullable column.
+   * Fills null-or-absent slots at insert time. Requires a non-nullable column.
+   *
+   * A plain value persists in the catalog and fills inside the engine, so every write path
+   * gets it — raw batches, SQL statements, other tabs. Datetime columns accept only "now",
+   * which stamps one consistent timestamp per batch.
+   *
+   * A function is a userland generator (`() => ulid()`): the typed facade calls it just
+   * before the batch is sent, so it never persists and never crosses the worker boundary —
+   * and write paths that don't go through the facade don't see it.
    */
   default(
-    value: TValue extends Date ? "now" : TValue,
+    value: (TValue extends Date ? "now" : TValue) | (() => TValue),
   ): ColumnBuilder<TValue, TNullable, TUnique, true>;
   /**
    * Generates monotonically increasing integers for null-or-absent slots from a persistent
@@ -92,8 +107,6 @@ function defaultSpecFromArg(type: SchemaColumnType, value: unknown): ColumnDefau
       return { kind: "now" };
     case "string":
       if (typeof value !== "string") throw new TypeError("Default literal must be a string");
-      if (value === "uuid") return { kind: "uuid" };
-      if (value === "nanoid") return { kind: "nanoid" };
       return { kind: "literal", value };
     case "number":
       if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -109,7 +122,16 @@ function defaultSpecFromArg(type: SchemaColumnType, value: unknown): ColumnDefau
 function createColumn<TType extends SchemaColumnType>(
   type: TType,
   state: Partial<
-    Pick<AnyColumn, "isNullable" | "isUnique" | "renamedFromName" | "reference" | "defaultSpec">
+    Pick<
+      AnyColumn,
+      | "isNullable"
+      | "isUnique"
+      | "renamedFromName"
+      | "reference"
+      | "defaultSpec"
+      | "defaultFn"
+      | "enumValues"
+    >
   > = {},
 ): ColumnBuilder<ValueOf<TType>, false> {
   const base = {
@@ -117,10 +139,14 @@ function createColumn<TType extends SchemaColumnType>(
     type,
     isNullable: (state.isNullable ?? false) as false,
     isUnique: (state.isUnique ?? false) as false,
-    hasDefault: (state.defaultSpec !== undefined) as false,
+    hasDefault: (state.defaultSpec !== undefined || state.defaultFn !== undefined) as false,
     ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
+    ...(state.defaultFn === undefined
+      ? {}
+      : { defaultFn: state.defaultFn as () => ValueOf<TType> }),
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
     ...(state.reference === undefined ? {} : { reference: state.reference }),
+    ...(state.enumValues === undefined ? {} : { enumValues: state.enumValues }),
   };
   return {
     ...base,
@@ -138,27 +164,35 @@ function createColumn<TType extends SchemaColumnType>(
     renamedFrom: (name: string) => createColumn(type, { ...state, renamedFromName: name }),
     references: (table: string, referencedColumn: string) =>
       createColumn(type, { ...state, reference: { table, column: referencedColumn } }),
-    default: ((value: unknown) =>
-      createColumn(type, {
-        ...state,
-        defaultSpec: defaultSpecFromArg(type, value),
-      })) as unknown as ColumnBuilder<ValueOf<TType>, false>["default"],
+    default: ((value: unknown) => {
+      // A declared default is one thing: a function replaces any spec and vice versa.
+      const cleared = { ...state };
+      delete cleared.defaultSpec;
+      delete cleared.defaultFn;
+      return typeof value === "function"
+        ? createColumn(type, { ...cleared, defaultFn: value as () => ValueOf<TType> })
+        : createColumn(type, { ...cleared, defaultSpec: defaultSpecFromArg(type, value) });
+    }) as unknown as ColumnBuilder<ValueOf<TType>, false>["default"],
     autoIncrement: (() => {
       if (type !== "number") {
         throw new TypeError("Auto-increment requires a number column");
       }
-      return createColumn(type, { ...state, defaultSpec: { kind: "autoincrement" } });
+      const cleared = { ...state };
+      delete cleared.defaultFn;
+      return createColumn(type, { ...cleared, defaultSpec: { kind: "autoincrement" } });
     }) as unknown as ColumnBuilder<ValueOf<TType>, false>["autoIncrement"],
   };
 }
 
 /**
  * Rebuilds a column carrying an exact default spec — the wire layer's escape hatch, since the
- * public `.default()` interprets the reserved generator names and cannot express them as
- * literals.
+ * public `.default()` interprets "now" on datetime columns and cannot express auto-increment.
  */
 export function columnWithDefaultSpec(
-  base: Pick<AnyColumn, "type" | "isNullable" | "isUnique" | "renamedFromName" | "reference">,
+  base: Pick<
+    AnyColumn,
+    "type" | "isNullable" | "isUnique" | "renamedFromName" | "reference" | "enumValues"
+  >,
   spec: ColumnDefault,
 ): AnyColumn {
   return createColumn(base.type, {
@@ -166,6 +200,7 @@ export function columnWithDefaultSpec(
     isUnique: base.isUnique,
     ...(base.renamedFromName === undefined ? {} : { renamedFromName: base.renamedFromName }),
     ...(base.reference === undefined ? {} : { reference: base.reference }),
+    ...(base.enumValues === undefined ? {} : { enumValues: base.enumValues }),
     defaultSpec: spec,
   });
 }
@@ -175,6 +210,22 @@ export const column = {
   number: () => createColumn("number"),
   string: () => createColumn("string"),
   datetime: () => createColumn("datetime"),
+  /**
+   * A string column restricted to a closed set of values, typed as their literal union:
+   *
+   * ```ts
+   * status: column.enum(["draft", "published", "archived"]).default("draft")
+   * ```
+   *
+   * Selects return `"draft" | "published" | "archived"` and inserts accept nothing else; every
+   * write path also validates membership at runtime. Physically the column is a plain string
+   * column, so migrations may add values or relax the column to `column.string()`, but never
+   * remove values — existing rows could already hold them.
+   */
+  enum: <const TValues extends readonly [string, ...string[]]>(
+    values: TValues,
+  ): ColumnBuilder<TValues[number], false> =>
+    createColumn("string", { enumValues: validateEnumValues(values, "enum column") }),
 };
 
 export interface TableSchema<
@@ -213,6 +264,9 @@ export function table<const TName extends string, TColumns extends Record<string
     throw new TypeError(`Table ${name} unique column must not be nullable: ${uniqueEntry[0]}`);
   }
   for (const [columnName, definition] of entries) {
+    if (definition.defaultFn !== undefined && definition.isNullable) {
+      throw new TypeError(`Defaults require a non-nullable column: ${columnName}`);
+    }
     const spec = definition.defaultSpec;
     if (spec === undefined) continue;
     validateColumnDefault(
@@ -221,6 +275,7 @@ export function table<const TName extends string, TColumns extends Record<string
         type: definition.type,
         nullable: definition.isNullable,
         isUniqueKey: definition.isUnique,
+        ...(definition.enumValues === undefined ? {} : { enumValues: definition.enumValues }),
       },
       spec,
     );
@@ -241,8 +296,13 @@ export function table<const TName extends string, TColumns extends Record<string
         for (const [columnName, definition] of entries) {
           const columnValue = row[columnName];
           if (columnValue === undefined || columnValue === null) {
-            // A default-bearing column may be omitted — the engine fills it at insert time.
-            if (!definition.isNullable && definition.defaultSpec === undefined) {
+            // A default-bearing column may be omitted — the engine (or the facade, for
+            // function defaults) fills it at insert time.
+            if (
+              !definition.isNullable &&
+              definition.defaultSpec === undefined &&
+              definition.defaultFn === undefined
+            ) {
               issues.push({ message: `Missing non-nullable column`, path: [columnName] });
             }
             continue;
@@ -253,6 +313,15 @@ export function table<const TName extends string, TColumns extends Record<string
               : typeof columnValue === definition.type;
           if (!matches) {
             issues.push({ message: `Expected ${definition.type}`, path: [columnName] });
+          } else if (
+            definition.enumValues !== undefined &&
+            typeof columnValue === "string" &&
+            !definition.enumValues.includes(columnValue)
+          ) {
+            issues.push({
+              message: `Expected one of: ${definition.enumValues.join(", ")}`,
+              path: [columnName],
+            });
           }
         }
         for (const key of Object.keys(row)) {
@@ -342,6 +411,8 @@ export type MigrationStep =
   | { kind: "add-column"; tableName: string; columnName: string; definition: AnyColumn }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
   | { kind: "widen-nullable"; tableName: string; columnName: string }
+  /** Grows an enum's value set, or drops the restriction entirely (`enumValues: null`). */
+  | { kind: "widen-enum"; tableName: string; columnName: string; enumValues: string[] | null }
   | {
       kind: "alter-default";
       tableName: string;
@@ -418,6 +489,38 @@ export function planMigration(
         throw new TypeError(
           `Column types cannot change: ${tableDefinition.name}.${columnName} is ${existing.type}, schema says ${columnDefinition.type}`,
         );
+      }
+      const existingEnum = existing.enumValues;
+      const definedEnum = columnDefinition.enumValues;
+      if (definedEnum !== undefined && existingEnum === undefined) {
+        throw new TypeError(
+          `Plain string columns cannot tighten to an enum: ${tableDefinition.name}.${columnName}. Existing rows may hold values outside the set.`,
+        );
+      }
+      if (existingEnum !== undefined) {
+        if (definedEnum === undefined) {
+          steps.push({
+            kind: "widen-enum",
+            tableName: tableDefinition.name,
+            columnName,
+            enumValues: null,
+          });
+        } else {
+          const removed = existingEnum.filter((value) => !definedEnum.includes(value));
+          if (removed.length > 0) {
+            throw new TypeError(
+              `Enum values cannot be removed: ${tableDefinition.name}.${columnName} drops ${removed.join(", ")}`,
+            );
+          }
+          if (definedEnum.some((value) => !existingEnum.includes(value))) {
+            steps.push({
+              kind: "widen-enum",
+              tableName: tableDefinition.name,
+              columnName,
+              enumValues: [...definedEnum],
+            });
+          }
+        }
       }
       const existingIsKey = record.uniqueKeyColumnId === existing.id;
       if (existingIsKey !== columnDefinition.isUnique) {
@@ -510,10 +613,18 @@ export function typedTable<TTable extends AnyTable>(
 } {
   const columnNames = Object.keys(definition.columns);
   // Pads every schema column, so omitting a nullable one is an explicit null rather than a
-  // "Missing column" error from the engine.
+  // "Missing column" error from the engine; function defaults fill their omitted slots here,
+  // before the batch reaches the engine.
   const pad = (rows: ReadonlyArray<Record<string, unknown>>): BatchRow[] =>
     rows.map(
-      (row) => Object.fromEntries(columnNames.map((name) => [name, row[name] ?? null])) as BatchRow,
+      (row) =>
+        Object.fromEntries(
+          columnNames.map((name) => {
+            const value = row[name] ?? null;
+            const fill = definition.columns[name]?.defaultFn;
+            return [name, value === null && fill !== undefined ? fill() : value];
+          }),
+        ) as BatchRow,
     );
   return {
     definition,
@@ -549,7 +660,18 @@ export function applyColumnSteps(
           name: step.columnName,
           type: step.definition.type,
           nullable: true,
+          ...(step.definition.enumValues === undefined
+            ? {}
+            : { enumValues: [...step.definition.enumValues] }),
         });
+      }
+      continue;
+    }
+    if (step.kind === "widen-enum") {
+      const target = columns.find(({ name }) => name === step.columnName);
+      if (target !== undefined) {
+        if (step.enumValues === null) delete target.enumValues;
+        else target.enumValues = [...step.enumValues];
       }
       continue;
     }

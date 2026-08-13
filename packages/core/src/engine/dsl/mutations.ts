@@ -71,6 +71,12 @@ export interface MutationServices {
   ): Promise<{ kind: string; rowCount?: number; returnedRows?: QueryRow[] }>;
   /** The table's full column list when the facade knows the schema; inserts pad from it. */
   tableColumns?(tableName: string): readonly string[] | undefined;
+  /**
+   * Userland default generators by column name, when the facade knows the schema. Inserts call
+   * them for omitted-or-null slots before the batch is sent — the engine never sees the
+   * functions, only the generated values.
+   */
+  columnDefaultFns?(tableName: string): Readonly<Record<string, () => QueryValue>> | undefined;
 }
 
 type ReturningState = readonly string[] | "*" | undefined;
@@ -163,14 +169,22 @@ export class InsertQueryBuilder<
   async execute(): Promise<TReturn[]> {
     if (this.rows.length === 0) throw new TypeError("insertInto() requires values()");
     // With the schema known, omitted nullable columns pad with null (the batch API takes every
-    // column); unknown extra keys still surface as engine errors.
+    // column) and function defaults fill their omitted-or-null slots; unknown extra keys still
+    // surface as engine errors.
     const columns = new Set<string>(this.services.tableColumns?.(this.table) ?? []);
     for (const row of this.rows) {
       for (const key of Object.keys(row)) columns.add(key);
     }
     const names = [...columns];
+    const defaults = this.services.columnDefaultFns?.(this.table);
     const padded = this.rows.map((row) =>
-      Object.fromEntries(names.map((name) => [name, (row[name] ?? null) as QueryValue])),
+      Object.fromEntries(
+        names.map((name) => {
+          const value = (row[name] ?? null) as QueryValue;
+          const fill = defaults?.[name];
+          return [name, value === null && fill !== undefined ? fill() : value];
+        }),
+      ),
     );
     const result = this.replaceOnConflict
       ? await this.services.upsertBatch(this.table, padded)

@@ -153,14 +153,12 @@ describe("MinnowDatabaseClient", () => {
     // the generated values (including Dates) must survive the structured clone back.
     const notes = table("notes", {
       id: column.number().unique().autoIncrement(),
-      slug: column.string().default("nanoid"),
       created: column.datetime().default("now"),
       body: column.string(),
     });
     await client.migrate(schema([notes]));
     const result = await client.insertBatch("notes", [{ body: "hello" }, { body: "there" }]);
     expect(result.generatedColumns?.id).toEqual([1, 2]);
-    expect(result.generatedColumns?.slug?.[0]).toMatch(/^[A-Za-z0-9_-]{21}$/);
     expect(result.generatedColumns?.created?.[0]).toBeInstanceOf(Date);
     const rows = await client.readTable("notes");
     expect(rows.map((row) => row.id).sort()).toEqual([1, 2]);

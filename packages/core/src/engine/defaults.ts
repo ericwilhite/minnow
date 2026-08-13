@@ -1,25 +1,14 @@
 /**
  * Write-time default filling. For a default-bearing column (always non-nullable), a null or
  * absent slot means "generate" and an explicit value passes through untouched. Pure defaults
- * (uuid, nanoid, now, literals) are filled here before validation; auto-increment slots stay
- * null until the write path reserves a range from storage, keeping generation atomic across
- * concurrent writers.
+ * (now, literals) are filled here before validation; auto-increment slots stay null until the
+ * write path reserves a range from storage, keeping generation atomic across concurrent
+ * writers. Function defaults never reach the engine — the typed facade fills them before the
+ * batch crosses the boundary.
  */
 
 import type { RowIdRange, TableColumnRecord, TableRecord } from "../storage/types.js";
 import type { BatchValue, ColumnarBatch } from "./batch.js";
-
-// The standard nanoid alphabet: 64 characters, so one random byte maps to one character with a
-// bitmask and no modulo bias.
-const NANOID_ALPHABET = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict";
-
-export function nanoid(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(21));
-  let id = "";
-  // `charAt` over indexing: the mask keeps the index in range, and it types as `string`.
-  for (const byte of bytes) id += NANOID_ALPHABET.charAt(byte & 63);
-  return id;
-}
 
 /** The deferred part of a fill: slots that need storage-reserved auto-increment values. */
 export interface AutoIncrementFill {
@@ -88,12 +77,6 @@ export function fillColumnDefaults(
       if ((values[index] ?? null) !== null) continue;
       filled = true;
       switch (defaultValue.kind) {
-        case "uuid":
-          values[index] = crypto.randomUUID();
-          break;
-        case "nanoid":
-          values[index] = nanoid();
-          break;
         case "now":
           values[index] = nowValue ??= now();
           break;
