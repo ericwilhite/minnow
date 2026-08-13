@@ -2,7 +2,10 @@ import {
   childExpressions,
   forEachBlockExpression,
   forEachNestedBlock,
+  isScalarFunctionName,
   scalarFunctionNames,
+  scalarFunctionValue,
+  type BinaryOperator,
   type CompiledQuery,
   type Expression,
   type Predicate,
@@ -393,21 +396,27 @@ function foldExpression(expression: Expression): Expression {
   }
   if (expression.kind === "call") {
     const foldedArguments = expression.arguments.map(foldExpression);
+    const literalValues = foldedArguments.flatMap((argument) =>
+      argument.kind === "literal" ? [argument.value] : [],
+    );
     if (
-      expression.name === "ROUND" &&
-      foldedArguments.every((argument) => argument.kind === "literal")
+      expression.name !== "COALESCE" &&
+      isScalarFunctionName(expression.name) &&
+      literalValues.length === foldedArguments.length
     ) {
-      const value = foldedArguments[0]?.kind === "literal" ? foldedArguments[0].value : null;
-      const digitsValue =
-        foldedArguments[1]?.kind === "literal" ? foldedArguments[1].value : undefined;
-      if (
-        (value === null || typeof value === "number") &&
-        (digitsValue === undefined || typeof digitsValue === "number")
-      ) {
-        if (value === null) return { kind: "literal", value: null };
-        const factor = 10 ** (digitsValue ?? 0);
-        const rounded = Math.round(value * factor) / factor;
-        if (Number.isFinite(rounded)) return { kind: "literal", value: rounded };
+      try {
+        const folded = scalarFunctionValue(expression.name, literalValues);
+        if (
+          folded === null ||
+          typeof folded === "string" ||
+          typeof folded === "boolean" ||
+          folded instanceof Date ||
+          (typeof folded === "number" && Number.isFinite(folded))
+        ) {
+          return { kind: "literal", value: folded };
+        }
+      } catch {
+        // A function that rejects its constant arguments folds nowhere; execution reports it.
       }
     }
     return { ...expression, arguments: foldedArguments };
@@ -455,11 +464,17 @@ function foldExpression(expression: Expression): Expression {
 
 /** Folds only when the result stays a finite SQL value, preserving runtime semantics otherwise. */
 function foldBinary(
-  operator: "+" | "-" | "*" | "/",
+  operator: BinaryOperator,
   leftValue: QueryValue,
   rightValue: QueryValue,
 ): QueryValue | undefined {
   if (leftValue === null || rightValue === null) return null;
+  if (operator === "||") {
+    if (typeof leftValue === "string" && typeof rightValue === "string") {
+      return leftValue + rightValue;
+    }
+    return undefined;
+  }
   if (typeof leftValue === "boolean" || typeof rightValue === "boolean") return undefined;
   if (typeof leftValue === "string" || typeof rightValue === "string") return undefined;
   const left = leftValue instanceof Date ? leftValue.getTime() : leftValue;

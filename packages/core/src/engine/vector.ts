@@ -1,6 +1,7 @@
 import type { DatabaseRow } from "./database.js";
 import type {
   AggregateName,
+  BinaryOperator,
   CompiledQuery,
   PredicateOperator,
   Expression,
@@ -11,10 +12,10 @@ import type {
 } from "./query.js";
 import {
   cachedListMembership,
-  dateTruncValue,
   isScalarFunctionName,
   likeRegExp,
   orderOutputName,
+  scalarFunctionValue,
 } from "./query.js";
 import {
   bm25DocumentScore,
@@ -3015,18 +3016,6 @@ function evaluateFinalExpression(
       evaluateFinalExpression(plan, expression.right, group),
     );
   }
-  if (expression.name === "ROUND") {
-    return roundValue(
-      evaluateFinalExpression(
-        plan,
-        required(expression.arguments[0], "ROUND argument is missing"),
-        group,
-      ),
-      expression.arguments[1] === undefined
-        ? 0
-        : numeric(evaluateFinalExpression(plan, expression.arguments[1], group)),
-    );
-  }
   if (expression.name === "COALESCE") {
     for (const argument of expression.arguments) {
       const candidate = evaluateFinalExpression(plan, argument, group);
@@ -3034,18 +3023,10 @@ function evaluateFinalExpression(
     }
     return null;
   }
-  if (expression.name === "DATE_TRUNC") {
-    return dateTruncValue(
-      evaluateFinalExpression(
-        plan,
-        required(expression.arguments[0], "DATE_TRUNC unit is missing"),
-        group,
-      ),
-      evaluateFinalExpression(
-        plan,
-        required(expression.arguments[1], "DATE_TRUNC argument is missing"),
-        group,
-      ),
+  if (isScalarFunctionName(expression.name)) {
+    return scalarFunctionValue(
+      expression.name,
+      expression.arguments.map((argument) => evaluateFinalExpression(plan, argument, group)),
     );
   }
   const aggregateIndex = expression.aggregateIndex ?? -1;
@@ -3364,34 +3345,11 @@ function evaluateBatchExpression(
     }
     return null;
   }
-  if (expression.name === "DATE_TRUNC") {
-    return dateTruncValue(
-      evaluateBatchExpression(
-        plan,
-        required(expression.arguments[0], "DATE_TRUNC unit is missing"),
-        batch,
-        row,
-      ),
-      evaluateBatchExpression(
-        plan,
-        required(expression.arguments[1], "DATE_TRUNC argument is missing"),
-        batch,
-        row,
-      ),
-    );
-  }
-  if (expression.name !== "ROUND")
+  if (!isScalarFunctionName(expression.name))
     throw new TypeError(`${expression.name} requires grouped execution`);
-  return roundValue(
-    evaluateBatchExpression(
-      plan,
-      required(expression.arguments[0], "ROUND argument is missing"),
-      batch,
-      row,
-    ),
-    expression.arguments[1] === undefined
-      ? 0
-      : numeric(evaluateBatchExpression(plan, expression.arguments[1], batch, row)),
+  return scalarFunctionValue(
+    expression.name,
+    expression.arguments.map((argument) => evaluateBatchExpression(plan, argument, batch, row)),
   );
 }
 
@@ -3439,49 +3397,32 @@ function evaluateExpression(expression: BoundExpression, rowsBySource: Int32Arra
     }
     return null;
   }
-  if (expression.name === "DATE_TRUNC") {
-    return dateTruncValue(
-      evaluateExpression(
-        required(expression.arguments[0], "DATE_TRUNC unit is missing"),
-        rowsBySource,
-      ),
-      evaluateExpression(
-        required(expression.arguments[1], "DATE_TRUNC argument is missing"),
-        rowsBySource,
-      ),
-    );
-  }
-  if (expression.name !== "ROUND")
+  if (!isScalarFunctionName(expression.name))
     throw new TypeError(`${expression.name} requires grouped execution`);
-  return roundValue(
-    evaluateExpression(
-      required(expression.arguments[0], "ROUND argument is missing"),
-      rowsBySource,
-    ),
-    expression.arguments[1] === undefined
-      ? 0
-      : numeric(evaluateExpression(expression.arguments[1], rowsBySource)),
+  return scalarFunctionValue(
+    expression.name,
+    expression.arguments.map((argument) => evaluateExpression(argument, rowsBySource)),
   );
 }
 
 function binaryValue(
-  operator: "+" | "-" | "*" | "/",
+  operator: BinaryOperator,
   left: unknown,
   right: unknown,
-): number | null {
+): number | string | null {
   if (left === null || left === undefined || right === null || right === undefined) return null;
+  if (operator === "||") {
+    if (typeof left !== "string" || typeof right !== "string") {
+      throw new TypeError("|| requires string operands");
+    }
+    return left + right;
+  }
   const a = numeric(left);
   const b = numeric(right);
   if (operator === "+") return a + b;
   if (operator === "-") return a - b;
   if (operator === "*") return a * b;
   return a / b;
-}
-
-function roundValue(value: unknown, digits: number): number | null {
-  if (value === null || value === undefined) return null;
-  const factor = 10 ** digits;
-  return Math.round(numeric(value) * factor) / factor;
 }
 
 function comparisonValue(

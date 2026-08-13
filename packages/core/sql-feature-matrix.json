@@ -387,9 +387,9 @@
     },
     {
       "id": "expression.concat",
-      "status": "unsupported",
-      "example": "SELECT region || region AS doubled FROM rows",
-      "error": "Unsupported SQL character: |"
+      "status": "supported",
+      "example": "SELECT region || '-' || label AS tag FROM dims",
+      "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error."
     },
     {
       "id": "expression.coalesce",
@@ -402,6 +402,17 @@
       "status": "supported",
       "example": "SELECT DATE_TRUNC('month', joined) AS joined_month FROM rows",
       "notes": "Units: year, quarter, month, week (Monday start), day, hour, minute, second. Truncation is in UTC; the engine has no session time zone."
+    },
+    {
+      "id": "function.string-core",
+      "status": "supported",
+      "example": "SELECT UPPER(label) AS u, LOWER(label) AS l, LENGTH(label) AS n, SUBSTR(label, 2, 3) AS mid, TRIM(label) AS t FROM dims",
+      "notes": "SUBSTRING is accepted as a spelling of SUBSTR; LENGTH and SUBSTR count characters, not UTF-16 units."
+    },
+    {
+      "id": "function.abs",
+      "status": "supported",
+      "example": "SELECT ABS(amount - 5) AS distance FROM rows"
     },
     {
       "id": "aggregate.distinct-argument",
@@ -418,9 +429,8 @@
     },
     {
       "id": "join.cross",
-      "status": "unsupported",
-      "example": "SELECT r.region FROM rows r CROSS JOIN dims d",
-      "error": "Expected eof, found CROSS"
+      "status": "supported",
+      "example": "SELECT r.region AS region, d.label AS label FROM rows r CROSS JOIN dims d"
     },
     {
       "id": "join.full",
@@ -430,9 +440,9 @@
     },
     {
       "id": "order-by.ordinal",
-      "status": "unsupported",
-      "example": "SELECT region, amount FROM rows ORDER BY 2",
-      "error": "ORDER BY ordinals are not supported"
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows ORDER BY 2 DESC",
+      "notes": "Ordinals resolve to the select list at compile time; out-of-range ordinals are an error."
     },
     {
       "id": "window.lag-lead",

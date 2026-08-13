@@ -326,6 +326,24 @@ const templates: Template[] = [
     params: [Math.floor(rng() * 300) / 4],
     ordered: true,
   }),
+  () => ({
+    sql: `SELECT id, label || '-' || COALESCE(region, 'none') AS tag FROM data ORDER BY id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id, UPPER(label) AS u, LOWER(label) AS l, LENGTH(label) AS n, SUBSTR(label, ?, 2) AS mid, TRIM(label) AS t, ABS(amount - ?) AS dist FROM data ORDER BY id`,
+    params: [1 + Math.floor(rng() * 3), Math.floor(rng() * 200) / 4],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id, m.rank AS r FROM data d CROSS JOIN dims m WHERE d.id <= ? ORDER BY id, r`,
+    params: [10 + Math.floor(rng() * 30)],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT region, amount, id FROM data ORDER BY 2 DESC, 3`,
+    ordered: true,
+  }),
 ];
 
 function buildCorpus(): Case[] {

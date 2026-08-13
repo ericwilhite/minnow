@@ -51,21 +51,85 @@ export interface QueryExecutionOptions {
   readonly executionMemoryBudgetBytes?: number;
 }
 
-export type BinaryOperator = "+" | "-" | "*" | "/";
+export type BinaryOperator = "+" | "-" | "*" | "/" | "||";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
 export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
-export type ScalarFunctionName = "ROUND" | "COALESCE" | "DATE_TRUNC";
+export type ScalarFunctionName =
+  "ROUND" | "COALESCE" | "DATE_TRUNC" | "UPPER" | "LOWER" | "LENGTH" | "ABS" | "TRIM" | "SUBSTR";
 
 export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "ROUND",
   "COALESCE",
   "DATE_TRUNC",
+  "UPPER",
+  "LOWER",
+  "LENGTH",
+  "ABS",
+  "TRIM",
+  "SUBSTR",
 ] satisfies ScalarFunctionName[]);
 
 export function isScalarFunctionName(
   name: AggregateName | ScalarFunctionName,
 ): name is ScalarFunctionName {
   return scalarFunctionNames.has(name);
+}
+
+function stringArgument(name: string, value: unknown): string {
+  if (typeof value !== "string") throw new TypeError(`${name} requires a string argument`);
+  return value;
+}
+
+/**
+ * Evaluates one scalar function over already-evaluated argument values. Every executor calls
+ * through here, so a function behaves identically in the row executor, the vectorized executor,
+ * and constant folding. COALESCE is not handled here — it short-circuits, so each call site
+ * evaluates it lazily. A NULL first argument returns NULL (SQL scalar semantics); LENGTH and
+ * SUBSTR count characters, not UTF-16 units, matching SQLite and PostgreSQL.
+ */
+export function scalarFunctionValue(
+  name: Exclude<ScalarFunctionName, "COALESCE">,
+  values: readonly unknown[],
+): unknown {
+  if (name === "DATE_TRUNC") return dateTruncValue(values[0], values[1]);
+  const first = values[0];
+  if (first === null || first === undefined) return null;
+  switch (name) {
+    case "ROUND": {
+      if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
+      const digits = values.length > 1 ? numeric(values[1]) : 0;
+      const factor = 10 ** digits;
+      return Math.round(numeric(first) * factor) / factor;
+    }
+    case "ABS":
+      return Math.abs(numeric(first));
+    case "UPPER":
+      return stringArgument("UPPER", first).toUpperCase();
+    case "LOWER":
+      return stringArgument("LOWER", first).toLowerCase();
+    case "TRIM":
+      // SQL TRIM removes spaces, not general whitespace.
+      return stringArgument("TRIM", first).replace(/^ +/, "").replace(/ +$/, "");
+    case "LENGTH":
+      return Array.from(stringArgument("LENGTH", first)).length;
+    case "SUBSTR": {
+      const text = Array.from(stringArgument("SUBSTR", first));
+      if (values[1] === null || values[1] === undefined) return null;
+      const start = numeric(values[1]);
+      if (!Number.isInteger(start) || start < 1) {
+        throw new TypeError("SUBSTR start must be a positive integer");
+      }
+      if (values.length > 2) {
+        if (values[2] === null || values[2] === undefined) return null;
+        const length = numeric(values[2]);
+        if (!Number.isInteger(length) || length < 0) {
+          throw new TypeError("SUBSTR length must be a non-negative integer");
+        }
+        return text.slice(start - 1, start - 1 + length).join("");
+      }
+      return text.slice(start - 1).join("");
+    }
+  }
 }
 
 export const dateTruncUnits: ReadonlySet<string> = new Set([
@@ -903,6 +967,15 @@ export function inferBlockSchema(
       return expression.op === "match" ? "boolean" : "number";
     }
     if (expression.kind === "binary") {
+      if (expression.operator === "||") {
+        for (const side of [expression.left, expression.right]) {
+          const type = infer(side);
+          if (type !== "string" && type !== "null") {
+            throw new TypeError("|| requires string operands");
+          }
+        }
+        return "string";
+      }
       for (const side of [expression.left, expression.right]) {
         const type = infer(side);
         if (type === "string" || type === "boolean") {
@@ -914,8 +987,25 @@ export function inferBlockSchema(
     if (expression.name === "COUNT" || expression.name === "SUM" || expression.name === "AVG") {
       return "number";
     }
-    if (expression.name === "ROUND") return "number";
+    if (expression.name === "ROUND" || expression.name === "LENGTH" || expression.name === "ABS") {
+      return "number";
+    }
     if (expression.name === "DATE_TRUNC") return "datetime";
+    if (
+      expression.name === "UPPER" ||
+      expression.name === "LOWER" ||
+      expression.name === "TRIM" ||
+      expression.name === "SUBSTR"
+    ) {
+      const argument = expression.arguments[0];
+      if (argument !== undefined) {
+        const type = infer(argument);
+        if (type !== "string" && type !== "null") {
+          throw new TypeError(`${expression.name} requires a string argument`);
+        }
+      }
+      return "string";
+    }
     if (expression.name === "COALESCE") {
       let resolved: SqlColumnType | "null" = "null";
       for (const argument of expression.arguments) {
@@ -1993,6 +2083,12 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       const left = evaluate(expression.left, context, group);
       const right = evaluate(expression.right, context, group);
       if (left === null || left === undefined || right === null || right === undefined) return null;
+      if (expression.operator === "||") {
+        if (typeof left !== "string" || typeof right !== "string") {
+          throw new TypeError("|| requires string operands");
+        }
+        return left + right;
+      }
       const a = numeric(left);
       const b = numeric(right);
       if (expression.operator === "+") return a + b;
@@ -2037,24 +2133,13 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         }
         return null;
       }
-      if (expression.name === "DATE_TRUNC") {
-        return dateTruncValue(
-          evaluate(expression.arguments[0] ?? { kind: "literal", value: null }, context, group),
-          evaluate(expression.arguments[1] ?? { kind: "literal", value: null }, context, group),
+      if (isScalarFunctionName(expression.name)) {
+        return scalarFunctionValue(
+          expression.name,
+          expression.arguments.map((argument) => evaluate(argument, context, group)),
         );
       }
-      const value = evaluate(
-        expression.arguments[0] ?? { kind: "literal", value: 0 },
-        context,
-        group,
-      );
-      if (value === null || value === undefined) return null;
-      const digits =
-        expression.arguments[1] === undefined
-          ? 0
-          : numeric(evaluate(expression.arguments[1], context, group));
-      const factor = 10 ** digits;
-      return Math.round(numeric(value) * factor) / factor;
+      throw new TypeError(`${expression.name} requires grouped execution`);
     }
   }
 }
@@ -2747,8 +2832,28 @@ class Parser {
       this.#isKeyword("JOIN") ||
       this.#isKeyword("INNER") ||
       this.#isKeyword("LEFT") ||
-      this.#isKeyword("RIGHT")
+      this.#isKeyword("RIGHT") ||
+      this.#isKeyword("CROSS")
     ) {
+      if (this.#isKeyword("CROSS")) {
+        // A cross join is the ON-less cartesian product: the nested-loop join path with a
+        // condition every row pair satisfies.
+        this.#keyword("CROSS");
+        this.#keyword("JOIN");
+        joins.push({
+          ...this.#source(),
+          kind: "inner",
+          left: { kind: "literal", value: null },
+          right: { kind: "literal", value: null },
+          on: {
+            kind: "condition",
+            operator: "=",
+            left: { kind: "literal", value: 1 },
+            right: { kind: "literal", value: 1 },
+          },
+        });
+        continue;
+      }
       let kind: JoinPlan["kind"] = "inner";
       let right = false;
       if (this.#isKeyword("INNER")) this.#keyword("INNER");
@@ -3066,8 +3171,15 @@ class Parser {
     let left = this.#primary();
     for (;;) {
       const operator = this.#peek().text;
+      // || binds loosest, matching PostgreSQL: concatenation applies to whole arithmetic terms.
       const precedence =
-        operator === "*" || operator === "/" ? 20 : operator === "+" || operator === "-" ? 10 : -1;
+        operator === "*" || operator === "/"
+          ? 20
+          : operator === "+" || operator === "-"
+            ? 10
+            : operator === "||"
+              ? 5
+              : -1;
       if (precedence < minimumPrecedence) break;
       this.#index += 1;
       left = {
@@ -3200,7 +3312,8 @@ class Parser {
         const { partitionBy, orderBy } = this.#overClause();
         return { kind: "window", name: upper, partitionBy, orderBy };
       }
-      const name = upper as AggregateName | ScalarFunctionName;
+      // SUBSTRING is the standard spelling; SUBSTR is the canonical plan name for both.
+      const name = (upper === "SUBSTRING" ? "SUBSTR" : upper) as AggregateName | ScalarFunctionName;
       if (!aggregateNames.has(name as AggregateName) && !scalarFunctionNames.has(name))
         throw new TypeError(`Unsupported function: ${identifier}`);
       let distinct = false;
@@ -3223,6 +3336,18 @@ class Parser {
         throw new TypeError("ROUND requires one or two arguments");
       if (name === "COALESCE" && args.length < 1)
         throw new TypeError("COALESCE requires at least one argument");
+      if (
+        (name === "UPPER" ||
+          name === "LOWER" ||
+          name === "TRIM" ||
+          name === "LENGTH" ||
+          name === "ABS") &&
+        args.length !== 1
+      ) {
+        throw new TypeError(`${name} requires exactly one argument`);
+      }
+      if (name === "SUBSTR" && (args.length < 2 || args.length > 3))
+        throw new TypeError("SUBSTR requires a string, a start, and an optional length");
       if (name === "DATE_TRUNC") {
         if (args.length !== 2)
           throw new TypeError("DATE_TRUNC requires a unit and a datetime argument");
@@ -3382,10 +3507,32 @@ export interface SelectBlockParts {
 }
 
 /** Validates and assembles one select block, applying every parser desugar. */
+/** Resolves ORDER BY ordinals (ORDER BY 2) to the matching select item's output alias. */
+function resolveOrderByOrdinals(
+  orderBy: CompiledQuery["orderBy"],
+  select: readonly SelectItem[],
+): CompiledQuery["orderBy"] {
+  return orderBy.map((order) => {
+    if (order.expression.kind !== "literal" || typeof order.expression.value !== "number") {
+      return order;
+    }
+    const ordinal = order.expression.value;
+    if (select.some((item) => item.expression.kind === "wildcard")) {
+      throw new TypeError("ORDER BY ordinals cannot be used with SELECT *");
+    }
+    const item = Number.isInteger(ordinal) ? select[ordinal - 1] : undefined;
+    if (item === undefined) {
+      throw new TypeError(`ORDER BY ordinal is out of range: ${String(ordinal)}`);
+    }
+    return { ...order, expression: { kind: "column" as const, reference: item.alias } };
+  });
+}
+
 export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
 ): CompiledQuery {
+  parts = { ...parts, orderBy: resolveOrderByOrdinals(parts.orderBy, parts.select) };
   if (parts.orderBy.some((order) => order.expression.kind !== "column")) {
     return assembleOrderByExpressionBlock(parts, nextSequence);
   }
@@ -3500,6 +3647,8 @@ export function compoundSelectBlock(
   tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
   nextSequence: () => number,
 ): CompiledQuery {
+  // Set-operation output columns are the first member's, so ordinals resolve against them.
+  tail = { ...tail, orderBy: resolveOrderByOrdinals(tail.orderBy, blocks[0]?.select ?? []) };
   return {
     sql,
     base: {
@@ -3936,7 +4085,7 @@ function tokenize(sql: string): Token[] {
     }
     if (character === ";")
       throw new SqlCompileError("Run one SELECT statement at a time", index, 1);
-    if ([">=", "<=", "!=", "<>"].includes(pair)) {
+    if ([">=", "<=", "!=", "<>", "||"].includes(pair)) {
       tokens.push({ kind: "operator", text: pair, start: index, end: index + 2 });
       index += 2;
       continue;
