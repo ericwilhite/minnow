@@ -105,7 +105,10 @@ describe("column defaults", () => {
     expect(notes.columns.slug.defaultFn?.()).toMatch(/^slug-/);
     expect(notes.columns.slug.hasDefault).toBe(true);
     // Declaring one kind of default replaces the other.
-    const replaced = column.string().default(() => "generated").default("literal");
+    const replaced = column
+      .string()
+      .default(() => "generated")
+      .default("literal");
     expect(replaced.defaultFn).toBeUndefined();
     expect(replaced.defaultSpec).toEqual({ kind: "literal", value: "literal" });
   });
@@ -115,7 +118,12 @@ describe("column defaults", () => {
       "Defaults require a non-nullable column",
     );
     expect(() =>
-      table("bad", { a: column.string().default(() => "x").nullable() }),
+      table("bad", {
+        a: column
+          .string()
+          .default(() => "x")
+          .nullable(),
+      }),
     ).toThrow("Defaults require a non-nullable column");
     expect(() => table("bad", { a: column.number().autoIncrement(), b: column.string() })).toThrow(
       "Auto-increment requires the unique key column",
@@ -241,7 +249,10 @@ describe("column defaults", () => {
     const database = new MinnowDatabase(store);
     let counter = 0;
     const entries = table("entries", {
-      key: column.string().unique().default(() => `key-${String((counter += 1))}`),
+      key: column
+        .string()
+        .unique()
+        .default(() => `key-${String((counter += 1))}`),
       body: column.string(),
     });
     await database.migrate(schema([entries]));
@@ -250,9 +261,9 @@ describe("column defaults", () => {
     const rows = await handle.rows();
     expect(rows.map(({ key }) => key).sort()).toEqual(["explicit", "key-1"]);
     // The raw batch API bypasses the facade, so the function default does not apply there.
-    await expect(
-      database.insertBatch("entries", [{ key: null, body: "raw" }]),
-    ).rejects.toThrow("key[0] cannot be null");
+    await expect(database.insertBatch("entries", [{ key: null, body: "raw" }])).rejects.toThrow(
+      "key[0] cannot be null",
+    );
     store.close();
   });
 
@@ -317,9 +328,9 @@ describe("enum columns", () => {
     expect(() => column.enum([] as unknown as ["x"])).toThrow("at least one value");
     expect(() => column.enum(["a", "a"])).toThrow("Duplicate enum value");
     expect(() => column.enum([""])).toThrow("non-empty strings");
-    expect(() =>
-      table("bad", { state: column.enum(["a", "b"]).default("c" as "a") }),
-    ).toThrow("Default must be one of the enum values");
+    expect(() => table("bad", { state: column.enum(["a", "b"]).default("c" as "a") })).toThrow(
+      "Default must be one of the enum values",
+    );
   });
 
   it("validates membership through the Standard Schema interface", () => {
@@ -410,7 +421,10 @@ describe("enum columns", () => {
       status: column.enum(["open", "closed"]).default("open"),
     });
     await database.migrate(schema([v1]));
-    const inserted = await database.insertBatch("tickets", [{ status: null }, { status: "closed" }]);
+    const inserted = await database.insertBatch("tickets", [
+      { status: null },
+      { status: "closed" },
+    ]);
     expect(inserted.generatedColumns?.status).toEqual(["open", "closed"]);
     await expect(database.insertBatch("tickets", [{ status: "reopened" }])).rejects.toThrow(
       "status[0] must be one of: open, closed",

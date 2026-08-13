@@ -130,6 +130,8 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
 
 export type Expression =
   | { kind: "literal"; value: QueryValue }
+  /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
+  | { kind: "parameter"; index: number }
   | { kind: "column"; reference: string }
   | { kind: "wildcard" }
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
@@ -266,12 +268,18 @@ export interface CompiledQuery {
   orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
   limit?: number;
   offset?: number;
+  /**
+   * Number of `?`/`$n` placeholders in the whole statement; set only on the top-level plan.
+   * A plan with placeholders must pass through bindPlanParameters before it prepares.
+   */
+  parameterCount?: number;
 }
 
 type RowContext = Record<string, DatabaseRow | undefined>;
 
 interface Token {
-  kind: "identifier" | "number" | "string" | "operator" | "punctuation" | "eof";
+  kind: "identifier" | "number" | "string" | "operator" | "punctuation" | "parameter" | "eof";
+  /** For parameter tokens: the 1-based number of `$n`, or "" for positional `?`. */
   text: string;
   /**
    * Half-open character span in the tokenized text. String tokens span their quotes even though
@@ -341,22 +349,35 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   } catch (error) {
     throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
   }
-  return options.optimize === false ? plan : optimizePlan(plan);
+  const compiled = options.optimize === false ? plan : optimizePlan(plan);
+  if (parser.parameterCount > 0) compiled.parameterCount = parser.parameterCount;
+  return compiled;
 }
 
+/** An INSERT value: a constant, or an unbound `?`/`$n` placeholder awaiting its parameter. */
+export type InsertValue = QueryValue | { parameter: number };
+
 export type CompiledStatement =
-  | { kind: "select"; sql: string }
-  | { kind: "insert"; table: string; columns: string[]; rows: QueryValue[][] }
+  | { kind: "select"; sql: string; parameterCount?: number }
+  | {
+      kind: "insert";
+      table: string;
+      columns: string[];
+      rows: InsertValue[][];
+      parameterCount?: number;
+    }
   | {
       kind: "update";
       table: string;
       assignments: Array<{ column: string; expression: Expression }>;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+      parameterCount?: number;
     }
   | {
       kind: "delete";
       table: string;
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
+      parameterCount?: number;
     };
 
 /**
@@ -374,10 +395,14 @@ export function compileStatement(sql: string): CompiledStatement {
     const keyword = first?.kind === "identifier" ? first.text.toUpperCase() : "";
     if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
       parser = new Parser(tokens);
-      return parser.parseMutation(keyword);
+      const statement = parser.parseMutation(keyword);
+      if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
+      return statement;
     }
-    compileQuery(text);
-    return { kind: "select", sql: text };
+    const plan = compileQuery(text);
+    return plan.parameterCount === undefined
+      ? { kind: "select", sql: text }
+      : { kind: "select", sql: text, parameterCount: plan.parameterCount };
   } catch (error) {
     throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
   }
@@ -584,6 +609,190 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
   return blockHas(plan);
 }
 
+/** True when any `?`/`$n` placeholder remains anywhere in the expression tree. */
+export function containsParameter(expression: Expression): boolean {
+  if (expression.kind === "parameter") return true;
+  if (expression.kind === "subquery" || expression.kind === "exists") {
+    return blockHasParameters(expression.block);
+  }
+  return childExpressions(expression).some(containsParameter);
+}
+
+export function blockHasParameters(block: CompiledQuery): boolean {
+  const expressions: Expression[] = [];
+  forEachBlockExpression(block, (expression) => expressions.push(expression));
+  return (
+    expressions.some(containsParameter) ||
+    [block.base, ...block.joins].some(
+      (source) =>
+        (source.derived !== undefined && blockHasParameters(source.derived)) ||
+        source.union?.blocks.some(blockHasParameters) === true ||
+        (source.windowed !== undefined && blockHasParameters(source.windowed.block)) ||
+        (source.recursive !== undefined &&
+          (blockHasParameters(source.recursive.base) || blockHasParameters(source.recursive.step))),
+    )
+  );
+}
+
+function validateParameters(count: number, params: readonly QueryValue[] | undefined): void {
+  const given = params?.length ?? 0;
+  if (given !== count) {
+    throw new TypeError(
+      `This statement takes ${String(count)} parameter${count === 1 ? "" : "s"}, got ${String(given)}`,
+    );
+  }
+  params?.forEach((value, index) => {
+    const label = `$${String(index + 1)}`;
+    if (value === null || typeof value === "boolean" || typeof value === "string") return;
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) {
+        throw new TypeError(`Parameter ${label} must be a finite number`);
+      }
+      return;
+    }
+    if (value instanceof Date) {
+      if (!Number.isFinite(value.getTime())) {
+        throw new TypeError(`Parameter ${label} must be a valid date`);
+      }
+      return;
+    }
+    throw new TypeError(`Parameter ${label} must be null, boolean, number, string, or Date`);
+  });
+}
+
+function bindExpression(expression: Expression, values: readonly QueryValue[]): Expression {
+  if (expression.kind === "parameter") {
+    return { kind: "literal", value: values[expression.index] ?? null };
+  }
+  if (expression.kind === "subquery" || expression.kind === "exists") {
+    bindBlock(expression.block, values);
+    return expression;
+  }
+  if (
+    expression.kind === "binary" ||
+    expression.kind === "condition" ||
+    expression.kind === "logical"
+  ) {
+    expression.left = bindExpression(expression.left, values);
+    expression.right = bindExpression(expression.right, values);
+    return expression;
+  }
+  if (expression.kind === "call") {
+    expression.arguments = expression.arguments.map((argument) => bindExpression(argument, values));
+    return expression;
+  }
+  if (expression.kind === "list") {
+    expression.items = expression.items.map((item) => bindExpression(item, values));
+    return expression;
+  }
+  if (expression.kind === "not") {
+    expression.operand = bindExpression(expression.operand, values);
+    return expression;
+  }
+  if (expression.kind === "case") {
+    for (const branch of expression.branches) {
+      branch.when = bindExpression(branch.when, values);
+      branch.then = bindExpression(branch.then, values);
+    }
+    if (expression.otherwise !== undefined) {
+      expression.otherwise = bindExpression(expression.otherwise, values);
+    }
+    return expression;
+  }
+  if (expression.kind === "window") {
+    expression.partitionBy = expression.partitionBy.map((part) => bindExpression(part, values));
+    for (const order of expression.orderBy) {
+      order.expression = bindExpression(order.expression, values);
+    }
+    if (expression.argument !== undefined) {
+      expression.argument = bindExpression(expression.argument, values);
+    }
+    return expression;
+  }
+  return expression;
+}
+
+function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
+  for (const item of block.select) item.expression = bindExpression(item.expression, values);
+  for (const predicate of [...block.predicates, ...block.having]) {
+    predicate.left = bindExpression(predicate.left, values);
+    predicate.right = bindExpression(predicate.right, values);
+  }
+  block.groupBy = block.groupBy.map((expression) => bindExpression(expression, values));
+  for (const order of block.orderBy) {
+    order.expression = bindExpression(order.expression, values);
+  }
+  for (const join of block.joins) {
+    join.left = bindExpression(join.left, values);
+    join.right = bindExpression(join.right, values);
+    if (join.on !== undefined) join.on = bindExpression(join.on, values);
+  }
+  for (const source of [block.base, ...block.joins]) {
+    if (source.derived !== undefined) bindBlock(source.derived, values);
+    for (const member of source.union?.blocks ?? []) bindBlock(member, values);
+    if (source.windowed !== undefined) bindBlock(source.windowed.block, values);
+    if (source.recursive !== undefined) {
+      bindBlock(source.recursive.base, values);
+      bindBlock(source.recursive.step, values);
+    }
+  }
+}
+
+/**
+ * Replaces every placeholder with its parameter value as a literal. The input plan is never
+ * modified — plans come from the compile cache, so binding is copy-on-write. The parameter list
+ * must match the statement's placeholder count exactly; a plan without placeholders passes
+ * through untouched (and rejects a non-empty parameter list explicitly).
+ */
+export function bindPlanParameters(
+  plan: CompiledQuery,
+  params: readonly QueryValue[] | undefined,
+): CompiledQuery {
+  const count = plan.parameterCount ?? 0;
+  validateParameters(count, params);
+  if (count === 0) return plan;
+  const clone = structuredClone(plan);
+  bindBlock(clone, params ?? []);
+  delete clone.parameterCount;
+  return clone;
+}
+
+function isParameterSlot(value: InsertValue): value is { parameter: number } {
+  return typeof value === "object" && value !== null && !(value instanceof Date);
+}
+
+/** The mutation-statement counterpart of bindPlanParameters; SELECTs bind through their plan. */
+export function bindStatementParameters(
+  statement: CompiledStatement,
+  params: readonly QueryValue[] | undefined,
+): CompiledStatement {
+  const count = statement.parameterCount ?? 0;
+  validateParameters(count, params);
+  if (count === 0) return statement;
+  if (statement.kind === "select") {
+    throw new TypeError("SELECT parameters bind through the query pipeline, not the statement");
+  }
+  const values = params ?? [];
+  const clone = structuredClone(statement);
+  delete clone.parameterCount;
+  if (clone.kind === "insert") {
+    clone.rows = clone.rows.map((row) =>
+      row.map((value) => (isParameterSlot(value) ? (values[value.parameter] ?? null) : value)),
+    );
+    return clone;
+  }
+  if (clone.kind === "update") {
+    for (const assignment of clone.assignments) {
+      assignment.expression = bindExpression(assignment.expression, values);
+    }
+  }
+  for (const predicate of clone.predicates) {
+    predicate.left = bindExpression(predicate.left, values);
+    predicate.right = bindExpression(predicate.right, values);
+  }
+  return clone;
+}
+
 export type SqlColumnType = "boolean" | "number" | "string" | "datetime";
 
 export interface SqlColumnSchema {
@@ -630,6 +839,9 @@ export function inferBlockSchema(
   const infer = (expression: Expression): SqlColumnType | "null" => {
     if (expression.kind === "subquery" || expression.kind === "list") {
       throw new TypeError("Subqueries must be resolved before schema inference");
+    }
+    if (expression.kind === "parameter") {
+      throw new TypeError("Parameters must be bound before schema inference");
     }
     if (expression.kind === "window") {
       throw new TypeError("Window functions must be desugared before schema inference");
@@ -1093,6 +1305,13 @@ export function childExpressions(expression: Expression): Expression[] {
     ];
   }
   if (expression.kind === "fts") return expression.columns === "*" ? [] : [...expression.columns];
+  if (expression.kind === "window") {
+    return [
+      ...expression.partitionBy,
+      ...expression.orderBy.map((order) => order.expression),
+      ...(expression.argument === undefined ? [] : [expression.argument]),
+    ];
+  }
   return [];
 }
 
@@ -1718,6 +1937,10 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
   switch (expression.kind) {
     case "literal":
       return expression.value;
+    case "parameter":
+      throw new TypeError(
+        `Placeholder $${String(expression.index + 1)} is unbound; pass parameters when executing`,
+      );
     case "wildcard":
       return 1;
     case "subquery":
@@ -2215,6 +2438,14 @@ function asQueryValue(value: unknown): QueryValue {
 class Parser {
   #index = 0;
   #derivedSequence = 0;
+  /** Placeholders seen so far: positional `?` count, and the highest `$n` number. */
+  #positionalParameters = 0;
+  #highestNumberedParameter = 0;
+
+  /** Total parameter slots the statement expects; 0 when it has no placeholders. */
+  get parameterCount(): number {
+    return Math.max(this.#positionalParameters, this.#highestNumberedParameter);
+  }
   /** Shared with the assembly helpers so parser plans and builder plans number sources alike. */
   readonly nextDerivedSequence = (): number => {
     this.#derivedSequence += 1;
@@ -2370,12 +2601,12 @@ class Parser {
       throw new TypeError("INSERT columns must be unique");
     }
     this.#keyword("VALUES");
-    const rows: QueryValue[][] = [];
+    const rows: InsertValue[][] = [];
     for (;;) {
       this.#expectPunctuation("(");
-      const values: QueryValue[] = [];
+      const values: InsertValue[] = [];
       for (;;) {
-        values.push(this.#constantValue("INSERT values"));
+        values.push(this.#insertValue("INSERT values"));
         if (!this.#punctuation(",")) break;
       }
       this.#expectPunctuation(")");
@@ -2438,8 +2669,14 @@ class Parser {
     return predicates;
   }
 
-  #constantValue(label: string): QueryValue {
+  #insertValue(label: string): InsertValue {
     const expression = this.#expression();
+    // A bare placeholder stays a slot; the batch write binds it later. Placeholders nested in
+    // arithmetic would need expression retention through the batch path, so they stay rejected.
+    if (expression.kind === "parameter") return { parameter: expression.index };
+    if (containsParameter(expression)) {
+      throw new TypeError(`${label} take a bare ? placeholder or a constant expression`);
+    }
     if (hasAggregate(expression) || expressionColumns(expression).length > 0) {
       throw new TypeError(`${label} must be constant expressions`);
     }
@@ -2836,8 +3073,29 @@ class Parser {
     return left;
   }
 
+  #parameterExpression(): Expression {
+    const token = this.#take("parameter");
+    if (token.text === "") {
+      if (this.#highestNumberedParameter > 0) {
+        throw new TypeError("Use either ? or $n placeholders in one statement, not both");
+      }
+      this.#positionalParameters += 1;
+      return { kind: "parameter", index: this.#positionalParameters - 1 };
+    }
+    if (this.#positionalParameters > 0) {
+      throw new TypeError("Use either ? or $n placeholders in one statement, not both");
+    }
+    const number = Number(token.text);
+    if (!Number.isInteger(number) || number < 1) {
+      throw new TypeError(`Parameter numbers start at $1: $${token.text}`);
+    }
+    this.#highestNumberedParameter = Math.max(this.#highestNumberedParameter, number);
+    return { kind: "parameter", index: number - 1 };
+  }
+
   #primary(): Expression {
     const token = this.#peek();
+    if (token.kind === "parameter") return this.#parameterExpression();
     if (token.kind === "number") {
       this.#index += 1;
       return { kind: "literal", value: Number(token.text) };
@@ -3648,6 +3906,21 @@ function tokenize(sql: string): Token[] {
       if (!closed)
         throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
       tokens.push({ kind: "string", text: value, start, end: index });
+      continue;
+    }
+    if (character === "?") {
+      tokens.push({ kind: "parameter", text: "", start: index, end: index + 1 });
+      index += 1;
+      continue;
+    }
+    if (character === "$") {
+      const start = index++;
+      while (index < sql.length && /\d/.test(sql[index] ?? "")) index += 1;
+      const digits = sql.slice(start + 1, index);
+      if (digits.length === 0) {
+        throw new SqlCompileError("Expected a parameter number after $", start, 1);
+      }
+      tokens.push({ kind: "parameter", text: digits, start, end: index });
       continue;
     }
     const pair = sql.slice(index, index + 2);

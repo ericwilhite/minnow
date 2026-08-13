@@ -171,11 +171,36 @@ SQL -> lexer -> parser ----------------+
 Typed builder -> compile() ------------+
 ```
 
+## Parameters
+
+Every SQL entry point takes `?` (positional) or `$1`-style (numbered) placeholders. Values bind
+at execution — they are never spliced into the statement text:
+
+```ts
+const result = await database.query("SELECT name FROM people WHERE score >= $1 ORDER BY name", {
+  params: [25],
+});
+
+await database.execute("UPDATE people SET score = ? WHERE name = ?", [40, "Ada"]);
+```
+
+The rules are strict on purpose:
+
+- A statement uses either `?` or `$n`, never both. `$n` values may repeat; each `?` takes the
+  next value in order.
+- The parameter list must match the placeholder count exactly, and a statement with placeholders
+  refuses to run without one.
+- Any column value binds — including datetimes with full time precision, which SQL text can only
+  write as `DATE` literals.
+
+Compiled plans are cached on the statement text, so a parameterized query parses once and
+re-binds per execution.
+
 ## The SQL escape hatch
 
 Anything the builder can't express can be written as SQL against the same optimizer and executor.
-The `sql` tag renders interpolations as SQL literals — strings escape their quotes, arrays become
-IN lists, nested fragments splice:
+The `sql` tag turns interpolations into bound parameters — arrays expand to IN-list placeholders,
+nested fragments splice with their parameters renumbered:
 
 ```ts
 import { sql } from "@minnowdb/core";
@@ -183,6 +208,7 @@ import { sql } from "@minnowdb/core";
 const rows = await sql<{ n: number }>`
   SELECT COUNT(*) AS n FROM people WHERE city IN ${["London", "DC"]}
 `.execute(db);
+// Compiles to: SELECT COUNT(*) AS n FROM people WHERE city IN ($1, $2)
 ```
 
 `query()` and `prepareQuery()` remain the raw read-only SQL API.

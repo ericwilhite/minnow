@@ -113,7 +113,11 @@ describe("enum columns", () => {
     expect(rows).toEqual([{ id: 2, state: "doing" }]);
 
     await expect(
-      db.updateTable("tasks").set({ state: "later" as "done" }).where("id", "=", 1).execute(),
+      db
+        .updateTable("tasks")
+        .set({ state: "later" as "done" })
+        .where("id", "=", 1)
+        .execute(),
     ).rejects.toThrow("must be one of: todo, doing, done");
   });
 });
@@ -672,11 +676,13 @@ describe("sql template tag", () => {
     expect(listed).toEqual([{ name: "Ada" }, { name: "Grace" }]);
   });
 
-  it("refuses literals the SQL surface cannot represent", () => {
+  it("refuses unrepresentable values and binds the rest as parameters", () => {
     expect(() => sql`SELECT ${Number.NaN}`).toThrow("finite");
-    expect(() => sql`SELECT ${1e21}`).toThrow("cannot render");
-    expect(() => sql`SELECT ${new Date("2024-01-02T03:04:05Z")}`).toThrow("DATE literals");
-    expect(sql`SELECT ${new Date("2024-01-02T00:00:00Z")}`.sql).toBe("SELECT DATE '2024-01-02'");
+    expect(() => sql`SELECT ${new Date("nope")}`).toThrow("valid dates");
+    // Values the old literal renderer refused are representable as bound parameters.
+    const timed = sql`SELECT ${1e21}, ${new Date("2024-01-02T03:04:05Z")}`;
+    expect(timed.sql).toBe("SELECT $1, $2");
+    expect(timed.params).toEqual([1e21, new Date("2024-01-02T03:04:05.000Z")]);
   });
 });
 

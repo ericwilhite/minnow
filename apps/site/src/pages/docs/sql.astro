@@ -7,8 +7,16 @@ interface SqlFeature {
   id: string;
   status: "supported" | "unsupported";
   example: string;
+  /** Bound values for the example's placeholders, in order. */
+  params?: Array<string | number | boolean | null>;
   error?: string;
   notes?: string;
+}
+
+function exampleWithParams(feature: SqlFeature): string {
+  return feature.params === undefined
+    ? feature.example
+    : `${feature.example}\n-- bound: ${JSON.stringify(feature.params)}`;
 }
 
 const features = (sqlFeatureMatrix as { features: SqlFeature[] }).features;
@@ -41,7 +49,7 @@ const themes = { light: "github-light", dark: "github-dark" } as const;
             <code class="feature-id">{feature.id}</code>
             <span class="badge yes">supported</span>
           </div>
-          <Code code={feature.example} lang="sql" themes={themes} defaultColor={false} />
+          <Code code={exampleWithParams(feature)} lang="sql" themes={themes} defaultColor={false} />
           {feature.notes !== undefined && <small>{feature.notes}</small>}
         </article>
       ))
@@ -62,7 +70,7 @@ const themes = { light: "github-light", dark: "github-dark" } as const;
             <code class="feature-id">{feature.id}</code>
             <span class="badge no">not supported</span>
           </div>
-          <Code code={feature.example} lang="sql" themes={themes} defaultColor={false} />
+          <Code code={exampleWithParams(feature)} lang="sql" themes={themes} defaultColor={false} />
           {feature.error !== undefined && <em class="feature-error">{feature.error}</em>}
           {feature.notes !== undefined && <small>{feature.notes}</small>}
         </article>

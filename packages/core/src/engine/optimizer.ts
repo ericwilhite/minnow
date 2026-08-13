@@ -519,6 +519,7 @@ function renderExpression(expression: Expression): string {
     if (typeof value === "string") return `'${value}'`;
     return String(value);
   }
+  if (expression.kind === "parameter") return `$${String(expression.index + 1)}`;
   if (expression.kind === "column") return expression.reference;
   if (expression.kind === "wildcard") return "*";
   if (expression.kind === "binary") {

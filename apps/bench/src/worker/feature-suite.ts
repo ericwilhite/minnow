@@ -8,7 +8,13 @@
  * about where other engines' surfaces differ.
  */
 import sqlFeatureMatrix from "@minnowdb/core/sql-feature-matrix.json";
-import { MinnowDatabase, compileQuery, executeQuery, type DatabaseRow } from "@minnowdb/core";
+import {
+  MinnowDatabase,
+  bindPlanParameters,
+  compileQuery,
+  executeQuery,
+  type DatabaseRow,
+} from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { engineIds, engineNames } from "../protocol.js";
 import type {
@@ -24,6 +30,8 @@ interface MatrixFeature {
   id: string;
   status: "supported" | "unsupported";
   example: string;
+  /** Bound values for the example's placeholders, in order. */
+  params?: Array<string | number | boolean | null>;
   error?: string;
   notes?: string;
 }
@@ -175,10 +183,13 @@ function minnowRunner(): FeatureRunner {
     async execute(feature) {
       if (usesDatabase(feature)) {
         const database = await keyedDatabase();
-        await database.execute(feature.example);
+        await database.execute(feature.example, feature.params);
         return;
       }
-      executeQuery(compileQuery(feature.example), fixtureTables);
+      executeQuery(
+        bindPlanParameters(compileQuery(feature.example), feature.params),
+        fixtureTables,
+      );
     },
     close: () => Promise.resolve(),
   };
@@ -236,7 +247,8 @@ async function sqliteRunner(): Promise<FeatureRunner> {
       // the next measurement.
       for (const sql of fixtureTeardown) database.exec(sql);
       for (const sql of fixtureDdl) database.exec(sql);
-      database.exec(feature.example);
+      if (feature.params === undefined) database.exec(feature.example);
+      else database.exec({ sql: feature.example, bind: feature.params });
       return Promise.resolve();
     },
     close() {
@@ -253,7 +265,8 @@ async function pgliteRunner(): Promise<FeatureRunner> {
     async execute(feature) {
       for (const sql of fixtureTeardown) await database.exec(sql);
       for (const sql of fixtureDdl) await database.exec(sql);
-      await database.exec(feature.example);
+      if (feature.params === undefined) await database.exec(feature.example);
+      else await database.query(feature.example, [...feature.params]);
     },
     async close() {
       if (!database.closed) await database.close();

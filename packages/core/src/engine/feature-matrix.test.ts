@@ -2,12 +2,14 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
-import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from "./query.js";
 
 interface MatrixFeature {
   id: string;
   status: "supported" | "unsupported";
   example: string;
+  /** Bound values for the example's placeholders, in order. */
+  params?: Array<string | number | boolean | null>;
   error?: string;
   notes?: string;
 }
@@ -67,13 +69,13 @@ describe("SQL feature matrix conformance", () => {
     if (feature.id.startsWith("mutation.")) {
       it(`executes supported ${feature.id}`, async () => {
         const database = await keyedDatabase();
-        const result = await database.execute(feature.example);
+        const result = await database.execute(feature.example, feature.params);
         expect(result.kind).not.toBe("rows");
       });
       continue;
     }
     it(`executes supported ${feature.id} identically in both executors`, () => {
-      const plan = compileQuery(feature.example);
+      const plan = bindPlanParameters(compileQuery(feature.example), feature.params);
       expect(executeQuery(plan, tables)).toEqual(executeRowQuery(plan, tables));
     });
   }

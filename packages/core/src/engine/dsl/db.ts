@@ -71,7 +71,10 @@ export interface DslDriver {
     statement: CompiledStatement,
     options?: { returning?: readonly string[] | "*" },
   ): Promise<{ kind: string; rowCount?: number; returnedRows?: QueryRow[] }>;
-  execute(sql: string): Promise<{ kind: string; result?: { rows: QueryRow[] } }>;
+  execute(
+    sql: string,
+    params?: readonly QueryValue[],
+  ): Promise<{ kind: string; result?: { rows: QueryRow[] } }>;
   liveQueries(options?: DslLiveOptions): DriverLiveSet;
 }
 
@@ -316,8 +319,8 @@ export class Minnow<in out DB> {
   }
 
   /** @internal Raw-SQL escape hatch used by the `sql` template tag. */
-  async $executeRaw(sqlText: string): Promise<QueryRow[]> {
-    const result = await this.#driver.execute(sqlText);
+  async $executeRaw(sqlText: string, params?: readonly QueryValue[]): Promise<QueryRow[]> {
+    const result = await this.#driver.execute(sqlText, params);
     return result.result?.rows ?? [];
   }
 

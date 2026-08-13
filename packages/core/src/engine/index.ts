@@ -4,11 +4,14 @@ export * from "./database.js";
 export * from "./schema-wire.js";
 export * from "./worker-host.js";
 export {
+  bindPlanParameters,
+  bindStatementParameters,
   compileQuery,
   compileStatement,
   createPreparedQuery,
   executeQuery,
   referencedColumns,
+  type InsertValue,
   type CompiledQuery,
   type CompiledStatement,
   type PreparedQuery,

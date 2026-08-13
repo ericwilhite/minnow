@@ -57,7 +57,7 @@ import {
 } from "./errors.js";
 import type { LiveQueryInput, LiveQueryStats, LiveQuerySubscribeOptions } from "./live.js";
 import { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
-import type { CompiledQuery, CompiledStatement, QueryResult } from "./query.js";
+import type { CompiledQuery, CompiledStatement, QueryResult, QueryValue } from "./query.js";
 import type { AnyTable, SchemaDefinition } from "./schema.js";
 import { serializeSchema, type WireMigrationStep } from "./schema-wire.js";
 import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "./worker-host.js";
@@ -290,8 +290,11 @@ export class MinnowDatabaseClient {
     return (await this.#call("explain", [sql])) as string;
   }
 
-  async execute(sql: string): Promise<ExecuteResult> {
-    return (await this.#call("execute", [sql])) as ExecuteResult;
+  async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
+    return (await this.#call(
+      "execute",
+      params === undefined ? [sql] : [sql, params],
+    )) as ExecuteResult;
   }
 
   /** Executes a compiled statement from the typed mutation builders in the worker. */

@@ -63,6 +63,20 @@
       "example": "SELECT region FROM rows WHERE joined >= DATE '2026-01-01'"
     },
     {
+      "id": "parameter.numbered",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows WHERE amount >= $1 ORDER BY amount",
+      "params": [6],
+      "notes": "Values bind by 1-based number and may repeat; the compiled plan is cached on the SQL text and re-bound per execution."
+    },
+    {
+      "id": "parameter.positional",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows WHERE amount >= ? AND active = ? ORDER BY amount",
+      "params": [6, true],
+      "notes": "Each ? takes the next value in order. A statement uses either ? or $n placeholders, never both; PostgreSQL itself has no ? form."
+    },
+    {
       "id": "join.inner-equi",
       "status": "supported",
       "example": "SELECT r.region, d.label FROM rows r JOIN dims d ON d.region = r.region"

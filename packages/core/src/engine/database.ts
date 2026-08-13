@@ -93,6 +93,8 @@ import {
 } from "../transactions/index.js";
 import {
   applyWindowFunctions,
+  bindPlanParameters,
+  bindStatementParameters,
   blockHasSubqueries,
   combineUnionResults,
   compileQuery,
@@ -117,6 +119,7 @@ import {
   type CompiledQuery,
   type CompiledStatement,
   type Expression,
+  type InsertValue,
   type PreparedQuery,
   type QueryResult,
   type QueryRow,
@@ -293,6 +296,12 @@ export interface ReadTableOptions {
 
 export interface QueryOptions {
   readonly version?: number;
+  /**
+   * Values for the statement's `?`/`$n` placeholders, in order. Required exactly when the
+   * statement has placeholders; the compiled plan is cached on the SQL text and re-bound per
+   * execution, so parameterized queries skip re-parsing.
+   */
+  readonly params?: readonly QueryValue[];
   /**
    * Budget for the documented modeled vector, row-index, group/result payload, and ordering buffers.
    * Boxed snapshot preparation, JavaScript container overhead, returned-result lifetime, and browser
@@ -519,6 +528,14 @@ export type ExecuteResult =
       version?: number | null;
       returnedRows?: QueryRow[];
     };
+
+/** Rejects an INSERT value that is still an unbound `?`/`$n` slot. */
+function boundInsertValue(value: InsertValue): QueryValue {
+  if (typeof value === "object" && value !== null && !(value instanceof Date)) {
+    throw new TypeError("Statement has unbound placeholders; pass parameters when executing");
+  }
+  return value;
+}
 
 export interface RunStatementOptions {
   /**
@@ -1268,7 +1285,10 @@ export class MinnowDatabase {
    * Repeated execute() calls measure query execution without including storage I/O.
    */
   async prepareQuery(sql: string, options: QueryOptions = {}): Promise<PreparedQuery> {
-    return this.#prepareCompiledPlan(this.#compileCached(sql), options);
+    return this.#prepareCompiledPlan(
+      bindPlanParameters(this.#compileCached(sql), options.params),
+      options,
+    );
   }
 
   #compileCached(sql: string): CompiledQuery {
@@ -1687,7 +1707,7 @@ export class MinnowDatabase {
       options.spillPageRows === undefined
         ? undefined
         : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
-    const plan = this.#compileCached(sql);
+    const plan = bindPlanParameters(this.#compileCached(sql), options.params);
     if (this.#canStreamPlanShape(plan, options)) {
       const streamed = await this.#queryStreamed(plan, options, spillPageRows);
       if (streamed !== undefined) return streamed;
@@ -2018,8 +2038,15 @@ export class MinnowDatabase {
    * mutation are two steps, not one serializable transaction: a key changed by a competing writer
    * in between fails the statement explicitly rather than silently mutating other rows.
    */
-  async execute(sql: string): Promise<ExecuteResult> {
-    return this.runStatement(compileStatement(sql));
+  async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
+    const statement = compileStatement(sql);
+    if (statement.kind === "select") {
+      return {
+        kind: "rows",
+        result: await this.query(statement.sql, params === undefined ? {} : { params }),
+      };
+    }
+    return this.runStatement(bindStatementParameters(statement, params));
   }
 
   /**
@@ -2039,7 +2066,7 @@ export class MinnowDatabase {
     if (statement.kind === "insert") {
       const columns: Record<string, BatchValue[]> = {};
       statement.columns.forEach((column, index) => {
-        columns[column] = statement.rows.map((row) => row[index] ?? null);
+        columns[column] = statement.rows.map((row) => boundInsertValue(row[index] ?? null));
       });
       const result = await this.insertBatch(statement.table, { columns });
       let returningColumns: readonly string[] | undefined;
@@ -2077,7 +2104,8 @@ export class MinnowDatabase {
                 Object.fromEntries(
                   returningColumns.map((name) => [
                     name,
-                    generated[name]?.[rowIndex] ?? row[statement.columns.indexOf(name)] ?? null,
+                    generated[name]?.[rowIndex] ??
+                      boundInsertValue(row[statement.columns.indexOf(name)] ?? null),
                   ]),
                 ),
               ),

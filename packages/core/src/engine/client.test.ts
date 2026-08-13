@@ -82,6 +82,31 @@ describe("MinnowDatabaseClient", () => {
     await client.close();
   });
 
+  it("binds statement parameters across the boundary", async () => {
+    const client = connect();
+    await createPeopleTable(client);
+    await client.execute("INSERT INTO people (id, name, joined) VALUES (?, ?, ?)", [
+      1,
+      "Ada",
+      new Date("2024-01-02T03:04:05Z"),
+    ]);
+    const result = await client.query("SELECT name FROM people WHERE joined = $1", {
+      params: [new Date("2024-01-02T03:04:05Z")],
+    });
+    expect(result.rows).toEqual([{ name: "Ada" }]);
+    const updated = await client.execute("UPDATE people SET name = $2 WHERE id = $1", [
+      1,
+      "Countess",
+    ]);
+    expect(updated.kind).toBe("update");
+    const prepared = await client.prepareQuery("SELECT name FROM people WHERE id = ?", {
+      params: [1],
+    });
+    expect((await prepared.execute()).rows).toEqual([{ name: "Countess" }]);
+    await prepared.close();
+    await client.close();
+  });
+
   it("issues calls without awaiting ready because the channel is ordered", async () => {
     const client = connect();
     await createPeopleTable(client);

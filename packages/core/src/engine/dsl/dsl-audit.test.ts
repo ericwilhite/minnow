@@ -446,11 +446,14 @@ describe("sql tag hardening", () => {
     expect(stillThere.length).toBe(6);
   });
 
-  it("splices nested fragments verbatim", () => {
+  it("splices nested fragments with renumbered placeholders", () => {
     const clause = sql`score > ${10}`;
-    expect(sql`SELECT name FROM people WHERE ${clause} AND city = ${"DC"}`.sql).toBe(
-      "SELECT name FROM people WHERE score > 10 AND city = 'DC'",
-    );
+    const spliced = sql`SELECT name FROM people WHERE ${clause} AND city = ${"DC"}`;
+    expect(spliced.sql).toBe("SELECT name FROM people WHERE score > $1 AND city = $2");
+    expect(spliced.params).toEqual([10, "DC"]);
+    // The nested fragment still renders standalone with its own numbering.
+    expect(clause.sql).toBe("score > $1");
+    expect(clause.params).toEqual([10]);
   });
 });
 
@@ -683,9 +686,9 @@ describe("live query lifecycle", () => {
 
 describe("sql tag lists", () => {
   it("splices fragments inside IN lists and rejects nested arrays", () => {
-    expect(sql`SELECT 1 WHERE x IN ${[1, sql`score + 1`, "a"]}`.sql).toBe(
-      "SELECT 1 WHERE x IN (1, score + 1, 'a')",
-    );
+    const listed = sql`SELECT 1 WHERE x IN ${[1, sql`score + 1`, "a"]}`;
+    expect(listed.sql).toBe("SELECT 1 WHERE x IN ($1, score + 1, $2)");
+    expect(listed.params).toEqual([1, "a"]);
     expect(() => sql`SELECT ${[[1]] as never}`).toThrow("sql lists cannot nest arrays");
   });
 });

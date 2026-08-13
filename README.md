@@ -17,7 +17,8 @@ npm install @minnowdb/core
 - **One schema, everything typed** — a single declaration drives migrations, autocomplete, row
   types, insert validation, and live subscriptions.
 - **SQL and a typed builder** — both compile to the same plans, so a builder query and its SQL
-  equivalent run identically. Tests enforce it.
+  equivalent run identically. Tests enforce it. SQL takes `?`/`$n` parameters, bound per
+  execution against a cached plan.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background on large tables.
 - **Safe across tabs** — writes publish atomically. Another tab sees the old version or the new
@@ -86,14 +87,14 @@ on every write.
 
 `table()`, `column`, and `schema()` define tables with compile-time row types.
 
-| Modifier                  | Effect                                                             |
-| ------------------------- | ------------------------------------------------------------------ |
-| `.unique()`               | The table's unique key — one non-nullable column                   |
-| `.nullable()`             | Permits NULL and widens the inferred type                          |
-| `.autoIncrement()`        | Cross-tab atomic counter for number unique keys                    |
+| Modifier                  | Effect                                                                                          |
+| ------------------------- | ----------------------------------------------------------------------------------------------- |
+| `.unique()`               | The table's unique key — one non-nullable column                                                |
+| `.nullable()`             | Permits NULL and widens the inferred type                                                       |
+| `.autoIncrement()`        | Cross-tab atomic counter for number unique keys                                                 |
 | `.default(value \| fn)`   | A literal or `"now"` filled engine-side; a function (`() => ulid()`) filled by the typed facade |
-| `.renamedFrom(name)`      | Rename via stable column ID — metadata only, not a drop-and-add    |
-| `.references(table, col)` | Declared relation, stored as catalog metadata                      |
+| `.renamedFrom(name)`      | Rename via stable column ID — metadata only, not a drop-and-add                                 |
+| `.references(table, col)` | Declared relation, stored as catalog metadata                                                   |
 
 `migrate()` diffs the live catalog and applies metadata-only steps: create a table, add a nullable
 column, rename, widen nullability, change a default. Each step is one atomic swap, so an

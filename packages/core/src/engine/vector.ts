@@ -691,6 +691,11 @@ function bindExpression(
   if (expression.kind === "subquery") {
     throw new TypeError("Subqueries are only supported in WHERE, HAVING, SELECT, and IN");
   }
+  if (expression.kind === "parameter") {
+    throw new TypeError(
+      `Placeholder $${String(expression.index + 1)} is unbound; pass parameters when executing`,
+    );
+  }
   if (expression.kind === "fts") {
     // The canonical search shape evaluates the same node in WHERE, SELECT, and ORDER BY;
     // sharing one bound node by signature means one set of dictionary tables, one corpus

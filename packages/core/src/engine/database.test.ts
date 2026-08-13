@@ -848,9 +848,9 @@ for (const implementation of implementations()) {
       await expect(
         database.updateBatch("tickets", { keys: [1], changes: { status: ["reopened"] } }),
       ).rejects.toThrow("status[0] must be one of: open, closed");
-      await expect(database.execute('UPDATE tickets SET status = \'gone\' WHERE id = 1')).rejects.toThrow(
-        "status[0] must be one of: open, closed",
-      );
+      await expect(
+        database.execute("UPDATE tickets SET status = 'gone' WHERE id = 1"),
+      ).rejects.toThrow("status[0] must be one of: open, closed");
 
       await expect(
         database.createTable({

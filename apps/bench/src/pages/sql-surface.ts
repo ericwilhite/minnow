@@ -8,6 +8,8 @@ interface SqlFeature {
   id: string;
   status: "supported" | "unsupported";
   example: string;
+  /** Bound values for the example's placeholders, in order. */
+  params?: Array<string | number | boolean | null>;
   error?: string;
   notes?: string;
 }
@@ -32,9 +34,13 @@ function featureCard(feature: SqlFeature): string {
   // A note distinguishes a missing capability from one reachable through a typed API, or
   // from a deliberate restriction; without it the list reads as a flat catalog of gaps.
   const note = feature.notes === undefined ? "" : `<small>${escapeHtml(feature.notes)}</small>`;
+  const example =
+    feature.params === undefined
+      ? feature.example
+      : `${feature.example}\n-- bound: ${JSON.stringify(feature.params)}`;
   return `<article class="sql-feature ${feature.status}">
     <strong>${escapeHtml(feature.id)}</strong>
-    <pre><code data-lang="sql">${escapeHtml(feature.example)}</code></pre>
+    <pre><code data-lang="sql">${escapeHtml(example)}</code></pre>
     ${error}
     ${note}
   </article>`;
