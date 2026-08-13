@@ -55,6 +55,9 @@ export function createInsertForm(deps: InsertFormDeps): InsertForm {
     if (table === undefined) return;
     const values: Record<string, QueryValue> = {};
     for (const { column, input } of inputs) {
+      // A column the engine fills is left out of the row entirely when blank, rather than being
+      // sent as NULL — that is what lets it choose the value.
+      if (column.hasDefault === true && input.value.trim().length === 0) continue;
       const parsed = parseInput(input.value, column.type, column.nullable);
       if (!parsed.ok) {
         error.textContent = `${column.name}: ${parsed.message}`;
@@ -89,7 +92,10 @@ export function createInsertForm(deps: InsertFormDeps): InsertForm {
           type: "text",
           attrs: { spellcheck: "false", "aria-label": column.name },
         });
-        input.placeholder = inputHint(column.type, column.nullable);
+        input.placeholder =
+          column.hasDefault === true
+            ? "set automatically"
+            : inputHint(column.type, column.nullable);
         input.value = formatForInput(null);
         return { column, input };
       });
@@ -100,7 +106,13 @@ export function createInsertForm(deps: InsertFormDeps): InsertForm {
               el("span", { class: "insert-name", text: column.name }),
               el("span", {
                 class: "insert-type",
-                text: column.isUniqueKey ? `${column.type} · key` : column.type,
+                text: [
+                  column.type,
+                  column.isUniqueKey ? "key" : "",
+                  column.hasDefault === true ? "auto" : "",
+                ]
+                  .filter((part) => part.length > 0)
+                  .join(" · "),
               }),
             ]),
             input,

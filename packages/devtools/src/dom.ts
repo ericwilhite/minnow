@@ -68,6 +68,7 @@ export const icons = {
   maximize: "M5 5h14v14H5z",
   restore: "M9 9h10v10H9zM5 15V5h10",
   split: "M4 12h16",
+  refresh: "M20 11a8 8 0 10-2 6M20 5v6h-6",
   minimize: "M6 12h12",
   play: "M6 4l14 8-14 8V4z",
   grip: "M21 9L9 21M21 15l-6 6",

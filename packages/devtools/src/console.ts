@@ -32,6 +32,8 @@ export interface ConsoleView {
   setSchema(schema: EditorSchema): void;
   /** Drops text in at the caret — how the rail contributes to a query. */
   insert(text: string): void;
+  /** Releases the editor. CodeMirror registers observers that outlive its DOM node. */
+  destroy(): void;
 }
 
 function describeExecuteResult(result: ExecuteResult): string {
@@ -133,17 +135,18 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   }
 
   let splitStart = 0;
+  let splitBounds = 0;
   draggable(splitter, {
     onStart: () => {
+      // Both measurements are taken once. Reading layout inside the move handler would force a
+      // reflow on every pointer event, against a value that cannot change mid-drag anyway.
       splitStart = editorSlot.getBoundingClientRect().height;
+      splitBounds = main.getBoundingClientRect().height;
       splitter.classList.add("dragging");
       return true;
     },
     onMove: (_dx, dy) => {
-      editorHeight = resizeSplit(splitStart, dy, main.getBoundingClientRect().height, {
-        top: 60,
-        bottom: 120,
-      });
+      editorHeight = resizeSplit(splitStart, dy, splitBounds, { top: 60, bottom: 120 });
       applySplit();
     },
     onEnd: () => {
@@ -319,6 +322,9 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     },
     insert: (text) => {
       editor.insert(text);
+    },
+    destroy: () => {
+      editor.destroy();
     },
     upgrade: async () => {
       try {

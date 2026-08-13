@@ -225,11 +225,25 @@ describe("toCatalog", () => {
         name: "people",
         uniqueKey: "id",
         columns: [
-          { name: "id", type: "number", nullable: false, isUniqueKey: true },
-          { name: "city", type: "string", nullable: true, isUniqueKey: false },
+          { name: "id", type: "number", nullable: false, isUniqueKey: true, hasDefault: false },
+          { name: "city", type: "string", nullable: true, isUniqueKey: false, hasDefault: false },
         ],
       },
     ]);
+  });
+
+  it("marks a column the engine fills, so a form can leave it blank", () => {
+    const [table] = toCatalog([
+      {
+        name: "people",
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "name", type: "string" },
+        ],
+      },
+    ]);
+    expect(table?.columns.map((column) => column.hasDefault)).toEqual([true, false]);
   });
 
   it("leaves uniqueKey absent for a keyless table", () => {

@@ -113,7 +113,12 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   let sort: Sort | undefined;
   let cursor: Cursor | undefined;
   let exhausted = false;
-  let loading = false;
+  /**
+   * The generation whose request is in flight, if any. A reload must never be refused because an
+   * older one is still running — it supersedes it — so this gates appending rather than loading,
+   * and only the request that set it may clear it.
+   */
+  let inFlight: number | undefined;
   /** Rising token: a response from a superseded view is dropped rather than rendered. */
   let generation = 0;
   let total: number | undefined;
@@ -160,8 +165,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   }
 
   async function fetchPage(current: TableInfo, token: number, append: boolean): Promise<void> {
-    if (loading) return;
-    loading = true;
+    inFlight = token;
     const started = performance.now();
     try {
       const sql = buildPageQuery({
@@ -178,6 +182,9 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
       const rows: QueryRow[] = page.rows;
       if (append) grid.appendRows(rows);
       else grid.setRows(rows);
+      // Replacing the rows drops the selection, so the row actions have to be re-derived or
+      // Delete row stays enabled with nothing to delete.
+      updateRowActions();
 
       exhausted = rows.length < pageSize;
       const last = rows[rows.length - 1];
@@ -191,7 +198,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
       setStatus("failed");
       exhausted = true;
     } finally {
-      loading = false;
+      if (inFlight === token) inFlight = undefined;
     }
   }
 
@@ -209,7 +216,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
 
   async function loadMore(): Promise<void> {
     const current = table;
-    if (current === undefined || exhausted || loading) return;
+    if (current === undefined || exhausted || inFlight !== undefined) return;
     await fetchPage(current, generation, true);
   }
 
@@ -295,7 +302,13 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     const result = await target.query(
       buildPageQuery({
         table: current,
-        filters: [{ column: keyColumn.name, type: keyColumn.type, operator: "=", values: [key] }],
+        // The active filters are part of the question: an edit that moves a row out of the
+        // current view should take it out of the grid rather than leave a row that no longer
+        // matches what is being looked at.
+        filters: [
+          ...filterBar.filters(),
+          { column: keyColumn.name, type: keyColumn.type, operator: "=", values: [key] },
+        ],
         limit: 1,
       }),
     );

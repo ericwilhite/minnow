@@ -6,6 +6,12 @@ export interface ColumnInfo {
   type: ColumnType;
   nullable: boolean;
   isUniqueKey: boolean;
+  /**
+   * The engine fills this column when an insert omits it — an auto-incrementing key, a uuid, a
+   * timestamp. A form must let it be left blank rather than demanding a value the database is
+   * about to choose. Optional so a hand-built `TableInfo` need not spell out its absence.
+   */
+  hasDefault?: boolean;
 }
 
 export interface TableInfo {
@@ -24,6 +30,7 @@ export function toCatalog(tables: readonly TableDefinition[]): TableInfo[] {
       type: column.type,
       nullable: column.nullable ?? false,
       isUniqueKey: column.name === table.uniqueKey,
+      hasDefault: column.defaultValue !== undefined,
     })),
     ...(table.uniqueKey === undefined ? {} : { uniqueKey: table.uniqueKey }),
   }));

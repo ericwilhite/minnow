@@ -66,6 +66,19 @@ await database.createTable({
     { name: "at", type: "datetime" },
   ],
 });
+// A table whose key and timestamp the engine fills, so the insert form's optional columns are
+// reachable from the demo.
+await database.createTable({
+  name: "notes",
+  uniqueKey: "note_id",
+  columns: [
+    { name: "note_id", type: "number", defaultValue: { kind: "autoincrement" } },
+    { name: "body", type: "string" },
+    { name: "written_at", type: "datetime", defaultValue: { kind: "now" } },
+  ],
+});
+await database.insert("notes", { body: "the first note" });
+
 const kinds = ["created", "paid", "shipped", "refunded", "cancelled"];
 const writer = database.bufferedWriter("events", { maxRows: 5000 });
 for (let index = 0; index < bulk; index += 1) {

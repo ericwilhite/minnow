@@ -67,6 +67,9 @@ export function createDevtools(
    */
   const rail = createSchemaRail({
     storageKey: resolved.storageKey,
+    onRefresh: () => {
+      void loadCatalog();
+    },
     onPickTable: (table) => {
       if (panel.activeView() === "query") view.insert(table.name);
       else void explorer.open(table.name);
@@ -183,6 +186,7 @@ export function createDevtools(
       destroyed = true;
       window.removeEventListener("keydown", onKeyDown);
       confirm.dismiss();
+      view.destroy();
       panel.destroy();
       root.replaceChildren();
     },

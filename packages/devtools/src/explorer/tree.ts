@@ -12,6 +12,8 @@ export interface SchemaRail {
 export interface SchemaRailDeps {
   /** Namespaces the remembered collapsed state. */
   storageKey: string;
+  /** Rereads the catalog — tables created after the panel opened are not there otherwise. */
+  onRefresh(): void;
   onPickTable(table: TableInfo): void;
   /** A column was clicked — used to insert its name while writing a query. */
   onPickColumn(table: TableInfo, column: ColumnInfo): void;
@@ -33,15 +35,20 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
     type: "text",
     attrs: { placeholder: "Filter tables…", "aria-label": "Filter tables" },
   });
+  const refresh = iconButton("side-toggle", "Reload the tables", icons.refresh);
   const collapse = iconButton("side-toggle", "Hide the tables", icons.chevronLeft);
   const expand = iconButton("side-toggle", "Show the tables", icons.chevronRight);
   const list = el("div", { class: "rail-list" });
-  const head = el("div", { class: "side-head" }, [search, collapse]);
+  const head = el("div", { class: "side-head" }, [search, refresh, collapse]);
   const node = el("div", { class: "rail side" }, [
     head,
     el("div", { class: "side-stub" }, [expand]),
     list,
   ]);
+
+  refresh.addEventListener("click", () => {
+    deps.onRefresh();
+  });
 
   const collapsedKey = `${deps.storageKey}:rail-collapsed`;
   let collapsed = readFlag(collapsedKey, false);
