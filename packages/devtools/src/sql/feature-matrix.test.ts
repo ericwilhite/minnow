@@ -63,8 +63,7 @@ describe("the shipped matrix", () => {
     for (const message of [
       "Correlated NOT IN subqueries are not supported; use NOT EXISTS",
       "UPDATE requires a table with a unique key",
-      "Unsupported function: LAG",
-      "DISTINCT is only supported inside COUNT",
+      "Expected SELECT, found BEGIN",
     ]) {
       expect(lookupFailure(index, message)?.notes).toBeDefined();
     }

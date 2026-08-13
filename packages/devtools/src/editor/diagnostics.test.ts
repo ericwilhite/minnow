@@ -37,14 +37,15 @@ describe("diagnose", () => {
   });
 
   it("appends what the matrix knows, when it knows something", () => {
+    const sql = "SELECT SUM(a) OVER (ORDER BY a GROUPS UNBOUNDED PRECEDING) AS s FROM t";
     const explain = (message: string): string | undefined =>
-      message.includes("LAG") ? "LAG is on the roadmap." : undefined;
-    const [explained] = diagnose("SELECT LAG(a) OVER (ORDER BY a) AS p FROM t", explain);
-    expect(explained?.message).toContain("Unsupported function: LAG");
-    expect(explained?.message).toContain("on the roadmap.");
+      message.includes("GROUPS") ? "Use ROWS or RANGE frames." : undefined;
+    const [explained] = diagnose(sql, explain);
+    expect(explained?.message).toContain("GROUPS window frames are not supported");
+    expect(explained?.message).toContain("Use ROWS or RANGE frames.");
 
     // Nothing to add leaves the compiler's own message alone.
-    const [plain] = diagnose("SELECT LAG(a) OVER (ORDER BY a) AS p FROM t", () => undefined);
-    expect(plain?.message).toBe("Unsupported function: LAG");
+    const [plain] = diagnose(sql, () => undefined);
+    expect(plain?.message).toBe("GROUPS window frames are not supported");
   });
 });

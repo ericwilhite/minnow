@@ -12,6 +12,7 @@ import type {
 } from "./query.js";
 import {
   cachedListMembership,
+  explicitNullOrder,
   isScalarFunctionName,
   likeRegExp,
   orderOutputName,
@@ -291,7 +292,11 @@ interface BoundPlan {
   readonly groupIndexBySignature: ReadonlyMap<string, number>;
   readonly aggregates: readonly AggregateSpec[];
   readonly select: readonly BoundSelectItem[];
-  readonly orderBy: ReadonlyArray<{ outputName: string; direction: "asc" | "desc" }>;
+  readonly orderBy: ReadonlyArray<{
+    outputName: string;
+    direction: "asc" | "desc";
+    nulls?: "first" | "last";
+  }>;
   readonly grouped: boolean;
   readonly codeGrouping?: { source: number; vector: StringVector };
   readonly wildcard: boolean;
@@ -643,9 +648,10 @@ function bindPlan(
     alias: source.alias,
     columns: [...(sourceTables[index]?.columns.keys() ?? [])],
   }));
-  const orderBy = plan.orderBy.map(({ expression, direction }) => ({
+  const orderBy = plan.orderBy.map(({ expression, direction, nulls }) => ({
     outputName: orderOutputName(expression, plan.select, orderSources),
     direction,
+    ...(nulls === undefined ? {} : { nulls }),
   }));
   const grouped = groupBy.length > 0 || aggregateSpecs.length > 0;
   // A single bare string-column GROUP BY can group on dictionary codes: identical values share a
@@ -1899,6 +1905,8 @@ function compareOrderedRows(
   orderBy: BoundPlan["orderBy"],
 ): number {
   for (const order of orderBy) {
+    const placed = explicitNullOrder(left[order.outputName], right[order.outputName], order.nulls);
+    if (placed !== undefined && placed !== 0) return placed;
     const comparison = compareValues(left[order.outputName], right[order.outputName]);
     if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
   }
@@ -2527,6 +2535,8 @@ class ResultSink {
     const orderBy = this.#plan.orderBy;
     for (let index = 0; index < orderBy.length; index += 1) {
       const order = required(orderBy[index], "Order term is missing");
+      const placed = explicitNullOrder(left[index], right[index], order.nulls);
+      if (placed !== undefined && placed !== 0) return placed;
       const comparison = compareValues(left[index], right[index]);
       if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
     }
@@ -3472,10 +3482,7 @@ function groupKey(value: unknown): GroupIndexKey {
   throw new TypeError("Group keys must be SQL scalar values");
 }
 
-function stableSortRows(
-  rows: QueryRow[],
-  orderBy: ReadonlyArray<{ outputName: string; direction: "asc" | "desc" }>,
-): void {
+function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
   if (rows.length > 0xffffffff) throw new RangeError("Too many rows to order");
   const indexes = new Uint32Array(rows.length);
   const scratch = new Uint32Array(rows.length);
@@ -3497,10 +3504,11 @@ function stableSortRows(
   const compareIndexes = (leftIndex: number, rightIndex: number): number => {
     for (let term = 0; term < termCount; term += 1) {
       const order = required(orderBy[term], "Order term is missing");
-      const comparison = compareComparables(
-        keys[leftIndex * termCount + term],
-        keys[rightIndex * termCount + term],
-      );
+      const leftKey = keys[leftIndex * termCount + term];
+      const rightKey = keys[rightIndex * termCount + term];
+      const placed = explicitNullOrder(leftKey, rightKey, order.nulls);
+      if (placed !== undefined && placed !== 0) return placed;
+      const comparison = compareComparables(leftKey, rightKey);
       if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
     }
     return 0;

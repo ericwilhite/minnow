@@ -55,7 +55,16 @@ export type BinaryOperator = "+" | "-" | "*" | "/" | "||";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
 export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
 export type ScalarFunctionName =
-  "ROUND" | "COALESCE" | "DATE_TRUNC" | "UPPER" | "LOWER" | "LENGTH" | "ABS" | "TRIM" | "SUBSTR";
+  | "ROUND"
+  | "COALESCE"
+  | "DATE_TRUNC"
+  | "UPPER"
+  | "LOWER"
+  | "LENGTH"
+  | "ABS"
+  | "TRIM"
+  | "SUBSTR"
+  | "CAST";
 
 export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "ROUND",
@@ -67,6 +76,7 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "ABS",
   "TRIM",
   "SUBSTR",
+  "CAST",
 ] satisfies ScalarFunctionName[]);
 
 export function isScalarFunctionName(
@@ -78,6 +88,58 @@ export function isScalarFunctionName(
 function stringArgument(name: string, value: unknown): string {
   if (typeof value !== "string") throw new TypeError(`${name} requires a string argument`);
   return value;
+}
+
+/**
+ * CAST conversions between the four logical types, matching the strict common ground of
+ * SQLite and PostgreSQL: numeric strings parse or fail (never silently 0), integer targets
+ * truncate toward zero, booleans render as 'true'/'false', datetimes as ISO strings, and a
+ * number cast to datetime reads as milliseconds since the epoch.
+ */
+function castValue(value: unknown, target: string): unknown {
+  if (target === "string") {
+    if (typeof value === "string") return value;
+    if (typeof value === "number") return String(value);
+    if (typeof value === "boolean") return value ? "true" : "false";
+    if (value instanceof Date) return value.toISOString();
+  }
+  if (target === "number" || target === "number-integer") {
+    let parsed: number | undefined;
+    if (typeof value === "number") parsed = value;
+    else if (typeof value === "boolean") parsed = value ? 1 : 0;
+    else if (typeof value === "string") {
+      const text = value.trim();
+      const candidate = text === "" ? Number.NaN : Number(text);
+      if (!Number.isFinite(candidate)) {
+        throw new TypeError(`Cannot cast this string to a number: ${value}`);
+      }
+      parsed = candidate;
+    }
+    if (parsed !== undefined) return target === "number-integer" ? Math.trunc(parsed) : parsed;
+  }
+  if (target === "boolean") {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") {
+      if (value === 0) return false;
+      if (value === 1) return true;
+      throw new TypeError(`Only 0 and 1 cast to boolean, got ${String(value)}`);
+    }
+    if (typeof value === "string") {
+      const text = value.trim().toLowerCase();
+      if (text === "true" || text === "t" || text === "1") return true;
+      if (text === "false" || text === "f" || text === "0") return false;
+      throw new TypeError(`Cannot cast this string to a boolean: ${value}`);
+    }
+  }
+  if (target === "datetime") {
+    if (value instanceof Date) return value;
+    if (typeof value === "string" || typeof value === "number") {
+      const parsed = new Date(value);
+      if (Number.isFinite(parsed.getTime())) return parsed;
+      throw new TypeError(`Cannot cast this value to a datetime: ${String(value)}`);
+    }
+  }
+  throw new TypeError(`Unsupported CAST: ${typeof value} to ${target}`);
 }
 
 /**
@@ -112,6 +174,8 @@ export function scalarFunctionValue(
       return stringArgument("TRIM", first).replace(/^ +/, "").replace(/ +$/, "");
     case "LENGTH":
       return Array.from(stringArgument("LENGTH", first)).length;
+    case "CAST":
+      return castValue(first, typeof values[1] === "string" ? values[1] : "");
     case "SUBSTR": {
       const text = Array.from(stringArgument("SUBSTR", first));
       if (values[1] === null || values[1] === undefined) return null;
@@ -220,8 +284,17 @@ export type Expression =
       kind: "window";
       name: WindowFunctionName;
       partitionBy: Expression[];
-      orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
+      orderBy: Array<{
+        expression: Expression;
+        direction: "asc" | "desc";
+        nulls?: "first" | "last";
+      }>;
       argument?: Expression;
+      /** LAG/LEAD row distance; parsed as a literal non-negative integer, defaulting to 1. */
+      offset?: number;
+      /** LAG/LEAD default when the offset row falls outside the partition; NULL when absent. */
+      fallback?: QueryValue;
+      frame?: WindowFrame;
     }
   | {
       kind: "fts";
@@ -241,15 +314,34 @@ export type Expression =
       stats?: FtsStats;
     };
 
-export type WindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK" | AggregateName;
+export type WindowFunctionName =
+  "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD" | AggregateName;
+
+export interface WindowFrameBound {
+  kind: "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
+  /** Row distance for preceding/following bounds (ROWS unit only). */
+  offset?: number;
+}
+
+/** An explicit frame clause; absent means the SQL default for the window's ordering. */
+export interface WindowFrame {
+  unit: "rows" | "range";
+  start: WindowFrameBound;
+  end: WindowFrameBound;
+}
 
 export interface WindowSpec {
   alias: string;
   name: WindowFunctionName;
   partitionAliases: string[];
-  orderAliases: Array<{ alias: string; direction: "asc" | "desc" }>;
+  orderAliases: Array<{ alias: string; direction: "asc" | "desc"; nulls?: "first" | "last" }>;
   /** Hidden inner alias of an aggregate window's argument; absent for COUNT(*) and rankings. */
   argumentAlias?: string;
+  /** LAG/LEAD row distance. */
+  offset?: number;
+  /** LAG/LEAD default when the offset row falls outside the partition. */
+  fallback?: QueryValue;
+  frame?: WindowFrame;
 }
 
 /** The output column type of one window: rankings and most aggregates count, MIN/MAX carry. */
@@ -257,7 +349,12 @@ export function windowOutputType(
   window: WindowSpec,
   innerSchema: readonly SqlColumnSchema[],
 ): SqlColumnType {
-  if ((window.name === "MIN" || window.name === "MAX") && window.argumentAlias !== undefined) {
+  const carries =
+    window.name === "MIN" ||
+    window.name === "MAX" ||
+    window.name === "LAG" ||
+    window.name === "LEAD";
+  if (carries && window.argumentAlias !== undefined) {
     return innerSchema.find(({ name }) => name === window.argumentAlias)?.type ?? "number";
   }
   return "number";
@@ -286,6 +383,8 @@ export interface JoinPlan extends TableSource {
   right: Expression;
   /** General ON condition for non-equi or multi-key joins; left/right are inert placeholders. */
   on?: Expression;
+  /** Parser marker: FULL OUTER JOIN. Assembly desugars it into a union of two left joins. */
+  full?: boolean;
 }
 
 export type SetOperator = "union" | "union all" | "intersect" | "except";
@@ -329,7 +428,15 @@ export interface CompiledQuery {
   predicates: Predicate[];
   groupBy: Expression[];
   having: Predicate[];
-  orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
+  orderBy: Array<{
+    expression: Expression;
+    direction: "asc" | "desc";
+    /**
+     * Explicit NULL placement, absolute regardless of direction. Absent keeps the default:
+     * NULL sorts smallest, so ASC puts NULLs first and DESC puts them last (SQLite's default).
+     */
+    nulls?: "first" | "last";
+  }>;
   limit?: number;
   offset?: number;
   /**
@@ -345,6 +452,8 @@ interface Token {
   kind: "identifier" | "number" | "string" | "operator" | "punctuation" | "parameter" | "eof";
   /** For parameter tokens: the 1-based number of `$n`, or "" for positional `?`. */
   text: string;
+  /** A `"double-quoted"` identifier: never a keyword, its text taken exactly as written. */
+  quoted?: boolean;
   /**
    * Half-open character span in the tokenized text. String tokens span their quotes even though
    * `text` holds the unescaped value, so a squiggle covers what the author actually typed.
@@ -1037,6 +1146,16 @@ export function inferBlockSchema(
       return "number";
     }
     if (expression.name === "DATE_TRUNC") return "datetime";
+    if (expression.name === "CAST") {
+      const target = expression.arguments[1];
+      const word =
+        target?.kind === "literal" && typeof target.value === "string" ? target.value : "";
+      if (word === "number-integer") return "number";
+      if (word === "number" || word === "string" || word === "boolean" || word === "datetime") {
+        return word;
+      }
+      throw new TypeError("CAST target must be a type name");
+    }
     if (
       expression.name === "UPPER" ||
       expression.name === "LOWER" ||
@@ -1596,11 +1715,12 @@ export function expandFtsColumns(
 }
 
 /**
- * Computes one aggregate window over partition-sorted row indexes. The frame is the SQL default:
- * without OVER ordering every partition row shares the whole-partition aggregate; with ordering
- * each row sees the running aggregate from the partition start through its ordering peers
- * (RANGE UNBOUNDED PRECEDING TO CURRENT ROW). State accumulates incrementally, so a partition
- * costs one pass regardless of peer-group count.
+ * Computes one aggregate window over partition-sorted row indexes. Without an explicit frame the
+ * SQL default applies: no OVER ordering makes every partition row share the whole-partition
+ * aggregate, and ordering gives each row the running aggregate through its ordering peers
+ * (RANGE UNBOUNDED PRECEDING AND CURRENT ROW). Explicit ROWS frames bound by row distance;
+ * RANGE frames take only UNBOUNDED and CURRENT ROW bounds, where CURRENT ROW spans the peer
+ * group. COUNT of an empty frame is 0 and every other aggregate NULL.
  */
 function applyAggregateWindow(
   rows: QueryRow[],
@@ -1609,62 +1729,144 @@ function applyAggregateWindow(
   samePartition: (left: number, right: number) => boolean,
   sameOrderKeys: (left: number, right: number) => boolean,
 ): void {
+  const frame: WindowFrame = window.frame ?? {
+    unit: "range",
+    start: { kind: "unbounded-preceding" },
+    end:
+      window.orderAliases.length === 0 ? { kind: "unbounded-following" } : { kind: "current-row" },
+  };
   let start = 0;
   while (start < indexes.length) {
     let end = start + 1;
     while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
       end += 1;
     }
-    let consumed = start;
-    let rowsInFrame = 0;
-    let nonNullCount = 0;
-    let sum = 0;
-    let best: unknown;
-    const advance = (to: number): void => {
-      for (; consumed < to; consumed += 1) {
-        rowsInFrame += 1;
-        if (window.argumentAlias === undefined) continue;
-        const value = rows[indexes[consumed] ?? -1]?.[window.argumentAlias] ?? null;
-        if (value === null) continue;
-        nonNullCount += 1;
-        if (window.name === "SUM" || window.name === "AVG") sum += numeric(value);
-        else if (window.name === "MIN") {
-          if (best === undefined || compareValues(value, best) < 0) best = value;
-        } else if (window.name === "MAX") {
-          if (best === undefined || compareValues(value, best) > 0) best = value;
+    applyAggregateWindowPartition(rows, indexes, window, frame, sameOrderKeys, start, end);
+    start = end;
+  }
+}
+
+function applyAggregateWindowPartition(
+  rows: QueryRow[],
+  indexes: readonly number[],
+  window: WindowSpec,
+  frame: WindowFrame,
+  sameOrderKeys: (left: number, right: number) => boolean,
+  start: number,
+  end: number,
+): void {
+  const size = end - start;
+  // Peer-group bounds per position; with no OVER ordering the whole partition is one peer group.
+  const peerStart = new Array<number>(size).fill(0);
+  const peerEnd = new Array<number>(size).fill(size);
+  if (window.orderAliases.length > 0) {
+    let groupBegin = 0;
+    for (let position = 1; position <= size; position += 1) {
+      if (
+        position === size ||
+        !sameOrderKeys(indexes[start + groupBegin] ?? 0, indexes[start + position] ?? 0)
+      ) {
+        for (let member = groupBegin; member < position; member += 1) {
+          peerStart[member] = groupBegin;
+          peerEnd[member] = position;
         }
+        groupBegin = position;
       }
-    };
-    const current = (): unknown => {
-      if (window.name === "COUNT") {
-        return window.argumentAlias === undefined ? rowsInFrame : nonNullCount;
-      }
-      if (nonNullCount === 0) return null;
-      if (window.name === "SUM") return sum;
-      if (window.name === "AVG") return sum / nonNullCount;
-      return best ?? null;
-    };
-    const assign = (from: number, to: number): void => {
-      const value = asQueryValue(current());
-      for (let position = from; position < to; position += 1) {
-        const row = rows[indexes[position] ?? -1];
-        if (row !== undefined) row[window.alias] = value;
-      }
-    };
-    if (window.orderAliases.length === 0) {
-      advance(end);
-      assign(start, end);
+    }
+  }
+  const values: unknown[] = [];
+  const prefixNonNull = new Float64Array(size + 1);
+  const prefixSum = new Float64Array(size + 1);
+  const sums = window.name === "SUM" || window.name === "AVG";
+  for (let position = 0; position < size; position += 1) {
+    const value =
+      window.argumentAlias === undefined
+        ? undefined
+        : (rows[indexes[start + position] ?? -1]?.[window.argumentAlias] ?? null);
+    values.push(value);
+    const nonNull = window.argumentAlias !== undefined && value !== null && value !== undefined;
+    prefixNonNull[position + 1] = (prefixNonNull[position] ?? 0) + (nonNull ? 1 : 0);
+    prefixSum[position + 1] = (prefixSum[position] ?? 0) + (sums && nonNull ? numeric(value) : 0);
+  }
+  const bound = (edge: WindowFrameBound, position: number, isStart: boolean): number => {
+    switch (edge.kind) {
+      case "unbounded-preceding":
+        return 0;
+      case "unbounded-following":
+        return size;
+      case "preceding":
+        return position - (edge.offset ?? 0) + (isStart ? 0 : 1);
+      case "following":
+        return position + (edge.offset ?? 0) + (isStart ? 0 : 1);
+      case "current-row":
+        if (frame.unit === "range") {
+          return (isStart ? peerStart[position] : peerEnd[position]) ?? position;
+        }
+        return position + (isStart ? 0 : 1);
+    }
+  };
+  for (let position = 0; position < size; position += 1) {
+    const low = Math.max(0, Math.min(size, bound(frame.start, position, true)));
+    const high = Math.max(0, Math.min(size, bound(frame.end, position, false)));
+    let value: unknown;
+    if (high <= low) {
+      value = window.name === "COUNT" ? 0 : null;
+    } else if (window.name === "COUNT") {
+      value =
+        window.argumentAlias === undefined
+          ? high - low
+          : (prefixNonNull[high] ?? 0) - (prefixNonNull[low] ?? 0);
+    } else if (sums) {
+      const nonNull = (prefixNonNull[high] ?? 0) - (prefixNonNull[low] ?? 0);
+      const total = (prefixSum[high] ?? 0) - (prefixSum[low] ?? 0);
+      value = nonNull === 0 ? null : window.name === "SUM" ? total : total / nonNull;
     } else {
-      let groupStart = start;
-      while (groupStart < end) {
-        let groupEnd = groupStart + 1;
-        while (groupEnd < end && sameOrderKeys(indexes[groupStart] ?? 0, indexes[groupEnd] ?? 0)) {
-          groupEnd += 1;
+      let best: unknown;
+      for (let member = low; member < high; member += 1) {
+        const candidate = values[member];
+        if (candidate === null || candidate === undefined) continue;
+        if (
+          best === undefined ||
+          (window.name === "MIN"
+            ? compareValues(candidate, best) < 0
+            : compareValues(candidate, best) > 0)
+        ) {
+          best = candidate;
         }
-        advance(groupEnd);
-        assign(groupStart, groupEnd);
-        groupStart = groupEnd;
       }
+      value = best ?? null;
+    }
+    const row = rows[indexes[start + position] ?? -1];
+    if (row !== undefined) row[window.alias] = asQueryValue(value);
+  }
+}
+
+/** Computes LAG/LEAD over partition-sorted row indexes: the argument value offset rows away. */
+function applyOffsetWindow(
+  rows: QueryRow[],
+  indexes: readonly number[],
+  window: WindowSpec,
+  samePartition: (left: number, right: number) => boolean,
+): void {
+  const offset = window.offset ?? 1;
+  const fallback = window.fallback ?? null;
+  let start = 0;
+  while (start < indexes.length) {
+    let end = start + 1;
+    while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
+      end += 1;
+    }
+    for (let position = start; position < end; position += 1) {
+      const source = window.name === "LAG" ? position - offset : position + offset;
+      const row = rows[indexes[position] ?? -1];
+      if (row === undefined) continue;
+      if (source < start || source >= end) {
+        row[window.alias] = fallback;
+        continue;
+      }
+      const sourceRow = rows[indexes[source] ?? -1];
+      row[window.alias] =
+        window.argumentAlias === undefined ? fallback : (sourceRow?.[window.argumentAlias] ?? null);
     }
     start = end;
   }
@@ -1709,11 +1911,12 @@ export function applyWindowFunctions(
         );
         if (comparison !== 0) return comparison;
       }
-      for (const { alias, direction } of window.orderAliases) {
-        const comparison = compareValues(
-          comparable(leftRow[alias] ?? null),
-          comparable(rightRow[alias] ?? null),
-        );
+      for (const { alias, direction, nulls } of window.orderAliases) {
+        const leftValue = comparable(leftRow[alias] ?? null);
+        const rightValue = comparable(rightRow[alias] ?? null);
+        const placed = explicitNullOrder(leftValue, rightValue, nulls);
+        if (placed !== undefined && placed !== 0) return placed;
+        const comparison = compareValues(leftValue, rightValue);
         if (comparison !== 0) return direction === "desc" ? -comparison : comparison;
       }
       return left - right;
@@ -1735,6 +1938,10 @@ export function applyWindowFunctions(
             comparable(rows[right]?.[alias] ?? null),
           ) === 0,
       );
+    if (window.name === "LAG" || window.name === "LEAD") {
+      applyOffsetWindow(rows, indexes, window, samePartition);
+      continue;
+    }
     if (window.name !== "ROW_NUMBER" && window.name !== "RANK" && window.name !== "DENSE_RANK") {
       applyAggregateWindow(rows, indexes, window, samePartition, sameOrderKeys);
       continue;
@@ -1904,12 +2111,15 @@ export function executeRowQuery(
             columns: rowTableColumnNames(tables.get(source.table) ?? []),
           }))
         : [];
-    const sortColumns = plan.orderBy.map(({ expression, direction }) => ({
+    const sortColumns = plan.orderBy.map(({ expression, direction, nulls }) => ({
       outputName: orderOutputName(expression, plan.select, orderSources),
       multiplier: direction === "desc" ? -1 : 1,
+      nulls,
     }));
     rows.sort((left, right) => {
-      for (const { outputName, multiplier } of sortColumns) {
+      for (const { outputName, multiplier, nulls } of sortColumns) {
+        const placed = explicitNullOrder(left[outputName], right[outputName], nulls);
+        if (placed !== undefined && placed !== 0) return placed;
         const comparison = compareValues(left[outputName], right[outputName]);
         if (comparison !== 0) return comparison * multiplier;
       }
@@ -2538,6 +2748,25 @@ function comparable(value: unknown): unknown {
   return value instanceof Date ? value.getTime() : value;
 }
 
+/**
+ * Resolves an explicit NULLS FIRST/LAST placement for one order term. Returns undefined when
+ * no explicit placement applies (either none was requested or neither side is NULL); otherwise
+ * the signed placement, which is absolute — direction negation must not apply to it. Two NULLs
+ * return 0 so the comparison falls through to the next term.
+ */
+export function explicitNullOrder(
+  left: unknown,
+  right: unknown,
+  nulls: "first" | "last" | undefined,
+): number | undefined {
+  if (nulls === undefined) return undefined;
+  const leftNull = left === null || left === undefined;
+  const rightNull = right === null || right === undefined;
+  if (!leftNull && !rightNull) return undefined;
+  if (leftNull && rightNull) return 0;
+  return (leftNull ? -1 : 1) * (nulls === "first" ? 1 : -1);
+}
+
 function compareValues(left: unknown, right: unknown): number {
   const a = comparable(left);
   const b = comparable(right);
@@ -2775,6 +3004,25 @@ class Parser {
       columns,
       ...(uniqueKey === undefined ? {} : { uniqueKey }),
     };
+  }
+
+  /** A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names. */
+  #castTarget(): string {
+    const word = this.#identifier().toUpperCase();
+    if (word === "DOUBLE") {
+      this.#keyword("PRECISION");
+      return "number";
+    }
+    const mapped = createTableTypeNames.get(word);
+    if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
+    if (this.#punctuation("(")) {
+      this.#take("number");
+      if (this.#punctuation(",")) this.#take("number");
+      this.#expectPunctuation(")");
+    }
+    const integer =
+      word === "INTEGER" || word === "INT" || word === "BIGINT" || word === "SMALLINT";
+    return integer ? "number-integer" : mapped;
   }
 
   #columnType(): SqlColumnType {
@@ -3015,7 +3263,18 @@ class Parser {
           this.#keyword("DESC");
           direction = "desc";
         } else if (this.#isKeyword("ASC")) this.#keyword("ASC");
-        orderBy.push({ expression, direction });
+        let nulls: "first" | "last" | undefined;
+        if (this.#isKeyword("NULLS")) {
+          this.#keyword("NULLS");
+          if (this.#isKeyword("FIRST")) {
+            this.#keyword("FIRST");
+            nulls = "first";
+          } else {
+            this.#keyword("LAST");
+            nulls = "last";
+          }
+        }
+        orderBy.push({ expression, direction, ...(nulls === undefined ? {} : { nulls }) });
         if (!this.#punctuation(",")) break;
       }
     }
@@ -3052,6 +3311,7 @@ class Parser {
       this.#isKeyword("INNER") ||
       this.#isKeyword("LEFT") ||
       this.#isKeyword("RIGHT") ||
+      this.#isKeyword("FULL") ||
       this.#isKeyword("CROSS")
     ) {
       if (this.#isKeyword("CROSS")) {
@@ -3075,6 +3335,7 @@ class Parser {
       }
       let kind: JoinPlan["kind"] = "inner";
       let right = false;
+      let full = false;
       if (this.#isKeyword("INNER")) this.#keyword("INNER");
       else if (this.#isKeyword("LEFT")) {
         this.#keyword("LEFT");
@@ -3083,6 +3344,10 @@ class Parser {
         this.#keyword("RIGHT");
         right = true;
         rightJoins += 1;
+      } else if (this.#isKeyword("FULL")) {
+        this.#keyword("FULL");
+        kind = "left";
+        full = true;
       }
       if (this.#isKeyword("OUTER")) this.#keyword("OUTER");
       this.#keyword("JOIN");
@@ -3090,7 +3355,13 @@ class Parser {
       this.#keyword("ON");
       const condition = this.#expression();
       if (condition.kind === "condition" && condition.operator === "=") {
-        joins.push({ ...source, kind, left: condition.left, right: condition.right });
+        joins.push({
+          ...source,
+          kind,
+          left: condition.left,
+          right: condition.right,
+          ...(full ? { full } : {}),
+        });
       } else {
         // Any other boolean condition becomes a nested-loop join.
         joins.push({
@@ -3099,6 +3370,7 @@ class Parser {
           left: { kind: "literal", value: null },
           right: { kind: "literal", value: null },
           on: condition,
+          ...(full ? { full } : {}),
         });
       }
       if (right) {
@@ -3465,7 +3737,14 @@ class Parser {
       this.#expectPunctuation(")");
       return expression;
     }
+    const quotedIdentifier = this.#peek().quoted === true;
     const identifier = this.#identifier();
+    if (quotedIdentifier) {
+      // A quoted identifier is always a plain reference — never a keyword, literal, or function.
+      let reference = identifier;
+      if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
+      return { kind: "column", reference };
+    }
     const upper = identifier.toUpperCase();
     if (upper === "TRUE" || upper === "FALSE" || upper === "NULL")
       return { kind: "literal", value: upper === "NULL" ? null : upper === "TRUE" };
@@ -3519,6 +3798,19 @@ class Parser {
         query: queryToken.text,
       };
     }
+    if (upper === "CAST" && this.#peek().text === "(") {
+      this.#expectPunctuation("(");
+      const operand = this.#expression();
+      this.#keyword("AS");
+      const target = this.#castTarget();
+      this.#expectPunctuation(")");
+      // CAST rides the call machinery: the target travels as a literal second argument.
+      return {
+        kind: "call",
+        name: "CAST",
+        arguments: [operand, { kind: "literal", value: target }],
+      };
+    }
     if (upper === "DATE" && this.#peek().kind === "string") {
       const date = new Date(`${this.#take("string").text}T00:00:00.000Z`);
       if (!Number.isFinite(date.getTime())) throw new TypeError("Invalid DATE literal");
@@ -3528,8 +3820,64 @@ class Parser {
       if (upper === "ROW_NUMBER" || upper === "RANK" || upper === "DENSE_RANK") {
         this.#expectPunctuation(")");
         this.#keyword("OVER");
-        const { partitionBy, orderBy } = this.#overClause();
+        const { partitionBy, orderBy, frame } = this.#overClause();
+        if (frame !== undefined) {
+          throw new TypeError(`${upper} does not take a window frame`);
+        }
         return { kind: "window", name: upper, partitionBy, orderBy };
+      }
+      if (upper === "LAG" || upper === "LEAD") {
+        const lagArgs: Expression[] = [];
+        if (!this.#punctuation(")")) {
+          lagArgs.push(...this.#expressionList());
+          this.#expectPunctuation(")");
+        }
+        if (lagArgs.length < 1 || lagArgs.length > 3) {
+          throw new TypeError(
+            `${upper} takes a value, an optional offset, and an optional default`,
+          );
+        }
+        const constant = (expression: Expression, label: string): QueryValue => {
+          if (
+            hasAggregate(expression) ||
+            expressionColumns(expression).length > 0 ||
+            containsParameter(expression)
+          ) {
+            throw new TypeError(`${upper} ${label} must be a constant`);
+          }
+          return asQueryValue(evaluate(expression, {}));
+        };
+        const offsetExpression = lagArgs[1];
+        let offset = 1;
+        if (offsetExpression !== undefined) {
+          const value = constant(offsetExpression, "offset");
+          if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+            throw new TypeError(`${upper} offset must be a non-negative integer`);
+          }
+          offset = value;
+        }
+        const fallbackExpression = lagArgs[2];
+        const fallback: QueryValue =
+          fallbackExpression === undefined ? null : constant(fallbackExpression, "default");
+        this.#keyword("OVER");
+        const { partitionBy, orderBy, frame } = this.#overClause();
+        if (frame !== undefined) throw new TypeError(`${upper} does not take a window frame`);
+        if (orderBy.length === 0) {
+          throw new TypeError(`${upper} requires ORDER BY inside OVER (...)`);
+        }
+        const argument = lagArgs[0];
+        if (argument === undefined || argument.kind === "wildcard") {
+          throw new TypeError(`${upper} requires a value argument`);
+        }
+        return {
+          kind: "window",
+          name: upper,
+          partitionBy,
+          orderBy,
+          argument,
+          offset,
+          ...(fallback === null ? {} : { fallback }),
+        };
       }
       // SUBSTRING is the standard spelling; SUBSTR is the canonical plan name for both.
       const name = (upper === "SUBSTRING" ? "SUBSTR" : upper) as AggregateName | ScalarFunctionName;
@@ -3537,7 +3885,9 @@ class Parser {
         throw new TypeError(`Unsupported function: ${identifier}`);
       let distinct = false;
       if (this.#isKeyword("DISTINCT")) {
-        if (name !== "COUNT") throw new TypeError("DISTINCT is only supported inside COUNT");
+        if (!aggregateNames.has(name as AggregateName)) {
+          throw new TypeError("DISTINCT is only supported inside aggregate functions");
+        }
         this.#keyword("DISTINCT");
         distinct = true;
       }
@@ -3547,7 +3897,7 @@ class Parser {
         this.#expectPunctuation(")");
       }
       if (distinct && (args.length !== 1 || args[0]?.kind === "wildcard")) {
-        throw new TypeError("COUNT(DISTINCT) requires exactly one scalar argument");
+        throw new TypeError(`${name}(DISTINCT) requires exactly one scalar argument`);
       }
       if (aggregateNames.has(name as AggregateName) && args.length !== 1)
         throw new TypeError(`${name} requires exactly one argument`);
@@ -3582,7 +3932,7 @@ class Parser {
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("OVER")) {
         if (distinct) throw new TypeError("DISTINCT window aggregates are not supported");
         this.#keyword("OVER");
-        const { partitionBy, orderBy } = this.#overClause();
+        const { partitionBy, orderBy, frame } = this.#overClause();
         const argument = args[0];
         if (argument !== undefined && hasAggregate(argument)) {
           throw new TypeError("Window aggregate arguments cannot contain aggregates");
@@ -3593,6 +3943,7 @@ class Parser {
           partitionBy,
           orderBy,
           ...(argument === undefined || argument.kind === "wildcard" ? {} : { argument }),
+          ...(frame === undefined ? {} : { frame }),
         };
       }
       return { kind: "call", name, arguments: args, ...(distinct ? { distinct: true } : {}) };
@@ -3623,7 +3974,8 @@ class Parser {
 
   #overClause(): {
     partitionBy: Expression[];
-    orderBy: Array<{ expression: Expression; direction: "asc" | "desc" }>;
+    orderBy: Array<{ expression: Expression; direction: "asc" | "desc"; nulls?: "first" | "last" }>;
+    frame?: WindowFrame;
   } {
     this.#expectPunctuation("(");
     const partitionBy: Expression[] = [];
@@ -3633,11 +3985,62 @@ class Parser {
       partitionBy.push(...this.#expressionList());
     }
     const orderBy = this.#orderByClause();
-    if (this.#isKeyword("ROWS") || this.#isKeyword("RANGE") || this.#isKeyword("GROUPS")) {
-      throw new TypeError("Window frames are not supported");
+    let frame: WindowFrame | undefined;
+    if (this.#isKeyword("ROWS") || this.#isKeyword("RANGE")) {
+      const unit = this.#isKeyword("ROWS") ? "rows" : "range";
+      this.#keyword(unit === "rows" ? "ROWS" : "RANGE");
+      let start: WindowFrameBound;
+      let end: WindowFrameBound;
+      if (this.#isKeyword("BETWEEN")) {
+        this.#keyword("BETWEEN");
+        start = this.#frameBound(unit);
+        this.#keyword("AND");
+        end = this.#frameBound(unit);
+      } else {
+        // The single-bound shorthand: the bound is the frame start, the end is the current row.
+        start = this.#frameBound(unit);
+        end = { kind: "current-row" };
+      }
+      if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
+        throw new TypeError("Window frame bounds are reversed");
+      }
+      frame = { unit, start, end };
+    }
+    if (this.#isKeyword("GROUPS")) {
+      throw new TypeError("GROUPS window frames are not supported");
     }
     this.#expectPunctuation(")");
-    return { partitionBy, orderBy };
+    return { partitionBy, orderBy, ...(frame === undefined ? {} : { frame }) };
+  }
+
+  #frameBound(unit: "rows" | "range"): WindowFrameBound {
+    if (this.#isKeyword("UNBOUNDED")) {
+      this.#keyword("UNBOUNDED");
+      if (this.#isKeyword("PRECEDING")) {
+        this.#keyword("PRECEDING");
+        return { kind: "unbounded-preceding" };
+      }
+      this.#keyword("FOLLOWING");
+      return { kind: "unbounded-following" };
+    }
+    if (this.#isKeyword("CURRENT")) {
+      this.#keyword("CURRENT");
+      this.#keyword("ROW");
+      return { kind: "current-row" };
+    }
+    const offset = Number(this.#take("number").text);
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new TypeError("Window frame offsets must be non-negative integers");
+    }
+    if (unit === "range") {
+      throw new TypeError("RANGE frames take only UNBOUNDED and CURRENT ROW bounds; use ROWS");
+    }
+    if (this.#isKeyword("PRECEDING")) {
+      this.#keyword("PRECEDING");
+      return { kind: "preceding", offset };
+    }
+    this.#keyword("FOLLOWING");
+    return { kind: "following", offset };
   }
 
   #comparison(): ComparisonOperator {
@@ -3653,7 +4056,9 @@ class Parser {
 
   #isKeyword(value: string): boolean {
     const token = this.#peek();
-    return token.kind === "identifier" && token.text.toUpperCase() === value;
+    return (
+      token.kind === "identifier" && token.quoted !== true && token.text.toUpperCase() === value
+    );
   }
 
   #keyword(value: string): void {
@@ -3747,11 +4152,83 @@ function resolveOrderByOrdinals(
   });
 }
 
+/**
+ * FULL OUTER JOIN desugars into UNION ALL of two left joins: the plain left join carries every
+ * base row (matched or not), and the swapped left join filtered to a NULL-extended base side
+ * carries the joined source's unmatched rows. Sound because an equality join key never matches
+ * NULL, so "base side IS NULL" identifies exactly the null-extended rows.
+ */
+function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
+  const join = parts.joins[0];
+  if (parts.joins.length !== 1 || join?.full !== true) {
+    throw new TypeError("FULL JOIN is only supported as the sole join");
+  }
+  if (parts.select.some((item) => item.expression.kind === "wildcard")) {
+    throw new TypeError("FULL JOIN cannot be combined with SELECT *");
+  }
+  if (
+    parts.groupBy.length > 0 ||
+    parts.having.length > 0 ||
+    parts.distinct ||
+    parts.select.some((item) => hasAggregate(item.expression) || containsWindow(item.expression))
+  ) {
+    throw new TypeError(
+      "FULL JOIN cannot be combined with grouping, DISTINCT, or window functions yet",
+    );
+  }
+  if (join.on !== undefined) {
+    throw new TypeError("FULL JOIN requires a single equality ON condition");
+  }
+  // `on` is absent here: the guard above rejected non-equi conditions.
+  const { full, kind, left, right, ...joinSource } = join;
+  void full;
+  void kind;
+  const { limit, offset, ...blockParts } = parts;
+  const baseSide = expressionAliases(left).has(join.alias) ? right : left;
+  const matched = assembleSelectBlock(
+    {
+      ...blockParts,
+      sql: "(full join left)",
+      joins: [{ ...joinSource, kind: "left", left, right }],
+      orderBy: [],
+    },
+    nextSequence,
+  );
+  const unmatchedRight = assembleSelectBlock(
+    {
+      ...blockParts,
+      sql: "(full join right)",
+      base: joinSource,
+      joins: [{ ...parts.base, kind: "left", left, right }],
+      predicates: [
+        ...parts.predicates,
+        { left: baseSide, operator: "IS NULL", right: { kind: "literal", value: null } },
+      ],
+      orderBy: [],
+    },
+    nextSequence,
+  );
+  return compoundSelectBlock(
+    parts.sql,
+    [matched, unmatchedRight],
+    ["union all"],
+    {
+      orderBy: parts.orderBy,
+      ...(limit === undefined ? {} : { limit }),
+      ...(offset === undefined ? {} : { offset }),
+    },
+    nextSequence,
+  );
+}
+
 export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
 ): CompiledQuery {
   parts = { ...parts, orderBy: resolveOrderByOrdinals(parts.orderBy, parts.select) };
+  if (parts.joins.some((join) => join.full === true)) {
+    return desugarFullJoin(parts, nextSequence);
+  }
   if (parts.orderBy.some((order) => order.expression.kind !== "column")) {
     return assembleOrderByExpressionBlock(parts, nextSequence);
   }
@@ -3801,7 +4278,7 @@ export function assembleSelectBlock(
         !(item.expression.kind === "call" && item.expression.distinct === true),
     )
   ) {
-    throw new TypeError("COUNT(DISTINCT) must be a top-level select item");
+    throw new TypeError("DISTINCT aggregates must be top-level select items");
   }
   const tail = {
     orderBy,
@@ -3813,7 +4290,7 @@ export function assembleSelectBlock(
   );
   if (distinctCounts.length > 0) {
     if (distinctCounts.length > 1) {
-      throw new TypeError("Only one COUNT(DISTINCT) is supported per select");
+      throw new TypeError("Only one DISTINCT aggregate is supported per select");
     }
     if (
       select.some(
@@ -3823,13 +4300,13 @@ export function assembleSelectBlock(
           hasAggregate(item.expression),
       )
     ) {
-      throw new TypeError("COUNT(DISTINCT) cannot be combined with other aggregates yet");
+      throw new TypeError("A DISTINCT aggregate cannot be combined with other aggregates yet");
     }
     if (select.some((item) => containsWindow(item.expression))) {
-      throw new TypeError("COUNT(DISTINCT) cannot be combined with window functions");
+      throw new TypeError("A DISTINCT aggregate cannot be combined with window functions");
     }
     if (having.length > 0) {
-      throw new TypeError("COUNT(DISTINCT) cannot be combined with HAVING yet");
+      throw new TypeError("A DISTINCT aggregate cannot be combined with HAVING yet");
     }
     return desugarDistinctCount(sql, base, joins, select, predicates, groupBy, tail, nextSequence);
   }
@@ -3927,15 +4404,15 @@ function assembleOrderByExpressionBlock(
     const existingAlias = selectSignatures.get(JSON.stringify(order.expression));
     if (existingAlias !== undefined) {
       return {
+        ...order,
         expression: { kind: "column", reference: existingAlias } satisfies Expression,
-        direction: order.direction,
       };
     }
     const alias = `(order ${String(hiddenItems.length + 1)})`;
     hiddenItems.push({ expression: order.expression, alias });
     return {
+      ...order,
       expression: { kind: "column", reference: alias } satisfies Expression,
-      direction: order.direction,
     };
   });
   const inner = assembleSelectBlock(
@@ -4065,12 +4542,14 @@ function desugarDistinctCount(
   for (const item of select) {
     if (item.expression.kind === "call" && item.expression.distinct === true) {
       const argument = item.expression.arguments[0];
-      if (argument === undefined) throw new TypeError("COUNT(DISTINCT) argument is missing");
+      if (argument === undefined) throw new TypeError("DISTINCT aggregate argument is missing");
       innerSelect.push({ expression: argument, alias: distinctAlias });
+      // The inner block groups the argument to distinct values; the original aggregate then
+      // runs over them — COUNT counts them, SUM/AVG sum them, MIN/MAX pass through.
       outerSelect.push({
         expression: {
           kind: "call",
-          name: "COUNT",
+          name: item.expression.name,
           arguments: [{ kind: "column", reference: distinctAlias }],
         },
         alias: item.alias,
@@ -4085,7 +4564,7 @@ function desugarDistinctCount(
   }
   const distinctArgument = innerSelect.find(({ alias }) => alias === distinctAlias);
   if (distinctArgument === undefined) {
-    throw new TypeError("COUNT(DISTINCT) argument is missing");
+    throw new TypeError("DISTINCT aggregate argument is missing");
   }
   const inner: CompiledQuery = {
     sql: "(count distinct input)",
@@ -4168,7 +4647,11 @@ function desugarWindows(
       hidden += 1;
       const alias = `(window ${String(hidden)})`;
       innerSelect.push({ expression: order.expression, alias });
-      return { alias, direction: order.direction };
+      return {
+        alias,
+        direction: order.direction,
+        ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
+      };
     });
     let argumentAlias: string | undefined;
     if (expression.argument !== undefined) {
@@ -4182,6 +4665,9 @@ function desugarWindows(
       partitionAliases,
       orderAliases,
       ...(argumentAlias === undefined ? {} : { argumentAlias }),
+      ...(expression.offset === undefined ? {} : { offset: expression.offset }),
+      ...(expression.fallback === undefined ? {} : { fallback: expression.fallback }),
+      ...(expression.frame === undefined ? {} : { frame: expression.frame }),
     });
   }
   if (innerSelect.length === 0) {
@@ -4281,6 +4767,29 @@ function tokenize(sql: string): Token[] {
       if (!closed)
         throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
       tokens.push({ kind: "string", text: value, start, end: index });
+      continue;
+    }
+    if (character === '"') {
+      const start = index++;
+      let value = "";
+      let closed = false;
+      while (index < sql.length) {
+        if (sql[index] === '"' && sql[index + 1] === '"') {
+          value += '"';
+          index += 2;
+        } else if (sql[index] === '"') {
+          index += 1;
+          closed = true;
+          break;
+        } else value += sql[index++] ?? "";
+      }
+      if (!closed) {
+        throw new SqlCompileError("Unterminated quoted identifier", start, sql.length - start);
+      }
+      if (value.length === 0) {
+        throw new SqlCompileError("Quoted identifiers cannot be empty", start, index - start);
+      }
+      tokens.push({ kind: "identifier", text: value, quoted: true, start, end: index });
       continue;
     }
     if (character === "?") {

@@ -344,6 +344,47 @@ const templates: Template[] = [
     sql: `SELECT region, amount, id FROM data ORDER BY 2 DESC, 3`,
     ordered: true,
   }),
+  () => ({
+    sql: `SELECT id, CAST(amount AS INTEGER) AS whole, CAST(id AS TEXT) AS label, CAST('42.5' AS REAL) AS parsed FROM data ORDER BY id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT "id", "data"."amount" AS "amt" FROM "data" WHERE "amount" >= ? ORDER BY "id"`,
+    params: [Math.floor(rng() * 300) / 4],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT id, region FROM data ORDER BY region, id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql:
+      rng() < 0.5
+        ? `SELECT id, region FROM data ORDER BY region NULLS LAST, id`
+        : `SELECT id, region FROM data ORDER BY region DESC NULLS FIRST, id`,
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id, d.region AS dr, m.rank AS r FROM data d FULL JOIN dims m ON m.region = d.region`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT id, LAG(amount) OVER (PARTITION BY region ORDER BY id) AS prev, LEAD(amount, 2, -1.0) OVER (ORDER BY id) AS nxt FROM data`,
+    ordered: false,
+  }),
+  (rng) => ({
+    sql: `SELECT id, SUM(amount) OVER (ORDER BY id ROWS BETWEEN ${String(1 + Math.floor(rng() * 4))} PRECEDING AND CURRENT ROW) AS windowed, MIN(amount) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS ahead FROM data`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT id, COUNT(*) OVER (PARTITION BY region ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS peers FROM data`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT region, SUM(DISTINCT amount) AS s FROM data GROUP BY region`,
+    ordered: false,
+  }),
+  () => ({ sql: `SELECT AVG(DISTINCT amount) AS a FROM data`, ordered: false }),
 ];
 
 function buildCorpus(): Case[] {

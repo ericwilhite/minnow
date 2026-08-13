@@ -728,12 +728,12 @@ describe("public SQL queries", () => {
       input,
     );
     expect(constants.rows).toEqual([{ tag: "total", count: 6 }]);
-    expect(() => compileQuery("SELECT SUM(DISTINCT amount) AS total FROM rows")).toThrow(
-      "DISTINCT is only supported inside COUNT",
+    expect(() => compileQuery("SELECT UPPER(DISTINCT region) AS r FROM rows")).toThrow(
+      "DISTINCT is only supported inside aggregate functions",
     );
     expect(() =>
       compileQuery("SELECT COUNT(DISTINCT region) AS r, SUM(amount) AS total FROM rows"),
-    ).toThrow("COUNT(DISTINCT) cannot be combined with other aggregates yet");
+    ).toThrow("A DISTINCT aggregate cannot be combined with other aggregates yet");
     const notBetween = compileQuery("SELECT region FROM rows WHERE amount NOT BETWEEN 1 AND 5");
     expect(executeQuery(notBetween, input)).toEqual(executeRowQuery(notBetween, input));
     expect(executeQuery(notBetween, input).rows).toEqual([

@@ -344,9 +344,9 @@
     },
     {
       "id": "window.frame",
-      "status": "unsupported",
-      "example": "SELECT ROW_NUMBER() OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS rn FROM rows",
-      "error": "Window frames are not supported"
+      "status": "supported",
+      "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount, joined ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS windowed FROM rows",
+      "notes": "ROWS frames take row-distance bounds; RANGE frames take UNBOUNDED and CURRENT ROW bounds, where CURRENT ROW spans the ordering peer group."
     },
     {
       "id": "join.right",
@@ -409,6 +409,24 @@
       "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error."
     },
     {
+      "id": "expression.cast",
+      "status": "supported",
+      "example": "SELECT CAST(amount AS INTEGER) AS whole, CAST(amount AS TEXT) AS label FROM rows",
+      "notes": "Standard type names map to the four logical types; integer targets truncate toward zero, and non-numeric strings fail rather than becoming 0."
+    },
+    {
+      "id": "identifier.quoted",
+      "status": "supported",
+      "example": "SELECT \"region\", \"rows\".\"amount\" FROM \"rows\" WHERE \"amount\" > 5",
+      "notes": "Double-quoted identifiers are never keywords and keep their exact spelling."
+    },
+    {
+      "id": "order-by.nulls",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows ORDER BY region NULLS LAST, amount",
+      "notes": "Without NULLS FIRST/LAST the default matches SQLite: NULLs first ascending, last descending."
+    },
+    {
       "id": "expression.coalesce",
       "status": "supported",
       "example": "SELECT COALESCE(region, 'unknown') AS region_label FROM rows",
@@ -433,10 +451,9 @@
     },
     {
       "id": "aggregate.distinct-argument",
-      "status": "unsupported",
-      "example": "SELECT SUM(DISTINCT amount) AS total FROM rows",
-      "error": "DISTINCT is only supported inside COUNT",
-      "notes": "DISTINCT is accepted as a COUNT argument only; the other aggregates reject it."
+      "status": "supported",
+      "example": "SELECT SUM(DISTINCT amount) AS total, region FROM rows GROUP BY region",
+      "notes": "COUNT/SUM/AVG/MIN/MAX accept DISTINCT; one DISTINCT aggregate per select, not yet combined with other aggregates or HAVING."
     },
     {
       "id": "join.multi-key",
@@ -451,9 +468,9 @@
     },
     {
       "id": "join.full",
-      "status": "unsupported",
-      "example": "SELECT r.region FROM rows r FULL JOIN dims d ON d.region = r.region",
-      "error": "Expected eof, found FULL"
+      "status": "supported",
+      "example": "SELECT r.amount AS amount, d.label AS label FROM rows r FULL JOIN dims d ON d.region = r.region",
+      "notes": "Desugars into a union of two left joins, so it must be the sole join, with an equality ON and no grouping or DISTINCT yet."
     },
     {
       "id": "order-by.ordinal",
@@ -463,10 +480,9 @@
     },
     {
       "id": "window.lag-lead",
-      "status": "unsupported",
-      "example": "SELECT LAG(amount) OVER (ORDER BY amount) AS previous FROM rows",
-      "error": "Unsupported function: LAG",
-      "notes": "ROW_NUMBER, RANK, and DENSE_RANK are the only window functions."
+      "status": "supported",
+      "example": "SELECT amount, LAG(amount) OVER (ORDER BY amount) AS previous, LEAD(amount, 1, -1) OVER (ORDER BY amount) AS next FROM rows",
+      "notes": "LAG/LEAD take a constant offset (default 1) and default value (default NULL), and require ORDER BY inside OVER."
     },
     {
       "id": "mutation.insert-select",
