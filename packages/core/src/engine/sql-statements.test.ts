@@ -135,6 +135,71 @@ describe("ON CONFLICT", () => {
     ]);
   });
 
+  it("DO UPDATE with a column subset merges only those columns", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "p",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+        { name: "city", type: "string", nullable: true },
+      ],
+    });
+    await database.execute(
+      "INSERT INTO p (name, score, city) VALUES ('Ada', 10, 'London'), ('Grace', 25, 'DC')",
+    );
+    const merged = await database.execute(
+      "INSERT INTO p (name, score, city) VALUES ('Ada', 99, 'Paris'), ('Linus', 1, 'Helsinki') ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score RETURNING *",
+    );
+    expect(merged).toMatchObject({
+      kind: "insert",
+      rowCount: 2,
+      returnedRows: [
+        // Ada keeps her stored city: only score was assigned from EXCLUDED.
+        { name: "Ada", score: 99, city: "London" },
+        { name: "Linus", score: 1, city: "Helsinki" },
+      ],
+    });
+    const rows = await database.query("SELECT name, score, city FROM p ORDER BY name");
+    expect(rows.rows).toEqual([
+      { name: "Ada", score: 99, city: "London" },
+      { name: "Grace", score: 25, city: "DC" },
+      { name: "Linus", score: 1, city: "Helsinki" },
+    ]);
+    await expect(
+      database.execute(
+        "INSERT INTO p (name, score) VALUES ('x', 1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name",
+      ),
+    ).rejects.toThrow("cannot reassign the conflict key");
+  });
+
+  it("pads unlisted insert columns with NULL and returns them", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "p",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+        { name: "city", type: "string", nullable: true },
+      ],
+    });
+    const inserted = await database.execute(
+      "INSERT INTO p (name, score) VALUES ('Ada', 1) RETURNING *",
+    );
+    expect(inserted).toMatchObject({
+      returnedRows: [{ name: "Ada", score: 1, city: null }],
+    });
+    // A non-nullable column without a default still rejects the batch.
+    await expect(database.execute("INSERT INTO p (name) VALUES ('Grace')")).rejects.toThrow(
+      "cannot be null",
+    );
+    await expect(database.execute("INSERT INTO p (name, nope) VALUES ('x', 1)")).rejects.toThrow(
+      "INSERT column does not exist: nope",
+    );
+  });
+
   it("rejects unsupported conflict shapes explicitly", async () => {
     const database = await seeded();
     await expect(
@@ -151,6 +216,11 @@ describe("ON CONFLICT", () => {
       database.execute(
         "INSERT INTO people (name, score) VALUES ('x', 1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name",
       ),
-    ).rejects.toThrow("missing: score");
+    ).rejects.toThrow("cannot reassign the conflict key");
+    await expect(
+      database.execute(
+        "INSERT INTO people (name, score) VALUES ('x', 1) ON CONFLICT (name) DO UPDATE SET nope = EXCLUDED.nope",
+      ),
+    ).rejects.toThrow("column that is not inserted: nope");
   });
 });

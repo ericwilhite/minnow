@@ -39,10 +39,11 @@ async function keyedDatabase(): Promise<MinnowDatabase> {
     columns: [
       { name: "name", type: "string" },
       { name: "score", type: "number" },
+      { name: "bonus", type: "number", nullable: true },
     ],
   });
   await database.insertBatch("keyed", {
-    columns: { name: ["x", "y"], score: [1, -1] },
+    columns: { name: ["x", "y"], score: [1, -1], bonus: [null, null] },
   });
   await database.createTable({
     name: "rows",

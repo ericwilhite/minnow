@@ -208,9 +208,12 @@ async function keyedDatabase(): Promise<MinnowDatabase> {
     columns: [
       { name: "name", type: "string" },
       { name: "score", type: "number" },
+      { name: "bonus", type: "number", nullable: true },
     ],
   });
-  await database.insertBatch("keyed", { columns: { name: ["x", "y"], score: [1, -1] } });
+  await database.insertBatch("keyed", {
+    columns: { name: ["x", "y"], score: [1, -1], bonus: [null, null] },
+  });
   await database.createTable({
     name: "rows",
     columns: [
@@ -231,8 +234,8 @@ const fixtureDdl = [
     `(NULL, 8, TRUE, NULL)`,
   `CREATE TABLE "dims" ("region" TEXT, "label" TEXT, "amount" DOUBLE PRECISION)`,
   `INSERT INTO "dims" ("region", "label", "amount") VALUES ('west', 'West Coast', 1), ('north', 'North', 2)`,
-  `CREATE TABLE "keyed" ("name" TEXT PRIMARY KEY, "score" DOUBLE PRECISION)`,
-  `INSERT INTO "keyed" ("name", "score") VALUES ('x', 1), ('y', -1)`,
+  `CREATE TABLE "keyed" ("name" TEXT PRIMARY KEY, "score" DOUBLE PRECISION, "bonus" DOUBLE PRECISION)`,
+  `INSERT INTO "keyed" ("name", "score", "bonus") VALUES ('x', 1, NULL), ('y', -1, NULL)`,
 ];
 
 const fixtureTeardown = [

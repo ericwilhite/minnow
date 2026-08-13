@@ -12,6 +12,7 @@ import type {
 } from "./query.js";
 import {
   cachedListMembership,
+  distinctFromComparison,
   explicitNullOrder,
   isScalarFunctionName,
   likeRegExp,
@@ -3187,7 +3188,12 @@ function booleanTruth(
       if (sawNull) return null;
       return operator === "NOT IN";
     }
-    if (operator === "LIKE" || operator === "NOT LIKE") {
+    if (
+      operator === "LIKE" ||
+      operator === "NOT LIKE" ||
+      operator === "ILIKE" ||
+      operator === "NOT ILIKE"
+    ) {
       const value = evaluateValue(expression.left);
       const pattern = evaluateValue(expression.right);
       if (value === null || value === undefined || pattern === null || pattern === undefined) {
@@ -3196,8 +3202,17 @@ function booleanTruth(
       if (typeof value !== "string" || typeof pattern !== "string") {
         throw new TypeError("LIKE requires string operands");
       }
-      const matched = likeRegExp(pattern).test(value);
-      return operator === "LIKE" ? matched : !matched;
+      const matched = likeRegExp(pattern, operator === "ILIKE" || operator === "NOT ILIKE").test(
+        value,
+      );
+      return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
+    }
+    if (operator === "IS DISTINCT FROM" || operator === "IS NOT DISTINCT FROM") {
+      const distinct = distinctFromComparison(
+        evaluateValue(expression.left),
+        evaluateValue(expression.right),
+      );
+      return operator === "IS DISTINCT FROM" ? distinct : !distinct;
     }
     const left = evaluateValue(expression.left);
     const right = evaluateValue(expression.right);
@@ -3432,7 +3447,9 @@ function binaryValue(
   if (operator === "+") return a + b;
   if (operator === "-") return a - b;
   if (operator === "*") return a * b;
-  return a / b;
+  // Division and remainder by zero are NULL, matching SQLite, not Infinity/NaN.
+  if (b === 0) return null;
+  return operator === "%" ? a % b : a / b;
 }
 
 function comparisonValue(
@@ -3444,6 +3461,30 @@ function comparisonValue(
   if (operator === "IS NOT NULL") return leftValue !== null && leftValue !== undefined;
   if (operator === "IN" || operator === "NOT IN") {
     throw new TypeError("IN is only supported in WHERE predicates");
+  }
+  if (operator === "IS DISTINCT FROM") return distinctFromComparison(leftValue, rightValue);
+  if (operator === "IS NOT DISTINCT FROM") return !distinctFromComparison(leftValue, rightValue);
+  if (
+    operator === "LIKE" ||
+    operator === "NOT LIKE" ||
+    operator === "ILIKE" ||
+    operator === "NOT ILIKE"
+  ) {
+    if (
+      leftValue === null ||
+      leftValue === undefined ||
+      rightValue === null ||
+      rightValue === undefined
+    ) {
+      return false;
+    }
+    if (typeof leftValue !== "string" || typeof rightValue !== "string") {
+      throw new TypeError("LIKE requires string operands");
+    }
+    const matched = likeRegExp(rightValue, operator === "ILIKE" || operator === "NOT ILIKE").test(
+      leftValue,
+    );
+    return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
   }
   if (
     leftValue === null ||

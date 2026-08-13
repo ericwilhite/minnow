@@ -233,6 +233,12 @@
       "notes": "Rows whose key already exists at the statement's snapshot are skipped."
     },
     {
+      "id": "mutation.upsert-partial",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score, bonus) VALUES ('x', 50, 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
+      "notes": "Assigning a subset of inserted columns merges only those into existing rows; unassigned columns keep their stored values."
+    },
+    {
       "id": "where.or",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'"
@@ -241,6 +247,18 @@
       "id": "where.like",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region LIKE 'w%'"
+    },
+    {
+      "id": "predicate.is-distinct-from",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region IS DISTINCT FROM 'west'",
+      "notes": "Null-safe: NULL is not distinct from NULL."
+    },
+    {
+      "id": "predicate.ilike",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE region ILIKE 'WE%'",
+      "notes": "Case-insensitive LIKE, a PostgreSQL extension; SQLite's LIKE is case-insensitive by default instead."
     },
     {
       "id": "predicate.match",
@@ -301,6 +319,12 @@
       "notes": "EXISTS joins the subquery's distinct correlation keys; NOT EXISTS becomes a left join checked with IS NULL."
     },
     {
+      "id": "subquery.correlated-select",
+      "status": "supported",
+      "example": "SELECT r.region, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r",
+      "notes": "Correlated scalar aggregates decorrelate in the select list too, outside grouped queries."
+    },
+    {
       "id": "subquery.correlated-non-equi",
       "status": "unsupported",
       "example": "SELECT region FROM rows r WHERE EXISTS (SELECT region FROM dims d WHERE d.amount > r.amount)",
@@ -332,15 +356,49 @@
       "example": "SELECT region FROM rows EXCEPT SELECT region FROM dims"
     },
     {
+      "id": "set.intersect-all",
+      "status": "supported",
+      "example": "SELECT region FROM rows INTERSECT ALL SELECT region FROM dims",
+      "notes": "Bag semantics; SQLite itself has no INTERSECT ALL."
+    },
+    {
+      "id": "set.except-all",
+      "status": "supported",
+      "example": "SELECT region FROM rows EXCEPT ALL SELECT region FROM dims",
+      "notes": "Bag semantics; SQLite itself has no EXCEPT ALL."
+    },
+    {
       "id": "aggregate.count-distinct",
       "status": "supported",
       "example": "SELECT COUNT(DISTINCT region) AS regions FROM rows"
+    },
+    {
+      "id": "aggregate.filter",
+      "status": "supported",
+      "example": "SELECT region, COUNT(*) FILTER (WHERE amount > 5) AS big FROM rows GROUP BY region",
+      "notes": "Desugars into a CASE inside the aggregate, so it works with every aggregate and DISTINCT."
     },
     {
       "id": "window.aggregate-over",
       "status": "supported",
       "example": "SELECT SUM(amount) OVER (PARTITION BY region) AS total FROM rows",
       "notes": "Default frame only: whole partition without OVER ordering, running with peers when ordered."
+    },
+    {
+      "id": "window.value-functions",
+      "status": "supported",
+      "example": "SELECT amount, FIRST_VALUE(amount) OVER (PARTITION BY region ORDER BY amount) AS lowest, LAST_VALUE(amount) OVER (PARTITION BY region ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS highest FROM rows",
+      "notes": "FIRST_VALUE/LAST_VALUE respect the frame; the default frame ends at the current peer group, as the standard specifies."
+    },
+    {
+      "id": "window.ntile",
+      "status": "supported",
+      "example": "SELECT amount, NTILE(2) OVER (ORDER BY amount) AS half FROM rows"
+    },
+    {
+      "id": "window.distribution",
+      "status": "supported",
+      "example": "SELECT amount, PERCENT_RANK() OVER (ORDER BY amount) AS pr, CUME_DIST() OVER (ORDER BY amount) AS cd FROM rows"
     },
     {
       "id": "window.frame",
@@ -371,6 +429,24 @@
       "status": "supported",
       "example": "SELECT amount FROM rows LIMIT 5 OFFSET 2",
       "notes": "OFFSET is accepted directly after LIMIT."
+    },
+    {
+      "id": "select.no-from",
+      "status": "supported",
+      "example": "SELECT 1 + 1 AS two, UPPER('minnow') AS name"
+    },
+    {
+      "id": "limit.parameter",
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows ORDER BY region NULLS LAST, amount LIMIT $1 OFFSET $2",
+      "params": [2, 1],
+      "notes": "LIMIT and OFFSET take placeholders; the plan re-binds per execution like any parameter."
+    },
+    {
+      "id": "offset.standalone",
+      "status": "supported",
+      "example": "SELECT amount FROM rows ORDER BY amount OFFSET 2",
+      "notes": "OFFSET no longer requires LIMIT. SQLite itself needs LIMIT -1 OFFSET n."
     },
     {
       "id": "ddl.create-table",
@@ -407,6 +483,12 @@
       "status": "supported",
       "example": "SELECT region || '-' || label AS tag FROM dims",
       "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error."
+    },
+    {
+      "id": "expression.modulo",
+      "status": "supported",
+      "example": "SELECT amount % 3 AS remainder FROM rows",
+      "notes": "Division and remainder by zero are NULL, matching SQLite."
     },
     {
       "id": "expression.cast",
@@ -448,6 +530,23 @@
       "id": "function.abs",
       "status": "supported",
       "example": "SELECT ABS(amount - 5) AS distance FROM rows"
+    },
+    {
+      "id": "function.numeric-core",
+      "status": "supported",
+      "example": "SELECT NULLIF(amount, 3) AS n, GREATEST(amount, 5) AS g, LEAST(amount, 5) AS l, FLOOR(amount) AS f, CEILING(amount) AS c, MOD(amount, 4) AS m, POWER(2, 3) AS p, SQRT(16) AS s FROM rows",
+      "notes": "GREATEST/LEAST ignore NULL arguments, matching PostgreSQL."
+    },
+    {
+      "id": "function.string-extended",
+      "status": "supported",
+      "example": "SELECT REPLACE(region, 'we', 'be') AS r, LTRIM(' x') AS lt, RTRIM('x ') AS rt, INSTR(region, 'st') AS i FROM rows WHERE region IS NOT NULL"
+    },
+    {
+      "id": "function.extract",
+      "status": "supported",
+      "example": "SELECT EXTRACT(year FROM joined) AS y, EXTRACT(dow FROM joined) AS d FROM rows WHERE joined IS NOT NULL",
+      "notes": "Fields: year, quarter, month, week (ISO), day, hour, minute, second, epoch, dow \u2014 all in UTC. SQLite spells this strftime."
     },
     {
       "id": "aggregate.distinct-argument",

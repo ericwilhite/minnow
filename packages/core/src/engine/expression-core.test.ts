@@ -169,6 +169,57 @@ describe("LAG/LEAD and frames", () => {
   });
 });
 
+describe("features SQLite cannot arbitrate", () => {
+  it("ILIKE matches case-insensitively with LIKE's 3VL", () => {
+    expect(run("SELECT id FROM rows WHERE region ILIKE 'WEST%' ORDER BY id")).toEqual([{ id: 1 }]);
+    // NULL regions drop from NOT ILIKE, like NOT LIKE.
+    expect(run("SELECT id FROM rows WHERE region NOT ILIKE 'w%' ORDER BY id")).toEqual([{ id: 3 }]);
+  });
+
+  it("GREATEST and LEAST ignore NULL arguments like PostgreSQL", () => {
+    expect(
+      run("SELECT GREATEST(1, NULL, 3) AS g, LEAST(NULL, 2, NULL) AS l FROM rows WHERE id = 1"),
+    ).toEqual([{ g: 3, l: 2 }]);
+  });
+
+  it("EXTRACT reads UTC fields including ISO week and epoch", () => {
+    expect(
+      run(
+        "SELECT EXTRACT(quarter FROM joined) AS q, EXTRACT(week FROM joined) AS w, EXTRACT(hour FROM joined) AS h FROM rows WHERE id = 1",
+      ),
+    ).toEqual([{ q: 1, w: 1, h: 3 }]);
+    expect(() => run("SELECT EXTRACT(century FROM joined) AS c FROM rows")).toThrow(
+      "Unsupported EXTRACT field",
+    );
+  });
+
+  it("rejects SQRT of negatives and non-finite POWER", () => {
+    expect(() => run("SELECT SQRT(0 - 4) AS s FROM rows")).toThrow("non-negative");
+    expect(() => run("SELECT POWER(10, 1000) AS p FROM rows")).toThrow("non-finite");
+  });
+
+  it("computes INTERSECT ALL and EXCEPT ALL with bag semantics", () => {
+    const bags = new Map<string, DatabaseRow[]>([
+      ["a", [{ v: 1 }, { v: 1 }, { v: 1 }, { v: 2 }, { v: 3 }]],
+      ["b", [{ v: 1 }, { v: 1 }, { v: 2 }, { v: 4 }]],
+    ]);
+    const intersect = compileQuery("SELECT v FROM a INTERSECT ALL SELECT v FROM b");
+    expect(executeRowQuery(intersect, bags).rows.map((row) => row.v)).toEqual([1, 1, 2]);
+    expect(executeQuery(intersect, bags).rows.map((row) => row.v)).toEqual([1, 1, 2]);
+    const except = compileQuery("SELECT v FROM a EXCEPT ALL SELECT v FROM b");
+    expect(executeRowQuery(except, bags).rows.map((row) => row.v)).toEqual([1, 3]);
+    expect(executeQuery(except, bags).rows.map((row) => row.v)).toEqual([1, 3]);
+  });
+
+  it("rejects correlated select-list scalars under grouping", () => {
+    expect(() =>
+      compileQuery(
+        "SELECT r.region AS g, SUM((SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region)) AS s FROM rows r GROUP BY r.region",
+      ),
+    ).toThrow("not supported with grouping");
+  });
+});
+
 describe("DISTINCT aggregates", () => {
   it("deduplicates before aggregating", () => {
     const duplicated = new Map<string, DatabaseRow[]>([

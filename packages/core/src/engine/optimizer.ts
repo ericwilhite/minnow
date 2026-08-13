@@ -70,7 +70,76 @@ function decorrelateBlock(block: CompiledQuery): void {
     rewritten.push(replacement ?? predicate);
   }
   block.predicates = rewritten;
+  const grouped =
+    block.groupBy.length > 0 || block.select.some((item) => containsAggregateCall(item.expression));
+  for (const item of block.select) {
+    if (!expressionHasCorrelatedSubquery(item.expression)) continue;
+    if (grouped) {
+      throw new TypeError(
+        "Correlated select-list subqueries are not supported with grouping or aggregates",
+      );
+    }
+    item.expression = rewriteCorrelatedScalars(block, item.expression, scope, nextAlias);
+  }
   assertNoCorrelation(block);
+}
+
+function containsAggregateCall(expression: Expression): boolean {
+  if (expression.kind === "call" && aggregateCallNames.has(expression.name)) return true;
+  return childExpressions(expression).some(containsAggregateCall);
+}
+
+function expressionHasCorrelatedSubquery(expression: Expression): boolean {
+  if (expression.kind === "subquery") return blockReferencesOutside(expression.block);
+  if (expression.kind === "exists") return false;
+  return childExpressions(expression).some(expressionHasCorrelatedSubquery);
+}
+
+/** Replaces correlated scalar subqueries inside one select expression with decorrelated joins. */
+function rewriteCorrelatedScalars(
+  block: CompiledQuery,
+  expression: Expression,
+  scope: ReadonlySet<string>,
+  nextAlias: () => string,
+): Expression {
+  if (expression.kind === "subquery" && blockReferencesOutside(expression.block)) {
+    return decorrelateScalarSubquery(block, expression, scope, nextAlias);
+  }
+  if (
+    expression.kind === "binary" ||
+    expression.kind === "condition" ||
+    expression.kind === "logical"
+  ) {
+    expression.left = rewriteCorrelatedScalars(block, expression.left, scope, nextAlias);
+    expression.right = rewriteCorrelatedScalars(block, expression.right, scope, nextAlias);
+    return expression;
+  }
+  if (expression.kind === "call") {
+    expression.arguments = expression.arguments.map((argument) =>
+      rewriteCorrelatedScalars(block, argument, scope, nextAlias),
+    );
+    return expression;
+  }
+  if (expression.kind === "not") {
+    expression.operand = rewriteCorrelatedScalars(block, expression.operand, scope, nextAlias);
+    return expression;
+  }
+  if (expression.kind === "case") {
+    for (const branch of expression.branches) {
+      branch.when = rewriteCorrelatedScalars(block, branch.when, scope, nextAlias);
+      branch.then = rewriteCorrelatedScalars(block, branch.then, scope, nextAlias);
+    }
+    if (expression.otherwise !== undefined) {
+      expression.otherwise = rewriteCorrelatedScalars(
+        block,
+        expression.otherwise,
+        scope,
+        nextAlias,
+      );
+    }
+    return expression;
+  }
+  return expression;
 }
 
 function correlationAliasFactory(scope: ReadonlySet<string>): () => string {
@@ -175,6 +244,23 @@ function decorrelatePredicate(
   if (scalarSide === undefined) return undefined;
   const subquery = scalarSide === "left" ? predicate.left : predicate.right;
   if (subquery.kind !== "subquery") return undefined;
+  const value = decorrelateScalarSubquery(block, subquery, scope, nextAlias);
+  return scalarSide === "left"
+    ? { left: value, operator: predicate.operator, right: predicate.right }
+    : { left: predicate.left, operator: predicate.operator, right: value };
+}
+
+/**
+ * Rewrites one correlated scalar-aggregate subquery into a left join against the grouped
+ * aggregate, returning the expression that replaces the subquery node (COUNT wraps in COALESCE
+ * so an unmatched group reads 0, matching the empty-subquery semantics).
+ */
+function decorrelateScalarSubquery(
+  block: CompiledQuery,
+  subquery: Extract<Expression, { kind: "subquery" }>,
+  scope: ReadonlySet<string>,
+  nextAlias: () => string,
+): Expression {
   const inner = subquery.block;
   const item = inner.select[0];
   const isAggregate =
@@ -216,9 +302,7 @@ function decorrelatePredicate(
     // COUNT over an empty group is 0, but the unmatched left-join side is NULL.
     value = { kind: "call", name: "COALESCE", arguments: [value, { kind: "literal", value: 0 }] };
   }
-  return scalarSide === "left"
-    ? { left: value, operator: predicate.operator, right: predicate.right }
-    : { left: predicate.left, operator: predicate.operator, right: value };
+  return value;
 }
 
 function pushCorrelationJoin(
@@ -479,6 +563,7 @@ function foldBinary(
   if (typeof leftValue === "string" || typeof rightValue === "string") return undefined;
   const left = leftValue instanceof Date ? leftValue.getTime() : leftValue;
   const right = rightValue instanceof Date ? rightValue.getTime() : rightValue;
+  if ((operator === "/" || operator === "%") && right === 0) return null;
   const result =
     operator === "+"
       ? left + right
@@ -486,7 +571,9 @@ function foldBinary(
         ? left - right
         : operator === "*"
           ? left * right
-          : left / right;
+          : operator === "%"
+            ? left % right
+            : left / right;
   return Number.isFinite(result) ? result : undefined;
 }
 

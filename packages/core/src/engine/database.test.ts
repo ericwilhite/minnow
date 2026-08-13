@@ -6720,9 +6720,11 @@ for (const implementation of implementations()) {
     await expect(
       database.execute("INSERT INTO sql_people (name, score) VALUES ('Zoe')"),
     ).rejects.toThrow("Each INSERT row must match the column list length");
+    // Division by zero is NULL (SQLite semantics); the write boundary then rejects the NULL
+    // for a non-nullable column, so the statement still fails loudly rather than corrupting.
     await expect(
       database.execute("UPDATE sql_people SET score = score / 0 WHERE score > 0"),
-    ).rejects.toThrow("UPDATE assignment produced a non-finite number");
+    ).rejects.toThrow("score[0] cannot be null");
     store.close();
   });
 }

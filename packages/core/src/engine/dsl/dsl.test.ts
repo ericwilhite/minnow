@@ -657,7 +657,7 @@ describe("mutation builders", () => {
         compileStatement("INSERT INTO notes (slug, body) VALUES ('sql-slug-2', 'x')"),
         { returning: ["missing"] },
       ),
-    ).rejects.toThrow("INSERT returning column is not in the column list: missing");
+    ).rejects.toThrow("RETURNING column does not exist: missing");
   });
 });
 

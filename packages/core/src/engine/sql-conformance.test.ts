@@ -385,6 +385,59 @@ const templates: Template[] = [
     ordered: false,
   }),
   () => ({ sql: `SELECT AVG(DISTINCT amount) AS a FROM data`, ordered: false }),
+  () => ({
+    sql: `SELECT 1 + 1 AS two, UPPER('minnow') AS name, NULLIF(2, 2) AS n`,
+    ordered: false,
+  }),
+  (rng) => ({
+    sql: `SELECT id FROM data ORDER BY id LIMIT ? OFFSET ?`,
+    params: [5 + Math.floor(rng() * 20), Math.floor(rng() * 20)],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id, id % ? AS m FROM data WHERE region IS DISTINCT FROM ? ORDER BY id`,
+    params: [2 + Math.floor(rng() * 5), pick(rng, someRegions)],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT id FROM data WHERE region IS NOT DISTINCT FROM NULL ORDER BY id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id, NULLIF(region, 'west') AS n, FLOOR(amount) AS f, CEIL(amount) AS c, MOD(id, ?) AS m, POWER(2, id % 8) AS p, SQRT(id) AS s FROM data ORDER BY id`,
+    params: [2 + Math.floor(rng() * 4)],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id, REPLACE(label, 'a', 'o') AS r, LTRIM(RTRIM('  ' || label || '  ')) AS t, INSTR(label, ?) AS i FROM data ORDER BY id`,
+    params: [pick(rng, ["a", "o", "lt", "zz"] as const)],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT region, COUNT(*) FILTER (WHERE amount > ?) AS big, SUM(amount) FILTER (WHERE active = TRUE) AS active_total FROM data GROUP BY region`,
+    params: [Math.floor(rng() * 300) / 4],
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT id, FIRST_VALUE(amount) OVER (PARTITION BY region ORDER BY id) AS first_seen, LAST_VALUE(amount) OVER (PARTITION BY region ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS final FROM data`,
+    ordered: false,
+  }),
+  (rng) => ({
+    sql: `SELECT id, NTILE(${String(2 + Math.floor(rng() * 5))}) OVER (ORDER BY id) AS bucket FROM data`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT id, PERCENT_RANK() OVER (PARTITION BY region ORDER BY amount) AS pr, CUME_DIST() OVER (PARTITION BY region ORDER BY amount) AS cd FROM data`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id, (SELECT AVG(q.amount) FROM data q WHERE q.region = d.region) AS regional FROM data d ORDER BY d.id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id, SUM(amount) FILTER (WHERE label LIKE '${pick(rng, patterns)}') OVER (PARTITION BY region ORDER BY id) AS running FROM data`,
+    ordered: false,
+  }),
 ];
 
 function buildCorpus(): Case[] {

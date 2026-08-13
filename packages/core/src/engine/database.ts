@@ -95,6 +95,8 @@ import {
   applyWindowFunctions,
   bindPlanParameters,
   bindStatementParameters,
+  DUAL_TABLE,
+  dualTableRows,
   blockHasSubqueries,
   combineUnionResults,
   compileQuery,
@@ -116,6 +118,7 @@ import {
   transparentProjectionSource,
   windowOutputType,
   type ComparisonOperator,
+  type PredicateOperator,
   type CompiledQuery,
   type CompiledStatement,
   type Expression,
@@ -1692,6 +1695,10 @@ export class MinnowDatabase {
       sources.length === 1 && sources[0]?.derived === undefined ? block : undefined;
     for (const source of sources) {
       if (source.derived !== undefined || inputs.has(source.table)) continue;
+      if (source.table === DUAL_TABLE) {
+        inputs.set(DUAL_TABLE, columnarTableFromRows(DUAL_TABLE, dualTableRows()));
+        continue;
+      }
       const table = realTables.get(source.table);
       if (table === undefined) throw new TypeError(`Unknown table: ${source.table}`);
       const requestedColumns = columns.get(table.name) ?? [];
@@ -2057,6 +2064,210 @@ export class MinnowDatabase {
     return this.runStatement(bindStatementParameters(statement, params));
   }
 
+  /**
+   * ON CONFLICT (key) DO UPDATE SET with a column subset: rows whose key exists merge only the
+   * assigned EXCLUDED columns through the keyed update path, and the rest insert. The existence
+   * read and the writes are separate steps at one snapshot, like every SQL mutation here.
+   */
+  async #mergeConflictingInsertRows(
+    statement: Extract<CompiledStatement, { kind: "insert" }>,
+    options: RunStatementOptions,
+  ): Promise<ExecuteResult> {
+    const table = await this.#findTable(statement.table);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
+      throw new TypeError(
+        `ON CONFLICT targets the table's unique key column: ${keyColumn?.name ?? "(none)"}`,
+      );
+    }
+    const keyIndex = statement.columns.indexOf(keyColumn.name);
+    if (keyIndex === -1) {
+      // Without the key in the insert list no row can conflict; run as a plain insert.
+      const { onConflict, ...plain } = statement;
+      void onConflict;
+      return this.runStatement(plain, options);
+    }
+    const assigned = statement.onConflict.columns ?? [];
+    const keyToken = (value: QueryValue): string =>
+      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+    const existing = await this.#existingInsertKeys(table, keyColumn, statement);
+    const freshRows: InsertValue[][] = [];
+    const conflictingRows: InsertValue[][] = [];
+    for (const row of statement.rows) {
+      const key = boundInsertValue(row[keyIndex] ?? null);
+      if (key !== null && existing.has(keyToken(key))) conflictingRows.push(row);
+      else freshRows.push(row);
+    }
+    let updateVersion: number | undefined;
+    if (conflictingRows.length > 0) {
+      const changes: Record<string, BatchValue[]> = {};
+      for (const name of assigned) {
+        const columnIndex = statement.columns.indexOf(name);
+        changes[name] = conflictingRows.map((row) => boundInsertValue(row[columnIndex] ?? null));
+      }
+      const keys = conflictingRows.map((row) => {
+        const value = boundInsertValue(row[keyIndex] ?? null);
+        if (value === null)
+          throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
+        return value;
+      });
+      const result = await this.updateBatch(table.name, { keys, changes });
+      updateVersion = result.version;
+    }
+    let insertResult: ExecuteResult | undefined;
+    if (freshRows.length > 0) {
+      const { onConflict, ...plain } = statement;
+      void onConflict;
+      insertResult = await this.runStatement({ ...plain, rows: freshRows }, options);
+    }
+    const insertVersion = insertResult?.kind === "insert" ? insertResult.version : undefined;
+    const returning =
+      options.returning === undefined
+        ? undefined
+        : await this.#mergedUpsertReturnedRows(
+            table,
+            keyColumn,
+            statement,
+            conflictingRows,
+            insertResult,
+            options.returning,
+          );
+    const version = insertVersion ?? updateVersion;
+    return {
+      kind: "insert",
+      table: statement.table,
+      rowCount: statement.rows.length,
+      ...(version === undefined ? {} : { version }),
+      ...(returning === undefined ? {} : { returnedRows: returning }),
+    };
+  }
+
+  /** Post-merge RETURNING: updated rows read at the snapshot with assignments applied. */
+  async #mergedUpsertReturnedRows(
+    table: TableRecord,
+    keyColumn: TableRecord["columns"][number],
+    statement: Extract<CompiledStatement, { kind: "insert" }>,
+    conflictingRows: readonly InsertValue[][],
+    insertResult: ExecuteResult | undefined,
+    returning: readonly string[] | "*",
+  ): Promise<QueryRow[]> {
+    const names = returning === "*" ? table.columns.map(({ name }) => name) : [...returning];
+    for (const name of names) {
+      if (!table.columns.some((column) => column.name === name)) {
+        throw new TypeError(`RETURNING column does not exist: ${name}`);
+      }
+    }
+    const keyIndex = statement.columns.indexOf(keyColumn.name);
+    const assigned = new Set(statement.onConflict?.columns ?? []);
+    const updatedByKey = new Map<QueryValue | string, InsertValue[]>();
+    for (const row of conflictingRows) {
+      const key = boundInsertValue(row[keyIndex] ?? null);
+      updatedByKey.set(key instanceof Date ? key.toISOString() : key, row);
+    }
+    // One snapshot read serves every updated row's unassigned columns.
+    const rowsByKey = new Map<QueryValue | string, QueryRow>();
+    if (conflictingRows.length > 0) {
+      const plan: CompiledQuery = {
+        sql: "(on conflict returning)",
+        base: { table: table.name, alias: table.name },
+        joins: [],
+        select: [...new Set([keyColumn.name, ...names])].map((name) => ({
+          expression: { kind: "column", reference: name },
+          alias: name,
+        })),
+        predicates: [
+          {
+            left: { kind: "column", reference: keyColumn.name },
+            operator: "IN",
+            right: {
+              kind: "list",
+              items: [...updatedByKey.keys()].map((value) => ({
+                kind: "literal",
+                value: typeof value === "string" || value === null ? value : (value as QueryValue),
+              })),
+            },
+          },
+        ],
+        groupBy: [],
+        having: [],
+        orderBy: [],
+      };
+      const prepared = await this.#prepareCompiledPlan(plan);
+      try {
+        for (const row of prepared.execute().rows) {
+          const key = row[keyColumn.name] ?? null;
+          rowsByKey.set(key instanceof Date ? key.toISOString() : key, row);
+        }
+      } finally {
+        prepared.close();
+      }
+    }
+    const insertedEcho =
+      insertResult?.kind === "insert" ? [...(insertResult.returnedRows ?? [])] : [];
+    const output: QueryRow[] = [];
+    for (const row of statement.rows) {
+      const key = boundInsertValue(row[keyIndex] ?? null);
+      const token = key instanceof Date ? key.toISOString() : key;
+      const updated = updatedByKey.get(token);
+      if (updated === undefined) {
+        const echoed = insertedEcho.shift();
+        if (echoed !== undefined) output.push(echoed);
+        continue;
+      }
+      const snapshot = rowsByKey.get(token) ?? {};
+      output.push(
+        Object.fromEntries(
+          names.map((name) => {
+            if (assigned.has(name)) {
+              const columnIndex = statement.columns.indexOf(name);
+              return [name, boundInsertValue(updated[columnIndex] ?? null)];
+            }
+            if (name === keyColumn.name) return [name, key];
+            return [name, snapshot[name] ?? null];
+          }),
+        ),
+      );
+    }
+    return output;
+  }
+
+  /** Existing unique keys among an insert statement's rows, read at one snapshot. */
+  async #existingInsertKeys(
+    table: TableRecord,
+    keyColumn: TableRecord["columns"][number],
+    statement: Extract<CompiledStatement, { kind: "insert" }>,
+  ): Promise<Set<string>> {
+    const keyIndex = statement.columns.indexOf(keyColumn.name);
+    const keys = statement.rows
+      .map((row) => boundInsertValue(row[keyIndex] ?? null))
+      .filter((value): value is Exclude<QueryValue, null> => value !== null);
+    if (keys.length === 0) return new Set();
+    const keyToken = (value: QueryValue): string =>
+      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+    const plan: CompiledQuery = {
+      sql: "(on conflict existence)",
+      base: { table: table.name, alias: table.name },
+      joins: [],
+      select: [{ expression: { kind: "column", reference: keyColumn.name }, alias: "key" }],
+      predicates: [
+        {
+          left: { kind: "column", reference: keyColumn.name },
+          operator: "IN",
+          right: { kind: "list", items: keys.map((value) => ({ kind: "literal", value })) },
+        },
+      ],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    };
+    const prepared = await this.#prepareCompiledPlan(plan);
+    try {
+      return new Set(prepared.execute().rows.map((row) => keyToken(row.key ?? null)));
+    } finally {
+      prepared.close();
+    }
+  }
+
   /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
   async #filterConflictingInsertRows(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
@@ -2160,6 +2371,9 @@ export class MinnowDatabase {
     if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
       statement = await this.#filterConflictingInsertRows(statement);
     }
+    if (statement.kind === "insert" && statement.onConflict?.action === "update") {
+      return this.#mergeConflictingInsertRows(statement, options);
+    }
     if (statement.kind === "insert" && statement.rows.length === 0) {
       return {
         kind: "insert",
@@ -2169,9 +2383,9 @@ export class MinnowDatabase {
       };
     }
     if (statement.kind === "insert") {
+      const table = await this.#findTable(statement.table);
       const viaUpsert = statement.onConflict?.action === "replace";
       if (viaUpsert) {
-        const table = await this.#findTable(statement.table);
         const keyColumn = getUniqueKeyColumn(table);
         if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
           throw new TypeError(
@@ -2179,32 +2393,34 @@ export class MinnowDatabase {
           );
         }
       }
+      for (const name of statement.columns) {
+        if (!table.columns.some((column) => column.name === name)) {
+          throw new TypeError(`INSERT column does not exist: ${name}`);
+        }
+      }
       const columns: Record<string, BatchValue[]> = {};
       statement.columns.forEach((column, index) => {
         columns[column] = statement.rows.map((row) => boundInsertValue(row[index] ?? null));
       });
+      // Unlisted columns pad with NULL: defaults fill their null slots engine-side, nullable
+      // columns store NULL, and a non-nullable column without a default rejects the batch.
+      for (const column of table.columns) {
+        if (!(column.name in columns)) {
+          columns[column.name] = statement.rows.map(() => null);
+        }
+      }
       const result = viaUpsert
         ? await this.upsertBatch(statement.table, { columns })
         : await this.insertBatch(statement.table, { columns });
       let returningColumns: readonly string[] | undefined;
       if (options.returning !== undefined) {
-        // A default-bearing column may be returned even when the column list omits it — the
-        // engine generated its values and reported them back.
-        const table = await this.#findTable(statement.table);
-        const defaultNames = new Set(
-          table.columns
-            .filter((column) => column.defaultValue !== undefined)
-            .map((column) => column.name),
-        );
         returningColumns =
           options.returning === "*"
-            ? table.columns
-                .map((column) => column.name)
-                .filter((name) => statement.columns.includes(name) || defaultNames.has(name))
+            ? table.columns.map((column) => column.name)
             : options.returning;
         for (const name of returningColumns) {
-          if (!statement.columns.includes(name) && !defaultNames.has(name)) {
-            throw new TypeError(`INSERT returning column is not in the column list: ${name}`);
+          if (!table.columns.some((column) => column.name === name)) {
+            throw new TypeError(`RETURNING column does not exist: ${name}`);
           }
         }
       }
@@ -2354,6 +2570,7 @@ export class MinnowDatabase {
     return (
       options.executionMemoryBudgetBytes !== undefined &&
       options.spillToStorage !== false &&
+      plan.base.table !== DUAL_TABLE &&
       plan.base.derived === undefined &&
       plan.base.union === undefined &&
       plan.base.windowed === undefined &&
@@ -7832,18 +8049,13 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     const column = table.columns.find((candidate) => candidate.name === name);
     return column?.type === "number" || column?.type === "datetime" ? column : undefined;
   };
+  const comparisons = new Set<ComparisonOperator>(["=", "!=", "<>", ">", ">=", "<", "<="]);
+  const asComparison = (operator: PredicateOperator): ComparisonOperator | undefined =>
+    comparisons.has(operator as ComparisonOperator) ? (operator as ComparisonOperator) : undefined;
   for (const predicate of plan.predicates) {
-    if (
-      predicate.operator === "IN" ||
-      predicate.operator === "NOT IN" ||
-      predicate.operator === "IS NULL" ||
-      predicate.operator === "IS NOT NULL" ||
-      predicate.operator === "LIKE" ||
-      predicate.operator === "NOT LIKE" ||
-      predicate.operator === "IS TRUE"
-    ) {
-      continue;
-    }
+    // Zone-map pruning understands plain comparisons only; every other operator scans.
+    const comparisonOperator = asComparison(predicate.operator);
+    if (comparisonOperator === undefined) continue;
     const leftColumn =
       predicate.left.kind === "column" ? resolveColumn(predicate.left.reference) : undefined;
     const rightColumn =
@@ -7863,7 +8075,7 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
     output.push({
       column,
       operator:
-        leftColumn === undefined ? reverseComparison(predicate.operator) : predicate.operator,
+        leftColumn === undefined ? reverseComparison(comparisonOperator) : comparisonOperator,
       value,
     });
   }
@@ -8646,8 +8858,9 @@ function collectRealTableNames(plan: CompiledQuery): string[] {
         excluded.add(source.recursive.reference);
         walk(source.recursive.base);
         walk(source.recursive.step);
-      } else if (source.derived === undefined) names.add(source.table);
-      else walk(source.derived);
+      } else if (source.derived === undefined) {
+        if (source.table !== DUAL_TABLE) names.add(source.table);
+      } else walk(source.derived);
     }
     for (const item of block.select) walkExpression(item.expression);
     block.groupBy.forEach(walkExpression);

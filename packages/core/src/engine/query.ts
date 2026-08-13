@@ -51,7 +51,7 @@ export interface QueryExecutionOptions {
   readonly executionMemoryBudgetBytes?: number;
 }
 
-export type BinaryOperator = "+" | "-" | "*" | "/" | "||";
+export type BinaryOperator = "+" | "-" | "*" | "/" | "%" | "||";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
 export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
 export type ScalarFunctionName =
@@ -63,7 +63,20 @@ export type ScalarFunctionName =
   | "LENGTH"
   | "ABS"
   | "TRIM"
+  | "LTRIM"
+  | "RTRIM"
   | "SUBSTR"
+  | "REPLACE"
+  | "INSTR"
+  | "NULLIF"
+  | "GREATEST"
+  | "LEAST"
+  | "FLOOR"
+  | "CEIL"
+  | "MOD"
+  | "POWER"
+  | "SQRT"
+  | "EXTRACT"
   | "CAST";
 
 export const scalarFunctionNames: ReadonlySet<string> = new Set([
@@ -75,7 +88,20 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "LENGTH",
   "ABS",
   "TRIM",
+  "LTRIM",
+  "RTRIM",
   "SUBSTR",
+  "REPLACE",
+  "INSTR",
+  "NULLIF",
+  "GREATEST",
+  "LEAST",
+  "FLOOR",
+  "CEIL",
+  "MOD",
+  "POWER",
+  "SQRT",
+  "EXTRACT",
   "CAST",
 ] satisfies ScalarFunctionName[]);
 
@@ -154,9 +180,71 @@ export function scalarFunctionValue(
   values: readonly unknown[],
 ): unknown {
   if (name === "DATE_TRUNC") return dateTruncValue(values[0], values[1]);
+  if (name === "GREATEST" || name === "LEAST") {
+    // NULL arguments are ignored, matching PostgreSQL; all-NULL yields NULL.
+    let best: unknown;
+    for (const value of values) {
+      if (value === null || value === undefined) continue;
+      if (
+        best === undefined ||
+        (name === "GREATEST" ? compareValues(value, best) > 0 : compareValues(value, best) < 0)
+      ) {
+        best = value;
+      }
+    }
+    return best ?? null;
+  }
   const first = values[0];
   if (first === null || first === undefined) return null;
   switch (name) {
+    case "NULLIF": {
+      const other = values[1];
+      if (other === null || other === undefined) return first;
+      return comparable(first) === comparable(other) ? null : first;
+    }
+    case "FLOOR":
+      return Math.floor(numeric(first));
+    case "CEIL":
+      return Math.ceil(numeric(first));
+    case "MOD": {
+      if (values[1] === null || values[1] === undefined) return null;
+      const divisor = numeric(values[1]);
+      return divisor === 0 ? null : numeric(first) % divisor;
+    }
+    case "POWER": {
+      if (values[1] === null || values[1] === undefined) return null;
+      const raised = numeric(first) ** numeric(values[1]);
+      if (!Number.isFinite(raised)) throw new TypeError("POWER produced a non-finite number");
+      return raised;
+    }
+    case "SQRT": {
+      const operand = numeric(first);
+      if (operand < 0) throw new TypeError("SQRT requires a non-negative number");
+      return Math.sqrt(operand);
+    }
+    case "LTRIM":
+      return stringArgument("LTRIM", first).replace(/^ +/, "");
+    case "RTRIM":
+      return stringArgument("RTRIM", first).replace(/ +$/, "");
+    case "REPLACE": {
+      if (values[1] === null || values[1] === undefined) return null;
+      if (values[2] === null || values[2] === undefined) return null;
+      const search = stringArgument("REPLACE", values[1]);
+      if (search === "") return stringArgument("REPLACE", first);
+      return stringArgument("REPLACE", first)
+        .split(search)
+        .join(stringArgument("REPLACE", values[2]));
+    }
+    case "INSTR": {
+      if (values[1] === null || values[1] === undefined) return null;
+      const haystack = stringArgument("INSTR", first);
+      const needle = stringArgument("INSTR", values[1]);
+      const index = haystack.indexOf(needle);
+      // 1-based character position, 0 when absent, counting codepoints like LENGTH.
+      return index === -1 ? 0 : Array.from(haystack.slice(0, index)).length + 1;
+    }
+    case "EXTRACT":
+      return extractDatePart(typeof first === "string" ? first : "", values[1]);
     case "ROUND": {
       if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
       const digits = values.length > 1 ? numeric(values[1]) : 0;
@@ -315,7 +403,17 @@ export type Expression =
     };
 
 export type WindowFunctionName =
-  "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD" | AggregateName;
+  | "ROW_NUMBER"
+  | "RANK"
+  | "DENSE_RANK"
+  | "PERCENT_RANK"
+  | "CUME_DIST"
+  | "NTILE"
+  | "LAG"
+  | "LEAD"
+  | "FIRST_VALUE"
+  | "LAST_VALUE"
+  | AggregateName;
 
 export interface WindowFrameBound {
   kind: "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
@@ -353,7 +451,9 @@ export function windowOutputType(
     window.name === "MIN" ||
     window.name === "MAX" ||
     window.name === "LAG" ||
-    window.name === "LEAD";
+    window.name === "LEAD" ||
+    window.name === "FIRST_VALUE" ||
+    window.name === "LAST_VALUE";
   if (carries && window.argumentAlias !== undefined) {
     return innerSchema.find(({ name }) => name === window.argumentAlias)?.type ?? "number";
   }
@@ -387,7 +487,8 @@ export interface JoinPlan extends TableSource {
   full?: boolean;
 }
 
-export type SetOperator = "union" | "union all" | "intersect" | "except";
+export type SetOperator =
+  "union" | "union all" | "intersect" | "intersect all" | "except" | "except all";
 
 /**
  * A WITH RECURSIVE source: the base block seeds the working set, then the step block re-executes
@@ -412,6 +513,10 @@ export type PredicateOperator =
   | "IS NOT NULL"
   | "LIKE"
   | "NOT LIKE"
+  | "ILIKE"
+  | "NOT ILIKE"
+  | "IS DISTINCT FROM"
+  | "IS NOT DISTINCT FROM"
   | "IS TRUE";
 
 export interface Predicate {
@@ -439,11 +544,23 @@ export interface CompiledQuery {
   }>;
   limit?: number;
   offset?: number;
+  /** Parameter slots for LIMIT ? / OFFSET ?; binding resolves them into limit/offset. */
+  limitParameter?: number;
+  offsetParameter?: number;
   /**
    * Number of `?`/`$n` placeholders in the whole statement; set only on the top-level plan.
    * A plan with placeholders must pass through bindPlanParameters before it prepares.
    */
   parameterCount?: number;
+}
+
+/** ORDER BY / LIMIT / OFFSET tail of a select or set operation. */
+export interface SelectTail {
+  orderBy: CompiledQuery["orderBy"];
+  limit?: number;
+  offset?: number;
+  limitParameter?: number;
+  offsetParameter?: number;
 }
 
 type RowContext = Record<string, DatabaseRow | undefined>;
@@ -460,6 +577,18 @@ interface Token {
    */
   start: number;
   end: number;
+}
+
+/**
+ * The virtual one-row source behind a FROM-less SELECT. The name cannot collide with a real
+ * table (parentheses never survive identifier parsing unquoted), and its single hidden column
+ * keeps the row alive through columnar conversion, which derives row count from column vectors.
+ */
+export const DUAL_TABLE = "(dual)";
+
+/** The dual source's single row, shared by every resolution path. */
+export function dualTableRows(): DatabaseRow[] {
+  return [{ [DUAL_TABLE]: 1 }];
 }
 
 const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
@@ -568,10 +697,16 @@ export type CompiledStatement =
       /** INSERT ... SELECT source; `rows` is then empty and fills at execution. */
       query?: CompiledQuery;
       /**
-       * ON CONFLICT (column) DO NOTHING skips rows whose key exists; "replace" is
-       * DO UPDATE SET with every inserted column drawn from EXCLUDED — whole-row upsert.
+       * ON CONFLICT (column) DO NOTHING skips rows whose key exists. DO UPDATE SET with every
+       * inserted column drawn from EXCLUDED is "replace" (whole-row upsert); a subset is
+       * "update", which merges only the listed columns into existing rows.
        */
-      onConflict?: { column: string; action: "nothing" | "replace" };
+      onConflict?: {
+        column: string;
+        action: "nothing" | "replace" | "update";
+        /** The EXCLUDED columns a partial DO UPDATE merges; present only for "update". */
+        columns?: string[];
+      };
       returning?: string[] | "*";
       parameterCount?: number;
     }
@@ -841,6 +976,7 @@ export function containsParameter(expression: Expression): boolean {
 }
 
 export function blockHasParameters(block: CompiledQuery): boolean {
+  if (block.limitParameter !== undefined || block.offsetParameter !== undefined) return true;
   const expressions: Expression[] = [];
   forEachBlockExpression(block, (expression) => expressions.push(expression));
   return (
@@ -935,6 +1071,14 @@ function bindExpression(expression: Expression, values: readonly QueryValue[]): 
 }
 
 function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
+  if (block.limitParameter !== undefined) {
+    block.limit = validateLimit(numeric(values[block.limitParameter] ?? null));
+    delete block.limitParameter;
+  }
+  if (block.offsetParameter !== undefined) {
+    block.offset = validateOffset(numeric(values[block.offsetParameter] ?? null));
+    delete block.offsetParameter;
+  }
   for (const item of block.select) item.expression = bindExpression(item.expression, values);
   for (const predicate of [...block.predicates, ...block.having]) {
     predicate.left = bindExpression(predicate.left, values);
@@ -1142,10 +1286,38 @@ export function inferBlockSchema(
     if (expression.name === "COUNT" || expression.name === "SUM" || expression.name === "AVG") {
       return "number";
     }
-    if (expression.name === "ROUND" || expression.name === "LENGTH" || expression.name === "ABS") {
+    if (
+      expression.name === "ROUND" ||
+      expression.name === "LENGTH" ||
+      expression.name === "ABS" ||
+      expression.name === "FLOOR" ||
+      expression.name === "CEIL" ||
+      expression.name === "MOD" ||
+      expression.name === "POWER" ||
+      expression.name === "SQRT" ||
+      expression.name === "INSTR" ||
+      expression.name === "EXTRACT"
+    ) {
       return "number";
     }
     if (expression.name === "DATE_TRUNC") return "datetime";
+    if (
+      expression.name === "NULLIF" ||
+      expression.name === "GREATEST" ||
+      expression.name === "LEAST"
+    ) {
+      // The output carries the arguments' common type, like COALESCE.
+      let resolved: SqlColumnType | "null" = "null";
+      for (const argument of expression.arguments) {
+        const type = infer(argument);
+        if (type === "null") continue;
+        if (resolved !== "null" && resolved !== type) {
+          throw new TypeError(`${expression.name} arguments must produce one value type`);
+        }
+        resolved = type;
+      }
+      return resolved;
+    }
     if (expression.name === "CAST") {
       const target = expression.arguments[1];
       const word =
@@ -1160,6 +1332,9 @@ export function inferBlockSchema(
       expression.name === "UPPER" ||
       expression.name === "LOWER" ||
       expression.name === "TRIM" ||
+      expression.name === "LTRIM" ||
+      expression.name === "RTRIM" ||
+      expression.name === "REPLACE" ||
       expression.name === "SUBSTR"
     ) {
       const argument = expression.arguments[0];
@@ -1276,11 +1451,23 @@ function rowTableSearchableColumns(
   };
 }
 
+/** LIMIT/OFFSET placeholders never reach an executor: unresolved ones would silently no-op. */
+function assertTailParametersBound(plan: CompiledQuery): void {
+  const check = (block: CompiledQuery): void => {
+    if (block.limitParameter !== undefined || block.offsetParameter !== undefined) {
+      throw new TypeError("LIMIT/OFFSET placeholders are unbound; pass parameters when executing");
+    }
+    forEachNestedBlock(block, check);
+  };
+  check(plan);
+}
+
 export function createPreparedQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
   options: QueryExecutionOptions = {},
 ): PreparedQuery {
+  assertTailParametersBound(plan);
   validateGrouping(plan);
   // Every engine entry expands MATCH(*) exactly once, here against the row tables' own
   // columns; past this point no executor sees the "*" sentinel.
@@ -1465,6 +1652,21 @@ export function combineUnionResults(
     }
     if (op === "union") {
       combined = dedupe([...combined, ...next]);
+      continue;
+    }
+    if (op === "intersect all" || op === "except all") {
+      // Bag semantics: each right-side occurrence consumes at most one left-side occurrence.
+      const counts = new Map<string, number>();
+      for (const row of next) {
+        const key = encode(row);
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      combined = combined.filter((row) => {
+        const key = encode(row);
+        const remaining = counts.get(key) ?? 0;
+        if (remaining > 0) counts.set(key, remaining - 1);
+        return op === "intersect all" ? remaining > 0 : remaining === 0;
+      });
       continue;
     }
     // INTERSECT and EXCEPT return distinct left-side rows filtered by right-side membership.
@@ -1811,6 +2013,10 @@ function applyAggregateWindowPartition(
     let value: unknown;
     if (high <= low) {
       value = window.name === "COUNT" ? 0 : null;
+    } else if (window.name === "FIRST_VALUE") {
+      value = values[low] ?? null;
+    } else if (window.name === "LAST_VALUE") {
+      value = values[high - 1] ?? null;
     } else if (window.name === "COUNT") {
       value =
         window.argumentAlias === undefined
@@ -1838,6 +2044,61 @@ function applyAggregateWindowPartition(
     }
     const row = rows[indexes[start + position] ?? -1];
     if (row !== undefined) row[window.alias] = asQueryValue(value);
+  }
+}
+
+/**
+ * NTILE, PERCENT_RANK, and CUME_DIST over partition-sorted row indexes. NTILE deals rows into
+ * `offset` buckets with the larger buckets first; PERCENT_RANK is (rank - 1) / (rows - 1) with a
+ * lone row at 0; CUME_DIST is the fraction of partition rows at or before the current peer group.
+ */
+function applyDistributionWindow(
+  rows: QueryRow[],
+  indexes: readonly number[],
+  window: WindowSpec,
+  samePartition: (left: number, right: number) => boolean,
+  sameOrderKeys: (left: number, right: number) => boolean,
+): void {
+  let start = 0;
+  while (start < indexes.length) {
+    let end = start + 1;
+    while (end < indexes.length && samePartition(indexes[start] ?? 0, indexes[end] ?? 0)) {
+      end += 1;
+    }
+    const size = end - start;
+    let groupBegin = 0;
+    const assign = (position: number, value: number): void => {
+      const row = rows[indexes[start + position] ?? -1];
+      if (row !== undefined) row[window.alias] = value;
+    };
+    for (let position = 1; position <= size; position += 1) {
+      if (
+        position === size ||
+        !sameOrderKeys(indexes[start + groupBegin] ?? 0, indexes[start + position] ?? 0)
+      ) {
+        for (let member = groupBegin; member < position; member += 1) {
+          if (window.name === "PERCENT_RANK") {
+            assign(member, size === 1 ? 0 : groupBegin / (size - 1));
+          } else if (window.name === "CUME_DIST") {
+            assign(member, position / size);
+          }
+        }
+        groupBegin = position;
+      }
+    }
+    if (window.name === "NTILE") {
+      const buckets = window.offset ?? 1;
+      const bucketSize = Math.floor(size / buckets);
+      const remainder = size % buckets;
+      let position = 0;
+      for (let bucket = 1; bucket <= buckets && position < size; bucket += 1) {
+        const width = bucketSize + (bucket <= remainder ? 1 : 0);
+        for (let member = 0; member < width && position < size; member += 1, position += 1) {
+          assign(position, bucket);
+        }
+      }
+    }
+    start = end;
   }
 }
 
@@ -1942,6 +2203,10 @@ export function applyWindowFunctions(
       applyOffsetWindow(rows, indexes, window, samePartition);
       continue;
     }
+    if (window.name === "NTILE" || window.name === "PERCENT_RANK" || window.name === "CUME_DIST") {
+      applyDistributionWindow(rows, indexes, window, samePartition, sameOrderKeys);
+      continue;
+    }
     if (window.name !== "ROW_NUMBER" && window.name !== "RANK" && window.name !== "DENSE_RANK") {
       applyAggregateWindow(rows, indexes, window, samePartition, sameOrderKeys);
       continue;
@@ -1980,7 +2245,11 @@ function resolveDerivedRowTables(
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): ReadonlyMap<string, DatabaseRow[]> {
   const sources = [plan.base, ...plan.joins];
+  const needsDual = sources.some(
+    (source) => source.derived === undefined && source.table === DUAL_TABLE,
+  );
   if (
+    !needsDual &&
     !sources.some(
       (source) =>
         source.derived !== undefined ||
@@ -1992,6 +2261,7 @@ function resolveDerivedRowTables(
     return tables;
   }
   const resolved = new Map(tables);
+  if (needsDual) resolved.set(DUAL_TABLE, dualTableRows());
   for (const source of sources) {
     if (source.recursive !== undefined) {
       const { reference, base, step, all } = source.recursive;
@@ -2047,6 +2317,7 @@ export function executeRowQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {
+  assertTailParametersBound(plan);
   validateGrouping(plan);
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
@@ -2350,7 +2621,9 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       if (expression.operator === "+") return a + b;
       if (expression.operator === "-") return a - b;
       if (expression.operator === "*") return a * b;
-      return a / b;
+      // Division and remainder by zero are NULL, matching SQLite, not Infinity/NaN.
+      if (b === 0) return null;
+      return expression.operator === "%" ? a % b : a / b;
     }
     case "call": {
       if (aggregateNames.has(expression.name as AggregateName)) {
@@ -2501,8 +2774,9 @@ export function cachedListMembership(
 const likeCache = new Map<string, RegExp>();
 
 /** Compiles a LIKE pattern (% = any run, _ = any character) to an anchored RegExp, cached. */
-export function likeRegExp(pattern: string): RegExp {
-  const cached = likeCache.get(pattern);
+export function likeRegExp(pattern: string, caseInsensitive = false): RegExp {
+  const key = caseInsensitive ? `i ${pattern}` : pattern;
+  const cached = likeCache.get(key);
   if (cached !== undefined) return cached;
   let source = "^";
   for (const character of pattern) {
@@ -2511,10 +2785,73 @@ export function likeRegExp(pattern: string): RegExp {
     else source += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
   source += "$";
-  const regExp = new RegExp(source);
+  const regExp = new RegExp(source, caseInsensitive ? "i" : "");
   if (likeCache.size >= 128) likeCache.clear();
-  likeCache.set(pattern, regExp);
+  likeCache.set(key, regExp);
   return regExp;
+}
+
+const extractFields: ReadonlySet<string> = new Set([
+  "year",
+  "quarter",
+  "month",
+  "week",
+  "day",
+  "hour",
+  "minute",
+  "second",
+  "epoch",
+  "dow",
+]);
+
+/**
+ * EXTRACT(field FROM datetime), in UTC. `week` is the ISO 8601 week number and `dow` counts
+ * 0 = Sunday through 6 = Saturday, both matching PostgreSQL; `epoch` is fractional seconds.
+ */
+function extractDatePart(field: string, value: unknown): number | null {
+  const normalized = field.toLowerCase();
+  if (!extractFields.has(normalized)) {
+    throw new TypeError(`Unsupported EXTRACT field: ${field}`);
+  }
+  if (value === null || value === undefined) return null;
+  if (!(value instanceof Date)) throw new TypeError("EXTRACT requires a datetime value");
+  switch (normalized) {
+    case "year":
+      return value.getUTCFullYear();
+    case "quarter":
+      return Math.floor(value.getUTCMonth() / 3) + 1;
+    case "month":
+      return value.getUTCMonth() + 1;
+    case "week": {
+      const date = new Date(
+        Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()),
+      );
+      // ISO week: shift to the Thursday of this week, then count weeks from January 1st.
+      date.setUTCDate(date.getUTCDate() + 4 - (date.getUTCDay() || 7));
+      const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
+      return Math.ceil(((date.getTime() - yearStart) / 86_400_000 + 1) / 7);
+    }
+    case "day":
+      return value.getUTCDate();
+    case "hour":
+      return value.getUTCHours();
+    case "minute":
+      return value.getUTCMinutes();
+    case "second":
+      return value.getUTCSeconds();
+    case "epoch":
+      return value.getTime() / 1000;
+    default:
+      return value.getUTCDay();
+  }
+}
+
+/** Null-safe distinctness: NULL is not distinct from NULL, and distinct from every value. */
+export function distinctFromComparison(left: unknown, right: unknown): boolean {
+  const leftNull = left === null || left === undefined;
+  const rightNull = right === null || right === undefined;
+  if (leftNull || rightNull) return leftNull !== rightNull;
+  return comparable(left) !== comparable(right);
 }
 
 /**
@@ -2570,7 +2907,12 @@ export function evaluateBooleanExpression(
       if (sawNull) return null;
       return operator === "NOT IN";
     }
-    if (operator === "LIKE" || operator === "NOT LIKE") {
+    if (
+      operator === "LIKE" ||
+      operator === "NOT LIKE" ||
+      operator === "ILIKE" ||
+      operator === "NOT ILIKE"
+    ) {
       const value = evaluateValue(expression.left);
       const pattern = evaluateValue(expression.right);
       if (value === null || value === undefined || pattern === null || pattern === undefined) {
@@ -2579,8 +2921,17 @@ export function evaluateBooleanExpression(
       if (typeof value !== "string" || typeof pattern !== "string") {
         throw new TypeError("LIKE requires string operands");
       }
-      const matched = likeRegExp(pattern).test(value);
-      return operator === "LIKE" ? matched : !matched;
+      const matched = likeRegExp(pattern, operator === "ILIKE" || operator === "NOT ILIKE").test(
+        value,
+      );
+      return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
+    }
+    if (operator === "IS DISTINCT FROM" || operator === "IS NOT DISTINCT FROM") {
+      const distinct = distinctFromComparison(
+        evaluateValue(expression.left),
+        evaluateValue(expression.right),
+      );
+      return operator === "IS DISTINCT FROM" ? distinct : !distinct;
     }
     const left = evaluateValue(expression.left);
     const right = evaluateValue(expression.right);
@@ -2610,6 +2961,30 @@ function comparisonHolds(
   if (operator === "IS NOT NULL") return leftValue !== null && leftValue !== undefined;
   if (operator === "IN" || operator === "NOT IN") {
     throw new TypeError("IN is only supported in WHERE predicates");
+  }
+  if (operator === "IS DISTINCT FROM") return distinctFromComparison(leftValue, rightValue);
+  if (operator === "IS NOT DISTINCT FROM") return !distinctFromComparison(leftValue, rightValue);
+  if (
+    operator === "LIKE" ||
+    operator === "NOT LIKE" ||
+    operator === "ILIKE" ||
+    operator === "NOT ILIKE"
+  ) {
+    if (
+      leftValue === null ||
+      leftValue === undefined ||
+      rightValue === null ||
+      rightValue === undefined
+    ) {
+      return false;
+    }
+    if (typeof leftValue !== "string" || typeof rightValue !== "string") {
+      throw new TypeError("LIKE requires string operands");
+    }
+    const matched = likeRegExp(rightValue, operator === "ILIKE" || operator === "NOT ILIKE").test(
+      leftValue,
+    );
+    return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
   }
   if (
     leftValue === null ||
@@ -2872,7 +3247,10 @@ class Parser {
           } else ops.push("union");
         } else {
           this.#keyword("EXCEPT");
-          ops.push("except");
+          if (this.#isKeyword("ALL")) {
+            this.#keyword("ALL");
+            ops.push("except all");
+          } else ops.push("except");
         }
         members.push(this.#setTerm("(union member)"));
       }
@@ -2889,7 +3267,10 @@ class Parser {
     const ops: SetOperator[] = [];
     while (this.#isKeyword("INTERSECT")) {
       this.#keyword("INTERSECT");
-      ops.push("intersect");
+      if (this.#isKeyword("ALL")) {
+        this.#keyword("ALL");
+        ops.push("intersect all");
+      } else ops.push("intersect");
       members.push(this.#unionMember("(intersect member)"));
     }
     return { block: this.#compoundBlock(sql, members, ops), parenthesized: false };
@@ -2914,30 +3295,32 @@ class Parser {
     // unparenthesized last member the clause was greedily parsed into that member and lifts
     // out; after a parenthesized member it is still unparsed.
     const last = members[members.length - 1];
-    let orderBy: CompiledQuery["orderBy"];
-    let limit: number | undefined;
-    let offset: number | undefined;
+    let tail: SelectTail;
     if (last !== undefined && !last.parenthesized) {
-      orderBy = last.block.orderBy;
-      limit = last.block.limit;
-      offset = last.block.offset;
+      tail = {
+        orderBy: last.block.orderBy,
+        ...(last.block.limit === undefined ? {} : { limit: last.block.limit }),
+        ...(last.block.offset === undefined ? {} : { offset: last.block.offset }),
+        ...(last.block.limitParameter === undefined
+          ? {}
+          : { limitParameter: last.block.limitParameter }),
+        ...(last.block.offsetParameter === undefined
+          ? {}
+          : { offsetParameter: last.block.offsetParameter }),
+      };
       last.block.orderBy = [];
       delete last.block.limit;
       delete last.block.offset;
+      delete last.block.limitParameter;
+      delete last.block.offsetParameter;
     } else {
-      orderBy = this.#orderByClause();
-      limit = this.#limitClause();
-      offset = this.#offsetClause(limit);
+      tail = { orderBy: this.#orderByClause(), ...this.#limitClause(), ...this.#offsetClause() };
     }
     return compoundSelectBlock(
       sql,
       members.map((member) => member.block),
       ops,
-      {
-        orderBy,
-        ...(limit === undefined ? {} : { limit }),
-        ...(offset === undefined ? {} : { offset }),
-      },
+      tail,
       this.nextDerivedSequence,
     );
   }
@@ -3111,7 +3494,11 @@ class Parser {
   }
 
   #onConflictClause(columns: readonly string[]): {
-    onConflict?: { column: string; action: "nothing" | "replace" };
+    onConflict?: {
+      column: string;
+      action: "nothing" | "replace" | "update";
+      columns?: string[];
+    };
   } {
     if (!this.#isKeyword("ON")) return {};
     this.#keyword("ON");
@@ -3140,24 +3527,24 @@ class Parser {
       if (assigned.has(target)) {
         throw new TypeError(`ON CONFLICT DO UPDATE sets a column twice: ${target}`);
       }
+      if (target === column) {
+        throw new TypeError("ON CONFLICT DO UPDATE cannot reassign the conflict key");
+      }
       assigned.add(target);
       if (!this.#punctuation(",")) break;
-    }
-    // Anything short of every inserted column would need merge-update semantics; the engine's
-    // upsert replaces whole rows, so the statement must be explicit about that.
-    for (const name of columns) {
-      if (name !== column && !assigned.has(name)) {
-        throw new TypeError(
-          `ON CONFLICT DO UPDATE must set every inserted column from EXCLUDED; missing: ${name}`,
-        );
-      }
     }
     for (const name of assigned) {
       if (!columns.includes(name)) {
         throw new TypeError(`ON CONFLICT DO UPDATE sets a column that is not inserted: ${name}`);
       }
     }
-    return { onConflict: { column, action: "replace" } };
+    // Every inserted column assigned is a whole-row upsert; a subset merges into existing rows.
+    const complete = columns.every((name) => name === column || assigned.has(name));
+    return {
+      onConflict: complete
+        ? { column, action: "replace" }
+        : { column, action: "update", columns: [...assigned] },
+    };
   }
 
   /** RETURNING * or RETURNING col, ... — the engine's runStatement implements the semantics. */
@@ -3281,17 +3668,24 @@ class Parser {
     return orderBy;
   }
 
-  #limitClause(): number | undefined {
-    if (!this.#isKeyword("LIMIT")) return undefined;
+  #limitClause(): { limit?: number; limitParameter?: number } {
+    if (!this.#isKeyword("LIMIT")) return {};
     this.#keyword("LIMIT");
-    return validateLimit(Number(this.#take("number").text));
+    if (this.#peek().kind === "parameter") {
+      const parameter = this.#parameterExpression();
+      return parameter.kind === "parameter" ? { limitParameter: parameter.index } : {};
+    }
+    return { limit: validateLimit(Number(this.#take("number").text)) };
   }
 
-  /** OFFSET is only accepted directly after LIMIT, matching the LIMIT n OFFSET m dialect form. */
-  #offsetClause(limit: number | undefined): number | undefined {
-    if (limit === undefined || !this.#isKeyword("OFFSET")) return undefined;
+  #offsetClause(): { offset?: number; offsetParameter?: number } {
+    if (!this.#isKeyword("OFFSET")) return {};
     this.#keyword("OFFSET");
-    return validateOffset(Number(this.#take("number").text));
+    if (this.#peek().kind === "parameter") {
+      const parameter = this.#parameterExpression();
+      return parameter.kind === "parameter" ? { offsetParameter: parameter.index } : {};
+    }
+    return { offset: validateOffset(Number(this.#take("number").text)) };
   }
 
   #selectBlock(sql: string): CompiledQuery {
@@ -3302,8 +3696,17 @@ class Parser {
       distinct = true;
     }
     const select = this.#selectList();
-    this.#keyword("FROM");
-    let base = this.#source();
+    let base: TableSource;
+    if (this.#isKeyword("FROM")) {
+      this.#keyword("FROM");
+      base = this.#source();
+    } else {
+      // A FROM-less SELECT evaluates its expressions over the one-row dual source.
+      if (select.some((item) => item.expression.kind === "wildcard")) {
+        throw new TypeError("SELECT * requires a FROM clause");
+      }
+      base = { table: DUAL_TABLE, alias: DUAL_TABLE };
+    }
     const joins: JoinPlan[] = [];
     let rightJoins = 0;
     while (
@@ -3415,8 +3818,6 @@ class Parser {
       having.push(...splitCondition(this.#expression()));
     }
     const orderBy = this.#orderByClause();
-    const limit = this.#limitClause();
-    const offset = this.#offsetClause(limit);
     return assembleSelectBlock(
       {
         sql,
@@ -3428,8 +3829,8 @@ class Parser {
         groupBy,
         having,
         orderBy,
-        ...(limit === undefined ? {} : { limit }),
-        ...(offset === undefined ? {} : { offset }),
+        ...this.#limitClause(),
+        ...this.#offsetClause(),
       },
       this.nextDerivedSequence,
     );
@@ -3594,25 +3995,45 @@ class Parser {
     const left = this.#additive();
     if (this.#isKeyword("IS")) {
       this.#keyword("IS");
-      let operator: PredicateOperator = "IS NULL";
+      let negatedIs = false;
       if (this.#isKeyword("NOT")) {
         this.#keyword("NOT");
-        operator = "IS NOT NULL";
+        negatedIs = true;
+      }
+      if (this.#isKeyword("DISTINCT")) {
+        this.#keyword("DISTINCT");
+        this.#keyword("FROM");
+        return {
+          kind: "condition",
+          operator: negatedIs ? "IS NOT DISTINCT FROM" : "IS DISTINCT FROM",
+          left,
+          right: this.#additive(),
+        };
       }
       const token = this.#peek();
       if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
         throw new TypeError(`Expected NULL, found ${token.text || "end of query"}`);
       }
       this.#identifier();
-      return { kind: "condition", operator, left, right: { kind: "literal", value: null } };
+      return {
+        kind: "condition",
+        operator: negatedIs ? "IS NOT NULL" : "IS NULL",
+        left,
+        right: { kind: "literal", value: null },
+      };
     }
     // After a value expression, NOT can only introduce NOT BETWEEN / NOT IN / NOT LIKE.
     let negated = false;
     if (this.#isKeyword("NOT")) {
       this.#keyword("NOT");
       negated = true;
-      if (!this.#isKeyword("BETWEEN") && !this.#isKeyword("IN") && !this.#isKeyword("LIKE")) {
-        throw new TypeError(`Expected BETWEEN, IN, or LIKE after NOT`);
+      if (
+        !this.#isKeyword("BETWEEN") &&
+        !this.#isKeyword("IN") &&
+        !this.#isKeyword("LIKE") &&
+        !this.#isKeyword("ILIKE")
+      ) {
+        throw new TypeError(`Expected BETWEEN, IN, LIKE, or ILIKE after NOT`);
       }
     }
     if (this.#isKeyword("BETWEEN")) {
@@ -3650,6 +4071,11 @@ class Parser {
       const operator: PredicateOperator = negated ? "NOT LIKE" : "LIKE";
       return { kind: "condition", operator, left, right: this.#additive() };
     }
+    if (this.#isKeyword("ILIKE")) {
+      this.#keyword("ILIKE");
+      const operator: PredicateOperator = negated ? "NOT ILIKE" : "ILIKE";
+      return { kind: "condition", operator, left, right: this.#additive() };
+    }
     const token = this.#peek();
     if (token.kind === "operator" && ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)) {
       const operator = this.#comparison();
@@ -3664,7 +4090,7 @@ class Parser {
       const operator = this.#peek().text;
       // || binds loosest, matching PostgreSQL: concatenation applies to whole arithmetic terms.
       const precedence =
-        operator === "*" || operator === "/"
+        operator === "*" || operator === "/" || operator === "%"
           ? 20
           : operator === "+" || operator === "-"
             ? 10
@@ -3798,6 +4224,19 @@ class Parser {
         query: queryToken.text,
       };
     }
+    if (upper === "EXTRACT" && this.#peek().text === "(") {
+      this.#expectPunctuation("(");
+      const field = this.#identifier();
+      this.#keyword("FROM");
+      const operand = this.#expression();
+      this.#expectPunctuation(")");
+      // EXTRACT rides the call machinery: the field travels as a literal first argument.
+      return {
+        kind: "call",
+        name: "EXTRACT",
+        arguments: [{ kind: "literal", value: field.toLowerCase() }, operand],
+      };
+    }
     if (upper === "CAST" && this.#peek().text === "(") {
       this.#expectPunctuation("(");
       const operand = this.#expression();
@@ -3817,7 +4256,13 @@ class Parser {
       return { kind: "literal", value: date };
     }
     if (this.#punctuation("(")) {
-      if (upper === "ROW_NUMBER" || upper === "RANK" || upper === "DENSE_RANK") {
+      if (
+        upper === "ROW_NUMBER" ||
+        upper === "RANK" ||
+        upper === "DENSE_RANK" ||
+        upper === "PERCENT_RANK" ||
+        upper === "CUME_DIST"
+      ) {
         this.#expectPunctuation(")");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
@@ -3825,6 +4270,51 @@ class Parser {
           throw new TypeError(`${upper} does not take a window frame`);
         }
         return { kind: "window", name: upper, partitionBy, orderBy };
+      }
+      if (upper === "NTILE") {
+        const bucketExpression = this.#expression();
+        this.#expectPunctuation(")");
+        if (
+          bucketExpression.kind !== "literal" ||
+          typeof bucketExpression.value !== "number" ||
+          !Number.isInteger(bucketExpression.value) ||
+          bucketExpression.value < 1
+        ) {
+          throw new TypeError("NTILE requires a positive integer bucket count");
+        }
+        this.#keyword("OVER");
+        const { partitionBy, orderBy, frame } = this.#overClause();
+        if (frame !== undefined) throw new TypeError("NTILE does not take a window frame");
+        if (orderBy.length === 0) {
+          throw new TypeError("NTILE requires ORDER BY inside OVER (...)");
+        }
+        return {
+          kind: "window",
+          name: "NTILE",
+          partitionBy,
+          orderBy,
+          offset: bucketExpression.value,
+        };
+      }
+      if (upper === "FIRST_VALUE" || upper === "LAST_VALUE") {
+        const argument = this.#expression();
+        this.#expectPunctuation(")");
+        if (argument.kind === "wildcard") {
+          throw new TypeError(`${upper} requires a value argument`);
+        }
+        this.#keyword("OVER");
+        const { partitionBy, orderBy, frame } = this.#overClause();
+        if (orderBy.length === 0) {
+          throw new TypeError(`${upper} requires ORDER BY inside OVER (...)`);
+        }
+        return {
+          kind: "window",
+          name: upper,
+          partitionBy,
+          orderBy,
+          argument,
+          ...(frame === undefined ? {} : { frame }),
+        };
       }
       if (upper === "LAG" || upper === "LEAD") {
         const lagArgs: Expression[] = [];
@@ -3879,8 +4369,9 @@ class Parser {
           ...(fallback === null ? {} : { fallback }),
         };
       }
-      // SUBSTRING is the standard spelling; SUBSTR is the canonical plan name for both.
-      const name = (upper === "SUBSTRING" ? "SUBSTR" : upper) as AggregateName | ScalarFunctionName;
+      // SUBSTRING/CEILING are the standard spellings; SUBSTR/CEIL are the canonical plan names.
+      const name = (upper === "SUBSTRING" ? "SUBSTR" : upper === "CEILING" ? "CEIL" : upper) as
+        AggregateName | ScalarFunctionName;
       if (!aggregateNames.has(name as AggregateName) && !scalarFunctionNames.has(name))
         throw new TypeError(`Unsupported function: ${identifier}`);
       let distinct = false;
@@ -3909,11 +4400,28 @@ class Parser {
         (name === "UPPER" ||
           name === "LOWER" ||
           name === "TRIM" ||
+          name === "LTRIM" ||
+          name === "RTRIM" ||
           name === "LENGTH" ||
-          name === "ABS") &&
+          name === "ABS" ||
+          name === "FLOOR" ||
+          name === "CEIL" ||
+          name === "SQRT") &&
         args.length !== 1
       ) {
         throw new TypeError(`${name} requires exactly one argument`);
+      }
+      if (
+        (name === "NULLIF" || name === "MOD" || name === "POWER" || name === "INSTR") &&
+        args.length !== 2
+      ) {
+        throw new TypeError(`${name} requires exactly two arguments`);
+      }
+      if ((name === "GREATEST" || name === "LEAST") && args.length < 1) {
+        throw new TypeError(`${name} requires at least one argument`);
+      }
+      if (name === "REPLACE" && args.length !== 3) {
+        throw new TypeError("REPLACE requires a string, a search, and a replacement");
       }
       if (name === "SUBSTR" && (args.length < 2 || args.length > 3))
         throw new TypeError("SUBSTR requires a string, a start, and an optional length");
@@ -3928,6 +4436,27 @@ class Parser {
         ) {
           throw new TypeError(`Unsupported DATE_TRUNC unit: ${unit.value}`);
         }
+      }
+      if (aggregateNames.has(name as AggregateName) && this.#isKeyword("FILTER")) {
+        // FILTER (WHERE cond) desugars into the aggregate's argument: rows failing the filter
+        // contribute NULL, which every aggregate skips — COUNT(*) counts a CASE over 1.
+        this.#keyword("FILTER");
+        this.#expectPunctuation("(");
+        this.#keyword("WHERE");
+        const condition = this.#expression();
+        this.#expectPunctuation(")");
+        if (hasAggregate(condition)) {
+          throw new TypeError("FILTER conditions cannot contain aggregates");
+        }
+        const argument = args[0];
+        const kept: Expression =
+          argument === undefined || argument.kind === "wildcard"
+            ? { kind: "literal", value: 1 }
+            : argument;
+        args.splice(0, args.length, {
+          kind: "case",
+          branches: [{ when: condition, then: kept }],
+        });
       }
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("OVER")) {
         if (distinct) throw new TypeError("DISTINCT window aggregates are not supported");
@@ -4128,6 +4657,8 @@ export interface SelectBlockParts {
   orderBy: CompiledQuery["orderBy"];
   limit?: number;
   offset?: number;
+  limitParameter?: number;
+  offsetParameter?: number;
 }
 
 /** Validates and assembles one select block, applying every parser desugar. */
@@ -4183,7 +4714,7 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
   const { full, kind, left, right, ...joinSource } = join;
   void full;
   void kind;
-  const { limit, offset, ...blockParts } = parts;
+  const { limit, offset, limitParameter, offsetParameter, ...blockParts } = parts;
   const baseSide = expressionAliases(left).has(join.alias) ? right : left;
   const matched = assembleSelectBlock(
     {
@@ -4216,6 +4747,8 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
       orderBy: parts.orderBy,
       ...(limit === undefined ? {} : { limit }),
       ...(offset === undefined ? {} : { offset }),
+      ...(limitParameter === undefined ? {} : { limitParameter }),
+      ...(offsetParameter === undefined ? {} : { offsetParameter }),
     },
     nextSequence,
   );
@@ -4233,6 +4766,7 @@ export function assembleSelectBlock(
     return assembleOrderByExpressionBlock(parts, nextSequence);
   }
   const { sql, base, joins, select, distinct, predicates, having, orderBy, limit, offset } = parts;
+  const { limitParameter, offsetParameter } = parts;
   const groupBy = [...parts.groupBy];
   if (distinct) {
     if (select.some((item) => item.expression.kind === "wildcard"))
@@ -4284,6 +4818,8 @@ export function assembleSelectBlock(
     orderBy,
     ...(limit === undefined ? {} : { limit }),
     ...(offset === undefined ? {} : { offset }),
+    ...(limitParameter === undefined ? {} : { limitParameter }),
+    ...(offsetParameter === undefined ? {} : { offsetParameter }),
   };
   const distinctCounts = select.filter(
     (item) => item.expression.kind === "call" && item.expression.distinct === true,
@@ -4340,7 +4876,7 @@ export function compoundSelectBlock(
   sql: string,
   blocks: CompiledQuery[],
   ops: SetOperator[],
-  tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
+  tail: SelectTail,
   nextSequence: () => number,
 ): CompiledQuery {
   // Set-operation output columns are the first member's, so ordinals resolve against them.
@@ -4533,7 +5069,7 @@ function desugarDistinctCount(
   select: SelectItem[],
   predicates: Predicate[],
   groupBy: Expression[],
-  tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
+  tail: SelectTail,
   nextSequence: () => number,
 ): CompiledQuery {
   const distinctAlias = "(distinct 1)";
@@ -4604,7 +5140,7 @@ function desugarWindows(
   predicates: Predicate[],
   groupBy: Expression[],
   having: Predicate[],
-  tail: { orderBy: CompiledQuery["orderBy"]; limit?: number; offset?: number },
+  tail: SelectTail,
   nextSequence: () => number,
 ): CompiledQuery {
   if (
@@ -4818,7 +5354,7 @@ function tokenize(sql: string): Token[] {
       index += 2;
       continue;
     }
-    if (["+", "-", "*", "/", "=", ">", "<"].includes(character))
+    if (["+", "-", "*", "/", "%", "=", ">", "<"].includes(character))
       tokens.push({ kind: "operator", text: character, start: index, end: index + 1 });
     else if (["(", ")", ",", "."].includes(character))
       tokens.push({ kind: "punctuation", text: character, start: index, end: index + 1 });

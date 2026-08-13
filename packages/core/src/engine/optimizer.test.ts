@@ -38,10 +38,11 @@ describe("deterministic plan rewrites", () => {
     expect(renderPlan(optimized)).toBe(
       ["select bumped: (amount + 2)", "  from table rows", "  where amount > 5"].join("\n"),
     );
+    // Division by zero is NULL (SQLite semantics), so the fold produces a NULL literal.
     const division = optimizePlan(
       compileQuery("SELECT amount FROM rows WHERE amount > 1 / 0", { optimize: false }),
     );
-    expect(renderPlan(division)).toContain("where amount > (1 / 0)");
+    expect(renderPlan(division)).toContain("where amount > null");
     expectEquivalent("SELECT ROUND(2.345, 2) AS folded, amount FROM rows WHERE amount > 2 + 3");
   });
 

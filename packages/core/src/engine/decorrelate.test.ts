@@ -112,10 +112,31 @@ describe("correlated subquery decorrelation", () => {
     ).toThrow("use NOT EXISTS");
   });
 
-  it("rejects correlated subqueries outside top-level WHERE conjuncts", () => {
+  it("answers correlated scalar aggregates in the select list", () => {
+    expect(
+      run(
+        "SELECT r.amount, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS a FROM rows r WHERE r.region = 'west'",
+      ),
+    ).toEqual([
+      { amount: 10, a: 8 },
+      { amount: 6, a: 8 },
+    ]);
+  });
+
+  it("orders by a correlated scalar via the hidden select-item desugar", () => {
+    // ORDER BY expressions hoist into hidden select items before decorrelation, so a
+    // correlated ordering key rides the same rewrite as a visible select item.
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE r.region IS NOT NULL ORDER BY (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region), r.amount",
+      ),
+    ).toEqual([{ amount: 3 }, { amount: 6 }, { amount: 10 }]);
+  });
+
+  it("rejects correlated subqueries outside supported positions", () => {
     expect(() =>
       compileQuery(
-        "SELECT (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS a FROM rows r",
+        "SELECT r.region AS g, COUNT(*) AS c FROM rows r GROUP BY r.region HAVING COUNT(*) > (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region)",
       ),
     ).toThrow("top-level WHERE");
     expect(() =>
