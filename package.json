@@ -15,11 +15,12 @@
     "test": "npm run build && vitest run",
     "test:browser": "npm run build && playwright test",
     "test:library-browser": "tsc -b packages/core && playwright test --config playwright.library.config.ts",
+    "test:site": "tsc -b packages/core && playwright test --config playwright.site.config.ts",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "check": "npm run format && npm run typecheck && npm run lint && npm test",
-    "check:release": "npm run check && npm run test:library-browser && npm run test:browser"
+    "check:release": "npm run check && npm run test:library-browser && npm run test:site && npm run test:browser"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

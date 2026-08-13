@@ -44,7 +44,13 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node } },
   },
   {
-    files: ["apps/bench/src/engines/**/*.ts", "apps/bench/vite.config.ts"],
+    // Bench engines compare against SQLite/PGlite on purpose; the site test server is a
+    // Node process that never ships.
+    files: [
+      "apps/bench/src/engines/**/*.ts",
+      "apps/bench/vite.config.ts",
+      "apps/site/tests/serve-dist.mjs",
+    ],
     rules: { "no-restricted-imports": "off" },
   },
 );
