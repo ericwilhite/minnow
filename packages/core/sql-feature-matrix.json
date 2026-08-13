@@ -374,10 +374,9 @@
     },
     {
       "id": "ddl.create-table",
-      "status": "unsupported",
-      "example": "CREATE TABLE t (id INTEGER)",
-      "error": "Expected SELECT",
-      "notes": "Schema management is a programmatic API."
+      "status": "supported",
+      "example": "CREATE TABLE made (id INTEGER PRIMARY KEY, label TEXT NOT NULL, at TIMESTAMP)",
+      "notes": "Standard type names map onto the four logical types (widths parse and are ignored); one PRIMARY KEY or UNIQUE column becomes the unique key. Dropping or altering tables stays a programmatic concern."
     },
     {
       "id": "mutation.update-keyless",
@@ -390,7 +389,7 @@
       "id": "transaction.begin",
       "status": "unsupported",
       "example": "BEGIN",
-      "error": "Expected SELECT",
+      "error": "Expected SELECT, found BEGIN",
       "notes": "Transactions are a programmatic API."
     },
     {

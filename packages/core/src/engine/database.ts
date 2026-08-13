@@ -519,6 +519,7 @@ export interface QuerySpillCleanupResult {
 
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
+  | { kind: "create-table"; table: string }
   | {
       kind: "insert";
       table: string;
@@ -2140,6 +2141,14 @@ export class MinnowDatabase {
   ): Promise<ExecuteResult> {
     if (statement.kind === "select") {
       return { kind: "rows", result: await this.query(statement.sql) };
+    }
+    if (statement.kind === "create-table") {
+      await this.createTable({
+        name: statement.table,
+        columns: statement.columns,
+        ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
+      });
+      return { kind: "create-table", table: statement.table };
     }
     // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
     if (statement.returning !== undefined && options.returning === undefined) {

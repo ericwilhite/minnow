@@ -353,6 +353,27 @@ interface Token {
   end: number;
 }
 
+const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
+  ["BOOLEAN", "boolean"],
+  ["BOOL", "boolean"],
+  ["INTEGER", "number"],
+  ["INT", "number"],
+  ["BIGINT", "number"],
+  ["SMALLINT", "number"],
+  ["REAL", "number"],
+  ["FLOAT", "number"],
+  ["NUMERIC", "number"],
+  ["DECIMAL", "number"],
+  ["TEXT", "string"],
+  ["VARCHAR", "string"],
+  ["CHAR", "string"],
+  ["STRING", "string"],
+  ["TIMESTAMP", "datetime"],
+  ["TIMESTAMPTZ", "datetime"],
+  ["DATETIME", "datetime"],
+  ["DATE", "datetime"],
+]);
+
 const clauseKeywords = new Set([
   "WHERE",
   "GROUP",
@@ -459,6 +480,13 @@ export type CompiledStatement =
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       returning?: string[] | "*";
       parameterCount?: number;
+    }
+  | {
+      kind: "create-table";
+      table: string;
+      columns: Array<{ name: string; type: SqlColumnType; nullable?: boolean }>;
+      uniqueKey?: string;
+      parameterCount?: number;
     };
 
 /**
@@ -479,6 +507,10 @@ export function compileStatement(sql: string): CompiledStatement {
       const statement = parser.parseMutation(keyword);
       if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
       return statement;
+    }
+    if (keyword === "CREATE") {
+      parser = new Parser(tokens);
+      return parser.parseCreateTable();
     }
     const plan = compileQuery(text);
     return plan.parameterCount === undefined
@@ -852,6 +884,9 @@ export function bindStatementParameters(
   if (count === 0) return statement;
   if (statement.kind === "select") {
     throw new TypeError("SELECT parameters bind through the query pipeline, not the statement");
+  }
+  if (statement.kind === "create-table") {
+    throw new TypeError("DDL statements take no parameters");
   }
   const values = params ?? [];
   const clone = structuredClone(statement);
@@ -2676,6 +2711,87 @@ class Parser {
       },
       this.nextDerivedSequence,
     );
+  }
+
+  /**
+   * CREATE TABLE name (col TYPE [PRIMARY KEY | UNIQUE] [NOT NULL | NULL], ...). Standard type
+   * names map onto the engine's four logical types; widths in parentheses parse and are
+   * ignored, because numeric widths and encodings are the engine's job, not schema choices.
+   */
+  parseCreateTable(): CompiledStatement {
+    this.#keyword("CREATE");
+    this.#keyword("TABLE");
+    const table = this.#identifier();
+    this.#expectPunctuation("(");
+    const columns: Array<{ name: string; type: SqlColumnType; nullable?: boolean }> = [];
+    let uniqueKey: string | undefined;
+    for (;;) {
+      const name = this.#identifier();
+      const type = this.#columnType();
+      let nullable = true;
+      for (;;) {
+        if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
+          if (this.#isKeyword("PRIMARY")) {
+            this.#keyword("PRIMARY");
+            this.#keyword("KEY");
+          } else {
+            this.#keyword("UNIQUE");
+          }
+          if (uniqueKey !== undefined) {
+            throw new TypeError("CREATE TABLE supports one unique key column");
+          }
+          uniqueKey = name;
+          nullable = false;
+          continue;
+        }
+        if (this.#isKeyword("NOT")) {
+          this.#keyword("NOT");
+          const token = this.#peek();
+          if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
+            throw new TypeError(`Expected NULL after NOT, found ${token.text || "end of input"}`);
+          }
+          this.#identifier();
+          nullable = false;
+          continue;
+        }
+        if (this.#isKeyword("NULL")) {
+          this.#keyword("NULL");
+          nullable = true;
+          continue;
+        }
+        break;
+      }
+      columns.push({ name, type, ...(nullable ? { nullable: true } : {}) });
+      if (!this.#punctuation(",")) break;
+    }
+    this.#expectPunctuation(")");
+    this.#take("eof");
+    if (new Set(columns.map((column) => column.name)).size !== columns.length) {
+      throw new TypeError("CREATE TABLE column names must be unique");
+    }
+    return {
+      kind: "create-table",
+      table,
+      columns,
+      ...(uniqueKey === undefined ? {} : { uniqueKey }),
+    };
+  }
+
+  #columnType(): SqlColumnType {
+    const word = this.#identifier().toUpperCase();
+    if (word === "DOUBLE") {
+      this.#keyword("PRECISION");
+      return "number";
+    }
+    const mapped = createTableTypeNames.get(word);
+    if (mapped === undefined) throw new TypeError(`Unsupported column type: ${word}`);
+    // A width like VARCHAR(80) or NUMERIC(10, 2) parses and is discarded.
+    if (this.#punctuation("(")) {
+      this.#take("number");
+      if (this.#punctuation(",")) this.#take("number");
+      this.#expectPunctuation(")");
+    }
+    return mapped;
   }
 
   parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {

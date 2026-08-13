@@ -66,7 +66,7 @@ describe("SQL feature matrix conformance", () => {
   });
 
   for (const feature of features.filter(({ status }) => status === "supported")) {
-    if (feature.id.startsWith("mutation.")) {
+    if (feature.id.startsWith("mutation.") || feature.id.startsWith("ddl.")) {
       it(`executes supported ${feature.id}`, async () => {
         const database = await keyedDatabase();
         const result = await database.execute(feature.example, feature.params);
@@ -83,7 +83,11 @@ describe("SQL feature matrix conformance", () => {
   for (const feature of features.filter(({ status }) => status === "unsupported")) {
     it(`rejects unsupported ${feature.id} explicitly`, async () => {
       const error = feature.error ?? "";
-      if (feature.id.startsWith("mutation.") || feature.id.startsWith("transaction.")) {
+      if (
+        feature.id.startsWith("mutation.") ||
+        feature.id.startsWith("transaction.") ||
+        feature.id.startsWith("ddl.")
+      ) {
         const database = await keyedDatabase();
         await expect(database.execute(feature.example)).rejects.toThrow(error);
         return;

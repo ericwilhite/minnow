@@ -54,7 +54,11 @@ const fixtureTables = new Map([
 ]);
 
 function usesDatabase(feature: MatrixFeature): boolean {
-  return feature.id.startsWith("mutation.") || feature.id.startsWith("transaction.");
+  return (
+    feature.id.startsWith("mutation.") ||
+    feature.id.startsWith("transaction.") ||
+    feature.id.startsWith("ddl.")
+  );
 }
 
 export function validateFeaturePayload(value: unknown): FeatureSuitePayload {
@@ -235,6 +239,7 @@ const fixtureTeardown = [
   `DROP TABLE IF EXISTS "rows"`,
   `DROP TABLE IF EXISTS "dims"`,
   `DROP TABLE IF EXISTS "keyed"`,
+  `DROP TABLE IF EXISTS "made"`,
 ];
 
 async function sqliteRunner(): Promise<FeatureRunner> {

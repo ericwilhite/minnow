@@ -72,6 +72,40 @@ describe("INSERT ... SELECT", () => {
   });
 });
 
+describe("CREATE TABLE", () => {
+  it("creates a table with mapped types, nullability, and a unique key", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const created = await database.execute(
+      "CREATE TABLE made (id INTEGER PRIMARY KEY, label VARCHAR(80) NOT NULL, at TIMESTAMP, ok BOOLEAN)",
+    );
+    expect(created).toEqual({ kind: "create-table", table: "made" });
+    const inserted = await database.execute(
+      "INSERT INTO made (id, label, at, ok) VALUES (1, 'x', NULL, TRUE) RETURNING *",
+    );
+    expect(inserted).toMatchObject({
+      kind: "insert",
+      returnedRows: [{ id: 1, label: "x", at: null, ok: true }],
+    });
+    const [table] = await database.listTables();
+    expect(table?.columns.map(({ name, type }) => `${name}:${type}`)).toEqual([
+      "id:number",
+      "label:string",
+      "at:datetime",
+      "ok:boolean",
+    ]);
+  });
+
+  it("rejects unknown types and duplicate unique keys", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await expect(database.execute("CREATE TABLE bad (x JSONB)")).rejects.toThrow(
+      "Unsupported column type: JSONB",
+    );
+    await expect(
+      database.execute("CREATE TABLE bad (a INTEGER PRIMARY KEY, b TEXT UNIQUE)"),
+    ).rejects.toThrow("one unique key column");
+  });
+});
+
 describe("ON CONFLICT", () => {
   it("DO NOTHING skips existing keys and returns only inserted rows", async () => {
     const database = await seeded();
