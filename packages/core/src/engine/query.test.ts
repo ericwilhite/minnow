@@ -655,14 +655,13 @@ describe("public SQL queries", () => {
         input,
       ),
     ).toThrow("A scalar subquery must select exactly one column");
+    // Equality-correlated subqueries decorrelate at compile time (see decorrelate.test.ts);
+    // correlation anywhere but a top-level WHERE conjunct stays an explicit compile error.
     expect(() =>
-      executeRowQuery(
-        compileQuery(
-          "SELECT region FROM rows r WHERE amount IN (SELECT amount FROM rows q WHERE q.amount = r.amount)",
-        ),
-        input,
+      compileQuery(
+        "SELECT region FROM rows r WHERE amount > 0 OR amount IN (SELECT amount FROM rows q WHERE q.amount = r.amount)",
       ),
-    ).toThrow("Unknown table alias: r");
+    ).toThrow("top-level WHERE");
     expect(() => compileQuery("SELECT region FROM rows WHERE region IN (*)")).toThrow(
       "IN lists accept only scalar expressions",
     );

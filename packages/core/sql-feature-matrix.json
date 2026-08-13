@@ -272,9 +272,29 @@
     },
     {
       "id": "subquery.correlated",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT region FROM rows r WHERE amount > (SELECT AVG(amount) FROM rows q WHERE q.region = r.region)",
-      "error": "Unknown table alias"
+      "notes": "Equality-correlated subqueries decorrelate into derived-table joins at compile time; both executors run plain joins."
+    },
+    {
+      "id": "subquery.correlated-exists",
+      "status": "supported",
+      "example": "SELECT amount FROM rows r WHERE EXISTS (SELECT region FROM dims d WHERE d.region = r.region)",
+      "notes": "EXISTS joins the subquery's distinct correlation keys; NOT EXISTS becomes a left join checked with IS NULL."
+    },
+    {
+      "id": "subquery.correlated-non-equi",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows r WHERE EXISTS (SELECT region FROM dims d WHERE d.amount > r.amount)",
+      "error": "support only equality conditions",
+      "notes": "Correlation must be a plain equality between one inner and one outer qualified column."
+    },
+    {
+      "id": "subquery.correlated-not-in",
+      "status": "unsupported",
+      "example": "SELECT region FROM rows r WHERE region NOT IN (SELECT d.region FROM dims d WHERE d.region = r.region)",
+      "error": "use NOT EXISTS",
+      "notes": "Correlated NOT IN has NULL semantics that the join rewrite cannot preserve; NOT EXISTS expresses the intent."
     },
     {
       "id": "cte.recursive",

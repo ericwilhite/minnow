@@ -298,6 +298,34 @@ const templates: Template[] = [
     params: [Math.floor(rng() * 800) / 4],
     ordered: false,
   }),
+  (rng) => ({
+    sql: `SELECT d.id AS id FROM data d WHERE EXISTS (SELECT m.region FROM dims m WHERE m.region = d.region AND m.rank <= ?) ORDER BY d.id`,
+    params: [1 + Math.floor(rng() * 4)],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id FROM data d WHERE NOT EXISTS (SELECT m.region FROM dims m WHERE m.region = d.region AND m.rank <= ?) ORDER BY d.id`,
+    params: [1 + Math.floor(rng() * 4)],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id FROM data d WHERE d.amount > (SELECT AVG(q.amount) FROM data q WHERE q.region = d.region) ORDER BY d.id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id FROM data d WHERE (SELECT COUNT(*) FROM data q WHERE q.region = d.region AND q.amount > ?) >= ? ORDER BY d.id`,
+    params: [Math.floor(rng() * 300) / 4, Math.floor(rng() * 12)],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id FROM data d WHERE d.amount IN (SELECT q.amount FROM data q WHERE q.region = d.region AND q.active = ${rng() < 0.5 ? "TRUE" : "FALSE"}) ORDER BY d.id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id FROM data d WHERE EXISTS (SELECT q.id FROM data q WHERE q.region = d.region AND q.label = d.label AND q.amount > ?) ORDER BY d.id`,
+    params: [Math.floor(rng() * 300) / 4],
+    ordered: true,
+  }),
 ];
 
 function buildCorpus(): Case[] {

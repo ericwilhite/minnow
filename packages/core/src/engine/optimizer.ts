@@ -1,4 +1,7 @@
 import {
+  childExpressions,
+  forEachBlockExpression,
+  forEachNestedBlock,
   scalarFunctionNames,
   type CompiledQuery,
   type Expression,
@@ -20,6 +23,7 @@ export function optimizePlan(plan: CompiledQuery): CompiledQuery {
 }
 
 function optimizeBlock(block: CompiledQuery): void {
+  decorrelateBlock(block);
   for (const source of [block.base, ...block.joins]) {
     if (source.derived !== undefined) optimizeBlock(source.derived);
     source.union?.blocks.forEach(optimizeBlock);
@@ -33,6 +37,336 @@ function optimizeBlock(block: CompiledQuery): void {
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
+}
+
+// --- Correlated subquery decorrelation ----------------------------------------------------------
+//
+// A subquery that references the enclosing block's aliases rewrites into a derived-table join:
+// EXISTS becomes an inner join against the subquery's distinct correlation keys, NOT EXISTS a
+// left join plus IS NULL, IN an inner join carrying the compared value, and a scalar aggregate
+// a left join against the grouped aggregate (COUNT wraps in COALESCE for the empty group).
+// Only equality correlation on alias-qualified references is supported, and only in top-level
+// WHERE conjuncts; every other correlated shape fails with an explicit error. Decorrelation runs
+// at compile time, so both executors see plain joins and never a correlated node.
+
+interface CorrelationKey {
+  inner: Expression;
+  outer: Expression;
+}
+
+const comparisonOperators = new Set(["=", "!=", "<>", ">", ">=", "<", "<="]);
+const aggregateCallNames = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
+
+function decorrelateBlock(block: CompiledQuery): void {
+  const scope = new Set([block.base.alias, ...block.joins.map((join) => join.alias)]);
+  const nextAlias = correlationAliasFactory(scope);
+  const rewritten: Predicate[] = [];
+  for (const predicate of block.predicates) {
+    const replacement = decorrelatePredicate(block, predicate, scope, nextAlias);
+    if (replacement === "consumed") continue;
+    rewritten.push(replacement ?? predicate);
+  }
+  block.predicates = rewritten;
+  assertNoCorrelation(block);
+}
+
+function correlationAliasFactory(scope: ReadonlySet<string>): () => string {
+  let sequence = 0;
+  return () => {
+    for (;;) {
+      sequence += 1;
+      const alias = `corr_${String(sequence)}`;
+      if (!scope.has(alias)) return alias;
+    }
+  };
+}
+
+function decorrelatePredicate(
+  block: CompiledQuery,
+  predicate: Predicate,
+  scope: ReadonlySet<string>,
+  nextAlias: () => string,
+): Predicate | "consumed" | undefined {
+  // EXISTS / NOT EXISTS as a bare WHERE conjunct.
+  if (predicate.operator === "IS TRUE") {
+    let node = predicate.left;
+    let negated = false;
+    while (node.kind === "not") {
+      negated = !negated;
+      node = node.operand;
+    }
+    if (node.kind !== "exists") return undefined;
+    if (node.negated) negated = !negated;
+    const inner = node.block;
+    if (!blockReferencesOutside(inner)) return undefined;
+    rejectGroupedInner(inner, "EXISTS");
+    guardWildcard(block);
+    const keys = extractCorrelation(inner, scope, "EXISTS");
+    const alias = nextAlias();
+    const derived: CompiledQuery = {
+      sql: "(correlated exists)",
+      base: inner.base,
+      joins: inner.joins,
+      select: keys.map((key, index) => ({ expression: key.inner, alias: `k${String(index)}` })),
+      predicates: inner.predicates,
+      // Grouping by the keys deduplicates, so the join multiplies no outer row. The parser's
+      // injected LIMIT 1 and any ORDER BY are dropped: existence ignores both.
+      groupBy: keys.map((key) => key.inner),
+      having: [],
+      orderBy: [],
+    };
+    pushCorrelationJoin(block, alias, derived, keys, negated ? "left" : "inner");
+    if (!negated) return "consumed";
+    return {
+      left: { kind: "column", reference: `${alias}.k0` },
+      operator: "IS NULL",
+      right: { kind: "literal", value: null },
+    };
+  }
+  // outer IN (correlated subquery)
+  if (
+    (predicate.operator === "IN" || predicate.operator === "NOT IN") &&
+    predicate.right.kind === "subquery"
+  ) {
+    const inner = predicate.right.block;
+    if (!blockReferencesOutside(inner)) return undefined;
+    if (predicate.operator === "NOT IN") {
+      throw new TypeError("Correlated NOT IN subqueries are not supported; use NOT EXISTS");
+    }
+    rejectGroupedInner(inner, "IN");
+    const item = inner.select[0];
+    if (inner.select.length !== 1 || item === undefined || item.expression.kind === "wildcard") {
+      throw new TypeError("An IN subquery must select exactly one column");
+    }
+    guardWildcard(block);
+    const keys = extractCorrelation(inner, scope, "IN");
+    const alias = nextAlias();
+    const derived: CompiledQuery = {
+      sql: "(correlated in)",
+      base: inner.base,
+      joins: inner.joins,
+      select: [
+        ...keys.map((key, index) => ({ expression: key.inner, alias: `k${String(index)}` })),
+        { expression: item.expression, alias: "v" },
+      ],
+      predicates: inner.predicates,
+      groupBy: [...keys.map((key) => key.inner), item.expression],
+      having: [],
+      orderBy: [],
+    };
+    pushCorrelationJoin(block, alias, derived, keys, "inner");
+    return {
+      left: predicate.left,
+      operator: "=",
+      right: { kind: "column", reference: `${alias}.v` },
+    };
+  }
+  // comparison against a correlated scalar aggregate
+  if (!comparisonOperators.has(predicate.operator)) return undefined;
+  const scalarSide =
+    predicate.left.kind === "subquery" && blockReferencesOutside(predicate.left.block)
+      ? "left"
+      : predicate.right.kind === "subquery" && blockReferencesOutside(predicate.right.block)
+        ? "right"
+        : undefined;
+  if (scalarSide === undefined) return undefined;
+  const subquery = scalarSide === "left" ? predicate.left : predicate.right;
+  if (subquery.kind !== "subquery") return undefined;
+  const inner = subquery.block;
+  const item = inner.select[0];
+  const isAggregate =
+    item?.expression.kind === "call" && aggregateCallNames.has(item.expression.name);
+  if (inner.select.length !== 1 || item === undefined || !isAggregate) {
+    throw new TypeError(
+      "A correlated scalar subquery must select exactly one aggregate expression",
+    );
+  }
+  if (
+    inner.groupBy.length > 0 ||
+    inner.having.length > 0 ||
+    inner.orderBy.length > 0 ||
+    inner.limit !== undefined
+  ) {
+    throw new TypeError(
+      "A correlated scalar subquery cannot use GROUP BY, HAVING, ORDER BY, or LIMIT",
+    );
+  }
+  guardWildcard(block);
+  const keys = extractCorrelation(inner, scope, "scalar");
+  const alias = nextAlias();
+  const derived: CompiledQuery = {
+    sql: "(correlated scalar)",
+    base: inner.base,
+    joins: inner.joins,
+    select: [
+      ...keys.map((key, index) => ({ expression: key.inner, alias: `k${String(index)}` })),
+      { expression: item.expression, alias: "v" },
+    ],
+    predicates: inner.predicates,
+    groupBy: keys.map((key) => key.inner),
+    having: [],
+    orderBy: [],
+  };
+  pushCorrelationJoin(block, alias, derived, keys, "left");
+  let value: Expression = { kind: "column", reference: `${alias}.v` };
+  if (item.expression.kind === "call" && item.expression.name === "COUNT") {
+    // COUNT over an empty group is 0, but the unmatched left-join side is NULL.
+    value = { kind: "call", name: "COALESCE", arguments: [value, { kind: "literal", value: 0 }] };
+  }
+  return scalarSide === "left"
+    ? { left: value, operator: predicate.operator, right: predicate.right }
+    : { left: predicate.left, operator: predicate.operator, right: value };
+}
+
+function pushCorrelationJoin(
+  block: CompiledQuery,
+  alias: string,
+  derived: CompiledQuery,
+  keys: CorrelationKey[],
+  kind: "inner" | "left",
+): void {
+  const source = { table: alias, alias, derived };
+  const keyReference = (index: number): Expression => ({
+    kind: "column",
+    reference: `${alias}.k${String(index)}`,
+  });
+  const first = keys[0];
+  if (keys.length === 1 && first !== undefined) {
+    block.joins.push({ ...source, kind, left: first.outer, right: keyReference(0) });
+    return;
+  }
+  let on: Expression | undefined;
+  keys.forEach((key, index) => {
+    const equality: Expression = {
+      kind: "condition",
+      operator: "=",
+      left: key.outer,
+      right: keyReference(index),
+    };
+    on =
+      on === undefined ? equality : { kind: "logical", operator: "and", left: on, right: equality };
+  });
+  block.joins.push({
+    ...source,
+    kind,
+    left: { kind: "literal", value: null },
+    right: { kind: "literal", value: null },
+    ...(on === undefined ? {} : { on }),
+  });
+}
+
+function blockReferencesOutside(block: CompiledQuery): boolean {
+  const refs: string[] = [];
+  collectOutsideReferences(block, new Set(), refs);
+  return refs.length > 0;
+}
+
+/** Collects qualified column references whose alias no enclosing scope inside `block` defines. */
+function collectOutsideReferences(
+  block: CompiledQuery,
+  outer: ReadonlySet<string>,
+  refs: string[],
+): void {
+  const scope = new Set([...outer, block.base.alias, ...block.joins.map((join) => join.alias)]);
+  const visit = (expression: Expression): void => {
+    if (expression.kind === "column") {
+      const parts = expression.reference.split(".");
+      const alias = parts[0];
+      if (parts.length === 2 && alias !== undefined && !scope.has(alias)) {
+        refs.push(expression.reference);
+      }
+      return;
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      collectOutsideReferences(expression.block, scope, refs);
+      return;
+    }
+    for (const child of childExpressions(expression)) visit(child);
+  };
+  forEachBlockExpression(block, visit);
+  forEachNestedBlock(block, (nested) => {
+    collectOutsideReferences(nested, scope, refs);
+  });
+}
+
+function extractCorrelation(
+  inner: CompiledQuery,
+  outerScope: ReadonlySet<string>,
+  label: string,
+): CorrelationKey[] {
+  const innerScope = new Set([inner.base.alias, ...inner.joins.map((join) => join.alias)]);
+  const keys: CorrelationKey[] = [];
+  const kept: Predicate[] = [];
+  for (const predicate of inner.predicates) {
+    const key = correlationEquality(predicate, innerScope, outerScope);
+    if (key === undefined) kept.push(predicate);
+    else keys.push(key);
+  }
+  inner.predicates = kept;
+  const leftover: string[] = [];
+  collectOutsideReferences(inner, new Set(), leftover);
+  if (leftover.length > 0) {
+    throw new TypeError(
+      `Correlated ${label} subqueries support only equality conditions between one inner and one outer qualified column (unsupported reference: ${leftover[0] ?? ""})`,
+    );
+  }
+  if (keys.length === 0) {
+    throw new TypeError(`Correlated ${label} subquery has no usable correlation condition`);
+  }
+  return keys;
+}
+
+function correlationEquality(
+  predicate: Predicate,
+  innerScope: ReadonlySet<string>,
+  outerScope: ReadonlySet<string>,
+): CorrelationKey | undefined {
+  if (predicate.operator !== "=") return undefined;
+  const { left, right } = predicate;
+  if (left.kind !== "column" || right.kind !== "column") return undefined;
+  const sideOf = (reference: string): "inner" | "outer" | undefined => {
+    const parts = reference.split(".");
+    // An unqualified reference resolves inside the subquery, as it always has.
+    if (parts.length !== 2) return "inner";
+    const alias = parts[0] ?? "";
+    if (innerScope.has(alias)) return "inner";
+    if (outerScope.has(alias)) return "outer";
+    return undefined;
+  };
+  const leftSide = sideOf(left.reference);
+  const rightSide = sideOf(right.reference);
+  if (leftSide === "inner" && rightSide === "outer") return { inner: left, outer: right };
+  if (leftSide === "outer" && rightSide === "inner") return { inner: right, outer: left };
+  return undefined;
+}
+
+function rejectGroupedInner(inner: CompiledQuery, label: string): void {
+  if (inner.groupBy.length > 0 || inner.having.length > 0) {
+    throw new TypeError(`Correlated ${label} subqueries cannot use GROUP BY or HAVING`);
+  }
+}
+
+function guardWildcard(block: CompiledQuery): void {
+  if (block.select.some((item) => item.expression.kind === "wildcard")) {
+    throw new TypeError("Correlated subqueries cannot be combined with SELECT *");
+  }
+}
+
+function assertNoCorrelation(block: CompiledQuery): void {
+  const visit = (expression: Expression): void => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      const refs: string[] = [];
+      collectOutsideReferences(expression.block, new Set(), refs);
+      if (refs.length > 0) {
+        throw new TypeError(
+          `Correlated subqueries are supported only as top-level WHERE conditions (reference: ${refs[0] ?? ""})`,
+        );
+      }
+      return;
+    }
+    for (const child of childExpressions(expression)) visit(child);
+  };
+  forEachBlockExpression(block, visit);
 }
 
 // --- Constant folding ---------------------------------------------------------------------------

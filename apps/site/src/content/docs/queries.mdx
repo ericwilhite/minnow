@@ -244,6 +244,8 @@ on `MinnowDatabaseClient` too.
 
 > Writes get the same treatment — `insertInto` / `updateTable` / `deleteFrom` with `returning`,
 > in [Writes & transactions](/docs/writes/). The full supported-SQL list is the
-> [feature matrix](/docs/sql/). Known limits: correlated subqueries compile but fail at execution
-> (subqueries resolve at one snapshot), and ORDER BY must name a selected column or output alias —
+> [feature matrix](/docs/sql/). Known limits: correlated subqueries are supported as top-level
+> WHERE conditions with equality correlation on qualified columns (they decorrelate into joins at
+> compile time — EXISTS, NOT EXISTS, IN, and scalar aggregates; correlated NOT IN and non-equality
+> correlation are rejected explicitly), and ORDER BY must name a selected column or output alias —
 > over `SELECT *` that is any source column, qualified (`people.name`, `p.name`) or not.

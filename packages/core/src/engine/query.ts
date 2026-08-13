@@ -349,7 +349,14 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   } catch (error) {
     throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
   }
-  const compiled = options.optimize === false ? plan : optimizePlan(plan);
+  let compiled: CompiledQuery;
+  try {
+    compiled = options.optimize === false ? plan : optimizePlan(plan);
+  } catch (error) {
+    // Compile-time rewrites (for example decorrelation) reject unsupported shapes; those
+    // errors locate on the statement like any other compile failure.
+    throwLocated(error, offset, { start: 0, end: text.length });
+  }
   if (parser.parameterCount > 0) compiled.parameterCount = parser.parameterCount;
   return compiled;
 }
