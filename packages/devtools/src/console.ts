@@ -86,6 +86,15 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     },
   });
 
+  const planText = el("pre", { class: "plan" });
+  const planView = el("div", { class: "plan-view" }, [planText]);
+  planView.hidden = true;
+
+  const resultTabs = el("div", { class: "subtabs" });
+  const rowsTab = button("subtab on", "Rows");
+  const planTab = button("subtab", "Plan");
+  resultTabs.append(rowsTab, planTab);
+
   const splitter = el("div", {
     class: "splitter",
     attrs: {
@@ -103,7 +112,9 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     editorSlot,
     splitter,
     notice,
+    resultTabs,
     grid.node,
+    planView,
     status,
   ]);
   const node = el("div", { class: "console" }, [main, historyRail.node]);
@@ -145,6 +156,40 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   grid.setMessage("Run a query to see rows here.");
   renderHistory();
 
+  /**
+   * Rows and the plan are two readings of the same statement, so they are tabs over one result
+   * area rather than a second panel. The plan is asked for only when it is looked at — it compiles
+   * and optimizes the query, which is work nobody wants on every run.
+   */
+  function showResultTab(which: "rows" | "plan"): void {
+    rowsTab.className = which === "rows" ? "subtab on" : "subtab";
+    planTab.className = which === "plan" ? "subtab on" : "subtab";
+    grid.node.hidden = which !== "rows";
+    planView.hidden = which !== "plan";
+    if (which === "plan") void loadPlan();
+  }
+
+  async function loadPlan(): Promise<void> {
+    const sql = editor.value().trim();
+    if (sql.length === 0) {
+      planText.textContent = "Write a query to see its plan.";
+      return;
+    }
+    planText.textContent = "Explaining…";
+    try {
+      planText.textContent = await deps.target.explain(sql);
+    } catch (error) {
+      planText.textContent = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  rowsTab.addEventListener("click", () => {
+    showResultTab("rows");
+  });
+  planTab.addEventListener("click", () => {
+    showResultTab("plan");
+  });
+
   function renderHistory(): void {
     historyRail.render(history.entries(), selectedEntry);
   }
@@ -168,9 +213,17 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     grid.setRows(result.rows);
   }
 
+  /**
+   * The matrix lookup, available once the editor chunk that carries the matrix has loaded. Until
+   * then a failure reports the compiler's message and nothing more.
+   */
+  let explainUnsupported: ((message: string) => string | undefined) | undefined;
+
   /** Points the caret at the failure, so a located compile error reads as one in the editor. */
   function showFailure(error: unknown): void {
-    setNotice("error", error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    const extra = explainUnsupported?.(message);
+    setNotice("error", extra === undefined ? message : `${message}\n${extra}`);
     if (error instanceof SqlCompileError) {
       editor.selectRange(error.offset, error.offset + Math.max(error.length, 1));
     }
@@ -220,6 +273,7 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
 
     notice.hidden = true;
     run.disabled = true;
+    showResultTab("rows");
     setStatus("running…");
     const started = performance.now();
     try {
@@ -268,7 +322,11 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     },
     upgrade: async () => {
       try {
-        const { loadCodeMirrorEditor } = await import("./editor/codemirror.js");
+        const [{ loadCodeMirrorEditor }, diagnostics] = await Promise.all([
+          import("./editor/codemirror.js"),
+          import("./editor/diagnostics.js"),
+        ]);
+        explainUnsupported = diagnostics.explainUnsupported;
         const upgraded = await loadCodeMirrorEditor({
           root: deps.root,
           schema,

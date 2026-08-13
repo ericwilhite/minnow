@@ -1,3 +1,4 @@
+import { diagnose, explainUnsupported } from "./diagnostics.js";
 import { spaced, type EditorSchema, type SqlEditor, type SqlEditorDeps } from "./editor.js";
 
 export interface CodeMirrorDeps extends SqlEditorDeps {
@@ -71,6 +72,18 @@ const themeSpec = {
     color: "var(--mdt-accent)",
   },
   ".cm-completionIcon": { display: "none" },
+  ".cm-diagnostic": {
+    fontFamily: "var(--mdt-mono)",
+    fontSize: "11.5px",
+    padding: "5px 8px",
+    whiteSpace: "pre-wrap",
+  },
+  ".cm-diagnostic-error": { borderLeft: "3px solid var(--mdt-danger)" },
+  ".cm-lintRange-error": {
+    backgroundImage: "none",
+    borderBottom: "2px solid var(--mdt-danger)",
+  },
+  ".cm-gutter-lint .cm-gutterElement": { padding: "0 2px" },
   ".cm-completionDetail": {
     fontStyle: "normal",
     color: "var(--mdt-text-faint)",
@@ -92,15 +105,17 @@ function prefersDark(root: ShadowRoot): boolean {
  * the query tab is looked at.
  */
 export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEditor> {
-  const [state, view, language, langSql, autocomplete, commands, highlight] = await Promise.all([
-    import("@codemirror/state"),
-    import("@codemirror/view"),
-    import("@codemirror/language"),
-    import("@codemirror/lang-sql"),
-    import("@codemirror/autocomplete"),
-    import("@codemirror/commands"),
-    import("@lezer/highlight"),
-  ]);
+  const [state, view, language, langSql, autocomplete, commands, highlight, lint] =
+    await Promise.all([
+      import("@codemirror/state"),
+      import("@codemirror/view"),
+      import("@codemirror/language"),
+      import("@codemirror/lang-sql"),
+      import("@codemirror/autocomplete"),
+      import("@codemirror/commands"),
+      import("@lezer/highlight"),
+      import("@codemirror/lint"),
+    ]);
 
   const { Compartment, EditorState } = state;
   const { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } = view;
@@ -135,6 +150,12 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
         commands.history(),
         autocomplete.autocompletion({ activateOnTyping: true, icons: false }),
         schemaCompartment.of(sqlExtension(deps.schema)),
+        // Compiles on idle, in the page. The engine's own parser decides what is wrong and
+        // exactly where, so the squiggle sits under the token rather than the whole line.
+        lint.linter((editor) => diagnose(editor.state.doc.toString(), explainUnsupported), {
+          delay: 350,
+        }),
+        lint.lintGutter(),
         syntaxHighlighting(syntax),
         EditorState.allowMultipleSelections.of(true),
         EditorView.lineWrapping,

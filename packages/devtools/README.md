@@ -28,6 +28,10 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
   form. Values are validated against the column's type before anything is confirmed.
 - **Query with completion** — a CodeMirror console whose completion comes from your own catalog,
   loaded only when the query tab is first opened. The last 50 runs are kept beside it.
+- **Diagnostics as you type** — the engine's own compiler runs in the page, so bad SQL is
+  underlined on the exact token without a round trip or a query, and failures that name an
+  unsupported feature say what stands in for it. A **Plan** tab shows what the optimizer made of
+  the statement.
 - **Changes are confirmed first** — the prompt names the table, the key, and the before and after
   values. An `UPDATE` or `DELETE` with no `WHERE` is called out as hitting every row.
 - **`permissions: { write: false }`** refuses statements that change data before they reach the

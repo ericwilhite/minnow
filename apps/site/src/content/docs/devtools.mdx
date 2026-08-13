@@ -185,6 +185,24 @@ mentions `DELETE` in a string literal is still a query.
 SQL that fails to compile is reported with the offending token selected in the editor — the
 position comes from [`SqlCompileError`](/docs/queries/#locating-a-compile-error).
 
+## Diagnostics
+
+The editor compiles as you type and underlines what it cannot parse, on the token rather than the
+line. This costs nothing per keystroke: `compileStatement` is part of the library and runs in the
+page, so nothing is sent to the worker and no query is executed to find out that the SQL is wrong.
+
+Where the failure names a capability the engine records as unsupported, the message says which one
+and what stands in for it — "Expected VALUES, found SELECT" also explains that `INSERT` takes a
+`VALUES` list and cannot read from a query. That comes from the shipped
+[feature matrix](/docs/sql/), so it stays true as the engine changes. A message that several
+features share explains nothing rather than guessing between them.
+
+## Plan
+
+The **Plan** tab beside the results shows what the optimizer made of the statement — the join
+order, which predicates were pushed down, and whether the scan can stream. It is asked for only
+when you look at it, and running a query returns you to the rows.
+
 ## History
 
 The last 50 runs are kept beside the console, newest first, each with its row count, timing, and

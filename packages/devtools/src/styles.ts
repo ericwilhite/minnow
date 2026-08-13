@@ -590,6 +590,39 @@ input.mini.value { width: 110px; }
 
 .editor-slot { flex: none; min-height: 60px; display: flex; overflow: hidden; }
 
+.subtabs {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  height: 26px;
+  border-bottom: 1px solid var(--mdt-border);
+}
+.subtab {
+  height: 20px;
+  font-size: 11.5px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mdt-text-secondary);
+  cursor: pointer;
+}
+.subtab:hover { background: var(--mdt-bg-hover); }
+.subtab.on { background: var(--mdt-bg-active); color: var(--mdt-text); }
+
+.plan-view { flex: 1; overflow: auto; min-height: 0; }
+.plan {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--mdt-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--mdt-text);
+  white-space: pre;
+}
+
 /* The divider is a hairline with a taller target around it, so it is easy to grab but not loud. */
 .splitter {
   flex: none;
