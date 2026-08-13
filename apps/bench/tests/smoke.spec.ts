@@ -28,7 +28,10 @@ test("every page loads with the injected shell and no uncaught errors", async ({
 
 test("landing page runs a showcase example against an in-memory store", async ({ page }) => {
   await page.goto("/");
-  await expect(page.locator("#showcase article")).toHaveCount(4);
+  // Not pinned to an exact number, for the same reason the matrix below is not: the showcase
+  // grows whenever the API does, and an exact count turns that into an unrelated failure. What
+  // matters is that the examples render and that one of them really runs.
+  expect(await page.locator("#showcase article").count()).toBeGreaterThanOrEqual(4);
   await expect(page.locator("#showcase pre.shiki").first()).toBeVisible();
   await page.locator('[data-run="sql"]').click();
   await expect(page.locator('[data-output="sql"]')).toContainText('"score": 30', {
