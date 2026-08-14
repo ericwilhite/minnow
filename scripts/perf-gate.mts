@@ -115,7 +115,12 @@ function median(samples: number[]): number {
 }
 
 async function timeMinnow(database: MinnowDatabase, query: PerfQuery): Promise<number> {
-  const options = query.params === undefined ? {} : { params: query.params as never };
+  // The gate measures execution, not the probe-validated result memo (which would answer
+  // every repeat sample from cache); real applications keep the default memoize: true.
+  const options = {
+    memoize: false as const,
+    ...(query.params === undefined ? {} : { params: query.params as never }),
+  };
   for (let index = 0; index < WARMUP; index += 1) await database.query(query.sql, options);
   const samples: number[] = [];
   for (let index = 0; index < RUNS; index += 1) {

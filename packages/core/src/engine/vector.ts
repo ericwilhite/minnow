@@ -136,7 +136,7 @@ export interface AsyncQueryExecutionOptions {
    * batches align to storage-block boundaries and a loader can install whole decoded blocks by
    * reference instead of stitching copies.
    */
-  readonly loadScanWindow?: (start: number, length: number) => Promise<number | undefined>;
+  readonly loadScanWindow?: (start: number, length: number) => number | Promise<number>;
 }
 
 export interface PrepareVectorQueryOptions {
@@ -1382,7 +1382,10 @@ async function executeBoundPlanAsync(
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   for (let start = 0; start < scanRows;) {
     let length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
-    const residentEnd = await options.loadScanWindow?.(start, length);
+    // The loader answers synchronously when the batch is already resident — the common case,
+    // every batch but the first per block — so the scan loop only pays await on real slides.
+    const loaded = options.loadScanWindow?.(start, length);
+    const residentEnd = typeof loaded === "number" || loaded === undefined ? loaded : await loaded;
     if (typeof residentEnd === "number" && residentEnd > start) {
       length = Math.min(length, residentEnd - start);
     }
@@ -1421,7 +1424,9 @@ async function executeBoundPlanWithSortSpill(
     const scanBatchRows = Math.min(DEFAULT_BATCH_ROWS, pageRows);
     for (let start = 0; start < scanRows;) {
       let length = Math.min(scanBatchRows, scanRows - start);
-      const residentEnd = await options.loadScanWindow?.(start, length);
+      const loadedSort = options.loadScanWindow?.(start, length);
+      const residentEnd =
+        typeof loadedSort === "number" || loadedSort === undefined ? loadedSort : await loadedSort;
       if (typeof residentEnd === "number" && residentEnd > start) {
         length = Math.min(length, residentEnd - start);
       }
@@ -1554,7 +1559,9 @@ async function executeBoundPlanWithHashSpill(
     const scanChunkRows = Math.min(DEFAULT_BATCH_ROWS, HASH_SPILL_SCAN_CHUNK_ROWS);
     for (let start = 0; start < scanRows;) {
       let length = Math.min(scanChunkRows, scanRows - start);
-      const residentEnd = await options.loadScanWindow?.(start, length);
+      const loadedHash = options.loadScanWindow?.(start, length);
+      const residentEnd =
+        typeof loadedHash === "number" || loadedHash === undefined ? loadedHash : await loadedHash;
       if (typeof residentEnd === "number" && residentEnd > start) {
         length = Math.min(length, residentEnd - start);
       }
@@ -2148,6 +2155,142 @@ function filterPrimitive(
     kept += 1;
   }
   return kept;
+}
+
+/** Compacts the selection to rows where the dictionary-equality comparison holds. */
+function filterDictionaryEquality(
+  fast: DictionaryEquality,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number {
+  const vector = fast.vector;
+  if (fast.cache.dictionary !== vector.dictionary) {
+    fast.cache.dictionary = vector.dictionary;
+    fast.cache.code = vector.dictionary.indexOf(fast.value);
+  }
+  const target = fast.cache.code;
+  const negated = fast.negated;
+  const rows = batch.rowsBySource[fast.source];
+  const codes = vector.codes;
+  const validity = vector.validity;
+  const windowStart = vector.window?.start ?? 0;
+  const slots = codes.length;
+  const vectorLength = vector.length;
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = selection[index] ?? 0;
+    const sourceRow = rows?.[row] ?? -1;
+    if (sourceRow < 0 || sourceRow >= vectorLength) continue;
+    const slot = sourceRow - windowStart;
+    if (slot < 0 || slot >= slots) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+    if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
+    const code = codes[slot] ?? NULL_STRING_CODE;
+    if (code === NULL_STRING_CODE) continue;
+    const matches = target >= 0 && code === target;
+    if (negated ? matches : !matches) continue;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
+/** Compacts the selection to rows where the dictionary LIKE comparison holds. */
+function filterDictionaryLike(
+  fast: DictionaryLike,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number {
+  const vector = fast.vector;
+  if (fast.cache.dictionary !== vector.dictionary) {
+    fast.cache.dictionary = vector.dictionary;
+    fast.cache.matches = dictionaryLikeMatches(
+      vector.dictionary,
+      fast.pattern,
+      fast.caseInsensitive,
+      fast.escape,
+    );
+  }
+  const matches = fast.cache.matches;
+  const negated = fast.negated;
+  const rows = batch.rowsBySource[fast.source];
+  const codes = vector.codes;
+  const validity = vector.validity;
+  const windowStart = vector.window?.start ?? 0;
+  const slots = codes.length;
+  const vectorLength = vector.length;
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = selection[index] ?? 0;
+    const sourceRow = rows?.[row] ?? -1;
+    if (sourceRow < 0 || sourceRow >= vectorLength) continue;
+    const slot = sourceRow - windowStart;
+    if (slot < 0 || slot >= slots) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+    if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
+    const code = codes[slot] ?? NULL_STRING_CODE;
+    if (code === NULL_STRING_CODE) continue;
+    const matched = matches[code] === 1;
+    if (negated ? matched : !matched) continue;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
+// The per-batch selection scratch: batches are bounded by DEFAULT_BATCH_ROWS, spills may use
+// larger pages, so the scratch grows to the largest batch seen and is trivially small.
+let selectionScratch = new Uint32Array(DEFAULT_BATCH_ROWS);
+
+/**
+ * The no-join predicate kernel: primitive comparisons and dictionary equality/LIKE compact a
+ * shared selection in tight unboxed loops, and only rows surviving those reach the generic
+ * per-row evaluator for whatever predicates remain. Batches with no predicates skip it.
+ */
+function filterScanBatch(
+  plan: BoundPlan,
+  batch: BatchRows,
+): { selection: Uint32Array; survivors: number } {
+  if (selectionScratch.length < batch.length) selectionScratch = new Uint32Array(batch.length);
+  const selection = selectionScratch;
+  for (let row = 0; row < batch.length; row += 1) selection[row] = row;
+  let survivors = batch.length;
+  let generic: BoundPredicate[] | undefined;
+  for (const predicate of plan.predicates) {
+    if (survivors === 0) return { selection, survivors };
+    if (predicate.primitive !== undefined) {
+      survivors = filterPrimitive(predicate.primitive, batch, selection, survivors);
+    } else if (predicate.dictionaryEquality !== undefined) {
+      survivors = filterDictionaryEquality(
+        predicate.dictionaryEquality,
+        batch,
+        selection,
+        survivors,
+      );
+    } else if (predicate.dictionaryLike !== undefined) {
+      survivors = filterDictionaryLike(predicate.dictionaryLike, batch, selection, survivors);
+    } else {
+      (generic ??= []).push(predicate);
+    }
+  }
+  if (generic !== undefined) {
+    for (const predicate of generic) {
+      if (survivors === 0) break;
+      let kept = 0;
+      for (let index = 0; index < survivors; index += 1) {
+        const row = selection[index] ?? 0;
+        if (!evaluateBatchPredicate(plan, predicate, batch, row)) continue;
+        selection[kept] = row;
+        kept += 1;
+      }
+      survivors = kept;
+    }
+  }
+  return { selection, survivors };
 }
 
 /**
@@ -3366,15 +3509,32 @@ function consumeBatch(
   prefiltered = false,
 ): void {
   const checkPredicates = plan.predicates.length > 0 && !prefiltered;
-  if (
-    plan.grouped &&
-    groups.consumeFast(batch, (row) => passesPredicates(plan, batch, row), checkPredicates)
-  ) {
+  if (checkPredicates) {
+    // Selection-first: unboxed predicate loops compact the batch before any per-row work.
+    const { selection, survivors } = filterScanBatch(plan, batch);
+    if (survivors === 0) return;
+    if (plan.grouped) {
+      // Group over the compacted survivors so the unboxed aggregate kernel still applies.
+      const working =
+        survivors < batch.length
+          ? materializeSelection(batch, selection, survivors, memory)
+          : batch;
+      try {
+        consumeBatch(plan, working, groups, output, memory, true);
+      } finally {
+        if (working !== batch) working.memory?.close();
+      }
+      return;
+    }
+    for (let index = 0; index < survivors; index += 1) {
+      output.add(batch, selection[index] ?? 0);
+      if (reachedEarlyLimit(plan, output.size)) return;
+    }
     return;
   }
-  if (!plan.grouped && !checkPredicates && output.tryAddBatch(batch)) return;
+  if (plan.grouped && groups.consumeFast(batch, () => true, false)) return;
+  if (!plan.grouped && output.tryAddBatch(batch)) return;
   for (let row = 0; row < batch.length; row += 1) {
-    if (checkPredicates && !passesPredicates(plan, batch, row)) continue;
     if (plan.grouped) {
       updateAggregates(plan, groups.stateFor(batch, row), batch, row, memory);
     } else {

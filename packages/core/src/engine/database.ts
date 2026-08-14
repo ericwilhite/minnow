@@ -326,6 +326,12 @@ export interface BufferPoolStats {
 }
 
 export interface QueryOptions {
+  /**
+   * false bypasses the probe-validated result memo for this statement (the default true
+   * serves provably-fresh cached results). Useful for benchmarking execution itself and for
+   * callers that re-run one statement in a tight loop over changing external state.
+   */
+  memoize?: boolean;
   readonly version?: number;
   /**
    * Values for the statement's `?`/`$n` placeholders, in order. Required exactly when the
@@ -1838,6 +1844,7 @@ export class MinnowDatabase {
     // carry semantics of their own.
     const probe = this.store.getCatalogProbe?.bind(this.store);
     const memoizable =
+      options.memoize !== false &&
       options.version === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
       options.spillToStorage === undefined &&
@@ -3207,7 +3214,7 @@ export class MinnowDatabase {
     | {
         create: (memory: QueryMemoryContext) => Promise<{
           table: ColumnarTable;
-          load: (start: number, length: number) => Promise<number>;
+          load: (start: number, length: number) => number | Promise<number>;
         }>;
       }
     | undefined {
@@ -3278,13 +3285,13 @@ export class MinnowDatabase {
     baseView: {
       create: (memory: QueryMemoryContext) => Promise<{
         table: ColumnarTable;
-        load: (start: number, length: number) => Promise<number>;
+        load: (start: number, length: number) => number | Promise<number>;
       }>;
     },
     buildView: {
       create: (memory: QueryMemoryContext) => Promise<{
         table: ColumnarTable;
-        load: (start: number, length: number) => Promise<number>;
+        load: (start: number, length: number) => number | Promise<number>;
       }>;
     },
     buildTableName: string,
@@ -3427,7 +3434,7 @@ export class MinnowDatabase {
     rowCount: number,
     memory: QueryMemoryContext,
     storedBlocks?: Map<string, Uint8Array>,
-  ): { table: ColumnarTable; load: (start: number, length: number) => Promise<number> } {
+  ): { table: ColumnarTable; load: (start: number, length: number) => number | Promise<number> } {
     interface StreamedColumnState {
       column: TableColumnRecord;
       vector: ColumnVector;
@@ -3450,7 +3457,26 @@ export class MinnowDatabase {
     // exclusive end. Serving less than requested is normal — the window never extends past
     // the current block, so every install is a whole-block reference and a batch straddling
     // a block boundary is the caller's clamp to handle, not a stitched copy to build.
-    const load = async (start: number, length: number): Promise<number> => {
+    // Synchronous fast path: when every column's resident window already contains the batch
+    // start — every batch but the first per block — the loader answers without a promise, so
+    // the scan loop stays allocation-free between slides.
+    const load = (start: number, length: number): number | Promise<number> => {
+      let syncEnd = rowCount;
+      let allResident = states.length > 0;
+      for (const state of states) {
+        const window = state.vector.window;
+        if (window !== undefined && start >= window.start && start < window.start + window.length) {
+          syncEnd = Math.min(syncEnd, window.start + window.length);
+          continue;
+        }
+        allResident = false;
+        break;
+      }
+      if (allResident) return syncEnd;
+      if (states.length === 0) return rowCount;
+      return slide(start, length);
+    };
+    const slide = async (start: number, length: number): Promise<number> => {
       const end = Math.min(start + length, rowCount);
       let residentEnd = rowCount;
       for (const state of states) {
@@ -3552,7 +3578,10 @@ export class MinnowDatabase {
     baseSegments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
     memory: QueryMemoryContext,
-  ): Promise<{ table: ColumnarTable; load: (start: number, length: number) => Promise<number> }> {
+  ): Promise<{
+    table: ColumnarTable;
+    load: (start: number, length: number) => number | Promise<number>;
+  }> {
     const scanSegments = baseSegments.filter((segment) => {
       const kind = segment.kind ?? "insert";
       return kind === "insert" || kind === "base";
