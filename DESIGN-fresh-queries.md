@@ -280,6 +280,57 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
   Minnow's median prepare is now ~0.3 ms (compile only), versus 28–158 ms materializing
   prepares before this design.
 
+## Follow-on work landed after the five stages (2026-08-14)
+
+- **Scale-25 comparison published** beside scale-100 with a dataset toggle; scale-qualified
+  capture filenames.
+- **SELECT DISTINCT \*** — the last non-deliberate SQL matrix gap — expands against input
+  schemas at execution; conformance templates added.
+- **One read pipeline**: SQL text, the typed builder, and live-query re-runs all stream.
+- **Zone-gated live invalidation**: pure-insert commits whose new blocks' zone statistics
+  reject a subscription's predicates skip the re-run entirely; upserts always re-run (they
+  can remove result rows); compaction stays dodged via its empty change set.
+- **Result memoization** keyed (sql, params, catalog epoch): provably-fresh repeat queries.
+- **Buffer pool stats** + **read-triggered auto-compaction** (48-segment threshold,
+  fire-and-forget, autoCompact: false opts out).
+
+## Live queries and triggers — architecture assessment (2026-08-14)
+
+**Should the live-query engine be driven by the SQL/data layer?** Yes for invalidation, and
+that is now the implementation: validity comes from the committed manifest chain (the only
+signal every tab shares), selectivity from persisted change sets plus zone statistics over
+the committed segments. This is the data layer driving liveness — no timers or channel
+messages are load-bearing, and every skip is a proof, not a heuristic.
+
+**Should live queries be driven by SQL triggers instead?** No. Triggers fire at the writing
+site; subscriptions live at reading sites in other tabs. A trigger-based notifier would
+still need exactly the cross-tab commit signal the current design is built on, and would add
+write-side latency for a read-side concern.
+
+**Are triggers worth building at all?** Yes — as a write-side feature for derived data
+(audit rows, denormalized counters, updated-at stamps), which real applications otherwise
+hand-roll in application code where a crashed tab can leave the derivation half-applied.
+The architecture-fit design, staged:
+
+1. Catalog-persisted `CREATE TRIGGER name AFTER INSERT|UPDATE|DELETE ON table` with a body
+   of INSERT/UPDATE/DELETE statements referencing NEW.col / OLD.col. Trigger records live in
+   the catalog, so the existing epoch makes them visible to every tab immediately.
+2. Execution in the committing tab, inside the same transaction as the triggering write:
+   the trigger's derived segments stage into the same commit, so the write and its
+   derivations publish atomically — a crashed tab loses both or neither, and other tabs can
+   never observe the write without its derivations.
+3. Row-level semantics with a recursion depth cap (a trigger's writes can fire other
+   triggers once; deeper chains error). BEFORE triggers and statement-level triggers are
+   explicitly out of scope until AFTER triggers prove themselves.
+
+## Remaining follow-ups
+
+- **Streamed filter-scan tail** (~5.1 ms vs the old fused path's 1.4 ms on the gate; still
+  1.4x faster than sqlite): the streamed sink's eager per-row projection and the async batch
+  loop carry the residual. Deferred per-window projection over the stable cached block
+  vectors is the designed fix.
+- **Triggers** per the staged design above.
+
 ## Risks and open questions
 
 - **Executor regression risk is concentrated in stage 2.** Mitigation: the conformance oracle
