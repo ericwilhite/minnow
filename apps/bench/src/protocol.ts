@@ -5,14 +5,15 @@
  */
 import type { DurabilityMode } from "./benchmark.js";
 
-export type EngineId = "minnow" | "sqlite" | "pglite";
+export type EngineId = "minnow" | "sqlite" | "pglite" | "duckdb";
 
-export const engineIds: readonly EngineId[] = ["minnow", "sqlite", "pglite"];
+export const engineIds: readonly EngineId[] = ["minnow", "sqlite", "pglite", "duckdb"];
 
 export const engineNames: Record<EngineId, string> = {
   minnow: "MinnowDatabase",
   sqlite: "SQLite Wasm",
   pglite: "PGlite",
+  duckdb: "DuckDB",
 };
 
 export type CompressionCodec = "raw" | "rle" | "gzip";

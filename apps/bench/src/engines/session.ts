@@ -53,5 +53,7 @@ export async function loadDriver(engine: EngineId): Promise<EngineDriver> {
       return (await import("./sqlite.js")).sqliteDriver;
     case "pglite":
       return (await import("./pglite.js")).pgliteDriver;
+    case "duckdb":
+      return (await import("./duckdb.js")).duckdbDriver;
   }
 }

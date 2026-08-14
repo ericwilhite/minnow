@@ -25,6 +25,9 @@ npm install @minnowdb/core
   at ten million rows.
 - **Safe across tabs** — writes publish atomically; readers see the old version or the new one,
   never half a write. Reads never block writes.
+- **Always fresh** — every query observes the latest committed state, even commits from another
+  tab; stale reads are unrepresentable. Multi-statement consistency is an explicit `snapshot()`
+  scope that releases itself.
 - **Built for real data** — compression, a memory budget you set, spill to storage, and durable,
   resumable compaction and GC that fit in idle time.
 - **Workers first** — a shipped worker entry and main-thread client; the API is identical on

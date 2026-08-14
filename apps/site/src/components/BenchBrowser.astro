@@ -68,6 +68,7 @@ const ENGINE_META: Record<string, { label: string; slot: number }> = {
   minnow: { label: "Minnow", slot: 1 },
   sqlite: { label: "SQLite WASM", slot: 2 },
   pglite: { label: "PGlite", slot: 3 },
+  duckdb: { label: "DuckDB (in-memory)", slot: 4 },
 };
 const engines = results.suite.engines;
 const label = (engine: string): string => ENGINE_META[engine]?.label ?? engine;
@@ -425,6 +426,10 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   .series-3 {
     fill: var(--viz-series-3);
   }
+
+  .series-4 {
+    fill: var(--viz-series-4);
+  }
   .series-bg-1 {
     background: var(--viz-series-1);
   }
@@ -433,6 +438,10 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   }
   .series-bg-3 {
     background: var(--viz-series-3);
+  }
+
+  .series-bg-4 {
+    background: var(--viz-series-4);
   }
 
   .dot {

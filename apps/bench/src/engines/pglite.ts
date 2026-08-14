@@ -136,16 +136,23 @@ export const pgliteDriver: EngineDriver = {
 
   async openSession(record: DatasetRecord): Promise<EngineSession> {
     const database = await openPglite(dataDirName(record));
+    let nextStatement = 0;
     return {
       engine: "pglite",
-      prepare(sql) {
-        return Promise.resolve({
+      async prepare(sql) {
+        // A genuine server-side prepared statement, so prepareMs covers parse+plan once and
+        // executions reuse the plan.
+        const name = `bench_stmt_${String(nextStatement++)}`;
+        await database.exec(`PREPARE ${name} AS ${sql}`);
+        return {
           execute: async () =>
-            normalizeRows((await database.query<Record<string, unknown>>(sql)).rows).map(
-              canonicalizeRow,
-            ),
-          close: () => undefined,
-        });
+            normalizeRows(
+              (await database.query<Record<string, unknown>>(`EXECUTE ${name}`)).rows,
+            ).map(canonicalizeRow),
+          close: () => {
+            void database.exec(`DEALLOCATE ${name}`).catch(() => undefined);
+          },
+        };
       },
       async close() {
         if (!database.closed) await database.close();

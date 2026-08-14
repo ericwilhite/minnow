@@ -27,6 +27,15 @@ if (first === undefined) throw new Error("No engine-comparison results found");
 const capturedDate = first.capturedAt.slice(0, 10);
 const tableCount = Object.keys(first.dataset.tableRows).length;
 const engineMeta = Object.entries(first.dataset.engines);
+// Engines whose materialization records an in-memory (non-disk) store; the disclosure below
+// is generated from this metadata so the page and the capture record cannot disagree.
+const memoryEngines = engineMeta.filter(([, meta]) => meta.persistence.includes("in-memory"));
+const engineLabels: Record<string, string> = {
+  minnow: "Minnow",
+  sqlite: "SQLite WASM",
+  pglite: "PGlite",
+  duckdb: "DuckDB",
+};
 ---
 
 <Base
@@ -37,10 +46,10 @@ const engineMeta = Object.entries(first.dataset.engines);
     <header class="bench-header">
       <h1>Benchmarks</h1>
       <p class="lede">
-        Minnow, SQLite WASM, and PGlite loading and querying the same {
-          first.dataset.totalRows.toLocaleString("en-US")
-        }-row commerce dataset in real browsers. Every query result is checksum-verified identical
-        across all three engines before any timing counts.
+        {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} loading and
+        querying the same {first.dataset.totalRows.toLocaleString("en-US")}-row commerce dataset
+        in real browsers. Every query result is checksum-verified identical across all engines
+        before any timing counts.
       </p>
     </header>
 
@@ -93,13 +102,14 @@ const engineMeta = Object.entries(first.dataset.engines);
       <h2>Methodology</h2>
       <ul>
         <li>
-          All three engines run in the same page against browser storage, loading an identical
-          scale-{first.config.scale} dataset ({first.dataset.totalRows.toLocaleString("en-US")} rows,
+          Every engine runs in the same page, loading an identical scale-{first.config.scale}
+          dataset ({first.dataset.totalRows.toLocaleString("en-US")} rows,
           {tableCount} tables) with the same SQL.
         </li>
         <li>
-          Each query runs {first.suite.sampleCount} samples after a separate prepare step; the
-          charts show medians, with p95 and prepare time in the tooltips and table.
+          Each query runs {first.suite.sampleCount} samples after one prepare step (each
+          engine's genuine prepared statement — compile/plan only); the charts show medians of
+          fresh statement executions, with p95 and prepare time in the tooltips and table.
         </li>
         <li>
           Results are compared by checksum across engines — a timing only counts when all engines
@@ -123,8 +133,9 @@ const engineMeta = Object.entries(first.dataset.engines);
         {
           first.browser.storage !== undefined && (
             <li>
-              Captured in a persistent browser profile, so every engine's storage is genuinely
-              disk-backed — not the memory-backed IndexedDB of an ephemeral automation context.
+              Captured in a persistent browser profile, so disk-backed engines write genuinely
+              durable storage — not the memory-backed IndexedDB of an ephemeral automation
+              context.
             </li>
           )
         }
@@ -139,10 +150,27 @@ const engineMeta = Object.entries(first.dataset.engines);
         </li>
       </ul>
       <p>
-        Prepared-statement time is reported separately because the engines differ in kind: Minnow
-        pins an immutable snapshot at prepare time, SQLite compiles a statement, PGlite plans
-        per-execution. Comparing medians of executed queries keeps the comparison honest.
+        Every engine reports the same two numbers: a one-time prepare (statement compilation and
+        planning — no engine pins data) and the median of fresh statement executions over
+        current data. Minnow's executions stream through its block buffer pool and are
+        snapshot-fresh on every statement.
       </p>
+      {
+        memoryEngines.length > 0 && (
+          <p class="disclosure">
+            <strong>Not a storage peer:</strong>{" "}
+            {memoryEngines
+              .map(([engine]) => engineLabels[engine] ?? engine)
+              .join(" and ")}{" "}
+            runs fully in memory in this harness ({memoryEngines
+              .map(([, meta]) => meta.persistence)
+              .join("; ")}). Its numbers exclude all storage I/O and are not directly comparable
+            to the disk-backed engines; it is included as an executor reference. Its ingest
+            timing carries the same caveat, since ingest for the other engines is dominated by
+            exactly the storage writes it skips.
+          </p>
+        )
+      }
     </section>
   </main>
 </Base>
@@ -158,6 +186,7 @@ const engineMeta = Object.entries(first.dataset.engines);
     --viz-series-1: #2a78d6;
     --viz-series-2: #eb6834;
     --viz-series-3: #1baf7a;
+    --viz-series-4: #8b63d6;
     --viz-muted: #898781;
     --viz-grid: #e1e0d9;
   }
@@ -167,6 +196,7 @@ const engineMeta = Object.entries(first.dataset.engines);
       --viz-series-1: #3987e5;
       --viz-series-2: #d95926;
       --viz-series-3: #199e70;
+      --viz-series-4: #9a75e3;
       --viz-grid: #2c2c2a;
     }
   }
@@ -175,6 +205,7 @@ const engineMeta = Object.entries(first.dataset.engines);
     --viz-series-1: #3987e5;
     --viz-series-2: #d95926;
     --viz-series-3: #199e70;
+    --viz-series-4: #9a75e3;
     --viz-grid: #2c2c2a;
   }
 
@@ -259,6 +290,13 @@ const engineMeta = Object.entries(first.dataset.engines);
   .methodology h2 {
     font-size: 1.3rem;
     font-weight: 650;
+  }
+
+  .methodology .disclosure {
+    border-left: 3px solid var(--viz-series-2);
+    padding: 0.5rem 0.9rem;
+    background: color-mix(in srgb, var(--viz-series-2) 7%, transparent);
+    border-radius: 0 6px 6px 0;
   }
 </style>
 

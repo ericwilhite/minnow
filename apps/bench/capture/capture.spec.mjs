@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const BROWSERS = { chromium, firefox };
-const engineIds = ["minnow", "sqlite", "pglite"];
+const engineIds = ["minnow", "sqlite", "pglite", "duckdb"];
 const engines = (process.env.CAPTURE_ENGINES ?? engineIds.join(","))
   .split(",")
   .map((engine) => engine.trim())

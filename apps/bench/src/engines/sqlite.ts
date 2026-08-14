@@ -151,10 +151,19 @@ export const sqliteDriver: EngineDriver = {
     return {
       engine: "sqlite",
       prepare(sql) {
+        // A genuine prepared statement: compiled once, reset and re-stepped per execution,
+        // so prepareMs means the same thing here as in the other engines.
+        const statement = database.prepare(sql);
         return Promise.resolve({
-          execute: () =>
-            Promise.resolve(normalizeRows(database.selectObjects(sql)).map(canonicalizeRow)),
-          close: () => undefined,
+          execute: () => {
+            const rows: Array<Record<string, unknown>> = [];
+            statement.reset();
+            while (statement.step()) rows.push(statement.get({}));
+            return Promise.resolve(normalizeRows(rows).map(canonicalizeRow));
+          },
+          close: () => {
+            statement.finalize();
+          },
         });
       },
       close() {
