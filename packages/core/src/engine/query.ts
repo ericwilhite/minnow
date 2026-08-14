@@ -555,6 +555,12 @@ export interface CompiledQuery {
   }>;
   limit?: number;
   offset?: number;
+  /**
+   * SELECT DISTINCT * awaiting expansion: the wildcard's columns are unknown until input
+   * schemas exist, so every executor entry expands this into a concrete select list plus a
+   * matching GROUP BY exactly once (see expandDistinctWildcard), like MATCH(*).
+   */
+  distinctWildcard?: boolean;
   /** Parameter slots for LIMIT ? / OFFSET ?; binding resolves them into limit/offset. */
   limitParameter?: number;
   offsetParameter?: number;
@@ -1463,6 +1469,26 @@ export function referencedColumns(
  * column that ever held a non-boolean value. Boolean-only and all-null columns contribute
  * nothing to a document either way, so excluding them preserves match semantics exactly.
  */
+/** Every column a row table's rows ever mention, in first-seen order, for wildcard expansion. */
+function wildcardRowColumns(
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): (tableName: string) => readonly string[] | undefined {
+  return (tableName) => {
+    const rows = tables.get(tableName);
+    if (rows === undefined) return undefined;
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      for (const name of Object.keys(row)) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        names.push(name);
+      }
+    }
+    return names;
+  };
+}
+
 function rowTableSearchableColumns(
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): (tableName: string) => readonly string[] | undefined {
@@ -1506,6 +1532,7 @@ export function createPreparedQuery(
   for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
   plan = resolution.plan;
   tables = resolveDerivedRowTables(plan, tables);
+  plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
   const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
   if ([...tables.values()].some((rows) => rows.length === 0)) {
     if (options.executionMemoryBudgetBytes !== undefined) {
@@ -1531,6 +1558,10 @@ export function createPreparedColumnarQuery(
   memory: QueryMemoryContext = new QueryMemoryContext(),
   options: { ftsStats?: ReadonlyMap<string, FtsStats> } = {},
 ): PreparedQuery {
+  plan = expandDistinctWildcard(plan, (tableName) => {
+    const table = tables.get(tableName);
+    return table === undefined ? undefined : [...table.columns.keys()];
+  });
   validateGrouping(plan);
   let closed = false;
   let prepared: PreparedVectorQuery | undefined;
@@ -2360,6 +2391,7 @@ export function executeRowQuery(
       ? structuredClone(plan)
       : resolution.plan;
   tables = resolveDerivedRowTables(plan, tables);
+  plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
   annotateRowFtsStats(plan, tables);
   let contexts: RowContext[] = (tables.get(plan.base.table) ?? []).map((row) => ({
     [plan.base.alias]: row,
@@ -5265,16 +5297,21 @@ export function assembleSelectBlock(
   const { sql, base, joins, select, distinct, predicates, having, orderBy, limit, offset } = parts;
   const { limitParameter, offsetParameter } = parts;
   const groupBy = [...parts.groupBy];
+  let distinctWildcard = false;
   if (distinct) {
-    if (select.some((item) => item.expression.kind === "wildcard"))
-      throw new TypeError("SELECT DISTINCT * is not supported");
     if (select.some((item) => hasAggregate(item.expression)))
       throw new TypeError("SELECT DISTINCT cannot be combined with aggregate functions");
     if (groupBy.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with GROUP BY");
     if (having.length > 0) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
-    // DISTINCT is grouping by every selected expression, so it reuses the grouped executor,
-    // its value-carrying spill, and streamed scan inputs unchanged.
-    groupBy.push(...select.map((item) => item.expression));
+    if (select.some((item) => item.expression.kind === "wildcard")) {
+      // The wildcard's columns are unknown until input schemas exist; executor entries
+      // expand the flag into a concrete select list plus GROUP BY (expandDistinctWildcard).
+      distinctWildcard = true;
+    } else {
+      // DISTINCT is grouping by every selected expression, so it reuses the grouped executor,
+      // its value-carrying spill, and streamed scan inputs unchanged.
+      groupBy.push(...select.map((item) => item.expression));
+    }
   }
   if (having.length > 0) {
     const grouped =
@@ -5364,8 +5401,37 @@ export function assembleSelectBlock(
     predicates,
     groupBy,
     having,
+    ...(distinctWildcard ? { distinctWildcard: true } : {}),
     ...tail,
   };
+}
+
+/**
+ * Expands a pending SELECT DISTINCT * against known input columns: the select list becomes
+ * every wildcard output (alias-qualified when more than one source contributes), and GROUP BY
+ * over those same columns provides the deduplication through the grouped executor. Runs
+ * exactly once per execution entry, like MATCH(*) expansion.
+ */
+export function expandDistinctWildcard(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (plan.distinctWildcard !== true) return plan;
+  const sources = [plan.base, ...plan.joins];
+  const multiple = sources.length > 1;
+  const select: SelectItem[] = sources.flatMap((source) => {
+    const columns = columnsOf(source.table);
+    if (columns === undefined || columns.length === 0) {
+      throw new TypeError(`SELECT DISTINCT * requires known columns for: ${source.table}`);
+    }
+    return columns.map((name) => {
+      const output = multiple ? `${source.alias}.${name}` : name;
+      return { expression: { kind: "column" as const, reference: output }, alias: output };
+    });
+  });
+  const { distinctWildcard, ...rest } = plan;
+  void distinctWildcard;
+  return { ...rest, select, groupBy: select.map((item) => item.expression) };
 }
 
 /** Wraps compound members into the set-operation source the executor folds left to right. */

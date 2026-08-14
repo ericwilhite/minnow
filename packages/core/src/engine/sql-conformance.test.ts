@@ -292,6 +292,11 @@ const templates: Template[] = [
     };
   },
   () => ({ sql: `SELECT DISTINCT region FROM data`, ordered: false }),
+  () => ({ sql: `SELECT DISTINCT * FROM dims`, ordered: false }),
+  () => ({
+    sql: `SELECT DISTINCT * FROM (SELECT region, active FROM data WHERE amount > 5) filtered`,
+    ordered: false,
+  }),
   () => ({
     // The recursive base seeds from a real table: the SQL surface has no FROM-less SELECT.
     sql: `WITH RECURSIVE n AS (SELECT MIN(rank) AS v FROM dims UNION ALL SELECT v + 1 AS v FROM n WHERE v < 20) SELECT v FROM n`,

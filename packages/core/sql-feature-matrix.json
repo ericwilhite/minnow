@@ -461,9 +461,9 @@
     },
     {
       "id": "select.distinct-wildcard",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT DISTINCT * FROM rows",
-      "error": "SELECT DISTINCT * is not supported"
+      "notes": "Expands to DISTINCT over every wildcard output column once input schemas are known."
     },
     {
       "id": "limit.offset",

@@ -109,6 +109,63 @@ describe("public SQL queries", () => {
     });
   });
 
+  it("expands SELECT DISTINCT * across executors and joins", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 2 });
+    await database.createTable({
+      name: "pairs",
+      columns: [
+        { name: "a", type: "number" },
+        { name: "b", type: "string", nullable: true },
+      ],
+    });
+    await database.insertBatch("pairs", {
+      columns: { a: [1, 1, 2, 1, 2], b: ["x", "x", "y", "z", "y"] },
+    });
+    const single = await database.query("SELECT DISTINCT * FROM pairs ORDER BY a, b");
+    expect(single).toEqual({
+      columns: ["a", "b"],
+      rows: [
+        { a: 1, b: "x" },
+        { a: 1, b: "z" },
+        { a: 2, b: "y" },
+      ],
+    });
+    // NULLs group as equal under DISTINCT, and the row reference agrees with the engine.
+    await database.insertBatch("pairs", { columns: { a: [3, 3], b: [null, null] } });
+    const withNulls = await database.query("SELECT DISTINCT * FROM pairs WHERE a = 3");
+    expect(withNulls.rows).toEqual([{ a: 3, b: null }]);
+    const reference = executeQuery(
+      compileQuery("SELECT DISTINCT * FROM pairs WHERE a = 3"),
+      new Map([
+        [
+          "pairs",
+          [
+            { a: 3, b: null },
+            { a: 3, b: null },
+          ] as DatabaseRow[],
+        ],
+      ]),
+    );
+    expect(reference.rows).toEqual([{ a: 3, b: null }]);
+
+    // Joined wildcard outputs stay alias-qualified, exactly like plain SELECT *.
+    await database.createTable({
+      name: "tags",
+      columns: [
+        { name: "a", type: "number" },
+        { name: "tag", type: "string" },
+      ],
+    });
+    await database.insertBatch("tags", { columns: { a: [1, 1], tag: ["t", "t"] } });
+    const joined = await database.query(
+      "SELECT DISTINCT * FROM pairs p JOIN tags t ON t.a = p.a WHERE p.b = 'x'",
+    );
+    expect(joined).toEqual({
+      columns: ["p.a", "p.b", "t.a", "t.tag"],
+      rows: [{ "p.a": 1, "p.b": "x", "t.a": 1, "t.tag": "t" }],
+    });
+  });
+
   it("pins a snapshot scope while fresh queries observe new commits", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.createTable({
@@ -732,9 +789,8 @@ describe("public SQL queries", () => {
   });
 
   it("rejects unsupported DISTINCT and HAVING forms explicitly", () => {
-    expect(() => compileQuery("SELECT DISTINCT * FROM rows")).toThrow(
-      "SELECT DISTINCT * is not supported",
-    );
+    // DISTINCT * compiles; its wildcard expands against input schemas at execution.
+    expect(compileQuery("SELECT DISTINCT * FROM rows").distinctWildcard).toBe(true);
     expect(() => compileQuery("SELECT DISTINCT COUNT(*) AS count FROM rows")).toThrow(
       "SELECT DISTINCT cannot be combined with aggregate functions",
     );
