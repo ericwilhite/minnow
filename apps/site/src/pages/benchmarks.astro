@@ -45,7 +45,13 @@ const engineMeta = Object.entries(first.dataset.engines);
 
     <div class="stats" role="list">
       <div class="stat" role="listitem">
-        <div class="stat-value">{(first.dataset.totalRows / 1000).toFixed(0)}k</div>
+        <div class="stat-value">
+          {
+            first.dataset.totalRows >= 1_000_000
+              ? `${(first.dataset.totalRows / 1_000_000).toFixed(1)}M`
+              : `${(first.dataset.totalRows / 1000).toFixed(0)}k`
+          }
+        </div>
         <div class="stat-label">rows across {tableCount} tables</div>
       </div>
       <div class="stat" role="listitem">
