@@ -30,7 +30,7 @@ interface SuiteQuery {
 
 export interface BenchResults {
   capturedAt: string;
-  browser: { project: string; version: string };
+  browser: { project: string; version: string; storage?: string };
   host: { model: string; cpus: number };
   config: { scale: number };
   dataset: {

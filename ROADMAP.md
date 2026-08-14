@@ -102,8 +102,8 @@ a `ManifestSummary`, snapshot/lease validation walks the record chain instead of
 live block, and GC reachability and pruning resolve with one ascending pass over the (tombstoned,
 never-deleted) records. The same 800-commit fake-indexeddb curve flattened to
 9.7 → 11.6 → 12.5 → 13.1 ms/batch — 5.3× faster at the tail than the original and no longer
-growing linearly per commit. A 2026-08-12 real-browser re-capture
-(`benchmarks/results/engine-comparison-2026-08-12.md`) confirms the passes end to end: scale-10
+growing linearly per commit. A 2026-08-12 real-browser re-capture (in git history; current
+captures live in `apps/site/src/data/benchmarks/`) confirms the passes end to end: scale-10
 dataset inserts 1.85× faster in Chromium (1.24× Firefox), summed prepares a further 1.45×/1.21×
 lower, summed execution medians 1.31×/1.27× lower, competitors unchanged within noise, and all 15
 reference queries oracle-verified in both browsers. COALESCE and

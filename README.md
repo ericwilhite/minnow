@@ -7,303 +7,50 @@ search, live results, and durable storage on IndexedDB — no server, no WASM fi
 npm install @minnowdb/core
 ```
 
-> **Experimental.** The block format carries no compatibility promise yet, and the SQL surface is a
-> correctness-first subset, not full SQL-92.
+> **Experimental.** The block format carries no compatibility promise yet.
 
----
-
-## Highlights
+## Features
 
 - **One schema, everything typed** — a single declaration drives migrations, autocomplete, row
   types, insert validation, and live subscriptions.
-- **SQL and a typed builder** — both compile to the same plans, so a builder query and its SQL
-  equivalent run identically. Tests enforce it. SQL takes `?`/`$n` parameters, bound per
-  execution against a cached plan.
+- **SQL and a Kysely-style typed builder** — both compile to the same plans and run identically;
+  parameters bind per execution against a cached plan.
+- **SQL:2016 surface** — joins, CTEs, set operations, window functions, grouping sets, quantified
+  comparisons, upserts with `RETURNING`; the supported and rejected forms ship as a checked-in
+  feature matrix, and deliberate omissions are documented with reasons.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background on large tables.
-- **Safe across tabs** — writes publish atomically. Another tab sees the old version or the new
-  one, never half a write.
-- **Reads never block writes** — queries run against an immutable snapshot, so a long read can't be
-  torn by a concurrent commit.
-- **Built for real data** — compressed columnar blocks, vectorized execution, a memory budget you
-  set, and spill to storage when a query outgrows it.
-- **Stays fast over time** — compaction and GC are durable, resumable, and cancellable, so they fit
-  in idle time instead of blocking the page.
-- **Our own engine** — parser, planner, optimizer, and executor are implemented here. No SQLite or
+- **Fast** — columnar blocks, vectorized execution, and a perf gate that keeps every query class
+  ahead of native SQLite; in-browser, it leads SQLite Wasm and PGlite on queries and bulk ingest
+  at ten million rows.
+- **Safe across tabs** — writes publish atomically; readers see the old version or the new one,
+  never half a write. Reads never block writes.
+- **Built for real data** — compression, a memory budget you set, spill to storage, and durable,
+  resumable compaction and GC that fit in idle time.
+- **Workers first** — a shipped worker entry and main-thread client; the API is identical on
+  either side of the boundary.
+- **Live queries** — subscriptions re-run when their tables change, across tabs, and stay quiet
+  when results are unchanged.
+- **Devtools** — an embeddable SQL console and data browser for the database your app is already
+  using, shipped as a separate package.
+- **Our own engine** — parser, planner, optimizer, and executor implemented here; no SQLite or
   DuckDB underneath.
-- **Differentially tested** — every test run executes a seeded query corpus through the engine's
-  two executors and through three independent oracles (native SQLite, PGlite, and DuckDB); the
-  results must agree.
-
-## Quick start
-
-```ts
-import {
-  MinnowDatabase,
-  createMinnow,
-  column,
-  schema,
-  table,
-  type InferDatabase,
-} from "@minnowdb/core";
-import { IndexedDbBlockStore } from "@minnowdb/core/storage";
-
-const people = table("people", {
-  id: column.number().unique().autoIncrement(),
-  name: column.string(),
-  score: column.number().default(0),
-  joined: column.datetime().default("now"),
-  bio: column.string().nullable(),
-});
-
-const appSchema = schema([people]);
-interface DB extends InferDatabase<typeof appSchema> {}
-
-const database = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "app-db" }));
-await database.migrate(appSchema);
-
-const db = createMinnow<DB>(database, { schema: appSchema });
-
-await db
-  .insertInto("people")
-  .values([{ name: "Ada" }, { name: "Grace", score: 20 }])
-  .execute();
-
-const rows = await db
-  .selectFrom("people")
-  .where("score", ">=", 10)
-  .select(["name", "joined"])
-  .orderBy("name")
-  .execute(); // Array<{ name: string; joined: Date }>
-```
-
-There are **four column types on purpose**: `boolean`, `number`, `string`, `datetime`. Numeric
-widths, encodings, and row IDs are the engine's job, not schema choices. `column.enum([...])`
-is a string column restricted to a closed value set — typed as the literal union and validated
-on every write.
-
----
-
-## API overview
-
-### Schema and migrations
-
-`table()`, `column`, and `schema()` define tables with compile-time row types.
-
-| Modifier                  | Effect                                                                                          |
-| ------------------------- | ----------------------------------------------------------------------------------------------- |
-| `.unique()`               | The table's unique key — one non-nullable column                                                |
-| `.nullable()`             | Permits NULL and widens the inferred type                                                       |
-| `.autoIncrement()`        | Cross-tab atomic counter for number unique keys                                                 |
-| `.default(value \| fn)`   | A literal or `"now"` filled engine-side; a function (`() => ulid()`) filled by the typed facade |
-| `.renamedFrom(name)`      | Rename via stable column ID — metadata only, not a drop-and-add                                 |
-| `.references(table, col)` | Declared relation, stored as catalog metadata                                                   |
-
-`migrate()` diffs the live catalog and applies metadata-only steps: create a table, add a nullable
-column, rename, widen nullability, change a default. Each step is one atomic swap, so an
-interrupted migration finishes by re-running. Changes that would rewrite stored data — type
-changes, drops, unique-key changes — are **rejected instead of guessed at**.
-
-### Typed queries
-
-`createMinnow(database, { schema })` returns a Kysely-style builder: `selectFrom`, joins, `where`,
-`groupBy`, `having`, `orderBy`, `limit`, expression helpers, CTEs, subqueries, set operations, and
-aggregate and window functions. Left-joined columns type as `| null`, and `sum` over an empty group
-types as `number | null` — result types don't lie.
-
-### SQL
-
-```ts
-const result = await database.query("SELECT name FROM people WHERE score >= 10");
-const prepared = await database.prepareQuery("SELECT ..."); // pins one immutable version
-console.log(await database.explain("SELECT ...")); // optimized plan
-```
-
-`prepareQuery()` pins a snapshot and decodes only the columns it needs, so repeated `execute()`
-calls reuse it. The supported and rejected surface is checked in at
-[`sql-feature-matrix.json`](packages/core/sql-feature-matrix.json), with an executable example per
-entry and a conformance test that keeps it honest. **Unsupported syntax fails explicitly** rather
-than being silently reinterpreted.
-
-#### Deliberate omissions from the SQL standard
-
-Minnow targets SQL:2016 wherever it makes sense inside a browser worker. Some parts of the
-standard do not, and those are decisions, not gaps — the
-[full list with reasons](https://minnowdb.dev/docs/sql/#deliberate-omissions) is part of the docs.
-The short version:
-
-- **No access control, roles, or GRANT** — the browser origin sandbox is the security boundary;
-  there is exactly one "user".
-- **No sessions, cursors, or isolation-level selection** — every read is a stable snapshot and
-  writes serialize through MVCC; there is no weaker level to select.
-- **No session time zones** — datetimes are UTC instants, always, so a query returns the same
-  rows on every machine.
-- **No locale collation** — strings compare in codepoint order in every browser; locale-aware
-  ordering would ship ICU tables and make results depend on the host locale.
-- **No stored procedures, UDFs, or triggers** — extensibility lives in JavaScript around the
-  engine, and reactivity is what live queries are for.
-- **SQL-level `BEGIN`/`COMMIT` stays out** — transactions are the engine's programmatic API;
-  statements are individually atomic.
-
-Everything else in the standard that is missing (MERGE, LATERAL, `GROUPING()`, SQL/JSON) is
-catalogued as not-yet-implemented rather than never, and rejects with an explicit error.
-
-#### Performance
-
-A checked-in performance gate (`npm run test:perf`) times a seeded 200k-row suite on the full
-Minnow pipeline against three engines — native SQLite (`node:sqlite`), PGlite, and native
-DuckDB — and fails on regression past the recorded per-query ratios in
-[`perf-baseline.json`](packages/core/perf-baseline.json). Where things stand: Minnow beats
-PGlite on every measured query (3–70×) and beats native SQLite on every class but one —
-grouping 12×, DISTINCT aggregation 6.6×, joins 4.9×, scans 4.8×, top-N 4.1×, LIKE scans and
-windows 1.8× faster. The exception is bare `COUNT(*)`, where both engines answer in about a
-tenth of a millisecond and Minnow's fixed per-query snapshot cost (~0.06ms) shows; it ties
-native DuckDB there. Against native DuckDB — a vectorized OLAP engine and the ceiling worth
-measuring against — Minnow is faster on selective scans (1.6×), within 1.4–2.1× on top-N,
-windows, grouping, and joins, and 2.8× behind on LIKE and DISTINCT aggregation; the gate
-keeps every ratio from quietly getting worse. The comparisons are against
-native builds on purpose; the Wasm builds browsers actually run are slower, and the live
-in-browser comparison is on the bench site.
-
-### Full-text search
-
-Any column is searchable — no index DDL, no schema marking. A search treats the row as one
-document; matching is Unicode-aware and deterministic, and prefix terms end in `*`.
-
-```ts
-// Filter by match, rank by BM25, expose the score as _score
-const hits = await db
-  .selectFrom("articles")
-  .select(["title"])
-  .search("quick fo*")
-  .limit(10)
-  .execute();
-
-// The pieces, separately
-await db
-  .selectFrom("articles")
-  .select((eb) => ["title", eb.fn.bm25(["title", "body"], "quick fox").as("score")])
-  .where((eb) => eb.match(["title", "body"], "quick fox"))
-  .orderBy("score", "desc")
-  .execute();
-// SELECT title, BM25(title, body) AGAINST 'quick fox' AS score FROM articles
-// WHERE MATCH(title, body) AGAINST 'quick fox' ORDER BY score DESC
-
-// Every table at once, merged into one ranked list
-await db.search("quick fox", { limit: 20 }); // Array<{ table, row, score }>
-```
-
-Once a searched table crosses ~4096 rows, a **persisted index builds itself in the background** and
-inserts maintain it atomically. It is a pruning accelerator, never ground truth: every candidate is
-re-verified, and any invalidating mutation silently falls back to a scan and rebuilds.
-
-### Writes
-
-Typed `insertInto`, `updateTable`, and `deleteFrom` cover most work, with exact `returning` —
-including engine-generated defaults and auto-increment keys. Underneath, `insertBatch`,
-`upsertBatch`, `updateBatch`, and `deleteBatch` take arrays of rows or whole columns for bulk loads,
-and `bufferedWriter()` groups single rows into batches that flush on a row, byte, or age limit.
-
-Every write validates column names, row counts, nulls, and types before storing anything, and
-reports rows, bytes, timing, retries, and write amplification. A competing writer **fails your
-statement with a typed error** instead of interleaving.
-
-### Live queries
-
-```ts
-const live = db.selectFrom("people").where("score", ">=", 10).select(["name"]).live();
-```
-
-Subscriptions re-run when their tables change, **across tabs**. Every hint path — a local commit, a
-cross-tab message, or a poll tick — converges on the durable manifest version, so a missed message
-delays a refresh but cannot leave a stale result. A subscription keeps only its SQL, its table
-dependencies, and a result digest — never rows — and stays quiet when a rerun produces the same
-digest.
-
-### Workers
-
-The engine runs wherever you construct it. For real datasets, put it in a worker. The whole API is
-async, so your code is the same either way.
-
-```ts
-import { MinnowDatabaseClient } from "@minnowdb/core/client";
-
-const client = new MinnowDatabaseClient(
-  new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
-  { store: { kind: "indexeddb", name: "app-db" } },
-);
-const db = createMinnow<DB>(client, { schema: appSchema });
-```
-
-### Testing and maintenance
-
-`MemoryBlockStore` runs the real engine — tables, queries, compaction — with no browser storage.
-`compactTable()` rewrites older segments into fewer, larger ones; `collectGarbage()` reclaims
-unreachable data. Both are durable, resumable, and cancellable, with `...Step()` variants you can
-advance one step at a time.
-
-### Devtools
-
-An embeddable SQL console for the database your app is already using. It is a separate package, so
-it never reaches a production bundle unless you put it there.
-
-```ts
-import { mountMinnowDevtools } from "@minnowdb/devtools";
-
-if (import.meta.env.DEV) mountMinnowDevtools(db);
-```
-
-A launcher appears in the corner (`Cmd/Ctrl + Shift + D`). Browse tables in a windowed grid with
-sortable headers and typed filters, edit records inline, or run SQL in the console. The panel
-floats over your page without blocking it, every change is described and confirmed first, and
-`permissions: { write: false }` refuses those statements outright. It also ships as
-`<minnow-devtools>`, a custom element that works in any framework. See
-[the devtools guide](apps/site/src/content/docs/devtools.mdx), or run the docs site and open
-`/docs/playground/` to try the panel against a database running in the page.
-
-### Modules
-
-| Import                        | Contents                                            |
-| ----------------------------- | --------------------------------------------------- |
-| `@minnowdb/core`              | `MinnowDatabase`, `createMinnow`, schema DSL, types |
-| `@minnowdb/core/storage`      | `IndexedDbBlockStore`, `MemoryBlockStore`           |
-| `@minnowdb/core/client`       | `MinnowDatabaseClient` main-thread proxy            |
-| `@minnowdb/core/worker`       | The shipped worker entry                            |
-| `@minnowdb/core/testing`      | Test helpers                                        |
-| `@minnowdb/core/transactions` | Snapshots, leases, transaction manager              |
-| `@minnowdb/core/block-format` | Block encoding and decoding                         |
-| `@minnowdb/devtools`          | Embeddable SQL console panel                        |
-
----
-
-## Performance
-
-Latest capture (2026-08-14) on a 9,561,600-row, 50-table commerce dataset, 15 oracle-verified
-queries against SQLite Wasm and PGlite in real browsers with disk-backed storage (persistent
-profiles — earlier captures ran on memory-backed ephemeral profiles):
-
-- **~7.7× faster** than SQLite Wasm on sum of query medians in Chromium (255 ms vs 1,950 ms),
-  **~38×** in Firefox; **7–22× faster** than PGlite
-- **~456 MB** stored for the dataset SQLite keeps in 830 MB and PGlite in 1,390 MB
-- **~37k rows/s** sustained bulk insert to disk-backed IndexedDB in Chromium — the one axis
-  where SQLite Wasm's plain B-tree file is faster
-
-Single-host, single-run methodology — treat as observations, not a leaderboard. Full records and
-raw JSON are in [`benchmarks/`](benchmarks/).
+- **Differentially tested** — a seeded query corpus runs through the engine's two executors and
+  three independent oracles (native SQLite, PGlite, DuckDB) on every test run; results must
+  agree.
 
 ## Documentation
 
-The full docs cover the schema DSL, the query builder, writes and transactions, live queries,
-workers, best practices, architecture, and the complete API reference. They aren't published
-publicly yet — run the site locally:
+Everything else — quick start, the schema DSL, queries, writes, live queries, workers, devtools,
+the full SQL feature matrix, benchmark results, and the API reference — lives in the docs site,
+which is the single source of truth. It isn't published publicly yet; run it locally:
 
 ```bash
 npm run site:dev
 ```
 
-[`packages/core/README.md`](packages/core/README.md) is the typed API guide.
-[`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) cover the design and the
-milestone gates.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) are internal engineering
+records of the design and milestone gates.
 
 ## Development
 
@@ -312,19 +59,7 @@ npm install
 npm run check
 ```
 
-`npm run check` is the local format, lint, type, build, and unit-test gate. For the full release
-gate — real IndexedDB plus the browser dashboard suite:
-
-```bash
-npx playwright install chromium firefox webkit
-npm run check:release
-```
-
-`@minnowdb/bench` is the internal benchmark and test harness: a browser lab that generates the
-commerce dataset, verifies every value it stores, checks results against an independent JavaScript
-oracle, and compares Minnow against SQLite Wasm, DuckDB-Wasm, and PGlite. `@minnowdb/site` is the
-public docs site.
-
-```bash
-npm run dev --workspace @minnowdb/bench
-```
+`npm run check` is the local format, lint, type, build, and unit-test gate;
+`npm run check:release` adds real-browser suites (run `npx playwright install chromium firefox
+webkit` once first). `@minnowdb/bench` is the internal measurement harness; `@minnowdb/site` is
+the docs site.

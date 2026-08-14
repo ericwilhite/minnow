@@ -24,5 +24,8 @@
 
 - Update public documentation for every relevant change.
 - Write public documentation in clear, simple language. This includes the README.
-- The README covers key features and benefits, a quick start, and an API overview. It links to the
-  full docs rather than repeating them.
+- The docs site (`apps/site`) is the single source of truth for all user documentation: guides,
+  API reference, the SQL feature matrix page, and benchmark results (capture JSONs live in
+  `apps/site/src/data/benchmarks/`). Do not create parallel docs or results directories.
+- The README is a feature list plus install and development pointers. It links to the docs site
+  rather than repeating anything from it. Package READMEs are short summaries with the same rule.

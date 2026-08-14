@@ -3,9 +3,10 @@ import Base from "../layouts/Base.astro";
 import BenchBrowser, { type BenchResults } from "../components/BenchBrowser.astro";
 
 // Pick the newest engine-comparison capture per browser, decided by the recorded
-// capturedAt timestamp rather than filename order.
+// capturedAt timestamp rather than filename order. The site is the only home for
+// benchmark results; captures land in src/data/benchmarks/.
 const resultModules = import.meta.glob<{ default: BenchResults }>(
-  "../../../../benchmarks/results/*engine-comparison*.json",
+  "../data/benchmarks/*engine-comparison*.json",
   { eager: true },
 );
 const byBrowser = new Map<string, { path: string; results: BenchResults }>();
@@ -119,14 +120,22 @@ const engineMeta = Object.entries(first.dataset.engines);
             }
           </ul>
         </li>
+        {
+          first.browser.storage !== undefined && (
+            <li>
+              Captured in a persistent browser profile, so every engine's storage is genuinely
+              disk-backed — not the memory-backed IndexedDB of an ephemeral automation context.
+            </li>
+          )
+        }
         <li>
           Captured headless on an {first.host.model} ({first.host.cpus} cores). Absolute numbers
           vary by machine; the relationships are the point.
         </li>
         <li>
-          The harness, dataset generator, and result files are in the repository
-          (<code>benchmarks/results/</code>) — the suite runs in CI against all three engines, and
-          this page is generated from the same JSON.
+          The harness and dataset generator are in the repository, and the raw capture JSON lives
+          beside this page (<code>apps/site/src/data/benchmarks/</code>) — this page is generated
+          from it, so the page and the record cannot disagree.
         </li>
       </ul>
       <p>

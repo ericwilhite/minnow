@@ -1,91 +1,81 @@
 {
   "kind": "engine-comparison",
-  "capturedAt": "2026-08-12T10:46:03.714Z",
+  "capturedAt": "2026-08-14T14:11:15.599Z",
   "browser": {
-    "project": "chromium",
-    "version": "151.0.7922.34",
-    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36",
+    "project": "firefox",
+    "version": "153.0",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
     "hardwareConcurrency": 12,
-    "crossOriginIsolated": true
+    "crossOriginIsolated": true,
+    "storage": "persistent profile (disk-backed)"
   },
-  "host": {
-    "platform": "darwin",
-    "release": "25.5.0",
-    "arch": "arm64",
-    "cpus": 12,
-    "model": "Apple M2 Max"
+  "wallClock": {
+    "totalMs": 962910
   },
+  "progressCount": 719,
   "config": {
-    "scale": 10,
+    "scale": 100,
     "compression": "gzip",
     "targetBlockBytes": 1048576,
     "durability": "relaxed",
-    "engines": [
-      "minnow",
-      "sqlite",
-      "pglite"
-    ]
-  },
-  "wallClock": {
-    "datasetCreateMs": 32046.050000071526,
-    "referenceSuiteMs": 7116.799999952316
+    "engines": ["minnow", "sqlite", "pglite"]
   },
   "dataset": {
-    "id": "b1fc0055-5590-4467-ade1-20c49e0c8e2c",
-    "createdAt": "2026-08-12T10:45:24.602Z",
-    "scale": 10,
-    "totalRows": 956160,
+    "id": "c911734b-bb7b-4b8d-a593-1a4808658c1b",
+    "createdAt": "2026-08-14T13:55:12.770Z",
+    "scale": 100,
+    "totalRows": 9561600,
     "tableRows": {
-      "countries": 80,
-      "regions": 160,
-      "currencies": 40,
-      "sales_channels": 60,
-      "customer_segments": 60,
-      "tax_jurisdictions": 240,
-      "tax_rates": 480,
-      "warehouses": 80,
-      "stores": 240,
-      "employees": 1200,
-      "suppliers": 400,
-      "brands": 300,
-      "categories": 200,
-      "products": 2000,
-      "product_suppliers": 4000,
-      "price_lists": 120,
-      "product_prices": 6000,
-      "purchase_orders": 2400,
-      "purchase_order_items": 12000,
-      "receipts": 9000,
-      "receipt_items": 27000,
-      "customers": 2000,
-      "customer_addresses": 3000,
-      "customer_payment_methods": 2500,
-      "loyalty_accounts": 1800,
-      "loyalty_transactions": 12000,
-      "promotions": 300,
-      "carts": 6000,
-      "cart_items": 24000,
-      "orders": 10000,
-      "order_items": 30000,
-      "order_events": 250000,
-      "order_discounts": 2500,
-      "order_taxes": 30000,
-      "payments": 10000,
-      "payment_transactions": 20000,
-      "payment_attempts": 30000,
-      "fraud_reviews": 1200,
-      "shipments": 8000,
-      "shipment_items": 24000,
-      "shipment_events": 32000,
-      "delivery_attempts": 10000,
-      "returns": 1000,
-      "return_items": 1000,
-      "refunds": 800,
-      "support_tickets": 3000,
-      "support_messages": 15000,
-      "inventory_movements": 40000,
-      "inventory_snapshots": 100000,
-      "audit_events": 220000
+      "countries": 800,
+      "regions": 1600,
+      "currencies": 400,
+      "sales_channels": 600,
+      "customer_segments": 600,
+      "tax_jurisdictions": 2400,
+      "tax_rates": 4800,
+      "warehouses": 800,
+      "stores": 2400,
+      "employees": 12000,
+      "suppliers": 4000,
+      "brands": 3000,
+      "categories": 2000,
+      "products": 20000,
+      "product_suppliers": 40000,
+      "price_lists": 1200,
+      "product_prices": 60000,
+      "purchase_orders": 24000,
+      "purchase_order_items": 120000,
+      "receipts": 90000,
+      "receipt_items": 270000,
+      "customers": 20000,
+      "customer_addresses": 30000,
+      "customer_payment_methods": 25000,
+      "loyalty_accounts": 18000,
+      "loyalty_transactions": 120000,
+      "promotions": 3000,
+      "carts": 60000,
+      "cart_items": 240000,
+      "orders": 100000,
+      "order_items": 300000,
+      "order_events": 2500000,
+      "order_discounts": 25000,
+      "order_taxes": 300000,
+      "payments": 100000,
+      "payment_transactions": 200000,
+      "payment_attempts": 300000,
+      "fraud_reviews": 12000,
+      "shipments": 80000,
+      "shipment_items": 240000,
+      "shipment_events": 320000,
+      "delivery_attempts": 100000,
+      "returns": 10000,
+      "return_items": 10000,
+      "refunds": 8000,
+      "support_tickets": 30000,
+      "support_messages": 150000,
+      "inventory_movements": 400000,
+      "inventory_snapshots": 1000000,
+      "audit_events": 2200000
     },
     "compression": "gzip",
     "targetBlockBytes": 1048576,
@@ -94,85 +84,79 @@
       "minnow": {
         "engine": "minnow",
         "status": "ready",
-        "storageName": "mdb-dataset-b1fc0055-5590-4467-ade1-20c49e0c8e2c",
+        "storageName": "mdb-dataset-c911734b-bb7b-4b8d-a593-1a4808658c1b",
         "version": "workspace",
         "persistence": "IndexedDB · immutable compressed column blocks",
-        "storedBytes": 18822223,
-        "buildMs": 2340.610000014305,
-        "insertMs": 1852.4950000047684
+        "storedBytes": 206266557,
+        "buildMs": 22064.26,
+        "insertMs": 18532.79999999998
       },
       "sqlite": {
         "engine": "sqlite",
         "status": "ready",
-        "storageName": "/mdb-dataset-b1fc0055-5590-4467-ade1-20c49e0c8e2c.sqlite3",
+        "storageName": "/mdb-dataset-c911734b-bb7b-4b8d-a593-1a4808658c1b.sqlite3",
         "vfs": "sah-pool",
         "version": "3.53.0",
         "persistence": "OPFS SAH-pool VFS · persistent SQLite file",
-        "storedBytes": 80683008,
-        "buildMs": 9090.460000038147,
-        "insertMs": 6168.910000324249
+        "storedBytes": 829595648,
+        "buildMs": 118216.88,
+        "insertMs": 86359.06000000003
       },
       "pglite": {
         "engine": "pglite",
         "status": "ready",
-        "storageName": "/pglite/mdb-dataset-b1fc0055-5590-4467-ade1-20c49e0c8e2c",
+        "storageName": "/pglite/mdb-dataset-c911734b-bb7b-4b8d-a593-1a4808658c1b",
         "version": "0.5.x",
         "persistence": "IndexedDB VFS · persistent PostgreSQL data directory",
-        "storedBytes": 149987855,
-        "buildMs": 20290.179999947548,
-        "insertMs": 10727.685000538826
+        "storedBytes": 1390166543,
+        "buildMs": 632369.42,
+        "insertMs": 453190.62000000017
       }
     }
   },
   "suite": {
-    "datasetId": "b1fc0055-5590-4467-ade1-20c49e0c8e2c",
-    "scale": 10,
+    "datasetId": "c911734b-bb7b-4b8d-a593-1a4808658c1b",
+    "scale": 100,
     "sampleCount": 7,
-    "engines": [
-      "minnow",
-      "sqlite",
-      "pglite"
-    ],
+    "engines": ["minnow", "sqlite", "pglite"],
     "queries": [
       {
         "id": "q1",
         "name": "Order point lookup",
         "complexity": "simple",
-        "sql": "SELECT * FROM orders WHERE order_id = 5000",
-        "tables": [
-          "orders"
-        ],
+        "sql": "SELECT * FROM orders WHERE order_id = 50000",
+        "tables": ["orders"],
         "expectedRows": 1,
         "oracleRows": 1,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 15.914999961853027,
-            "medianMs": 0.020000100135803223,
-            "p95Ms": 0.05500006675720215,
+            "prepareMs": 50.339999999967404,
+            "medianMs": 0.07999999995809048,
+            "p95Ms": 0.17999999993480742,
             "resultRows": 1,
-            "checksum": 1367528661,
+            "checksum": 1687944301,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.019999980926513672,
-            "medianMs": 0.22499990463256836,
-            "p95Ms": 0.2749999761581421,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 0.2400000001071021,
+            "p95Ms": 0.30000000004656613,
             "resultRows": 1,
-            "checksum": 1367528661,
+            "checksum": 1687944301,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.014999985694885254,
-            "medianMs": 26.68999993801117,
-            "p95Ms": 29.84500002861023,
+            "prepareMs": 0,
+            "medianMs": 11.099999999976717,
+            "p95Ms": 11.460000000079162,
             "resultRows": 1,
-            "checksum": 1367528661,
+            "checksum": 1687944301,
             "verified": true
           }
         ]
@@ -182,40 +166,38 @@
         "name": "Paid orders in a date range",
         "complexity": "simple",
         "sql": "SELECT order_id, customer_id, total FROM orders WHERE status = 'paid' AND placed_at >= DATE '2025-04-01' AND placed_at < DATE '2025-07-01' ORDER BY total DESC, order_id LIMIT 25",
-        "tables": [
-          "orders"
-        ],
+        "tables": ["orders"],
         "expectedRows": 25,
         "oracleRows": 25,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 6.600000023841858,
-            "medianMs": 0.3700000047683716,
-            "p95Ms": 0.6850000619888306,
+            "prepareMs": 35.18000000005122,
+            "medianMs": 1.2800000000279397,
+            "p95Ms": 1.3600000001024455,
             "resultRows": 25,
-            "checksum": 2841624194,
+            "checksum": 3775019738,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 0.9300000667572021,
-            "p95Ms": 1.0199999809265137,
+            "prepareMs": 0,
+            "medianMs": 60.82000000006519,
+            "p95Ms": 61.15999999991618,
             "resultRows": 25,
-            "checksum": 2841624194,
+            "checksum": 3775019738,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 27.204999923706055,
-            "p95Ms": 27.68499994277954,
+            "prepareMs": 0,
+            "medianMs": 56.93999999994412,
+            "p95Ms": 58.92000000004191,
             "resultRows": 25,
-            "checksum": 2841624194,
+            "checksum": 3775019738,
             "verified": true
           }
         ]
@@ -225,40 +207,38 @@
         "name": "Revenue by order status",
         "complexity": "moderate",
         "sql": "SELECT status, COUNT(*) AS orders, SUM(total) AS revenue, AVG(total) AS avg_order FROM orders GROUP BY status ORDER BY revenue DESC",
-        "tables": [
-          "orders"
-        ],
+        "tables": ["orders"],
         "expectedRows": 4,
         "oracleRows": 4,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 2.990000009536743,
-            "medianMs": 0.7150000333786011,
-            "p95Ms": 0.9800000190734863,
+            "prepareMs": 10.559999999939464,
+            "medianMs": 3.459999999962747,
+            "p95Ms": 3.5200000000186265,
             "resultRows": 4,
-            "checksum": 2693879440,
+            "checksum": 2446484688,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0,
-            "medianMs": 3.024999976158142,
-            "p95Ms": 3.040000081062317,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 207.96000000007916,
+            "p95Ms": 215.4200000000419,
             "resultRows": 4,
-            "checksum": 2693879440,
+            "checksum": 2446484688,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 28.5349999666214,
-            "p95Ms": 28.90499997138977,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 142.05999999993946,
+            "p95Ms": 142.44000000006054,
             "resultRows": 4,
-            "checksum": 2693879440,
+            "checksum": 2446484688,
             "verified": true
           }
         ]
@@ -268,42 +248,38 @@
         "name": "Top customers by captured revenue",
         "complexity": "moderate",
         "sql": "SELECT c.customer_id, c.segment, SUM(p.captured_amount) AS revenue FROM customers c JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY c.customer_id, c.segment ORDER BY revenue DESC, c.customer_id LIMIT 20",
-        "tables": [
-          "customers",
-          "orders",
-          "payments"
-        ],
+        "tables": ["customers", "orders", "payments"],
         "expectedRows": 20,
         "oracleRows": 20,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 13.054999947547913,
-            "medianMs": 4.5350000858306885,
-            "p95Ms": 6.7799999713897705,
+            "prepareMs": 70.0800000000745,
+            "medianMs": 68.8399999999674,
+            "p95Ms": 116.21999999997206,
             "resultRows": 20,
-            "checksum": 1799370489,
+            "checksum": 1617917,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 8.259999990463257,
-            "p95Ms": 8.459999918937683,
+            "prepareMs": 0,
+            "medianMs": 559.2199999999721,
+            "p95Ms": 560.6999999999534,
             "resultRows": 20,
-            "checksum": 1799370489,
+            "checksum": 1617917,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 32.730000019073486,
-            "p95Ms": 33.53999996185303,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 319.9200000000419,
+            "p95Ms": 335.85999999998603,
             "resultRows": 20,
-            "checksum": 1799370489,
+            "checksum": 1617917,
             "verified": true
           }
         ]
@@ -313,41 +289,38 @@
         "name": "Category revenue after discounts",
         "complexity": "moderate",
         "sql": "SELECT p.category, SUM(i.quantity * i.unit_price * (1 - i.discount_pct)) AS net_revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category ORDER BY net_revenue DESC",
-        "tables": [
-          "order_items",
-          "products"
-        ],
+        "tables": ["order_items", "products"],
         "expectedRows": 5,
         "oracleRows": 5,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 7.629999995231628,
-            "medianMs": 5.230000019073486,
-            "p95Ms": 5.659999966621399,
+            "prepareMs": 68.15999999991618,
+            "medianMs": 62.059999999939464,
+            "p95Ms": 69.47999999998137,
             "resultRows": 5,
-            "checksum": 1978494626,
+            "checksum": 1667959758,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 16.62999999523163,
-            "p95Ms": 16.725000023841858,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 1258.640000000014,
+            "p95Ms": 1300.9799999999814,
             "resultRows": 5,
-            "checksum": 2044875500,
+            "checksum": 3331163317,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 37.16500008106232,
-            "p95Ms": 38.65499997138977,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 584.7199999999721,
+            "p95Ms": 600.5999999999767,
             "resultRows": 5,
-            "checksum": 1978494626,
+            "checksum": 1667959758,
             "verified": true
           }
         ]
@@ -357,42 +330,38 @@
         "name": "Repeat customers without returns",
         "complexity": "complex",
         "sql": "WITH returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id) SELECT o.customer_id, COUNT(*) AS orders FROM orders o WHERE o.order_id NOT IN (SELECT order_id FROM returned_orders) GROUP BY o.customer_id HAVING COUNT(*) >= 2",
-        "tables": [
-          "orders",
-          "order_items",
-          "returns"
-        ],
-        "expectedRows": 1800,
-        "oracleRows": 1800,
+        "tables": ["orders", "order_items", "returns"],
+        "expectedRows": 18000,
+        "oracleRows": 18000,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 11.240000009536743,
-            "medianMs": 2.759999990463257,
-            "p95Ms": 4.370000004768372,
-            "resultRows": 1800,
-            "checksum": 3487210463,
+            "prepareMs": 97.92000000004191,
+            "medianMs": 39.71999999997206,
+            "p95Ms": 60.639999999897555,
+            "resultRows": 18000,
+            "checksum": 1082572023,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 7.340000033378601,
-            "p95Ms": 8.47000002861023,
-            "resultRows": 1800,
-            "checksum": 3487210463,
+            "prepareMs": 0,
+            "medianMs": 431.61999999999534,
+            "p95Ms": 442.5200000000186,
+            "resultRows": 18000,
+            "checksum": 1082572023,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.009999990463256836,
-            "medianMs": 35.575000047683716,
-            "p95Ms": 37.36500000953674,
-            "resultRows": 1800,
-            "checksum": 3487210463,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 304.38000000000466,
+            "p95Ms": 325.94000000006054,
+            "resultRows": 18000,
+            "checksum": 1082572023,
             "verified": true
           }
         ]
@@ -402,19 +371,16 @@
         "name": "Top products within each category",
         "complexity": "complex",
         "sql": "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY revenue DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
-        "tables": [
-          "order_items",
-          "products"
-        ],
+        "tables": ["order_items", "products"],
         "expectedRows": 15,
         "oracleRows": 15,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 18.110000014305115,
-            "medianMs": 0.019999980926513672,
-            "p95Ms": 0.020000100135803223,
+            "prepareMs": 179.9800000000978,
+            "medianMs": 0.0400000000372529,
+            "p95Ms": 0.14000000001396984,
             "resultRows": 15,
             "checksum": 1152223829,
             "verified": true
@@ -422,9 +388,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 20.889999985694885,
-            "p95Ms": 21.37000000476837,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 1609.7399999999907,
+            "p95Ms": 1629.4400000000605,
             "resultRows": 15,
             "checksum": 1152223829,
             "verified": true
@@ -432,9 +398,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.009999990463256836,
-            "medianMs": 38.954999923706055,
-            "p95Ms": 40.424999952316284,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 1228.6800000000512,
+            "p95Ms": 1246.4000000000233,
             "resultRows": 15,
             "checksum": 1152223829,
             "verified": true
@@ -446,44 +412,38 @@
         "name": "Monthly cohort revenue and return rate",
         "complexity": "complex",
         "sql": "WITH cohorts AS (SELECT customer_id AS customer_id, DATE_TRUNC('month', joined_at) AS cohort_month FROM customers), returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id), captured AS (SELECT k.cohort_month AS cohort_month, o.customer_id AS customer_id, SUM(p.captured_amount) AS revenue, COUNT(*) AS orders FROM payments p JOIN orders o ON o.order_id = p.order_id JOIN cohorts k ON k.customer_id = o.customer_id WHERE p.status = 'captured' GROUP BY k.cohort_month, o.customer_id) SELECT cohort_month, COUNT(*) AS customers, SUM(revenue) AS revenue FROM captured GROUP BY cohort_month ORDER BY cohort_month",
-        "tables": [
-          "customers",
-          "orders",
-          "order_items",
-          "returns",
-          "payments"
-        ],
+        "tables": ["customers", "orders", "order_items", "returns", "payments"],
         "expectedRows": 12,
         "oracleRows": 12,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 11.045000076293945,
-            "medianMs": 0.35500001907348633,
-            "p95Ms": 0.4049999713897705,
+            "prepareMs": 112.35999999998603,
+            "medianMs": 3.8199999999487773,
+            "p95Ms": 4.940000000060536,
             "resultRows": 12,
-            "checksum": 194792967,
+            "checksum": 3625939987,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 10.899999976158142,
-            "p95Ms": 11.34500002861023,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 932.6199999999953,
+            "p95Ms": 955.8399999999674,
             "resultRows": 12,
-            "checksum": 194792967,
+            "checksum": 3625939987,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.014999985694885254,
-            "medianMs": 32.99500000476837,
-            "p95Ms": 34.0550000667572,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 407.46000000007916,
+            "p95Ms": 410.61999999999534,
             "resultRows": 12,
-            "checksum": 194792967,
+            "checksum": 3625939987,
             "verified": true
           }
         ]
@@ -493,43 +453,38 @@
         "name": "Region and segment revenue matrix",
         "complexity": "complex",
         "sql": "WITH per_customer AS (SELECT r.name AS region, c.segment AS segment, c.customer_id AS customer_id, SUM(p.captured_amount) AS revenue FROM regions r JOIN customers c ON c.region_id = r.region_id JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY r.name, c.segment, c.customer_id) SELECT region, segment, COUNT(*) AS customers, SUM(revenue) AS revenue FROM per_customer GROUP BY region, segment ORDER BY region, segment",
-        "tables": [
-          "regions",
-          "customers",
-          "orders",
-          "payments"
-        ],
-        "expectedRows": 480,
-        "oracleRows": 480,
+        "tables": ["regions", "customers", "orders", "payments"],
+        "expectedRows": 4800,
+        "oracleRows": 4800,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 13.235000014305115,
-            "medianMs": 0.75,
-            "p95Ms": 1.2949999570846558,
-            "resultRows": 480,
-            "checksum": 1214026370,
+            "prepareMs": 194.68000000005122,
+            "medianMs": 7.760000000009313,
+            "p95Ms": 8.160000000032596,
+            "resultRows": 4800,
+            "checksum": 992978448,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0,
-            "medianMs": 12.549999952316284,
-            "p95Ms": 13.370000004768372,
-            "resultRows": 480,
-            "checksum": 1214026370,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 831.7600000000093,
+            "p95Ms": 885.0999999999767,
+            "resultRows": 4800,
+            "checksum": 992978448,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 35.91499996185303,
-            "p95Ms": 41.91500008106232,
-            "resultRows": 480,
-            "checksum": 1214026370,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 467.44000000006054,
+            "p95Ms": 500.0799999999581,
+            "resultRows": 4800,
+            "checksum": 992978448,
             "verified": true
           }
         ]
@@ -539,42 +494,38 @@
         "name": "Return rate by product category",
         "complexity": "complex",
         "sql": "SELECT p.category, COUNT(*) AS items, COUNT(r.item_id) AS returns, COUNT(r.item_id) * 1.0 / COUNT(*) AS return_rate FROM products p JOIN order_items i ON i.product_id = p.product_id LEFT JOIN (SELECT DISTINCT item_id AS item_id FROM returns) r ON r.item_id = i.item_id GROUP BY p.category ORDER BY p.category",
-        "tables": [
-          "products",
-          "order_items",
-          "returns"
-        ],
+        "tables": ["products", "order_items", "returns"],
         "expectedRows": 5,
         "oracleRows": 5,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 4.829999923706055,
-            "medianMs": 3.7649999856948853,
-            "p95Ms": 4.284999966621399,
+            "prepareMs": 64.26000000000931,
+            "medianMs": 52.17999999993481,
+            "p95Ms": 52.64000000001397,
             "resultRows": 5,
-            "checksum": 3955307625,
+            "checksum": 3613870603,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 16.080000042915344,
-            "p95Ms": 16.460000038146973,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 1244.2200000000885,
+            "p95Ms": 1290.640000000014,
             "resultRows": 5,
-            "checksum": 3955307625,
+            "checksum": 3613870603,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.009999990463256836,
-            "medianMs": 36.83999991416931,
-            "p95Ms": 36.96000003814697,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 546.9199999999255,
+            "p95Ms": 565.8199999999488,
             "resultRows": 5,
-            "checksum": 3955307625,
+            "checksum": 3613870603,
             "verified": true
           }
         ]
@@ -584,42 +535,38 @@
         "name": "Tax collected by jurisdiction",
         "complexity": "complex",
         "sql": "SELECT j.name, SUM(t.tax_amount) AS tax_collected FROM order_taxes t JOIN tax_rates r ON r.tax_rate_id = t.tax_rate_id JOIN tax_jurisdictions j ON j.jurisdiction_id = r.jurisdiction_id GROUP BY j.name ORDER BY tax_collected DESC",
-        "tables": [
-          "order_taxes",
-          "tax_rates",
-          "tax_jurisdictions"
-        ],
-        "expectedRows": 240,
-        "oracleRows": 240,
+        "tables": ["order_taxes", "tax_rates", "tax_jurisdictions"],
+        "expectedRows": 2400,
+        "oracleRows": 2400,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 4.6600000858306885,
-            "medianMs": 3.194999933242798,
-            "p95Ms": 3.309999942779541,
-            "resultRows": 240,
-            "checksum": 1747700086,
+            "prepareMs": 43.26000000000931,
+            "medianMs": 27.5,
+            "p95Ms": 27.760000000009313,
+            "resultRows": 2400,
+            "checksum": 1758624792,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 15.15499997138977,
-            "p95Ms": 15.299999952316284,
-            "resultRows": 240,
-            "checksum": 1747700086,
+            "prepareMs": 0,
+            "medianMs": 1207.8799999998882,
+            "p95Ms": 1240.140000000014,
+            "resultRows": 2400,
+            "checksum": 1758624792,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0,
-            "medianMs": 38.28000009059906,
-            "p95Ms": 38.75499999523163,
-            "resultRows": 240,
-            "checksum": 1747700086,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 718.6199999999953,
+            "p95Ms": 739.1199999999953,
+            "resultRows": 2400,
+            "checksum": 1758624792,
             "verified": true
           }
         ]
@@ -629,42 +576,38 @@
         "name": "Fulfillment volume by warehouse",
         "complexity": "moderate",
         "sql": "WITH per_shipment AS (SELECT w.name AS name, s.shipment_id AS shipment_id, SUM(si.quantity) AS units FROM warehouses w JOIN shipments s ON s.warehouse_id = w.warehouse_id JOIN shipment_items si ON si.shipment_id = s.shipment_id GROUP BY w.name, s.shipment_id) SELECT name, COUNT(*) AS shipments, SUM(units) AS units FROM per_shipment GROUP BY name ORDER BY units DESC",
-        "tables": [
-          "shipments",
-          "shipment_items",
-          "warehouses"
-        ],
-        "expectedRows": 80,
-        "oracleRows": 80,
+        "tables": ["shipments", "shipment_items", "warehouses"],
+        "expectedRows": 800,
+        "oracleRows": 800,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 16.455000042915344,
-            "medianMs": 0.42500007152557373,
-            "p95Ms": 0.434999942779541,
-            "resultRows": 80,
-            "checksum": 3681613135,
+            "prepareMs": 307.6600000000326,
+            "medianMs": 2.85999999998603,
+            "p95Ms": 4.100000000093132,
+            "resultRows": 800,
+            "checksum": 2631281431,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 17.420000076293945,
-            "p95Ms": 17.72000002861023,
-            "resultRows": 80,
-            "checksum": 3681613135,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 1346.0999999999767,
+            "p95Ms": 1399.4600000000792,
+            "resultRows": 800,
+            "checksum": 2631281431,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.005000114440917969,
-            "medianMs": 40.07000005245209,
-            "p95Ms": 40.81000006198883,
-            "resultRows": 80,
-            "checksum": 3681613135,
+            "prepareMs": 0.01999999990221113,
+            "medianMs": 923.5999999999767,
+            "p95Ms": 943.2199999999721,
+            "resultRows": 800,
+            "checksum": 2631281431,
             "verified": true
           }
         ]
@@ -674,41 +617,38 @@
         "name": "Supplier inventory ledger",
         "complexity": "moderate",
         "sql": "SELECT s.name, COUNT(*) AS movements, SUM(m.quantity_delta) AS net_units FROM suppliers s JOIN inventory_movements m ON m.supplier_id = s.supplier_id GROUP BY s.name ORDER BY movements DESC",
-        "tables": [
-          "inventory_movements",
-          "suppliers"
-        ],
-        "expectedRows": 400,
-        "oracleRows": 400,
+        "tables": ["inventory_movements", "suppliers"],
+        "expectedRows": 4000,
+        "oracleRows": 4000,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 5.014999985694885,
-            "medianMs": 3.4149999618530273,
-            "p95Ms": 3.5700000524520874,
-            "resultRows": 400,
-            "checksum": 3614004205,
+            "prepareMs": 113.80000000004657,
+            "medianMs": 26.619999999995343,
+            "p95Ms": 27.319999999948777,
+            "resultRows": 4000,
+            "checksum": 3713854895,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 20.93999993801117,
-            "p95Ms": 26.049999952316284,
-            "resultRows": 400,
-            "checksum": 3614004205,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 1798.2999999999302,
+            "p95Ms": 1807.7200000000885,
+            "resultRows": 4000,
+            "checksum": 3713854895,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0,
-            "medianMs": 40.3199999332428,
-            "p95Ms": 40.68500006198883,
-            "resultRows": 400,
-            "checksum": 3614004205,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 943.5400000000373,
+            "p95Ms": 965.6199999999953,
+            "resultRows": 4000,
+            "checksum": 3713854895,
             "verified": true
           }
         ]
@@ -718,40 +658,38 @@
         "name": "Payment transaction funnel",
         "complexity": "simple",
         "sql": "SELECT kind, status, COUNT(*) AS transactions, SUM(amount) AS amount FROM payment_transactions GROUP BY kind, status ORDER BY kind, status",
-        "tables": [
-          "payment_transactions"
-        ],
+        "tables": ["payment_transactions"],
         "expectedRows": 4,
         "oracleRows": 4,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 8.509999990463257,
-            "medianMs": 1.415000081062317,
-            "p95Ms": 1.5299999713897705,
+            "prepareMs": 83.96000000007916,
+            "medianMs": 15.760000000009313,
+            "p95Ms": 16.29999999993015,
             "resultRows": 4,
-            "checksum": 2499603892,
+            "checksum": 468787018,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 8.31499993801117,
-            "p95Ms": 8.394999980926514,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 771.6199999999953,
+            "p95Ms": 804.0600000000559,
             "resultRows": 4,
-            "checksum": 2499603892,
+            "checksum": 468787018,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0,
-            "medianMs": 31.100000023841858,
-            "p95Ms": 32.09500002861023,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 344.78000000002794,
+            "p95Ms": 358.05999999993946,
             "resultRows": 4,
-            "checksum": 2499603892,
+            "checksum": 468787018,
             "verified": true
           }
         ]
@@ -761,51 +699,47 @@
         "name": "Discount and tax burden by order status",
         "complexity": "complex",
         "sql": "WITH discounts AS (SELECT order_id AS order_id, SUM(amount) AS amount FROM order_discounts GROUP BY order_id), taxes AS (SELECT order_id AS order_id, SUM(tax_amount) AS amount FROM order_taxes GROUP BY order_id) SELECT o.status, SUM(COALESCE(d.amount, 0)) AS discounts, SUM(COALESCE(t.amount, 0)) AS taxes FROM orders o LEFT JOIN discounts d ON d.order_id = o.order_id LEFT JOIN taxes t ON t.order_id = o.order_id GROUP BY o.status ORDER BY o.status",
-        "tables": [
-          "orders",
-          "order_discounts",
-          "order_taxes"
-        ],
+        "tables": ["orders", "order_discounts", "order_taxes"],
         "expectedRows": 4,
         "oracleRows": 4,
         "engines": [
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 14.700000047683716,
-            "medianMs": 2.2450000047683716,
-            "p95Ms": 3.334999918937683,
+            "prepareMs": 262.11999999999534,
+            "medianMs": 44.20000000006985,
+            "p95Ms": 46.559999999939464,
             "resultRows": 4,
-            "checksum": 2759817543,
+            "checksum": 4087583758,
             "verified": true
           },
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.004999995231628418,
-            "medianMs": 15.81000006198883,
-            "p95Ms": 16.304999947547913,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 1299.079999999958,
+            "p95Ms": 1336.4799999999814,
             "resultRows": 4,
-            "checksum": 2759817543,
+            "checksum": 2015296612,
             "verified": true
           },
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0,
-            "medianMs": 39.625,
-            "p95Ms": 40.375,
+            "prepareMs": 0.02000000001862645,
+            "medianMs": 728.0600000000559,
+            "p95Ms": 774.0600000000559,
             "resultRows": 4,
-            "checksum": 2759817543,
+            "checksum": 4087583758,
             "verified": true
           }
         ]
       }
     ],
     "totalMsByEngine": {
-      "minnow": 29.21500027179718,
-      "sqlite": 174.46999990940094,
-      "pglite": 521.9999998807907
+      "minnow": 356.1799999998184,
+      "sqlite": 13559.820000000065,
+      "pglite": 7728.2200000000885
     },
     "supportedByEngine": {
       "minnow": 15,
@@ -814,5 +748,11 @@
     },
     "passed": true
   },
-  "progressCount": 242
+  "host": {
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "cpus": 12,
+    "model": "Apple M2 Max"
+  }
 }
