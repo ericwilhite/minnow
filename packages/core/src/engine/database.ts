@@ -303,6 +303,16 @@ export interface ReadTableOptions {
   columns?: readonly string[];
 }
 
+/**
+ * The scope handed to `snapshot()`: queries pinned to one manifest version, consistent with
+ * each other for the lifetime of the callback.
+ */
+export interface SnapshotSession {
+  /** The pinned manifest version; null only on a database with no commits yet. */
+  readonly version: number | null;
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
+}
+
 export interface QueryOptions {
   readonly version?: number;
   /**
@@ -498,15 +508,14 @@ export interface MinnowDatabaseOptions {
   /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
   spillOwnerLeaseMs?: number;
   /**
-   * Retained bytes for the prepare cache: assembled append-table column vectors,
-   * zone-pruned projections, and derived/subquery block results that let repeated query
-   * preparation skip block reads, decompression, vector assembly, and deterministic
-   * re-execution. Entries are keyed by the exact visible segment ids (plus predicate
-   * values and the block plan where relevant), so a cached entry can never serve stale
-   * data; writes simply stop matching and old entries age out of the byte-bounded LRU.
-   * 0 disables the cache. Defaults to 64 MiB.
+   * Retained bytes for the block buffer pool: decoded physical blocks, their vectorized
+   * per-block column forms, zone-map block descriptions, and derived/subquery block
+   * results. Every entry is keyed by an immutable identity (a block id, or an exact
+   * visible-segment-id fingerprint), so a cached entry can never serve stale data;
+   * superseded entries simply stop being referenced and age out of the byte-bounded
+   * LRU. 0 disables the pool. Defaults to 64 MiB.
    */
-  prepareCacheBytes?: number;
+  bufferPoolBytes?: number;
   /**
    * Visible-row threshold at which a full-text MATCH on an unindexed append-only column
    * schedules a background index build (fire-and-forget; correctness never waits on it).
@@ -659,7 +668,7 @@ export class MinnowDatabase {
     if (!Number.isSafeInteger(this.#spillOwnerLeaseMs) || this.#spillOwnerLeaseMs <= 0) {
       throw new RangeError("Spill owner lease lifetime must be a positive whole number");
     }
-    this.#prepareCacheLimitBytes = options.prepareCacheBytes ?? 64 * 1024 * 1024;
+    this.#prepareCacheLimitBytes = options.bufferPoolBytes ?? 64 * 1024 * 1024;
     if (!Number.isSafeInteger(this.#prepareCacheLimitBytes) || this.#prepareCacheLimitBytes < 0) {
       throw new RangeError("Prepare cache bytes must be a non-negative whole number");
     }
@@ -1305,14 +1314,31 @@ export class MinnowDatabase {
   }
 
   /**
-   * Compiles a read-only SELECT statement and materializes one stable snapshot.
-   * Repeated execute() calls measure query execution without including storage I/O.
+   * Runs the callback against one pinned manifest version: every query inside the scope
+   * observes the same committed state, however many commits land meanwhile. This is the
+   * only pinning primitive — it cannot leak, because the pin is the scope. The version's
+   * blocks stay protected by an internal reader lease for the scope's duration, renewed
+   * while queries run; keep scopes short so garbage collection is not held back.
+   *
+   * On a database with no commits yet the session has no version to pin; its queries run
+   * fresh, which is indistinguishable until the first commit.
    */
-  async prepareQuery(sql: string, options: QueryOptions = {}): Promise<PreparedQuery> {
-    return this.#prepareCompiledPlan(
-      bindPlanParameters(this.#compileCached(sql), options.params),
-      options,
-    );
+  async snapshot<T>(action: (session: SnapshotSession) => Promise<T>): Promise<T> {
+    for (;;) {
+      const version = await this.store.getCurrentManifestVersion();
+      const entry = await this.#acquireSharedLease(version);
+      if (entry === undefined) continue;
+      try {
+        const session: SnapshotSession = {
+          version,
+          query: (sql: string, options: QueryOptions = {}) =>
+            this.query(sql, { ...options, ...(version === null ? {} : { version }) }),
+        };
+        return await action(session);
+      } finally {
+        this.#releaseSharedLease(entry);
+      }
+    }
   }
 
   #compileCached(sql: string): CompiledQuery {
@@ -6252,22 +6278,6 @@ export class MinnowDatabase {
     );
   }
 
-  /** Every projected column from cache, or undefined on any miss (misses fall through). */
-  #cachedAppendColumns(
-    table: TableRecord,
-    projectedColumns: readonly TableColumnRecord[],
-    fingerprint: string,
-  ): Map<string, ColumnVector> | undefined {
-    if (this.#prepareCacheLimitBytes === 0) return undefined;
-    const columns = new Map<string, ColumnVector>();
-    for (const column of projectedColumns) {
-      const vector = this.#cachedColumnVector(table.id, column.id, fingerprint);
-      if (vector === undefined) return undefined;
-      columns.set(column.name, vector);
-    }
-    return columns;
-  }
-
   #cacheGet(key: string): unknown {
     if (this.#prepareCacheLimitBytes === 0) return undefined;
     const entry = this.#prepareCache.get(key);
@@ -6297,28 +6307,6 @@ export class MinnowDatabase {
       this.#prepareCache.delete(oldestKey);
       this.#prepareCacheUsedBytes -= entry.bytes;
     }
-  }
-
-  #cachedColumnVector(
-    tableId: string,
-    columnId: string,
-    fingerprint: string,
-  ): ColumnVector | undefined {
-    return this.#cacheGet(`vec\u0000${tableId}\u0000${columnId}\u0000${fingerprint}`) as
-      ColumnVector | undefined;
-  }
-
-  #storeColumnVector(
-    tableId: string,
-    columnId: string,
-    fingerprint: string,
-    vector: ColumnVector,
-  ): void {
-    this.#cachePut(
-      `vec\u0000${tableId}\u0000${columnId}\u0000${fingerprint}`,
-      vector,
-      columnVectorRetainedBytes(vector),
-    );
   }
 
   /**
@@ -6677,18 +6665,6 @@ export class MinnowDatabase {
         keyColumn !== undefined && projectedColumns.some((column) => column.id === keyColumn.id)
           ? keyColumn.name
           : undefined;
-      // Segment records are immutable, so the ordered visible segment ids exactly identify
-      // a column's assembled vector; a fully cached projection needs no store reads at all.
-      const fingerprint = segments.map((segment) => segment.id).join(",");
-      const cachedColumns = this.#cachedAppendColumns(table, projectedColumns, fingerprint);
-      if (cachedColumns !== undefined) {
-        return {
-          name: table.name,
-          rowCount,
-          columns: cachedColumns,
-          ...(projectedKey ? { uniqueKey: projectedKey } : {}),
-        };
-      }
       // Zone-map pruning shrinks the scan the same way index pruning does, so a scoring plan
       // whose statistics come from the scan (no index serving it) must see the whole corpus.
       const zonePruningAllowed =
@@ -6698,17 +6674,6 @@ export class MinnowDatabase {
       const predicates =
         plan === undefined || !zonePruningAllowed ? [] : zonePredicates(plan, table);
       if (predicates.length > 0) {
-        const prunedKey =
-          `prn\u0000${table.id}\u0000${fingerprint}\u0000` +
-          `${projectedColumns.map((column) => column.id).join(",")}\u0000` +
-          predicates
-            .map(
-              (predicate) =>
-                `${predicate.column.id} ${predicate.operator} ${String(predicate.value)}`,
-            )
-            .join("&");
-        const cachedPruned = this.#cacheGet(prunedKey) as ColumnarTable | undefined;
-        if (cachedPruned !== undefined) return cachedPruned;
         const pruned = await this.#materializePrunedAppendTable(
           table,
           snapshot,
@@ -6716,19 +6681,14 @@ export class MinnowDatabase {
           segments,
           predicates,
         );
-        if (pruned !== undefined) {
-          this.#cachePut(prunedKey, pruned, columnarTableRetainedBytes(pruned));
-          return pruned;
-        }
+        if (pruned !== undefined) return pruned;
       }
       const columns = new Map<string, ColumnVector>();
       for (const column of projectedColumns) {
-        let vector = this.#cachedColumnVector(table.id, column.id, fingerprint);
-        if (vector === undefined) {
-          vector = await this.#materializeAppendColumnVector(column, segments, snapshot, rowCount);
-          this.#storeColumnVector(table.id, column.id, fingerprint, vector);
-        }
-        columns.set(column.name, vector);
+        columns.set(
+          column.name,
+          await this.#materializeAppendColumnVector(column, segments, snapshot, rowCount),
+        );
       }
       return {
         name: table.name,
@@ -9309,13 +9269,6 @@ function columnVectorRetainedBytes(vector: ColumnVector): number {
     return base + vector.codes.byteLength + dictionaryBytes;
   }
   return base + vector.values.byteLength;
-}
-
-/** Retained payload of a cached columnar table: its vectors plus fixed overhead. */
-function columnarTableRetainedBytes(table: ColumnarTable): number {
-  let bytes = 128;
-  for (const vector of table.columns.values()) bytes += columnVectorRetainedBytes(vector);
-  return bytes;
 }
 
 /** Retained payload of a cached block result: column names plus estimated row values. */

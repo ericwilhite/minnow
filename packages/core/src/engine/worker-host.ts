@@ -15,7 +15,6 @@ import {
   type BufferedWriterOptions,
 } from "./database.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
-import type { PreparedQuery } from "./query.js";
 import { deserializeSchema, serializeMigrationSteps, type WireSchema } from "./schema-wire.js";
 
 /**
@@ -34,7 +33,7 @@ export type StoreDescriptor =
 /** The cloneable subset of MinnowDatabaseOptions; function-valued seams stay worker-side. */
 export type WireDatabaseOptions = Pick<
   MinnowDatabaseOptions,
-  "compression" | "rowsPerBlock" | "maxCommitRetries" | "spillOwnerLeaseMs" | "prepareCacheBytes"
+  "compression" | "rowsPerBlock" | "maxCommitRetries" | "spillOwnerLeaseMs" | "bufferPoolBytes"
 >;
 
 export interface DatabaseInitPayload {
@@ -59,7 +58,7 @@ export interface AttachDatabaseWorkerOptions {
 }
 
 type Handle =
-  | { type: "prepared"; prepared: PreparedQuery }
+  | { type: "snapshot"; release: () => void }
   | { type: "writer"; writer: BufferedTableWriter }
   | { type: "live-set"; set: LiveQuerySet; subscriptionIds: Set<string> }
   | { type: "live-subscription"; subscription: LiveQuerySubscription; setId: string };
@@ -132,14 +131,25 @@ class DatabaseRpcServer {
           steps: serializeMigrationSteps(result.steps),
         };
       }
-      case "prepareQuery": {
-        const prepared = await this.database.prepareQuery(
-          args[0] as string,
-          args[1] as Parameters<MinnowDatabase["prepareQuery"]>[1],
-        );
+      case "snapshotOpen": {
+        // The scoped snapshot() holds its lease until the callback settles; the handle keeps
+        // the callback pending until the client closes it, so the pin spans the RPC session.
         const handleId = crypto.randomUUID();
-        this.#handles.set(handleId, { type: "prepared", prepared });
-        return { handleId, sql: prepared.sql, tables: prepared.tables };
+        let release!: () => void;
+        const version = await new Promise<number | null>((resolveVersion, rejectVersion) => {
+          void this.database
+            .snapshot(async (session) => {
+              resolveVersion(session.version);
+              await new Promise<void>((resolveRelease) => {
+                release = resolveRelease;
+              });
+            })
+            .catch((error: unknown) => {
+              rejectVersion(error instanceof Error ? error : new Error(String(error)));
+            });
+        });
+        this.#handles.set(handleId, { type: "snapshot", release });
+        return { handleId, version };
       }
       case "bufferedWriter": {
         // Event-producing handles are named by the client so its event routes exist before the
@@ -181,8 +191,12 @@ class DatabaseRpcServer {
     const handle = this.#handles.get(handleId);
     if (handle === undefined) throw new Error(`Unknown handle: ${handleId}`);
     switch (handle.type) {
-      case "prepared":
-        return this.#callPrepared(handleId, handle.prepared, method);
+      case "snapshot": {
+        if (method !== "close") throw new Error(`Unsupported snapshot method: ${method}`);
+        handle.release();
+        this.#handles.delete(handleId);
+        return undefined;
+      }
       case "writer":
         return this.#callWriter(handleId, handle.writer, method, args);
       case "live-set":
@@ -195,21 +209,6 @@ class DatabaseRpcServer {
         if (parent?.type === "live-set") parent.subscriptionIds.delete(handleId);
         return undefined;
       }
-    }
-  }
-
-  #callPrepared(handleId: string, prepared: PreparedQuery, method: string): unknown {
-    switch (method) {
-      case "execute":
-        return prepared.execute();
-      case "memoryUsage":
-        return prepared.memoryUsage;
-      case "close":
-        prepared.close();
-        this.#handles.delete(handleId);
-        return undefined;
-      default:
-        throw new Error(`Unsupported prepared query method: ${method}`);
     }
   }
 
@@ -310,7 +309,7 @@ class DatabaseRpcServer {
     this.#handles.clear();
     for (const [handleId, handle] of handles) {
       try {
-        if (handle.type === "prepared") handle.prepared.close();
+        if (handle.type === "snapshot") handle.release();
         else if (handle.type === "writer") await handle.writer.close();
         else if (handle.type === "live-set") this.#closeLiveSet(handleId, handle);
       } catch {

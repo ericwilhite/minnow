@@ -143,17 +143,12 @@ describe("parameter execution", () => {
     );
   });
 
-  it("prepares a query with bound parameters", async () => {
+  it("binds positional parameters through query()", async () => {
     const database = await seeded();
-    const prepared = await database.prepareQuery(
-      "SELECT name FROM people WHERE score >= ? ORDER BY name",
-      { params: [25] },
-    );
-    try {
-      expect(prepared.execute().rows).toEqual([{ name: "Grace" }, { name: "Katherine" }]);
-    } finally {
-      prepared.close();
-    }
+    const result = await database.query("SELECT name FROM people WHERE score >= ? ORDER BY name", {
+      params: [25],
+    });
+    expect(result.rows).toEqual([{ name: "Grace" }, { name: "Katherine" }]);
   });
 
   it("executes parameterized mutations end to end", async () => {

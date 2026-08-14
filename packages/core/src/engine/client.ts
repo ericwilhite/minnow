@@ -56,7 +56,7 @@ import {
   UniqueConstraintError,
 } from "./errors.js";
 import type { LiveQueryInput, LiveQueryStats, LiveQuerySubscribeOptions } from "./live.js";
-import { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
+import { QueryMemoryBudgetError } from "./memory.js";
 import type { CompiledQuery, CompiledStatement, QueryResult, QueryValue } from "./query.js";
 import type { AnyTable, SchemaDefinition } from "./schema.js";
 import { serializeSchema, type WireMigrationStep } from "./schema-wire.js";
@@ -308,12 +308,29 @@ export class MinnowDatabaseClient {
     )) as ExecuteResult;
   }
 
-  async prepareQuery(sql: string, options?: QueryOptions): Promise<ClientPreparedQuery> {
-    const created = (await this.#call(
-      "prepareQuery",
-      options === undefined ? [sql] : [sql, options],
-    )) as { handleId: string; sql: string; tables: string[] };
-    return new ClientPreparedQuery(this, created.handleId, created.sql, created.tables);
+  /**
+   * Runs the callback against one pinned manifest version, exactly like the in-worker
+   * `MinnowDatabase.snapshot()`: the worker holds the version's reader lease until the
+   * callback settles, and every session query crosses the channel pinned to that version.
+   */
+  async snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T> {
+    const opened = (await this.#call("snapshotOpen", [])) as {
+      handleId: string;
+      version: number | null;
+    };
+    try {
+      const session: ClientSnapshotSession = {
+        version: opened.version,
+        query: (sql: string, options: QueryOptions = {}) =>
+          this.query(sql, {
+            ...options,
+            ...(opened.version === null ? {} : { version: opened.version }),
+          }),
+      };
+      return await action(session);
+    } finally {
+      await this._invoke(opened.handleId, "close", []);
+    }
   }
 
   liveQueries(options: ClientLiveQueryOptions = {}): ClientLiveQuerySet {
@@ -494,28 +511,13 @@ export class MinnowDatabaseClient {
 }
 
 /**
- * Proxy of a worker-side PreparedQuery. The snapshot stays leased in the worker until close();
- * execute() is necessarily async here, so it measures execution plus one channel round trip.
+ * The scope handed to the client `snapshot()`: queries pinned to one manifest version,
+ * consistent with each other for the lifetime of the callback.
  */
-export class ClientPreparedQuery {
-  constructor(
-    private readonly client: MinnowDatabaseClient,
-    private readonly handleId: string,
-    readonly sql: string,
-    readonly tables: readonly string[],
-  ) {}
-
-  async execute(): Promise<QueryResult> {
-    return (await this.client._invoke(this.handleId, "execute", [])) as QueryResult;
-  }
-
-  async memoryUsage(): Promise<QueryMemoryUsage> {
-    return (await this.client._invoke(this.handleId, "memoryUsage", [])) as QueryMemoryUsage;
-  }
-
-  async close(): Promise<void> {
-    await this.client._invoke(this.handleId, "close", []);
-  }
+export interface ClientSnapshotSession {
+  /** The pinned manifest version; null only on a database with no commits yet. */
+  readonly version: number | null;
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
 }
 
 /**

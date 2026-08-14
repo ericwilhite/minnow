@@ -211,7 +211,7 @@ const rows = await sql<{ n: number }>`
 // Compiles to: SELECT COUNT(*) AS n FROM people WHERE city IN ($1, $2)
 ```
 
-`query()` and `prepareQuery()` remain the raw read-only SQL API.
+`query()` remains the raw read-only SQL API; every call observes the latest committed state.
 
 ### Locating a compile error
 

@@ -107,9 +107,11 @@ changes, and non-null tightening outright. So:
 
 ## Close what you open
 
-`prepareQuery()` pins a snapshot until `close()` — a leaked prepared query keeps old data alive
-and blocks cleanup. Live subscriptions, buffered writers, live sets, and the database itself all
-have `close()`. On the worker client, `close({ terminateWorker: true })` tears down everything.
+Live subscriptions, buffered writers, and live sets all have `close()`. On the worker client,
+`close({ terminateWorker: true })` tears down everything. Queries themselves have no lifecycle:
+every `query()` is fresh, and the only pinning primitive is the `snapshot()` scope, which
+releases itself when its callback returns — keep those scopes short so cleanup is never held
+back.
 
 ## Schedule maintenance in idle time
 

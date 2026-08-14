@@ -1987,9 +1987,11 @@ it("streams a search-shaped query under a budget too small to materialize", asyn
   const sql =
     "SELECT body FROM docs WHERE MATCH(body) AGAINST 'quick' ORDER BY BM25(body) AGAINST 'quick' DESC, body LIMIT 5";
   const budget = 192_000;
-  await expect(database.prepareQuery(sql, { executionMemoryBudgetBytes: budget })).rejects.toThrow(
-    QueryMemoryBudgetError,
-  );
+  // The materialized fallback (spill disabled) cannot run under this budget, while the
+  // streamed default returns the full result.
+  await expect(
+    database.query(sql, { executionMemoryBudgetBytes: budget, spillToStorage: false }),
+  ).rejects.toThrow(QueryMemoryBudgetError);
   const streamed = await database.query(sql, { executionMemoryBudgetBytes: budget });
   expect(streamed.columns).toEqual(["body"]);
   expect(streamed.rows).toHaveLength(5);
@@ -2365,16 +2367,17 @@ it("prepares append and compacted snapshots directly into stable vectors", async
     },
   });
 
-  const prepared = await database.prepareQuery(
-    "SELECT active, score, label, recordedAt FROM vector_readings ORDER BY score",
-  );
-  const beforeCompaction = prepared.execute();
-  await database.compactTable("vector_readings", {
-    targetBlockBytes: 64,
-    outputCompression: "rle",
+  const readingsSql = "SELECT active, score, label, recordedAt FROM vector_readings ORDER BY score";
+  const beforeCompaction = await database.snapshot(async (session) => {
+    const before = await session.query(readingsSql);
+    await database.compactTable("vector_readings", {
+      targetBlockBytes: 64,
+      outputCompression: "rle",
+    });
+    // The pinned session keeps observing the pre-compaction snapshot mid-scope.
+    expect(await session.query(readingsSql)).toEqual(before);
+    return before;
   });
-  expect(prepared.execute()).toEqual(beforeCompaction);
-  prepared.close();
   expect(
     await database.query(
       "SELECT active, score, label, recordedAt FROM vector_readings ORDER BY score",
@@ -6107,25 +6110,20 @@ for (const implementation of [
     ];
     for (const sql of statements) {
       const expected = await database.query(sql);
-      const probe = await database.prepareQuery(sql);
-      const materializedPeak = probe.memoryUsage.peakBytes;
-      probe.close();
-      if (materializedPeak > 4_096) {
-        // One byte under this statement's materialized prepare peak: the materialized path
-        // genuinely cannot run under the budget...
-        const budget = materializedPeak - 1;
-        await expect(
-          database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
-        ).rejects.toThrow(QueryMemoryBudgetError);
-        // ...while the streamed keyed-mutation path returns identical rows in identical order.
-        expect(await database.query(sql, { executionMemoryBudgetBytes: budget })).toEqual(expected);
-      } else {
-        // Metadata-only shapes (a bare COUNT(*)) prepare with ~zero accounted bytes; pin the
-        // streamed path's result equality under an ordinary budget instead.
+      if (sql === "SELECT COUNT(*) AS n FROM mutated") {
+        // Metadata-only shape: pin streamed result equality under an ordinary budget.
         expect(await database.query(sql, { executionMemoryBudgetBytes: 1_000_000 })).toEqual(
           expected,
         );
+        continue;
       }
+      // Measured bracket for this fixture: every statement streams under ~252k modeled bytes
+      // while the materialized fallback needs at least ~313k, so 300k splits them cleanly.
+      const budget = 300_000;
+      await expect(
+        database.query(sql, { executionMemoryBudgetBytes: budget, spillToStorage: false }),
+      ).rejects.toThrow(QueryMemoryBudgetError);
+      expect(await database.query(sql, { executionMemoryBudgetBytes: budget })).toEqual(expected);
     }
     store.close();
   });
@@ -6176,12 +6174,10 @@ for (const implementation of [
       "SELECT p.pid AS pid, j.payload AS payload, p.score AS score " +
       "FROM probe_side p JOIN build_side j ON p.build_id = j.id WHERE p.score >= 25";
     const expected = await database.query(sql);
-    const probe = await database.prepareQuery(sql);
-    const budget = probe.memoryUsage.peakBytes - 1;
-    probe.close();
-    // The materialized path genuinely cannot prepare under this budget...
+    const budget = 1_500_000;
+    // The materialized path (spill disabled) genuinely cannot prepare under this budget...
     await expect(
-      database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
+      database.query(sql, { executionMemoryBudgetBytes: budget, spillToStorage: false }),
     ).rejects.toThrow(QueryMemoryBudgetError);
     // ...while the partitioned join returns the same multiset (row order across partitions is
     // implementation-defined, like any unordered query).
@@ -6262,11 +6258,11 @@ for (const implementation of [
     });
     const sql = "SELECT f.fid AS fid, d.label AS label FROM fact f JOIN dim d ON f.dim_id = d.id";
     const expected = await database.query(sql);
-    const probe = await database.prepareQuery(sql);
-    const budget = probe.memoryUsage.peakBytes - 1;
-    probe.close();
+    // Measured bracket: the partitioned streamed join fits from ~429k modeled bytes while the
+    // materialized fallback needs at least ~752k, so 550k splits them cleanly.
+    const budget = 550_000;
     await expect(
-      database.prepareQuery(sql, { executionMemoryBudgetBytes: budget }),
+      database.query(sql, { executionMemoryBudgetBytes: budget, spillToStorage: false }),
     ).rejects.toThrow(QueryMemoryBudgetError);
     const budgeted = await database.query(sql, { executionMemoryBudgetBytes: budget });
     const byFid = (rows: QueryRow[]) =>
@@ -6438,8 +6434,9 @@ for (const implementation of implementations()) {
     const budget = 64_000;
 
     await expect(
-      database.prepareQuery("SELECT SUM(v) AS total, COUNT(*) AS rows FROM streamed_rows", {
+      database.query("SELECT SUM(v) AS total, COUNT(*) AS rows FROM streamed_rows", {
         executionMemoryBudgetBytes: budget,
+        spillToStorage: false,
       }),
     ).rejects.toThrow(QueryMemoryBudgetError);
 
@@ -6578,9 +6575,9 @@ for (const implementation of implementations()) {
     const budget = 96_000;
 
     await expect(
-      database.prepareQuery(
+      database.query(
         "SELECT d.segment, SUM(o.v) AS total FROM stream_fact o JOIN stream_dim d ON d.code = o.code GROUP BY d.segment",
-        { executionMemoryBudgetBytes: budget },
+        { executionMemoryBudgetBytes: budget, spillToStorage: false },
       ),
     ).rejects.toThrow(QueryMemoryBudgetError);
 
@@ -7289,22 +7286,18 @@ describe("prepared-input cache and shared read lease", () => {
     return { store, database };
   }
 
-  it("skips block reads and lease writes on repeated prepares at one version", async () => {
+  it("skips block reads and lease writes on repeated queries at one version", async () => {
     const { store, database } = await seededStore();
-    const first = await database.prepareQuery(
+    const first = await database.query(
       "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
     );
-    const firstRows = first.execute().rows;
-    first.close();
     expect(store.blockReadCalls).toBeGreaterThan(0);
     const blockReadsAfterFirst = store.blockReadCalls;
     const leasesAfterFirst = store.leaseCreates;
-    const second = await database.prepareQuery(
+    const second = await database.query(
       "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
     );
-    const secondRows = second.execute().rows;
-    second.close();
-    expect(secondRows).toEqual(firstRows);
+    expect(second.rows).toEqual(first.rows);
     expect(store.blockReadCalls).toBe(blockReadsAfterFirst);
     expect(store.leaseCreates).toBe(leasesAfterFirst);
     expect(store.catalogStateCalls).toBeGreaterThan(0);
@@ -7359,7 +7352,7 @@ describe("prepared-input cache and shared read lease", () => {
   });
 
   it("re-reads blocks when the cache is disabled", async () => {
-    const { store, database } = await seededStore({ prepareCacheBytes: 0 });
+    const { store, database } = await seededStore({ bufferPoolBytes: 0 });
     await database.query("SELECT SUM(amount) AS total FROM orders");
     const blockReadsAfterFirst = store.blockReadCalls;
     await database.query("SELECT SUM(amount) AS total FROM orders");
@@ -7367,7 +7360,7 @@ describe("prepared-input cache and shared read lease", () => {
   });
 
   it("keeps results exact under a cache too small to hold every column", async () => {
-    const { database } = await seededStore({ prepareCacheBytes: 96 });
+    const { database } = await seededStore({ bufferPoolBytes: 96 });
     for (let round = 0; round < 3; round += 1) {
       const result = await database.query(
         "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
@@ -7382,8 +7375,8 @@ describe("prepared-input cache and shared read lease", () => {
 
   it("rejects invalid cache sizes", () => {
     const store = new MemoryBlockStore();
-    expect(() => new MinnowDatabase(store, { prepareCacheBytes: -1 })).toThrow(RangeError);
-    expect(() => new MinnowDatabase(store, { prepareCacheBytes: 1.5 })).toThrow(RangeError);
+    expect(() => new MinnowDatabase(store, { bufferPoolBytes: -1 })).toThrow(RangeError);
+    expect(() => new MinnowDatabase(store, { bufferPoolBytes: 1.5 })).toThrow(RangeError);
   });
 
   it("keeps mutation-replay reads uncached and exact", async () => {

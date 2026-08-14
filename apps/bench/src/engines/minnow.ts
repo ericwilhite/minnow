@@ -86,15 +86,13 @@ export const minnowDriver: EngineDriver = {
     return {
       engine: "minnow",
       async prepare(sql) {
-        const prepared = await database.prepareQuery(sql);
+        // Prepare compiles only; every execute() is a fresh statement over current data,
+        // exactly what the engine's public query() semantics are.
         const plan = await database.explain(sql);
         return {
           plan,
-          execute: () =>
-            Promise.resolve(normalizeRows(prepared.execute().rows).map(canonicalizeRow)),
-          close: () => {
-            prepared.close();
-          },
+          execute: async () => normalizeRows((await database.query(sql)).rows).map(canonicalizeRow),
+          close: () => undefined,
         };
       },
       close() {

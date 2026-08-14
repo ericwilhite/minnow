@@ -209,19 +209,21 @@ const hits = await db
   },
   {
     id: "snapshot",
-    title: "Prepared queries hold one immutable snapshot",
-    code: `const prepared = await database.prepareQuery(
+    title: "Snapshot scopes pin one version; queries are always fresh",
+    code: `const before = await database.query(
   "SELECT COUNT(*) AS people FROM people",
-);
-const before = prepared.execute().rows; // [{ people: 2 }]
+); // [{ people: 2 }]
 
-await database.insertBatch("people", [{ name: "Margaret", score: 40 }]);
-
-const stillBefore = prepared.execute().rows; // [{ people: 2 }] — same snapshot
-const after = (await database.query(
-  "SELECT COUNT(*) AS people FROM people",
-)).rows; // [{ people: 3 }]
-prepared.close();`,
+const observed = await database.snapshot(async (session) => {
+  const pinned = await session.query("SELECT COUNT(*) AS people FROM people");
+  await database.insertBatch("people", [{ name: "Margaret", score: 40 }]);
+  const stillPinned = await session.query("SELECT COUNT(*) AS people FROM people");
+  const fresh = await database.query("SELECT COUNT(*) AS people FROM people");
+  return { pinned: pinned.rows, stillPinned: stillPinned.rows, fresh: fresh.rows };
+});
+// observed.pinned      → [{ people: 2 }]
+// observed.stillPinned → [{ people: 2 }] — the scope holds one version
+// observed.fresh       → [{ people: 3 }] — outside the scope, always current`,
     run: async () => {
       const database = freshDatabase();
       await database.createTable({
@@ -236,13 +238,14 @@ prepared.close();`,
         { name: "Ada", score: 10 },
         { name: "Grace", score: 25 },
       ]);
-      const prepared = await database.prepareQuery("SELECT COUNT(*) AS people FROM people");
-      const before = prepared.execute().rows;
-      await database.insertBatch("people", [{ name: "Margaret", score: 40 }]);
-      const stillBefore = prepared.execute().rows;
-      const after = (await database.query("SELECT COUNT(*) AS people FROM people")).rows;
-      prepared.close();
-      return show({ before, stillBefore, after });
+      const observed = await database.snapshot(async (session) => {
+        const pinned = await session.query("SELECT COUNT(*) AS people FROM people");
+        await database.insertBatch("people", [{ name: "Margaret", score: 40 }]);
+        const stillPinned = await session.query("SELECT COUNT(*) AS people FROM people");
+        const fresh = await database.query("SELECT COUNT(*) AS people FROM people");
+        return { pinned: pinned.rows, stillPinned: stillPinned.rows, fresh: fresh.rows };
+      });
+      return show(observed);
     },
   },
 ];

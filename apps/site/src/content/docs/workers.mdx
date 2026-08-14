@@ -66,10 +66,10 @@ starts and stops) and satisfies `worker-src` content-security policies from your
 ## What changes across the boundary
 
 - **Everything is async.** Members that are synchronous in the worker return promises on the
-  client, and getters become methods: `writer.stats()`, `prepared.memoryUsage()`.
-- **`prepareQuery()` still pins its snapshot in the worker** until `close()` — but a client-side
-  `execute()` includes a channel round trip. Benchmark inside the worker when isolating executor
-  time.
+  client, and getters become methods: `writer.stats()`.
+- **`snapshot()` pins its version in the worker** for the callback's lifetime — session queries
+  cross the channel pinned to that version, so a scope observes one consistent state even while
+  other tabs commit.
 - **`migrate()` takes the same schema DSL** — it's serialized over the wire automatically.
 - **Typed errors survive the trip.** `instanceof UniqueConstraintError` works on the client, with
   its fields; stack traces point into the worker.

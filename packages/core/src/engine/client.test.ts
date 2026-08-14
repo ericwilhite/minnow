@@ -99,11 +99,10 @@ describe("MinnowDatabaseClient", () => {
       "Countess",
     ]);
     expect(updated.kind).toBe("update");
-    const prepared = await client.prepareQuery("SELECT name FROM people WHERE id = ?", {
+    const requeried = await client.query("SELECT name FROM people WHERE id = ?", {
       params: [1],
     });
-    expect((await prepared.execute()).rows).toEqual([{ name: "Countess" }]);
-    await prepared.close();
+    expect(requeried.rows).toEqual([{ name: "Countess" }]);
     await client.close();
   });
 
@@ -214,21 +213,26 @@ describe("MinnowDatabaseClient", () => {
     expect(rows).toEqual([{ name: "Grace" }, { name: "Ada" }]);
   });
 
-  it("proxies prepared queries as worker-side handles", async () => {
+  it("pins a snapshot scope across the channel while writes continue", async () => {
     const client = connect();
     await createPeopleTable(client);
     await client.insert("people", { id: 1, name: "Ada", joined: new Date() });
-    const prepared = await client.prepareQuery("SELECT name FROM people");
-    expect(prepared.sql).toBe("SELECT name FROM people");
-    expect(prepared.tables).toEqual(["people"]);
-    const first = await prepared.execute();
-    const second = await prepared.execute();
-    expect(first.rows).toEqual([{ name: "Ada" }]);
-    expect(second.rows).toEqual(first.rows);
-    const usage = await prepared.memoryUsage();
-    expect(usage.peakBytes).toBeGreaterThanOrEqual(0);
-    await prepared.close();
-    await expect(prepared.execute()).rejects.toThrow(/Unknown handle/);
+    const observed = await client.snapshot(async (session) => {
+      const before = await session.query("SELECT COUNT(*) AS people FROM people");
+      // A commit lands mid-scope; the session must keep observing the pinned version while
+      // fresh queries outside the scope see the new row immediately.
+      await client.insert("people", { id: 2, name: "Grace", joined: new Date() });
+      const still = await session.query("SELECT COUNT(*) AS people FROM people");
+      const fresh = await client.query("SELECT COUNT(*) AS people FROM people");
+      return { before: before.rows, still: still.rows, fresh: fresh.rows };
+    });
+    expect(observed.before).toEqual([{ people: 1 }]);
+    expect(observed.still).toEqual([{ people: 1 }]);
+    expect(observed.fresh).toEqual([{ people: 2 }]);
+    // After the scope, queries are fresh by construction.
+    expect((await client.query("SELECT COUNT(*) AS people FROM people")).rows).toEqual([
+      { people: 2 },
+    ]);
   });
 
   it("proxies buffered writers, including flush results and stats", async () => {

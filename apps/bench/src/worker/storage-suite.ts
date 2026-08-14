@@ -1112,7 +1112,7 @@ async function benchmarkReferenceQueries(
       passed:
         integrityChecks.every((check) => check.passed) &&
         measurements.every((query) => query.verified),
-      note: `Each query is submitted to MinnowDatabase as SQL and executed through the public prepareQuery()/execute() API; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it excludes the storage read the engine timing also excludes, but it does no planning and keeps whole tables resident. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
+      note: `Each query is submitted to MinnowDatabase as SQL and executed through the public query() API, so every sample is a fresh statement over the warm buffer pool; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it does no planning and keeps whole tables resident, where the engine timing includes its buffer-pool reads. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
     };
   } finally {
     store.close();
@@ -1211,17 +1211,16 @@ async function measureReferenceQueryOnEngine(
   oracleTuples: readonly unknown[][],
   sampleCount: number,
 ): Promise<BenchmarkResult["referenceQueries"]["queries"][number]["engine"]> {
-  let prepared: Awaited<ReturnType<MinnowDatabase["prepareQuery"]>> | undefined;
   try {
+    // Prepare-as-compile: the first query pays plan compilation plus cold block reads; the
+    // samples then measure fresh statement execution over the warm buffer pool.
     const prepareStarted = performance.now();
-    prepared = await database.prepareQuery(query.sql);
+    let result = await database.query(query.sql);
     const prepareMs = performance.now() - prepareStarted;
-    prepared.execute();
     const samples: number[] = [];
-    let result = prepared.execute();
     for (let sample = 0; sample < sampleCount; sample += 1) {
       const started = performance.now();
-      result = prepared.execute();
+      result = await database.query(query.sql);
       samples.push(performance.now() - started);
     }
     samples.sort((left, right) => left - right);
@@ -1251,8 +1250,6 @@ async function measureReferenceQueryOnEngine(
       checksum: 0,
       verified: false,
     };
-  } finally {
-    prepared?.close();
   }
 }
 async function createReferenceTables(

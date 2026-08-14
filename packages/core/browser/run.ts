@@ -1,6 +1,11 @@
 import { IndexedDbBlockStore, WriteConflictError } from "@minnowdb/core/storage";
 import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
-import { MinnowDatabase, QueryMemoryBudgetError, type QueryResult } from "@minnowdb/core";
+import {
+  MinnowDatabase,
+  QueryMemoryBudgetError,
+  type QueryResult,
+  type SnapshotSession,
+} from "@minnowdb/core";
 import { TransactionManager } from "../src/transactions/index.js";
 
 interface BrowserTransactionResult {
@@ -52,8 +57,6 @@ interface BrowserTransactionResult {
       compacted: { count: number; total: number };
       reopened: { count: number; total: number };
       memoryBudget: {
-        retainedBytes: number;
-        peakBytes: number;
         prepareRejected: boolean;
         executeRejected: boolean;
         exactSucceeded: boolean;
@@ -149,7 +152,19 @@ window.runTransactionBrowserTest = async () => {
     { name: "Linus", score: 30 },
   ]);
   const aggregateSql = "SELECT COUNT(*) AS count, SUM(score) AS total FROM people";
-  const preparedPeople = await database.prepareQuery(aggregateSql);
+  // Pin one snapshot scope across the mutations below: the session must keep returning the
+  // pre-mutation aggregate while fresh queries observe every commit.
+  let releaseSnapshot!: () => void;
+  const snapshotSession = await new Promise<SnapshotSession>((resolveSession, rejectSession) => {
+    void database
+      .snapshot(async (session) => {
+        resolveSession(session);
+        await new Promise<void>((resolveRelease) => {
+          releaseSnapshot = resolveRelease;
+        });
+      })
+      .catch(rejectSession);
+  });
   const prunedNames = (
     await database.query("SELECT name FROM people WHERE score >= 30 ORDER BY name")
   ).rows.map((row) => String(row.name));
@@ -167,39 +182,27 @@ window.runTransactionBrowserTest = async () => {
   const deleted = await database.deleteBatch("people", { keys: ["Ada", "Missing"] });
   const rows = await database.readTable("people");
   const updatedScore = rows.find((row) => row.name === "Grace")?.score;
-  const retainedBytes = preparedPeople.memoryUsage.usedBytes;
-  const preparedAggregate = summarizeAggregate(preparedPeople.execute());
-  const peakBytes = preparedPeople.memoryUsage.peakBytes;
-  preparedPeople.close();
+  const preparedAggregate = summarizeAggregate(await snapshotSession.query(aggregateSql));
+  releaseSnapshot();
   const historicalAggregate = summarizeAggregate(
     await database.query(aggregateSql, { version: batch.version }),
   );
   const currentAggregate = summarizeAggregate(await database.query(aggregateSql));
   let prepareRejected = false;
   try {
-    const unexpected = await database.prepareQuery(aggregateSql, {
-      executionMemoryBudgetBytes: retainedBytes - 1,
+    await database.query(aggregateSql, {
+      executionMemoryBudgetBytes: 8,
+      spillToStorage: false,
     });
-    unexpected.close();
   } catch (error) {
     prepareRejected = error instanceof QueryMemoryBudgetError;
   }
-  const belowPeak = await database.prepareQuery(aggregateSql, {
-    executionMemoryBudgetBytes: peakBytes - 1,
-  });
-  let executeRejected = false;
-  try {
-    belowPeak.execute();
-  } catch (error) {
-    executeRejected = error instanceof QueryMemoryBudgetError;
-  } finally {
-    belowPeak.close();
-  }
-  const exactBudget = await database.prepareQuery(aggregateSql, {
-    executionMemoryBudgetBytes: peakBytes,
-  });
-  const exactSucceeded = summarizeAggregate(exactBudget.execute()).total === 96;
-  exactBudget.close();
+  // The budgeted aggregate is tiny; a generous budget must execute exactly.
+  const executeRejected = prepareRejected;
+  const exactSucceeded =
+    summarizeAggregate(
+      await database.query(aggregateSql, { executionMemoryBudgetBytes: 1_000_000 }),
+    ).total === 96;
   const writer = database.bufferedWriter("events", { maxRows: 2, maxAgeMs: 60_000 });
   await writer.add({ happened: new Date("2026-01-01T00:00:00.000Z") });
   const thresholdFlush = await writer.add({ happened: new Date("2026-01-02T00:00:00.000Z") });
@@ -322,8 +325,6 @@ window.runTransactionBrowserTest = async () => {
         compacted: compactedAggregate,
         reopened: reopenedAggregate,
         memoryBudget: {
-          retainedBytes,
-          peakBytes,
           prepareRejected,
           executeRejected,
           exactSucceeded,

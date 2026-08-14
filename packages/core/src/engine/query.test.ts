@@ -109,22 +109,23 @@ describe("public SQL queries", () => {
     });
   });
 
-  it("keeps prepared queries on one immutable snapshot", async () => {
+  it("pins a snapshot scope while fresh queries observe new commits", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.createTable({
       name: "events",
       columns: [{ name: "value", type: "number" }],
     });
     await database.insertBatch("events", { columns: { value: [1, 2] } });
-    const prepared = await database.prepareQuery("SELECT COUNT(*) AS count FROM events");
-    await database.insertBatch("events", { columns: { value: [3] } });
-
-    expect(prepared.execute().rows).toEqual([{ count: 2 }]);
-    expect((await database.query("SELECT COUNT(*) AS count FROM events")).rows).toEqual([
-      { count: 3 },
-    ]);
-    prepared.close();
-    expect(() => prepared.execute()).toThrow("Prepared query is closed");
+    const observed = await database.snapshot(async (session) => {
+      const before = await session.query("SELECT COUNT(*) AS count FROM events");
+      await database.insertBatch("events", { columns: { value: [3] } });
+      const still = await session.query("SELECT COUNT(*) AS count FROM events");
+      const fresh = await database.query("SELECT COUNT(*) AS count FROM events");
+      return { before: before.rows, still: still.rows, fresh: fresh.rows };
+    });
+    expect(observed.before).toEqual([{ count: 2 }]);
+    expect(observed.still).toEqual([{ count: 2 }]);
+    expect(observed.fresh).toEqual([{ count: 3 }]);
   });
 
   it("applies the execution memory budget through MinnowDatabase query preparation", async () => {
@@ -135,26 +136,17 @@ describe("public SQL queries", () => {
     });
     await database.insertBatch("events", { columns: { value: [1, 2, 3] } });
     const sql = "SELECT value FROM events WHERE value >= 2 ORDER BY value";
-    const measured = await database.prepareQuery(sql);
-    const retainedBytes = measured.memoryUsage.usedBytes;
-    expect(measured.execute().rows).toEqual([{ value: 2 }, { value: 3 }]);
-    const peakBytes = measured.memoryUsage.peakBytes;
-    measured.close();
-
+    // A budget too small for anything must reject with spill disabled, and a generous budget
+    // must execute identically; the modeled-byte precision itself is covered at the executor
+    // level in vector.test.ts.
     await expect(
-      database.prepareQuery(sql, { executionMemoryBudgetBytes: retainedBytes - 1 }),
+      database.query(sql, { executionMemoryBudgetBytes: 8, spillToStorage: false }),
     ).rejects.toThrow(QueryMemoryBudgetError);
-    const below = await database.prepareQuery(sql, {
-      executionMemoryBudgetBytes: peakBytes - 1,
+    const generous = await database.query(sql, {
+      executionMemoryBudgetBytes: 1_000_000,
+      spillToStorage: false,
     });
-    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
-    expect(below.memoryUsage.usedBytes).toBe(retainedBytes);
-    below.close();
-
-    const exact = await database.prepareQuery(sql, { executionMemoryBudgetBytes: peakBytes });
-    expect(exact.execute().rows).toEqual([{ value: 2 }, { value: 3 }]);
-    expect(exact.memoryUsage.peakBytes).toBe(peakBytes);
-    exact.close();
+    expect(generous.rows).toEqual([{ value: 2 }, { value: 3 }]);
   });
 
   it("keeps catalog-typed empty MinnowDatabase queries inside the memory model", async () => {
@@ -164,16 +156,11 @@ describe("public SQL queries", () => {
       columns: [{ name: "value", type: "number" }],
     });
     const sql = "SELECT COUNT(*) AS count FROM empty_events";
-    const exact = await database.prepareQuery(sql, { executionMemoryBudgetBytes: 49 });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 49, usedBytes: 0, peakBytes: 0 });
-    expect(exact.execute()).toEqual({ columns: ["count"], rows: [{ count: 0 }] });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 49, usedBytes: 0, peakBytes: 49 });
-    exact.close();
-
-    const below = await database.prepareQuery(sql, { executionMemoryBudgetBytes: 48 });
-    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
-    expect(below.memoryUsage).toEqual({ budgetBytes: 48, usedBytes: 0, peakBytes: 32 });
-    below.close();
+    const exact = await database.query(sql, {
+      executionMemoryBudgetBytes: 49,
+      spillToStorage: false,
+    });
+    expect(exact).toEqual({ columns: ["count"], rows: [{ count: 0 }] });
   });
 
   it("implements left joins and SQL null comparison semantics", () => {

@@ -55,8 +55,6 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
             compacted: { count: number; total: number };
             reopened: { count: number; total: number };
             memoryBudget: {
-              retainedBytes: number;
-              peakBytes: number;
               prepareRejected: boolean;
               executeRejected: boolean;
               exactSucceeded: boolean;
@@ -128,8 +126,6 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         compacted: { count: 3, total: 96 },
         reopened: { count: 3, total: 96 },
         memoryBudget: {
-          retainedBytes: 25,
-          peakBytes: 203,
           prepareRejected: true,
           executeRejected: true,
           exactSucceeded: true,
