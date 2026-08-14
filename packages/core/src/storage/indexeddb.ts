@@ -69,6 +69,13 @@ const UNIQUE_KEY_BASE = "unique-key-base";
  * instead of a scan whose cost grows with every key ever written.
  */
 const UNIQUE_KEY_TAIL_CHUNK_LIMIT = 16;
+const UNIQUE_KEY_BASE_PART = "unique-key-base-part";
+/**
+ * Tokens per chunks-v2 base partition. Small enough that a keyed point mutation deserializes
+ * one partition in about a millisecond; large enough that a multi-million-key table folds into
+ * hundreds of records instead of millions.
+ */
+const UNIQUE_KEY_PARTITION_TARGET = 16_384;
 const FTS_BASE_INDEX_PREFIX = "fts-base-index/";
 const FTS_BASE_PREFIX = "fts-base/";
 const FTS_CHUNK_PREFIX = "fts-chunk/";
@@ -102,12 +109,23 @@ export class IndexedDbBlockStore implements BlockStore {
   readonly #db: IDBDatabase;
   readonly #durability: IDBTransactionDurability;
   /**
-   * Memoized folded-base key tokens for the most recently written keyed table, mirroring
+   * Memoized unique-key state for the most recently written keyed table, mirroring
    * #manifestCache's validity rule: usable only while the next commit's expected manifest
-   * version matches, so any commit from another instance or tab invalidates it. Bulk loads
-   * hit this on every batch — it replaces one getKey request per row with a Set lookup.
+   * version matches, so any commit from another instance or tab invalidates it. `present` is
+   * the complete membership (folded base plus tail replay) and `chunks` are the unfolded tail
+   * in commit order, so a valid cache lets a commit skip every unique-key read and lets a
+   * fold rewrite the base without re-reading it. Bulk loads hit this on every batch.
    */
-  #uniqueKeyCache: { version: number; tableId: string; baseTokens: Set<string> } | undefined;
+  #uniqueKeyCache:
+    | {
+        version: number;
+        tableId: string;
+        mode: "chunks-v1" | "chunks-v2";
+        present: Set<string>;
+        chunks: UniqueKeyChunk[];
+        index: UniqueKeyChunkIndex;
+      }
+    | undefined;
   /**
    * The most recently resolved manifest block set, advanced in place as this instance commits.
    * Purely a memoization of immutable records: a miss (fresh instance, or another tab moved the
@@ -580,10 +598,19 @@ export class IndexedDbBlockStore implements BlockStore {
     const tokens = [...new Set(keyTokens)];
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
-    const tableValue: unknown = await requestResult(store.get(`${TABLE_ID_PREFIX}${tableId}`));
+    const [tableValue, versionValue] = await Promise.all([
+      requestResult<unknown>(store.get(`${TABLE_ID_PREFIX}${tableId}`)),
+      requestResult<unknown>(store.get(CURRENT_MANIFEST_KEY)),
+    ]);
     const table = tableValue === undefined ? undefined : asTableRecord(tableValue);
-    if (table?.uniqueKeyStorage === "chunks-v1") {
-      const { existing } = await readChunkedUniqueKeys(store, tableId, tokens);
+    const mode = table?.uniqueKeyStorage;
+    if (mode === "chunks-v1" || mode === "chunks-v2") {
+      const cache = this.#uniqueKeyCache;
+      if (cache?.tableId === tableId && cache.mode === mode && cache.version === versionValue) {
+        await transactionDone(transaction);
+        return tokens.filter((token) => cache.present.has(token)).sort();
+      }
+      const { existing } = await readChunkedUniqueKeys(store, tableId, tokens, mode);
       await transactionDone(transaction);
       return [...existing].sort();
     }
@@ -1084,42 +1111,65 @@ export class IndexedDbBlockStore implements BlockStore {
     }
 
     const uniqueKeyChanges = input.uniqueKeyChanges;
-    let chunkState: Awaited<ReturnType<typeof readChunkedUniqueKeys>> | undefined;
+    const keyMode = uniqueKeyChanges?.storageMode;
+    const chunkedKeys = keyMode === "chunks-v1" || keyMode === "chunks-v2";
     const keyCache = this.#uniqueKeyCache;
-    const cachedBaseTokens =
-      uniqueKeyChanges !== undefined &&
-      keyCache?.tableId === uniqueKeyChanges.tableId &&
-      keyCache.version === input.expectedManifestVersion
-        ? keyCache.baseTokens
-        : undefined;
-    let nextBaseTokens: Set<string> | undefined;
+    const keyCacheValid =
+      chunkedKeys &&
+      keyCache !== undefined &&
+      keyCache.tableId === uniqueKeyChanges?.tableId &&
+      keyCache.mode === keyMode &&
+      keyCache.version === input.expectedManifestVersion;
+    let keyState:
+      | {
+          existing: Set<string>;
+          index: UniqueKeyChunkIndex;
+          chunks: UniqueKeyChunk[];
+          fullPresent?: Set<string>;
+        }
+      | undefined;
     if (uniqueKeyChanges !== undefined) {
-      const storedKeys =
-        uniqueKeyChanges.storageMode === "chunks-v1"
-          ? ((chunkState = await readChunkedUniqueKeys(
-              catalog,
-              uniqueKeyChanges.tableId,
-              uniqueKeyChanges.keyTokens,
-              cachedBaseTokens,
-            )),
-            uniqueKeyChanges.keyTokens.map((token) =>
-              chunkState?.existing.has(token) === true ? token : undefined,
-            ))
-          : await Promise.all(
-              uniqueKeyChanges.keyTokens.map((token) =>
-                requestResult(catalog.getKey(uniqueKeyKey(uniqueKeyChanges.tableId, token))),
-              ),
-            );
-      if (uniqueKeyChanges.requireAbsent) {
-        const conflictIndex = storedKeys.findIndex((key) => key !== undefined);
-        if (conflictIndex >= 0) {
-          transaction.abort();
-          await ignoreAbort(transaction);
-          throw new UniqueKeyConflictError(
+      let conflictToken: string | undefined;
+      if (chunkedKeys) {
+        if (keyCacheValid) {
+          // Steady-state bulk load: membership answered entirely from memory, zero reads.
+          const existing = new Set<string>();
+          for (const token of uniqueKeyChanges.keyTokens) {
+            if (keyCache.present.has(token)) existing.add(token);
+          }
+          keyState = {
+            existing,
+            index: keyCache.index,
+            chunks: keyCache.chunks,
+            fullPresent: keyCache.present,
+          };
+        } else {
+          keyState = await readChunkedUniqueKeys(
+            catalog,
             uniqueKeyChanges.tableId,
-            uniqueKeyChanges.keyTokens[conflictIndex] ?? "",
+            uniqueKeyChanges.keyTokens,
+            keyMode,
           );
         }
+        if (uniqueKeyChanges.requireAbsent) {
+          conflictToken = uniqueKeyChanges.keyTokens.find((token) => keyState?.existing.has(token));
+        }
+      } else {
+        const storedKeys = await Promise.all(
+          uniqueKeyChanges.keyTokens.map((token) =>
+            requestResult(catalog.getKey(uniqueKeyKey(uniqueKeyChanges.tableId, token))),
+          ),
+        );
+        if (uniqueKeyChanges.requireAbsent) {
+          const conflictIndex = storedKeys.findIndex((key) => key !== undefined);
+          conflictToken =
+            conflictIndex >= 0 ? (uniqueKeyChanges.keyTokens[conflictIndex] ?? "") : undefined;
+        }
+      }
+      if (conflictToken !== undefined) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new UniqueKeyConflictError(uniqueKeyChanges.tableId, conflictToken);
       }
     }
 
@@ -1165,9 +1215,22 @@ export class IndexedDbBlockStore implements BlockStore {
         segment.id,
       );
     }
+    // How the unique-key cache advances once this commit proves durable: `keep` carries the
+    // valid cache through with its membership delta applied; `replace` installs newly resolved
+    // full knowledge; `drop` forgets a same-table cache we could not keep truthful.
+    let keyCachePlan:
+      | { action: "keep"; chunk: UniqueKeyChunk; index: UniqueKeyChunkIndex }
+      | {
+          action: "replace";
+          present: Set<string>;
+          chunks: UniqueKeyChunk[];
+          index: UniqueKeyChunkIndex;
+        }
+      | { action: "drop" }
+      | undefined;
     if (uniqueKeyChanges !== undefined) {
-      if (uniqueKeyChanges.storageMode === "chunks-v1") {
-        const existing = chunkState?.existing ?? new Set<string>();
+      if (chunkedKeys) {
+        const existing = keyState?.existing ?? new Set<string>();
         const chunk: UniqueKeyChunk = {
           addedTokens:
             uniqueKeyChanges.remove === true
@@ -1180,38 +1243,111 @@ export class IndexedDbBlockStore implements BlockStore {
         };
         if (chunk.addedTokens.length > 0 || chunk.removedTokens.length > 0) {
           const tableId = uniqueKeyChanges.tableId;
-          const index = chunkState?.index ?? { versions: [], hasBase: false };
+          const index = keyState?.index ?? { versions: [], hasBase: false };
+          // Complete membership before this commit, when known: from the live cache, from a
+          // bulk read that resolved every partition, or trivially empty for a base-less table
+          // whose whole tail is in hand.
+          const priorPresent =
+            keyState?.fullPresent ??
+            (index.hasBase ? undefined : replayChunks(keyState?.chunks ?? []));
           if (index.versions.length + 1 > UNIQUE_KEY_TAIL_CHUNK_LIMIT) {
-            // Fold the tail plus this commit's changes into per-key base records, atomically
-            // with the manifest publication. Chunks replay in commit order so later removals
-            // and re-adds land on the final state.
-            const knownBase = cachedBaseTokens ?? chunkState?.resolvedBase;
-            nextBaseTokens =
-              knownBase !== undefined
-                ? new Set(knownBase)
-                : index.hasBase
-                  ? undefined
-                  : new Set<string>();
-            for (const tail of [...(chunkState?.chunks ?? []), chunk]) {
-              for (const token of tail.addedTokens) {
-                catalog.put(manifest.version, uniqueKeyBaseKey(tableId, token));
-                nextBaseTokens?.add(token);
+            const tailChunks = [...(keyState?.chunks ?? []), chunk];
+            if (keyMode === "chunks-v2") {
+              // Fold the tail into hash-partitioned base chunks, atomically with the manifest
+              // publication: hundreds of records regardless of key count, never one per key.
+              let nextPresent = priorPresent;
+              if (nextPresent === undefined) {
+                nextPresent = await readAllV2BaseTokens(catalog, tableId, index);
+                for (const tail of keyState?.chunks ?? []) applyChunk(nextPresent, tail);
+              } else if (nextPresent === keyState?.fullPresent) {
+                // The cache's own set must not be mutated before the commit is durable.
+                nextPresent = new Set(nextPresent);
               }
-              for (const token of tail.removedTokens) {
-                catalog.delete(uniqueKeyBaseKey(tableId, token));
-                nextBaseTokens?.delete(token);
+              applyChunk(nextPresent, chunk);
+              const partitions = Math.max(
+                1,
+                Math.ceil(nextPresent.size / UNIQUE_KEY_PARTITION_TARGET),
+              );
+              const parts: string[][] = Array.from({ length: partitions }, () => []);
+              for (const token of nextPresent) {
+                parts[fnv1a(token) % partitions]?.push(token);
+              }
+              parts.forEach((tokens, ordinal) => {
+                catalog.put(tokens, uniqueKeyBasePartKey(tableId, ordinal));
+              });
+              for (let ordinal = partitions; ordinal < (index.partitions ?? 0); ordinal += 1) {
+                catalog.delete(uniqueKeyBasePartKey(tableId, ordinal));
+              }
+              for (const version of index.versions) {
+                catalog.delete(uniqueKeyChunkKey(tableId, version));
+              }
+              const nextIndex: UniqueKeyChunkIndex = { versions: [], hasBase: true, partitions };
+              catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
+              keyCachePlan = {
+                action: "replace",
+                present: nextPresent,
+                chunks: [],
+                index: nextIndex,
+              };
+            } else {
+              // chunks-v1 folds into per-key base records, incrementally over the tail.
+              for (const tail of tailChunks) {
+                for (const token of tail.addedTokens) {
+                  catalog.put(manifest.version, uniqueKeyBaseKey(tableId, token));
+                }
+                for (const token of tail.removedTokens) {
+                  catalog.delete(uniqueKeyBaseKey(tableId, token));
+                }
+              }
+              for (const version of index.versions) {
+                catalog.delete(uniqueKeyChunkKey(tableId, version));
+              }
+              const nextIndex: UniqueKeyChunkIndex = { versions: [], hasBase: true };
+              catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
+              if (priorPresent !== undefined) {
+                const nextPresent =
+                  priorPresent === keyState?.fullPresent ? new Set(priorPresent) : priorPresent;
+                applyChunk(nextPresent, chunk);
+                keyCachePlan = {
+                  action: "replace",
+                  present: nextPresent,
+                  chunks: [],
+                  index: nextIndex,
+                };
+              } else {
+                keyCachePlan = { action: "drop" };
               }
             }
-            for (const version of index.versions) {
-              catalog.delete(uniqueKeyChunkKey(tableId, version));
-            }
-            catalog.put({ versions: [], hasBase: true }, uniqueKeyChunkIndexKey(tableId));
           } else {
             catalog.put(chunk, uniqueKeyChunkKey(tableId, manifest.version));
-            catalog.put(
-              { versions: [...index.versions, manifest.version], hasBase: index.hasBase },
-              uniqueKeyChunkIndexKey(tableId),
-            );
+            const nextIndex: UniqueKeyChunkIndex = {
+              versions: [...index.versions, manifest.version],
+              hasBase: index.hasBase,
+              ...(index.partitions === undefined ? {} : { partitions: index.partitions }),
+            };
+            catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
+            if (keyCacheValid) {
+              keyCachePlan = { action: "keep", chunk, index: nextIndex };
+            } else if (keyState?.fullPresent !== undefined) {
+              const nextPresent = new Set(keyState.fullPresent);
+              applyChunk(nextPresent, chunk);
+              keyCachePlan = {
+                action: "replace",
+                present: nextPresent,
+                chunks: [...keyState.chunks, chunk],
+                index: nextIndex,
+              };
+            } else if (priorPresent !== undefined) {
+              applyChunk(priorPresent, chunk);
+              keyCachePlan = {
+                action: "replace",
+                present: priorPresent,
+                chunks: [...(keyState?.chunks ?? []), chunk],
+                index: nextIndex,
+              };
+            } else {
+              keyCachePlan = { action: "drop" };
+            }
           }
         }
       } else {
@@ -1261,23 +1397,38 @@ export class IndexedDbBlockStore implements BlockStore {
     await transactionDone(transaction);
     // The unique-key cache follows the same rule as the manifest cache below: advance it only
     // after the durable commit. Commits from this instance cannot silently change another
-    // table's folded base, so a cache for a different table just moves to the new version;
-    // an unfolded commit for the cached table carries the unchanged base forward.
-    if (uniqueKeyChanges?.storageMode === "chunks-v1") {
-      const carried = nextBaseTokens ?? cachedBaseTokens ?? chunkState?.resolvedBase;
-      if (carried !== undefined) {
+    // table's key records, so a cache for a different table just moves to the new version.
+    if (uniqueKeyChanges !== undefined && chunkedKeys && keyCachePlan !== undefined) {
+      if (keyCachePlan.action === "keep" && keyCacheValid) {
+        // In-place delta on the live cache: no copies of a multi-million-token set per batch.
+        applyChunk(keyCache.present, keyCachePlan.chunk);
+        keyCache.chunks.push(keyCachePlan.chunk);
+        keyCache.index = keyCachePlan.index;
+        keyCache.version = manifest.version;
+      } else if (keyCachePlan.action === "replace") {
         this.#uniqueKeyCache = {
           version: manifest.version,
           tableId: uniqueKeyChanges.tableId,
-          baseTokens: carried,
+          mode: keyMode,
+          present: keyCachePlan.present,
+          chunks: keyCachePlan.chunks,
+          index: keyCachePlan.index,
         };
       } else if (this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId) {
         this.#uniqueKeyCache = undefined;
       } else if (this.#uniqueKeyCache !== undefined) {
-        this.#uniqueKeyCache = { ...this.#uniqueKeyCache, version: manifest.version };
+        this.#uniqueKeyCache.version = manifest.version;
       }
+    } else if (
+      uniqueKeyChanges !== undefined &&
+      this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId
+    ) {
+      // A no-op or legacy-mode write against the cached table: nothing changed on disk for a
+      // no-op, but dropping is the safe answer for the legacy path.
+      if (chunkedKeys) this.#uniqueKeyCache.version = manifest.version;
+      else this.#uniqueKeyCache = undefined;
     } else if (this.#uniqueKeyCache !== undefined) {
-      this.#uniqueKeyCache = { ...this.#uniqueKeyCache, version: manifest.version };
+      this.#uniqueKeyCache.version = manifest.version;
     }
     // Advance the resolved-set cache only after the durable commit succeeded. A checkpoint
     // commit already built the new set; a delta commit with a resolved base applies the delta
@@ -2649,6 +2800,10 @@ function uniqueKeyBaseKey(tableId: string, keyToken: string): IDBValidKey {
   return [UNIQUE_KEY_BASE, tableId, keyToken];
 }
 
+function uniqueKeyBasePartKey(tableId: string, ordinal: number): IDBValidKey {
+  return [UNIQUE_KEY_BASE_PART, tableId, ordinal];
+}
+
 /**
  * Resolves which of the requested tokens exist: point probes against the folded base records,
  * then the bounded chunk tail applied in commit order (an add in a later chunk revives a token
@@ -2657,8 +2812,10 @@ function uniqueKeyBaseKey(tableId: string, keyToken: string): IDBValidKey {
  */
 interface UniqueKeyChunkIndex {
   versions: number[];
-  /** True once a fold has written per-key base records; probes skip them until then. */
+  /** True once a fold has written base records; probes skip them until then. */
   hasBase: boolean;
+  /** chunks-v2 only: how many hash partitions the folded base is spread across. */
+  partitions?: number;
 }
 
 /** Accepts the legacy bare-array shape (tail only, no base) and the current object shape. */
@@ -2670,7 +2827,13 @@ function asUniqueKeyChunkIndex(value: unknown): UniqueKeyChunkIndex {
   if (Array.isArray(value)) return { versions: versionsOf(value), hasBase: false };
   if (typeof value === "object" && value !== null) {
     const record = value as Record<string, unknown>;
-    return { versions: versionsOf(record.versions), hasBase: record.hasBase === true };
+    return {
+      versions: versionsOf(record.versions),
+      hasBase: record.hasBase === true,
+      ...(Number.isSafeInteger(record.partitions) && (record.partitions as number) > 0
+        ? { partitions: record.partitions as number }
+        : {}),
+    };
   }
   return { versions: [], hasBase: false };
 }
@@ -2681,63 +2844,138 @@ function asUniqueKeyChunkIndex(value: unknown): UniqueKeyChunkIndex {
  */
 const UNIQUE_KEY_BASE_SCAN_THRESHOLD = 2_048;
 
+/** FNV-1a over UTF-16 code units: the stable hash that assigns a token to a base partition. */
+function fnv1a(token: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < token.length; index += 1) {
+    hash ^= token.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/** Applies one tail chunk's membership delta in place, in the order commits recorded it. */
+function applyChunk(present: Set<string>, chunk: UniqueKeyChunk): void {
+  for (const token of chunk.addedTokens) present.add(token);
+  for (const token of chunk.removedTokens) present.delete(token);
+}
+
+/** Replays tail chunks over an empty base into a fresh membership set. */
+function replayChunks(chunks: readonly UniqueKeyChunk[]): Set<string> {
+  const present = new Set<string>();
+  for (const chunk of chunks) applyChunk(present, chunk);
+  return present;
+}
+
+function asBasePartition(value: unknown): string[] {
+  if (!isStringArray(value)) throw new Error("Unique-key base partition is invalid");
+  return value;
+}
+
+/** Reads every chunks-v2 base partition into one membership set. */
+async function readAllV2BaseTokens(
+  store: IDBObjectStore,
+  tableId: string,
+  index: UniqueKeyChunkIndex,
+): Promise<Set<string>> {
+  if (!index.hasBase) return new Set();
+  const partitions = index.partitions ?? 1;
+  const parts = await Promise.all(
+    Array.from({ length: partitions }, (_, ordinal) =>
+      requestResult<unknown>(store.get(uniqueKeyBasePartKey(tableId, ordinal))),
+    ),
+  );
+  const present = new Set<string>();
+  for (const part of parts) {
+    if (part === undefined) continue;
+    for (const token of asBasePartition(part)) present.add(token);
+  }
+  return present;
+}
+
 async function readChunkedUniqueKeys(
   store: IDBObjectStore,
   tableId: string,
   requestedTokens: readonly string[],
-  cachedBase?: ReadonlySet<string>,
+  mode: "chunks-v1" | "chunks-v2",
 ): Promise<{
   existing: Set<string>;
   index: UniqueKeyChunkIndex;
   chunks: UniqueKeyChunk[];
-  /** The complete folded-base token set, when this read materialized one via bulk scan. */
-  resolvedBase?: Set<string>;
+  /** The complete membership (base plus tail replay), when this read resolved all of it. */
+  fullPresent?: Set<string>;
 }> {
   const rawIndex: unknown = await requestResult(store.get(uniqueKeyChunkIndexKey(tableId)));
   const index = asUniqueKeyChunkIndex(rawIndex);
-  const useCache = index.hasBase && cachedBase !== undefined;
-  const scanBase =
-    index.hasBase && !useCache && requestedTokens.length >= UNIQUE_KEY_BASE_SCAN_THRESHOLD;
-  const probeBase = index.hasBase && !useCache && !scanBase;
-  const [chunkValues, scannedBase, baseKeys] = await Promise.all([
-    Promise.all(
-      index.versions.map((version) =>
-        requestResult<unknown>(store.get(uniqueKeyChunkKey(tableId, version))),
-      ),
+  const bulk = requestedTokens.length >= UNIQUE_KEY_BASE_SCAN_THRESHOLD;
+  const chunkReads = Promise.all(
+    index.versions.map((version) =>
+      requestResult<unknown>(store.get(uniqueKeyChunkKey(tableId, version))),
     ),
-    scanBase ? scanUniqueKeyBaseTokens(store, tableId) : Promise.resolve(undefined),
-    probeBase
-      ? Promise.all(
-          requestedTokens.map((token) =>
-            requestResult(store.getKey(uniqueKeyBaseKey(tableId, token))),
+  );
+  let baseMembership: ReadonlySet<string> | undefined;
+  let fullBase: Set<string> | undefined;
+  let probedKeys: Array<IDBValidKey | undefined> = [];
+  if (index.hasBase) {
+    if (mode === "chunks-v2") {
+      if (bulk) {
+        fullBase = await readAllV2BaseTokens(store, tableId, index);
+        baseMembership = fullBase;
+      } else {
+        // Point reads touch only the partitions the requested tokens hash to.
+        const partitions = index.partitions ?? 1;
+        const ordinals = [...new Set(requestedTokens.map((token) => fnv1a(token) % partitions))];
+        const parts = await Promise.all(
+          ordinals.map((ordinal) =>
+            requestResult<unknown>(store.get(uniqueKeyBasePartKey(tableId, ordinal))),
           ),
-        )
-      : Promise.resolve([]),
-  ]);
-  const base = useCache ? cachedBase : scannedBase;
+        );
+        const membership = new Set<string>();
+        for (const part of parts) {
+          if (part === undefined) continue;
+          for (const token of asBasePartition(part)) membership.add(token);
+        }
+        baseMembership = membership;
+      }
+    } else if (bulk) {
+      fullBase = await scanUniqueKeyBaseTokens(store, tableId);
+      baseMembership = fullBase;
+    } else {
+      probedKeys = await Promise.all(
+        requestedTokens.map((token) =>
+          requestResult(store.getKey(uniqueKeyBaseKey(tableId, token))),
+        ),
+      );
+    }
+  }
+  const chunks = (await chunkReads).map(asUniqueKeyChunk);
   const requested = new Set(requestedTokens);
   const existing = new Set<string>();
-  if (base !== undefined) {
+  if (baseMembership !== undefined) {
     for (const token of requestedTokens) {
-      if (base.has(token)) existing.add(token);
+      if (baseMembership.has(token)) existing.add(token);
     }
   } else {
     requestedTokens.forEach((token, position) => {
-      if (baseKeys[position] !== undefined) existing.add(token);
+      if (probedKeys[position] !== undefined) existing.add(token);
     });
   }
-  const chunks = chunkValues.map(asUniqueKeyChunk);
   for (const chunk of chunks) {
     for (const token of chunk.addedTokens) {
       if (requested.has(token)) existing.add(token);
     }
     for (const token of chunk.removedTokens) existing.delete(token);
   }
+  let fullPresent: Set<string> | undefined;
+  if (fullBase !== undefined || !index.hasBase) {
+    fullPresent = fullBase ?? new Set<string>();
+    for (const chunk of chunks) applyChunk(fullPresent, chunk);
+  }
   return {
     existing,
     index,
     chunks,
-    ...(scannedBase === undefined ? {} : { resolvedBase: scannedBase }),
+    ...(fullPresent === undefined ? {} : { fullPresent }),
   };
 }
 

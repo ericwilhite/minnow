@@ -711,7 +711,7 @@ export class MinnowDatabase {
       columns,
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
-      ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyStorage: "chunks-v1" as const }),
+      ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyStorage: "chunks-v2" as const }),
       createdAt: this.#now().toISOString(),
     });
   }

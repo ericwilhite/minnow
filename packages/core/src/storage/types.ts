@@ -202,7 +202,7 @@ export interface TableRecord {
   columns: TableColumnRecord[];
   uniqueKeyColumnId?: string;
   uniqueKeyLookupReady?: boolean;
-  uniqueKeyStorage?: "chunks-v1";
+  uniqueKeyStorage?: "chunks-v1" | "chunks-v2";
   /** Full-text index state per column ID. Writers that see this emit commit deltas. */
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
   createdAt: string;
@@ -683,7 +683,7 @@ export interface UniqueKeyChanges {
   keyTokens: readonly string[];
   requireAbsent: boolean;
   remove?: boolean;
-  storageMode?: "chunks-v1";
+  storageMode?: "chunks-v1" | "chunks-v2";
 }
 
 /** One term's postings within a commit delta or base chunk: parallel rowId/tf arrays. */

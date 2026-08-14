@@ -3170,87 +3170,126 @@ it("persists the auto-increment counter across IndexedDB connections", async () 
   store.close();
 });
 
-it("folds chunked unique keys and rejects duplicates through cache, scan, and probe", async () => {
-  const indexedDB = new IDBFactory();
-  const name = crypto.randomUUID();
-  const timestamp = "2026-01-01T00:00:00.000Z";
-  let sequence = 0;
-  const commitKeyed = async (
-    store: IndexedDbBlockStore,
-    tokens: string[],
-    expectedManifestVersion: number | null,
-  ): Promise<void> => {
-    sequence += 1;
-    const id = `keyed-${String(sequence)}`;
-    await store.addBlock(id, Uint8Array.of(1));
-    await store.createTransaction({
-      id,
-      snapshotVersion: expectedManifestVersion,
-      pendingBlockIds: [id],
-      pendingSegmentIds: [],
-      status: "active",
-      revision: 0,
-      startedAt: timestamp,
-      updatedAt: timestamp,
-      committedVersion: null,
-    });
-    await store.commitTransaction({
-      transactionId: id,
-      expectedTransactionRevision: 0,
-      expectedManifestVersion,
-      uniqueKeyChanges: {
-        tableId: "events",
-        storageMode: "chunks-v1",
-        keyTokens: tokens,
-        requireAbsent: true,
-      },
-      committedAt: timestamp,
-    });
-  };
-  const token = (index: number): string => `number:${String(index)}`;
+for (const storageMode of ["chunks-v1", "chunks-v2"] as const) {
+  it(`folds ${storageMode} unique keys and rejects duplicates through cache, bulk, and probe`, async () => {
+    const indexedDB = new IDBFactory();
+    const name = crypto.randomUUID();
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    let sequence = 0;
+    const commitKeyed = async (
+      store: IndexedDbBlockStore,
+      tokens: string[],
+      expectedManifestVersion: number | null,
+      remove = false,
+    ): Promise<void> => {
+      sequence += 1;
+      const id = `keyed-${String(sequence)}`;
+      await store.addBlock(id, Uint8Array.of(1));
+      await store.createTransaction({
+        id,
+        snapshotVersion: expectedManifestVersion,
+        pendingBlockIds: [id],
+        pendingSegmentIds: [],
+        status: "active",
+        revision: 0,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        committedVersion: null,
+      });
+      await store.commitTransaction({
+        transactionId: id,
+        expectedTransactionRevision: 0,
+        expectedManifestVersion,
+        uniqueKeyChanges: {
+          tableId: "events",
+          storageMode,
+          keyTokens: tokens,
+          requireAbsent: !remove,
+          ...(remove ? { remove: true } : {}),
+        },
+        committedAt: timestamp,
+      });
+    };
+    const token = (index: number): string => `number:${String(index)}`;
 
-  // 17 commits overflow the 16-chunk tail, folding everything into per-key base records.
-  let store = await IndexedDbBlockStore.open({ name, indexedDB });
-  let version: number | null = null;
-  let next = 0;
-  for (let commit = 0; commit < 17; commit += 1) {
-    await commitKeyed(
-      store,
-      Array.from({ length: 120 }, () => token(next++)),
-      version,
+    // 17 commits overflow the 16-chunk tail, folding everything into the base representation.
+    let store = await IndexedDbBlockStore.open({ name, indexedDB });
+    await store.addTable({
+      id: "events",
+      name: "events",
+      columns: [{ id: "event-id", name: "event_id", type: "number", nullable: false }],
+      uniqueKeyColumnId: "event-id",
+      uniqueKeyLookupReady: true,
+      uniqueKeyStorage: storageMode,
+      createdAt: timestamp,
+    });
+    let version: number | null = null;
+    let next = 0;
+    for (let commit = 0; commit < 17; commit += 1) {
+      await commitKeyed(
+        store,
+        Array.from({ length: 120 }, () => token(next++)),
+        version,
+      );
+      version = version === null ? 0 : version + 1;
+    }
+    // Same instance: the memoized membership must still catch a folded duplicate.
+    await expect(commitKeyed(store, [token(5), token(9_999)], version)).rejects.toBeInstanceOf(
+      UniqueKeyConflictError,
     );
-    version = version === null ? 0 : version + 1;
-  }
-  // Same instance: the memoized base must still catch a duplicate from the folded commits.
-  await expect(commitKeyed(store, [token(5), token(9_999)], version)).rejects.toBeInstanceOf(
-    UniqueKeyConflictError,
-  );
-  store.close();
+    store.close();
 
-  // A fresh instance has no cache. A batch above the scan threshold resolves the base with one
-  // cursor pass; a small batch probes per token. Both must see the folded keys.
-  store = await IndexedDbBlockStore.open({ name, indexedDB });
-  const bigBatch = Array.from({ length: 2_500 }, (_, index) => token(10_000 + index));
-  bigBatch[1_250] = token(3); // one folded duplicate hidden mid-batch
-  await expect(commitKeyed(store, bigBatch, version)).rejects.toBeInstanceOf(
-    UniqueKeyConflictError,
-  );
-  await expect(commitKeyed(store, [token(200_000), token(7)], version)).rejects.toBeInstanceOf(
-    UniqueKeyConflictError,
-  );
-  // New keys still commit, and a second fresh instance sees them plus the folded base.
-  await commitKeyed(store, [token(300_000)], version);
-  version = (version ?? -1) + 1;
-  store.close();
-  store = await IndexedDbBlockStore.open({ name, indexedDB });
-  await expect(commitKeyed(store, [token(300_000)], version)).rejects.toBeInstanceOf(
-    UniqueKeyConflictError,
-  );
-  await expect(commitKeyed(store, [token(0)], version)).rejects.toBeInstanceOf(
-    UniqueKeyConflictError,
-  );
-  store.close();
-});
+    // A fresh instance has no cache. A batch above the bulk threshold resolves the whole base;
+    // a small batch reads only what the tokens need. Both must see the folded keys.
+    store = await IndexedDbBlockStore.open({ name, indexedDB });
+    const bigBatch = Array.from({ length: 2_500 }, (_, index) => token(10_000 + index));
+    bigBatch[1_250] = token(3); // one folded duplicate hidden mid-batch
+    await expect(commitKeyed(store, bigBatch, version)).rejects.toBeInstanceOf(
+      UniqueKeyConflictError,
+    );
+    await expect(commitKeyed(store, [token(200_000), token(7)], version)).rejects.toBeInstanceOf(
+      UniqueKeyConflictError,
+    );
+    expect(await store.getExistingUniqueKeys("events", [token(7), token(999_999)])).toEqual([
+      token(7),
+    ]);
+    // New keys still commit, and a second fresh instance sees them plus the folded base.
+    await commitKeyed(store, [token(300_000)], version);
+    version = (version ?? -1) + 1;
+    store.close();
+    store = await IndexedDbBlockStore.open({ name, indexedDB });
+    await expect(commitKeyed(store, [token(300_000)], version)).rejects.toBeInstanceOf(
+      UniqueKeyConflictError,
+    );
+    await expect(commitKeyed(store, [token(0)], version)).rejects.toBeInstanceOf(
+      UniqueKeyConflictError,
+    );
+
+    // A delete crosses the fold representation: removed keys become insertable again and stay
+    // gone for point lookups, through a second fold and a reopen.
+    await commitKeyed(store, [token(5), token(11)], version, true);
+    version += 1;
+    expect(await store.getExistingUniqueKeys("events", [token(5), token(11), token(6)])).toEqual([
+      token(6),
+    ]);
+    for (let commit = 0; commit < 17; commit += 1) {
+      await commitKeyed(
+        store,
+        Array.from({ length: 120 }, () => token(next++)),
+        version,
+      );
+      version += 1;
+    }
+    store.close();
+    store = await IndexedDbBlockStore.open({ name, indexedDB });
+    await commitKeyed(store, [token(5)], version);
+    version += 1;
+    await expect(commitKeyed(store, [token(11), token(5)], version)).rejects.toBeInstanceOf(
+      UniqueKeyConflictError,
+    );
+    store.close();
+  });
+}
 
 it("persists compaction checkpoints across IndexedDB connections", async () => {
   const factory = new IDBFactory();
