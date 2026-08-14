@@ -134,7 +134,7 @@ import {
   QueryMemoryContext,
   type QueryMemoryReservation,
 } from "./memory.js";
-import { LiveQuerySet, type LiveQuerySetOptions } from "./live.js";
+import { LiveQuerySet, type LiveQueryInput, type LiveQuerySetOptions } from "./live.js";
 import { renderPlan } from "./optimizer.js";
 import {
   applyColumnSteps,
@@ -1805,11 +1805,22 @@ export class MinnowDatabase {
 
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    return this.#queryCompiled(
+      bindPlanParameters(this.#compileCached(sql), options.params),
+      options,
+    );
+  }
+
+  /**
+   * The one read pipeline: every compiled plan — SQL text, the typed builder, and live-query
+   * re-runs — routes through the same streaming-first execution, so builder/SQL parity holds
+   * for the execution path as well as the plan.
+   */
+  async #queryCompiled(plan: CompiledQuery, options: QueryOptions = {}): Promise<QueryResult> {
     const spillPageRows =
       options.spillPageRows === undefined
         ? undefined
         : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
-    const plan = bindPlanParameters(this.#compileCached(sql), options.params);
     if (this.#canStreamPlanShape(plan, options)) {
       const streamed = await this.#queryStreamed(plan, options, spillPageRows);
       if (streamed !== undefined) return streamed;
@@ -1943,15 +1954,10 @@ export class MinnowDatabase {
           const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
-        execute: async (query) => {
-          if (typeof query === "string") return this.query(query);
-          const prepared = await this.#prepareCompiledPlan(query.plan);
-          try {
-            return prepared.execute();
-          } finally {
-            prepared.close();
-          }
-        },
+        execute: async (query) =>
+          typeof query === "string" ? this.query(query) : this.#queryCompiled(query.plan),
+        changeCanAffect: (query, tableIds, after, until) =>
+          this.#liveChangeCanAffect(query, tableIds, after, until),
       },
       {
         ...options,
@@ -1965,22 +1971,94 @@ export class MinnowDatabase {
     return set;
   }
 
+  /**
+   * Data-layer live-query selectivity: proves, when it can, that the commits in
+   * (after, until] to the given tables cannot change the query's result. Pure compaction
+   * rewrites are data-neutral; a pure-insert commit whose every new block's zone statistics
+   * reject the plan's predicates for that table cannot add a matching row. Everything else —
+   * updates, deletes, upserts (which can remove rows from a result), missing statistics,
+   * full-text plans, tables without zone-analyzable predicates — answers true.
+   */
+  async #liveChangeCanAffect(
+    query: LiveQueryInput,
+    tableIds: readonly string[],
+    after: number | null,
+    until: number,
+  ): Promise<boolean> {
+    const plan = typeof query === "string" ? this.#compileCached(query) : query.plan;
+    if (planContainsFts(plan)) return true;
+    for (const tableId of tableIds) {
+      const table = await this.store.getTable(tableId);
+      if (table === undefined) return true;
+      const predicates = zonePredicates(plan, table);
+      const segments = await this.store.listSegments(tableId);
+      const transactions = new Map(
+        (await this.#transactionRecordsForSegments(segments)).map(
+          (record) => [record.id, record] as const,
+        ),
+      );
+      for (const segment of segments) {
+        const committed = transactions.get(segment.transactionId)?.committedVersion ?? null;
+        if (committed === null || committed <= (after ?? -1) || committed > until) continue;
+        const kind = segment.kind ?? "insert";
+        // Compaction rewrites are visible-data-neutral by construction.
+        if (kind === "base") continue;
+        // Updates and deletes change existing rows; upserts can remove a row from a result
+        // set by replacing values. Only pure inserts are append-only-safe to zone-check.
+        if (kind !== "insert") return true;
+        if (predicates.length === 0) return true;
+        for (const predicate of predicates) {
+          const blockIds = segment.columnBlockIds[predicate.column.id];
+          if (blockIds === undefined) return true;
+        }
+        // The segment's new rows enter the result only if some row group passes every
+        // predicate's zone check; block descriptions ride the same immutable-id cache the
+        // streamed scan uses.
+        const firstIds = segment.columnBlockIds[predicates[0]?.column.id ?? ""] ?? [];
+        if (
+          predicates.some(
+            (predicate) =>
+              (segment.columnBlockIds[predicate.column.id]?.length ?? 0) !== firstIds.length,
+          )
+        ) {
+          return true;
+        }
+        for (let blockIndex = 0; blockIndex < firstIds.length; blockIndex += 1) {
+          let canMatch = true;
+          for (const predicate of predicates) {
+            const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
+            let description = this.#cacheGet(`zi ${blockId}`) as
+              ReturnType<typeof inspectBlock> | undefined;
+            if (description === undefined) {
+              const bytes = (await this.store.getBlocks([blockId]))[0];
+              if (bytes === undefined) return true;
+              description = inspectBlock(bytes);
+              this.#cachePut(`zi ${blockId}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+            }
+            if (description.type !== predicate.column.type) return true;
+            if (!zoneMapCanMatch(description, predicate)) {
+              canMatch = false;
+              break;
+            }
+          }
+          if (canMatch) return true;
+        }
+      }
+    }
+    return false;
+  }
+
   #notifyLiveCommit(): void {
     for (const set of this.#liveSets) set.notifyLocalCommit();
   }
 
-  /** Executes a built ORM query through the same preparation pipeline as compiled SQL. */
+  /** Executes a built ORM query through the same streaming-first pipeline as compiled SQL. */
   async run<TRow>(query: {
     kind: "typed-query";
     plan: CompiledQuery;
     __row?: TRow;
   }): Promise<TRow[]> {
-    const prepared = await this.#prepareCompiledPlan(query.plan);
-    try {
-      return prepared.execute().rows as TRow[];
-    } finally {
-      prepared.close();
-    }
+    return (await this.#queryCompiled(query.plan)).rows as TRow[];
   }
 
   /**

@@ -63,17 +63,24 @@ describe("live queries", () => {
     expect(changes).toHaveLength(2);
     expect(live.stats.rerunsAvoided).toBe(skippedBefore + 1);
 
-    // A dependent commit that does not change the result re-runs but suppresses notification.
+    // A dependent commit whose new block cannot match the predicate never re-runs at all:
+    // zone statistics prove value >= 2 rejects the [1] block.
     await database.insertBatch("events", { columns: { value: [1], label: [null] } });
     await live.refresh();
     expect(changes).toHaveLength(2);
-    expect(live.stats.notificationsSuppressed).toBe(1);
+    expect(live.stats.zoneSkips).toBe(1);
+    // A commit that passes the zone gate but leaves the result unchanged re-runs and
+    // suppresses the notification through the digest.
+    await database.insertBatch("events", { columns: { value: [2], label: [null] } });
+    await live.refresh();
+    expect(changes).toHaveLength(3);
+    expect(changes[2]?.rows).toEqual([{ count: 4, total: 17 }]);
 
     // Compaction publishes an empty change set, so it never re-runs subscriptions.
     const rerunsBefore = live.stats.reruns;
     await database.compactTable("events");
     await live.refresh();
-    expect(changes).toHaveLength(2);
+    expect(changes).toHaveLength(3);
     expect(live.stats.reruns).toBe(rerunsBefore);
     expect(live.stats.rerunsAvoided).toBeGreaterThan(skippedBefore + 1);
 
@@ -160,6 +167,88 @@ describe("live queries", () => {
     expect(live.stats.reruns).toBe(1);
     expect(changes).toHaveLength(1);
     expect(live.stats.lastSweepMs).toBeGreaterThanOrEqual(0);
+    live.close();
+    store.close();
+  });
+
+  it("skips re-runs when zone statistics prove new inserts cannot match", async () => {
+    const store = new MemoryBlockStore();
+    const database = await seeded(store);
+    const live = database.liveQueries();
+    const changes: QueryResult[] = [];
+    await live.subscribe("SELECT COUNT(*) AS n FROM events WHERE value >= 100", {
+      onChange: (result) => changes.push(result),
+    });
+    expect(changes).toHaveLength(1);
+
+    // New rows far below the predicate range: the commit is table-affecting, but every new
+    // block's zone statistics reject value >= 100, so the sweep skips the re-run entirely.
+    await database.insertBatch("events", {
+      columns: { value: [10, 11, 12], label: [null, null, null] },
+    });
+    await live.refresh();
+    expect(live.stats.zoneSkips).toBe(1);
+    expect(live.stats.reruns).toBe(0);
+    expect(changes).toHaveLength(1);
+
+    // A matching insert re-runs and notifies.
+    await database.insertBatch("events", { columns: { value: [150], label: ["hot"] } });
+    await live.refresh();
+    expect(live.stats.reruns).toBe(1);
+    expect(changes).toHaveLength(2);
+    expect(changes[1]?.rows).toEqual([{ n: 1 }]);
+    live.close();
+    store.close();
+  });
+
+  it("re-runs on keyed upserts even when new values reject the predicates", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await database.createTable({
+      name: "scores",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    await database.insertBatch("scores", { columns: { name: ["a", "b"], score: [150, 20] } });
+    const live = database.liveQueries();
+    const changes: QueryResult[] = [];
+    await live.subscribe("SELECT COUNT(*) AS n FROM scores WHERE score >= 100", {
+      onChange: (result) => changes.push(result),
+    });
+    expect(changes[0]?.rows).toEqual([{ n: 1 }]);
+    // The upsert's new value (5) rejects score >= 100, but it REPLACES a's 150 — the result
+    // loses a row, so zone gating must not skip this.
+    await database.upsertBatch("scores", { columns: { name: ["a"], score: [5] } });
+    await live.refresh();
+    expect(live.stats.zoneSkips).toBe(0);
+    expect(changes).toHaveLength(2);
+    expect(changes[1]?.rows).toEqual([{ n: 0 }]);
+    live.close();
+    store.close();
+  });
+
+  it("skips re-runs for data-neutral compaction commits", async () => {
+    const store = new MemoryBlockStore();
+    const database = await seeded(store);
+    await database.insertBatch("events", {
+      columns: { value: [4, 5, 6, 7, 8, 9, 10, 11, 12], label: Array(9).fill(null) },
+    });
+    const live = database.liveQueries();
+    const changes: QueryResult[] = [];
+    await live.subscribe("SELECT COUNT(*) AS n FROM events WHERE value >= 100", {
+      onChange: (result) => changes.push(result),
+    });
+    const avoidedBefore = live.stats.rerunsAvoided;
+    await database.compactTable("events");
+    await live.refresh();
+    // Compaction publishes an empty change set (logically unchanged), so the sweep avoids
+    // the re-run before the zone gate is even consulted.
+    expect(live.stats.rerunsAvoided).toBe(avoidedBefore + 1);
+    expect(live.stats.reruns).toBe(0);
+    expect(changes).toHaveLength(1);
     live.close();
     store.close();
   });
