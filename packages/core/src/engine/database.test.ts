@@ -7413,6 +7413,70 @@ describe("prepared-input cache and shared read lease", () => {
       ]);
     }
   });
+
+  it("collapses repeated catalog reads into probes while the epoch holds", async () => {
+    const { store, database } = await seededStore();
+    await database.query("SELECT COUNT(*) AS orders FROM orders");
+    const catalogReadsAfterFirst = store.catalogStateCalls;
+    for (let round = 0; round < 5; round += 1) {
+      await database.query("SELECT COUNT(*) AS orders FROM orders");
+      await database.query("SELECT region, SUM(amount) AS total FROM orders GROUP BY region");
+    }
+    // Every repeat is served by the (version, epoch) probe plus the cached state: both
+    // statements read the same table set, so no further catalog read happens at all until
+    // something actually changes.
+    expect(store.catalogStateCalls).toBe(catalogReadsAfterFirst);
+    await database.insertBatch("orders", { columns: { region: ["south"], amount: [11] } });
+    const after = await database.query("SELECT COUNT(*) AS orders FROM orders");
+    expect(after.rows).toEqual([{ orders: 7 }]);
+    expect(store.catalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
+  });
+
+  it("serves another instance's committed writes on the very next query", async () => {
+    const store = new LeaseCountingStore();
+    const writer = new MinnowDatabase(store, { rowsPerBlock: 4 });
+    const reader = new MinnowDatabase(store, { rowsPerBlock: 4 });
+    await writer.createTable({
+      name: "people",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    await writer.insertBatch("people", {
+      columns: { name: ["Ada", "Grace"], score: [10, 25] },
+    });
+    const before = await reader.query("SELECT COUNT(*) AS people FROM people");
+    expect(before.rows).toEqual([{ people: 2 }]);
+    // The reader's catalog cache is warm; the writer's commit must invalidate it through the
+    // epoch alone — there is no in-process signal between the two instances.
+    await writer.insertBatch("people", { columns: { name: ["Margaret"], score: [40] } });
+    const after = await reader.query("SELECT COUNT(*) AS people FROM people");
+    expect(after.rows).toEqual([{ people: 3 }]);
+  });
+
+  it("serves another instance's DDL on the very next query", async () => {
+    const store = new LeaseCountingStore();
+    const writer = new MinnowDatabase(store, { rowsPerBlock: 4 });
+    const reader = new MinnowDatabase(store, { rowsPerBlock: 4 });
+    await writer.createTable({
+      name: "seed",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await writer.insertBatch("seed", { columns: { value: [1] } });
+    // Warm the reader's cache, and prove a missing-table miss does not stick.
+    expect((await reader.query("SELECT value FROM seed")).rows).toEqual([{ value: 1 }]);
+    await expect(reader.query("SELECT label FROM labels")).rejects.toThrow(
+      "Table not found: labels",
+    );
+    await writer.createTable({
+      name: "labels",
+      columns: [{ name: "label", type: "string" }],
+    });
+    await writer.insertBatch("labels", { columns: { label: ["fresh"] } });
+    const result = await reader.query("SELECT label FROM labels");
+    expect(result.rows).toEqual([{ label: "fresh" }]);
+  });
 });
 
 describe("derived-block and pruned-projection caching", () => {

@@ -9,6 +9,7 @@ import {
   type CreateGarbageCollectionJobInput,
   createGarbageCollectionJobRecord,
   type BlockStore,
+  type CatalogProbe,
   type BlockWrite,
   advanceGarbageCollectionJobRecord,
   collectFtsCandidates,
@@ -73,6 +74,8 @@ export class MemoryBlockStore implements BlockStore {
   readonly #tempRunPages = new Map<string, Uint8Array>();
   readonly #tempOwners = new Map<string, TempOwnerRecord>();
   #currentVersion: number | null = null;
+  /** Advances on every catalog mutation; see `CatalogProbe` for the freshness contract. */
+  #catalogEpoch = 0;
   #commitQueue = Promise.resolve();
 
   async addBlock(id: string, bytes: Uint8Array): Promise<void> {
@@ -221,6 +224,7 @@ export class MemoryBlockStore implements BlockStore {
       throw new Error(`Table name already exists: ${record.name}`);
     this.#tables.set(record.id, structuredClone(record));
     this.#tableIdsByName.set(record.name, record.id);
+    this.#catalogEpoch += 1;
   }
 
   async getTable(id: string): Promise<TableRecord | undefined> {
@@ -254,6 +258,7 @@ export class MemoryBlockStore implements BlockStore {
         revision: expectedRevision + 1,
       };
       this.#tables.set(id, updated);
+      this.#catalogEpoch += 1;
       return structuredClone(updated);
     });
   }
@@ -417,6 +422,10 @@ export class MemoryBlockStore implements BlockStore {
     return this.#currentVersion;
   }
 
+  async getCatalogProbe(): Promise<CatalogProbe> {
+    return { manifestVersion: this.#currentVersion, catalogEpoch: this.#catalogEpoch };
+  }
+
   async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
     const tables = await Promise.all(tableNames.map((name) => this.getTableByName(name)));
     const foundTableIds = new Set(
@@ -434,6 +443,7 @@ export class MemoryBlockStore implements BlockStore {
       tables,
       segments,
       transactions,
+      catalogEpoch: this.#catalogEpoch,
     };
   }
 
@@ -485,6 +495,7 @@ export class MemoryBlockStore implements BlockStore {
         const manifest = createManifest(input);
         this.#manifests.set(manifest.version, manifest);
         this.#currentVersion = manifest.version;
+        this.#catalogEpoch += 1;
         resolveResult(structuredClone(manifest));
       } catch (error) {
         rejectResult(error);
@@ -750,6 +761,7 @@ export class MemoryBlockStore implements BlockStore {
           this.#uniqueKeys.set(uniqueKeyChanges.tableId, existing);
         }
         this.#applyFtsChanges(pendingSegments, input.ftsChanges, manifest.version);
+        this.#catalogEpoch += 1;
         // Match the IndexedDB store's observable commit shape: the summary without blockIds.
         const { blockIds: _resolved, ...summary } = manifest;
         void _resolved;

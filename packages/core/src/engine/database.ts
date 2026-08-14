@@ -168,6 +168,8 @@ const DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION = 16;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 const INTERNAL_READ_LEASE_TTL_MS = 60_000;
+/** Distinct table-name sets whose catalog state stays resident; entries are tiny (records only). */
+const CATALOG_STATE_CACHE_LIMIT = 64;
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
 const PLAN_CACHE_LIMIT = 512;
 
@@ -626,6 +628,13 @@ export class MinnowDatabase {
   readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
   #sharedLeaseRenewal: Promise<void> | undefined;
+  /**
+   * Catalog states keyed by requested table-name set, valid only at #catalogStateEpoch.
+   * The (version, epoch) probe is the sole validity signal: a matched epoch proves a cached
+   * entry is byte-identical to a fresh read, and a moved epoch clears every entry.
+   */
+  readonly #catalogStateCache = new Map<string, QueryCatalogState>();
+  #catalogStateEpoch: number | undefined;
 
   constructor(
     private readonly store: BlockStore,
@@ -1427,7 +1436,7 @@ export class MinnowDatabase {
     ) => Promise<T>,
   ): Promise<T> {
     for (;;) {
-      const state = await this.#queryCatalogState(names);
+      const state = await this.#cachedCatalogState(names);
       const realTables = new Map<string, TableRecord>();
       names.forEach((name, index) => {
         const table = state.tables[index];
@@ -1445,13 +1454,57 @@ export class MinnowDatabase {
         segmentsByTable,
       };
       const entry = await this.#acquireSharedLease(state.manifestVersion);
-      if (entry === undefined) continue;
+      if (entry === undefined) {
+        // The manifest disappeared between the read and the lease, so the cached state is
+        // anchored to a pruned version; drop it and re-read.
+        this.#catalogStateCache.clear();
+        this.#catalogStateEpoch = undefined;
+        continue;
+      }
       try {
         return await action(entry.lease, realTables, visibility);
       } finally {
         this.#releaseSharedLease(entry);
       }
     }
+  }
+
+  /**
+   * The catalog freshness probe: one atomic (version, epoch) read decides whether the cached
+   * catalog state is provably identical to a fresh read. An unchanged epoch means no table
+   * record, manifest publish, or commit has landed anywhere — this tab or another — since the
+   * cached state was read, so reuse is exact, not heuristic. Stores without a probe are never
+   * cached. Entries key on the requested table-name set; a changed epoch clears them all.
+   */
+  async #cachedCatalogState(names: readonly string[]): Promise<QueryCatalogState> {
+    const probe = this.store.getCatalogProbe?.bind(this.store);
+    if (probe === undefined) return this.#queryCatalogState(names);
+    const { catalogEpoch } = await probe();
+    // Table names are only trimmed, never charset-restricted, so no join separator is
+    // collision-free; JSON encoding is.
+    const key = JSON.stringify(names);
+    if (catalogEpoch === this.#catalogStateEpoch) {
+      const cached = this.#catalogStateCache.get(key);
+      if (cached !== undefined) {
+        this.#catalogStateCache.delete(key);
+        this.#catalogStateCache.set(key, cached);
+        return cached;
+      }
+    }
+    const state = await this.#queryCatalogState(names);
+    // Only a state carrying its own epoch (read atomically with the records) can be cached;
+    // the sequential fallback shape cannot prove which epoch it observed.
+    if (state.catalogEpoch === undefined) return state;
+    if (state.catalogEpoch !== this.#catalogStateEpoch) {
+      this.#catalogStateCache.clear();
+      this.#catalogStateEpoch = state.catalogEpoch;
+    }
+    this.#catalogStateCache.set(key, state);
+    if (this.#catalogStateCache.size > CATALOG_STATE_CACHE_LIMIT) {
+      const oldest = this.#catalogStateCache.keys().next().value;
+      if (oldest !== undefined) this.#catalogStateCache.delete(oldest);
+    }
+    return state;
   }
 
   /** One coherent catalog read via the store's batched method, or its sequential shape. */

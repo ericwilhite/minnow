@@ -10,6 +10,7 @@ import {
   TempOwnerConflictError,
   UniqueKeyConflictError,
   floorWholeNumberProduct,
+  storeNames,
   type BlockStore,
   type CompactionJobRecord,
   type CompactionJobRecordUpdate,
@@ -826,6 +827,117 @@ for (const implementation of stores()) {
           (record) => record !== undefined,
         ),
       );
+      store.close();
+    });
+
+    it("advances the catalog epoch on every catalog mutation and only those", async () => {
+      const store = await implementation.create();
+      const probe = store.getCatalogProbe?.bind(store);
+      expect(probe).toBeDefined();
+      if (probe === undefined) return;
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      const initial = await probe();
+      expect(initial.manifestVersion).toBeNull();
+
+      await store.addTable({
+        id: "epoch-id",
+        name: "epoch",
+        columns: [{ id: "epoch-column", name: "value", type: "number", nullable: false }],
+        createdAt: timestamp,
+      });
+      const afterAdd = await probe();
+      expect(afterAdd.catalogEpoch).toBeGreaterThan(initial.catalogEpoch);
+
+      await store.updateTable("epoch-id", 0, {
+        columns: [{ id: "epoch-column", name: "renamed", type: "number", nullable: false }],
+      });
+      const afterUpdate = await probe();
+      expect(afterUpdate.catalogEpoch).toBeGreaterThan(afterAdd.catalogEpoch);
+
+      // Block and segment staging are not catalog mutations: nothing a reader could have
+      // cached changes until the publish makes the staged work visible.
+      await store.addBlock("epoch-block", Uint8Array.of(1));
+      await store.addSegment({
+        id: "epoch-segment",
+        tableId: "epoch-id",
+        transactionId: "epoch-transaction",
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { "epoch-column": ["epoch-block"] },
+        createdAt: timestamp,
+      });
+      await store.createTransaction({
+        ...activeTransaction("epoch-transaction"),
+        pendingBlockIds: ["epoch-block"],
+        pendingSegmentIds: ["epoch-segment"],
+      });
+      const afterStaging = await probe();
+      expect(afterStaging.catalogEpoch).toBe(afterUpdate.catalogEpoch);
+
+      await store.commitTransaction({
+        transactionId: "epoch-transaction",
+        expectedTransactionRevision: 0,
+        expectedManifestVersion: null,
+        committedAt: timestamp,
+      });
+      const afterCommit = await probe();
+      expect(afterCommit.catalogEpoch).toBeGreaterThan(afterStaging.catalogEpoch);
+      expect(afterCommit.manifestVersion).toBe(0);
+
+      await store.publishManifest({ expectedVersion: 0, blockIds: ["epoch-block"] });
+      const afterPublish = await probe();
+      expect(afterPublish.catalogEpoch).toBeGreaterThan(afterCommit.catalogEpoch);
+      expect(afterPublish.manifestVersion).toBe(1);
+
+      // The batched catalog read reports the epoch it observed, atomically with its records.
+      const state = await store.getQueryCatalogState?.(["epoch"]);
+      expect(state?.catalogEpoch).toBe(afterPublish.catalogEpoch);
+      store.close();
+    });
+
+    it("sorts multi-table catalog segments globally by id", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      for (const [tableId, name] of [
+        ["sort-a-id", "sort-a"],
+        ["sort-b-id", "sort-b"],
+      ] as const) {
+        await store.addTable({
+          id: tableId,
+          name,
+          columns: [{ id: `${tableId}-column`, name: "value", type: "number", nullable: false }],
+          createdAt: timestamp,
+        });
+      }
+      await store.addBlock("sort-block", Uint8Array.of(1));
+      // Interleave segment ids across the two tables so a per-table concatenation without a
+      // global re-sort would come back misordered.
+      const segmentIds = [
+        ["segment-1", "sort-a-id"],
+        ["segment-2", "sort-b-id"],
+        ["segment-3", "sort-a-id"],
+        ["segment-4", "sort-b-id"],
+      ] as const;
+      for (const [segmentId, tableId] of segmentIds) {
+        await store.addSegment({
+          id: segmentId,
+          tableId,
+          transactionId: "sort-transaction",
+          rowCount: 1,
+          rowIdStart: 1n,
+          rowIdEndExclusive: 2n,
+          columnBlockIds: { [`${tableId}-column`]: ["sort-block"] },
+          createdAt: timestamp,
+        });
+      }
+      const state = await store.getQueryCatalogState?.(["sort-b", "sort-a"]);
+      expect(state?.segments.map((segment) => segment.id)).toEqual([
+        "segment-1",
+        "segment-2",
+        "segment-3",
+        "segment-4",
+      ]);
       store.close();
     });
 
@@ -3012,6 +3124,55 @@ for (const implementation of stores()) {
     });
   });
 }
+
+it("upgrades a version-1 IndexedDB database in place, back-filling the segment index", async () => {
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  // Build a schema-version-1 database by hand: plain object stores, no indexes, with a
+  // segment record already present so the upgrade must back-fill rather than start empty.
+  const legacy = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(name, 1);
+    request.onupgradeneeded = () => {
+      for (const storeName of storeNames) request.result.createObjectStore(storeName);
+    };
+    request.onsuccess = () => {
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      reject(request.error ?? new Error("open failed"));
+    };
+  });
+  const legacySegment = {
+    id: "legacy-segment",
+    tableId: "legacy-table-id",
+    transactionId: "legacy-transaction",
+    rowCount: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    columnBlockIds: { "legacy-column": ["legacy-block"] },
+    createdAt: timestamp,
+  };
+  await new Promise<void>((resolve, reject) => {
+    const transaction = legacy.transaction("segments", "readwrite");
+    transaction.objectStore("segments").add(legacySegment, legacySegment.id);
+    transaction.oncomplete = () => {
+      resolve();
+    };
+    transaction.onerror = () => {
+      reject(transaction.error ?? new Error("write failed"));
+    };
+  });
+  legacy.close();
+
+  const store = await IndexedDbBlockStore.open({ name, indexedDB });
+  const byTable = await store.listSegments("legacy-table-id");
+  expect(byTable.map((segment) => segment.id)).toEqual(["legacy-segment"]);
+  expect(await store.listSegments("some-other-table")).toEqual([]);
+  const probe = await store.getCatalogProbe();
+  expect(probe).toEqual({ manifestVersion: null, catalogEpoch: 0 });
+  store.close();
+});
 
 it("resumes a garbage collection job atomically after IndexedDB reopen", async () => {
   const indexedDB = new IDBFactory();

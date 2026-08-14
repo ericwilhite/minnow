@@ -12,6 +12,7 @@ import {
   advanceGarbageCollectionJobRecord,
   type BlockStore,
   type BlockWrite,
+  type CatalogProbe,
   collectFtsCandidates,
   invalidateUncoveredFtsColumns,
   type FtsCandidates,
@@ -53,8 +54,10 @@ import {
   WriteConflictError,
 } from "./types.js";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const CURRENT_MANIFEST_KEY = "manifest/current";
+const CATALOG_EPOCH_KEY = "catalog/epoch";
+const SEGMENT_TABLE_INDEX = "byTable";
 const TABLE_ID_PREFIX = "table/id/";
 const TABLE_NAME_PREFIX = "table/name/";
 const ROW_ID_PREFIX = "row-id/";
@@ -146,6 +149,15 @@ export class IndexedDbBlockStore implements BlockStore {
       for (const storeName of storeNames) {
         if (!request.result.objectStoreNames.contains(storeName)) {
           request.result.createObjectStore(storeName);
+        }
+      }
+      // Version 2: segments become range-readable by table. createIndex back-fills from
+      // existing records, so version-1 databases upgrade in place with no data rewrite.
+      const upgrade = request.transaction;
+      if (upgrade !== null) {
+        const segments = upgrade.objectStore("segments");
+        if (!segments.indexNames.contains(SEGMENT_TABLE_INDEX)) {
+          segments.createIndex(SEGMENT_TABLE_INDEX, "tableId");
         }
       }
     });
@@ -357,6 +369,7 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     store.add(structuredClone(record), idKey);
     store.add(record.id, nameKey);
+    await bumpCatalogEpoch(store);
     await transactionDone(transaction);
   }
 
@@ -400,6 +413,7 @@ export class IndexedDbBlockStore implements BlockStore {
       revision: expectedRevision + 1,
     };
     store.put(structuredClone(updated), idKey);
+    await bumpCatalogEpoch(store);
     await transactionDone(transaction);
     return updated;
   }
@@ -548,10 +562,19 @@ export class IndexedDbBlockStore implements BlockStore {
 
   async listSegments(tableId?: string): Promise<SegmentRecord[]> {
     const transaction = this.#transaction("segments", "readonly");
+    if (tableId !== undefined) {
+      // Index range read: cost scales with this table's segments, not the store's total.
+      const values = await requestResult<unknown[]>(
+        transaction.objectStore("segments").index(SEGMENT_TABLE_INDEX).getAll(tableId),
+      );
+      await transactionDone(transaction);
+      return values
+        .map((value) => asSegmentRecord(value))
+        .sort((left, right) => left.id.localeCompare(right.id));
+    }
     const records: SegmentRecord[] = [];
     await visitObjectStoreSequentially(transaction.objectStore("segments"), (value) => {
-      const record = asSegmentRecord(value);
-      if (tableId === undefined || record.tableId === tableId) records.push(record);
+      records.push(asSegmentRecord(value));
     });
     await transactionDone(transaction);
     return records.sort((left, right) => left.id.localeCompare(right.id));
@@ -630,11 +653,26 @@ export class IndexedDbBlockStore implements BlockStore {
     return typeof value === "number" ? value : null;
   }
 
+  async getCatalogProbe(): Promise<CatalogProbe> {
+    const transaction = this.#transaction("catalog", "readonly");
+    const catalog = transaction.objectStore("catalog");
+    const [versionValue, epochValue] = await Promise.all([
+      requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
+      requestResult<unknown>(catalog.get(CATALOG_EPOCH_KEY)),
+    ]);
+    await transactionDone(transaction);
+    return {
+      manifestVersion: typeof versionValue === "number" ? versionValue : null,
+      catalogEpoch: typeof epochValue === "number" ? epochValue : 0,
+    };
+  }
+
   async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
     const transaction = this.#transaction(["catalog", "segments", "transactions"], "readonly");
     const catalog = transaction.objectStore("catalog");
-    const [versionValue, tableIds] = await Promise.all([
+    const [versionValue, epochValue, tableIds] = await Promise.all([
       requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
+      requestResult<unknown>(catalog.get(CATALOG_EPOCH_KEY)),
       Promise.all(
         tableNames.map((name) =>
           requestResult<unknown>(catalog.get(`${TABLE_NAME_PREFIX}${name}`)),
@@ -648,14 +686,20 @@ export class IndexedDbBlockStore implements BlockStore {
         return value === undefined ? undefined : asTableRecord(value);
       }),
     );
-    const foundTableIds = new Set(
-      tables.filter((table): table is TableRecord => table !== undefined).map((table) => table.id),
+    const foundTableIds = [
+      ...new Set(
+        tables
+          .filter((table): table is TableRecord => table !== undefined)
+          .map((table) => table.id),
+      ),
+    ];
+    // Range-read each found table's segments through the byTable index: cost scales with the
+    // queried tables' segments, not the store's total segment count.
+    const segmentIndex = transaction.objectStore("segments").index(SEGMENT_TABLE_INDEX);
+    const segmentValues = await Promise.all(
+      foundTableIds.map((tableId) => requestResult<unknown[]>(segmentIndex.getAll(tableId))),
     );
-    const segments: SegmentRecord[] = [];
-    await visitObjectStoreSequentially(transaction.objectStore("segments"), (value) => {
-      const record = asSegmentRecord(value);
-      if (foundTableIds.has(record.tableId)) segments.push(record);
-    });
+    const segments = segmentValues.flat().map((value) => asSegmentRecord(value));
     segments.sort((left, right) => left.id.localeCompare(right.id));
     const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
     const transactionStore = transaction.objectStore("transactions");
@@ -670,6 +714,7 @@ export class IndexedDbBlockStore implements BlockStore {
       transactions: transactionValues
         .filter((value) => value !== undefined)
         .map((value) => asTransactionRecord(value)),
+      catalogEpoch: typeof epochValue === "number" ? epochValue : 0,
     };
   }
 
@@ -774,6 +819,7 @@ export class IndexedDbBlockStore implements BlockStore {
     const manifest = createManifest(input);
     transaction.objectStore("manifests").add(manifest, manifest.version);
     catalog.put(manifest.version, CURRENT_MANIFEST_KEY);
+    await bumpCatalogEpoch(catalog);
     await transactionDone(transaction);
     this.#manifestCache = { version: manifest.version, blockIds: new Set(manifest.blockIds) };
     return manifest;
@@ -1205,6 +1251,7 @@ export class IndexedDbBlockStore implements BlockStore {
     });
     manifestStore.add(manifestRecord, manifest.version);
     catalog.put(manifest.version, CURRENT_MANIFEST_KEY);
+    await bumpCatalogEpoch(catalog);
     for (const segment of pendingSegments) {
       segmentStore.put(
         {
@@ -1986,6 +2033,17 @@ function readCursorPage<T>(
       }
     };
   });
+}
+
+/**
+ * Advances the catalog epoch inside an already-open readwrite transaction on the catalog
+ * store. Every catalog mutation calls this in its own transaction, so the epoch read by
+ * `getCatalogProbe` is an atomic, monotonic proof of catalog identity: an unchanged epoch
+ * means no table record, manifest publish, or commit has landed since the epoch was read.
+ */
+async function bumpCatalogEpoch(catalog: IDBObjectStore): Promise<void> {
+  const value = (await requestResult(catalog.get(CATALOG_EPOCH_KEY))) as number | undefined;
+  catalog.put((value ?? 0) + 1, CATALOG_EPOCH_KEY);
 }
 
 function visitObjectStoreSequentially(

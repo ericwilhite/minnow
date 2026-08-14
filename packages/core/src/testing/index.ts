@@ -11,6 +11,7 @@ import type {
   Manifest,
   ManifestSummary,
   PublishManifestInput,
+  CatalogProbe,
   QueryCatalogState,
   RowIdRange,
   RunGarbageCollectionStepInput,
@@ -40,6 +41,8 @@ export type FaultInjector = (point: FaultPoint) => void | Promise<void>;
 export class FaultInjectingBlockStore implements BlockStore {
   /** Present only when the inner store implements it, so callers' fallbacks stay honest. */
   getQueryCatalogState?: (tableNames: readonly string[]) => Promise<QueryCatalogState>;
+  /** Present only when the inner store implements it, so callers' fallbacks stay honest. */
+  getCatalogProbe?: () => Promise<CatalogProbe>;
 
   constructor(
     private readonly inner: BlockStore,
@@ -48,6 +51,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     const innerCatalogState = inner.getQueryCatalogState?.bind(inner);
     if (innerCatalogState !== undefined) {
       this.getQueryCatalogState = (tableNames) => innerCatalogState(tableNames);
+    }
+    const innerCatalogProbe = inner.getCatalogProbe?.bind(inner);
+    if (innerCatalogProbe !== undefined) {
+      this.getCatalogProbe = () => innerCatalogProbe();
     }
   }
 

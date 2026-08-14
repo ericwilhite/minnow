@@ -859,6 +859,26 @@ export interface QueryCatalogState {
   segments: SegmentRecord[];
   /** Records for the segments' transaction ids; missing records are omitted. */
   transactions: TransactionRecord[];
+  /**
+   * The catalog epoch this state was read at, read in the same atomic storage transaction.
+   * Present when the store maintains an epoch (see `getCatalogProbe`); callers may cache the
+   * state and reuse it while a probe returns the same epoch.
+   */
+  catalogEpoch?: number;
+}
+
+/**
+ * The two change counters a reader needs to know whether anything it may have cached is
+ * still current, read together in one atomic storage transaction. `manifestVersion` moves on
+ * every data commit. `catalogEpoch` moves on every catalog mutation — table creation, table
+ * record updates (schema migration, full-text index stamps), and every manifest publish —
+ * so an unchanged epoch proves cached catalog state is byte-identical to a fresh read.
+ * Physical garbage collection does not move the epoch: it only deletes records that are
+ * already invisible at every leased version, so cached state stays result-equivalent.
+ */
+export interface CatalogProbe {
+  manifestVersion: number | null;
+  catalogEpoch: number;
 }
 
 export interface BlockStore {
@@ -929,6 +949,12 @@ export interface BlockStore {
   getCurrentManifest(): Promise<Manifest | undefined>;
   /** The current version alone, without materializing the manifest's block list. */
   getCurrentManifestVersion(): Promise<number | null>;
+  /**
+   * Optional: the current manifest version and catalog epoch in one atomic read. This is the
+   * freshness probe: an unchanged pair proves any cached catalog state is still exactly what
+   * a fresh read would return. Callers that find this absent must not cache catalog state.
+   */
+  getCatalogProbe?(): Promise<CatalogProbe>;
   /**
    * Optional: one atomic catalog read for query preparation. Implementations must return
    * the same records the individual getTableByName/listSegments/getTransactions calls
