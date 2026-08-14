@@ -39,14 +39,17 @@ export interface ConsoleView {
 function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "rows") return `${String(result.result.rows.length)} rows`;
   if (result.kind === "create-table") return `created table ${result.table}`;
+  if (result.kind === "create-trigger") return `created trigger ${result.name} on ${result.table}`;
+  if (result.kind === "drop-trigger") return `dropped trigger ${result.name}`;
   const rows = result.rowCount === 1 ? "1 row" : `${String(result.rowCount)} rows`;
   return `${result.kind}: ${rows} in ${result.table}`;
 }
 
 function affectedRows(result: ExecuteResult): number {
-  if (result.kind === "rows") return result.result.rows.length;
-  if (result.kind === "create-table") return 0;
-  return result.rowCount;
+  if (result.kind !== "rows") {
+    return "rowCount" in result ? result.rowCount : 0;
+  }
+  return result.result.rows.length;
 }
 
 /** The SQL console: type a statement, run it, read the rows, and find it again afterwards. */

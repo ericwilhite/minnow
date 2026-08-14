@@ -30,6 +30,7 @@ interface MatrixFeature {
   id: string;
   status: "supported" | "unsupported";
   example: string;
+  setup?: string[];
   /** Bound values for the example's placeholders, in order. */
   params?: Array<string | number | boolean | null>;
   error?: string;
@@ -57,7 +58,8 @@ function usesDatabase(feature: MatrixFeature): boolean {
   return (
     feature.id.startsWith("mutation.") ||
     feature.id.startsWith("transaction.") ||
-    feature.id.startsWith("ddl.")
+    feature.id.startsWith("ddl.") ||
+    feature.id.startsWith("trigger.")
   );
 }
 
@@ -189,6 +191,7 @@ function minnowRunner(): FeatureRunner {
     async execute(feature) {
       if (usesDatabase(feature)) {
         const database = await keyedDatabase();
+        for (const statement of feature.setup ?? []) await database.execute(statement);
         await database.execute(feature.example, feature.params);
         return;
       }
@@ -257,6 +260,7 @@ async function sqliteRunner(): Promise<FeatureRunner> {
       // the next measurement.
       for (const sql of fixtureTeardown) database.exec(sql);
       for (const sql of fixtureDdl) database.exec(sql);
+      for (const sql of feature.setup ?? []) database.exec(sql);
       if (feature.params === undefined) database.exec(feature.example);
       else database.exec({ sql: feature.example, bind: feature.params });
       return Promise.resolve();
@@ -275,6 +279,7 @@ async function duckdbRunner(): Promise<FeatureRunner> {
     async execute(feature) {
       for (const sql of fixtureTeardown) await connection.query(sql);
       for (const sql of fixtureDdl) await connection.query(sql);
+      for (const sql of feature.setup ?? []) await connection.query(sql);
       if (feature.params === undefined) {
         await connection.query(feature.example);
       } else {
@@ -299,6 +304,7 @@ async function pgliteRunner(): Promise<FeatureRunner> {
     async execute(feature) {
       for (const sql of fixtureTeardown) await database.exec(sql);
       for (const sql of fixtureDdl) await database.exec(sql);
+      for (const sql of feature.setup ?? []) await database.exec(sql);
       if (feature.params === undefined) await database.exec(feature.example);
       else await database.query(feature.example, [...feature.params]);
     },

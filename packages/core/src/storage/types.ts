@@ -205,9 +205,31 @@ export interface TableRecord {
   uniqueKeyStorage?: "chunks-v1" | "chunks-v2";
   /** Full-text index state per column ID. Writers that see this emit commit deltas. */
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
+  /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
+  triggers?: TriggerRecord[];
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
   revision?: number;
+}
+
+/**
+ * One AFTER trigger: catalog-persisted on its table record so the catalog epoch makes it
+ * visible to every tab immediately, and executed by the committing writer inside the same
+ * transaction as the triggering write — the write and its derivations publish atomically.
+ */
+export interface TriggerRecord {
+  name: string;
+  event: "insert" | "update" | "delete";
+  /** Body statements in order; each fires once per affected row. */
+  statements: TriggerStatementRecord[];
+  createdAt: string;
+}
+
+export interface TriggerStatementRecord {
+  /** The body statement with every NEW.col / OLD.col reference rewritten to a placeholder. */
+  sql: string;
+  /** Placeholder bindings in order: which pseudo-row and column fills each parameter. */
+  bindings: Array<{ source: "new" | "old"; column: string }>;
 }
 
 export class TableRecordConflictError extends Error {
@@ -899,6 +921,8 @@ export interface BlockStore {
       columns?: TableColumnRecord[];
       /** Replaces the full-text index state map; null clears it. */
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      /** Replaces the trigger list; null clears it. */
+      triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord>;
   /**

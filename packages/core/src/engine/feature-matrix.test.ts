@@ -8,6 +8,8 @@ interface MatrixFeature {
   id: string;
   status: "supported" | "unsupported";
   example: string;
+  /** Statements executed before the example, for examples that need prior state. */
+  setup?: string[];
   /** Bound values for the example's placeholders, in order. */
   params?: Array<string | number | boolean | null>;
   error?: string;
@@ -67,9 +69,14 @@ describe("SQL feature matrix conformance", () => {
   });
 
   for (const feature of features.filter(({ status }) => status === "supported")) {
-    if (feature.id.startsWith("mutation.") || feature.id.startsWith("ddl.")) {
+    if (
+      feature.id.startsWith("mutation.") ||
+      feature.id.startsWith("ddl.") ||
+      feature.id.startsWith("trigger.")
+    ) {
       it(`executes supported ${feature.id}`, async () => {
         const database = await keyedDatabase();
+        for (const statement of feature.setup ?? []) await database.execute(statement);
         const result = await database.execute(feature.example, feature.params);
         expect(result.kind).not.toBe("rows");
       });

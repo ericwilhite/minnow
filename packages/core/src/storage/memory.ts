@@ -10,6 +10,7 @@ import {
   createGarbageCollectionJobRecord,
   type BlockStore,
   type CatalogProbe,
+  type TriggerRecord,
   type BlockWrite,
   advanceGarbageCollectionJobRecord,
   collectFtsCandidates,
@@ -238,6 +239,7 @@ export class MemoryBlockStore implements BlockStore {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
     return this.#runAtomic(() => {
@@ -247,14 +249,18 @@ export class MemoryBlockStore implements BlockStore {
         throw new TableRecordConflictError(id, expectedRevision, actualRevision);
       }
       if (update.columns !== undefined) validateTableColumns(update.columns);
-      const { ftsColumns: previousFts, ...base } = record;
+      const { ftsColumns: previousFts, triggers: previousTriggers, ...base } = record;
       const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+      const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
       const updated: TableRecord = {
         ...base,
         columns: update.columns === undefined ? record.columns : structuredClone(update.columns),
         ...(nextFts === null || nextFts === undefined
           ? {}
           : { ftsColumns: structuredClone(nextFts) }),
+        ...(nextTriggers === null || nextTriggers === undefined
+          ? {}
+          : { triggers: structuredClone(nextTriggers) }),
         revision: expectedRevision + 1,
       };
       this.#tables.set(id, updated);

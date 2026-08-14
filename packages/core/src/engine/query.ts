@@ -659,6 +659,15 @@ export interface CompileQueryOptions {
  * Trims the statement the parser sees while remembering how far that shifted every position, so
  * compile errors report offsets into the caller's own text rather than the trimmed copy.
  */
+/** Single-statement rule for every route except CREATE TRIGGER bodies. */
+function rejectSemicolons(tokens: Token[]): void {
+  for (const token of tokens) {
+    if (token.kind === "punctuation" && token.text === ";") {
+      throw new SqlCompileError("Run one SELECT statement at a time", token.start, 1);
+    }
+  }
+}
+
 function normalizeSql(sql: string): { text: string; offset: number } {
   return { text: sql.trim().replace(/;$/, "").trim(), offset: sql.length - sql.trimStart().length };
 }
@@ -689,7 +698,9 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   let parser: Parser | undefined;
   let plan: CompiledQuery;
   try {
-    parser = new Parser(tokenize(text));
+    const tokens = tokenize(text);
+    rejectSemicolons(tokens);
+    parser = new Parser(tokens);
     plan = parser.parse(text);
   } catch (error) {
     throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
@@ -753,7 +764,134 @@ export type CompiledStatement =
       columns: Array<{ name: string; type: SqlColumnType; nullable?: boolean }>;
       uniqueKey?: string;
       parameterCount?: number;
-    };
+    }
+  | {
+      kind: "create-trigger";
+      table: string;
+      trigger: {
+        name: string;
+        event: "insert" | "update" | "delete";
+        statements: Array<{
+          /** Body INSERT with every NEW.col / OLD.col rewritten to a positional placeholder. */
+          sql: string;
+          bindings: Array<{ source: "new" | "old"; column: string }>;
+        }>;
+      };
+      parameterCount?: number;
+    }
+  | { kind: "drop-trigger"; name: string; parameterCount?: number };
+
+/**
+ * Parses CREATE TRIGGER name AFTER INSERT|UPDATE|DELETE ON table [FOR EACH ROW]
+ * BEGIN insert; ... END. Body statements are INSERT ... VALUES with NEW.col / OLD.col
+ * references; each reference rewrites to a positional placeholder recorded in order, so
+ * firing is one bindStatementParameters call per affected row against machinery that
+ * already exists. Bodies cannot carry their own parameters — placeholder order is the
+ * binding order.
+ */
+function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
+  let cursor = 2;
+  const keywordAt = (index: number, keyword: string): boolean => {
+    const token = tokens[index];
+    return (
+      token?.kind === "identifier" && token.quoted !== true && token.text.toUpperCase() === keyword
+    );
+  };
+  const identifier = (what: string): string => {
+    const token = tokens[cursor];
+    if (token?.kind !== "identifier") throw new TypeError(`Expected ${what}`);
+    cursor += 1;
+    return token.text;
+  };
+  const name = identifier("a trigger name");
+  if (!keywordAt(cursor, "AFTER")) {
+    throw new TypeError("CREATE TRIGGER supports AFTER triggers only");
+  }
+  cursor += 1;
+  const eventText = identifier("a trigger event").toUpperCase();
+  if (eventText !== "INSERT" && eventText !== "UPDATE" && eventText !== "DELETE") {
+    throw new TypeError("Trigger event must be INSERT, UPDATE, or DELETE");
+  }
+  const event = eventText.toLowerCase() as "insert" | "update" | "delete";
+  if (!keywordAt(cursor, "ON")) throw new TypeError("Expected ON before the trigger table");
+  cursor += 1;
+  const table = identifier("the trigger table");
+  if (keywordAt(cursor, "FOR")) {
+    if (!keywordAt(cursor + 1, "EACH") || !keywordAt(cursor + 2, "ROW")) {
+      throw new TypeError("Expected FOR EACH ROW");
+    }
+    cursor += 3;
+  }
+  if (!keywordAt(cursor, "BEGIN")) throw new TypeError("Trigger bodies use BEGIN ... END");
+  cursor += 1;
+  let endIndex = -1;
+  for (let index = tokens.length - 1; index > cursor; index -= 1) {
+    if (keywordAt(index, "END")) {
+      endIndex = index;
+      break;
+    }
+  }
+  if (endIndex <= cursor) throw new TypeError("Trigger bodies use BEGIN ... END");
+  const spans: Array<[number, number]> = [];
+  let statementStart = cursor;
+  for (let index = cursor; index < endIndex; index += 1) {
+    const token = tokens[index];
+    if (token?.kind === "punctuation" && token.text === ";") {
+      if (index > statementStart) spans.push([statementStart, index]);
+      statementStart = index + 1;
+    }
+  }
+  if (endIndex > statementStart) spans.push([statementStart, endIndex]);
+  if (spans.length === 0) throw new TypeError("A trigger body needs at least one statement");
+  const statements = spans.map(([from, to]) => {
+    const bindings: Array<{ source: "new" | "old"; column: string }> = [];
+    const rewrites: Array<{ start: number; end: number }> = [];
+    for (let index = from; index < to; index += 1) {
+      const token = tokens[index];
+      if (token?.kind === "parameter") {
+        throw new TypeError("Trigger bodies cannot contain parameters");
+      }
+      if (
+        (keywordAt(index, "NEW") || keywordAt(index, "OLD")) &&
+        tokens[index + 1]?.kind === "punctuation" &&
+        tokens[index + 1]?.text === "." &&
+        tokens[index + 2]?.kind === "identifier" &&
+        index + 2 < to
+      ) {
+        const source = (tokens[index] ?? { text: "" }).text.toLowerCase() as "new" | "old";
+        bindings.push({ source, column: (tokens[index + 2] ?? { text: "" }).text });
+        rewrites.push({
+          start: tokens[index]?.start ?? 0,
+          end: tokens[index + 2]?.end ?? 0,
+        });
+        index += 2;
+      }
+    }
+    const sliceStart = tokens[from]?.start ?? 0;
+    const sliceEnd = tokens[to - 1]?.end ?? sliceStart;
+    let sql = text.slice(sliceStart, sliceEnd);
+    for (let index = rewrites.length - 1; index >= 0; index -= 1) {
+      const rewrite = rewrites[index];
+      if (rewrite === undefined) continue;
+      sql = `${sql.slice(0, rewrite.start - sliceStart)}?${sql.slice(rewrite.end - sliceStart)}`;
+    }
+    const compiled = compileStatement(sql);
+    if (compiled.kind !== "insert" || compiled.query !== undefined) {
+      throw new TypeError("Trigger bodies support INSERT ... VALUES statements");
+    }
+    if (compiled.onConflict !== undefined) {
+      throw new TypeError("Trigger body INSERTs cannot carry ON CONFLICT");
+    }
+    if ((compiled.parameterCount ?? 0) !== bindings.length) {
+      throw new TypeError("Trigger body placeholders must all come from NEW/OLD references");
+    }
+    return { sql, bindings };
+  });
+  if (tokens[endIndex + 1]?.kind !== "eof") {
+    throw new TypeError("Unexpected input after the trigger body END");
+  }
+  return { kind: "create-trigger", table, trigger: { name, event, statements } };
+}
 
 /**
  * Routes one SQL statement: SELECT and WITH compile through the read-only query pipeline, while
@@ -768,6 +906,12 @@ export function compileStatement(sql: string): CompiledStatement {
     const tokens = tokenize(text);
     const first = tokens[0];
     const keyword = first?.kind === "identifier" ? first.text.toUpperCase() : "";
+    const second = tokens[1];
+    const isTriggerDdl =
+      (keyword === "CREATE" || keyword === "DROP") &&
+      second?.kind === "identifier" &&
+      second.text.toUpperCase() === "TRIGGER";
+    if (!isTriggerDdl) rejectSemicolons(tokens);
     if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
       parser = new Parser(tokens);
       const statement = parser.parseMutation(keyword);
@@ -775,8 +919,16 @@ export function compileStatement(sql: string): CompiledStatement {
       return statement;
     }
     if (keyword === "CREATE") {
+      if (isTriggerDdl) return parseCreateTrigger(text, tokens);
       parser = new Parser(tokens);
       return parser.parseCreateTable();
+    }
+    if (keyword === "DROP") {
+      const name = tokens[2];
+      if (isTriggerDdl && name?.kind === "identifier" && tokens[3]?.kind === "eof") {
+        return { kind: "drop-trigger", name: name.text };
+      }
+      throw new TypeError("DROP supports: DROP TRIGGER name");
     }
     if (keyword === "WITH") {
       parser = new Parser(tokens);
@@ -1174,7 +1326,11 @@ export function bindStatementParameters(
   if (statement.kind === "select") {
     throw new TypeError("SELECT parameters bind through the query pipeline, not the statement");
   }
-  if (statement.kind === "create-table") {
+  if (
+    statement.kind === "create-table" ||
+    statement.kind === "create-trigger" ||
+    statement.kind === "drop-trigger"
+  ) {
     throw new TypeError("DDL statements take no parameters");
   }
   const values = params ?? [];
@@ -5917,8 +6073,13 @@ function tokenize(sql: string): Token[] {
     if (pair === "--" || pair === "/*") {
       throw new SqlCompileError("SQL comments are not supported", index, pair.length);
     }
-    if (character === ";")
-      throw new SqlCompileError("Run one SELECT statement at a time", index, 1);
+    if (character === ";") {
+      // Statement separators lex normally; the routers reject them everywhere except inside
+      // a CREATE TRIGGER body, which is the one multi-statement construct.
+      tokens.push({ kind: "punctuation", text: ";", start: index, end: index + 1 });
+      index += 1;
+      continue;
+    }
     if ([">=", "<=", "!=", "<>", "||"].includes(pair)) {
       tokens.push({ kind: "operator", text: pair, start: index, end: index + 2 });
       index += 2;

@@ -13,6 +13,7 @@ import {
   type BlockStore,
   type BlockWrite,
   type CatalogProbe,
+  type TriggerRecord,
   collectFtsCandidates,
   invalidateUncoveredFtsColumns,
   type FtsCandidates,
@@ -388,6 +389,7 @@ export class IndexedDbBlockStore implements BlockStore {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
     if (update.columns !== undefined) validateTableColumns(update.columns);
@@ -402,14 +404,18 @@ export class IndexedDbBlockStore implements BlockStore {
       await ignoreAbort(transaction);
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
     }
-    const { ftsColumns: previousFts, ...base } = record;
+    const { ftsColumns: previousFts, triggers: previousTriggers, ...base } = record;
     const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
     const updated: TableRecord = {
       ...base,
       columns: update.columns === undefined ? record.columns : structuredClone(update.columns),
       ...(nextFts === null || nextFts === undefined
         ? {}
         : { ftsColumns: structuredClone(nextFts) }),
+      ...(nextTriggers === null || nextTriggers === undefined
+        ? {}
+        : { triggers: structuredClone(nextTriggers) }),
       revision: expectedRevision + 1,
     };
     store.put(structuredClone(updated), idKey);

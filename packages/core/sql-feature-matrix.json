@@ -515,6 +515,20 @@
       "notes": "Deliberate: mutation segments address rows by unique key, so tables without one cannot be updated or deleted through any API."
     },
     {
+      "id": "trigger.create-after",
+      "status": "supported",
+      "example": "CREATE TRIGGER keyed_audit AFTER INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END",
+      "notes": "AFTER INSERT/UPDATE/DELETE row triggers with INSERT ... VALUES bodies over NEW/OLD references, executed atomically inside the triggering commit. Bodies target keyless tables; cascades and BEFORE triggers are rejected."
+    },
+    {
+      "id": "trigger.drop",
+      "status": "supported",
+      "example": "DROP TRIGGER droppable_audit",
+      "setup": [
+        "CREATE TRIGGER droppable_audit AFTER INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END"
+      ]
+    },
+    {
       "id": "transaction.begin",
       "status": "unsupported",
       "example": "BEGIN",

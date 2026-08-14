@@ -563,6 +563,8 @@ export interface QuerySpillCleanupResult {
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
   | { kind: "create-table"; table: string }
+  | { kind: "create-trigger"; table: string; name: string }
+  | { kind: "drop-trigger"; name: string }
   | {
       kind: "insert";
       table: string;
@@ -954,6 +956,12 @@ export class MinnowDatabase {
         storedBytes += bytes.byteLength;
         blockCount += 1;
       }
+      const deletePreImages = await this.#triggerPreImages(
+        table,
+        keyColumn,
+        [...keys.values()],
+        "delete",
+      );
       let stageStarted = performance.now();
       await transaction.stageBlocks(blockWrites);
       stageMs += performance.now() - stageStarted;
@@ -971,6 +979,14 @@ export class MinnowDatabase {
         level: 0,
         createdAt: this.#now().toISOString(),
       });
+      await this.#stageTriggerDerivedInserts(
+        transaction,
+        table,
+        "delete",
+        [...keys.values()].length,
+        (source, column, rowIndex) =>
+          source === "old" ? (deletePreImages[rowIndex]?.[column] ?? null) : null,
+      );
       stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
@@ -1083,6 +1099,12 @@ export class MinnowDatabase {
         blockCount += blockWrites.length;
         batchBlockWrites.push(...blockWrites);
       }
+      const preImages = await this.#triggerPreImages(
+        table,
+        keyColumn,
+        input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
+        "update",
+      );
       const stageStarted = performance.now();
       await transaction.stageArtifacts(batchBlockWrites, [
         {
@@ -1099,6 +1121,19 @@ export class MinnowDatabase {
           createdAt: this.#now().toISOString(),
         },
       ]);
+      await this.#stageTriggerDerivedInserts(
+        transaction,
+        table,
+        "update",
+        input.keys.length,
+        (source, column, rowIndex) => {
+          if (source === "old") return preImages[rowIndex]?.[column] ?? null;
+          const changed = input.changes[column];
+          return changed === undefined
+            ? (preImages[rowIndex]?.[column] ?? null)
+            : (changed[rowIndex] ?? null);
+        },
+      );
       stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
@@ -1283,6 +1318,16 @@ export class MinnowDatabase {
       };
       const stageStarted = performance.now();
       await transaction.stageArtifacts(batchBlockWrites, [segment]);
+      if (kind === "insert") {
+        await this.#stageTriggerDerivedInserts(
+          transaction,
+          table,
+          "insert",
+          rowCount,
+          (source, column, rowIndex) =>
+            source === "new" ? (input.columns[column]?.[rowIndex] ?? null) : null,
+        );
+      }
       stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
@@ -2127,6 +2172,235 @@ export class MinnowDatabase {
       });
   }
 
+  /**
+   * Persists one AFTER trigger on its table record (compare-and-swap with retry, like
+   * migration). Validation is CREATE-time so firing can trust the record: events bind only
+   * the pseudo-rows they have (INSERT has NEW, DELETE has OLD, UPDATE both), binding columns
+   * must exist on the trigger table, and body targets must exist, be keyless (v1 — the
+   * commit's unique-key channel belongs to the primary write), differ from the trigger
+   * table, and carry no triggers of their own: cascades are rejected, not silently skipped.
+   */
+  async #createTrigger(
+    tableName: string,
+    trigger: {
+      name: string;
+      event: "insert" | "update" | "delete";
+      statements: Array<{
+        sql: string;
+        bindings: Array<{ source: "new" | "old"; column: string }>;
+      }>;
+    },
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      const table = await this.#findTable(tableName);
+      const tables = await this.store.listTables();
+      for (const record of tables) {
+        if ((record.triggers ?? []).some((existing) => existing.name === trigger.name)) {
+          throw new TypeError(`Trigger already exists: ${trigger.name}`);
+        }
+      }
+      const columnNames = new Set(table.columns.map((column) => column.name));
+      for (const statement of trigger.statements) {
+        for (const binding of statement.bindings) {
+          if (trigger.event === "insert" && binding.source === "old") {
+            throw new TypeError("AFTER INSERT triggers have no OLD row");
+          }
+          if (trigger.event === "delete" && binding.source === "new") {
+            throw new TypeError("AFTER DELETE triggers have no NEW row");
+          }
+          if (!columnNames.has(binding.column)) {
+            throw new TypeError(`Unknown trigger column: ${binding.column}`);
+          }
+        }
+        const compiled = compileStatement(statement.sql);
+        if (compiled.kind !== "insert") {
+          throw new TypeError("Trigger bodies support INSERT ... VALUES statements");
+        }
+        const target = tables.find((record) => record.name === compiled.table);
+        if (target === undefined) throw new TypeError(`Table not found: ${compiled.table}`);
+        if (target.id === table.id) {
+          throw new TypeError("A trigger cannot write to its own table");
+        }
+        if (target.uniqueKeyColumnId !== undefined) {
+          throw new TypeError(`Trigger bodies insert into keyless tables only: ${compiled.table}`);
+        }
+        if ((target.triggers ?? []).length > 0) {
+          throw new TypeError(`Trigger cascades are not supported: ${compiled.table}`);
+        }
+      }
+      try {
+        await this.store.updateTable(table.id, table.revision ?? 0, {
+          triggers: [
+            ...(table.triggers ?? []),
+            { ...trigger, createdAt: this.#now().toISOString() },
+          ],
+        });
+        return;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  async #dropTrigger(name: string): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      const tables = await this.store.listTables();
+      const owner = tables.find((record) =>
+        (record.triggers ?? []).some((trigger) => trigger.name === name),
+      );
+      if (owner === undefined) throw new TypeError(`Trigger not found: ${name}`);
+      try {
+        await this.store.updateTable(owner.id, owner.revision ?? 0, {
+          triggers: (owner.triggers ?? []).filter((trigger) => trigger.name !== name),
+        });
+        return;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  /**
+   * Pre-images for UPDATE/DELETE trigger firing, keyed to the input order; fetched only when
+   * the table has matching triggers. OLD reflects the values observed at statement start
+   * (snapshot semantics), which is also exactly what the mutation replay supersedes.
+   */
+  async #triggerPreImages(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: ReadonlyArray<Exclude<BatchValue, null>>,
+    event: "update" | "delete",
+  ): Promise<Array<Record<string, BatchValue> | undefined>> {
+    if (!(table.triggers ?? []).some((trigger) => trigger.event === event)) return [];
+    const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+    const placeholders = keys.map(() => "?").join(", ");
+    const result = await this.query(
+      `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`,
+      { params: [...keys] as QueryValue[], memoize: false },
+    );
+    const byToken = new Map(
+      result.rows.map((row) => {
+        const key = row[keyColumn.name];
+        return [
+          key === null || key === undefined ? "" : keyToken(keyColumn.type, key),
+          row,
+        ] as const;
+      }),
+    );
+    return keys.map((key) => byToken.get(keyToken(keyColumn.type, key)));
+  }
+
+  /**
+   * Fires the table's AFTER triggers for one write: every body statement binds once per
+   * affected row (NEW/OLD values as positional parameters), the bound rows accumulate into
+   * one derived insert per statement, and each derived segment stages into the SAME
+   * transaction as the triggering write — the write and its derivations publish atomically,
+   * so a crashed tab loses both or neither and no tab can observe one without the other.
+   */
+  async #stageTriggerDerivedInserts(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    event: "insert" | "update" | "delete",
+    rowCount: number,
+    valueAt: (source: "new" | "old", column: string, rowIndex: number) => BatchValue,
+  ): Promise<void> {
+    const triggers = (table.triggers ?? []).filter((trigger) => trigger.event === event);
+    if (triggers.length === 0 || rowCount === 0) return;
+    for (const trigger of triggers) {
+      for (const statement of trigger.statements) {
+        const compiled = compileStatement(statement.sql);
+        if (compiled.kind !== "insert") continue;
+        const derivedRows: BatchValue[][] = [];
+        for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+          const params = statement.bindings.map((binding) =>
+            valueAt(binding.source, binding.column, rowIndex),
+          );
+          const bound = bindStatementParameters(compiled, params);
+          if (bound.kind !== "insert") continue;
+          for (const row of bound.rows) {
+            derivedRows.push(
+              row.map((value) =>
+                typeof value === "object" && value !== null && "parameter" in value ? null : value,
+              ),
+            );
+          }
+        }
+        const target = await this.#findTable(compiled.table);
+        if (target.uniqueKeyColumnId !== undefined) {
+          throw new TypeError(`Trigger bodies insert into keyless tables only: ${target.name}`);
+        }
+        const columns: Record<string, BatchValue[]> = {};
+        compiled.columns.forEach((name, columnIndex) => {
+          columns[name] = derivedRows.map((row) => row[columnIndex] ?? null);
+        });
+        const filled = fillColumnDefaults(
+          target,
+          toColumnarBatch({ columns }),
+          this.#now,
+          derivedRows.length,
+        );
+        validateBatch(target, filled.batch, filled.autoIncrement?.column.name);
+        if (filled.autoIncrement !== undefined && filled.autoIncrement.missingIndexes.length > 0) {
+          const values = await this.store.reserveAutoIncrement(
+            target.id,
+            filled.autoIncrement.column.id,
+            filled.autoIncrement.missingIndexes.length,
+            filled.autoIncrement.atLeast,
+          );
+          patchAutoIncrementValues(filled.batch, filled.autoIncrement, values);
+        }
+        await this.#stageDerivedInsert(transaction, target, filled.batch, derivedRows.length);
+      }
+    }
+  }
+
+  /** Encodes and stages one derived insert segment into an already-open transaction. */
+  async #stageDerivedInsert(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    batch: ColumnarBatch,
+    rowCount: number,
+  ): Promise<void> {
+    const rowIds = await this.store.reserveRowIds(table.id, rowCount);
+    const segmentId = this.#createId();
+    const columnBlockIds: Record<string, string[]> = {};
+    const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
+    for (const column of table.columns) {
+      const values = batch.columns[column.name] ?? [];
+      const blockIds: string[] = [];
+      for (let start = 0, part = 0; start < rowCount; start += this.#rowsPerBlock, part += 1) {
+        const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
+        const bytes = await encodeBlock(asColumnInput(column.type, slice), this.#compression);
+        const blockId = [
+          "table",
+          table.id,
+          "segment",
+          segmentId,
+          "column",
+          column.id,
+          "part",
+          String(part).padStart(6, "0"),
+        ].join("/");
+        blockWrites.push({ id: blockId, bytes });
+        blockIds.push(blockId);
+      }
+      columnBlockIds[column.id] = blockIds;
+    }
+    const segment: SegmentRecord = {
+      id: segmentId,
+      tableId: table.id,
+      transactionId: transaction.id,
+      rowCount,
+      rowIdStart: rowIds.start,
+      rowIdEndExclusive: rowIds.endExclusive,
+      columnBlockIds,
+      kind: "insert",
+      level: 0,
+      createdAt: this.#now().toISOString(),
+    };
+    await transaction.stageArtifacts(blockWrites, [segment]);
+  }
+
   #notifyLiveCommit(): void {
     for (const set of this.#liveSets) set.notifyLocalCommit();
   }
@@ -2604,6 +2878,14 @@ export class MinnowDatabase {
         ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
       });
       return { kind: "create-table", table: statement.table };
+    }
+    if (statement.kind === "create-trigger") {
+      await this.#createTrigger(statement.table, statement.trigger);
+      return { kind: "create-trigger", table: statement.table, name: statement.trigger.name };
+    }
+    if (statement.kind === "drop-trigger") {
+      await this.#dropTrigger(statement.name);
+      return { kind: "drop-trigger", name: statement.name };
     }
     // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
     if (statement.returning !== undefined && options.returning === undefined) {
