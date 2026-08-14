@@ -16,6 +16,7 @@
     "test:browser": "npm run build && playwright test",
     "test:library-browser": "tsc -b packages/core && playwright test --config playwright.library.config.ts",
     "test:site": "tsc -b packages/core && playwright test --config playwright.site.config.ts",
+    "capture": "tsc -b && playwright test --config apps/bench/capture/playwright.config.mjs",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",

@@ -1,0 +1,115 @@
+/**
+ * The capture itself. A persistent context with a real on-disk profile is non-negotiable:
+ * Playwright's default ephemeral context backs IndexedDB with memory, which benchmarks
+ * nothing. Progress is forwarded through an exposed binding, because in-page console.log
+ * is invisible and a stalled run must be distinguishable from a slow one.
+ */
+import { test, chromium, firefox } from "@playwright/test";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const BROWSERS = { chromium, firefox };
+const engineIds = ["minnow", "sqlite", "pglite"];
+const engines = (process.env.CAPTURE_ENGINES ?? engineIds.join(","))
+  .split(",")
+  .map((engine) => engine.trim())
+  .filter((engine) => engineIds.includes(engine));
+const scale = Number(process.env.CAPTURE_SCALE ?? 100);
+const outDir = path.resolve(repoRoot, process.env.CAPTURE_OUT ?? ".captures");
+
+// Playwright requires the destructuring pattern; this test drives its own persistent context.
+// eslint-disable-next-line no-empty-pattern
+test("capture engine comparison", async ({}, testInfo) => {
+  test.setTimeout(5_400_000);
+  const browserType = BROWSERS[testInfo.project.name];
+  const profileDir = mkdtempSync(path.join(os.tmpdir(), `minnow-bench-${testInfo.project.name}-`));
+  const context = await browserType.launchPersistentContext(profileDir, { headless: true });
+  try {
+    const page = context.pages()[0] ?? (await context.newPage());
+    page.on("console", (message) => {
+      console.log(`[page:${message.type()}]`, message.text().slice(0, 300));
+    });
+    page.on("pageerror", (error) => {
+      console.log("[pageerror]", String(error).slice(0, 500));
+    });
+    await page.exposeFunction("reportProgress", (line) => {
+      console.log(`[progress ${new Date().toISOString().slice(11, 19)}]`, line);
+    });
+    await page.goto("http://127.0.0.1:4176/");
+    const config = {
+      scale,
+      compression: "gzip",
+      targetBlockBytes: 1_048_576,
+      durability: "relaxed",
+      engines,
+    };
+    const started = Date.now();
+    const payload = await page.evaluate(async (config) => {
+      const { BenchWorker } = await import("/src/ui/worker-client.ts");
+      const worker = new BenchWorker();
+      let progressCount = 0;
+      let lastReported = 0;
+      const report = (stage) => (progress) => {
+        progressCount += 1;
+        if (progressCount <= 10 || Date.now() - lastReported > 5_000) {
+          lastReported = Date.now();
+          void window.reportProgress(
+            `${stage} ${progress.phase ?? ""} ${progress.message ?? ""} ${progress.completed}/${progress.total}`,
+          );
+        }
+      };
+      const dataset = await worker.request("datasetCreate", config, report("load"));
+      const suite = await worker.request(
+        "suiteReference",
+        { datasetId: dataset.id, engines: config.engines },
+        report("suite"),
+      );
+      return {
+        dataset,
+        suite,
+        progressCount,
+        browserMeta: {
+          userAgent: navigator.userAgent,
+          hardwareConcurrency: navigator.hardwareConcurrency,
+          crossOriginIsolated: globalThis.crossOriginIsolated === true,
+        },
+      };
+    }, config);
+    const bundle = {
+      kind: "engine-comparison",
+      capturedAt: new Date().toISOString(),
+      browser: {
+        project: testInfo.project.name,
+        version: context.browser()?.version() ?? "unknown",
+        userAgent: payload.browserMeta.userAgent,
+        hardwareConcurrency: payload.browserMeta.hardwareConcurrency,
+        crossOriginIsolated: payload.browserMeta.crossOriginIsolated,
+        storage: "persistent profile (disk-backed)",
+      },
+      wallClock: { totalMs: Date.now() - started },
+      progressCount: payload.progressCount,
+      config,
+      dataset: payload.dataset,
+      suite: payload.suite,
+      host: {
+        platform: os.platform(),
+        release: os.release(),
+        arch: os.arch(),
+        cpus: os.cpus().length,
+        model: os.cpus()[0]?.model ?? "unknown",
+      },
+    };
+    mkdirSync(outDir, { recursive: true });
+    const stamp = bundle.capturedAt.slice(0, 10);
+    const file = path.join(outDir, `${stamp}-engine-comparison-${testInfo.project.name}.json`);
+    writeFileSync(file, JSON.stringify(bundle, null, 1) + "\n");
+    console.log(
+      `[done:${testInfo.project.name}] passed=${payload.suite.passed} -> ${file} totals=${JSON.stringify(payload.suite.totalMsByEngine)}`,
+    );
+  } finally {
+    await context.close();
+  }
+});

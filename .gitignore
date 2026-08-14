@@ -6,3 +6,4 @@ test-results/
 *.tsbuildinfo
 .DS_Store
 apps/site/.astro/
+.captures/

@@ -225,8 +225,12 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
       </svg>
     </div>
     <div class="chart-card half">
-      <h3>On-disk size</h3>
-      <p class="chart-sub">Stored bytes for the same dataset.</p>
+      <h3>Stored size</h3>
+      <p class="chart-sub">
+        Each engine's own report of its stored bytes — Minnow's block ledger, SQLite's
+        <code>page_count × page_size</code>, PGlite's <code>pg_database_size</code>. The dataset
+        is deterministic, so these are identical across browsers by construction.
+      </p>
       <svg viewBox={`0 0 ${BAR_W} ${sizeBars.height}`} role="img" aria-label="Stored size by engine">
         {
           sizeBars.bars.map((bar) => (

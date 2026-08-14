@@ -50,6 +50,7 @@ export default tseslint.config(
     files: [
       "apps/bench/src/engines/**/*.ts",
       "apps/bench/vite.config.ts",
+      "apps/bench/capture/*.mjs",
       "apps/site/tests/serve-dist.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
       "scripts/perf-gate.mts",
