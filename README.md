@@ -278,12 +278,15 @@ floats over your page without blocking it, every change is described and confirm
 
 ## Performance
 
-Latest capture (2026-08-12) on a 956,160-row, 50-table commerce dataset, 15 oracle-verified queries
-against SQLite Wasm, DuckDB-Wasm, and PGlite in real browsers:
+Latest capture (2026-08-14) on a 9,561,600-row, 50-table commerce dataset, 15 oracle-verified
+queries against SQLite Wasm and PGlite in real browsers with disk-backed storage (persistent
+profiles — earlier captures ran on memory-backed ephemeral profiles):
 
-- **~516k rows/s** insert through the public batch API against IndexedDB (Chromium)
-- **~6× faster** than SQLite Wasm on repeated-execution medians in Chromium, **~31×** in Firefox
-- **~18.9 MB** stored for that dataset
+- **~7.7× faster** than SQLite Wasm on sum of query medians in Chromium (255 ms vs 1,950 ms),
+  **~38×** in Firefox; **7–22× faster** than PGlite
+- **~456 MB** stored for the dataset SQLite keeps in 830 MB and PGlite in 1,390 MB
+- **~37k rows/s** sustained bulk insert to disk-backed IndexedDB in Chromium — the one axis
+  where SQLite Wasm's plain B-tree file is faster
 
 Single-host, single-run methodology — treat as observations, not a leaderboard. Full records and
 raw JSON are in [`benchmarks/`](benchmarks/).
