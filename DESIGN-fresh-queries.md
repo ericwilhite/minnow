@@ -247,6 +247,30 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
 | 4     | Compaction block-size tuning                                                     | Scan-throughput-vs-block-size curve captured; chosen default recorded with the data |
 | 5     | Bench: duckdb-wasm engine + disclosures; re-capture; perf-gate re-baseline       | New capture JSONs published; benchmarks page regenerated with disclosure            |
 
+## Measured outcomes (updated as stages land)
+
+- **Stage 1 (landed):** catalog read flat vs unrelated segment count (200x segments -> 1.8x
+  read time, formerly linear); probe 0.06-0.24 ms in fake-indexeddb, 0.10 ms in Chromium.
+- **Stage 2 (landed):** streamed execution beats sqlite on every perf-gate query; group,
+  join, and top-n match the old fused-path numbers (5.6/5.9/2.2 ms at 200k rows) while every
+  statement returns provably fresh data. Perf gate re-baselined to fresh-execution semantics.
+- **Stage 3 (landed):** prepareQuery deleted; snapshot() scope in engine and worker client;
+  bufferPoolBytes replaces prepareCacheBytes.
+- **Stage 4 (landed):** scan throughput vs block size, 400k rows, streamed executor
+  (median ms; filter / group / like / top-n):
+
+  | rows per block | filter | group | like | top-n |
+  | -------------- | ------ | ----- | ---- | ----- |
+  | 2,048          | 11.36  | 8.35  | 8.61 | 5.18  |
+  | 8,192          | 11.18  | 7.18  | 7.62 | 3.50  |
+  | 16,384         | 9.99   | 6.71  | 7.83 | 3.17  |
+  | 65,536         | 9.88   | 6.54  | 7.98 | 3.11  |
+  | 262,144        | 9.83   | 6.37  | 7.25 | 3.07  |
+
+  Throughput is flat from ~16k rows per block. The write default stays 65,536 rows per
+  block and the compaction default stays 2 MiB target blocks — both on the plateau, with
+  moderate buffer-pool eviction granularity. Recorded beside the default in database.ts.
+
 ## Risks and open questions
 
 - **Executor regression risk is concentrated in stage 2.** Mitigation: the conformance oracle

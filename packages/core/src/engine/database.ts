@@ -654,6 +654,10 @@ export class MinnowDatabase {
     options: MinnowDatabaseOptions = {},
   ) {
     this.#compression = options.compression ?? "raw";
+    // The block is the streamed scan's row group and the buffer pool's residency unit.
+    // Measured curve (400k rows, streamed filter/group/like/top-n, 2026-08): throughput is
+    // flat from ~16k rows per block and 2k-row blocks cost up to 66% on top-n; 65,536 sits
+    // on the plateau while keeping eviction granularity moderate.
     this.#rowsPerBlock = options.rowsPerBlock ?? 65_536;
     if (!Number.isSafeInteger(this.#rowsPerBlock) || this.#rowsPerBlock <= 0) {
       throw new RangeError("Rows per block must be a positive whole number");
