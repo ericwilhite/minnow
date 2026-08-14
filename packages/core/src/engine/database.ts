@@ -1805,10 +1805,39 @@ export class MinnowDatabase {
 
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
-    return this.#queryCompiled(
-      bindPlanParameters(this.#compileCached(sql), options.params),
-      options,
-    );
+    const plan = bindPlanParameters(this.#compileCached(sql), options.params);
+    // Result memoization is a pure cache over the freshness probe: the catalog epoch is part
+    // of the key, so any commit or DDL changes the key and a hit can never be stale. Only
+    // plain current-version queries memoize — explicit versions, budgets, and spill options
+    // carry semantics of their own.
+    const probe = this.store.getCatalogProbe?.bind(this.store);
+    const memoizable =
+      options.version === undefined &&
+      options.executionMemoryBudgetBytes === undefined &&
+      options.spillToStorage === undefined &&
+      options.spillPageRows === undefined &&
+      probe !== undefined;
+    if (probe === undefined || !memoizable) return this.#queryCompiled(plan, options);
+    const key = `res ${sql}\u0001${JSON.stringify(options.params ?? [])}`;
+    const before = await probe();
+    const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
+      QueryResult | undefined;
+    if (cached !== undefined) return copyQueryResult(cached);
+    const result = await this.#queryCompiled(plan, options);
+    const bytes = queryResultRetainedBytes(result);
+    if (bytes <= RESULT_MEMO_MAX_BYTES) {
+      // Cache only when the epoch did not move during execution: the result is then exactly
+      // that epoch's answer. A moved epoch simply skips the cache — never mis-files.
+      const after = await probe();
+      if (after.catalogEpoch === before.catalogEpoch) {
+        this.#cachePut(
+          `${key}\u0001${String(before.catalogEpoch)}`,
+          copyQueryResult(result),
+          bytes,
+        );
+      }
+    }
+    return result;
   }
 
   /**
@@ -9354,6 +9383,27 @@ function columnVectorRetainedBytes(vector: ColumnVector): number {
 }
 
 /** Retained payload of a cached block result: column names plus estimated row values. */
+/** Modest per-entry cap so one giant result cannot thrash the buffer pool. */
+const RESULT_MEMO_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Defensive copy for memoized results: callers own their rows and may mutate them, so both
+ * the stored entry and every hit are fresh shallow row copies (values are primitives and
+ * Dates; a new Date guards against setTime-style mutation).
+ */
+function copyQueryResult(result: QueryResult): QueryResult {
+  return {
+    columns: [...result.columns],
+    rows: result.rows.map((row) => {
+      const copy: QueryRow = {};
+      for (const [name, value] of Object.entries(row)) {
+        copy[name] = value instanceof Date ? new Date(value.getTime()) : value;
+      }
+      return copy;
+    }),
+  };
+}
+
 function queryResultRetainedBytes(result: QueryResult): number {
   let bytes = 64;
   for (const column of result.columns) bytes += 16 + column.length * 2;

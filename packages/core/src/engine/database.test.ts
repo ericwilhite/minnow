@@ -7425,6 +7425,26 @@ describe("prepared-input cache and shared read lease", () => {
     expect(store.catalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
   });
 
+  it("memoizes results under the probe and stays fresh and unpoisonable", async () => {
+    const { store, database } = await seededStore();
+    const sql = "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region";
+    const first = await database.query(sql);
+    // Mutating a returned row must not poison later hits: every hit is a defensive copy.
+    (first.rows[0] as Record<string, unknown>).total = -999;
+    const second = await database.query(sql);
+    expect(second.rows[0]).toEqual({ region: "east", total: 14 });
+    // The memo hit serves without a fresh catalog read or lease acquisition.
+    const catalogReads = store.catalogStateCalls;
+    const leases = store.leaseCreates;
+    await database.query(sql);
+    expect(store.catalogStateCalls).toBe(catalogReads);
+    expect(store.leaseCreates).toBe(leases);
+    // A commit moves the epoch: the very next query recomputes, never serves the old entry.
+    await database.insertBatch("orders", { columns: { region: ["east"], amount: [100] } });
+    const fresh = await database.query(sql);
+    expect(fresh.rows[0]).toEqual({ region: "east", total: 114 });
+  });
+
   it("serves another instance's committed writes on the very next query", async () => {
     const store = new LeaseCountingStore();
     const writer = new MinnowDatabase(store, { rowsPerBlock: 4 });
