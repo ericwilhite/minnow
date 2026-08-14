@@ -325,11 +325,23 @@ The architecture-fit design, staged:
 
 ## Remaining follow-ups
 
-- **Streamed filter-scan tail** (~5.1 ms vs the old fused path's 1.4 ms on the gate; still
-  1.4x faster than sqlite): the streamed sink's eager per-row projection and the async batch
-  loop carry the residual. Deferred per-window projection over the stable cached block
-  vectors is the designed fix.
-- **Triggers** per the staged design above.
+Both prior follow-ups landed (2026-08-14, same day):
+
+- **Streamed filter-scan tail — closed.** Profiling showed the old 1.4 ms comparator was the
+  deleted fused-vector cache, whose honest replacement is the result memo (~0.2 ms and
+  provably fresh); the real remainder was per-row predicate dispatch. The no-join selection
+  kernel (filterScanBatch: unboxed primitive, dictionary-equality, and dictionary-LIKE loops
+  compacting a shared selection before any per-row work) took gate filter-scan from 5.7 to
+  2.5 ms — 3.1x faster than sqlite and ahead of in-memory DuckDB on that shape — with
+  like-scan 5.5 → 3.3 ms and grouped filters 4.6 → 1.7 ms. Window loads answer synchronously
+  when the batch is resident, and query() gained memoize: false so the gate measures the
+  executor, not the memo.
+- **Triggers — landed** per the staged design: CREATE TRIGGER ... AFTER
+  INSERT|UPDATE|DELETE with INSERT ... VALUES bodies over NEW/OLD, catalog-persisted
+  (epoch-visible cross-tab), fired inside the triggering commit so the write and its
+  derivations publish atomically. v1 bounds enforced loudly at CREATE: keyless body targets,
+  no cascades, no BEFORE/statement-level triggers — those are the v2 surface, alongside
+  UPDATE/DELETE bodies.
 
 ## Risks and open questions
 
