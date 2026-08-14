@@ -2,6 +2,7 @@ import type { DatabaseRow } from "./database.js";
 import type {
   AggregateName,
   BinaryOperator,
+  ComparisonOperator,
   CompiledQuery,
   PredicateOperator,
   Expression,
@@ -245,6 +246,16 @@ interface BoundPredicate {
   readonly dictionaryEquality?: DictionaryEquality;
   /** Dictionary-level LIKE against a literal pattern: one match pass per dictionary. */
   readonly dictionaryLike?: DictionaryLike;
+  /** Unboxed comparison of a bare numeric/datetime/boolean column against a literal. */
+  readonly primitive?: PrimitiveComparison;
+}
+
+interface PrimitiveComparison {
+  readonly source: number;
+  readonly vector: NumberVector | DateTimeVector | BooleanVector;
+  readonly operator: ComparisonOperator;
+  /** The literal as a float: numbers as-is, datetimes as epoch millis, booleans as 0/1. */
+  readonly value: number;
 }
 
 interface DictionaryEquality {
@@ -616,7 +627,9 @@ function bindPlan(
     const dictionaryEquality = detectDictionaryEquality(bound);
     if (dictionaryEquality !== undefined) return { ...bound, dictionaryEquality };
     const dictionaryLike = detectDictionaryLike(bound);
-    return dictionaryLike === undefined ? bound : { ...bound, dictionaryLike };
+    if (dictionaryLike !== undefined) return { ...bound, dictionaryLike };
+    const primitive = detectPrimitiveComparison(bound);
+    return primitive === undefined ? bound : { ...bound, primitive };
   });
   const having = plan.having.map((predicate) => ({
     left: bind(predicate.left),
@@ -2057,6 +2070,148 @@ function finishResult(
   return { columns, rows };
 }
 
+/** Source indexes a bound expression reads, for pre-join predicate placement. */
+function prefilterSources(expression: BoundExpression, into: Set<number>): boolean {
+  if (expression.kind === "column") {
+    into.add(expression.source);
+    return true;
+  }
+  // FTS and aggregate-bearing expressions stay at the final stage.
+  if (expression.kind === "fts") return false;
+  if (expression.kind === "call" && expression.aggregateIndex !== undefined) return false;
+  for (const child of boundChildren(expression)) {
+    if (!prefilterSources(child, into)) return false;
+  }
+  return true;
+}
+
+interface PrefilteredBatch {
+  /** Surviving original row indexes; only the first `survivors` entries are meaningful. */
+  readonly selection: Uint32Array;
+  readonly survivors: number;
+  /** True when every plan predicate was applied, so downstream re-checks can be skipped. */
+  readonly complete: boolean;
+}
+
+/** Compacts the selection in place to rows where the primitive comparison holds. */
+function filterPrimitive(
+  primitive: PrimitiveComparison,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number {
+  const vector = primitive.vector;
+  const values = vector.values;
+  const validity = vector.validity;
+  const windowStart = vector.window?.start ?? 0;
+  const slots = values.length;
+  const vectorLength = vector.length;
+  const rows = batch.rowsBySource[primitive.source];
+  const target = primitive.value;
+  // Any comparison operator is three independent outcomes: below, equal, above the target.
+  const operator = primitive.operator;
+  const passBelow = operator === "<" || operator === "<=" || operator === "!=" || operator === "<>";
+  const passEqual = operator === "=" || operator === "<=" || operator === ">=";
+  const passAbove = operator === ">" || operator === ">=" || operator === "!=" || operator === "<>";
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = selection[index] ?? 0;
+    const sourceRow = rows?.[row] ?? -1;
+    if (sourceRow < 0 || sourceRow >= vectorLength) continue;
+    const slot = sourceRow - windowStart;
+    if (slot < 0 || slot >= slots) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+    if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
+    const value = values[slot] ?? 0;
+    if (!(value < target ? passBelow : value > target ? passAbove : passEqual)) continue;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
+/**
+ * Predicates whose sources are all materialized before the given join filter the batch first,
+ * so the join and everything downstream never see rows the WHERE clause was going to discard.
+ * Filters are idempotent, so applying one early is pure savings; when every predicate applies
+ * here the result is marked complete and the final pass skips re-checking.
+ */
+function prefilterBatch(
+  plan: BoundPlan,
+  batch: BatchRows,
+  join: BoundJoin,
+): PrefilteredBatch | undefined {
+  let applicable: BoundPredicate[] | undefined;
+  for (const predicate of plan.predicates) {
+    const sources = new Set<number>();
+    if (!prefilterSources(predicate.left, sources) || !prefilterSources(predicate.right, sources)) {
+      continue;
+    }
+    let available = true;
+    for (let later = plan.joins.indexOf(join); later < plan.joins.length; later += 1) {
+      if (sources.has(plan.joins[later]?.buildSource ?? -1)) {
+        available = false;
+        break;
+      }
+    }
+    if (available) (applicable ??= []).push(predicate);
+  }
+  if (applicable === undefined) return undefined;
+  const complete = applicable.length === plan.predicates.length;
+  const selection = new Uint32Array(batch.length);
+  for (let row = 0; row < batch.length; row += 1) selection[row] = row;
+  let survivors = batch.length;
+  for (const predicate of applicable) {
+    if (survivors === 0) break;
+    const primitive = predicate.primitive;
+    if (primitive !== undefined) {
+      survivors = filterPrimitive(primitive, batch, selection, survivors);
+      continue;
+    }
+    let kept = 0;
+    for (let index = 0; index < survivors; index += 1) {
+      const row = selection[index] ?? 0;
+      if (!evaluateBatchPredicate(plan, predicate, batch, row)) continue;
+      selection[kept] = row;
+      kept += 1;
+    }
+    survivors = kept;
+  }
+  return { selection, survivors, complete };
+}
+
+/** Copies the surviving rows into a compact batch, for joins that cannot take a selection. */
+function materializeSelection(
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+  memory: QueryMemoryContext,
+): BatchRows {
+  const batchMemory = memory.createChild();
+  try {
+    batchMemory.reserve(
+      safeMemoryProduct(
+        safeMemoryProduct(batch.rowsBySource.length, survivors, "Prefiltered row-index count"),
+        Int32Array.BYTES_PER_ELEMENT,
+        "Prefiltered row indexes",
+      ),
+      "Prefiltered row indexes",
+    );
+    const rowsBySource = batch.rowsBySource.map((inputRows) => {
+      const outputRows = new Int32Array(survivors);
+      for (let output = 0; output < survivors; output += 1) {
+        outputRows[output] = inputRows[selection[output] ?? 0] ?? -1;
+      }
+      return outputRows;
+    });
+    return { length: survivors, rowsBySource, memory: batchMemory };
+  } catch (error) {
+    batchMemory.close();
+    throw error;
+  }
+}
+
 function consumeJoinedBatches(
   plan: BoundPlan,
   batch: BatchRows,
@@ -2064,20 +2219,43 @@ function consumeJoinedBatches(
   groups: GroupAccumulator,
   output: ResultSink,
   memory: QueryMemoryContext,
+  prefiltered = false,
 ): boolean {
   const join = plan.joins[joinIndex];
   if (join === undefined) {
-    consumeBatch(plan, batch, groups, output, memory);
+    consumeBatch(plan, batch, groups, output, memory, prefiltered);
     return reachedEarlyLimit(plan, output.size);
   }
-  for (const joined of joinBatches(plan, batch, join, memory)) {
-    try {
-      if (consumeJoinedBatches(plan, joined, joinIndex + 1, groups, output, memory)) return true;
-    } finally {
-      joined.memory?.close();
+  let working = batch;
+  let complete = prefiltered;
+  let owned: QueryMemoryContext | undefined;
+  if (joinIndex === 0 && !prefiltered) {
+    const filtered = prefilterBatch(plan, batch, join);
+    if (filtered !== undefined) {
+      complete = filtered.complete;
+      if (filtered.survivors === 0) return false;
+      if (filtered.survivors < batch.length) {
+        // Compacting up front measured faster than threading the selection into the join:
+        // the probe loop stays dense and the all-match shortcut skips the second copy.
+        working = materializeSelection(batch, filtered.selection, filtered.survivors, memory);
+        owned = working.memory;
+      }
     }
   }
-  return false;
+  try {
+    for (const joined of joinBatches(plan, working, join, memory)) {
+      try {
+        if (consumeJoinedBatches(plan, joined, joinIndex + 1, groups, output, memory, complete)) {
+          return true;
+        }
+      } finally {
+        joined.memory?.close();
+      }
+    }
+    return false;
+  } finally {
+    owned?.close();
+  }
 }
 
 function reachedEarlyLimit(plan: BoundPlan, outputRows: number): boolean {
@@ -2452,6 +2630,38 @@ class ResultSink {
   /** Rows accepted so far; only meaningful for the unbounded early-limit check. */
   get size(): number {
     return this.#capacity === undefined ? this.#rows.length : 0;
+  }
+
+  /**
+   * The bounded-order batch loop: with an unboxed first key and an established cut line, a
+   * whole batch scans in one pass and strictly-worse rows die on a single float comparison.
+   * Returns false when the sink shape needs the per-row path.
+   */
+  tryAddBatch(batch: BatchRows): boolean {
+    const fast = this.#fastFirstKey;
+    if (this.#capacity === undefined || !this.#deferred || fast === undefined) return false;
+    const rows = batch.rowsBySource[fast.source];
+    const vector = fast.vector;
+    const values = vector.values;
+    const validity = vector.validity;
+    const desc = fast.desc;
+    for (let row = 0; row < batch.length; row += 1) {
+      const threshold = this.#thresholdFirst;
+      if (threshold === undefined || threshold === null) {
+        this.#addDeferred(batch, row);
+        continue;
+      }
+      const sourceRow = rows?.[row] ?? -1;
+      if (sourceRow >= 0 && sourceRow < vector.length && isValid(validity, sourceRow)) {
+        const value = values[sourceRow] ?? 0;
+        if ((desc ? threshold - value : value - threshold) > 0) {
+          this.#seq += 1;
+          continue;
+        }
+      }
+      this.#addDeferred(batch, row);
+    }
+    return true;
   }
 
   add(batch: BatchRows, row: number): void {
@@ -2845,27 +3055,66 @@ class GroupAccumulator {
     const groupVector = codeGrouping?.vector;
     const states = this.#codeStates;
     const nullCode = groupVector?.dictionary.length ?? 0;
-    const aggregates = plan.aggregates;
     const globalState = globalGroup
       ? required(this.#index.getEmpty(), "Grouped query state is missing")
       : undefined;
+    // Hoisted per-column reads: the row loop touches only local typed arrays and numbers.
+    const columns: Array<{
+      readonly index: number;
+      readonly sums: boolean;
+      readonly rows: Int32Array | undefined;
+      readonly values: Float64Array;
+      readonly validity: Uint8Array;
+      readonly windowStart: number;
+      readonly length: number;
+      readonly slots: number;
+    }> = [];
+    let stars = 0;
+    for (let index = 0; index < specs.length; index += 1) {
+      const spec = specs[index];
+      if (spec === undefined || spec.kind === "star") {
+        stars += 1;
+        continue;
+      }
+      const raw = plan.aggregates[index]?.rawNumber;
+      if (raw === undefined) return false;
+      columns.push({
+        index,
+        sums: spec.sums,
+        rows: batch.rowsBySource[raw.source],
+        values: raw.vector.values,
+        validity: raw.vector.validity,
+        windowStart: raw.vector.window?.start ?? 0,
+        length: raw.vector.length,
+        slots: raw.vector.values.length,
+      });
+    }
+    const grouping =
+      groupVector === undefined
+        ? undefined
+        : {
+            codes: groupVector.codes,
+            validity: groupVector.validity,
+            length: groupVector.length,
+            dictionary: groupVector.dictionary,
+          };
     for (let row = 0; row < batch.length; row += 1) {
       if (hasPredicates && !passes(row)) continue;
       let state = globalState;
-      if (state === undefined && groupVector !== undefined && states !== undefined) {
+      if (state === undefined && grouping !== undefined && states !== undefined) {
         const sourceRow = groupRows?.[row] ?? -1;
         let code = nullCode;
         if (
           sourceRow >= 0 &&
-          sourceRow < groupVector.length &&
-          isValid(groupVector.validity, sourceRow)
+          sourceRow < grouping.length &&
+          isValid(grouping.validity, sourceRow)
         ) {
-          const rawCode = groupVector.codes[sourceRow] ?? NULL_STRING_CODE;
+          const rawCode = grouping.codes[sourceRow] ?? NULL_STRING_CODE;
           if (rawCode !== NULL_STRING_CODE) code = rawCode;
         }
         state = states[code];
         if (state === undefined) {
-          const value = code === nullCode ? null : (groupVector.dictionary[code] ?? null);
+          const value = code === nullCode ? null : (grouping.dictionary[code] ?? null);
           state = createGroupState([value], plan, this.#memory);
           states[code] = state;
           this.#ordered?.push(state);
@@ -2873,20 +3122,23 @@ class GroupAccumulator {
       }
       if (state === undefined) return false;
       const counts = state.counts;
-      const sums = state.sums;
-      for (let index = 0; index < specs.length; index += 1) {
-        const spec = specs[index];
-        if (spec === undefined) continue;
-        if (spec.kind === "star") {
-          counts[index] = (counts[index] ?? 0) + 1;
-          continue;
+      if (stars > 0) {
+        for (let index = 0; index < specs.length; index += 1) {
+          if (specs[index]?.kind === "star") counts[index] = (counts[index] ?? 0) + 1;
         }
-        const raw = aggregates[index]?.rawNumber;
-        if (raw === undefined) continue;
-        const value = rawFloat64Value(raw.vector, batch.rowsBySource[raw.source]?.[row] ?? -1);
-        if (value === null) continue;
-        counts[index] = (counts[index] ?? 0) + 1;
-        if (spec.sums) sums[index] = (sums[index] ?? 0) + value;
+      }
+      for (const column of columns) {
+        const sourceRow = column.rows?.[row] ?? -1;
+        if (sourceRow < 0 || sourceRow >= column.length) continue;
+        const slot = sourceRow - column.windowStart;
+        if (slot < 0 || slot >= column.slots) {
+          throw new RangeError("Streamed vector row is outside the resident window");
+        }
+        if (!isValid(column.validity, slot)) continue;
+        counts[column.index] = (counts[column.index] ?? 0) + 1;
+        if (column.sums) {
+          state.sums[column.index] = (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
+        }
       }
     }
     return true;
@@ -3003,19 +3255,18 @@ function consumeBatch(
   groups: GroupAccumulator,
   output: ResultSink,
   memory: QueryMemoryContext,
+  prefiltered = false,
 ): void {
+  const checkPredicates = plan.predicates.length > 0 && !prefiltered;
   if (
     plan.grouped &&
-    groups.consumeFast(
-      batch,
-      (row) => passesPredicates(plan, batch, row),
-      plan.predicates.length > 0,
-    )
+    groups.consumeFast(batch, (row) => passesPredicates(plan, batch, row), checkPredicates)
   ) {
     return;
   }
+  if (!plan.grouped && !checkPredicates && output.tryAddBatch(batch)) return;
   for (let row = 0; row < batch.length; row += 1) {
-    if (!passesPredicates(plan, batch, row)) continue;
+    if (checkPredicates && !passesPredicates(plan, batch, row)) continue;
     if (plan.grouped) {
       updateAggregates(plan, groups.stateFor(batch, row), batch, row, memory);
     } else {
@@ -3337,6 +3588,85 @@ function detectDictionaryEquality(predicate: BoundPredicate): DictionaryEquality
   return undefined;
 }
 
+const primitiveOperators: ReadonlySet<string> = new Set(["=", "!=", "<>", ">", ">=", "<", "<="]);
+
+/** Detects `column <op> literal` over numeric/datetime/boolean columns for unboxed evaluation. */
+function detectPrimitiveComparison(predicate: BoundPredicate): PrimitiveComparison | undefined {
+  if (!primitiveOperators.has(predicate.operator)) return undefined;
+  const comparison = predicate.operator as ComparisonOperator;
+  const sides = [
+    { column: predicate.left, literal: predicate.right, operator: comparison },
+    {
+      column: predicate.right,
+      literal: predicate.left,
+      operator: reverseComparisonOperator(comparison),
+    },
+  ];
+  for (const { column, literal, operator } of sides) {
+    if (column.kind !== "column" || literal.kind !== "literal") continue;
+    const vector = column.vector;
+    const value = literal.value;
+    if (vector.kind === "number" && typeof value === "number") {
+      return { source: column.source, vector, operator, value };
+    }
+    if (vector.kind === "datetime" && value instanceof Date) {
+      return { source: column.source, vector, operator, value: value.getTime() };
+    }
+    if (
+      vector.kind === "boolean" &&
+      typeof value === "boolean" &&
+      (operator === "=" || operator === "!=" || operator === "<>")
+    ) {
+      return { source: column.source, vector, operator, value: value ? 1 : 0 };
+    }
+  }
+  return undefined;
+}
+
+function reverseComparisonOperator(operator: ComparisonOperator): ComparisonOperator {
+  if (operator === ">") return "<";
+  if (operator === ">=") return "<=";
+  if (operator === "<") return ">";
+  if (operator === "<=") return ">=";
+  return operator;
+}
+
+/** Reads a numeric/datetime/boolean slot as an unboxed float, or null when invalid. */
+function rawPrimitiveValue(
+  vector: NumberVector | DateTimeVector | BooleanVector,
+  rowIndex: number,
+): number | null {
+  if (rowIndex < 0 || rowIndex >= vector.length) return null;
+  const window = vector.window;
+  let slot = rowIndex;
+  if (window !== undefined) {
+    slot = rowIndex - window.start;
+    if (slot < 0 || slot >= window.length) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+  }
+  if (!isValid(vector.validity, slot)) return null;
+  return vector.values[slot] ?? 0;
+}
+
+function primitiveComparisonHolds(primitive: PrimitiveComparison, value: number): boolean {
+  switch (primitive.operator) {
+    case "=":
+      return value === primitive.value;
+    case "!=":
+    case "<>":
+      return value !== primitive.value;
+    case ">":
+      return value > primitive.value;
+    case ">=":
+      return value >= primitive.value;
+    case "<":
+      return value < primitive.value;
+    default:
+      return value <= primitive.value;
+  }
+}
+
 /** Detects `stringColumn LIKE 'literal'` (and NOT/ILIKE) for dictionary-level matching. */
 function detectDictionaryLike(predicate: BoundPredicate): DictionaryLike | undefined {
   const operator = predicate.operator;
@@ -3578,6 +3908,14 @@ function evaluateBatchPredicate(
     }
     const matches = fast.cache.code >= 0 && code === fast.cache.code;
     return fast.negated ? !matches : matches;
+  }
+  const primitive = predicate.primitive;
+  if (primitive !== undefined) {
+    const value = rawPrimitiveValue(
+      primitive.vector,
+      batch.rowsBySource[primitive.source]?.[row] ?? -1,
+    );
+    return value === null ? false : primitiveComparisonHolds(primitive, value);
   }
   const like = predicate.dictionaryLike;
   if (like !== undefined) {
