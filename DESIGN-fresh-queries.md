@@ -271,6 +271,15 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
   block and the compaction default stays 2 MiB target blocks — both on the plateau, with
   moderate buffer-pool eviction granularity. Recorded beside the default in database.ts.
 
+- **Stage 5 (landed):** DuckDB (wasm) joined the browser engine comparison as an
+  in-memory executor reference with the disclosure generated from the capture metadata;
+  sqlite/pglite use genuine prepared statements. Scale-100 re-capture (9.56M rows,
+  15 queries, all four engines checksum-verified, both browsers passed): suite totals
+  Chromium — Minnow 434 ms, SQLite 2,118 ms, PGlite 1,894 ms, DuckDB (in-memory) 167 ms;
+  Firefox — Minnow 606 ms, SQLite 12,712 ms, PGlite 7,169 ms, DuckDB (in-memory) 1,355 ms.
+  Minnow's median prepare is now ~0.3 ms (compile only), versus 28–158 ms materializing
+  prepares before this design.
+
 ## Risks and open questions
 
 - **Executor regression risk is concentrated in stage 2.** Mitigation: the conformance oracle
