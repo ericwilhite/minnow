@@ -7425,6 +7425,52 @@ describe("prepared-input cache and shared read lease", () => {
     expect(store.catalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
   });
 
+  it("reports buffer pool stats and schedules read-triggered compaction", async () => {
+    const store = new LeaseCountingStore();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 4 });
+    await database.createTable({
+      name: "fragmented",
+      columns: [{ name: "value", type: "number" }],
+    });
+    // 50 one-row commits: far past the 48-segment threshold a streamed scan reacts to.
+    for (let index = 0; index < 50; index += 1) {
+      await database.insertBatch("fragmented", { columns: { value: [index] } });
+    }
+    const before = (await database.listVisibleSegments("fragmented")).length;
+    expect(before).toBe(50);
+    await database.query("SELECT SUM(value) AS total FROM fragmented");
+    const stats = database.bufferPoolStats();
+    expect(stats.limitBytes).toBe(64 * 1024 * 1024);
+    expect(stats.usedBytes).toBeGreaterThan(0);
+    expect(stats.usedBytes).toBeLessThanOrEqual(stats.limitBytes);
+    expect(stats.hits + stats.misses).toBeGreaterThan(0);
+    // The scan scheduled one fire-and-forget compaction step; poll briefly for its commit.
+    let after = before;
+    for (let attempt = 0; attempt < 200 && after >= before; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      after = (await database.listVisibleSegments("fragmented")).length;
+    }
+    expect(after).toBeLessThan(before);
+    // Results stay exact across the background rewrite.
+    expect((await database.query("SELECT SUM(value) AS total FROM fragmented")).rows).toEqual([
+      { total: 1225 },
+    ]);
+
+    // Opting out leaves fragmentation untouched.
+    const optOutStore = new LeaseCountingStore();
+    const optOut = new MinnowDatabase(optOutStore, { rowsPerBlock: 4, autoCompact: false });
+    await optOut.createTable({
+      name: "fragmented",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let index = 0; index < 50; index += 1) {
+      await optOut.insertBatch("fragmented", { columns: { value: [index] } });
+    }
+    await optOut.query("SELECT SUM(value) AS total FROM fragmented");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await optOut.listVisibleSegments("fragmented")).length).toBe(50);
+  });
+
   it("memoizes results under the probe and stays fresh and unpoisonable", async () => {
     const { store, database } = await seededStore();
     const sql = "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region";

@@ -172,6 +172,8 @@ const INTERNAL_READ_LEASE_TTL_MS = 60_000;
 const CATALOG_STATE_CACHE_LIMIT = 64;
 /** Blocks fetched per round trip when a streamed scan window needs more data. */
 const STREAMED_SCAN_LOOKAHEAD_BLOCKS = 8;
+/** Visible segments per table at which a streamed scan schedules a compaction step. */
+const AUTO_COMPACT_SCAN_SEGMENTS = 48;
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
 const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
@@ -311,6 +313,16 @@ export interface SnapshotSession {
   /** The pinned manifest version; null only on a database with no commits yet. */
   readonly version: number | null;
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
+}
+
+/** Lifetime buffer pool counters; see MinnowDatabase.bufferPoolStats(). */
+export interface BufferPoolStats {
+  limitBytes: number;
+  usedBytes: number;
+  entries: number;
+  hits: number;
+  misses: number;
+  evictions: number;
 }
 
 export interface QueryOptions {
@@ -522,6 +534,13 @@ export interface MinnowDatabaseOptions {
    * Defaults to 4096.
    */
   ftsAutoIndexRows?: number;
+  /**
+   * Read-triggered compaction: when a streamed scan observes a table fragmented past
+   * 48 visible segments, one incremental compaction step is scheduled fire-and-forget —
+   * the same self-maintenance pattern as the full-text auto index. Correctness never waits
+   * on it; repeated scans advance further steps. false disables.
+   */
+  autoCompact?: boolean;
 }
 
 export interface QuerySpillCleanupOptions {
@@ -620,11 +639,17 @@ export class MinnowDatabase {
   #internalLeaseSequence = 0;
   readonly #prepareCacheLimitBytes: number;
   readonly #ftsAutoIndexRows: number;
+  readonly #autoCompact: boolean;
   /** One background build attempt per (table, column) per session; misses just stay scans. */
   readonly #ftsBuildsInFlight = new Set<string>();
   /** Insertion order doubles as LRU order; hits re-insert their entry. */
   readonly #prepareCache = new Map<string, { payload: unknown; bytes: number }>();
   #prepareCacheUsedBytes = 0;
+  #bufferPoolHits = 0;
+  #bufferPoolMisses = 0;
+  #bufferPoolEvictions = 0;
+  /** Tables with a fire-and-forget compaction step already running. */
+  readonly #autoCompactionsInFlight = new Set<string>();
   /**
    * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
    * optimization — subquery resolution and CTE expansion clone before rewriting and join
@@ -677,6 +702,7 @@ export class MinnowDatabase {
       throw new RangeError("Prepare cache bytes must be a non-negative whole number");
     }
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
+    this.#autoCompact = options.autoCompact ?? true;
     if (!Number.isSafeInteger(this.#ftsAutoIndexRows) || this.#ftsAutoIndexRows < 0) {
       throw new RangeError(
         "Full-text auto-index row threshold must be a non-negative whole number",
@@ -2077,6 +2103,23 @@ export class MinnowDatabase {
     return false;
   }
 
+  /**
+   * Read-triggered self-maintenance: a streamed scan that observes heavy fragmentation
+   * schedules one incremental compaction step in the background, exactly like the full-text
+   * auto index — fire-and-forget, never awaited by the read, one per table at a time.
+   */
+  #maybeScheduleAutoCompaction(table: TableRecord, visibleSegmentCount: number): void {
+    if (!this.#autoCompact) return;
+    if (visibleSegmentCount < AUTO_COMPACT_SCAN_SEGMENTS) return;
+    if (this.#autoCompactionsInFlight.has(table.id)) return;
+    this.#autoCompactionsInFlight.add(table.id);
+    void this.compactTableStep(table.name, { maxBlocks: 4 })
+      .catch(() => undefined)
+      .finally(() => {
+        this.#autoCompactionsInFlight.delete(table.id);
+      });
+  }
+
   #notifyLiveCommit(): void {
     for (const set of this.#liveSets) set.notifyLocalCommit();
   }
@@ -2880,9 +2923,15 @@ export class MinnowDatabase {
       if (planContainsFts(plan, "bm25") && ftsStats === undefined) return undefined;
       // The streamed scan honors the same index pruning as the materialized path; a budgeted
       // MATCH query must not silently pay the full scan just because it streams.
+      const visibleBaseSegments = await this.#visibleSegmentRecords(
+        freshBaseTable,
+        snapshot,
+        visibility,
+      );
+      this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments.length);
       const baseSegments = await this.#ftsPrunedSegments(
         freshBaseTable,
-        await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility),
+        visibleBaseSegments,
         plan,
         snapshot,
       );
@@ -6392,10 +6441,30 @@ export class MinnowDatabase {
   #cacheGet(key: string): unknown {
     if (this.#prepareCacheLimitBytes === 0) return undefined;
     const entry = this.#prepareCache.get(key);
-    if (entry === undefined) return undefined;
+    if (entry === undefined) {
+      this.#bufferPoolMisses += 1;
+      return undefined;
+    }
+    this.#bufferPoolHits += 1;
     this.#prepareCache.delete(key);
     this.#prepareCache.set(key, entry);
     return entry.payload;
+  }
+
+  /**
+   * Buffer pool observability: byte budget and residency plus lifetime hit/miss/eviction
+   * counters across every entry family (decoded blocks, block vectors, zone descriptions,
+   * derived results, memoized results). Use it to size bufferPoolBytes from real workloads.
+   */
+  bufferPoolStats(): BufferPoolStats {
+    return {
+      limitBytes: this.#prepareCacheLimitBytes,
+      usedBytes: this.#prepareCacheUsedBytes,
+      entries: this.#prepareCache.size,
+      hits: this.#bufferPoolHits,
+      misses: this.#bufferPoolMisses,
+      evictions: this.#bufferPoolEvictions,
+    };
   }
 
   /**
@@ -6417,6 +6486,7 @@ export class MinnowDatabase {
       if (oldestKey === key) continue;
       this.#prepareCache.delete(oldestKey);
       this.#prepareCacheUsedBytes -= entry.bytes;
+      this.#bufferPoolEvictions += 1;
     }
   }
 

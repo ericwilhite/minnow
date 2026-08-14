@@ -19,6 +19,7 @@ import {
 import { toColumnarBatch, type BatchRow, type InsertBatchInput } from "./batch.js";
 import type {
   BatchValue,
+  BufferPoolStats,
   BufferedFlushResult,
   BufferedWriterOptions,
   CancelCompactionJobResult,
@@ -331,6 +332,11 @@ export class MinnowDatabaseClient {
     } finally {
       await this._invoke(opened.handleId, "close", []);
     }
+  }
+
+  /** The worker-side buffer pool's byte budget, residency, and lifetime counters. */
+  async bufferPoolStats(): Promise<BufferPoolStats> {
+    return (await this.#call("bufferPoolStats", [])) as BufferPoolStats;
   }
 
   liveQueries(options: ClientLiveQueryOptions = {}): ClientLiveQuerySet {

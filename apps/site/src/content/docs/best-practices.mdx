@@ -115,8 +115,11 @@ back.
 
 ## Schedule maintenance in idle time
 
-Compaction and garbage collection advance in small, durable steps and survive a tab closing
-mid-job. Run them when the app is quiet:
+Compaction largely schedules itself: a scan that observes a heavily fragmented table (48+
+visible segments) kicks off one incremental compaction step in the background, the same way
+full-text indexes build themselves. Set `autoCompact: false` to opt out. Garbage collection —
+and compaction beyond the automatic nudge — still advance in small, durable steps that survive
+a tab closing mid-job; run them when the app is quiet:
 
 ```ts
 requestIdleCallback(async () => {

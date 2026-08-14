@@ -121,6 +121,7 @@ class DatabaseRpcServer {
       case "collectGarbage":
       case "collectGarbageStep":
       case "resumeGarbageCollectionJob":
+      case "bufferPoolStats":
       case "listGarbageCollectionJobs":
         return database[method]?.(...args);
       case "migrate": {
