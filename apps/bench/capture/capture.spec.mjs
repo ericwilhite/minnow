@@ -104,7 +104,11 @@ test("capture engine comparison", async ({}, testInfo) => {
     };
     mkdirSync(outDir, { recursive: true });
     const stamp = bundle.capturedAt.slice(0, 10);
-    const file = path.join(outDir, `${stamp}-engine-comparison-${testInfo.project.name}.json`);
+    // The scale is part of the identity: captures at different scales publish side by side.
+    const file = path.join(
+      outDir,
+      `${stamp}-engine-comparison-scale${scale}-${testInfo.project.name}.json`,
+    );
     writeFileSync(file, JSON.stringify(bundle, null, 1) + "\n");
     console.log(
       `[done:${testInfo.project.name}] passed=${payload.suite.passed} -> ${file} totals=${JSON.stringify(payload.suite.totalMsByEngine)}`,

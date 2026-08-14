@@ -9,24 +9,42 @@ const resultModules = import.meta.glob<{ default: BenchResults }>(
   "../data/benchmarks/*engine-comparison*.json",
   { eager: true },
 );
-const byBrowser = new Map<string, { path: string; results: BenchResults }>();
-for (const [path, module] of Object.entries(resultModules)) {
+// Captures key on (scale, browser): different scales publish side by side, and within a
+// key the newest capturedAt wins.
+const byPane = new Map<string, BenchResults>();
+for (const module of Object.values(resultModules)) {
   const results = module.default;
-  const current = byBrowser.get(results.browser.project);
-  if (current === undefined || results.capturedAt > current.results.capturedAt) {
-    byBrowser.set(results.browser.project, { path, results });
+  const key = `${String(results.config.scale)}-${results.browser.project}`;
+  const current = byPane.get(key);
+  if (current === undefined || results.capturedAt > current.capturedAt) {
+    byPane.set(key, results);
   }
 }
-const panes = [...byBrowser.values()].map(({ results }) => ({
-  results,
-  project: results.browser.project,
-  label: results.browser.project.charAt(0).toUpperCase() + results.browser.project.slice(1),
-}));
+// Smallest scale first: the realistic dataset is the headline, larger scales stay a click away.
+const scales = [...new Set([...byPane.values()].map((results) => results.config.scale))].sort(
+  (left, right) => left - right,
+);
+const panes = [...byPane.values()]
+  .map((results) => ({
+    results,
+    scale: results.config.scale,
+    project: results.browser.project,
+    label: results.browser.project.charAt(0).toUpperCase() + results.browser.project.slice(1),
+  }))
+  .sort((left, right) => left.scale - right.scale || left.project.localeCompare(right.project));
+const projects = [...new Set(panes.map((pane) => pane.project))].sort();
 const first = panes[0]?.results;
 if (first === undefined) throw new Error("No engine-comparison results found");
 const capturedDate = first.capturedAt.slice(0, 10);
 const tableCount = Object.keys(first.dataset.tableRows).length;
 const engineMeta = Object.entries(first.dataset.engines);
+const scaleStats = scales.map((scale) => {
+  const results = panes.find((pane) => pane.scale === scale)?.results;
+  if (results === undefined) throw new Error("Missing scale pane");
+  return { scale, totalRows: results.dataset.totalRows };
+});
+const fmtRows = (rows: number): string =>
+  rows >= 1_000_000 ? `${(rows / 1_000_000).toFixed(1)}M` : `${(rows / 1000).toFixed(0)}k`;
 // Engines whose materialization records an in-memory (non-disk) store; the disclosure below
 // is generated from this metadata so the page and the capture record cannot disagree.
 const memoryEngines = engineMeta.filter(([, meta]) => meta.persistence.includes("in-memory"));
@@ -47,64 +65,88 @@ const engineLabels: Record<string, string> = {
       <h1>Benchmarks</h1>
       <p class="lede">
         {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} loading and
-        querying the same {first.dataset.totalRows.toLocaleString("en-US")}-row commerce dataset
-        in real browsers. Every query result is checksum-verified identical across all engines
-        before any timing counts.
+        querying identical commerce datasets ({scaleStats
+          .map((entry) => `${fmtRows(entry.totalRows)} rows`)
+          .join(" and ")}) in real browsers. Every query result is checksum-verified identical
+        across all engines before any timing counts.
       </p>
     </header>
 
-    <div class="stats" role="list">
-      <div class="stat" role="listitem">
-        <div class="stat-value">
-          {
-            first.dataset.totalRows >= 1_000_000
-              ? `${(first.dataset.totalRows / 1_000_000).toFixed(1)}M`
-              : `${(first.dataset.totalRows / 1000).toFixed(0)}k`
-          }
+    {
+      scaleStats.map((entry) => (
+        <div class={`stats scale-stats scale-stats-${String(entry.scale)}`} role="list">
+          <div class="stat" role="listitem">
+            <div class="stat-value">{fmtRows(entry.totalRows)}</div>
+            <div class="stat-label">rows across {tableCount} tables</div>
+          </div>
+          <div class="stat" role="listitem">
+            <div class="stat-value">{first.suite.queries.length}</div>
+            <div class="stat-label">reference queries, point lookups to cohort analyses</div>
+          </div>
+          <div class="stat" role="listitem">
+            <div class="stat-value">{first.suite.sampleCount}</div>
+            <div class="stat-label">samples per query; medians reported</div>
+          </div>
+          <div class="stat" role="listitem">
+            <div class="stat-value">{projects.length}</div>
+            <div class="stat-label">browsers, captured {capturedDate}</div>
+          </div>
         </div>
-        <div class="stat-label">rows across {tableCount} tables</div>
-      </div>
-      <div class="stat" role="listitem">
-        <div class="stat-value">{first.suite.queries.length}</div>
-        <div class="stat-label">reference queries, point lookups to cohort analyses</div>
-      </div>
-      <div class="stat" role="listitem">
-        <div class="stat-value">{first.suite.sampleCount}</div>
-        <div class="stat-label">samples per query; medians reported</div>
-      </div>
-      <div class="stat" role="listitem">
-        <div class="stat-value">{panes.length}</div>
-        <div class="stat-label">browsers, captured {capturedDate}</div>
-      </div>
-    </div>
+      ))
+    }
+
+    {
+      scales.length > 1 && (
+        <div class="browser-toggle scale-toggle" role="tablist" aria-label="Dataset scale">
+          {scales.map((scale, i) => (
+            <>
+              <input
+                type="radio"
+                name="bench-scale"
+                id={`scale-${String(scale)}`}
+                checked={i === 0}
+              />
+              <label for={`scale-${String(scale)}`} role="tab">
+                {fmtRows(scaleStats.find((entry) => entry.scale === scale)?.totalRows ?? 0)} rows
+              </label>
+            </>
+          ))}
+        </div>
+      )
+    }
 
     <div class="browser-toggle" role="tablist" aria-label="Browser">
       {
-        panes.map((pane, i) => (
+        projects.map((project, i) => (
           <>
-            <input
-              type="radio"
-              name="bench-browser"
-              id={`toggle-${pane.project}`}
-              checked={i === 0}
-            />
-            <label for={`toggle-${pane.project}`} role="tab">
-              {pane.label} {pane.results.browser.version.split(".")[0]}
+            <input type="radio" name="bench-browser" id={`toggle-${project}`} checked={i === 0} />
+            <label for={`toggle-${project}`} role="tab">
+              {project.charAt(0).toUpperCase() + project.slice(1)}{" "}
+              {panes.find((pane) => pane.project === project)?.results.browser.version.split(
+                ".",
+              )[0] ?? ""}
             </label>
           </>
         ))
       }
     </div>
 
-    {panes.map((pane) => <BenchBrowser results={pane.results} paneId={`pane-${pane.project}`} />)}
+    {
+      panes.map((pane) => (
+        <BenchBrowser
+          results={pane.results}
+          paneId={`pane-${String(pane.scale)}-${pane.project}`}
+        />
+      ))
+    }
 
     <section class="methodology prose">
       <h2>Methodology</h2>
       <ul>
         <li>
-          Every engine runs in the same page, loading an identical scale-{first.config.scale}
-          dataset ({first.dataset.totalRows.toLocaleString("en-US")} rows,
-          {tableCount} tables) with the same SQL.
+          Every engine runs in the same page, loading identical datasets ({scaleStats
+            .map((entry) => `scale ${String(entry.scale)}: ${entry.totalRows.toLocaleString("en-US")} rows`)
+            .join("; ")}; {tableCount} tables) with the same SQL.
         </li>
         <li>
           Each query runs {first.suite.sampleCount} samples after one prepare step (each
@@ -301,14 +343,29 @@ const engineLabels: Record<string, string> = {
 </style>
 
 <style is:global>
-  /* Radio-driven pane switching: hide every pane, show the checked browser's. */
+  /* Radio-driven pane switching: hide every pane, show the checked (scale, browser) one.
+     Selectors enumerate the published matrix; a new scale adds one line per browser. */
   .bench section.bench-pane {
     display: none;
   }
 
-  .bench:has(#toggle-chromium:checked) #pane-chromium,
-  .bench:has(#toggle-firefox:checked) #pane-firefox,
-  .bench:has(#toggle-webkit:checked) #pane-webkit {
+  .bench .scale-stats {
+    display: none;
+  }
+
+  .bench:not(:has(input[name="bench-scale"])) .scale-stats,
+  .bench:has(#scale-25:checked) .scale-stats-25,
+  .bench:has(#scale-100:checked) .scale-stats-100 {
+    display: grid;
+  }
+
+  .bench:not(:has(input[name="bench-scale"])):has(#toggle-chromium:checked)
+    section[id$="-chromium"],
+  .bench:not(:has(input[name="bench-scale"])):has(#toggle-firefox:checked) section[id$="-firefox"],
+  .bench:has(#scale-25:checked):has(#toggle-chromium:checked) #pane-25-chromium,
+  .bench:has(#scale-25:checked):has(#toggle-firefox:checked) #pane-25-firefox,
+  .bench:has(#scale-100:checked):has(#toggle-chromium:checked) #pane-100-chromium,
+  .bench:has(#scale-100:checked):has(#toggle-firefox:checked) #pane-100-firefox {
     display: grid;
   }
 
