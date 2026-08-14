@@ -1,0 +1,102 @@
+---
+/**
+ * The floating-devtools demo: a real worker-hosted database loaded with the generated commerce
+ * dataset, with the devtools mounted in launcher mode — the exact setup an app would ship.
+ * Nothing starts until the button is pressed; the worker, the data, and the panel all cost
+ * nothing on page load.
+ */
+---
+
+<div class="devtools-demo" data-devtools-demo>
+  <button class="demo-launch" type="button" data-demo-launch>Launch the floating devtools</button>
+  <p class="demo-status" data-demo-status>
+    Starts a web worker in this page, loads a generated 165,808-row commerce dataset into it, and
+    mounts the devtools launcher over the docs. Nothing is saved.
+  </p>
+</div>
+
+<style>
+  .devtools-demo {
+    margin: 1.5rem 0 2rem;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-secondary);
+  }
+
+  .demo-launch {
+    font: inherit;
+    font-weight: 600;
+    padding: 0.55rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .demo-launch:hover:not(:disabled) {
+    border-color: var(--text-faint);
+  }
+
+  .demo-launch:disabled {
+    cursor: default;
+    opacity: 0.7;
+  }
+
+  .demo-status {
+    margin: 0.6rem 0 0;
+    font-size: 0.8rem;
+    color: var(--text-faint);
+  }
+</style>
+
+<script>
+  const root = document.querySelector<HTMLElement>("[data-devtools-demo]");
+  const button = root?.querySelector<HTMLButtonElement>("[data-demo-launch]");
+  const status = root?.querySelector<HTMLElement>("[data-demo-status]");
+
+  async function launch(button: HTMLButtonElement, status: HTMLElement): Promise<void> {
+    button.disabled = true;
+    button.textContent = "Starting the worker…";
+    try {
+      const [{ MinnowDatabaseClient }, { loadCommerceDataset, commerceQuery, COMMERCE_TOTAL_ROWS }, { mountMinnowDevtools }] =
+        await Promise.all([
+          import("@minnowdb/core/client"),
+          import("../lib/commerce.ts"),
+          import("@minnowdb/devtools"),
+        ]);
+      const client = new MinnowDatabaseClient(
+        new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
+        { store: { kind: "memory" } },
+      );
+      await client.ready();
+      button.textContent = "Loading the commerce dataset…";
+      await loadCommerceDataset(client, ({ table, loadedRows, totalRows }) => {
+        status.textContent = `Loading ${table} — ${loadedRows.toLocaleString()} of ${totalRows.toLocaleString()} rows, in the worker.`;
+      });
+      const devtools = mountMinnowDevtools(client, {
+        corner: "bottom-right",
+        defaultOpen: true,
+        initialQuery: commerceQuery,
+        storageKey: "minnow-docs-devtools-demo",
+      });
+      devtools.open();
+      button.textContent = "Devtools running — Cmd/Ctrl + Shift + D toggles";
+      status.textContent = `${COMMERCE_TOTAL_ROWS.toLocaleString()} rows across 5 tables, served from a web worker — the title bar badge says so. Browse order_items to watch keyset paging, or run the opening query: a four-table join.`;
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Launch the floating devtools";
+      status.textContent = `The demo could not start: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+    }
+  }
+
+  if (button !== null && button !== undefined && status !== null && status !== undefined) {
+    // Not `once`: a failed start re-enables the button, so the listener has to survive it.
+    button.addEventListener("click", () => {
+      if (!button.disabled) void launch(button, status);
+    });
+  }
+</script>

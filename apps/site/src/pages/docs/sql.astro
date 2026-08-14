@@ -35,8 +35,8 @@ const themes = { light: "github-light", dark: "github-dark" } as const;
     (<code>@minnowdb/core/sql-feature-matrix.json</code>). The engine's conformance suite reports
     drift against this file, so this page and the engine cannot silently disagree. Beyond the
     matrix, a differential harness executes a generated query corpus through the engine's two
-    executors and through SQLite as an oracle on every test run — where the surfaces overlap, the
-    results must agree.
+    executors and through three independent oracles — native SQLite, PGlite, and DuckDB — on
+    every test run; where the surfaces overlap, the results must agree.
   </p>
   <p>
     <strong>{supported.length}</strong> of <strong>{features.length}</strong> cataloged SQL

@@ -10,6 +10,19 @@ description: An embeddable SQL console for your database — a floating panel in
   floats over your page without blocking it, and every change asks first.
 </p>
 
+## Try it on this page
+
+The launcher below is the real thing, in its production shape: a database running in a web worker
+(the same [worker client](/docs/workers/) an app ships), loaded with a generated five-table
+commerce dataset — 165,808 rows of regions, customers, products, orders, and order items. The
+panel floats over these docs exactly as it would float over your app, and the title-bar badge
+reads **worker** because the queries genuinely leave the page. For the same panel rendered inline
+against a small in-memory database, see the [playground](/docs/playground/).
+
+import DevtoolsDemo from "../../components/DevtoolsDemo.astro";
+
+<DevtoolsDemo />
+
 ## Install
 
 ```bash
@@ -98,8 +111,10 @@ For text, **`contains` is the one you usually want** — it adds the wildcards, 
 only the string `crea`, and you need `%crea%` to search inside a value. The value box hints which
 one you are in.
 
-Both are case-sensitive, and `_` and `%` inside a `contains` value stay live as wildcards — the
-engine's `LIKE` has no escape character, so there is nothing to switch them off with.
+Both are case-sensitive. A `contains` or `starts with` value is treated as literal text — `_` and
+`%` typed into it are escaped, so searching for `100%` finds `100%` and nothing else. In `like`
+they stay live as wildcards, because there you are writing the pattern yourself (with
+`ESCAPE '\'` available when you need a literal one).
 
 **Paging.** Rows load as you scroll. Where it can, the explorer asks for "the rows after the last
 one I saw" rather than "skip the first N", so reading deep into a table costs the same as reading
@@ -194,8 +209,8 @@ line. This costs nothing per keystroke: `compileStatement` is part of the librar
 page, so nothing is sent to the worker and no query is executed to find out that the SQL is wrong.
 
 Where the failure names a capability the engine records as unsupported, the message says which one
-and what stands in for it — "Expected VALUES, found SELECT" also explains that `INSERT` takes a
-`VALUES` list and cannot read from a query. That comes from the shipped
+and what stands in for it — "Expected SELECT, found BEGIN" also explains that transactions are
+scoped through the API rather than opened in SQL. That comes from the shipped
 [feature matrix](/docs/sql/), so it stays true as the engine changes. A message that several
 features share explains nothing rather than guessing between them.
 

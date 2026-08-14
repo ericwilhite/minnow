@@ -43,7 +43,7 @@ describe("substring filters", () => {
   it("wraps a contains value in wildcards", () => {
     expect(
       renderFilters("events", [filter({ column: "kind", operator: "contains", values: ["crea"] })]),
-    ).toBe("(events.kind LIKE '%crea%')");
+    ).toBe("(events.kind LIKE '%crea%' ESCAPE '\\')");
   });
 
   it("anchors starts with to the front only", () => {
@@ -51,7 +51,20 @@ describe("substring filters", () => {
       renderFilters("events", [
         filter({ column: "kind", operator: "starts with", values: ["crea"] }),
       ]),
-    ).toBe("(events.kind LIKE 'crea%')");
+    ).toBe("(events.kind LIKE 'crea%' ESCAPE '\\')");
+  });
+
+  // The typed value is a literal string, not a pattern: wildcards and the escape character
+  // itself are neutralised, so `100%` matches `100%` and not `1000`.
+  it("escapes wildcards typed into the value", () => {
+    expect(
+      renderFilters("events", [filter({ column: "kind", operator: "contains", values: ["100%"] })]),
+    ).toBe("(events.kind LIKE '%100\\%%' ESCAPE '\\')");
+    expect(
+      renderFilters("events", [
+        filter({ column: "kind", operator: "starts with", values: ["a_b\\c"] }),
+      ]),
+    ).toBe("(events.kind LIKE 'a\\_b\\\\c%' ESCAPE '\\')");
   });
 
   it("leaves a hand-written pattern exactly as typed", () => {
@@ -66,7 +79,7 @@ describe("substring filters", () => {
   it("still escapes quotes in the value it wraps", () => {
     expect(
       renderFilters("events", [filter({ column: "kind", operator: "contains", values: ["O'Ha"] })]),
-    ).toBe("(events.kind LIKE '%O''Ha%')");
+    ).toBe("(events.kind LIKE '%O''Ha%' ESCAPE '\\')");
   });
 
   it("reads plainly on the chip", () => {

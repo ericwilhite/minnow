@@ -244,13 +244,18 @@ on `MinnowDatabaseClient` too.
 
 > Writes get the same treatment — `insertInto` / `updateTable` / `deleteFrom` with `returning`,
 > in [Writes & transactions](/docs/writes/). The full supported-SQL list is the
-> [feature matrix](/docs/sql/), which now covers the surface a query builder emits end to end:
+> [feature matrix](/docs/sql/), which covers the surface a query builder emits end to end:
 > parameters everywhere including LIMIT/OFFSET, quoted identifiers, FROM-less SELECT, CAST, the
 > standard scalar/window/aggregate function core with FILTER and DISTINCT, set operations with
 > ALL, upserts including partial DO UPDATE, and correlated subqueries (equality-correlated, in
 > WHERE conjuncts, the select list, and ORDER BY — they decorrelate into joins at compile time).
+> The SQL:2016 grammar rounds it out: `FETCH FIRST … ROWS ONLY` and `OFFSET … ROWS`,
+> `BETWEEN SYMMETRIC`, `LIKE … ESCAPE`, quantified comparisons (`> ANY`, `= SOME`, `> ALL`),
+> `VALUES` as a standalone statement or table source, `GROUPING SETS` / `ROLLUP` / `CUBE`,
+> `INSERT … SELECT`, and `WITH` on mutations, all with `RETURNING`.
 > Known limits: correlated NOT IN and non-equality correlation are rejected explicitly, ORDER BY
 > must name a selected column, output alias, or ordinal, and the default NULL ordering matches
 > SQLite (NULLs first ascending, last descending) with `NULLS FIRST`/`NULLS LAST` to override.
 > FULL JOIN desugars into a union of two left joins, so it must be the sole join with an equality
-> ON condition.
+> ON condition. The [deliberate omissions](/docs/sql/#deliberate-omissions) — things that make no
+> sense in a browser worker — are documented with reasons.

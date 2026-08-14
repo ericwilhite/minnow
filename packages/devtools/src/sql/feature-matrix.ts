@@ -12,8 +12,8 @@ export interface UnsupportedFeature {
 }
 
 /**
- * Matches a failure against the features the engine records as unsupported, so "Expected VALUES,
- * found SELECT" can also say which capability it ran into and what stands in for it.
+ * Matches a failure against the features the engine records as unsupported, so "Expected SELECT,
+ * found BEGIN" can also say which capability it ran into and what stands in for it.
  *
  * Only fragments recorded against exactly one feature are used. `Expected SELECT` covers both DDL
  * and transactions — and is what a perfectly supported `DELETE` reports when run through the

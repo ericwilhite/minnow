@@ -102,6 +102,13 @@ export class IndexedDbBlockStore implements BlockStore {
   readonly #db: IDBDatabase;
   readonly #durability: IDBTransactionDurability;
   /**
+   * Memoized folded-base key tokens for the most recently written keyed table, mirroring
+   * #manifestCache's validity rule: usable only while the next commit's expected manifest
+   * version matches, so any commit from another instance or tab invalidates it. Bulk loads
+   * hit this on every batch — it replaces one getKey request per row with a Set lookup.
+   */
+  #uniqueKeyCache: { version: number; tableId: string; baseTokens: Set<string> } | undefined;
+  /**
    * The most recently resolved manifest block set, advanced in place as this instance commits.
    * Purely a memoization of immutable records: a miss (fresh instance, or another tab moved the
    * version) re-resolves from storage inside the committing transaction.
@@ -1078,6 +1085,14 @@ export class IndexedDbBlockStore implements BlockStore {
 
     const uniqueKeyChanges = input.uniqueKeyChanges;
     let chunkState: Awaited<ReturnType<typeof readChunkedUniqueKeys>> | undefined;
+    const keyCache = this.#uniqueKeyCache;
+    const cachedBaseTokens =
+      uniqueKeyChanges !== undefined &&
+      keyCache?.tableId === uniqueKeyChanges.tableId &&
+      keyCache.version === input.expectedManifestVersion
+        ? keyCache.baseTokens
+        : undefined;
+    let nextBaseTokens: Set<string> | undefined;
     if (uniqueKeyChanges !== undefined) {
       const storedKeys =
         uniqueKeyChanges.storageMode === "chunks-v1"
@@ -1085,6 +1100,7 @@ export class IndexedDbBlockStore implements BlockStore {
               catalog,
               uniqueKeyChanges.tableId,
               uniqueKeyChanges.keyTokens,
+              cachedBaseTokens,
             )),
             uniqueKeyChanges.keyTokens.map((token) =>
               chunkState?.existing.has(token) === true ? token : undefined,
@@ -1169,12 +1185,21 @@ export class IndexedDbBlockStore implements BlockStore {
             // Fold the tail plus this commit's changes into per-key base records, atomically
             // with the manifest publication. Chunks replay in commit order so later removals
             // and re-adds land on the final state.
+            const knownBase = cachedBaseTokens ?? chunkState?.resolvedBase;
+            nextBaseTokens =
+              knownBase !== undefined
+                ? new Set(knownBase)
+                : index.hasBase
+                  ? undefined
+                  : new Set<string>();
             for (const tail of [...(chunkState?.chunks ?? []), chunk]) {
               for (const token of tail.addedTokens) {
                 catalog.put(manifest.version, uniqueKeyBaseKey(tableId, token));
+                nextBaseTokens?.add(token);
               }
               for (const token of tail.removedTokens) {
                 catalog.delete(uniqueKeyBaseKey(tableId, token));
+                nextBaseTokens?.delete(token);
               }
             }
             for (const version of index.versions) {
@@ -1234,6 +1259,26 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     transactionStore.put(committed, committed.id);
     await transactionDone(transaction);
+    // The unique-key cache follows the same rule as the manifest cache below: advance it only
+    // after the durable commit. Commits from this instance cannot silently change another
+    // table's folded base, so a cache for a different table just moves to the new version;
+    // an unfolded commit for the cached table carries the unchanged base forward.
+    if (uniqueKeyChanges?.storageMode === "chunks-v1") {
+      const carried = nextBaseTokens ?? cachedBaseTokens ?? chunkState?.resolvedBase;
+      if (carried !== undefined) {
+        this.#uniqueKeyCache = {
+          version: manifest.version,
+          tableId: uniqueKeyChanges.tableId,
+          baseTokens: carried,
+        };
+      } else if (this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId) {
+        this.#uniqueKeyCache = undefined;
+      } else if (this.#uniqueKeyCache !== undefined) {
+        this.#uniqueKeyCache = { ...this.#uniqueKeyCache, version: manifest.version };
+      }
+    } else if (this.#uniqueKeyCache !== undefined) {
+      this.#uniqueKeyCache = { ...this.#uniqueKeyCache, version: manifest.version };
+    }
     // Advance the resolved-set cache only after the durable commit succeeded. A checkpoint
     // commit already built the new set; a delta commit with a resolved base applies the delta
     // in place (the cache owns that set from here on).
@@ -2630,20 +2675,38 @@ function asUniqueKeyChunkIndex(value: unknown): UniqueKeyChunkIndex {
   return { versions: [], hasBase: false };
 }
 
+/**
+ * Above this many tokens, probing the folded base per token costs more than one cursor pass
+ * over it; below, point lookups win. Bulk loads sit far above, keyed point writes far below.
+ */
+const UNIQUE_KEY_BASE_SCAN_THRESHOLD = 2_048;
+
 async function readChunkedUniqueKeys(
   store: IDBObjectStore,
   tableId: string,
   requestedTokens: readonly string[],
-): Promise<{ existing: Set<string>; index: UniqueKeyChunkIndex; chunks: UniqueKeyChunk[] }> {
+  cachedBase?: ReadonlySet<string>,
+): Promise<{
+  existing: Set<string>;
+  index: UniqueKeyChunkIndex;
+  chunks: UniqueKeyChunk[];
+  /** The complete folded-base token set, when this read materialized one via bulk scan. */
+  resolvedBase?: Set<string>;
+}> {
   const rawIndex: unknown = await requestResult(store.get(uniqueKeyChunkIndexKey(tableId)));
   const index = asUniqueKeyChunkIndex(rawIndex);
-  const [chunkValues, baseKeys] = await Promise.all([
+  const useCache = index.hasBase && cachedBase !== undefined;
+  const scanBase =
+    index.hasBase && !useCache && requestedTokens.length >= UNIQUE_KEY_BASE_SCAN_THRESHOLD;
+  const probeBase = index.hasBase && !useCache && !scanBase;
+  const [chunkValues, scannedBase, baseKeys] = await Promise.all([
     Promise.all(
       index.versions.map((version) =>
         requestResult<unknown>(store.get(uniqueKeyChunkKey(tableId, version))),
       ),
     ),
-    index.hasBase
+    scanBase ? scanUniqueKeyBaseTokens(store, tableId) : Promise.resolve(undefined),
+    probeBase
       ? Promise.all(
           requestedTokens.map((token) =>
             requestResult(store.getKey(uniqueKeyBaseKey(tableId, token))),
@@ -2651,11 +2714,18 @@ async function readChunkedUniqueKeys(
         )
       : Promise.resolve([]),
   ]);
+  const base = useCache ? cachedBase : scannedBase;
   const requested = new Set(requestedTokens);
   const existing = new Set<string>();
-  requestedTokens.forEach((token, position) => {
-    if (baseKeys[position] !== undefined) existing.add(token);
-  });
+  if (base !== undefined) {
+    for (const token of requestedTokens) {
+      if (base.has(token)) existing.add(token);
+    }
+  } else {
+    requestedTokens.forEach((token, position) => {
+      if (baseKeys[position] !== undefined) existing.add(token);
+    });
+  }
   const chunks = chunkValues.map(asUniqueKeyChunk);
   for (const chunk of chunks) {
     for (const token of chunk.addedTokens) {
@@ -2663,7 +2733,57 @@ async function readChunkedUniqueKeys(
     }
     for (const token of chunk.removedTokens) existing.delete(token);
   }
-  return { existing, index, chunks };
+  return {
+    existing,
+    index,
+    chunks,
+    ...(scannedBase === undefined ? {} : { resolvedBase: scannedBase }),
+  };
+}
+
+/**
+ * One key-cursor pass over a table's folded base records. Seeks with cursor.continue(key)
+ * rather than IDBKeyRange, which the injected test factory lacks; a seek that lands past the
+ * range (or throws because the cursor is already beyond it) means the walk is complete.
+ */
+function scanUniqueKeyBaseTokens(store: IDBObjectStore, tableId: string): Promise<Set<string>> {
+  return new Promise((resolve, reject) => {
+    const tokens = new Set<string>();
+    const rangeStart: IDBValidKey = [UNIQUE_KEY_BASE, tableId, ""];
+    const request = store.openKeyCursor();
+    let seeked = false;
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor === null) {
+        resolve(tokens);
+        return;
+      }
+      const key = cursor.key;
+      if (
+        Array.isArray(key) &&
+        key[0] === UNIQUE_KEY_BASE &&
+        key[1] === tableId &&
+        typeof key[2] === "string"
+      ) {
+        tokens.add(key[2]);
+        cursor.continue();
+        return;
+      }
+      if (!seeked) {
+        seeked = true;
+        try {
+          cursor.continue(rangeStart);
+        } catch {
+          // The first visited key already sorts at or past the range start: nothing to walk.
+          resolve(tokens);
+        }
+        return;
+      }
+      // Keys arrive in order, so the first non-matching key after the seek ends the range.
+      resolve(tokens);
+    };
+  });
 }
 
 function asUniqueKeyChunk(value: unknown): UniqueKeyChunk {

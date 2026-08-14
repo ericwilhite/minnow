@@ -83,6 +83,11 @@ export function isComplete(filter: Filter): boolean {
   return filter.values.length === arity;
 }
 
+/** Neutralises LIKE wildcards in a typed value, so `contains` searches for exactly what was typed. */
+function escapeLikeValue(value: QueryValue | undefined): string {
+  return String(value ?? "").replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
 function renderFilter(table: string, filter: Filter): string {
   const column = sqlColumn(table, filter.column);
   const literal = (index: number): string => sqlLiteral(filter.values[index] ?? null, filter.type);
@@ -94,12 +99,12 @@ function renderFilter(table: string, filter: Filter): string {
       return `${column} IS NOT NULL`;
     case "like":
       return `${column} LIKE ${literal(0)}`;
-    // The wildcards are added here rather than typed. `_` and `%` inside the value stay live —
-    // the engine's LIKE has no escape character, so there is nothing to neutralise them with.
+    // The wildcards are added here rather than typed; `_`, `%`, and the escape character itself
+    // inside the typed value are escaped, so `100%` finds the literal string and nothing else.
     case "contains":
-      return `${column} LIKE ${sqlLiteral(`%${String(filter.values[0] ?? "")}%`, "string")}`;
+      return `${column} LIKE ${sqlLiteral(`%${escapeLikeValue(filter.values[0])}%`, "string")} ESCAPE '\\'`;
     case "starts with":
-      return `${column} LIKE ${sqlLiteral(`${String(filter.values[0] ?? "")}%`, "string")}`;
+      return `${column} LIKE ${sqlLiteral(`${escapeLikeValue(filter.values[0])}%`, "string")} ESCAPE '\\'`;
     case "in":
       return `${column} IN (${filter.values
         .map((value) => sqlLiteral(value, filter.type))

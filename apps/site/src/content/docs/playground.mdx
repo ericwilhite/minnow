@@ -53,11 +53,11 @@ UPDATE orders SET status = 'paid' WHERE order_id = 3
 Then open the **Data** tab: pick `orders` from the rail, sort by clicking a header, add a filter,
 and double-click a cell to edit it. Every change asks first.
 
-Try something the engine does not support and the editor will underline it as you type, and say
-what stands in for it:
+Try something the engine deliberately does not support and the editor will underline it as you
+type, and say what stands in for it:
 
 ```sql
-INSERT INTO customers (name) SELECT name FROM customers
+BEGIN TRANSACTION
 ```
 
 ## Embedding one
@@ -75,4 +75,5 @@ mountMinnowDevtools(database, {
 });
 ```
 
-The same panel floats over your own app in `launcher` mode — see [Devtools](/docs/devtools/).
+The same panel floats over your own app in `launcher` mode — the [Devtools](/docs/devtools/) page
+has a live one, backed by a web worker and a 165,808-row commerce dataset.
