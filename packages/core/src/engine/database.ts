@@ -170,6 +170,10 @@ const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 const INTERNAL_READ_LEASE_TTL_MS = 60_000;
 /** Distinct table-name sets whose catalog state stays resident; entries are tiny (records only). */
 const CATALOG_STATE_CACHE_LIMIT = 64;
+/** Blocks fetched per round trip when a streamed scan window needs more data. */
+const STREAMED_SCAN_LOOKAHEAD_BLOCKS = 8;
+/** Modeled retained bytes for one cached block description (header metadata, no payload). */
+const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
 const PLAN_CACHE_LIMIT = 512;
 
@@ -2041,8 +2045,8 @@ export class MinnowDatabase {
     // projection, so every execution-path note reports against the inner block.
     const reported = transparentProjectionSource(plan)?.inner ?? plan;
     const notes: string[] = [];
-    if (this.#canStreamPlanShape(reported, { executionMemoryBudgetBytes: 1 })) {
-      notes.push("eligible to stream the base scan through resident block windows under a budget");
+    if (this.#canStreamPlanShape(reported, {})) {
+      notes.push("streams the base scan through resident block windows");
     } else {
       notes.push("materializes inputs at preparation");
     }
@@ -2616,13 +2620,14 @@ export class MinnowDatabase {
    * spill paths, consumes scan rows batch-forward and copies values out, so a sliding resident
    * window can back the scan source while join build sides stay fully materialized. A self-join
    * is excluded because the base table would also be probed as a build side at arbitrary rows.
-   * Streaming exists to honor an explicit budget; an unbudgeted or spill-disabled query keeps the
-   * materialized path.
+   * Streaming is the default execution: scan cost stays proportional to blocks actually read
+   * through the buffer pool instead of a whole-table materialization per prepared snapshot.
+   * The one excluded option combination is an explicit budget with spill disabled, where the
+   * materialized path owns the memory-budget error contract.
    */
   #canStreamPlanShape(plan: CompiledQuery, options: QueryOptions): boolean {
     return (
-      options.executionMemoryBudgetBytes !== undefined &&
-      options.spillToStorage !== false &&
+      (options.executionMemoryBudgetBytes === undefined || options.spillToStorage !== false) &&
       plan.base.table !== DUAL_TABLE &&
       plan.base.derived === undefined &&
       plan.base.union === undefined &&
@@ -2647,7 +2652,60 @@ export class MinnowDatabase {
   ): Promise<QueryResult | undefined> {
     const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
     const uniqueTableNames = [...new Set(tableNames)];
+    if (options.version === undefined) {
+      // The common path shares the probe-gated catalog state and the shared reader lease
+      // with every other statement at the current version.
+      return this.#withSharedCatalogSnapshot(uniqueTableNames, (snapshot, realTables, visibility) =>
+        this.#queryStreamedAtSnapshot(
+          plan,
+          options,
+          spillPageRows,
+          snapshot,
+          [...realTables.values()],
+          visibility,
+        ),
+      );
+    }
+    // Explicit time travel keeps the per-call lease and version-anchored reads.
     const tables = await Promise.all(uniqueTableNames.map((name) => this.#findTable(name)));
+    return this.#withLeasedSnapshot(options.version, async (snapshot) => {
+      const tableIds = new Set(tables.map((table) => table.id));
+      const only = tables.length === 1 ? tables[0] : undefined;
+      const segmentRecords =
+        only !== undefined
+          ? await this.store.listSegments(only.id)
+          : await this.store.listSegments();
+      const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
+      const segmentsByTable = new Map<string, SegmentRecord[]>();
+      for (const segment of segmentRecords) {
+        if (!tableIds.has(segment.tableId)) continue;
+        const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
+        tableSegments.push(segment);
+        segmentsByTable.set(segment.tableId, tableSegments);
+      }
+      const visibility: SegmentVisibilityCatalog = {
+        transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
+        segmentsByTable,
+      };
+      return this.#queryStreamedAtSnapshot(
+        plan,
+        options,
+        spillPageRows,
+        snapshot,
+        tables,
+        visibility,
+      );
+    });
+  }
+
+  async #queryStreamedAtSnapshot(
+    plan: CompiledQuery,
+    options: QueryOptions,
+    spillPageRows: number | undefined,
+    snapshot: LeasedSnapshot,
+    tables: readonly TableRecord[],
+    visibility: SegmentVisibilityCatalog,
+  ): Promise<QueryResult | undefined> {
     // Copy-on-write: expansion clones only full-text plans, leaving the compile cache's copy
     // untouched.
     plan = expandFtsColumns(plan, (tableName) =>
@@ -2662,24 +2720,7 @@ export class MinnowDatabase {
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
     const projectedBaseColumns =
       requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
-    return this.#withLeasedSnapshot(options.version, async (snapshot) => {
-      const tableIds = new Set(tables.map((table) => table.id));
-      const segmentRecords =
-        tables.length === 1
-          ? await this.store.listSegments(baseTable.id)
-          : await this.store.listSegments();
-      const transactionRecords = await this.#transactionRecordsForSegments(segmentRecords);
-      const segmentsByTable = new Map<string, SegmentRecord[]>();
-      for (const segment of segmentRecords) {
-        if (!tableIds.has(segment.tableId)) continue;
-        const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
-        tableSegments.push(segment);
-        segmentsByTable.set(segment.tableId, tableSegments);
-      }
-      const visibility: SegmentVisibilityCatalog = {
-        transactions: new Map(transactionRecords.map((record) => [record.id, record] as const)),
-        segmentsByTable,
-      };
+    {
       // The fts invalidation flip commits atomically with its segments, so a record fetched
       // after the segment reads above cannot claim "ready" for data those segments miss.
       const freshBaseTable = planContainsFts(plan)
@@ -2708,11 +2749,21 @@ export class MinnowDatabase {
         plan,
         snapshot,
       );
-      const baseView = this.#streamedViewFactory(
-        baseTable,
+      // Zone-map elimination composes after index pruning: whole row groups whose statistics
+      // reject the plan's predicates never stream at all.
+      const zonePruned = await this.#zonePrunedStreamSegments(
+        plan,
+        freshBaseTable,
         projectedBaseColumns,
         baseSegments,
         snapshot,
+      );
+      const baseView = this.#streamedViewFactory(
+        baseTable,
+        projectedBaseColumns,
+        zonePruned?.segments ?? baseSegments,
+        snapshot,
+        zonePruned?.storedBlocks,
       );
       if (baseView === undefined) return undefined;
 
@@ -2804,6 +2855,11 @@ export class MinnowDatabase {
           else prepared.close();
         }
       };
+      // Without a budget or an explicit spill request there is nothing to spill for: the
+      // scan streams in windows and retained state grows unbounded exactly like the
+      // materialized path would.
+      const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
+      if (!spill) return runStreamedExecution({ spill: false });
       // Retained state is usually far smaller than the scan: a limited ORDER BY keeps only its
       // top rows and a grouped plan keeps one state per distinct group. Try the in-memory
       // execution before committing to a spill of every scanned row; only a genuine budget
@@ -2816,7 +2872,7 @@ export class MinnowDatabase {
         if (bounded !== undefined) return bounded;
       }
       return runStreamedExecution({ spill: true });
-    });
+    }
   }
 
   /**
@@ -2827,16 +2883,145 @@ export class MinnowDatabase {
    * shapes whose blocks cannot back a block-driven loader return undefined so the caller keeps
    * the materialized path.
    */
+  /**
+   * Zone-map row-group pruning for the streamed scan: header-only inspection of the
+   * predicate columns' blocks selects the block indexes that can match, and the scan then
+   * streams only those row groups — the same elimination the materialized pruned projection
+   * performs, paid at scan time instead of cached under a mutable fingerprint. The inspected
+   * bytes ride along so surviving predicate blocks decode without a second store fetch.
+   * Returns undefined when the shape cannot prune (no zone predicates, a mutation history
+   * whose slot arithmetic depends on every row group, scan-derived BM25 statistics, or
+   * misaligned per-column block counts); the caller keeps the original segments.
+   */
+  async #zonePrunedStreamSegments(
+    plan: CompiledQuery,
+    table: TableRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+  ): Promise<{ segments: SegmentRecord[]; storedBlocks: Map<string, Uint8Array> } | undefined> {
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind ?? "insert";
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return undefined;
+    }
+    const predicates = zonePredicates(plan, table);
+    if (predicates.length === 0) return undefined;
+    if (planContainsFts(plan, "bm25") && !this.#ftsIndexServesScoring(plan, table, segments)) {
+      return undefined;
+    }
+    const predicateColumns = [
+      ...new Map(predicates.map((predicate) => [predicate.column.id, predicate.column])).values(),
+    ];
+    const involvedColumns = [
+      ...new Map(
+        [...projectedColumns, ...predicateColumns].map((column) => [column.id, column]),
+      ).values(),
+    ];
+    if (
+      involvedColumns.some((column) =>
+        segments.some((segment) => segment.columnBlockIds[column.id] === undefined),
+      )
+    ) {
+      return undefined;
+    }
+    const storedBlocks = new Map<string, Uint8Array>();
+    const descriptions = new Map<string, ReturnType<typeof inspectBlock>>();
+    const predicateBlockIds = [
+      ...new Set(
+        segments.flatMap((segment) =>
+          predicateColumns.flatMap((column) => segment.columnBlockIds[column.id] ?? []),
+        ),
+      ),
+    ];
+    // Block descriptions are immutable per id, like decoded blocks, so a repeated pruned
+    // query pays zero store reads for elimination once its descriptions are resident.
+    const missingIds = predicateBlockIds.filter((id) => {
+      const cached = this.#cacheGet(`zi ${id}`) as ReturnType<typeof inspectBlock> | undefined;
+      if (cached === undefined) return true;
+      descriptions.set(id, cached);
+      return false;
+    });
+    for (let start = 0; start < missingIds.length; start += 16) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      const ids = missingIds.slice(start, start + 16);
+      const blocks = await this.store.getBlocks(ids);
+      for (let index = 0; index < ids.length; index += 1) {
+        const id = ids[index] ?? "";
+        const bytes = blocks[index];
+        if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+        storedBlocks.set(id, bytes);
+        // Header and metadata only: zone-map elimination must not pay the decompress,
+        // checksum, and payload-validation cost of blocks it is about to discard.
+        const description = inspectBlock(bytes);
+        descriptions.set(id, description);
+        this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+      }
+    }
+    const prunedSegments: SegmentRecord[] = [];
+    for (const segment of segments) {
+      const firstIds = segment.columnBlockIds[predicateColumns[0]?.id ?? ""] ?? [];
+      if (
+        involvedColumns.some(
+          (column) => (segment.columnBlockIds[column.id]?.length ?? 0) !== firstIds.length,
+        )
+      ) {
+        return undefined;
+      }
+      const blockIndexes: number[] = [];
+      let segmentRows = 0;
+      let prunedRows = 0;
+      for (let blockIndex = 0; blockIndex < firstIds.length; blockIndex += 1) {
+        let rowCount: number | undefined;
+        let canMatch = true;
+        for (const predicate of predicates) {
+          const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
+          const description = descriptions.get(blockId);
+          if (description === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+          if (description.type !== predicate.column.type) {
+            throw new Error(`Column type mismatch: ${predicate.column.name}`);
+          }
+          if (rowCount !== undefined && description.rowCount !== rowCount) return undefined;
+          rowCount = description.rowCount;
+          if (!zoneMapCanMatch(description, predicate)) canMatch = false;
+        }
+        if (rowCount === undefined) return undefined;
+        segmentRows += rowCount;
+        if (canMatch) {
+          blockIndexes.push(blockIndex);
+          prunedRows += rowCount;
+        }
+      }
+      if (segmentRows !== segment.rowCount) return undefined;
+      if (blockIndexes.length === 0) continue;
+      prunedSegments.push({
+        ...segment,
+        rowCount: prunedRows,
+        columnBlockIds: Object.fromEntries(
+          involvedColumns.map((column) => [
+            column.id,
+            blockIndexes.map((blockIndex) => segment.columnBlockIds[column.id]?.[blockIndex] ?? ""),
+          ]),
+        ),
+      });
+    }
+    return { segments: prunedSegments, storedBlocks };
+  }
+
   #streamedViewFactory(
     table: TableRecord,
     projectedColumns: readonly TableColumnRecord[],
     segments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
+    storedBlocks?: Map<string, Uint8Array>,
   ):
     | {
         create: (memory: QueryMemoryContext) => Promise<{
           table: ColumnarTable;
-          load: (start: number, length: number) => Promise<void>;
+          load: (start: number, length: number) => Promise<number>;
         }>;
       }
     | undefined {
@@ -2884,6 +3069,7 @@ export class MinnowDatabase {
               snapshot,
               scanRowCount,
               memory,
+              storedBlocks,
             ),
     };
   }
@@ -2906,13 +3092,13 @@ export class MinnowDatabase {
     baseView: {
       create: (memory: QueryMemoryContext) => Promise<{
         table: ColumnarTable;
-        load: (start: number, length: number) => Promise<void>;
+        load: (start: number, length: number) => Promise<number>;
       }>;
     },
     buildView: {
       create: (memory: QueryMemoryContext) => Promise<{
         table: ColumnarTable;
-        load: (start: number, length: number) => Promise<void>;
+        load: (start: number, length: number) => Promise<number>;
       }>;
     },
     buildTableName: string,
@@ -2941,11 +3127,15 @@ export class MinnowDatabase {
           let buildRows: DatabaseRow[] = [];
           const buildColumns = [...build.table.columns.entries()];
           // Small steps keep the collection windows a minor budget term next to the resident
-          // partition itself.
+          // partition itself. The loader serves up to its current block boundary, so the
+          // consumed length clamps to the returned resident end.
           const step = 1_024;
-          for (let start = 0; start < build.table.rowCount; start += step) {
-            const length = Math.min(step, build.table.rowCount - start);
-            await build.load(start, length);
+          for (let start = 0; start < build.table.rowCount;) {
+            let length = Math.min(step, build.table.rowCount - start);
+            const residentEnd = await build.load(start, length);
+            if (typeof residentEnd === "number" && residentEnd > start) {
+              length = Math.min(length, residentEnd - start);
+            }
             const keyVector = build.table.columns.get(buildKeyName);
             if (keyVector === undefined) {
               throw new Error(`Join key column is missing: ${buildTableName}.${buildKeyName}`);
@@ -2964,6 +3154,7 @@ export class MinnowDatabase {
               );
               buildRows.push(buildRow);
             }
+            start += length;
           }
           buildScanMemory.close();
           if (buildRows.length === 0) {
@@ -3010,6 +3201,38 @@ export class MinnowDatabase {
    * as needed, reserves the replacement window before installing it, and releases the superseded
    * reservation afterward. The scan is forward-only; a backward request is a programming error.
    */
+  /**
+   * The vectorized form of one immutable block: validity, typed values, and for strings the
+   * per-block dictionary with codes. Cached by block id beside the decoded physical form, so
+   * a streamed scan installs whole blocks by reference — zero copies, zero re-decoding, and
+   * dictionary objects that stay identical across queries, which keeps per-dictionary
+   * expression caches (equality codes, LIKE match sets) hot between statements.
+   */
+  #blockColumnVector(blockId: string, decoded: DecodedPhysicalBlock): ColumnVector {
+    const cached = this.#cacheGet(`dbv ${blockId}`) as ColumnVector | undefined;
+    if (cached !== undefined) return cached;
+    const column = decoded.column;
+    const rows = column.rowCount;
+    const validity = new Uint8Array(Math.ceil(rows / 8));
+    const values =
+      column.type === "boolean"
+        ? new Uint8Array(rows)
+        : column.type === "number" || column.type === "datetime"
+          ? new Float64Array(rows)
+          : undefined;
+    const codes = column.type === "string" ? new Uint32Array(rows) : undefined;
+    codes?.fill(NULL_STRING_VECTOR_CODE);
+    const builder = new StringDictionaryBuilder();
+    appendPhysicalColumnToVector(column, 0, validity, values, codes, builder);
+    const vector = (
+      codes !== undefined
+        ? { kind: "string", length: rows, validity, codes, dictionary: builder.dictionary }
+        : { kind: column.type, length: rows, validity, values }
+    ) as ColumnVector;
+    this.#cachePut(`dbv ${blockId}`, vector, columnVectorRetainedBytes(vector));
+    return vector;
+  }
+
   #createStreamedTable(
     table: TableRecord,
     projectedColumns: readonly TableColumnRecord[],
@@ -3017,18 +3240,15 @@ export class MinnowDatabase {
     snapshot: LeasedSnapshot,
     rowCount: number,
     memory: QueryMemoryContext,
-  ): { table: ColumnarTable; load: (start: number, length: number) => Promise<void> } {
-    interface ResidentBlock {
-      column: ValidatedPhysicalColumn;
-      startRow: number;
-    }
+    storedBlocks?: Map<string, Uint8Array>,
+  ): { table: ColumnarTable; load: (start: number, length: number) => Promise<number> } {
     interface StreamedColumnState {
       column: TableColumnRecord;
       vector: ColumnVector;
       blockIds: readonly string[];
       nextBlockIndex: number;
       nextBlockStartRow: number;
-      resident: ResidentBlock[];
+      resident: ResidentStreamBlock[];
       reservations: QueryMemoryReservation[];
     }
     const states: StreamedColumnState[] = projectedColumns.map((column) => ({
@@ -3040,34 +3260,54 @@ export class MinnowDatabase {
       resident: [],
       reservations: [],
     }));
-    const load = async (start: number, length: number): Promise<void> => {
+    // The load contract: make a prefix of [start, start + length) resident and return its
+    // exclusive end. Serving less than requested is normal — the window never extends past
+    // the current block, so every install is a whole-block reference and a batch straddling
+    // a block boundary is the caller's clamp to handle, not a stitched copy to build.
+    const load = async (start: number, length: number): Promise<number> => {
       const end = Math.min(start + length, rowCount);
+      let residentEnd = rowCount;
       for (const state of states) {
         const window = state.vector.window;
-        if (window !== undefined && start >= window.start && end <= window.start + window.length) {
+        if (window !== undefined && start >= window.start && start < window.start + window.length) {
+          residentEnd = Math.min(residentEnd, window.start + window.length);
           continue;
         }
         if (window !== undefined && start < window.start) {
           throw new Error(`Streamed scan moved backward: ${table.name}.${state.column.name}`);
         }
         state.resident = state.resident.filter(
-          (block) => block.startRow + block.column.rowCount > start,
+          (block) => block.startRow + block.vector.length > start,
         );
-        while (state.nextBlockStartRow < end && state.nextBlockIndex < state.blockIds.length) {
-          await this.#renewInternalLeaseIfNeeded(snapshot);
-          const blockId = state.blockIds[state.nextBlockIndex] ?? "";
-          const bytes = await this.store.getBlock(blockId);
-          if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-          const decoded = await decodePhysicalBlock(bytes);
-          if (decoded.column.type !== state.column.type) {
-            throw new Error(`Column type mismatch: ${state.column.name}`);
+        while (state.nextBlockStartRow <= start && state.nextBlockIndex < state.blockIds.length) {
+          // Fetch a short run of upcoming blocks in one round trip through the buffer pool.
+          // The scan is forward-only over exactly these ids, so a decoded block beyond this
+          // window is never wasted: it stays warm for the next load.
+          const run = state.blockIds.slice(
+            state.nextBlockIndex,
+            state.nextBlockIndex + STREAMED_SCAN_LOOKAHEAD_BLOCKS,
+          );
+          const decodedRun = await this.#decodedBlocksThroughCache(run, snapshot, storedBlocks);
+          for (let index = 0; index < decodedRun.length; index += 1) {
+            const decoded = decodedRun[index];
+            if (decoded === undefined) continue;
+            if (decoded.column.type !== state.column.type) {
+              throw new Error(`Column type mismatch: ${state.column.name}`);
+            }
+            state.resident.push({
+              vector: this.#blockColumnVector(run[index] ?? "", decoded),
+              startRow: state.nextBlockStartRow,
+            });
+            state.nextBlockIndex += 1;
+            state.nextBlockStartRow += decoded.column.rowCount;
+            if (state.nextBlockStartRow > start) break;
           }
-          state.resident.push({ column: decoded.column, startRow: state.nextBlockStartRow });
-          state.nextBlockIndex += 1;
-          state.nextBlockStartRow += decoded.column.rowCount;
         }
+        state.resident = state.resident.filter(
+          (block) => block.startRow + block.vector.length > start,
+        );
         const first = state.resident[0];
-        if (first === undefined || state.nextBlockStartRow < end) {
+        if (first === undefined || first.startRow > start) {
           throw new Error(`Column row count mismatch: ${state.column.name}`);
         }
         const windowStart = first.startRow;
@@ -3089,7 +3329,12 @@ export class MinnowDatabase {
         }
         for (const previous of state.reservations) previous.release();
         state.reservations = replacements;
+        residentEnd = Math.min(residentEnd, windowStart + windowRows);
       }
+      if (residentEnd <= start && end > start) {
+        throw new Error(`Streamed scan made no progress: ${table.name}`);
+      }
+      return residentEnd;
     };
     return {
       table: {
@@ -3121,7 +3366,7 @@ export class MinnowDatabase {
     baseSegments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
     memory: QueryMemoryContext,
-  ): Promise<{ table: ColumnarTable; load: (start: number, length: number) => Promise<void> }> {
+  ): Promise<{ table: ColumnarTable; load: (start: number, length: number) => Promise<number> }> {
     const scanSegments = baseSegments.filter((segment) => {
       const kind = segment.kind ?? "insert";
       return kind === "insert" || kind === "base";
@@ -3173,10 +3418,8 @@ export class MinnowDatabase {
       touchedByScanSegment.set(segment.id, entries);
       let segmentRows = 0;
       for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
-        await this.#renewInternalLeaseIfNeeded(snapshot);
-        const bytes = await this.store.getBlock(blockId);
-        if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-        const decoded = await decodePhysicalBlock(bytes);
+        const [decoded] = await this.#decodedBlocksThroughCache([blockId], snapshot);
+        if (decoded === undefined) throw new Error(`Visible block is missing: ${blockId}`);
         if (decoded.column.type !== keyColumn.type) {
           throw new Error(`Column type mismatch: ${keyColumn.name}`);
         }
@@ -3291,11 +3534,11 @@ export class MinnowDatabase {
     // Forward-only cursor: cursorOutput live rows exist strictly before base row cursorBase.
     let cursorOutput = 0;
     let cursorBase = 0;
-    const load = async (start: number, length: number): Promise<void> => {
+    const load = async (start: number, length: number): Promise<number> => {
       const end = Math.min(start + length, outputRows);
       const window = states[0]?.vector.window;
       if (window !== undefined && start >= window.start && end <= window.start + window.length) {
-        return;
+        return window.start + window.length;
       }
       if (window !== undefined && start < window.start) {
         throw new Error(`Streamed scan moved backward: ${table.name}`);
@@ -3304,7 +3547,6 @@ export class MinnowDatabase {
         if (!bitmapHasValue(dead, cursorBase)) cursorOutput += 1;
         cursorBase += 1;
       }
-      const baseStart = cursorBase;
       let scanBase = cursorBase;
       let scanOutput = cursorOutput;
       const liveBaseRows: number[] = [];
@@ -3316,24 +3558,34 @@ export class MinnowDatabase {
         scanBase += 1;
       }
       if (scanOutput < end) throw new Error(`Column row count mismatch: ${table.name}`);
-      if (scanBase > baseStart) await inner.load(baseStart, scanBase - baseStart);
       const windowRows = end - start;
-      for (const state of states) {
-        const innerVector = inner.table.columns.get(state.column.name);
-        const innerWindow = innerVector?.window;
-        if (innerVector === undefined || innerWindow === undefined) {
-          throw new Error(`Streamed column is missing: ${state.column.name}`);
-        }
-        const validityBytes = Math.ceil(windowRows / 8);
-        const typedBytes =
-          validityBytes +
-          (state.column.type === "boolean"
-            ? windowRows
-            : state.column.type === "string"
-              ? windowRows * Uint32Array.BYTES_PER_ELEMENT
-              : windowRows * Float64Array.BYTES_PER_ELEMENT);
-        const replacements: QueryMemoryReservation[] = [];
-        try {
+      interface OuterTarget {
+        state: OuterColumnState;
+        innerVector: ColumnVector;
+        validity: Uint8Array;
+        values?: Uint8Array | Float64Array;
+        codes?: Uint32Array;
+        dictionary: string[];
+        dictionaryIndex: Map<string, number>;
+        replacements: QueryMemoryReservation[];
+        target: ColumnVector;
+      }
+      const targets: OuterTarget[] = [];
+      try {
+        for (const state of states) {
+          const innerVector = inner.table.columns.get(state.column.name);
+          if (innerVector === undefined) {
+            throw new Error(`Streamed column is missing: ${state.column.name}`);
+          }
+          const validityBytes = Math.ceil(windowRows / 8);
+          const typedBytes =
+            validityBytes +
+            (state.column.type === "boolean"
+              ? windowRows
+              : state.column.type === "string"
+                ? windowRows * Uint32Array.BYTES_PER_ELEMENT
+                : windowRows * Float64Array.BYTES_PER_ELEMENT);
+          const replacements: QueryMemoryReservation[] = [];
           replacements.push(memory.reserve(typedBytes, `Streamed window ${state.column.name}`));
           const validity = new Uint8Array(validityBytes);
           const values =
@@ -3345,51 +3597,102 @@ export class MinnowDatabase {
           const codes = state.column.type === "string" ? new Uint32Array(windowRows) : undefined;
           codes?.fill(NULL_STRING_VECTOR_CODE);
           const dictionary: string[] = [];
-          const dictionaryIndex = new Map<string, number>();
           const target = (
             codes !== undefined
               ? { kind: "string", length: windowRows, validity, codes, dictionary }
               : { kind: state.column.type, length: windowRows, validity, values }
           ) as ColumnVector;
-          for (let index = 0; index < liveBaseRows.length; index += 1) {
-            const baseRow = liveBaseRows[index] ?? 0;
-            const patch = patches.get(baseRow)?.get(state.column.id);
-            if (patch !== undefined) {
-              copyColumnVectorValue(patch.vector, patch.row, target, index, dictionaryIndex);
-            } else {
-              copyColumnVectorValue(
-                innerVector,
-                baseRow - innerWindow.start,
-                target,
-                index,
-                dictionaryIndex,
-              );
+          targets.push({
+            state,
+            innerVector,
+            validity,
+            ...(values === undefined ? {} : { values }),
+            ...(codes === undefined ? {} : { codes }),
+            dictionary,
+            dictionaryIndex: new Map<string, number>(),
+            replacements,
+            target,
+          });
+        }
+        // The inner loader serves whole blocks, so the copy walks live rows one inner window
+        // at a time: patched slots read the resident mutation vectors, everything else reads
+        // the inner window at its own offset.
+        let index = 0;
+        while (index < liveBaseRows.length) {
+          const chunkStart = liveBaseRows[index] ?? 0;
+          const innerEnd = await inner.load(chunkStart, scanBase - chunkStart);
+          const usable = typeof innerEnd === "number" ? Math.min(innerEnd, scanBase) : scanBase;
+          if (usable <= chunkStart) {
+            throw new Error(`Column row count mismatch: ${table.name}`);
+          }
+          let chunkEndIndex = index;
+          while (
+            chunkEndIndex < liveBaseRows.length &&
+            (liveBaseRows[chunkEndIndex] ?? 0) < usable
+          ) {
+            chunkEndIndex += 1;
+          }
+          for (const entry of targets) {
+            const innerWindow = entry.innerVector.window;
+            if (innerWindow === undefined) {
+              throw new Error(`Streamed column is missing: ${entry.state.column.name}`);
+            }
+            for (let live = index; live < chunkEndIndex; live += 1) {
+              const baseRow = liveBaseRows[live] ?? 0;
+              const patch = patches.get(baseRow)?.get(entry.state.column.id);
+              if (patch !== undefined) {
+                copyColumnVectorValue(
+                  patch.vector,
+                  patch.row,
+                  entry.target,
+                  live,
+                  entry.dictionaryIndex,
+                );
+              } else {
+                copyColumnVectorValue(
+                  entry.innerVector,
+                  baseRow - innerWindow.start,
+                  entry.target,
+                  live,
+                  entry.dictionaryIndex,
+                );
+              }
             }
           }
+          index = chunkEndIndex;
+        }
+        // Reserve every fallible byte first; the installs below cannot throw, so a budget
+        // overflow here leaves every state's previous window and reservations intact.
+        for (const entry of targets) {
           let dictionaryBytes = 0;
-          for (const value of dictionary) dictionaryBytes += value.length;
+          for (const value of entry.dictionary) dictionaryBytes += value.length;
           if (dictionaryBytes > 0) {
-            replacements.push(
-              memory.reserve(dictionaryBytes, `Streamed window ${state.column.name}`),
+            entry.replacements.push(
+              memory.reserve(dictionaryBytes, `Streamed window ${entry.state.column.name}`),
             );
           }
-          const mutable = state.vector as unknown as MutableStreamedVectorFields;
-          mutable.validity = validity;
-          if (values !== undefined) mutable.values = values;
-          if (codes !== undefined) {
-            mutable.codes = codes;
-            mutable.dictionary = dictionary;
+        }
+        for (const entry of targets) {
+          const mutable = entry.state.vector as unknown as MutableStreamedVectorFields;
+          mutable.validity = entry.validity;
+          if (entry.values !== undefined) mutable.values = entry.values;
+          if (entry.codes !== undefined) {
+            mutable.codes = entry.codes;
+            mutable.dictionary = entry.dictionary;
           }
           mutable.window = { start, length: windowRows };
-        } catch (error) {
-          for (const replacement of replacements) replacement.release();
-          throw error;
+          for (const previous of entry.state.reservations) previous.release();
+          entry.state.reservations = entry.replacements;
         }
-        for (const previous of state.reservations) previous.release();
-        state.reservations = replacements;
+      } catch (error) {
+        for (const entry of targets) {
+          for (const replacement of entry.replacements) replacement.release();
+        }
+        throw error;
       }
       cursorOutput = end;
       cursorBase = scanBase;
+      return end;
     };
     return {
       table: {
@@ -6776,6 +7079,58 @@ export class MinnowDatabase {
     };
   }
 
+  /**
+   * The block buffer pool: every read path decodes physical blocks through here. Block
+   * content is immutable, so the decoded form caches by id alone and can never be stale —
+   * a commit only ever introduces new ids, and superseded blocks simply stop being
+   * referenced and age out of the byte-bounded LRU. Returns one decoded block per id, in
+   * order; `storedBlocks` short-circuits the store fetch for bytes the caller already holds.
+   */
+  async #decodedBlocksThroughCache(
+    ids: readonly string[],
+    snapshot: LeasedSnapshot,
+    storedBlocks?: Map<string, Uint8Array>,
+  ): Promise<DecodedPhysicalBlock[]> {
+    await this.#renewInternalLeaseIfNeeded(snapshot);
+    const decodedBlocks = new Array<DecodedPhysicalBlock | undefined>(ids.length);
+    const pendingIndexes: number[] = [];
+    const fetchIds: string[] = [];
+    for (let index = 0; index < ids.length; index += 1) {
+      const id = ids[index] ?? "";
+      const cached = this.#cacheGet(`dpb ${id}`) as DecodedPhysicalBlock | undefined;
+      if (cached !== undefined) {
+        decodedBlocks[index] = cached;
+        continue;
+      }
+      pendingIndexes.push(index);
+      if (storedBlocks?.has(id) !== true) fetchIds.push(id);
+    }
+    const bytesById = storedBlocks ?? new Map<string, Uint8Array>();
+    if (fetchIds.length > 0) {
+      const fetched = await this.store.getBlocks(fetchIds);
+      for (let index = 0; index < fetchIds.length; index += 1) {
+        const id = fetchIds[index] ?? "";
+        const bytes = fetched[index];
+        if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+        bytesById.set(id, bytes);
+      }
+    }
+    for (const index of pendingIndexes) {
+      const id = ids[index] ?? "";
+      const bytes = bytesById.get(id);
+      if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+      const decoded = await decodePhysicalBlock(bytes);
+      this.#cachePut(`dpb ${id}`, decoded, bytes.byteLength);
+      decodedBlocks[index] = decoded;
+    }
+    return decodedBlocks.map((decoded, index) => {
+      if (decoded === undefined) {
+        throw new Error(`Visible block is missing: ${ids[index] ?? ""}`);
+      }
+      return decoded;
+    });
+  }
+
   async #materializeAppendColumnVector(
     column: TableColumnRecord,
     segments: readonly SegmentRecord[],
@@ -6807,43 +7162,10 @@ export class MinnowDatabase {
       }
       let segmentRows = 0;
       for (let start = 0; start < blockIds.length; start += 16) {
-        await this.#renewInternalLeaseIfNeeded(snapshot);
         const ids = blockIds.slice(start, start + 16);
-        // Block content is immutable, so the decoded physical form caches by id alone: after a
-        // commit changes the visible segment set (which invalidates every assembled vector
-        // fingerprint), the unchanged blocks skip the store fetch, decompression, checksum,
-        // and payload validation, and re-preparation only pays vector assembly.
-        const decodedBlocks = new Array<DecodedPhysicalBlock | undefined>(ids.length);
-        const pendingIndexes: number[] = [];
-        const fetchIds: string[] = [];
-        for (let index = 0; index < ids.length; index += 1) {
-          const id = ids[index] ?? "";
-          const cached = this.#cacheGet(`dpb\u0000${id}`) as DecodedPhysicalBlock | undefined;
-          if (cached !== undefined) {
-            decodedBlocks[index] = cached;
-            continue;
-          }
-          pendingIndexes.push(index);
-          if (storedBlocks?.has(id) !== true) fetchIds.push(id);
-        }
-        const bytesById = storedBlocks ?? new Map<string, Uint8Array>();
-        if (fetchIds.length > 0) {
-          const fetched = await this.store.getBlocks(fetchIds);
-          for (let index = 0; index < fetchIds.length; index += 1) {
-            const id = fetchIds[index] ?? "";
-            const bytes = fetched[index];
-            if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-            bytesById.set(id, bytes);
-          }
-        }
-        for (const index of pendingIndexes) {
-          const id = ids[index] ?? "";
-          const bytes = bytesById.get(id);
-          if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-          const decoded = await decodePhysicalBlock(bytes);
-          this.#cachePut(`dpb\u0000${id}`, decoded, bytes.byteLength);
-          decodedBlocks[index] = decoded;
-        }
+        // Immutable block content decodes through the buffer pool: unchanged blocks skip the
+        // store fetch, decompression, checksum, and payload validation on every re-read.
+        const decodedBlocks = await this.#decodedBlocksThroughCache(ids, snapshot, storedBlocks);
         for (let index = 0; index < decodedBlocks.length; index += 1) {
           const decoded = decodedBlocks[index];
           if (decoded === undefined) {
@@ -7788,20 +8110,46 @@ interface MutableStreamedVectorFields {
   dictionary?: string[];
 }
 
+/** One decoded block resident in a streamed scan, in its vectorized (buffer pool) form. */
+interface ResidentStreamBlock {
+  vector: ColumnVector;
+  startRow: number;
+}
+
 /**
- * Replaces a streamed vector's resident window with freshly decoded rows. Fixed-width bytes are
- * reserved before allocation; per-window string dictionary bytes are measured during decoding and
- * reserved before the window is installed. The caller releases the superseded reservations.
+ * Replaces a streamed vector's resident window. The common case — a batch-aligned window
+ * covering exactly one block — installs the buffer pool's block vector by reference: no
+ * copies, no re-decoding, and a dictionary object that stays identical across queries so
+ * per-dictionary expression caches survive. A window straddling blocks (only where block
+ * row counts are not batch-aligned) stitches the block vectors into one copied window.
+ * Modeled bytes are reserved either way; the caller releases the superseded reservations.
  */
 function installStreamedWindow(
   vector: ColumnVector,
-  resident: ReadonlyArray<{ column: ValidatedPhysicalColumn; startRow: number }>,
+  resident: readonly ResidentStreamBlock[],
   windowStart: number,
   windowRows: number,
   memory: QueryMemoryContext,
   label: string,
   reservations: QueryMemoryReservation[],
 ): void {
+  const single = resident.length === 1 ? resident[0] : undefined;
+  const mutable = vector as unknown as MutableStreamedVectorFields;
+  if (single !== undefined) {
+    const block = single.vector;
+    if (single.startRow === windowStart && block.length === windowRows) {
+      reservations.push(memory.reserve(columnVectorRetainedBytes(block), label));
+      mutable.validity = block.validity;
+      if (block.kind === "string") {
+        mutable.codes = block.codes;
+        mutable.dictionary = block.dictionary as string[];
+      } else {
+        mutable.values = block.values;
+      }
+      mutable.window = { start: windowStart, length: windowRows };
+      return;
+    }
+  }
   const validityBytes = Math.ceil(windowRows / 8);
   const typedBytes =
     validityBytes +
@@ -7820,22 +8168,43 @@ function installStreamedWindow(
         : undefined;
   const codes = vector.kind === "string" ? new Uint32Array(windowRows) : undefined;
   codes?.fill(NULL_STRING_VECTOR_CODE);
-  const builder = new StringDictionaryBuilder();
+  const dictionary: string[] = [];
+  const dictionaryIndex = new Map<string, number>();
+  let dictionaryBytes = 0;
   for (const block of resident) {
-    appendPhysicalColumnToVector(
-      block.column,
-      block.startRow - windowStart,
-      validity,
-      values,
-      codes,
-      builder,
-    );
+    const offset = block.startRow - windowStart;
+    const blockVector = block.vector;
+    for (let row = 0; row < blockVector.length; row += 1) {
+      if (bitmapHasValue(blockVector.validity, row)) setBitmapValue(validity, offset + row);
+    }
+    if (blockVector.kind === "string") {
+      if (codes === undefined) throw new Error("String vector is missing");
+      // Remap block codes through the merged window dictionary; the remap array makes the
+      // per-row cost one lookup regardless of dictionary size.
+      const remap = new Int32Array(blockVector.dictionary.length).fill(-1);
+      for (let row = 0; row < blockVector.length; row += 1) {
+        const code = blockVector.codes[row] ?? NULL_STRING_VECTOR_CODE;
+        if (code === NULL_STRING_VECTOR_CODE) continue;
+        let mapped = remap[code] ?? -1;
+        if (mapped < 0) {
+          const value = blockVector.dictionary[code] ?? "";
+          let existing = dictionaryIndex.get(value);
+          if (existing === undefined) {
+            existing = dictionary.length;
+            dictionary.push(value);
+            dictionaryIndex.set(value, existing);
+            dictionaryBytes += value.length;
+          }
+          remap[code] = existing;
+          mapped = existing;
+        }
+        codes[offset + row] = mapped;
+      }
+    } else if (values !== undefined) {
+      values.set(blockVector.values, offset);
+    }
   }
-  const dictionary = builder.dictionary;
-  // The builder already retains each distinct value's UTF-8 bytes, so the window's dictionary
-  // footprint is known without re-encoding every entry.
-  if (dictionary.length > 0) reservations.push(memory.reserve(builder.byteLength, label));
-  const mutable = vector as unknown as MutableStreamedVectorFields;
+  if (dictionary.length > 0) reservations.push(memory.reserve(dictionaryBytes, label));
   mutable.validity = validity;
   if (values !== undefined) mutable.values = values;
   if (codes !== undefined) {

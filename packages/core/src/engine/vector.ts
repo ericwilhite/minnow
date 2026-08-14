@@ -131,9 +131,12 @@ export interface AsyncQueryExecutionOptions {
   /**
    * Makes the scan-source window [start, start + length) resident before each batch. Supplied by
    * a streaming preparation whose scan-source vectors hold only a sliding window; the executor
-   * awaits it at the top of every scan batch in every asynchronous execution path.
+   * awaits it at the top of every scan batch in every asynchronous execution path. A numeric
+   * return is the exclusive end of the resident window: the executor clamps the batch to it, so
+   * batches align to storage-block boundaries and a loader can install whole decoded blocks by
+   * reference instead of stitching copies.
    */
-  readonly loadScanWindow?: (start: number, length: number) => Promise<void>;
+  readonly loadScanWindow?: (start: number, length: number) => Promise<number | undefined>;
 }
 
 export interface PrepareVectorQueryOptions {
@@ -693,14 +696,12 @@ function bindPlan(
   }));
   const grouped = groupBy.length > 0 || aggregateSpecs.length > 0;
   // A single bare string-column GROUP BY can group on dictionary codes: identical values share a
-  // code within one materialized vector, so a code-indexed slot table replaces per-row hashing.
-  // Streamed vectors rebuild their dictionary per window, so a windowed vector never qualifies.
+  // code within one vector, so a code-indexed slot table replaces per-row hashing. Streamed
+  // vectors swap dictionaries per window; the accumulator remaps its slot table by value on
+  // each swap, so windowed vectors qualify too.
   const groupColumn = groupBy.length === 1 ? groupBy[0] : undefined;
   const codeGrouping =
-    grouped &&
-    groupColumn?.kind === "column" &&
-    groupColumn.vector.kind === "string" &&
-    groupColumn.vector.window === undefined
+    grouped && groupColumn?.kind === "column" && groupColumn.vector.kind === "string"
       ? { source: groupColumn.source, vector: groupColumn.vector }
       : undefined;
   return {
@@ -1379,10 +1380,14 @@ async function executeBoundPlanAsync(
   const groups = new GroupAccumulator(plan, memory);
   const output = new ResultSink(plan, memory, options.loadScanWindow === undefined);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-  for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
-    const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
-    await options.loadScanWindow?.(start, length);
+  for (let start = 0; start < scanRows;) {
+    let length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
+    const residentEnd = await options.loadScanWindow?.(start, length);
+    if (typeof residentEnd === "number" && residentEnd > start) {
+      length = Math.min(length, residentEnd - start);
+    }
     if (runScanBatch(plan, start, length, groups, output, memory)) break;
+    start += length;
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
@@ -1414,9 +1419,12 @@ async function executeBoundPlanWithSortSpill(
   try {
     const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
     const scanBatchRows = Math.min(DEFAULT_BATCH_ROWS, pageRows);
-    for (let start = 0; start < scanRows; start += scanBatchRows) {
-      const length = Math.min(scanBatchRows, scanRows - start);
-      await options.loadScanWindow?.(start, length);
+    for (let start = 0; start < scanRows;) {
+      let length = Math.min(scanBatchRows, scanRows - start);
+      const residentEnd = await options.loadScanWindow?.(start, length);
+      if (typeof residentEnd === "number" && residentEnd > start) {
+        length = Math.min(length, residentEnd - start);
+      }
       const batchMemory = memory.createChild();
       try {
         batchMemory.reserve(
@@ -1429,7 +1437,10 @@ async function executeBoundPlanWithSortSpill(
         );
         const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
         const scan = sourceRows[plan.scanSource];
-        if (scan === undefined) continue;
+        if (scan === undefined) {
+          start += length;
+          continue;
+        }
         for (let index = 0; index < length; index += 1) scan[index] = start + index;
         await spillJoinedBatches(
           plan,
@@ -1466,6 +1477,7 @@ async function executeBoundPlanWithSortSpill(
       } finally {
         batchMemory.close();
       }
+      start += length;
     }
 
     if (runs.length === 0) return { columns, rows: [] };
@@ -1540,9 +1552,12 @@ async function executeBoundPlanWithHashSpill(
     // A fixed chunk bounds buffered evaluated values per flush independently of the configured
     // page size while staying coarse enough to amortize partition-page write transactions.
     const scanChunkRows = Math.min(DEFAULT_BATCH_ROWS, HASH_SPILL_SCAN_CHUNK_ROWS);
-    for (let start = 0; start < scanRows; start += scanChunkRows) {
-      const length = Math.min(scanChunkRows, scanRows - start);
-      await options.loadScanWindow?.(start, length);
+    for (let start = 0; start < scanRows;) {
+      let length = Math.min(scanChunkRows, scanRows - start);
+      const residentEnd = await options.loadScanWindow?.(start, length);
+      if (typeof residentEnd === "number" && residentEnd > start) {
+        length = Math.min(length, residentEnd - start);
+      }
       const batchMemory = memory.createChild();
       try {
         batchMemory.reserve(
@@ -1555,7 +1570,10 @@ async function executeBoundPlanWithHashSpill(
         );
         const scanRowsBySource = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
         const scan = scanRowsBySource[plan.scanSource];
-        if (scan === undefined) continue;
+        if (scan === undefined) {
+          start += length;
+          continue;
+        }
         for (let index = 0; index < length; index += 1) scan[index] = start + index;
         const partitionBuffers = new Map<number, QueryRow[]>();
         await spillJoinedBatches(
@@ -1611,6 +1629,7 @@ async function executeBoundPlanWithHashSpill(
       } finally {
         batchMemory.close();
       }
+      start += length;
     }
 
     const runs: SpillRun[] = [];
@@ -2444,8 +2463,10 @@ function joinUniqueBatch(
     const buildRows = new Int32Array(input.length);
     let outputLength = 0;
     const probe = join.probe;
+    // Windowed probes qualify: stringCodeAt is window-aware and the code cache re-resolves
+    // whenever the resident window's dictionary object changes.
     const dictProbe =
-      probe.kind === "column" && probe.vector.kind === "string" && probe.vector.window === undefined
+      probe.kind === "column" && probe.vector.kind === "string"
         ? { source: probe.source, vector: probe.vector }
         : undefined;
     if (dictProbe !== undefined) {
@@ -2610,6 +2631,7 @@ class ResultSink {
     // A bare numeric/datetime first order key rejects most rows with one unboxed comparison
     // against the current cut line, before any generic key evaluation or allocation. NULLs and
     // explicit NULLS placement fall through to the full comparison, so semantics are untouched.
+    // Windowed scan vectors qualify too: the batch loop re-reads the resident window per batch.
     const firstKey = keyExpressions?.[0];
     const firstOrder = plan.orderBy[0];
     this.#fastFirstKey =
@@ -2617,8 +2639,7 @@ class ResultSink {
       firstOrder !== undefined &&
       firstOrder.nulls === undefined &&
       firstKey.kind === "column" &&
-      (firstKey.vector.kind === "number" || firstKey.vector.kind === "datetime") &&
-      firstKey.vector.window === undefined
+      (firstKey.vector.kind === "number" || firstKey.vector.kind === "datetime")
         ? {
             vector: firstKey.vector,
             source: firstKey.source,
@@ -2639,29 +2660,41 @@ class ResultSink {
    */
   tryAddBatch(batch: BatchRows): boolean {
     const fast = this.#fastFirstKey;
-    if (this.#capacity === undefined || !this.#deferred || fast === undefined) return false;
+    if (this.#capacity === undefined || fast === undefined) return false;
     const rows = batch.rowsBySource[fast.source];
     const vector = fast.vector;
+    // Window and arrays re-read per batch: a streamed scan replaces them on every window slide.
     const values = vector.values;
     const validity = vector.validity;
+    const window = vector.window;
+    const windowStart = window?.start ?? 0;
+    const windowLength = window?.length ?? vector.length;
     const desc = fast.desc;
     for (let row = 0; row < batch.length; row += 1) {
       const threshold = this.#thresholdFirst;
       if (threshold === undefined || threshold === null) {
-        this.#addDeferred(batch, row);
+        this.#addSlow(batch, row);
         continue;
       }
       const sourceRow = rows?.[row] ?? -1;
-      if (sourceRow >= 0 && sourceRow < vector.length && isValid(validity, sourceRow)) {
-        const value = values[sourceRow] ?? 0;
-        if ((desc ? threshold - value : value - threshold) > 0) {
-          this.#seq += 1;
-          continue;
+      const slot = sourceRow - windowStart;
+      if (sourceRow >= 0 && sourceRow < vector.length && slot >= 0 && slot < windowLength) {
+        if (isValid(validity, slot)) {
+          const value = values[slot] ?? 0;
+          if ((desc ? threshold - value : value - threshold) > 0) {
+            this.#seq += 1;
+            continue;
+          }
         }
       }
-      this.#addDeferred(batch, row);
+      this.#addSlow(batch, row);
     }
     return true;
+  }
+
+  #addSlow(batch: BatchRows, row: number): void {
+    if (this.#deferred) this.#addDeferred(batch, row);
+    else this.#addEager(batch, row);
   }
 
   add(batch: BatchRows, row: number): void {
@@ -2810,6 +2843,7 @@ class ResultSink {
         reservation,
       };
       this.#siftDown(0);
+      this.#updateEagerThreshold();
       return;
     }
     const resultRow = projected ?? projectBatchRow(this.#plan, batch, row);
@@ -2824,6 +2858,20 @@ class ResultSink {
       reservation,
     });
     this.#siftUp(this.#heap.length - 1);
+    this.#updateEagerThreshold();
+  }
+
+  /**
+   * The eager cut line for the unboxed batch loop: once the heap is full, its root's first
+   * order key as a float. Non-numeric keys leave the threshold null, which sends every row
+   * through the full comparison.
+   */
+  #updateEagerThreshold(): void {
+    if (this.#fastFirstKey === undefined) return;
+    if (this.#heap.length < (this.#capacity ?? 0)) return;
+    const first = this.#heap[0]?.keys[0];
+    this.#thresholdFirst =
+      typeof first === "number" ? first : first instanceof Date ? first.getTime() : null;
   }
 
   #evaluateKeys(batch: BatchRows, row: number): void {
@@ -2917,6 +2965,12 @@ class GroupAccumulator {
   readonly #memory: QueryMemoryContext;
   readonly #index: ByteGroupIndex<GroupState>;
   #codeStates: Array<GroupState | undefined> | undefined;
+  /** The dictionary #codeStates is laid out for; a streamed window slide swaps it. */
+  #codeDictionary: readonly string[] | undefined;
+  /** Value-keyed group states so a new window's dictionary remaps to existing groups. */
+  readonly #codeStateByValue = new Map<string, GroupState>();
+  #nullCodeState: GroupState | undefined;
+  #codeSlotsReserved = 0;
   #ordered: GroupState[] | undefined;
   readonly #codeColumns: ReadonlyArray<{ source: number; vector: StringVector } | undefined>;
   #multiCodeColumns: ReadonlyArray<{ source: number; vector: StringVector }> | undefined;
@@ -2963,6 +3017,8 @@ class GroupAccumulator {
         "Group code slots",
       );
       this.#codeStates = new Array<GroupState | undefined>(slots).fill(undefined);
+      this.#codeDictionary = plan.codeGrouping.vector.dictionary;
+      this.#codeSlotsReserved = slots;
       this.#ordered = [];
     }
     // Compound keys substitute the dictionary code for each bare unwindowed string column: codes
@@ -3053,6 +3109,7 @@ class GroupAccumulator {
     const groupRows =
       codeGrouping === undefined ? undefined : batch.rowsBySource[codeGrouping.source];
     const groupVector = codeGrouping?.vector;
+    if (groupVector !== undefined) this.#ensureCodeStates(groupVector.dictionary);
     const states = this.#codeStates;
     const nullCode = groupVector?.dictionary.length ?? 0;
     const globalState = globalGroup
@@ -3097,6 +3154,8 @@ class GroupAccumulator {
             validity: groupVector.validity,
             length: groupVector.length,
             dictionary: groupVector.dictionary,
+            windowStart: groupVector.window?.start ?? 0,
+            slots: groupVector.codes.length,
           };
     for (let row = 0; row < batch.length; row += 1) {
       if (hasPredicates && !passes(row)) continue;
@@ -3104,19 +3163,22 @@ class GroupAccumulator {
       if (state === undefined && grouping !== undefined && states !== undefined) {
         const sourceRow = groupRows?.[row] ?? -1;
         let code = nullCode;
-        if (
-          sourceRow >= 0 &&
-          sourceRow < grouping.length &&
-          isValid(grouping.validity, sourceRow)
-        ) {
-          const rawCode = grouping.codes[sourceRow] ?? NULL_STRING_CODE;
-          if (rawCode !== NULL_STRING_CODE) code = rawCode;
+        if (sourceRow >= 0 && sourceRow < grouping.length) {
+          const slot = sourceRow - grouping.windowStart;
+          if (slot < 0 || slot >= grouping.slots) {
+            throw new RangeError("Streamed vector row is outside the resident window");
+          }
+          if (isValid(grouping.validity, slot)) {
+            const rawCode = grouping.codes[slot] ?? NULL_STRING_CODE;
+            if (rawCode !== NULL_STRING_CODE) code = rawCode;
+          }
         }
         state = states[code];
         if (state === undefined) {
           const value = code === nullCode ? null : (grouping.dictionary[code] ?? null);
           state = createGroupState([value], plan, this.#memory);
           states[code] = state;
+          this.#registerCodeState(value, state);
           this.#ordered?.push(state);
         }
       }
@@ -3148,6 +3210,42 @@ class GroupAccumulator {
     return this.#fastAggregatesCache;
   }
 
+  /**
+   * Re-lays the code-slot table for a new window dictionary. Existing groups carry over by
+   * value, so a group's state is shared across every window that mentions its value; the cost
+   * is one map lookup per distinct value per window, never per row. Only used for the
+   * single-column code grouping — compound code keys stay unwindowed.
+   */
+  #ensureCodeStates(dictionary: readonly string[]): void {
+    if (this.#codeDictionary === dictionary || this.#codeStates === undefined) return;
+    const slots = dictionary.length + 1;
+    if (slots > this.#codeSlotsReserved) {
+      this.#memory.reserve(
+        safeMemoryProduct(
+          slots - this.#codeSlotsReserved,
+          QUERY_REFERENCE_BYTES,
+          "Group code slots",
+        ),
+        "Group code slots",
+      );
+      this.#codeSlotsReserved = slots;
+    }
+    const next = new Array<GroupState | undefined>(slots).fill(undefined);
+    for (let code = 0; code < dictionary.length; code += 1) {
+      const state = this.#codeStateByValue.get(dictionary[code] ?? "");
+      if (state !== undefined) next[code] = state;
+    }
+    next[dictionary.length] = this.#nullCodeState;
+    this.#codeStates = next;
+    this.#codeDictionary = dictionary;
+  }
+
+  /** Registers a freshly created code-grouped state so later windows can find it by value. */
+  #registerCodeState(value: string | null, state: GroupState): void {
+    if (value === null) this.#nullCodeState = state;
+    else this.#codeStateByValue.set(value, state);
+  }
+
   /** Resolves the group state for one row, creating it on first touch. */
   stateFor(batch: BatchRows, row: number): GroupState {
     const plan = this.#plan;
@@ -3155,16 +3253,26 @@ class GroupAccumulator {
     if (codeGrouping !== undefined && this.#codeStates !== undefined) {
       const sourceRow = batch.rowsBySource[codeGrouping.source]?.[row] ?? -1;
       const vector = codeGrouping.vector;
+      this.#ensureCodeStates(vector.dictionary);
+      const states = required(this.#codeStates, "Group code slots are missing");
       let code = vector.dictionary.length;
-      if (sourceRow >= 0 && sourceRow < vector.length && isValid(vector.validity, sourceRow)) {
-        const rawCode = vector.codes[sourceRow] ?? NULL_STRING_CODE;
-        if (rawCode !== NULL_STRING_CODE) code = rawCode;
+      if (sourceRow >= 0 && sourceRow < vector.length) {
+        const windowStart = vector.window?.start ?? 0;
+        const slot = sourceRow - windowStart;
+        if (slot < 0 || slot >= vector.codes.length) {
+          throw new RangeError("Streamed vector row is outside the resident window");
+        }
+        if (isValid(vector.validity, slot)) {
+          const rawCode = vector.codes[slot] ?? NULL_STRING_CODE;
+          if (rawCode !== NULL_STRING_CODE) code = rawCode;
+        }
       }
-      let state = this.#codeStates[code];
+      let state = states[code];
       if (state === undefined) {
         const value = code === vector.dictionary.length ? null : (vector.dictionary[code] ?? null);
         state = createGroupState([value], plan, this.#memory);
-        this.#codeStates[code] = state;
+        states[code] = state;
+        this.#registerCodeState(value, state);
         this.#ordered?.push(state);
       }
       return state;

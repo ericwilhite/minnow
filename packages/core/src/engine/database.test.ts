@@ -6789,10 +6789,10 @@ for (const implementation of implementations()) {
     expect(explained).toContain("where (amount * 2) > 10");
     // After predicate pushdown the outer block is a pure projection wrapper, which executes
     // as its inner filtered scan — a streamable shape.
-    expect(explained).toContain("-- eligible to stream");
+    expect(explained).toContain("-- streams the base scan");
     expect(
       await database.explain("SELECT SUM(amount) AS total FROM cte_sales WHERE amount > 5"),
-    ).toContain("-- eligible to stream");
+    ).toContain("-- streams the base scan");
 
     const union = await database.query(
       "SELECT region, amount FROM cte_sales WHERE amount < 3 UNION SELECT region, amount FROM cte_sales WHERE amount < 5 ORDER BY amount",
