@@ -22,7 +22,7 @@ npm install @minnowdb/core
   that builds itself in the background on large tables.
 - **Fast** — columnar blocks, vectorized execution, and a perf gate that keeps every query class
   ahead of native SQLite; in-browser, it leads SQLite Wasm and PGlite on queries and bulk ingest
-  at ten million rows.
+  at every published dataset scale.
 - **Safe across tabs** — writes publish atomically; readers see the old version or the new one,
   never half a write. Reads never block writes.
 - **Always fresh** — every query observes the latest committed state, even commits from another

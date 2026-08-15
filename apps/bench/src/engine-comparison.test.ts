@@ -2,6 +2,7 @@ import { compileQuery, executeQuery, type DatabaseRow } from "@minnowdb/core";
 import { describe, expect, it } from "vitest";
 import { generateEntityBatch, getScenario } from "./benchmark.js";
 import { comparisonQueries } from "./engines/shared.js";
+import { referenceQueryDefinitions } from "./worker/reference-suite.js";
 
 function generatedRows(table: string): DatabaseRow[] {
   const entity = getScenario("commerce").entities.find((candidate) => candidate.name === table);
@@ -54,5 +55,21 @@ describe("MinnowDatabase comparison SQL", () => {
         amount: 51_418.75,
       },
     ]);
+  });
+
+  it("q16 text search: SQL, baseline, and oracle agree on the scale-1 dataset", () => {
+    const messages = generatedRows("support_messages");
+    const orders = generatedRows("orders");
+    const definition = referenceQueryDefinitions(orders.length).find(({ id }) => id === "q16");
+    if (definition === undefined) throw new Error("Missing q16");
+    const tables = new Map([["support_messages", messages]]);
+    const actual = executeQuery(compileQuery(definition.sql), tables).rows.map((row) =>
+      definition.columns.map((column) => row[column]),
+    );
+    const oracle = definition
+      .oracle(tables)
+      .map((row) => definition.project(row as Record<string, unknown>));
+    expect(actual.length).toBe(definition.expectedRows);
+    expect(actual).toEqual(oracle);
   });
 });

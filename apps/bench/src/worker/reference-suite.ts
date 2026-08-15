@@ -410,9 +410,17 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
       complexity: "complex",
       tables: ["order_items", "products"],
       expectedRows: 15,
-      // product_id breaks revenue ties so DENSE_RANK stays unique and rank <= 3 keeps exactly
-      // three rows per category. QUALIFY is not in the surface; the window feeds a CTE instead.
-      sql: "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY revenue DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
+      // Ranking on ROUND(revenue, 4) makes mathematically-tied revenues true ties in every
+      // engine — summation-order float noise would otherwise pick different winners — and
+      // product_id then breaks those ties so DENSE_RANK stays unique and rank <= 3 keeps
+      // exactly three rows per category. QUALIFY is not in the surface; the window feeds a
+      // CTE instead.
+      sql: "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
+      // Postgres has no ROUND(double precision, int); the window key casts through numeric.
+      engineSql: {
+        pglite:
+          "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue::numeric, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
+      },
       columns: ["category", "product_id", "revenue", "rank"],
       project: (row) => [row.category, row.productId, row.revenue, row.rank],
       baseline: rankedProductsIndexed,
@@ -526,7 +534,43 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
       baseline: orderAdjustmentsIndexed,
       oracle: orderAdjustments,
     },
+    {
+      id: "q16",
+      name: "Support message text search",
+      complexity: "simple",
+      tables: ["support_messages"],
+      expectedRows: expectedMessageSearchRows(orderRows),
+      // Search-as-you-type: a contains-LIKE over the highest-cardinality text column,
+      // newest matches first. message_id breaks (impossible today) timestamp ties.
+      sql: "SELECT message_id, ticket_id, author_type, sent_at FROM support_messages WHERE body LIKE '%message 12%' ORDER BY sent_at DESC, message_id LIMIT 25",
+      columns: ["message_id", "ticket_id", "author_type", "sent_at"],
+      project: (row) => [row.message_id, row.ticket_id, row.author_type, row.sent_at],
+      baseline: (context) => messageSearch(rows(context.tables, "support_messages")),
+      oracle: (tables) => messageSearch(rows(tables, "support_messages")),
+    },
   ];
+}
+
+/** Shared by q16's baseline and oracle: contains-match, newest first, capped at 25. */
+function messageSearch(messageRows: DatabaseRow[]): DatabaseRow[] {
+  return messageRows
+    .filter((row) => stringField(row, "body").includes("message 12"))
+    .sort(
+      (left, right) =>
+        dateField(right, "sent_at").getTime() - dateField(left, "sent_at").getTime() ||
+        numberField(left, "message_id") - numberField(right, "message_id"),
+    )
+    .slice(0, 25);
+}
+
+/** support_messages holds 1.5 rows per order; bodies end in their 1-based message id. */
+function expectedMessageSearchRows(orderRows: number): number {
+  const messageRows = Math.max(1, Math.ceil(orderRows * 1.5));
+  let matches = 0;
+  for (let id = 1; id <= messageRows; id += 1) {
+    if (String(id).startsWith("12")) matches += 1;
+  }
+  return Math.min(25, matches);
 }
 /**
  * Shared by q2's baseline and oracle so both apply the same tie-break the SQL uses; the
@@ -701,6 +745,11 @@ function repeatCustomersWithoutReturns(tables: ReadonlyMap<string, DatabaseRow[]
     .map(([customerId, count]) => ({ customerId, count }));
 }
 
+/** Mirrors q7's ROUND(revenue, 4) window key so float-noise near-ties rank identically. */
+function roundedRevenue(revenue: number): number {
+  return Math.round(revenue * 10_000) / 10_000;
+}
+
 function rankedProducts(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
   const products = new Map(
     rows(tables, "products").map((row) => [numberField(row, "product_id"), row]),
@@ -725,7 +774,11 @@ function rankedProducts(tables: ReadonlyMap<string, DatabaseRow[]>): unknown[] {
   }
   return [...byCategory].flatMap(([category, values]) =>
     values
-      .sort((left, right) => right.revenue - left.revenue || left.productId - right.productId)
+      .sort(
+        (left, right) =>
+          roundedRevenue(right.revenue) - roundedRevenue(left.revenue) ||
+          left.productId - right.productId,
+      )
       .slice(0, 3)
       .map((value, index) => ({ category, ...value, rank: index + 1 })),
   );
@@ -851,7 +904,11 @@ function rankedProductsIndexed(context: ReferenceQueryContext): unknown[] {
   }
   return [...byCategory].flatMap(([category, values]) =>
     values
-      .sort((left, right) => right.revenue - left.revenue || left.productId - right.productId)
+      .sort(
+        (left, right) =>
+          roundedRevenue(right.revenue) - roundedRevenue(left.revenue) ||
+          left.productId - right.productId,
+      )
       .slice(0, 3)
       .map((value, index) => ({ category, ...value, rank: index + 1 })),
   );

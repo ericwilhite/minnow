@@ -7,24 +7,17 @@
  * a fresh worker rebuilds the dataset from the deterministic generator before serving queries.
  */
 import * as duckdb from "@duckdb/duckdb-wasm";
+import * as arrow from "apache-arrow";
 import duckdbWasmMvp from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
 import duckdbWasmEh from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
 import duckdbWorkerMvp from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
 import duckdbWorkerEh from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import { generateEntityBatch, getScenario } from "../benchmark.js";
 import type { DatasetRecord, EngineMaterialization } from "../protocol.js";
-import {
-  canonicalizeRow,
-  createTableSql,
-  quoteIdentifier,
-  rowsFromColumns,
-  secondaryIndexSql,
-} from "./shared.js";
+import { canonicalizeRow, createTableSql, quoteIdentifier, secondaryIndexSql } from "./shared.js";
 import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
 
 const BATCH_ROWS = 50_000;
-/** Rows per INSERT statement; values are rendered as SQL literals. */
-const ROWS_PER_STATEMENT = 2_000;
 
 const BUNDLES: duckdb.DuckDBBundles = {
   mvp: { mainModule: duckdbWasmMvp, mainWorker: duckdbWorkerMvp },
@@ -50,12 +43,46 @@ function duckdbInstance(): Promise<DuckDbInstance> {
   return instancePromise;
 }
 
-function literal(value: boolean | number | string | null, type: string): string {
-  if (value === null) return "NULL";
-  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "NULL";
-  const escaped = value.replaceAll("'", "''");
-  return type === "TIMESTAMP" ? `TIMESTAMP '${escaped}'` : `'${escaped}'`;
+/**
+ * Builds one explicitly-typed Arrow table for a generated batch — duckdb-wasm's documented
+ * bulk-ingestion path. Types are pinned rather than inferred so appends always match the
+ * DDL schema: Float64 → DOUBLE, Utf8 → VARCHAR, Bool → BOOLEAN, TimestampMillisecond →
+ * TIMESTAMP.
+ */
+function arrowBatch(
+  entity: { columns: ReadonlyArray<{ name: string; type: string }> },
+  columns: Record<string, ReadonlyArray<boolean | number | string | Date | null>>,
+): arrow.Table {
+  const vectors: Record<string, arrow.Vector> = {};
+  for (const column of entity.columns) {
+    const values = columns[column.name] ?? [];
+    switch (column.type) {
+      case "number":
+        vectors[column.name] = arrow.vectorFromArray(
+          values as Array<number | null>,
+          new arrow.Float64(),
+        );
+        break;
+      case "boolean":
+        vectors[column.name] = arrow.vectorFromArray(
+          values as Array<boolean | null>,
+          new arrow.Bool(),
+        );
+        break;
+      case "datetime":
+        vectors[column.name] = arrow.vectorFromArray(
+          (values as Array<Date | null>).map((value) => (value === null ? null : value.getTime())),
+          new arrow.TimestampMillisecond(),
+        );
+        break;
+      default:
+        vectors[column.name] = arrow.vectorFromArray(
+          values as Array<string | null>,
+          new arrow.Utf8(),
+        );
+    }
+  }
+  return new arrow.Table(vectors);
 }
 
 /** Arrow's Timestamp type id; arrow-js hands values back as epoch milliseconds. */
@@ -88,27 +115,15 @@ async function buildDataset(
     let completedRows = 0;
     for (const entity of entities) {
       const entityRows = entity.rows(record.scale);
-      const types = entity.columns.map((column) =>
-        column.type === "datetime" ? "TIMESTAMP" : "OTHER",
-      );
-      const columnList = entity.columns.map((column) => quoteIdentifier(column.name)).join(", ");
       for (let start = 0; start < entityRows; start += BATCH_ROWS) {
         checkCancelled?.();
         const rowCount = Math.min(BATCH_ROWS, entityRows - start);
         const columns = generateEntityBatch(entity, start, rowCount, entityRows, record.scale);
-        const rows = rowsFromColumns(entity, columns);
         const insertStarted = performance.now();
-        for (let offset = 0; offset < rows.length; offset += ROWS_PER_STATEMENT) {
-          const tuples = rows
-            .slice(offset, offset + ROWS_PER_STATEMENT)
-            .map(
-              (row) =>
-                `(${row.map((value, index) => literal(value, types[index] ?? "OTHER")).join(", ")})`,
-            );
-          await connection.query(
-            `INSERT INTO ${quoteIdentifier(entity.name)} (${columnList}) VALUES ${tuples.join(", ")}`,
-          );
-        }
+        await connection.insertArrowTable(arrowBatch(entity, columns), {
+          name: entity.name,
+          create: false,
+        });
         insertMs += performance.now() - insertStarted;
         completedRows += rowCount;
         report?.(`DuckDB · ${entity.name}`, completedRows);

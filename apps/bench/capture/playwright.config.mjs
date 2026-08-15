@@ -22,6 +22,9 @@ export default defineConfig({
   testDir: ".",
   timeout: 5_400_000,
   workers: 1,
+  // First cold-cache serve of a large worker dependency can trigger one dev-server
+  // reload mid-run; the retry then runs against the warmed optimizer.
+  retries: 1,
   reporter: [["line"]],
   webServer: {
     command: "npm run dev --workspace @minnowdb/bench -- --host 127.0.0.1 --port 4176 --strictPort",

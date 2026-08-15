@@ -81,7 +81,7 @@ const fmtMB = (bytes: number): string => `${(bytes / (1024 * 1024)).toFixed(1)} 
 
 /* ---------- horizontal bar chart geometry ---------- */
 const BAR_W = 860;
-const BAR_LABEL_W = 130;
+const BAR_LABEL_W = 152;
 const BAR_VALUE_W = 84;
 const BAR_H = 22;
 const BAR_GAP = 12;
@@ -135,13 +135,17 @@ const buildBars = barChart(
   })),
 );
 
+// Engines with no stored bytes to report (in-memory DuckDB) are omitted rather than
+// drawn as a misleading zero-length bar.
 const sizeBars = barChart(
-  engines.map((engine) => ({
-    name: label(engine),
-    slot: slot(engine),
-    value: results.dataset.engines[engine]?.storedBytes ?? 0,
-    valueLabel: fmtMB(results.dataset.engines[engine]?.storedBytes ?? 0),
-  })),
+  engines
+    .filter((engine) => (results.dataset.engines[engine]?.storedBytes ?? null) !== null)
+    .map((engine) => ({
+      name: label(engine),
+      slot: slot(engine),
+      value: results.dataset.engines[engine]?.storedBytes ?? 0,
+      valueLabel: fmtMB(results.dataset.engines[engine]?.storedBytes ?? 0),
+    })),
 );
 
 /* ---------- per-query dot plot (log scale) ---------- */
@@ -228,7 +232,7 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     <div class="chart-card half">
       <h3>Stored size</h3>
       <p class="chart-sub">
-        Each engine's own report of its stored bytes — Minnow's block ledger, SQLite's
+        Each engine's own report of its stored bytes — Minnow's block ledger, SQLite's{" "}
         <code>page_count × page_size</code>, PGlite's <code>pg_database_size</code>. The dataset
         is deterministic, so these are identical across browsers by construction.
       </p>

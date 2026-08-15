@@ -23,6 +23,9 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
+    // Pre-bundle at server start: a dep first discovered mid-session triggers a full page
+    // reload, which kills any in-flight capture worker.
+    include: ["apache-arrow"],
     exclude: ["@sqlite.org/sqlite-wasm", "@electric-sql/pglite"],
   },
   worker: {

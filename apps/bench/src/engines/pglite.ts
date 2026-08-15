@@ -22,9 +22,14 @@ function dataDirName(record: DatasetRecord): string {
  * Date objects: the generator writes UTC wall-clock values, and letting a Date parser
  * reinterpret them in the local zone would corrupt cross-engine comparison.
  */
-function openPglite(name: string): Promise<PGlite> {
+async function openPglite(name: string, durability: DatasetRecord["durability"]): Promise<PGlite> {
   const identity = (value: string | null): string | null => value;
-  return PGlite.create(`idb://${name}`, {
+  // relaxedDurability would mirror Minnow's relaxed IndexedDB mode, but PGlite 0.5.4's
+  // relaxed flush races its own IDBFS connection during bulk loads and crashes the worker
+  // ("The database connection is closing"), so the driver stays on strict durability —
+  // the only mode that survives the workload.
+  void durability;
+  const database = await PGlite.create(`idb://${name}`, {
     parsers: {
       [types.TIMESTAMP]: identity,
       [types.TIMESTAMPTZ]: identity,
@@ -34,6 +39,11 @@ function openPglite(name: string): Promise<PGlite> {
       [types.NUMERIC]: (value: string | null) => (value === null ? null : Number(value)),
     },
   });
+  // Postgres ships a 4 MB work_mem default sized for many concurrent sessions; this is a
+  // single-session analytical workload, so give sorts, hash joins, and index builds the
+  // same 64 MiB the other engines' caches get instead of forcing spills.
+  await database.exec("SET work_mem = '64MB'; SET maintenance_work_mem = '64MB';");
+  return database;
 }
 
 /**
@@ -61,7 +71,7 @@ export const pgliteDriver: EngineDriver = {
     const { record } = context;
     const started = performance.now();
     const name = dataDirName(record);
-    let database = await openPglite(name);
+    let database = await openPglite(name, record.durability);
     let insertMs = 0;
     try {
       const entities = getScenario("commerce").entities;
@@ -103,7 +113,7 @@ export const pgliteDriver: EngineDriver = {
       await database.syncToFs();
       // Close and reopen so what the record marks "ready" is what actually persisted.
       await database.close();
-      database = await openPglite(name);
+      database = await openPglite(name, record.durability);
       const orderRows =
         entities.find((entity) => entity.name === "orders")?.rows(record.scale) ?? 0;
       const counted = await database.query<{ row_count: number | bigint }>(
@@ -135,7 +145,7 @@ export const pgliteDriver: EngineDriver = {
   },
 
   async openSession(record: DatasetRecord): Promise<EngineSession> {
-    const database = await openPglite(dataDirName(record));
+    const database = await openPglite(dataDirName(record), record.durability);
     let nextStatement = 0;
     return {
       engine: "pglite",

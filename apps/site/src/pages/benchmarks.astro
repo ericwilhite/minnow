@@ -66,8 +66,8 @@ const engineLabels: Record<string, string> = {
       <p class="lede">
         {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} loading and
         querying identical commerce datasets ({scaleStats
-          .map((entry) => `${fmtRows(entry.totalRows)} rows`)
-          .join(" and ")}) in real browsers. Every query result is checksum-verified identical
+          .map((entry) => fmtRows(entry.totalRows))
+          .join(", ")} rows) in real browsers. Every query result is checksum-verified identical
         across all engines before any timing counts.
       </p>
     </header>
@@ -181,6 +181,16 @@ const engineLabels: Record<string, string> = {
             </li>
           )
         }
+        <li>
+          Each engine runs its documented best-practice configuration: SQLite Wasm with
+          exclusive OPFS locking, a 64 MiB page cache, TRUNCATE journaling, and{" "}
+          <code>synchronous=NORMAL</code>; PGlite with 64 MB <code>work_mem</code>{" "}
+          (its relaxed-durability mode is excluded — it crashes mid-load in this workload);
+          DuckDB fed through Arrow bulk ingestion.
+          All engines get identical schemas, secondary indexes on every foreign key, post-load
+          statistics (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine
+          prepared statements.
+        </li>
         <li>
           Captured headless on an {first.host.model} ({first.host.cpus} cores). Absolute numbers
           vary by machine; the relationships are the point.
@@ -354,18 +364,21 @@ const engineLabels: Record<string, string> = {
   }
 
   .bench:not(:has(input[name="bench-scale"])) .scale-stats,
-  .bench:has(#scale-25:checked) .scale-stats-25,
-  .bench:has(#scale-100:checked) .scale-stats-100 {
+  .bench:has(#scale-1:checked) .scale-stats-1,
+  .bench:has(#scale-5:checked) .scale-stats-5,
+  .bench:has(#scale-25:checked) .scale-stats-25 {
     display: grid;
   }
 
   .bench:not(:has(input[name="bench-scale"])):has(#toggle-chromium:checked)
     section[id$="-chromium"],
   .bench:not(:has(input[name="bench-scale"])):has(#toggle-firefox:checked) section[id$="-firefox"],
+  .bench:has(#scale-1:checked):has(#toggle-chromium:checked) #pane-1-chromium,
+  .bench:has(#scale-1:checked):has(#toggle-firefox:checked) #pane-1-firefox,
+  .bench:has(#scale-5:checked):has(#toggle-chromium:checked) #pane-5-chromium,
+  .bench:has(#scale-5:checked):has(#toggle-firefox:checked) #pane-5-firefox,
   .bench:has(#scale-25:checked):has(#toggle-chromium:checked) #pane-25-chromium,
-  .bench:has(#scale-25:checked):has(#toggle-firefox:checked) #pane-25-firefox,
-  .bench:has(#scale-100:checked):has(#toggle-chromium:checked) #pane-100-chromium,
-  .bench:has(#scale-100:checked):has(#toggle-firefox:checked) #pane-100-firefox {
+  .bench:has(#scale-25:checked):has(#toggle-firefox:checked) #pane-25-firefox {
     display: grid;
   }
 

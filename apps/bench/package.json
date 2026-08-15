@@ -15,7 +15,8 @@
     "@shikijs/engine-javascript": "^4.4.3",
     "@shikijs/langs": "^4.4.3",
     "@shikijs/themes": "^4.4.3",
-    "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
+    "apache-arrow": "^17.0.0"
   },
   "devDependencies": {
     "vite": "^8.2.1"
