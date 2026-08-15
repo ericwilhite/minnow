@@ -129,6 +129,108 @@ describe("AFTER triggers", () => {
     );
   });
 
+  it("supports BEFORE timing with identical atomicity", async () => {
+    const database = await seeded();
+    await database.execute(
+      "CREATE TRIGGER before_audit BEFORE INSERT ON accounts FOR EACH ROW BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('before', NEW.id, NEW.balance); END",
+    );
+    const result = await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [10], owner: ["ada"] },
+    });
+    const audit = await database.query("SELECT action, amount FROM audit", {
+      version: result.version,
+    });
+    expect(audit.rows).toEqual([{ action: "before", amount: 10 }]);
+  });
+
+  it("runs UPDATE and DELETE trigger bodies against keyed targets", async () => {
+    const database = await seeded();
+    await database.createTable({
+      name: "owner_stats",
+      uniqueKey: "owner",
+      columns: [
+        { name: "owner", type: "string" },
+        { name: "accounts", type: "number" },
+      ],
+    });
+    await database.insertBatch("owner_stats", {
+      columns: { owner: ["ada", "grace"], accounts: [0, 0] },
+    });
+    await database.execute(
+      "CREATE TRIGGER count_up AFTER INSERT ON accounts BEGIN " +
+        "UPDATE owner_stats SET accounts = accounts + 1 WHERE owner = NEW.owner; END",
+    );
+    await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [10], owner: ["ada"] },
+    });
+    await database.insertBatch("accounts", {
+      columns: { id: [2], balance: [20], owner: ["ada"] },
+    });
+    // Two separate commits compound: the body reads current state each firing.
+    expect(
+      (await database.query("SELECT owner, accounts FROM owner_stats ORDER BY owner")).rows,
+    ).toEqual([
+      { owner: "ada", accounts: 2 },
+      { owner: "grace", accounts: 0 },
+    ]);
+    // DELETE bodies prune keyed targets.
+    await database.execute(
+      "CREATE TRIGGER drop_stats AFTER DELETE ON accounts BEGIN " +
+        "DELETE FROM owner_stats WHERE owner = OLD.owner; END",
+    );
+    await database.deleteBatch("accounts", { keys: [1] });
+    expect((await database.query("SELECT owner FROM owner_stats ORDER BY owner")).rows).toEqual([
+      { owner: "grace" },
+    ]);
+    // The same target row touched twice in one firing cannot compound and is rejected.
+    await expect(
+      database.insertBatch("accounts", {
+        columns: { id: [10, 11], balance: [1, 2], owner: ["grace", "grace"] },
+      }),
+    ).rejects.toThrow("touched the same owner_stats row twice");
+    expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 1 }]);
+  });
+
+  it("allows one cascade level and errors loudly on deeper chains", async () => {
+    const database = await seeded();
+    await database.createTable({
+      name: "mirror",
+      columns: [{ name: "action", type: "string" }],
+    });
+    await database.execute(
+      "CREATE TRIGGER audit_mirror AFTER INSERT ON audit BEGIN " +
+        "INSERT INTO mirror (action) VALUES (NEW.action); END",
+    );
+    await database.execute(
+      "CREATE TRIGGER account_audit AFTER INSERT ON accounts BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('insert', NEW.id, NEW.balance); END",
+    );
+    const result = await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [10], owner: ["ada"] },
+    });
+    // Primary -> audit (trigger) -> mirror (one cascade level), all in one commit.
+    expect(
+      (await database.query("SELECT action FROM mirror", { version: result.version })).rows,
+    ).toEqual([{ action: "insert" }]);
+    // A third level errors at write time and the whole commit vanishes.
+    await database.createTable({
+      name: "deep",
+      columns: [{ name: "action", type: "string" }],
+    });
+    await database.execute(
+      "CREATE TRIGGER mirror_deep AFTER INSERT ON mirror BEGIN " +
+        "INSERT INTO deep (action) VALUES (NEW.action); END",
+    );
+    await expect(
+      database.insertBatch("accounts", {
+        columns: { id: [2], balance: [20], owner: ["grace"] },
+      }),
+    ).rejects.toThrow("Trigger cascade depth exceeded");
+    expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 1 }]);
+    expect((await database.query("SELECT COUNT(*) AS n FROM mirror")).rows).toEqual([{ n: 1 }]);
+  });
+
   it("rejects invalid trigger definitions at CREATE time", async () => {
     const database = await seeded();
     await expect(
@@ -136,7 +238,7 @@ describe("AFTER triggers", () => {
         "CREATE TRIGGER bad AFTER INSERT ON accounts BEGIN " +
           "INSERT INTO audit (action) VALUES (OLD.owner); END",
       ),
-    ).rejects.toThrow("AFTER INSERT triggers have no OLD row");
+    ).rejects.toThrow("INSERT triggers have no OLD row");
     await expect(
       database.execute(
         "CREATE TRIGGER bad AFTER INSERT ON accounts BEGIN " +
@@ -151,7 +253,6 @@ describe("AFTER triggers", () => {
           "INSERT INTO accounts (id, balance, owner) VALUES (1, 2, 'x'); END",
       ),
     ).rejects.toThrow("keyless tables only");
-    // Cascades are rejected, not silently skipped.
     await database.createTable({
       name: "mirror",
       columns: [{ name: "action", type: "string" }],
@@ -162,18 +263,16 @@ describe("AFTER triggers", () => {
     );
     await expect(
       database.execute(
-        "CREATE TRIGGER cascade_attempt AFTER INSERT ON accounts BEGIN " +
-          "INSERT INTO audit (action) VALUES ('x'); END",
-      ),
-    ).rejects.toThrow("Trigger cascades are not supported");
-    await expect(
-      database.execute(
         "CREATE TRIGGER audit_mirror AFTER INSERT ON mirror BEGIN " +
           "INSERT INTO audit (action) VALUES ('x'); END",
       ),
     ).rejects.toThrow("Trigger already exists");
+    // Body UPDATE/DELETE statements need keyed targets; body INSERTs need keyless ones.
     await expect(
-      database.execute("CREATE TRIGGER b BEFORE INSERT ON accounts BEGIN INSERT INTO x; END"),
-    ).rejects.toThrow("AFTER triggers only");
+      database.execute(
+        "CREATE TRIGGER bad AFTER INSERT ON accounts BEGIN " +
+          "UPDATE audit SET action = 'x' WHERE action = 'y'; END",
+      ),
+    ).rejects.toThrow("need a keyed table");
   });
 });

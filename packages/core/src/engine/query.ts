@@ -771,6 +771,7 @@ export type CompiledStatement =
       trigger: {
         name: string;
         event: "insert" | "update" | "delete";
+        timing: "before" | "after";
         statements: Array<{
           /** Body INSERT with every NEW.col / OLD.col rewritten to a positional placeholder. */
           sql: string;
@@ -804,9 +805,10 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     return token.text;
   };
   const name = identifier("a trigger name");
-  if (!keywordAt(cursor, "AFTER")) {
-    throw new TypeError("CREATE TRIGGER supports AFTER triggers only");
-  }
+  let timing: "before" | "after";
+  if (keywordAt(cursor, "AFTER")) timing = "after";
+  else if (keywordAt(cursor, "BEFORE")) timing = "before";
+  else throw new TypeError("CREATE TRIGGER supports BEFORE and AFTER triggers");
   cursor += 1;
   const eventText = identifier("a trigger event").toUpperCase();
   if (eventText !== "INSERT" && eventText !== "UPDATE" && eventText !== "DELETE") {
@@ -876,11 +878,17 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
       sql = `${sql.slice(0, rewrite.start - sliceStart)}?${sql.slice(rewrite.end - sliceStart)}`;
     }
     const compiled = compileStatement(sql);
-    if (compiled.kind !== "insert" || compiled.query !== undefined) {
-      throw new TypeError("Trigger bodies support INSERT ... VALUES statements");
+    if (compiled.kind !== "insert" && compiled.kind !== "update" && compiled.kind !== "delete") {
+      throw new TypeError("Trigger bodies support INSERT, UPDATE, and DELETE statements");
     }
-    if (compiled.onConflict !== undefined) {
+    if (compiled.kind === "insert" && compiled.query !== undefined) {
+      throw new TypeError("Trigger body INSERTs use VALUES");
+    }
+    if (compiled.kind === "insert" && compiled.onConflict !== undefined) {
       throw new TypeError("Trigger body INSERTs cannot carry ON CONFLICT");
+    }
+    if (compiled.kind !== "insert" && compiled.returning !== undefined) {
+      throw new TypeError("Trigger bodies cannot carry RETURNING");
     }
     if ((compiled.parameterCount ?? 0) !== bindings.length) {
       throw new TypeError("Trigger body placeholders must all come from NEW/OLD references");
@@ -890,7 +898,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
   if (tokens[endIndex + 1]?.kind !== "eof") {
     throw new TypeError("Unexpected input after the trigger body END");
   }
-  return { kind: "create-trigger", table, trigger: { name, event, statements } };
+  return { kind: "create-trigger", table, trigger: { name, event, timing, statements } };
 }
 
 /**

@@ -352,6 +352,8 @@ export class MinnowDatabaseClient {
     ): Promise<StagedWriteResult> =>
       this._invoke(opened.handleId, "stage", [op, tableName, input]) as Promise<StagedWriteResult>;
     const session: ClientWriteSession = {
+      query: (sql, options) =>
+        this._invoke(opened.handleId, "query", [sql, options]) as Promise<QueryResult>,
       insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
       upsertBatch: (tableName, input) => stage("upsertBatch", tableName, input),
       updateBatch: (tableName, input) => stage("updateBatch", tableName, input),
@@ -557,6 +559,8 @@ export class MinnowDatabaseClient {
  */
 /** The scope handed to the client `write()`; mirrors the in-worker WriteSession. */
 export interface ClientWriteSession {
+  /** Read-your-writes: observes the pre-scope snapshot plus everything staged so far. */
+  query(sql: string, options?: { params?: QueryValue[] }): Promise<QueryResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;

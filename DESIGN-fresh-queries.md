@@ -350,6 +350,20 @@ Both prior follow-ups landed (2026-08-14, same day):
   derivations publish atomically. v1 bounds enforced loudly at CREATE: keyless body targets,
   no cascades, no BEFORE/statement-level triggers — those are the v2 surface, alongside
   UPDATE/DELETE bodies.
+- **Trigger v2 + scope reads — landed (2026-08-14).** BEFORE timing (bodies stage ahead of
+  the primary write; atomicity and visibility identical to AFTER, so timing is a
+  portability feature), UPDATE/DELETE bodies against keyed targets (per-row NEW/OLD
+  binding, current-state reads each firing, same-target-row-twice rejected), and one
+  cascade level (deeper chains error at write time with full rollback). write() scopes
+  gained read-your-writes: `session.query()` executes at a doctored visibility — the
+  scope's lease plus its staged segments overlaid as committed, ordered after all
+  committed data — and in-scope UPDATE/DELETE resolve keys through the scope's staged
+  key-membership overlay, so a row inserted moments earlier in the same scope can be
+  updated, deleted, and read back before anything publishes. Fixing that surfaced a
+  latent ordering bug: the journal stores pendingSegmentIds sorted, and commit stamps
+  every segment of a transaction with the same logicalOrder, so two same-commit segments
+  touching one key folded in UUID order. Segments now persist a `commitOrdinal` stamped
+  at staging time, and the visible-segment sort breaks logicalOrder ties on it.
 
 ## Risks and open questions
 

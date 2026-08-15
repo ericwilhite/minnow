@@ -238,6 +238,10 @@ class DatabaseRpcServer {
         return undefined;
       }
       case "write": {
+        if (method === "query") {
+          const [sql, options] = args as [string, { params?: unknown } | undefined];
+          return handle.session.query(sql, options as never);
+        }
         if (method === "stage") {
           const [op, tableName, input] = args as [keyof WriteSession, string, never];
           return handle.session[op](tableName, input);

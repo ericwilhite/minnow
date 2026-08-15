@@ -206,21 +206,29 @@ export class DatabaseTransaction {
         throw new Error(`Segment ${segment.id} belongs to another transaction`);
       }
     }
+    // The journal stores pendingSegmentIds deduped and sorted, so staging position is the
+    // only record of operation order within this transaction. Stamp it on the segments:
+    // reads use it to fold same-commit segments in the order they were staged.
+    const ordinalBase = this.#record.pendingSegmentIds.length;
+    const ordered = segments.map((segment, index) => ({
+      ...segment,
+      commitOrdinal: segment.commitOrdinal ?? ordinalBase + index,
+    }));
     const batched = this.store.stageTransactionArtifacts?.bind(this.store);
     if (batched === undefined) {
       await this.stageBlocks(blocks);
-      for (const segment of segments) await this.stageSegment(segment);
+      for (const segment of ordered) await this.stageSegment(segment);
       return;
     }
-    if (blocks.length === 0 && segments.length === 0) return;
+    if (blocks.length === 0 && ordered.length === 0) return;
     this.#record = await batched({
       transactionId: this.id,
       expectedRevision: this.#record.revision,
       blocks,
-      segments,
+      segments: ordered,
       updatedAt: this.now().toISOString(),
     });
-    for (const segment of segments) this.#changedTableIds.add(segment.tableId);
+    for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
   }
 
   /**
@@ -254,6 +262,9 @@ export class DatabaseTransaction {
     if (record.transactionId !== this.id) {
       throw new Error(`Segment ${record.id} belongs to another transaction`);
     }
+    if (record.commitOrdinal === undefined) {
+      record = { ...record, commitOrdinal: this.#record.pendingSegmentIds.length };
+    }
     this.#changedTableIds.add(record.tableId);
     await this.store.addSegment(record);
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
@@ -286,6 +297,11 @@ export class DatabaseTransaction {
   markLogicallyUnchanged(): void {
     this.#assertActive();
     this.#logicallyUnchanged = true;
+  }
+
+  /** Accumulated key changes in operation order, for in-scope membership overlays. */
+  get accumulatedUniqueKeyChanges(): readonly UniqueKeyChanges[] {
+    return this.#uniqueKeyChanges;
   }
 
   /** Appends one operation's key changes; entries commit in operation order. */

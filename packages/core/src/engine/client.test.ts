@@ -222,6 +222,12 @@ describe("MinnowDatabaseClient", () => {
         columns: { id: [2], name: ["Grace"], joined: [new Date()] },
       });
       await tx.updateBatch("people", { keys: [1], changes: { name: ["Countess"] } });
+      // Read-your-writes across the channel: the staged rows are visible in-scope only.
+      expect((await tx.query("SELECT name FROM people ORDER BY name")).rows).toEqual([
+        { name: "Countess" },
+        { name: "Grace" },
+      ]);
+      expect((await client.query("SELECT COUNT(*) AS n FROM people")).rows).toEqual([{ n: 1 }]);
       return staged.rowCount;
     });
     expect(result).toBe(1);

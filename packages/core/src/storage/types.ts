@@ -220,6 +220,12 @@ export interface TableRecord {
 export interface TriggerRecord {
   name: string;
   event: "insert" | "update" | "delete";
+  /**
+   * BEFORE and AFTER differ only in body staging order here: both fire in the committing
+   * writer inside the triggering commit, so the pair exists for SQL portability, with
+   * identical atomicity.
+   */
+  timing: "before" | "after";
   /** Body statements in order; each fires once per affected row. */
   statements: TriggerStatementRecord[];
   createdAt: string;
@@ -269,6 +275,12 @@ export interface SegmentRecord {
   level?: number;
   /** Missing on legacy records, where commit order supplies the logical order. */
   logicalOrder?: number;
+  /**
+   * Staging position inside the owning transaction. Orders segments of one commit relative
+   * to each other (an in-scope update must fold after the in-scope insert it patches);
+   * missing on legacy records, which never shared a key within one commit.
+   */
+  commitOrdinal?: number;
   /** Missing on legacy insert/upsert records, which imply one contiguous row-ID span. */
   rowIdSpans?: readonly RowIdSpan[];
   /** Monotone policy ordinal for an immutable append-row-range level-two partition. */

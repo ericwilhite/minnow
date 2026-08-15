@@ -173,6 +173,85 @@ describe("atomic write scopes", () => {
     });
   }
 
+  for (const implementation of implementations) {
+    it(`${implementation.name} reads its own staged writes inside the scope`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      await database.write(async (tx) => {
+        // Outside the scope: committed state only. Inside: staged rows overlay it.
+        await tx.insertBatch("accounts", { columns: { id: [3], balance: [50] } });
+        expect((await tx.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 3 }]);
+        expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([
+          { n: 2 },
+        ]);
+        await tx.updateBatch("accounts", { keys: [1], changes: { balance: [400] } });
+        expect((await tx.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
+          { balance: 400 },
+        ]);
+        await tx.deleteBatch("accounts", { keys: [2] });
+        expect((await tx.query("SELECT id, balance FROM accounts ORDER BY id")).rows).toEqual([
+          { id: 1, balance: 400 },
+          { id: 3, balance: 50 },
+        ]);
+        // Aggregates and params run through the same doctored read.
+        expect(
+          (
+            await tx.query("SELECT SUM(balance) AS total FROM accounts WHERE balance >= ?", {
+              params: [50],
+            })
+          ).rows,
+        ).toEqual([{ total: 450 }]);
+      });
+      // After commit, the outside view converges on what the scope saw.
+      expect((await database.query("SELECT id, balance FROM accounts ORDER BY id")).rows).toEqual([
+        { id: 1, balance: 400 },
+        { id: 3, balance: 50 },
+      ]);
+    });
+
+    it(`${implementation.name} updates and deletes rows staged in the same scope`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      await database.write(async (tx) => {
+        await tx.insertBatch("accounts", { columns: { id: [10], balance: [5] } });
+        // The staged key is updatable in-scope even though it is not committed yet.
+        await tx.updateBatch("accounts", { keys: [10], changes: { balance: [7] } });
+        expect((await tx.query("SELECT balance FROM accounts WHERE id = 10")).rows).toEqual([
+          { balance: 7 },
+        ]);
+        // A key deleted in-scope is gone for later statements in the same scope.
+        await tx.deleteBatch("accounts", { keys: [10] });
+        await expect(
+          tx.updateBatch("accounts", { keys: [10], changes: { balance: [9] } }),
+        ).rejects.toThrow();
+      });
+      expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 2 }]);
+    });
+  }
+
+  it("gives trigger pre-images the scope's view of staged rows", async () => {
+    const database = await bank(new MemoryBlockStore());
+    await database.createTable({
+      name: "audit",
+      columns: [
+        { name: "account_id", type: "number" },
+        { name: "old_balance", type: "number" },
+      ],
+    });
+    await database.execute(
+      "CREATE TRIGGER account_update_audit AFTER UPDATE ON accounts BEGIN " +
+        "INSERT INTO audit (account_id, old_balance) VALUES (OLD.id, OLD.balance); END",
+    );
+    await database.write(async (tx) => {
+      await tx.insertBatch("accounts", { columns: { id: [30], balance: [11] } });
+      // OLD for the staged row must read the staged value, not "missing".
+      await tx.updateBatch("accounts", { keys: [30], changes: { balance: [12] } });
+    });
+    expect((await database.query("SELECT account_id, old_balance FROM audit")).rows).toEqual([
+      { account_id: 30, old_balance: 11 },
+    ]);
+  });
+
   it("surfaces concurrent commits as explicit conflicts; a retry succeeds", async () => {
     const store = new MemoryBlockStore();
     const database = await bank(store);

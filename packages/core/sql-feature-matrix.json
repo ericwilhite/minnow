@@ -518,7 +518,23 @@
       "id": "trigger.create-after",
       "status": "supported",
       "example": "CREATE TRIGGER keyed_audit AFTER INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END",
-      "notes": "AFTER INSERT/UPDATE/DELETE row triggers with INSERT ... VALUES bodies over NEW/OLD references, executed atomically inside the triggering commit. Bodies target keyless tables; cascades and BEFORE triggers are rejected."
+      "notes": "AFTER and BEFORE row triggers on INSERT/UPDATE/DELETE, executed atomically inside the triggering commit with NEW/OLD references. Bodies: INSERT ... VALUES into keyless tables; UPDATE/DELETE against keyed tables. One cascade level is allowed; deeper chains error at write time."
+    },
+    {
+      "id": "trigger.create-before",
+      "status": "supported",
+      "example": "CREATE TRIGGER keyed_before BEFORE INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END",
+      "notes": "BEFORE bodies stage ahead of the primary write but publish in the same atomic commit, so timing is a portability feature: atomicity and visibility are identical to AFTER."
+    },
+    {
+      "id": "trigger.body-update-delete",
+      "status": "supported",
+      "example": "CREATE TRIGGER keyed_counts AFTER INSERT ON keyed BEGIN UPDATE stats SET total = total + NEW.score WHERE region = NEW.name; END",
+      "setup": [
+        "CREATE TABLE stats (region TEXT UNIQUE, total REAL)",
+        "INSERT INTO stats (region, total) VALUES ('east', 0), ('west', 0)"
+      ],
+      "notes": "UPDATE and DELETE trigger bodies run against keyed tables, reading current state each firing. Touching the same target row twice in one firing is rejected."
     },
     {
       "id": "trigger.drop",
