@@ -10,13 +10,16 @@ export function canonicalTuples(
   resultRows: readonly unknown[],
   project: (row: Record<string, unknown>) => unknown[],
 ): unknown[][] {
+  // The sort key is built once per row rather than inside the comparator: the write suite
+  // canonicalizes result sets of 100,000 rows, where re-deriving it per comparison would
+  // cost millions of serializations.
   return resultRows
-    .map((row) => project(row as Record<string, unknown>).map(canonicalValue))
-    .sort((left, right) => {
-      const leftKey = tupleSortKey(left);
-      const rightKey = tupleSortKey(right);
-      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
-    });
+    .map((row) => {
+      const tuple = project(row as Record<string, unknown>).map(canonicalValue);
+      return { tuple, key: tupleSortKey(tuple) };
+    })
+    .sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0))
+    .map((entry) => entry.tuple);
 }
 
 function canonicalValue(value: unknown): unknown {

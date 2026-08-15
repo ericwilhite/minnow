@@ -371,7 +371,24 @@ export interface WriteSession {
   deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
 }
 
+/** What one statement's execution cost, reported by the engine that ran it. */
+export interface QueryExecutionStats {
+  /**
+   * Peak modeled execution memory for this statement, in bytes: the documented vector,
+   * row-index, group/result payload, and ordering buffers, which is the same model
+   * `executionMemoryBudgetBytes` bounds. Boxed snapshot preparation, JavaScript container
+   * overhead, and allocator overhead are outside it. Not reported for a memo hit — nothing ran.
+   */
+  readonly peakMemoryBytes: number;
+}
+
 export interface QueryOptions {
+  /**
+   * Called once with what this execution cost, before the result is returned. Additive and
+   * optional: the engine can report its own memory because it reserves before it allocates,
+   * which is not something the storage layer or a caller could measure from outside.
+   */
+  readonly onStats?: (stats: QueryExecutionStats) => void;
   /**
    * false makes this statement compute its results instead of reusing any it has cached: the
    * probe-validated result memo, cached block results, and the columnar forms of derived and
@@ -2155,20 +2172,27 @@ export class MinnowDatabase {
       }
     }
     const prepared = await this.#prepareCompiledPlan(plan, options);
+    // Read the peak before close(): closing releases the context and zeroes what it tracked.
+    const report = (result: QueryResult): QueryResult => {
+      options.onStats?.({ peakMemoryBytes: prepared.memoryUsage.peakBytes });
+      return result;
+    };
     try {
       const spill = options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined;
-      if (!spill) return prepared.execute();
+      if (!spill) return report(prepared.execute());
       if (options.spillToStorage !== true) {
         try {
-          return prepared.execute();
+          return report(prepared.execute());
         } catch (error) {
           if (!(error instanceof QueryMemoryBudgetError)) throw error;
         }
       }
-      return await prepared.executeAsync({
-        ...(spillPageRows === undefined ? {} : { spillPageRows }),
-        spillStore: this.#leasedSpillStore(),
-      });
+      return report(
+        await prepared.executeAsync({
+          ...(spillPageRows === undefined ? {} : { spillPageRows }),
+          spillStore: this.#leasedSpillStore(),
+        }),
+      );
     } finally {
       prepared.close();
     }
@@ -4525,17 +4549,23 @@ export class MinnowDatabase {
           );
           if (!attempt.spill) {
             try {
-              return await prepared.executeAsync({ loadScanWindow: streamed.load });
+              const streamedResult = await prepared.executeAsync({
+                loadScanWindow: streamed.load,
+              });
+              options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
+              return streamedResult;
             } catch (error) {
               if (error instanceof QueryMemoryBudgetError) return undefined;
               throw error;
             }
           }
-          return await prepared.executeAsync({
+          const spilledResult = await prepared.executeAsync({
             ...(spillPageRows === undefined ? {} : { spillPageRows }),
             spillStore: this.#leasedSpillStore(),
             loadScanWindow: streamed.load,
           });
+          options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
+          return spilledResult;
         } finally {
           if (prepared === undefined) memory.close();
           else prepared.close();

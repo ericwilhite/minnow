@@ -69,12 +69,27 @@ export function sqlType(type: LogicalType): string {
   }
 }
 
-export function createTableSql(entity: EntityDefinition): string {
+/**
+ * The part of a table definition the portable DDL and row pivot need. `EntityDefinition`
+ * satisfies it, and so does the write suite's dedicated table, which has no generator.
+ */
+export interface TableShape {
+  name: string;
+  primaryKey?: string | undefined;
+  columns: ReadonlyArray<{ name: string; type: LogicalType }>;
+}
+
+export function createTableSql(entity: TableShape): string {
   const columns = entity.columns.map((column) => {
     const primary = column.name === entity.primaryKey ? " PRIMARY KEY" : "";
     return `${quoteIdentifier(column.name)} ${sqlType(column.type)}${primary}`;
   });
   return `CREATE TABLE ${quoteIdentifier(entity.name)} (${columns.join(", ")})`;
+}
+
+/** `("a", "b")` — the column list shared by INSERT statements and read-back projections. */
+export function columnList(entity: TableShape): string {
+  return entity.columns.map((column) => quoteIdentifier(column.name)).join(", ");
 }
 
 export function secondaryIndexSql(entities: readonly EntityDefinition[]): string[] {
@@ -93,7 +108,7 @@ export function quoteIdentifier(value: string): string {
 }
 
 export function rowsFromColumns(
-  entity: EntityDefinition,
+  entity: TableShape,
   columns: GeneratedBatchColumns,
 ): Array<Array<boolean | number | string | null>> {
   const rowCount = columns[entity.columns[0]?.name ?? ""]?.length ?? 0;

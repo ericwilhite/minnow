@@ -11,9 +11,10 @@
     <main>
       <h1>Benchmarks &amp; test suites</h1>
       <p class="lead">
-        Three independent suites. Reference queries verify results against hand-written JavaScript
-        oracles; the storage matrix measures MinnowDatabase's own configuration space; the
-        conformance run executes the documented SQL surface live.
+        Four independent suites. Reference queries verify results against hand-written JavaScript
+        oracles; the write suite measures inserts, updates, and upserts the same way; the storage
+        matrix measures MinnowDatabase's own configuration space; the conformance run executes the
+        documented SQL surface live.
       </p>
 
       <h2 id="reference">Reference query suite</h2>
@@ -39,6 +40,36 @@
       </div>
       <p class="status" id="ref-status"></p>
       <div id="ref-results"></div>
+
+      <hr />
+
+      <h2 id="writes">Write suite</h2>
+      <p class="note">
+        Inserts, updates, and upserts at 1, 100, and 10,000 rows (inserts also at 100,000), each
+        through the engine's own bulk path: MinnowDatabase's batch write API, one SQLite prepared
+        statement stepped inside a transaction, PGlite's multi-row statements inside a transaction,
+        and DuckDB's Arrow append. Every sample writes into a table created for that sample, so no
+        sample measures a table an earlier one grew. Each final table is read back and compared row
+        for row against a JavaScript oracle. The suite adds its own tables to the selected dataset
+        and never reads or writes the dataset's own tables; MinnowDatabase has no DROP TABLE, so its
+        copies stay until the dataset is deleted.
+      </p>
+      <fieldset>
+        <div>
+          <label for="write-dataset">Dataset</label>
+          <select id="write-dataset"></select>
+        </div>
+      </fieldset>
+      <div class="checkbox-row" id="write-engines"></div>
+      <div class="actions">
+        <button class="primary" id="write-run">Run write suite</button>
+      </div>
+      <div class="progress" id="write-progress" hidden>
+        <span id="write-progress-label"></span>
+        <div class="progress-track"><i id="write-progress-bar"></i></div>
+      </div>
+      <p class="status" id="write-status"></p>
+      <div id="write-results"></div>
 
       <hr />
 

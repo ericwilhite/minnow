@@ -11,6 +11,7 @@ import { runFeatureSuite, validateFeaturePayload } from "./feature-suite.js";
 import { runQuery, validateRunQueryPayload } from "./run-query.js";
 import { runReferenceSuite, validateReferencePayload } from "./reference-suite.js";
 import { runStorageBenchmark, validateConfig } from "./storage-suite.js";
+import { runWriteSuite, validateWritePayload } from "./write-suite.js";
 import { cancelledRuns, getRequestId, resolveMemorySample } from "./support.js";
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
@@ -67,6 +68,17 @@ async function runRequest(raw: unknown): Promise<void> {
         try {
           self.postMessage(
             success(request.requestId, await runReferenceSuite(request.requestId, payload)),
+          );
+        } finally {
+          cancelledRuns.delete(request.requestId);
+        }
+        return;
+      }
+      case "suiteWrite": {
+        const payload = validateWritePayload(request.payload);
+        try {
+          self.postMessage(
+            success(request.requestId, await runWriteSuite(request.requestId, payload)),
           );
         } finally {
           cancelledRuns.delete(request.requestId);

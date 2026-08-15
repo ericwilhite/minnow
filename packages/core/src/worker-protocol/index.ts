@@ -13,6 +13,7 @@ export type WorkerOperation =
   | "datasetDelete"
   | "runQuery"
   | "suiteReference"
+  | "suiteWrite"
   | "suiteFeatureMatrix";
 
 export interface WorkerRequest<T = unknown> {
@@ -214,6 +215,7 @@ function isOperation(value: unknown): value is WorkerOperation {
     "datasetDelete",
     "runQuery",
     "suiteReference",
+    "suiteWrite",
     "suiteFeatureMatrix",
   ].includes(String(value));
 }

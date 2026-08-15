@@ -67,9 +67,17 @@ test("capture engine comparison", async ({}, testInfo) => {
         { datasetId: dataset.id, engines: config.engines },
         report("suite"),
       );
+      // Writes run after the read suite: they add tables to each engine's copy of the
+      // dataset, and the read numbers must be measured against the dataset as loaded.
+      const writes = await worker.request(
+        "suiteWrite",
+        { datasetId: dataset.id, engines: config.engines },
+        report("writes"),
+      );
       return {
         dataset,
         suite,
+        writes,
         progressCount,
         browserMeta: {
           userAgent: navigator.userAgent,
@@ -94,6 +102,7 @@ test("capture engine comparison", async ({}, testInfo) => {
       config,
       dataset: payload.dataset,
       suite: payload.suite,
+      writes: payload.writes,
       host: {
         platform: os.platform(),
         release: os.release(),
@@ -111,7 +120,7 @@ test("capture engine comparison", async ({}, testInfo) => {
     );
     writeFileSync(file, JSON.stringify(bundle, null, 1) + "\n");
     console.log(
-      `[done:${testInfo.project.name}] passed=${payload.suite.passed} -> ${file} totals=${JSON.stringify(payload.suite.totalMsByEngine)}`,
+      `[done:${testInfo.project.name}] passed=${payload.suite.passed} writesPassed=${payload.writes.passed} -> ${file} totals=${JSON.stringify(payload.suite.totalMsByEngine)}`,
     );
   } finally {
     await context.close();

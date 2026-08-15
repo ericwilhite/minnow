@@ -255,6 +255,9 @@ async function measureOnSession(
         medianMs,
         p95Ms,
         ...(cachedMedianMs === undefined ? {} : { cachedMedianMs }),
+        ...(prepared.peakMemoryBytes === undefined
+          ? {}
+          : { peakMemoryBytes: prepared.peakMemoryBytes }),
         resultRows: rows.length,
         checksum: referenceChecksum(tuples),
         verified: tuplesMatch(tuples, oracleTuples),
@@ -317,8 +320,19 @@ function indexRows(
   return new Map(rows(tables, table).map((row) => [numberField(row, key), row]));
 }
 
+/** Low, dense product keys so the probe resolves the same five rows at every scale. */
+const PRODUCT_KEY_SET = [1, 2, 3, 5, 8];
+
 export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefinition[] {
   const pointId = Math.max(1, Math.floor(orderRows / 2));
+  // Selective probes derive their keys from the row count so they hit real rows at every
+  // scale. Customers are a quarter of orders in this scenario and products a fiftieth, so
+  // both stay in range without the definitions knowing the generator's exact ratios.
+  const customerPointId = Math.max(1, Math.floor(orderRows / 8));
+  // Every order gets exactly three line items, and orders are dense from 1, so these probes
+  // resolve to the same row counts at every scale — which `expectedRows` has to be.
+  const itemsOrderId = Math.max(1, Math.floor(orderRows / 3));
+  const rangeFirstId = Math.max(1, Math.floor(orderRows / 4));
   const dateRangeRows = Math.min(
     25,
     Array.from({ length: orderRows }, (_, index) => index).filter(
@@ -358,6 +372,111 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
       },
       oracle: (tables) =>
         rows(tables, "orders").filter((row) => numberField(row, "order_id") === pointId),
+    },
+    {
+      id: "s1",
+      workload: "selective",
+      name: "Customer by key",
+      complexity: "simple",
+      tables: ["customers"],
+      expectedRows: 1,
+      sql: `SELECT customer_id, region_id, segment FROM customers WHERE customer_id = ${String(customerPointId)}`,
+      columns: ["customer_id", "region_id", "segment"],
+      project: (row) => [row.customer_id, row.region_id, row.segment],
+      baseline: (context) => {
+        const row = context.customersById.get(customerPointId);
+        return row === undefined ? [] : [row];
+      },
+      oracle: (tables) =>
+        rows(tables, "customers").filter(
+          (row) => numberField(row, "customer_id") === customerPointId,
+        ),
+    },
+    {
+      id: "s2",
+      workload: "selective",
+      name: "Line items for one order",
+      complexity: "simple",
+      tables: ["order_items"],
+      // The generator gives every order exactly three line items at every scale.
+      expectedRows: 3,
+      sql: `SELECT item_id, product_id, quantity FROM order_items WHERE order_id = ${String(itemsOrderId)} ORDER BY item_id`,
+      columns: ["item_id", "product_id", "quantity"],
+      project: (row) => [row.item_id, row.product_id, row.quantity],
+      baseline: (context) =>
+        rows(context.tables, "order_items")
+          .filter((row) => numberField(row, "order_id") === itemsOrderId)
+          .sort((left, right) => numberField(left, "item_id") - numberField(right, "item_id")),
+      oracle: (tables) =>
+        rows(tables, "order_items")
+          .filter((row) => numberField(row, "order_id") === itemsOrderId)
+          .sort((left, right) => numberField(left, "item_id") - numberField(right, "item_id")),
+    },
+    {
+      id: "s3",
+      workload: "selective",
+      name: "Small key set",
+      complexity: "simple",
+      tables: ["products"],
+      expectedRows: PRODUCT_KEY_SET.length,
+      sql: `SELECT product_id, category, unit_cost FROM products WHERE product_id IN (${PRODUCT_KEY_SET.map(String).join(", ")}) ORDER BY product_id`,
+      columns: ["product_id", "category", "unit_cost"],
+      project: (row) => [row.product_id, row.category, row.unit_cost],
+      baseline: (context) =>
+        PRODUCT_KEY_SET.map((key) => context.productsById.get(key)).filter(
+          (row) => row !== undefined,
+        ),
+      oracle: (tables) =>
+        rows(tables, "products")
+          .filter((row) => PRODUCT_KEY_SET.includes(numberField(row, "product_id")))
+          .sort(
+            (left, right) => numberField(left, "product_id") - numberField(right, "product_id"),
+          ),
+    },
+    {
+      id: "s4",
+      workload: "selective",
+      name: "Keyed range window",
+      complexity: "simple",
+      tables: ["orders"],
+      expectedRows: 10,
+      sql: `SELECT order_id, status, total FROM orders WHERE order_id >= ${String(rangeFirstId)} AND order_id < ${String(rangeFirstId + 100)} ORDER BY order_id LIMIT 10`,
+      columns: ["order_id", "status", "total"],
+      project: (row) => [row.order_id, row.status, row.total],
+      baseline: (context) =>
+        rows(context.tables, "orders")
+          .filter((row) => {
+            const id = numberField(row, "order_id");
+            return id >= rangeFirstId && id < rangeFirstId + 100;
+          })
+          .sort((left, right) => numberField(left, "order_id") - numberField(right, "order_id"))
+          .slice(0, 10),
+      oracle: (tables) =>
+        rows(tables, "orders")
+          .filter((row) => {
+            const id = numberField(row, "order_id");
+            return id >= rangeFirstId && id < rangeFirstId + 100;
+          })
+          .sort((left, right) => numberField(left, "order_id") - numberField(right, "order_id"))
+          .slice(0, 10),
+    },
+    {
+      id: "s5",
+      workload: "selective",
+      name: "Order exists check",
+      complexity: "simple",
+      tables: ["orders"],
+      expectedRows: 1,
+      sql: `SELECT COUNT(*) AS found FROM orders WHERE order_id = ${String(pointId)}`,
+      columns: ["found"],
+      project: (row) => [row.found],
+      baseline: (context) => [{ found: context.ordersById.has(pointId) ? 1 : 0 }],
+      oracle: (tables) => [
+        {
+          found: rows(tables, "orders").filter((row) => numberField(row, "order_id") === pointId)
+            .length,
+        },
+      ],
     },
     {
       id: "q2",

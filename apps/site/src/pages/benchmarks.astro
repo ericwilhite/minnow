@@ -215,6 +215,17 @@ const engineLabels: Record<string, string> = {
         snapshot-fresh on every statement.
       </p>
       <p>
+        <strong>Memory</strong> is reported per query, and only by Minnow, because the browser
+        gives us nothing comparable. <code>performance.measureUserAgentSpecificMemory()</code> —
+        the one API that counts a WebAssembly engine's heap as well as the JavaScript one —
+        throws <code>SecurityError</code> in the Chromium build Playwright ships (it needs full
+        site isolation), is not exposed inside workers at all, where these engines actually run,
+        and does not exist in Firefox. Launch flags do not change that; we tried. So rather than
+        publish a number we cannot stand behind for four engines, the page publishes the one
+        that is exact: Minnow reserves memory before it allocates it, so it knows its own peak
+        for each statement and reports it. Compare it across queries, not across engines.
+      </p>
+      <p>
         Summaries are a <strong>geometric mean</strong>, not a sum. These queries span three
         orders of magnitude, so adding them up reports the slowest few and nothing else — an
         engine could lose every fast query and still win the total. A geometric mean weights

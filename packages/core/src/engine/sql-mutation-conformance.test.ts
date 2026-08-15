@@ -53,7 +53,14 @@ const TRIGGERS = [
 ];
 
 async function minnowFixture(): Promise<MinnowDatabase> {
-  const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 16 });
+  // autoCompact: false keeps this harness deterministic. Read-triggered compaction commits a
+  // manifest of its own, and a commit landing while a write scope is open makes that scope
+  // fail with a version conflict — so with it on, this test fails intermittently under load
+  // for a reason that has nothing to do with DML conformance.
+  const database = new MinnowDatabase(new MemoryBlockStore(), {
+    rowsPerBlock: 16,
+    autoCompact: false,
+  });
   await database.createTable({
     name: "items",
     uniqueKey: "id",

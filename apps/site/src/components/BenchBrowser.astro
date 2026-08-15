@@ -15,10 +15,29 @@ interface EngineRun {
   medianMs?: number;
   /** Engines with a result cache: what a repeat costs with that cache left on (the default). */
   cachedMedianMs?: number;
+  /** Peak modeled execution memory, self-reported by engines that measure their own execution. */
+  peakMemoryBytes?: number;
   p95Ms?: number;
   resultRows?: number;
   verified?: boolean;
   reason?: string;
+}
+
+interface WriteRun {
+  engine: string;
+  supported: boolean;
+  medianMs?: number;
+  rowsPerSecond?: number;
+  verified?: boolean;
+  error?: string;
+}
+
+interface WriteCase {
+  id: string;
+  name: string;
+  operation: string;
+  rows: number;
+  engines: WriteRun[];
 }
 
 interface SuiteQuery {
@@ -58,6 +77,13 @@ export interface BenchResults {
     totalMsByEngine: Record<string, number>;
     passed: boolean;
   };
+  /** Present once a capture includes the write suite; older bundles simply omit it. */
+  writes?: {
+    sampleCount: number;
+    engines: string[];
+    cases: WriteCase[];
+    passed: boolean;
+  };
 }
 
 interface Props {
@@ -81,6 +107,11 @@ const fmtMs = (ms: number): string =>
   ms >= 100 ? `${Math.round(ms).toLocaleString("en-US")} ms` : ms >= 1 ? `${ms.toFixed(1)} ms` : `${ms.toFixed(2)} ms`;
 const fmtS = (ms: number): string => `${(ms / 1000).toFixed(1)} s`;
 const fmtMB = (bytes: number): string => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+/** Execution memory is kilobytes to a few megabytes; pick the unit per value so both read. */
+const fmtBytes = (bytes: number): string =>
+  bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    : `${(bytes / 1024).toFixed(0)} KB`;
 
 /* ---------- horizontal bar chart geometry ---------- */
 const BAR_W = 860;
@@ -264,6 +295,66 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   </div>
 
   {
+    results.writes !== undefined && results.writes.cases.length > 0 && (
+      <div class="chart-card">
+        <h3>Writes</h3>
+        <p class="chart-sub">
+          Inserts, updates, and upserts at several batch sizes, each against a table the suite
+          creates empty so every sample does the same work. Rows per second — higher is better;
+          the fastest engine in each row is marked. Every engine's final table is compared
+          against an independent JavaScript oracle, so a timing only counts when the data is
+          right.
+        </p>
+        <table class="split-table">
+          <thead>
+            <tr>
+              <th>Operation</th>
+              <th class="num">Rows</th>
+              {results.writes.engines.map((engine) => (
+                <th class="num">{label(engine)}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {results.writes.cases.map((entry) => {
+              const best = Math.max(
+                ...entry.engines
+                  .filter((run) => run.supported && typeof run.rowsPerSecond === "number")
+                  .map((run) => run.rowsPerSecond ?? 0),
+              );
+              return (
+                <tr>
+                  <td>{entry.name}</td>
+                  <td class="num">{entry.rows.toLocaleString("en-US")}</td>
+                  {results.writes?.engines.map((engine) => {
+                    const run = entry.engines.find((candidate) => candidate.engine === engine);
+                    if (run?.supported !== true) {
+                      return (
+                        <td class="num" title={run?.error ?? "not supported"}>
+                          —
+                        </td>
+                      );
+                    }
+                    const isBest = (run.rowsPerSecond ?? 0) === best && best > 0;
+                    return (
+                      <td class={isBest ? "num best" : "num"}>
+                        {isBest && <span class="best-mark">●</span>}
+                        {Math.round(run.rowsPerSecond ?? 0).toLocaleString("en-US")}/s
+                        <br />
+                        <small class="cached">{fmtMs(run.medianMs ?? 0)}</small>
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
+  {
     splitRows.length > 0 && (
       <div class="chart-card">
         <h3>By access pattern</h3>
@@ -414,8 +505,8 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     </svg>
   </div>
 
-  <details class="bench-table">
-    <summary>Table view — every number in the charts above</summary>
+  <details class="bench-table" open>
+    <summary>Every number in the charts above</summary>
     <table>
       <thead>
         <tr>
@@ -444,15 +535,35 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
               <td>{query.complexity}</td>
               {engines.map((engine) => {
                 const run = query.engines.find((r) => r.engine === engine);
+                // Best in this row: the lowest median among engines that ran it. Marked so a
+                // reader can see who wins each query without comparing sixteen numbers by eye.
+                const best = Math.min(
+                  ...query.engines
+                    .filter((r) => r.supported && typeof r.medianMs === "number")
+                    .map((r) => r.medianMs ?? Number.POSITIVE_INFINITY),
+                );
+                const isBest =
+                  run?.supported === true &&
+                  typeof run.medianMs === "number" &&
+                  run.medianMs === best;
                 return run?.supported === true ? (
                   <>
-                    <td class="num">
+                    <td class={isBest ? "num best" : "num"}>
+                      {isBest && <span class="best-mark" title="Fastest engine for this query">●</span>}
                       {fmtMs(run.medianMs ?? 0)}
                       {run.cachedMedianMs !== undefined && (
                         <>
                           <br />
                           <small class="cached" title="Same statement with the result memo left on — the default an application gets. A cache lookup, not execution.">
                             {fmtMs(run.cachedMedianMs)} cached
+                          </small>
+                        </>
+                      )}
+                      {run.peakMemoryBytes !== undefined && (
+                        <>
+                          <br />
+                          <small class="cached" title="Peak modeled execution memory this engine reserved for the statement. Self-reported: the browser exposes no cross-engine memory API here.">
+                            {fmtBytes(run.peakMemoryBytes)} peak
                           </small>
                         </>
                       )}
@@ -672,6 +783,17 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   .split-table .num {
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+
+  .bench-table td.best {
+    font-weight: 650;
+  }
+
+  .bench-table .best-mark {
+    color: var(--viz-series-1, #2a78d6);
+    margin-right: 0.3em;
+    font-size: 0.7em;
+    vertical-align: 0.15em;
   }
 
   .bench-table .cached {

@@ -3,13 +3,21 @@ import { generateEntityBatch, getScenario } from "../benchmark.js";
 import type { DatasetRecord, EngineMaterialization } from "../protocol.js";
 import {
   canonicalizeRow,
+  columnList,
   createTableSql,
   normalizeRows,
   quoteIdentifier,
   rowsFromColumns,
   secondaryIndexSql,
+  sqlType,
 } from "./shared.js";
-import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
+import type {
+  EngineDriver,
+  EngineSession,
+  LoadContext,
+  WriteSession,
+  WriteTableSchema,
+} from "./session.js";
 
 const BATCH_ROWS = 50_000;
 
@@ -160,6 +168,114 @@ export const pgliteDriver: EngineDriver = {
             ).map(canonicalizeRow),
           close: () => {
             void database.exec(`DEALLOCATE ${name}`).catch(() => undefined);
+          },
+        };
+      },
+      async close() {
+        if (!database.closed) await database.close();
+      },
+    };
+  },
+
+  async openWriteSession(record: DatasetRecord): Promise<WriteSession> {
+    const database = await openPglite(dataDirName(record), record.durability);
+    return {
+      engine: "pglite",
+      async createTable(schema: WriteTableSchema) {
+        await database.exec(createTableSql(schema));
+        const table = quoteIdentifier(schema.name);
+        const key = quoteIdentifier(schema.primaryKey);
+        const columns = columnList(schema);
+        const assignments = schema.columns
+          .filter((column) => column.name !== schema.primaryKey)
+          .map(
+            (column) =>
+              `${quoteIdentifier(column.name)} = EXCLUDED.${quoteIdentifier(column.name)}`,
+          )
+          .join(", ");
+        const keyType = sqlType(
+          schema.columns.find((column) => column.name === schema.primaryKey)?.type ?? "number",
+        );
+        // Postgres bulk writes are multi-row statements inside one transaction, chunked so a
+        // statement stays under the parameter limit — the same shape the dataset loader uses.
+        // Statement text and the flat parameter list are built before the timed call; parsing,
+        // planning, executing, and committing them is what gets measured.
+        const chunkRows = Math.max(1, Math.floor(10_000 / Math.max(1, schema.columns.length)));
+        const runStatements =
+          (statements: ReadonlyArray<{ sql: string; values: unknown[] }>) => async () => {
+            await database.transaction(async (transaction) => {
+              for (const statement of statements) {
+                await transaction.query(statement.sql, statement.values);
+              }
+            });
+          };
+        const insertStatements = (
+          suffix: string,
+          rows: Array<Array<boolean | number | string | null>>,
+        ): Array<{ sql: string; values: unknown[] }> => {
+          const statements: Array<{ sql: string; values: unknown[] }> = [];
+          for (let offset = 0; offset < rows.length; offset += chunkRows) {
+            const values: unknown[] = [];
+            const tuples = rows.slice(offset, offset + chunkRows).map((row) => {
+              const placeholders = row.map((value) => {
+                values.push(value);
+                return `$${String(values.length)}`;
+              });
+              return `(${placeholders.join(", ")})`;
+            });
+            statements.push({
+              sql: `INSERT INTO ${table} (${columns}) VALUES ${tuples.join(", ")}${suffix}`,
+              values,
+            });
+          }
+          return statements;
+        };
+        return {
+          prepareInsert: (batch) =>
+            runStatements(insertStatements("", rowsFromColumns(schema, batch.columns))),
+          prepareUpsert: (batch) =>
+            runStatements(
+              insertStatements(
+                ` ON CONFLICT (${key}) DO UPDATE SET ${assignments}`,
+                rowsFromColumns(schema, batch.columns),
+              ),
+            ),
+          // The idiomatic Postgres bulk update: join the table against the new values
+          // carried inline, rather than one round trip per row. Parameters inside VALUES
+          // have no inferable type, so every element is cast.
+          prepareUpdate: (keys, column, values) => {
+            const valueType = sqlType(
+              schema.columns.find((candidate) => candidate.name === column)?.type ?? "number",
+            );
+            const pairsPerStatement = 5_000;
+            const statements: Array<{ sql: string; values: unknown[] }> = [];
+            for (let offset = 0; offset < keys.length; offset += pairsPerStatement) {
+              const bound: unknown[] = [];
+              const tuples: string[] = [];
+              const end = Math.min(offset + pairsPerStatement, keys.length);
+              for (let index = offset; index < end; index += 1) {
+                bound.push(keys[index], values[index] ?? null);
+                tuples.push(
+                  `($${String(bound.length - 1)}::${keyType}, $${String(bound.length)}::${valueType})`,
+                );
+              }
+              statements.push({
+                sql: `UPDATE ${table} SET ${quoteIdentifier(column)} = source.value FROM (VALUES ${tuples.join(", ")}) AS source(key, value) WHERE ${table}.${key} = source.key`,
+                values: bound,
+              });
+            }
+            return runStatements(statements);
+          },
+          readAll: async () =>
+            normalizeRows(
+              (
+                await database.query<Record<string, unknown>>(
+                  `SELECT ${columns} FROM ${table} ORDER BY ${key}`,
+                )
+              ).rows,
+            ).map(canonicalizeRow),
+          drop: async () => {
+            await database.exec(`DROP TABLE IF EXISTS ${table}`);
           },
         };
       },

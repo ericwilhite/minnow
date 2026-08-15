@@ -123,6 +123,14 @@ export interface ReferenceEngineMeasurement {
    * application gets. Absent for engines with no result cache, which re-execute every call.
    */
   cachedMedianMs?: number;
+  /**
+   * Peak modeled execution memory in bytes, self-reported by engines that measure their own
+   * execution. The browser's cross-engine memory API is unavailable in this harness (Chromium
+   * refuses it without full site isolation, which Playwright's build lacks, and it does not
+   * exist in workers or in Firefox at all), so this is an engine's own accounting rather than
+   * an observation from outside — comparable across queries, not across engines.
+   */
+  peakMemoryBytes?: number;
   resultRows: number;
   checksum: number;
   /** Result tuples match the independent JavaScript oracle. */
@@ -153,6 +161,62 @@ export interface ReferenceSuiteResult {
   totalMsByEngine: Partial<Record<EngineId, number>>;
   supportedByEngine: Partial<Record<EngineId, number>>;
   /** Every query an engine could run agreed with the oracle. */
+  passed: boolean;
+}
+
+export interface WriteSuitePayload {
+  datasetId: string;
+  engines: EngineId[];
+}
+
+export type WriteOperation = "insert" | "update" | "upsert";
+
+export interface WriteEngineMeasurement {
+  engine: EngineId;
+  /** The engine ran the operation. False carries the engine's own error in `error`. */
+  supported: boolean;
+  error?: string;
+  medianMs: number;
+  p95Ms: number;
+  /** Batch rows divided by the median, so sizes compare on one axis. */
+  rowsPerSecond: number;
+  /** Rows in the table after the operation; the oracle's expectation is on the case. */
+  tableRows: number;
+  /** FNV-1a over the final table's canonical tuples, sorted by key. */
+  checksum: number;
+  /** Final table state matched the independent JavaScript oracle, row for row. */
+  verified: boolean;
+}
+
+export interface WriteCaseReport {
+  id: string;
+  name: string;
+  operation: WriteOperation;
+  /** Rows the measured statement writes. */
+  rows: number;
+  /** Rows seeded (unmeasured) before the measured statement. */
+  seedRows: number;
+  /** Rows the oracle expects in the table afterwards. */
+  expectedTableRows: number;
+  /** Oracle checksum every engine's final table is compared against. */
+  oracleChecksum: number;
+  engines: WriteEngineMeasurement[];
+  /** null when fewer than two engines ran the case. */
+  checksumAgreement: "match" | "mismatch" | null;
+}
+
+export interface WriteSuiteResult {
+  datasetId: string;
+  scale: number;
+  sampleCount: number;
+  engines: EngineId[];
+  /** The dedicated table this suite writes; the read dataset is never touched. */
+  tableColumns: string[];
+  cases: WriteCaseReport[];
+  /** Summed median write time per engine over its supported cases. */
+  totalMsByEngine: Partial<Record<EngineId, number>>;
+  supportedByEngine: Partial<Record<EngineId, number>>;
+  /** Every case an engine could run left the table exactly as the oracle predicts. */
   passed: boolean;
 }
 

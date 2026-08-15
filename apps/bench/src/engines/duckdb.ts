@@ -14,8 +14,21 @@ import duckdbWorkerMvp from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.
 import duckdbWorkerEh from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import { generateEntityBatch, getScenario } from "../benchmark.js";
 import type { DatasetRecord, EngineMaterialization } from "../protocol.js";
-import { canonicalizeRow, createTableSql, quoteIdentifier, secondaryIndexSql } from "./shared.js";
-import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
+import {
+  canonicalizeRow,
+  columnList,
+  createTableSql,
+  quoteIdentifier,
+  secondaryIndexSql,
+  type TableShape,
+} from "./shared.js";
+import type {
+  EngineDriver,
+  EngineSession,
+  LoadContext,
+  WriteSession,
+  WriteTableSchema,
+} from "./session.js";
 
 const BATCH_ROWS = 50_000;
 
@@ -93,6 +106,22 @@ function arrowTimestampToIso(value: unknown): unknown {
   const millis = typeof value === "bigint" ? Number(value) : Number(value);
   if (!Number.isFinite(millis)) return value;
   return new Date(millis).toISOString();
+}
+
+/** Arrow result rows in the shape the cross-engine comparison expects. */
+function arrowRows(table: arrow.Table): Array<Record<string, unknown>> {
+  // Arrow hands timestamps back as epoch milliseconds; normalize them to the ISO strings
+  // the cross-engine checksum expects.
+  const timestampColumns: string[] = [];
+  for (const field of table.schema.fields) {
+    const type = field.type as { typeId?: number };
+    if (type.typeId === ARROW_TIMESTAMP_TYPE) timestampColumns.push(field.name);
+  }
+  return table.toArray().map((entry) => {
+    const row = (entry as { toJSON(): Record<string, unknown> }).toJSON();
+    for (const name of timestampColumns) row[name] = arrowTimestampToIso(row[name]);
+    return canonicalizeRow(row);
+  });
 }
 
 /** Datasets are memory-resident, so a loaded copy lives exactly as long as this worker. */
@@ -182,23 +211,92 @@ export const duckdbDriver: EngineDriver = {
       async prepare(sql) {
         const statement = await connection.prepare(sql);
         return {
-          execute: async () => {
-            const table = await statement.query();
-            // Arrow hands timestamps back as epoch milliseconds; normalize them to the ISO
-            // strings the cross-engine checksum expects.
-            const timestampColumns: string[] = [];
-            for (const field of table.schema.fields) {
-              const type = field.type as { typeId?: number };
-              if (type.typeId === ARROW_TIMESTAMP_TYPE) timestampColumns.push(field.name);
-            }
-            return table.toArray().map((entry) => {
-              const row = (entry as { toJSON(): Record<string, unknown> }).toJSON();
-              for (const name of timestampColumns) row[name] = arrowTimestampToIso(row[name]);
-              return canonicalizeRow(row);
-            });
-          },
+          execute: async () => arrowRows(await statement.query()),
           close: () => {
             void statement.close();
+          },
+        };
+      },
+      async close() {
+        await connection.close();
+      },
+    };
+  },
+
+  async openWriteSession(record: DatasetRecord): Promise<WriteSession> {
+    const { db } = await duckdbInstance();
+    // Write into the same populated catalog the read comparison queries.
+    if (!loadedDatasets.has(record.id)) await buildDataset(record);
+    const connection = await db.connect();
+    return {
+      engine: "duckdb",
+      async createTable(schema: WriteTableSchema) {
+        await connection.query(createTableSql(schema));
+        const table = quoteIdentifier(schema.name);
+        const key = quoteIdentifier(schema.primaryKey);
+        const columns = columnList(schema);
+        const assignments = schema.columns
+          .filter((column) => column.name !== schema.primaryKey)
+          .map(
+            (column) =>
+              `${quoteIdentifier(column.name)} = excluded.${quoteIdentifier(column.name)}`,
+          )
+          .join(", ");
+        const stageName = `${schema.name}_stage`;
+        const stage = quoteIdentifier(stageName);
+        /**
+         * duckdb-wasm's bulk path is an Arrow append, and its keyed writes join against a
+         * staged relation rather than binding row by row. Building the Arrow table is the
+         * conversion step and happens before the timed call; creating the staging table,
+         * appending to it, running the statement, and dropping it are all engine work and
+         * stay inside it. No key on the staging relation: it is read once, and an index
+         * would only add build cost the operation does not need.
+         */
+        const stageTable = (
+          stageColumns: TableShape["columns"],
+          columnValues: Record<string, Array<boolean | number | string | Date | null>>,
+        ): { sql: string; arrow: arrow.Table } => {
+          const stageSchema: TableShape = { name: stageName, columns: stageColumns };
+          return { sql: createTableSql(stageSchema), arrow: arrowBatch(stageSchema, columnValues) };
+        };
+        const runStaged =
+          (staged: { sql: string; arrow: arrow.Table }, statement: string) => async () => {
+            await connection.query(staged.sql);
+            await connection.insertArrowTable(staged.arrow, { name: stageName, create: false });
+            await connection.query(statement);
+            await connection.query(`DROP TABLE ${stage}`);
+          };
+        return {
+          prepareInsert: (batch) => {
+            const arrowTable = arrowBatch(schema, batch.columns);
+            return async () => {
+              await connection.insertArrowTable(arrowTable, { name: schema.name, create: false });
+            };
+          },
+          prepareUpsert: (batch) =>
+            runStaged(
+              stageTable(schema.columns, batch.columns),
+              `INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${stage} ON CONFLICT (${key}) DO UPDATE SET ${assignments}`,
+            ),
+          prepareUpdate: (keys, column, values) => {
+            const updated = schema.columns.find((candidate) => candidate.name === column);
+            const keyed = schema.columns.find((candidate) => candidate.name === schema.primaryKey);
+            if (updated === undefined || keyed === undefined) {
+              throw new Error(`Unknown column: ${column}`);
+            }
+            return runStaged(
+              stageTable([keyed, updated], {
+                [schema.primaryKey]: [...keys],
+                [column]: [...values],
+              }),
+              `UPDATE ${table} SET ${quoteIdentifier(column)} = ${stage}.${quoteIdentifier(column)} FROM ${stage} WHERE ${table}.${key} = ${stage}.${key}`,
+            );
+          },
+          readAll: async () =>
+            arrowRows(await connection.query(`SELECT ${columns} FROM ${table} ORDER BY ${key}`)),
+          drop: async () => {
+            await connection.query(`DROP TABLE IF EXISTS ${stage}`);
+            await connection.query(`DROP TABLE IF EXISTS ${table}`);
           },
         };
       },

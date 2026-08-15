@@ -7,13 +7,20 @@ import { generateEntityBatch, getScenario } from "../benchmark.js";
 import type { DatasetRecord, EngineMaterialization } from "../protocol.js";
 import {
   canonicalizeRow,
+  columnList,
   createTableSql,
   normalizeRows,
   quoteIdentifier,
   rowsFromColumns,
   secondaryIndexSql,
 } from "./shared.js";
-import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
+import type {
+  EngineDriver,
+  EngineSession,
+  LoadContext,
+  WriteSession,
+  WriteTableSchema,
+} from "./session.js";
 
 const BATCH_ROWS = 50_000;
 const SAH_POOL_NAME = "mdb-datasets";
@@ -71,6 +78,18 @@ async function openDatabase(context: SqliteContext, path: string): Promise<Datab
   const database = new pool.OpfsSAHPoolDb(path);
   if (PRAGMAS.length > 0) database.exec(PRAGMAS);
   return database;
+}
+
+/** Opens a dataset's file, refusing when it was written through a VFS this browser lacks. */
+async function openDatasetDatabase(record: DatasetRecord): Promise<Database> {
+  const sqlite = await sqliteContext();
+  const materialization = record.engines.sqlite;
+  if (materialization?.vfs !== undefined && materialization.vfs !== sqlite.vfs) {
+    throw new Error(
+      `This dataset's SQLite copy was written through the ${materialization.vfs} VFS, which is not available in this browser session`,
+    );
+  }
+  return openDatabase(sqlite, databasePath(record));
 }
 
 export const sqliteDriver: EngineDriver = {
@@ -145,14 +164,7 @@ export const sqliteDriver: EngineDriver = {
   },
 
   async openSession(record: DatasetRecord): Promise<EngineSession> {
-    const sqlite = await sqliteContext();
-    const materialization = record.engines.sqlite;
-    if (materialization?.vfs !== undefined && materialization.vfs !== sqlite.vfs) {
-      throw new Error(
-        `This dataset's SQLite copy was written through the ${materialization.vfs} VFS, which is not available in this browser session`,
-      );
-    }
-    const database = await openDatabase(sqlite, databasePath(record));
+    const database = await openDatasetDatabase(record);
     return {
       engine: "sqlite",
       prepare(sql) {
@@ -168,6 +180,81 @@ export const sqliteDriver: EngineDriver = {
           },
           close: () => {
             statement.finalize();
+          },
+        });
+      },
+      close() {
+        if (database.isOpen()) database.close();
+        return Promise.resolve();
+      },
+    };
+  },
+
+  async openWriteSession(record: DatasetRecord): Promise<WriteSession> {
+    const database = await openDatasetDatabase(record);
+    return {
+      engine: "sqlite",
+      createTable(schema: WriteTableSchema) {
+        database.exec(createTableSql(schema));
+        const table = quoteIdentifier(schema.name);
+        const key = quoteIdentifier(schema.primaryKey);
+        const columns = columnList(schema);
+        const placeholders = schema.columns.map(() => "?").join(", ");
+        const assignments = schema.columns
+          .filter((column) => column.name !== schema.primaryKey)
+          .map(
+            (column) =>
+              `${quoteIdentifier(column.name)} = excluded.${quoteIdentifier(column.name)}`,
+          )
+          .join(", ");
+        /**
+         * One prepared statement stepped per row inside a single transaction — the way
+         * sqlite is meant to be written in bulk, and what the dataset loader already does.
+         * Compiling the statement is engine work and stays inside the timed call; pivoting
+         * the batch into bindable tuples is not, and happens before the call is returned.
+         */
+        const rowRunner =
+          (sql: string, rows: Array<Array<boolean | number | string | null>>) =>
+          (): Promise<void> => {
+            const statement = database.prepare(sql);
+            try {
+              database.transaction("IMMEDIATE", () => {
+                for (const row of rows) statement.bind(row).stepReset();
+              });
+            } finally {
+              statement.finalize();
+            }
+            return Promise.resolve();
+          };
+        return Promise.resolve({
+          prepareInsert: (batch) =>
+            rowRunner(
+              `INSERT INTO ${table} (${columns}) VALUES (${placeholders})`,
+              rowsFromColumns(schema, batch.columns),
+            ),
+          prepareUpsert: (batch) =>
+            rowRunner(
+              `INSERT INTO ${table} (${columns}) VALUES (${placeholders}) ON CONFLICT(${key}) DO UPDATE SET ${assignments}`,
+              rowsFromColumns(schema, batch.columns),
+            ),
+          prepareUpdate: (keys, column, values) =>
+            rowRunner(
+              `UPDATE ${table} SET ${quoteIdentifier(column)} = ? WHERE ${key} = ?`,
+              keys.map((keyValue, index) => [values[index] ?? null, keyValue]),
+            ),
+          readAll: () => {
+            const statement = database.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${key}`);
+            try {
+              const rows: Array<Record<string, unknown>> = [];
+              while (statement.step()) rows.push(statement.get({}));
+              return Promise.resolve(normalizeRows(rows).map(canonicalizeRow));
+            } finally {
+              statement.finalize();
+            }
+          },
+          drop: () => {
+            database.exec(`DROP TABLE IF EXISTS ${table}`);
+            return Promise.resolve();
           },
         });
       },

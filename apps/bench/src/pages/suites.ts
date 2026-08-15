@@ -12,6 +12,7 @@ import type {
   FeatureSuiteResult,
   ReferenceSuiteResult,
   WorkProgress,
+  WriteSuiteResult,
 } from "../protocol.js";
 import { engineNames } from "../protocol.js";
 import {
@@ -73,39 +74,55 @@ const refProgress = progressWidget("ref");
 const refStatus = required<HTMLElement>("#ref-status");
 const refResults = required<HTMLElement>("#ref-results");
 
+const writeDataset = required<HTMLSelectElement>("#write-dataset");
+const writeEngines = required<HTMLElement>("#write-engines");
+const writeRun = required<HTMLButtonElement>("#write-run");
+const writeProgress = progressWidget("write");
+const writeStatus = required<HTMLElement>("#write-status");
+const writeResults = required<HTMLElement>("#write-results");
+
 let datasets: DatasetRecord[] = [];
 
-void worker
-  .request<DatasetListResult>("datasetList", {})
-  .then((list) => {
-    datasets = list.datasets;
-    refDataset.innerHTML =
-      datasets.length === 0
-        ? `<option value="">No datasets — generate one first</option>`
-        : datasets
-            .map(
-              (record) =>
-                `<option value="${record.id}">${formatDecimal(record.scale)}× · ${formatInteger(record.totalRows)} rows · ${new Date(record.createdAt).toLocaleString()}</option>`,
-            )
-            .join("");
-    renderRefEngineChecks();
-    refRun.disabled = datasets.length === 0;
-  })
-  .catch((error: unknown) => {
-    setStatus(refStatus, error instanceof Error ? error.message : String(error), "fail");
-  });
+/** Both dataset-backed suites offer the same datasets and the same materialized engines. */
+function datasetOptions(): string {
+  return datasets.length === 0
+    ? `<option value="">No datasets — generate one first</option>`
+    : datasets
+        .map(
+          (record) =>
+            `<option value="${record.id}">${formatDecimal(record.scale)}× · ${formatInteger(record.totalRows)} rows · ${new Date(record.createdAt).toLocaleString()}</option>`,
+        )
+        .join("");
+}
 
-refDataset.addEventListener("change", renderRefEngineChecks);
-
-function renderRefEngineChecks(): void {
-  const record = datasets.find((candidate) => candidate.id === refDataset.value);
-  refEngines.innerHTML = (Object.keys(engineNames) as EngineId[])
+function renderEngineChecks(container: HTMLElement, datasetId: string): void {
+  const record = datasets.find((candidate) => candidate.id === datasetId);
+  container.innerHTML = (Object.keys(engineNames) as EngineId[])
     .map((engine) => {
       const ready = record?.engines[engine]?.status === "ready";
       return `<label><input type="checkbox" value="${engine}" ${ready ? "checked" : "disabled"} /> ${engineNames[engine]}${ready ? "" : " (not materialized)"}</label>`;
     })
     .join("");
 }
+
+void worker
+  .request<DatasetListResult>("datasetList", {})
+  .then((list) => {
+    datasets = list.datasets;
+    refDataset.innerHTML = datasetOptions();
+    writeDataset.innerHTML = datasetOptions();
+    renderEngineChecks(refEngines, refDataset.value);
+    renderEngineChecks(writeEngines, writeDataset.value);
+    refRun.disabled = datasets.length === 0;
+    writeRun.disabled = datasets.length === 0;
+  })
+  .catch((error: unknown) => {
+    setStatus(refStatus, error instanceof Error ? error.message : String(error), "fail");
+  });
+
+refDataset.addEventListener("change", () => {
+  renderEngineChecks(refEngines, refDataset.value);
+});
 
 refRun.addEventListener("click", () => {
   const engines = checkedEngines(refEngines);
@@ -203,6 +220,108 @@ function renderReferenceResult(result: ReferenceSuiteResult): void {
       <tbody>${rows}</tbody>
     </table></div>`;
   void highlightAll(refResults);
+}
+
+/* ---------------------------------------------------------------- write suite */
+
+writeDataset.addEventListener("change", () => {
+  renderEngineChecks(writeEngines, writeDataset.value);
+});
+
+writeRun.addEventListener("click", () => {
+  const engines = checkedEngines(writeEngines);
+  if (writeDataset.value === "" || engines.length === 0) {
+    setStatus(writeStatus, "Select a dataset and at least one engine.", "fail");
+    return;
+  }
+  writeRun.disabled = true;
+  writeProgress.box.hidden = false;
+  setStatus(writeStatus, "", "");
+  worker
+    .request<WriteSuiteResult>(
+      "suiteWrite",
+      { datasetId: writeDataset.value, engines },
+      onProgress(writeProgress),
+    )
+    .then(renderWriteResult)
+    .catch((error: unknown) => {
+      setStatus(writeStatus, error instanceof Error ? error.message : String(error), "fail");
+    })
+    .finally(() => {
+      writeRun.disabled = false;
+      writeProgress.box.hidden = true;
+      writeProgress.bar.style.width = "0%";
+    });
+});
+
+function renderWriteResult(result: WriteSuiteResult): void {
+  setStatus(
+    writeStatus,
+    result.passed
+      ? "Every write an engine could run left the table exactly as the oracle predicts."
+      : "At least one engine's table disagreed with the oracle.",
+    result.passed ? "ok" : "fail",
+  );
+  const engineSummary = result.engines
+    .map(
+      (engine) =>
+        `${engineNames[engine]}: ${String(result.supportedByEngine[engine] ?? 0)}/${String(result.cases.length)} cases · ${formatDuration(result.totalMsByEngine[engine] ?? 0)} summed median`,
+    )
+    .join(" — ");
+  const engineHeader = result.engines
+    .map((engine) => `<th colspan="3">${escapeHtml(engineNames[engine])}</th>`)
+    .join("");
+  const subHeader = result.engines
+    .map(() => `<th class="num">Median</th><th class="num">Rows/s</th><th>Result</th>`)
+    .join("");
+  const rows = result.cases
+    .map((report) => {
+      const cells = result.engines
+        .map((engine) => {
+          const measurement = report.engines.find((candidate) => candidate.engine === engine);
+          if (measurement === undefined) return "<td>—</td><td>—</td><td>—</td>";
+          if (!measurement.supported) {
+            return `<td class="num">—</td><td class="num">—</td><td><span class="badge gap" title="${escapeHtml(measurement.error ?? "")}">not supported</span><br /><small class="note">${escapeHtml(measurement.error ?? "")}</small></td>`;
+          }
+          const badge = measurement.verified
+            ? `<span class="badge ok">matches oracle</span>`
+            : `<span class="badge fail">differs from oracle</span>`;
+          return `<td class="num">${formatDuration(measurement.medianMs)}</td><td class="num">${formatInteger(measurement.rowsPerSecond)}</td><td>${badge}</td>`;
+        })
+        .join("");
+      const seeded =
+        report.seedRows === 0
+          ? "empty table"
+          : `${formatInteger(report.seedRows)} rows already present`;
+      return `<tr>
+        <td>
+          <strong>${escapeHtml(report.operation)}</strong> ${formatInteger(report.rows)} rows
+          <small class="note"> · ${escapeHtml(seeded)} · ${formatInteger(report.expectedTableRows)} rows after</small>
+        </td>
+        <td>${report.checksumAgreement === null ? "—" : report.checksumAgreement === "match" ? `<span class="badge ok">agree</span>` : `<span class="badge fail">disagree</span>`}</td>
+        ${cells}
+      </tr>`;
+    })
+    .join("");
+  writeResults.innerHTML = `
+    <p class="note">${escapeHtml(engineSummary)}.</p>
+    <p class="note">
+      How to read this: <strong>Median</strong> is the middle of ${String(result.sampleCount)}
+      measured runs of the operation, each into a table created empty for that run, so no run
+      inherits rows or fragmentation from the one before. <strong>Rows/s</strong> divides the batch
+      by that median. <strong>Result</strong> reads the finished table back — with MinnowDatabase's
+      result memo off — and compares every row against a JavaScript oracle built from the same
+      inputs. <strong>Engines</strong> says whether the engines that ran a case produced identical
+      tables. Rows are ${escapeHtml(result.tableColumns.join(", "))}; an upsert's keys start halfway
+      through the seeded range, so about half update in place and half insert.
+    </p>
+    <div class="table-scroll"><table>
+      <thead>
+        <tr><th rowspan="2">Operation</th><th rowspan="2">Engines</th>${engineHeader}</tr>
+        <tr>${subHeader}</tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
 }
 
 /* ---------------------------------------------------------------- storage suite */

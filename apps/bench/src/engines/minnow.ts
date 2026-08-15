@@ -3,7 +3,13 @@ import { IndexedDbBlockStore } from "@minnowdb/core/storage";
 import { generateEntityBatch, getScenario } from "../benchmark.js";
 import type { DatasetRecord, EngineMaterialization } from "../protocol.js";
 import { canonicalizeRow, normalizeRows } from "./shared.js";
-import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
+import type {
+  EngineDriver,
+  EngineSession,
+  LoadContext,
+  WriteSession,
+  WriteTableSchema,
+} from "./session.js";
 
 const BATCH_ROWS = 50_000;
 
@@ -88,22 +94,89 @@ export const minnowDriver: EngineDriver = {
       async prepare(sql) {
         // Prepare compiles only; every execute() is a fresh statement over current data.
         const plan = await database.explain(sql);
-        return {
+        const statement: {
+          plan: string;
+          peakMemoryBytes?: number;
+          execute: () => Promise<Array<Record<string, unknown>>>;
+          executeCached: () => Promise<Array<Record<string, unknown>>>;
+          close: () => void;
+        } = {
           plan,
           // memoize: false measures execution, not the probe-validated result memo. The suite
           // replays one statement over unchanging data, so the default (memo on) would answer
           // every sample from cache — a constant-time lookup against the other engines' real
           // execution, which is not a comparison. Applications keep the default and get the
           // cache; this column is what the engine costs when it actually runs the query.
-          execute: async () =>
-            normalizeRows((await database.query(sql, { memoize: false })).rows).map(
-              canonicalizeRow,
-            ),
+          execute: async () => {
+            const result = await database.query(sql, {
+              memoize: false,
+              onStats: (stats) => {
+                statement.peakMemoryBytes = stats.peakMemoryBytes;
+              },
+            });
+            return normalizeRows(result.rows).map(canonicalizeRow);
+          },
           // The same statement with the memo left on, reported beside the execution number
           // rather than instead of it.
           executeCached: async () =>
             normalizeRows((await database.query(sql)).rows).map(canonicalizeRow),
           close: () => undefined,
+        };
+        return statement;
+      },
+      close() {
+        store.close();
+        return Promise.resolve();
+      },
+    };
+  },
+
+  async openWriteSession(record: DatasetRecord): Promise<WriteSession> {
+    const store = await IndexedDbBlockStore.open({
+      name: storageName(record),
+      durability: record.durability,
+    });
+    const database = new MinnowDatabase(store, databaseOptions(record));
+    return {
+      engine: "minnow",
+      async createTable(schema: WriteTableSchema) {
+        await database.createTable({
+          name: schema.name,
+          uniqueKey: schema.primaryKey,
+          columns: schema.columns.map((column) => ({ name: column.name, type: column.type })),
+        });
+        const projection = schema.columns.map((column) => column.name).join(", ");
+        // Nothing to convert: the batch write API takes the columnar batch as it stands, so
+        // the timed call is the whole cost of the write.
+        return {
+          prepareInsert: (batch) => async () => {
+            await database.insertBatch(schema.name, {
+              columns: batch.columns,
+              rowCount: batch.rowCount,
+            });
+          },
+          prepareUpsert: (batch) => async () => {
+            await database.upsertBatch(schema.name, {
+              columns: batch.columns,
+              rowCount: batch.rowCount,
+            });
+          },
+          prepareUpdate: (keys, column, values) => async () => {
+            await database.updateBatch(schema.name, { keys, changes: { [column]: values } });
+          },
+          // memoize: false for the same reason the reference suite uses it — a verification
+          // read must observe the table, not a memo of an identical earlier statement.
+          readAll: async () =>
+            normalizeRows(
+              (
+                await database.query(
+                  `SELECT ${projection} FROM ${schema.name} ORDER BY ${schema.primaryKey}`,
+                  { memoize: false },
+                )
+              ).rows,
+            ).map(canonicalizeRow),
+          // MinnowDatabase has no DROP TABLE; these tables leave with the dataset's database.
+          drop: () => Promise.resolve(),
         };
       },
       close() {
