@@ -725,6 +725,20 @@ describe("SQL conformance against SQLite, PGlite, and DuckDB", () => {
               `${caseLabel}\n${diffSummary(`minnow vs ${oracle.name}`, vectorKeys, oracleKeys)}`,
             );
           }
+          // Row comparison sorts keys, so it cannot see output column order. Compare the
+          // projected column lists directly: a regression that reorders or renames output
+          // columns would otherwise pass silently.
+          const oracleColumns = Object.keys(oracleRows[0] ?? {});
+          if (
+            oracleColumns.length > 0 &&
+            vectorized.columns.join(",") !== oracleColumns.join(",")
+          ) {
+            failures.push(
+              `${caseLabel}\n  column order/names vs ${oracle.name}:\n` +
+                `    minnow: ${vectorized.columns.join(", ")}\n` +
+                `    oracle: ${oracleColumns.join(", ")}`,
+            );
+          }
         }
       }
     } finally {

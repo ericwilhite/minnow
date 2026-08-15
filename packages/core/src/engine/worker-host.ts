@@ -42,6 +42,18 @@ export interface DatabaseInitPayload {
   options?: WireDatabaseOptions;
 }
 
+/**
+ * The staged-mutation ops a client may name inside a "stage" call. The op arrives as wire data,
+ * so it must be checked against this list before indexing into the session — otherwise any
+ * property name (including Object.prototype members like "constructor") would be reachable.
+ */
+const stageOps = ["insertBatch", "upsertBatch", "updateBatch", "deleteBatch"] as const;
+type StageOp = (typeof stageOps)[number];
+
+function isStageOp(value: unknown): value is StageOp {
+  return typeof value === "string" && (stageOps as readonly string[]).includes(value);
+}
+
 class WriteScopeAbortedError extends Error {
   override readonly name = "WriteScopeAbortedError";
 
@@ -243,7 +255,10 @@ class DatabaseRpcServer {
           return handle.session.query(sql, options as never);
         }
         if (method === "stage") {
-          const [op, tableName, input] = args as [keyof WriteSession, string, never];
+          const [op, tableName, input] = args as [unknown, string, never];
+          if (!isStageOp(op)) {
+            throw new Error(`Unsupported write stage operation: ${String(op)}`);
+          }
           return handle.session[op](tableName, input);
         }
         if (method === "commit") {

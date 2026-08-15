@@ -261,6 +261,58 @@ window.runTransactionBrowserTest = async () => {
       result.outputStoredBytes <= result.plannedOutputStoredBytesUpperBound &&
       result.plannedOutputStoredBytesUpperBound <= result.maximumOutputStoredBytes,
   );
+
+  // Atomic write scopes and AFTER triggers over real IndexedDB: the multi-table commit shape
+  // (per-table unique-key channels plus trigger derivations) is otherwise only exercised
+  // against fake-indexeddb in Node.
+  await database.createTable({
+    name: "ledger",
+    uniqueKey: "id",
+    columns: [
+      { name: "id", type: "number" },
+      { name: "balance", type: "number" },
+    ],
+  });
+  await database.createTable({
+    name: "ledger_audit",
+    columns: [
+      { name: "action", type: "string" },
+      { name: "balance", type: "number" },
+    ],
+  });
+  await database.execute(
+    "CREATE TRIGGER ledger_insert_audit AFTER INSERT ON ledger BEGIN " +
+      "INSERT INTO ledger_audit (action, balance) VALUES ('ins', NEW.balance); END",
+  );
+  await database.execute(
+    "CREATE TRIGGER ledger_update_audit AFTER UPDATE ON ledger BEGIN " +
+      "INSERT INTO ledger_audit (action, balance) VALUES ('upd', NEW.balance); END",
+  );
+  await database.insertBatch("ledger", { columns: { id: [1], balance: [100] } });
+  const scopeCommit = await database.write(async (tx) => {
+    await tx.updateBatch("ledger", { keys: [1], changes: { balance: [60] } });
+    await tx.insertBatch("ledger", { columns: { id: [2], balance: [40] } });
+    // Reads inside the scope see the scope's own staged writes.
+    return (await tx.query("SELECT SUM(balance) AS total FROM ledger")).rows[0]?.total;
+  });
+  // A scope that fails publishes nothing, and its key stays free.
+  let scopeRolledBack = false;
+  try {
+    await database.write(async (tx) => {
+      await tx.insertBatch("ledger", { columns: { id: [3], balance: [1] } });
+      await tx.updateBatch("ledger", { keys: [999], changes: { balance: [0] } });
+    });
+  } catch {
+    scopeRolledBack = true;
+  }
+  const ledgerAfterScopes = await database.readTable("ledger");
+  const ledgerAuditActions = (
+    await database.query("SELECT action FROM ledger_audit ORDER BY action")
+  ).rows.map((row) => String(row.action));
+  // Deleting a key that was never there fires no trigger.
+  const ledgerMissingDelete = await database.deleteBatch("ledger", { keys: [2, 404] });
+  const ledgerAuditAfterDelete = (await database.query("SELECT COUNT(*) AS n FROM ledger_audit"))
+    .rows[0]?.n;
   libraryStore.close();
 
   const reopenedLibraryStore = await IndexedDbBlockStore.open({ name: libraryName });
@@ -270,6 +322,12 @@ window.runTransactionBrowserTest = async () => {
     (segment) => segment.id,
   );
   const reopenedAggregate = summarizeAggregate(await reopenedDatabase.query(aggregateSql));
+  // The scope's commit and its trigger derivations are durable across a fresh open, and the
+  // catalog still carries the triggers.
+  const reopenedLedger = await reopenedDatabase.readTable("ledger");
+  const reopenedLedgerAudit = (
+    await reopenedDatabase.query("SELECT COUNT(*) AS n FROM ledger_audit")
+  ).rows[0]?.n;
   reopenedLibraryStore.close();
   await deleteDatabase(libraryName);
 
@@ -284,6 +342,17 @@ window.runTransactionBrowserTest = async () => {
     lostResponseRecovered,
     leases: { renewed: leaseRenewed, released: leaseReleased },
     rowIdsDisjoint,
+    writeScopes: {
+      scopeTotal: typeof scopeCommit.result === "number" ? scopeCommit.result : null,
+      scopeRolledBack,
+      ledgerAfterScopes: ledgerAfterScopes.map((row) => Number(row.balance)).sort(),
+      ledgerAuditActions,
+      missingKeyDeleted: ledgerMissingDelete.deletedRowCount,
+      auditRowsAfterDelete:
+        typeof ledgerAuditAfterDelete === "number" ? ledgerAuditAfterDelete : null,
+      reopenedLedgerRows: reopenedLedger.length,
+      reopenedAuditRows: typeof reopenedLedgerAudit === "number" ? reopenedLedgerAudit : null,
+    },
     batchWrite: {
       tables: tableNames,
       rowCount: batch.rowCount,

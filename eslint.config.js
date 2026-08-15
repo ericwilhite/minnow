@@ -53,6 +53,7 @@ export default tseslint.config(
       "apps/bench/capture/*.mjs",
       "apps/site/tests/serve-dist.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
+      "packages/core/src/engine/sql-mutation-conformance.test.ts",
       "scripts/perf-gate.mts",
     ],
     rules: { "no-restricted-imports": "off" },

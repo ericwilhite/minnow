@@ -70,7 +70,12 @@ Not much, by design:
 
 - A subscription keeps its query, its dependency table IDs, and a numeric digest of the last
   result — **never rows**.
-- Re-runs are skipped when none of the query's tables changed.
+- Re-runs are skipped when none of the query's tables changed, and also when the data layer can
+  _prove_ the commits could not change the result — every new block's zone statistics reject the
+  query's predicates. The proof is deliberately narrow: a query that reads the same table again
+  through a subquery, `EXISTS`/`IN`, CTE, or derived table always re-runs, because a row the
+  predicates reject can still move a value such a read produces. So can a commit whose segments
+  were compacted away and reclaimed before the sweep saw them.
 - Notifications are suppressed when a re-run produces an unchanged digest, so `onChange` fires
   only when the result actually differs.
 - `live.stats` reports all of it: hints received, sweeps, re-runs executed and avoided,

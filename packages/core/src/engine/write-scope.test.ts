@@ -1,5 +1,6 @@
 import { IDBFactory } from "fake-indexeddb";
 import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import { FaultInjectingBlockStore } from "../testing/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
 
@@ -135,6 +136,73 @@ describe("atomic write scopes", () => {
         database.insertBatch("labels", { columns: { name: ["fresh"], note: ["z"] } }),
       ).rejects.toThrow();
       await database.insertBatch("labels", { columns: { name: ["old"], note: ["z"] } });
+    });
+
+    it(`${implementation.name} refuses to commit after a caught partial-stage failure`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      await database.createTable({
+        name: "audit",
+        columns: [{ name: "label", type: "string" }],
+      });
+      // The body writes the numeric balance into a string column: the insert registers its
+      // unique key first, then fails while staging the derivation — partial work landed.
+      await database.execute(
+        "CREATE TRIGGER bad_audit AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit (label) VALUES (NEW.balance); END",
+      );
+      await expect(
+        database.write(async (tx) => {
+          try {
+            await tx.insertBatch("accounts", { columns: { id: [7], balance: [1] } });
+          } catch {
+            // Swallowed on purpose: the partial registration cannot be undone in place, so
+            // the scope must refuse to publish rather than commit the fragment.
+          }
+          await expect(
+            tx.insertBatch("accounts", { columns: { id: [8], balance: [1] } }),
+          ).rejects.toThrow("can only roll back");
+        }),
+      ).rejects.toThrow("failed mid-stage");
+      expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 2 }]);
+      // No phantom key membership survived: the aborted scope's key is still insertable.
+      await database.execute("DROP TRIGGER bad_audit");
+      await database.insertBatch("accounts", { columns: { id: [7], balance: [1] } });
+      expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 3 }]);
+    });
+
+    it(`${implementation.name} keeps the scope usable after a clean validation failure`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      const { version } = await database.write(async (tx) => {
+        // Nothing was registered before this rejected, so the scope stays usable.
+        await expect(
+          tx.updateBatch("accounts", { keys: [999], changes: { balance: [1] } }),
+        ).rejects.toThrow();
+        await tx.insertBatch("accounts", { columns: { id: [7], balance: [1] } });
+      });
+      expect(version).not.toBeNull();
+      expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 3 }]);
+    });
+
+    it(`${implementation.name} accepts multiple insert batches into one full-text table`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+      await database.createTable({
+        name: "docs",
+        columns: [{ name: "body", type: "string" }],
+      });
+      await database.insertBatch("docs", { columns: { body: ["seed document"] } });
+      await database.buildFtsIndex("docs", "body");
+      await database.write(async (tx) => {
+        await tx.insertBatch("docs", { columns: { body: ["quick brown fox"] } });
+        await tx.insertBatch("docs", { columns: { body: ["quick silver stream"] } });
+      });
+      // Both batches' full-text deltas merged into the one atomic commit.
+      expect(
+        (await database.query("SELECT COUNT(*) AS n FROM docs WHERE MATCH(body) AGAINST 'quick'"))
+          .rows,
+      ).toEqual([{ n: 2 }]);
     });
 
     it(`${implementation.name} fires AFTER triggers inside the scope's single commit`, async () => {
@@ -276,6 +344,112 @@ describe("atomic write scopes", () => {
     expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
       { balance: 401 },
     ]);
+  });
+
+  /**
+   * Crash atomicity: a fault at the commit boundary must leave the durable store either fully
+   * before or fully after the scope, across every table the scope touched plus its trigger
+   * derivations and unique-key membership — as observed by a brand-new database instance that
+   * shares nothing with the one that crashed.
+   */
+  for (const implementation of implementations) {
+    for (const point of ["beforeTransactionCommit", "afterTransactionCommit"] as const) {
+      it(`${implementation.name} survives a fault at ${point} as all-or-nothing`, async () => {
+        const inner = await implementation.create();
+        let armed = false;
+        const store = new FaultInjectingBlockStore(inner, (fired) => {
+          if (fired === point && armed) {
+            armed = false;
+            throw new Error("injected crash");
+          }
+        });
+        const database = await bank(store);
+        await database.createTable({
+          name: "transfers",
+          columns: [
+            { name: "from_id", type: "number" },
+            { name: "amount", type: "number" },
+          ],
+        });
+        await database.createTable({
+          name: "audit",
+          columns: [{ name: "account_id", type: "number" }],
+        });
+        await database.execute(
+          "CREATE TRIGGER account_audit AFTER UPDATE ON accounts BEGIN " +
+            "INSERT INTO audit (account_id) VALUES (NEW.id); END",
+        );
+        armed = true;
+        const outcome = await database
+          .write(async (tx) => {
+            await tx.updateBatch("accounts", { keys: [1], changes: { balance: [400] } });
+            await tx.insertBatch("accounts", { columns: { id: [9], balance: [1] } });
+            await tx.insertBatch("transfers", { columns: { from_id: [1], amount: [100] } });
+          })
+          .then(
+            () => "committed" as const,
+            () => "failed" as const,
+          );
+        // The fault fired (it disarms itself) and the outcome is the documented one for this
+        // point: a fault before the commit publishes nothing, while one after it loses only
+        // the response — the transaction re-reads its persisted record and reports success.
+        expect(armed).toBe(false);
+        expect(outcome).toBe(point === "beforeTransactionCommit" ? "failed" : "committed");
+
+        // A fresh instance on the same store sees only durable state.
+        const reopened = new MinnowDatabase(inner, { rowsPerBlock: 8, compression: "raw" });
+        const balances = (await reopened.query("SELECT id, balance FROM accounts ORDER BY id"))
+          .rows;
+        const transfers = (await reopened.query("SELECT COUNT(*) AS n FROM transfers")).rows;
+        const audit = (await reopened.query("SELECT COUNT(*) AS n FROM audit")).rows;
+
+        if (outcome === "committed") {
+          // afterTransactionCommit can lose only the response: the commit itself landed.
+          expect(balances).toEqual([
+            { id: 1, balance: 400 },
+            { id: 2, balance: 100 },
+            { id: 9, balance: 1 },
+          ]);
+          expect(transfers).toEqual([{ n: 1 }]);
+          expect(audit).toEqual([{ n: 1 }]);
+        } else {
+          // Nothing from the scope is visible anywhere — no half-applied table, no orphan
+          // trigger row, and the scope's key is free for reuse.
+          expect(balances).toEqual([
+            { id: 1, balance: 500 },
+            { id: 2, balance: 100 },
+          ]);
+          expect(transfers).toEqual([{ n: 0 }]);
+          expect(audit).toEqual([{ n: 0 }]);
+          await reopened.insertBatch("accounts", { columns: { id: [9], balance: [7] } });
+          expect((await reopened.query("SELECT balance FROM accounts WHERE id = 9")).rows).toEqual([
+            { balance: 7 },
+          ]);
+        }
+      });
+    }
+  }
+
+  it("pins scope reads to the pre-scope snapshot", async () => {
+    const store = new MemoryBlockStore();
+    const database = await bank(store);
+    const other = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    let sawInterloper: number | undefined;
+    await expect(
+      database.write(async (tx) => {
+        await tx.insertBatch("accounts", { columns: { id: [60], balance: [1] } });
+        // A commit from another instance lands mid-scope. The scope reads its own pinned
+        // snapshot plus its staged rows, so the interloper stays invisible; the scope then
+        // loses the version race at commit, which is the documented outcome.
+        await other.insertBatch("accounts", { columns: { id: [50], balance: [1] } });
+        sawInterloper = (
+          (await tx.query("SELECT COUNT(*) AS n FROM accounts WHERE id = 50")).rows[0] as {
+            n: number;
+          }
+        ).n;
+      }),
+    ).rejects.toThrow();
+    expect(sawInterloper).toBe(0);
   });
 
   it("delivers one live notification and one fresh memo per scope", async () => {

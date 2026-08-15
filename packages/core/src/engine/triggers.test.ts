@@ -1,6 +1,8 @@
-import { MemoryBlockStore } from "../storage/index.js";
+import { MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import { FaultInjectingBlockStore } from "../testing/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
+import { column, schema, table } from "./schema.js";
 
 /**
  * AFTER triggers: catalog-persisted, fired by the committing writer inside the same
@@ -8,7 +10,7 @@ import { MinnowDatabase } from "./database.js";
  * and cross-tab visibility follows the catalog epoch like any other DDL.
  */
 
-async function seeded(store = new MemoryBlockStore()): Promise<MinnowDatabase> {
+async function seeded(store: BlockStore = new MemoryBlockStore()): Promise<MinnowDatabase> {
   const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
   await database.createTable({
     name: "accounts",
@@ -190,6 +192,265 @@ describe("AFTER triggers", () => {
       }),
     ).rejects.toThrow("touched the same owner_stats row twice");
     expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 1 }]);
+  });
+
+  it("trigger body updates compound across firings inside one write scope", async () => {
+    const database = await seeded();
+    await database.createTable({
+      name: "owner_stats",
+      uniqueKey: "owner",
+      columns: [
+        { name: "owner", type: "string" },
+        { name: "accounts", type: "number" },
+      ],
+    });
+    await database.insertBatch("owner_stats", { columns: { owner: ["ada"], accounts: [0] } });
+    await database.execute(
+      "CREATE TRIGGER count_up AFTER INSERT ON accounts BEGIN " +
+        "UPDATE owner_stats SET accounts = accounts + 1 WHERE owner = NEW.owner; END",
+    );
+    // Two firings in one scope: the second body read must see the first's staged update.
+    await database.write(async (tx) => {
+      await tx.insertBatch("accounts", { columns: { id: [1], balance: [10], owner: ["ada"] } });
+      await tx.insertBatch("accounts", { columns: { id: [2], balance: [20], owner: ["ada"] } });
+    });
+    expect((await database.query("SELECT accounts FROM owner_stats")).rows).toEqual([
+      { accounts: 2 },
+    ]);
+  });
+
+  it("trigger body updates compound with the scope's own staged update", async () => {
+    const database = await seeded();
+    await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [110], owner: ["ada"] },
+    });
+    await database.createTable({
+      name: "events",
+      columns: [{ name: "amount", type: "number" }],
+    });
+    await database.execute(
+      "CREATE TRIGGER apply AFTER INSERT ON events BEGIN " +
+        "UPDATE accounts SET balance = balance + NEW.amount WHERE id = 1; END",
+    );
+    await database.write(async (tx) => {
+      await tx.updateBatch("accounts", { keys: [1], changes: { balance: [500] } });
+      await tx.insertBatch("events", { columns: { amount: [10] } });
+    });
+    // The body reads the staged 500, not the committed 110.
+    expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
+      { balance: 510 },
+    ]);
+  });
+
+  it("trigger bodies match rows the scope staged earlier", async () => {
+    const database = await seeded();
+    await database.createTable({
+      name: "events",
+      columns: [{ name: "amount", type: "number" }],
+    });
+    await database.execute(
+      "CREATE TRIGGER apply AFTER INSERT ON events BEGIN " +
+        "UPDATE accounts SET balance = balance + NEW.amount WHERE id = 7; END",
+    );
+    // The target row exists only in the scope's staged state.
+    await database.write(async (tx) => {
+      await tx.insertBatch("accounts", { columns: { id: [7], balance: [0], owner: ["ada"] } });
+      await tx.insertBatch("events", { columns: { amount: [25] } });
+    });
+    expect((await database.query("SELECT balance FROM accounts WHERE id = 7")).rows).toEqual([
+      { balance: 25 },
+    ]);
+  });
+
+  it("fires DELETE triggers only for rows that actually existed", async () => {
+    const database = await seeded();
+    await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [100], owner: ["ada"] },
+    });
+    await database.execute(
+      "CREATE TRIGGER account_delete_audit AFTER DELETE ON accounts BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('delete', OLD.id, OLD.balance); END",
+    );
+    const result = await database.deleteBatch("accounts", { keys: [1, 2, 3] });
+    expect(result.deletedRowCount).toBe(1);
+    // One audit row for the one real deletion — no phantom all-null OLD images for 2 and 3.
+    expect((await database.query("SELECT account_id, amount FROM audit")).rows).toEqual([
+      { account_id: 1, amount: 100 },
+    ]);
+  });
+
+  it("upserts fire INSERT triggers for fresh keys and UPDATE triggers for replaced rows", async () => {
+    const database = await seeded();
+    await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [100], owner: ["ada"] },
+    });
+    await database.execute(
+      "CREATE TRIGGER ins_audit AFTER INSERT ON accounts BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('ins', NEW.id, NEW.balance); END",
+    );
+    await database.execute(
+      "CREATE TRIGGER upd_audit AFTER UPDATE ON accounts BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('upd-old', OLD.id, OLD.balance); " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('upd-new', NEW.id, NEW.balance); END",
+    );
+    await database.upsertBatch("accounts", {
+      columns: { id: [1, 2], balance: [150, 50], owner: ["ada", "bo"] },
+    });
+    expect(
+      (await database.query("SELECT action, account_id, amount FROM audit ORDER BY action")).rows,
+    ).toEqual([
+      { action: "ins", account_id: 2, amount: 50 },
+      { action: "upd-new", account_id: 1, amount: 150 },
+      { action: "upd-old", account_id: 1, amount: 100 },
+    ]);
+    // The SQL upsert routes identically whether or not the SET lists every column.
+    await database.execute(
+      "INSERT INTO accounts (id, balance, owner) VALUES (2, 75, 'bo') " +
+        "ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance, owner = EXCLUDED.owner",
+    );
+    expect(
+      (await database.query("SELECT amount FROM audit WHERE action = 'upd-new' AND account_id = 2"))
+        .rows,
+    ).toEqual([{ amount: 75 }]);
+  });
+
+  it("re-runs trigger bodies from fresh state when the commit hits a conflict", async () => {
+    const inner = new MemoryBlockStore();
+    let fired = false;
+    const interloper: { run?: () => Promise<void> } = {};
+    const store = new FaultInjectingBlockStore(inner, async (point) => {
+      if (point === "beforeTransactionCommit" && !fired && interloper.run !== undefined) {
+        fired = true;
+        await interloper.run();
+      }
+    });
+    const database = await seeded(store);
+    const other = new MinnowDatabase(inner, { rowsPerBlock: 8, compression: "raw" });
+    await database.createTable({
+      name: "owner_stats",
+      uniqueKey: "owner",
+      columns: [
+        { name: "owner", type: "string" },
+        { name: "accounts", type: "number" },
+      ],
+    });
+    await database.insertBatch("owner_stats", { columns: { owner: ["ada"], accounts: [0] } });
+    await database.execute(
+      "CREATE TRIGGER count_up AFTER INSERT ON accounts BEGIN " +
+        "UPDATE owner_stats SET accounts = accounts + 1 WHERE owner = NEW.owner; END",
+    );
+    // A competing commit (which itself fires the trigger) lands between this write's staging
+    // and its commit: the conflicted attempt must re-run the body, not republish accounts=1.
+    interloper.run = async () => {
+      await other.insertBatch("accounts", { columns: { id: [2], balance: [1], owner: ["ada"] } });
+    };
+    await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [1], owner: ["ada"] },
+    });
+    expect((await database.query("SELECT accounts FROM owner_stats")).rows).toEqual([
+      { accounts: 2 },
+    ]);
+  });
+
+  it("pads unlisted nullable body-INSERT columns and rejects impossible bodies at CREATE", async () => {
+    const database = await seeded();
+    // audit(action, account_id nullable, amount nullable): listing only action is legal.
+    await database.execute(
+      "CREATE TRIGGER thin_audit AFTER INSERT ON accounts BEGIN " +
+        "INSERT INTO audit (action) VALUES ('touched'); END",
+    );
+    await database.insertBatch("accounts", {
+      columns: { id: [1], balance: [10], owner: ["ada"] },
+    });
+    expect((await database.query("SELECT action, account_id FROM audit")).rows).toEqual([
+      { action: "touched", account_id: null },
+    ]);
+    // A body omitting a non-nullable column without a default can never fire: CREATE fails.
+    await database.createTable({
+      name: "strict",
+      columns: [
+        { name: "a", type: "string" },
+        { name: "b", type: "number" },
+      ],
+    });
+    await expect(
+      database.execute(
+        "CREATE TRIGGER impossible AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO strict (a) VALUES ('x'); END",
+      ),
+    ).rejects.toThrow("omits a non-nullable column");
+    await expect(
+      database.execute(
+        "CREATE TRIGGER unknown_column AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit (nope) VALUES ('x'); END",
+      ),
+    ).rejects.toThrow("column does not exist");
+  });
+
+  it("rejects renaming a column a trigger references", async () => {
+    const database = await seeded();
+    await database.execute(
+      "CREATE TRIGGER account_insert_audit AFTER INSERT ON accounts BEGIN " +
+        "INSERT INTO audit (action, account_id, amount) VALUES ('insert', NEW.id, NEW.balance); END",
+    );
+    // NEW.balance binds the trigger's own table column; renaming it would bind NULL forever.
+    await expect(
+      database.migrate(
+        schema([
+          table("accounts", {
+            id: column.number().unique(),
+            cash: column.number().renamedFrom("balance"),
+            owner: column.string(),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("trigger account_insert_audit references it");
+    // The body's target column is protected too: renaming audit.amount would fail every firing.
+    await expect(
+      database.migrate(
+        schema([
+          table("audit", {
+            action: column.string(),
+            account_id: column.number().nullable(),
+            value: column.number().nullable().renamedFrom("amount"),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("trigger account_insert_audit references it");
+  });
+
+  it("keeps trigger names unique when two instances create the same name at once", async () => {
+    const store = new MemoryBlockStore();
+    const database = await seeded(store);
+    const other = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await database.createTable({
+      name: "mirror",
+      columns: [{ name: "action", type: "string" }],
+    });
+    // Same trigger name, different tables: the pre-check can't see the other in flight, so
+    // exactly one must survive the post-write settle and the other must report the conflict.
+    const outcomes = await Promise.allSettled([
+      database.execute(
+        "CREATE TRIGGER dup AFTER INSERT ON accounts BEGIN " +
+          "INSERT INTO audit (action, account_id, amount) VALUES ('a', NEW.id, NEW.balance); END",
+      ),
+      other.execute(
+        "CREATE TRIGGER dup AFTER INSERT ON audit BEGIN " +
+          "INSERT INTO mirror (action) VALUES (NEW.action); END",
+      ),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const named = (await store.listTables()).flatMap((record) =>
+      (record.triggers ?? []).filter((trigger) => trigger.name === "dup"),
+    );
+    expect(named).toHaveLength(1);
+    // The survivor is intact and droppable by name.
+    await database.execute("DROP TRIGGER dup");
+    expect(
+      (await store.listTables()).flatMap((record) =>
+        (record.triggers ?? []).filter((trigger) => trigger.name === "dup"),
+      ),
+    ).toHaveLength(0);
   });
 
   it("allows one cascade level and errors loudly on deeper chains", async () => {

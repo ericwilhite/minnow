@@ -166,6 +166,23 @@ export class DatabaseTransaction {
     return [...this.#supersededBlockIds].sort();
   }
 
+  /**
+   * Counts every registration this transaction carries: staged blocks and segments, unique-key
+   * entries, full-text entries, and supersessions. A caller that fails part-way through a
+   * multi-step stage compares this before and after to tell "nothing was registered" (the
+   * statement is cleanly undone) from "partial work landed" (the transaction can only abort),
+   * since there is no statement-level rollback inside a transaction.
+   */
+  get stagedWorkCount(): number {
+    return (
+      this.#record.pendingBlockIds.length +
+      this.#record.pendingSegmentIds.length +
+      this.#uniqueKeyChanges.length +
+      this.#ftsChanges.length +
+      this.#supersededBlockIds.size
+    );
+  }
+
   async snapshot(): Promise<Snapshot> {
     return loadSnapshot(this.store, this.#record.snapshotVersion);
   }
@@ -316,15 +333,51 @@ export class DatabaseTransaction {
     });
   }
 
-  /** Attaches one table's full-text deltas; applied atomically with the publish. */
+  /**
+   * Attaches one batch's full-text deltas; applied atomically with the publish. A second
+   * batch for the same table merges per column — postings re-sorted by term (each batch's
+   * reserved row ids are strictly above the last, so rowIds stay ascending within a term)
+   * and token totals summed — so a scope can insert into one FTS table any number of times.
+   */
   setFtsChanges(changes: FtsChanges): void {
     this.#assertActive();
-    if (this.#ftsChanges.some((entry) => entry.tableId === changes.tableId)) {
-      throw new Error(
-        `A transaction already carries full-text deltas for table: ${changes.tableId}`,
-      );
+    const existing = this.#ftsChanges.find((entry) => entry.tableId === changes.tableId);
+    if (existing === undefined) {
+      this.#ftsChanges.push(changes);
+      return;
     }
-    this.#ftsChanges.push(changes);
+    const merged = new Map(existing.columns.map((column) => [column.columnId, column] as const));
+    for (const column of changes.columns) {
+      const present = merged.get(column.columnId);
+      if (present === undefined) {
+        merged.set(column.columnId, column);
+        continue;
+      }
+      const byTerm = new Map(present.postings.map((posting) => [posting.term, posting] as const));
+      for (const posting of column.postings) {
+        const held = byTerm.get(posting.term);
+        if (held === undefined) {
+          byTerm.set(posting.term, posting);
+        } else {
+          byTerm.set(posting.term, {
+            term: posting.term,
+            rowIds: [...held.rowIds, ...posting.rowIds],
+            tf: [...held.tf, ...posting.tf],
+          });
+        }
+      }
+      merged.set(column.columnId, {
+        columnId: column.columnId,
+        postings: [...byTerm.values()].sort((left, right) =>
+          left.term < right.term ? -1 : left.term > right.term ? 1 : 0,
+        ),
+        totalTokens: present.totalTokens + column.totalTokens,
+      });
+    }
+    this.#ftsChanges[this.#ftsChanges.indexOf(existing)] = {
+      tableId: changes.tableId,
+      columns: [...merged.values()],
+    };
   }
 
   supersedeBlocks(blockIds: readonly string[]): void {

@@ -20,6 +20,14 @@ const WARMUP = 2;
 const RUNS = 7;
 /** Headroom multiplier applied to a measured ratio when writing a new baseline. */
 const MARGIN = 1.5;
+/**
+ * Sub-millisecond medians are timer-noise-dominated, so both sides of a ratio are floored:
+ * a 0.08ms query gates as 0.5ms and only trips once it genuinely leaves the fast-path range,
+ * instead of flaking on scheduler jitter.
+ */
+const FLOOR_MS = 0.5;
+const ratioOf = (minnowMs: number, engineMs: number): number =>
+  Math.max(minnowMs, FLOOR_MS) / Math.max(engineMs, FLOOR_MS);
 
 function mulberry32(seed: number): () => number {
   let state = seed;
@@ -74,6 +82,8 @@ interface PerfQuery {
   readonly name: string;
   readonly sql: string;
   readonly params?: ReadonlyArray<number | string>;
+  /** Serve Minnow's probe-validated result memo instead of re-executing (gates memo-hit latency). */
+  readonly memoize?: boolean;
 }
 
 const QUERIES: readonly PerfQuery[] = [
@@ -107,6 +117,25 @@ const QUERIES: readonly PerfQuery[] = [
     name: "distinct-aggregate",
     sql: "SELECT region, COUNT(DISTINCT label) AS labels FROM data GROUP BY region",
   },
+  {
+    name: "point-lookup",
+    sql: "SELECT id, amount, label FROM data WHERE id = ?",
+    params: [123_456],
+  },
+  {
+    // Ids arrive in insertion order, so blocks are id-clustered and zone maps prune almost
+    // every block; a pruning regression turns this into a full scan and trips the gate.
+    name: "range-scan",
+    sql: "SELECT COUNT(*) AS n, SUM(amount) AS s FROM data WHERE id BETWEEN ? AND ?",
+    params: [150_000, 154_000],
+  },
+  {
+    // Same statement repeated unchanged: Minnow answers from the probe-validated memo while
+    // the other engines re-execute. Gates the memo probe's own latency.
+    name: "memo-hit-aggregate",
+    sql: "SELECT region, COUNT(*) AS c, SUM(amount) AS s, AVG(amount) AS a FROM data GROUP BY region",
+    memoize: true,
+  },
 ];
 
 function median(samples: number[]): number {
@@ -115,10 +144,10 @@ function median(samples: number[]): number {
 }
 
 async function timeMinnow(database: MinnowDatabase, query: PerfQuery): Promise<number> {
-  // The gate measures execution, not the probe-validated result memo (which would answer
-  // every repeat sample from cache); real applications keep the default memoize: true.
+  // By default the gate measures execution, not the probe-validated result memo (which would
+  // answer every repeat sample from cache); memo-hit shapes opt in to measure the memo path.
   const options = {
-    memoize: false as const,
+    memoize: query.memoize ?? false,
     ...(query.params === undefined ? {} : { params: query.params as never }),
   };
   for (let index = 0; index < WARMUP; index += 1) await database.query(query.sql, options);
@@ -159,14 +188,24 @@ await minnow.createTable({
     { name: "label", type: "string" },
   ],
 });
-for (let start = 0; start < rows.length; start += 50_000) {
-  await minnow.insertBatch(
-    "data",
-    rows.slice(start, start + 50_000).map((row) => ({
-      ...row,
-      joined: row.joined === null ? null : new Date(row.joined),
-    })),
-  );
+/**
+ * Wall time to load the 200k-row table, per engine, measured on each engine's load path as
+ * configured here (Minnow insertBatch, SQLite one transaction, PGlite/DuckDB literal batches).
+ * Single-sample by nature, but hundreds of milliseconds, so noise is proportionally small.
+ */
+const ingestMs = { minnow: 0, sqlite: 0, pglite: 0, duckdb: 0 };
+{
+  const started = performance.now();
+  for (let start = 0; start < rows.length; start += 50_000) {
+    await minnow.insertBatch(
+      "data",
+      rows.slice(start, start + 50_000).map((row) => ({
+        ...row,
+        joined: row.joined === null ? null : new Date(row.joined),
+      })),
+    );
+  }
+  ingestMs.minnow = performance.now() - started;
 }
 await minnow.createTable({
   name: "dims",
@@ -186,11 +225,13 @@ sqlite.exec(
 sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
 {
   const insert = sqlite.prepare("INSERT INTO data VALUES (?, ?, ?, ?, ?, ?)");
+  const started = performance.now();
   sqlite.exec("BEGIN");
   for (const row of rows) {
     insert.run(row.id, row.region, row.amount, row.active ? 1 : 0, row.joined, row.label);
   }
   sqlite.exec("COMMIT");
+  ingestMs.sqlite = performance.now() - started;
   const dim = sqlite.prepare("INSERT INTO dims VALUES (?, ?, ?)");
   for (const entry of DIMS) dim.run(entry.region, entry.label, entry.rank);
 }
@@ -214,17 +255,21 @@ await pglite.exec(
   `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
 await pglite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
-for (let start = 0; start < rows.length; start += 2000) {
-  const batch = rows
-    .slice(start, start + 2000)
-    .map(
-      (row) =>
-        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
-          .map(sqlLiteral)
-          .join(", ")})`,
-    )
-    .join(", ");
-  await pglite.exec(`INSERT INTO data VALUES ${batch}`);
+{
+  const started = performance.now();
+  for (let start = 0; start < rows.length; start += 2000) {
+    const batch = rows
+      .slice(start, start + 2000)
+      .map(
+        (row) =>
+          `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
+            .map(sqlLiteral)
+            .join(", ")})`,
+      )
+      .join(", ");
+    await pglite.exec(`INSERT INTO data VALUES ${batch}`);
+  }
+  ingestMs.pglite = performance.now() - started;
 }
 await pglite.exec(
   `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
@@ -238,17 +283,21 @@ await duckdb.run(
   `CREATE TABLE data (id INTEGER, region TEXT, amount DOUBLE, active BOOLEAN, joined TIMESTAMPTZ, label TEXT)`,
 );
 await duckdb.run(`CREATE TABLE dims (region TEXT, label TEXT, rank DOUBLE)`);
-for (let start = 0; start < rows.length; start += 2000) {
-  const batch = rows
-    .slice(start, start + 2000)
-    .map(
-      (row) =>
-        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
-          .map(sqlLiteral)
-          .join(", ")})`,
-    )
-    .join(", ");
-  await duckdb.run(`INSERT INTO data VALUES ${batch}`);
+{
+  const started = performance.now();
+  for (let start = 0; start < rows.length; start += 2000) {
+    const batch = rows
+      .slice(start, start + 2000)
+      .map(
+        (row) =>
+          `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
+            .map(sqlLiteral)
+            .join(", ")})`,
+      )
+      .join(", ");
+    await duckdb.run(`INSERT INTO data VALUES ${batch}`);
+  }
+  ingestMs.duckdb = performance.now() - started;
 }
 await duckdb.run(
   `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
@@ -304,7 +353,13 @@ interface Result {
   engineMs: Record<EngineName, number>;
 }
 
-const results: Result[] = [];
+const results: Result[] = [
+  {
+    name: "bulk-ingest",
+    minnowMs: ingestMs.minnow,
+    engineMs: { sqlite: ingestMs.sqlite, pglite: ingestMs.pglite, duckdb: ingestMs.duckdb },
+  },
+];
 for (const query of QUERIES) {
   const minnowMs = await timeMinnow(minnow, query);
   results.push({
@@ -336,7 +391,7 @@ for (const result of results) {
   newThresholds[result.name] = {};
   for (const engine of ENGINES) {
     const engineMs = result.engineMs[engine];
-    const ratio = result.minnowMs / engineMs;
+    const ratio = ratioOf(result.minnowMs, engineMs);
     newThresholds[result.name][engine] = Number((ratio * MARGIN).toFixed(2));
     const threshold = baseline?.thresholds[result.name]?.[engine];
     const flag = threshold !== undefined && ratio > threshold ? "!" : " ";

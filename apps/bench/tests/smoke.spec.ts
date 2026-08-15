@@ -1,4 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
+import { referenceQueryDefinitions } from "../src/worker/reference-suite.js";
+
+/**
+ * Derived from the suite itself, so adding a reference query updates the expectation instead
+ * of silently breaking this smoke test (the row count is independent of dataset size).
+ */
+const referenceQueryCount = referenceQueryDefinitions(1000).length;
 
 const pages = [
   { path: "/", title: "Minnow bench", nav: "Overview" },
@@ -86,12 +93,14 @@ test("generates, queries, verifies, and deletes a dataset on all three engines",
   await expect(page.locator("#ref-status")).toContainText("agreed with its oracle", {
     timeout: 240_000,
   });
-  await expect(page.locator("#ref-results tbody tr")).toHaveCount(15);
+  await expect(page.locator("#ref-results tbody tr")).toHaveCount(referenceQueryCount);
   await expect(page.locator("#ref-results .badge.fail")).toHaveCount(0);
   // Every query now compiles on every engine: COALESCE and DATE_TRUNC joined the
   // MinnowDatabase surface, so no cell reports "not supported".
   await expect(page.locator("#ref-results .badge.gap")).toHaveCount(0);
-  await expect(page.locator("#ref-results")).toContainText("15/15 supported");
+  await expect(page.locator("#ref-results")).toContainText(
+    `${String(referenceQueryCount)}/${String(referenceQueryCount)} supported`,
+  );
 
   // Delete the dataset from every engine's storage.
   await page.goto("/datasets.html");
@@ -116,7 +125,9 @@ test("storage-configuration benchmark passes every check", async ({ page, browse
   await expect(page.locator("#storage-results")).toContainText(
     "Dataset integrity checks · 4/4 passed",
   );
-  await expect(page.locator("#storage-results")).toContainText("15/15 on SQL");
+  await expect(page.locator("#storage-results")).toContainText(
+    `${String(referenceQueryCount)}/${String(referenceQueryCount)} on SQL`,
+  );
 });
 
 test("sql conformance run reports zero drift against the shipped matrix", async ({

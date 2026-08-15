@@ -1,4 +1,5 @@
 import { MemoryBlockStore } from "../storage/index.js";
+import { parseRpcResponse, protocolVersion, type RpcResponse } from "../worker-protocol/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabaseClient, type ClientTransport } from "./client.js";
 import { MinnowDatabase } from "./database.js";
@@ -325,6 +326,47 @@ describe("MinnowDatabaseClient", () => {
     await client.close();
     expect(disposed).toBe(true);
     await expect(client.listTables()).rejects.toThrow(/closed/);
+  });
+
+  it("rejects wire-supplied stage ops outside the whitelist", async () => {
+    // Raw frames stand in for a hostile or buggy client: the real client only ever names the
+    // four staged-mutation ops, so anything else (including Object.prototype members) must get
+    // a failure reply instead of indexing into the session.
+    const { clientSide, workerSide } = createBoundary();
+    exposeDatabase(new MinnowDatabase(new MemoryBlockStore()), workerSide);
+    const pending = new Map<string, (response: RpcResponse) => void>();
+    clientSide.addEventListener("message", (event) => {
+      const response = parseRpcResponse(event.data);
+      if (response !== null && response.requestId !== null) {
+        pending.get(response.requestId)?.(response);
+      }
+    });
+    let nextRequestId = 0;
+    const call = (handleId: string | null, method: string, args: unknown[]): Promise<RpcResponse> =>
+      new Promise((resolve) => {
+        const requestId = `raw-${String((nextRequestId += 1))}`;
+        pending.set(requestId, resolve);
+        clientSide.postMessage({
+          version: protocolVersion,
+          requestId,
+          kind: "rpc-call",
+          handleId,
+          method,
+          args,
+        });
+      });
+    const opened = await call(null, "writeOpen", []);
+    if (opened.kind !== "rpc-result") throw new Error("writeOpen failed");
+    const { handleId } = opened.result as { handleId: string };
+    for (const op of ["constructor", "toString", "hasOwnProperty", "query"]) {
+      const reply = await call(handleId, "stage", [op, "people", { columns: {} }]);
+      expect(reply.kind).toBe("rpc-failure");
+      if (reply.kind === "rpc-failure") {
+        expect(reply.error.message).toBe(`Unsupported write stage operation: ${op}`);
+      }
+    }
+    // The scope survives the rejected frames and still aborts cleanly.
+    expect((await call(handleId, "abort", [])).kind).toBe("rpc-result");
   });
 
   it("rejects calls after dispose and unknown methods cleanly", async () => {

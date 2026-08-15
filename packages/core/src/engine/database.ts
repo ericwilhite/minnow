@@ -113,6 +113,7 @@ import {
   expandFtsColumns,
   forEachBlockExpression,
   planContainsFts,
+  planReadsBeyondSingleScan,
   projectResultColumns,
   subqueryResolutionSteps,
   topLevelFtsMatchConjuncts,
@@ -180,6 +181,17 @@ const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 
 /** Overlay logical order for a write scope's staged segments: after all committed data. */
 const STAGED_OVERLAY_ORDER_BASE = 2 ** 52;
+
+/**
+ * Internal restart signal: a commit conflict invalidated staged trigger derivations — their
+ * bodies and OLD/NEW images were read at the superseded snapshot, so a rebase would republish
+ * stale values. The statement re-runs whole instead, re-reading everything fresh.
+ */
+class StaleTriggerDerivationsError extends Error {
+  constructor(readonly conflict: WriteConflictError) {
+    super("Trigger derivations were computed at a superseded snapshot");
+  }
+}
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
 const PLAN_CACHE_LIMIT = 512;
 
@@ -823,6 +835,22 @@ export class MinnowDatabase {
     });
   }
 
+  /**
+   * Re-runs a statement whose staged trigger derivations were invalidated by a commit
+   * conflict: unlike the plain rebase-and-retry, a restart re-reads pre-images and re-runs
+   * trigger bodies at the fresh state, so derivations can never publish stale values.
+   */
+  async #withTriggerRestarts<T>(run: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await run();
+      } catch (error) {
+        if (!(error instanceof StaleTriggerDerivationsError)) throw error;
+        if (attempt >= this.#maxCommitRetries) throw error.conflict;
+      }
+    }
+  }
+
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
     const table = await this.#findTable(tableName);
     const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
@@ -830,7 +858,9 @@ export class MinnowDatabase {
       autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
         ? batchKeys(table, batch)
         : undefined;
-    const result = await this.#writeBatch(table, batch, "insert", keys, autoIncrement);
+    const result = await this.#withTriggerRestarts(() =>
+      this.#writeBatch(table, batch, "insert", keys, autoIncrement),
+    );
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       tableName: result.tableName,
@@ -867,7 +897,9 @@ export class MinnowDatabase {
     const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
     const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
     const keys = deferred ? undefined : batchKeys(table, batch);
-    const result = await this.#writeBatch(table, batch, "upsert", keys, autoIncrement);
+    const result = await this.#withTriggerRestarts(() =>
+      this.#writeBatch(table, batch, "upsert", keys, autoIncrement),
+    );
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       ...result,
@@ -887,7 +919,7 @@ export class MinnowDatabase {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
     }
     const keys = validateUpdateBatch(table, keyColumn, input);
-    return this.#writeUpdateBatch(table, keyColumn, input, keys);
+    return this.#withTriggerRestarts(() => this.#writeUpdateBatch(table, keyColumn, input, keys));
   }
 
   async update(
@@ -902,6 +934,10 @@ export class MinnowDatabase {
   }
 
   async deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
+    return this.#withTriggerRestarts(() => this.#deleteBatchOnce(tableName, input));
+  }
+
+  async #deleteBatchOnce(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
     const started = performance.now();
     const table = await this.#findTable(tableName);
     const keyColumn = getUniqueKeyColumn(table);
@@ -986,12 +1022,11 @@ export class MinnowDatabase {
         storedBytes += bytes.byteLength;
         blockCount += 1;
       }
-      const deletePreImages = await this.#triggerPreImages(
-        table,
-        keyColumn,
-        [...keys.values()],
-        "delete",
-      );
+      // Triggers fire once per row that actually exists: a requested key with no row deletes
+      // nothing and must not fire a phantom all-null OLD image.
+      const deletePreImages = (
+        await this.#triggerPreImages(table, keyColumn, [...keys.values()], "delete")
+      ).filter((row) => row !== undefined);
       const deleteValueAt = (
         source: "new" | "old",
         column: string,
@@ -1001,7 +1036,7 @@ export class MinnowDatabase {
         transaction,
         table,
         "delete",
-        keys.size,
+        deletePreImages.length,
         deleteValueAt,
         "before",
       );
@@ -1026,7 +1061,7 @@ export class MinnowDatabase {
         transaction,
         table,
         "delete",
-        keys.size,
+        deletePreImages.length,
         deleteValueAt,
         "after",
       );
@@ -1062,6 +1097,7 @@ export class MinnowDatabase {
           if (!(error instanceof WriteConflictError) || attempt === this.#maxCommitRetries) {
             throw error;
           }
+          if (deletePreImages.length > 0) throw new StaleTriggerDerivationsError(error);
           retries += 1;
           const snapshot = await transaction.rebase();
           deletedRowCount = (
@@ -1224,6 +1260,7 @@ export class MinnowDatabase {
           if (!(error instanceof WriteConflictError) || attempt === this.#maxCommitRetries) {
             throw error;
           }
+          if (preImages.length > 0) throw new StaleTriggerDerivationsError(error);
           retries += 1;
           const snapshot = await transaction.rebase();
           await this.#assertKeysExist(table, keyColumn, snapshot.version, keys);
@@ -1379,6 +1416,13 @@ export class MinnowDatabase {
         column: string,
         rowIndex: number,
       ): BatchValue => (source === "new" ? (input.columns[column]?.[rowIndex] ?? null) : null);
+      // Upserts fire per-row: INSERT triggers for fresh keys, UPDATE triggers (with the
+      // replaced row as OLD) for conflicting ones — ON CONFLICT DO UPDATE semantics.
+      const upsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
+      const upsertFirings =
+        upsertKeyColumn === undefined
+          ? undefined
+          : await this.#upsertTriggerFirings(table, upsertKeyColumn, input, rowCount);
       if (kind === "insert") {
         await this.#stageTriggerDerivedInserts(
           transaction,
@@ -1388,6 +1432,8 @@ export class MinnowDatabase {
           insertValueAt,
           "before",
         );
+      } else if (upsertFirings !== undefined) {
+        await this.#stageUpsertTriggerFirings(transaction, table, input, upsertFirings, "before");
       }
       await transaction.stageArtifacts(batchBlockWrites, [segment]);
       if (kind === "insert") {
@@ -1399,6 +1445,8 @@ export class MinnowDatabase {
           insertValueAt,
           "after",
         );
+      } else if (upsertFirings !== undefined) {
+        await this.#stageUpsertTriggerFirings(transaction, table, input, upsertFirings, "after");
       }
       stageMs += performance.now() - stageStarted;
 
@@ -1433,6 +1481,11 @@ export class MinnowDatabase {
           if (!(error instanceof WriteConflictError) || attempt === this.#maxCommitRetries) {
             throw error;
           }
+          const stagedDerivations =
+            kind === "insert"
+              ? (table.triggers ?? []).some((trigger) => trigger.event === "insert")
+              : upsertFirings !== undefined;
+          if (stagedDerivations) throw new StaleTriggerDerivationsError(error);
           retries += 1;
           const snapshot = await transaction.rebase();
           counts =
@@ -2013,7 +2066,15 @@ export class MinnowDatabase {
       options.spillPageRows === undefined &&
       probe !== undefined;
     if (probe === undefined || !memoizable) return this.#queryCompiled(plan, options);
-    const key = `res ${sql}\u0001${JSON.stringify(options.params ?? [])}`;
+    // Params serialize with a type tag: JSON alone renders a Date and its ISO string
+    // identically, yet they bind as different literal types with different comparison
+    // semantics, so an untagged key would serve one result for the other.
+    const paramKey = (options.params ?? [])
+      .map((value) =>
+        value instanceof Date ? `d${String(value.getTime())}` : `${typeof value}:${String(value)}`,
+      )
+      .join(`\u0001`);
+    const key = `res ${sql}\u0001${paramKey}`;
     const before = await probe();
     const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
       QueryResult | undefined;
@@ -2211,6 +2272,32 @@ export class MinnowDatabase {
   ): Promise<boolean> {
     const plan = typeof query === "string" ? this.#compileCached(query) : query.plan;
     if (planContainsFts(plan)) return true;
+    // Base-scan zone proofs are unsound when the plan reads the table anywhere else — a
+    // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
+    // predicates reject (e.g. `value > (SELECT AVG(value) FROM t)`).
+    if (planReadsBeyondSingleScan(plan)) return true;
+    // Versions in (after, until] that recorded a change to each table. Proof requires every
+    // one of them to be accounted for by a surviving, inspected segment: garbage collection
+    // deletes reclaimed segments outright, so "no segment in the window" is absence of
+    // evidence, not evidence of neutrality.
+    const changedVersions = new Map<string, Set<number>>();
+    {
+      let cursor = after;
+      pages: for (;;) {
+        const page = await this.store.listManifestPage(cursor, 64);
+        for (const manifest of page.records) {
+          if (manifest.version > until) break pages;
+          for (const tableId of manifest.changedTableIds ?? []) {
+            const versions = changedVersions.get(tableId) ?? new Set<number>();
+            versions.add(manifest.version);
+            changedVersions.set(tableId, versions);
+          }
+          if (manifest.version === until) break pages;
+        }
+        if (page.nextCursor === null) break;
+        cursor = page.nextCursor;
+      }
+    }
     for (const tableId of tableIds) {
       const table = await this.store.getTable(tableId);
       if (table === undefined) return true;
@@ -2221,9 +2308,11 @@ export class MinnowDatabase {
           (record) => [record.id, record] as const,
         ),
       );
+      const coveredVersions = new Set<number>();
       for (const segment of segments) {
         const committed = transactions.get(segment.transactionId)?.committedVersion ?? null;
         if (committed === null || committed <= (after ?? -1) || committed > until) continue;
+        coveredVersions.add(committed);
         const kind = segment.kind ?? "insert";
         // Compaction rewrites are visible-data-neutral by construction.
         if (kind === "base") continue;
@@ -2247,18 +2336,32 @@ export class MinnowDatabase {
         ) {
           return true;
         }
+        // One batched read covers every uncached predicate block in the segment, instead of
+        // a store round trip per block — hint processing after a wide insert stays cheap.
+        const uncachedIds = [
+          ...new Set(
+            predicates.flatMap((predicate) =>
+              (segment.columnBlockIds[predicate.column.id] ?? []).filter(
+                (blockId) => this.#cacheGet(`zi ${blockId}`) === undefined,
+              ),
+            ),
+          ),
+        ];
+        if (uncachedIds.length > 0) {
+          const fetched = await this.store.getBlocks(uncachedIds);
+          for (const [index, blockId] of uncachedIds.entries()) {
+            const bytes = fetched[index];
+            if (bytes === undefined) return true;
+            this.#cachePut(`zi ${blockId}`, inspectBlock(bytes), ZONE_DESCRIPTION_CACHE_BYTES);
+          }
+        }
         for (let blockIndex = 0; blockIndex < firstIds.length; blockIndex += 1) {
           let canMatch = true;
           for (const predicate of predicates) {
             const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
-            let description = this.#cacheGet(`zi ${blockId}`) as
+            const description = this.#cacheGet(`zi ${blockId}`) as
               ReturnType<typeof inspectBlock> | undefined;
-            if (description === undefined) {
-              const bytes = (await this.store.getBlocks([blockId]))[0];
-              if (bytes === undefined) return true;
-              description = inspectBlock(bytes);
-              this.#cachePut(`zi ${blockId}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
-            }
+            if (description === undefined) return true;
             if (description.type !== predicate.column.type) return true;
             if (!zoneMapCanMatch(description, predicate)) {
               canMatch = false;
@@ -2267,6 +2370,11 @@ export class MinnowDatabase {
           }
           if (canMatch) return true;
         }
+      }
+      // A version that changed this table but left no surviving segment to inspect (its
+      // segments were compacted away and reclaimed) cannot be proven neutral.
+      for (const version of changedVersions.get(tableId) ?? []) {
+        if (!coveredVersions.has(version)) return true;
       }
     }
     return false;
@@ -2346,6 +2454,26 @@ export class MinnowDatabase {
         if (compiled.kind === "insert" && target.uniqueKeyColumnId !== undefined) {
           throw new TypeError(`Trigger bodies insert into keyless tables only: ${compiled.table}`);
         }
+        if (compiled.kind === "insert") {
+          // Validate the body's column list now: a body that can never fire successfully
+          // must fail CREATE, not every later write to the trigger's table.
+          for (const name of compiled.columns) {
+            if (!target.columns.some((column) => column.name === name)) {
+              throw new TypeError(`Trigger body INSERT column does not exist: ${name}`);
+            }
+          }
+          for (const column of target.columns) {
+            if (
+              !compiled.columns.includes(column.name) &&
+              !column.nullable &&
+              column.defaultValue === undefined
+            ) {
+              throw new TypeError(
+                `Trigger body INSERT omits a non-nullable column without a default: ${column.name}`,
+              );
+            }
+          }
+        }
         if (compiled.kind !== "insert" && target.uniqueKeyColumnId === undefined) {
           throw new TypeError(
             `Trigger body ${compiled.kind.toUpperCase()}s need a keyed table: ${compiled.table}`,
@@ -2354,12 +2482,44 @@ export class MinnowDatabase {
         // Cascades are allowed one level deep; the runtime budget errors on deeper chains.
       }
       try {
+        const createdAt = this.#now().toISOString();
         await this.store.updateTable(table.id, table.revision ?? 0, {
-          triggers: [
-            ...(table.triggers ?? []),
-            { ...trigger, createdAt: this.#now().toISOString() },
-          ],
+          triggers: [...(table.triggers ?? []), { ...trigger, createdAt }],
         });
+        // The CAS guards only this table's record, so a concurrent create of the same name on
+        // a different table can slip through the pre-check. Re-read and settle it the same
+        // way on both sides — earliest createdAt wins, table id breaks ties — so exactly one
+        // survives and the loser removes its own entry.
+        const loser = (await this.store.listTables()).some(
+          (record) =>
+            record.id !== table.id &&
+            (record.triggers ?? []).some(
+              (existing) =>
+                existing.name === trigger.name &&
+                (existing.createdAt < createdAt ||
+                  (existing.createdAt === createdAt && record.id < table.id)),
+            ),
+        );
+        if (loser) {
+          await this.#removeTriggerFrom(table.id, trigger.name);
+          throw new TypeError(`Trigger already exists: ${trigger.name}`);
+        }
+        return;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  /** Removes one named trigger from one specific table record, retrying the record CAS. */
+  async #removeTriggerFrom(tableId: string, name: string): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      const record = await this.store.getTable(tableId);
+      if (record === undefined) return;
+      const remaining = (record.triggers ?? []).filter((trigger) => trigger.name !== name);
+      if (remaining.length === (record.triggers ?? []).length) return;
+      try {
+        await this.store.updateTable(record.id, record.revision ?? 0, { triggers: remaining });
         return;
       } catch (error) {
         if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
@@ -2383,6 +2543,118 @@ export class MinnowDatabase {
         if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
       }
     }
+  }
+
+  /**
+   * The firing plan for an upsert batch: rows whose key already names a visible row (in the
+   * read the caller provides — committed state, or the session overlay) fire as UPDATEs with
+   * that row as OLD, matching ON CONFLICT DO UPDATE semantics; the rest fire as INSERTs. An
+   * in-batch duplicate key fires as an UPDATE of the earlier occurrence. Returns undefined
+   * when the table has no insert or update triggers.
+   */
+  async #upsertTriggerFirings(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    batch: ColumnarBatch,
+    rowCount: number,
+    readRows?: (sql: string, params: QueryValue[]) => Promise<QueryResult>,
+  ): Promise<
+    | {
+        inserts: number[];
+        updates: number[];
+        oldImages: Array<Record<string, BatchValue> | undefined>;
+      }
+    | undefined
+  > {
+    const fires = (table.triggers ?? []).some(
+      (trigger) => trigger.event === "insert" || trigger.event === "update",
+    );
+    if (!fires || rowCount === 0) return undefined;
+    const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+    const keyValues = batch.columns[keyColumn.name] ?? [];
+    const params = keyValues.filter((value): value is Exclude<BatchValue, null> => value !== null);
+    const placeholders = params.map(() => "?").join(", ");
+    const sql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
+    const result =
+      readRows === undefined
+        ? await this.query(sql, { params, memoize: false })
+        : await readRows(sql, params);
+    const byToken = new Map(
+      result.rows.map((row) => {
+        const key = row[keyColumn.name];
+        return [
+          key === null || key === undefined ? "" : keyToken(keyColumn.type, key),
+          row,
+        ] as const;
+      }),
+    );
+    const inserts: number[] = [];
+    const updates: number[] = [];
+    const oldImages: Array<Record<string, BatchValue> | undefined> = [];
+    const seenInBatch = new Map<string, number>();
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      const key = keyValues[rowIndex] ?? null;
+      const token = key === null ? "" : keyToken(keyColumn.type, key);
+      const earlier = seenInBatch.get(token);
+      const old =
+        earlier === undefined
+          ? byToken.get(token)
+          : Object.fromEntries(
+              table.columns.map((column) => [
+                column.name,
+                batch.columns[column.name]?.[earlier] ?? null,
+              ]),
+            );
+      if (old === undefined) {
+        inserts.push(rowIndex);
+        oldImages.push(undefined);
+      } else {
+        updates.push(rowIndex);
+        oldImages.push(old);
+      }
+      seenInBatch.set(token, rowIndex);
+    }
+    return { inserts, updates, oldImages };
+  }
+
+  /** Fires INSERT and UPDATE triggers for one upsert batch at one timing, per the plan. */
+  async #stageUpsertTriggerFirings(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    batch: ColumnarBatch,
+    firings: {
+      inserts: number[];
+      updates: number[];
+      oldImages: Array<Record<string, BatchValue> | undefined>;
+    },
+    timing: "before" | "after",
+    cascadeBudget = 1,
+  ): Promise<void> {
+    const batchValue = (column: string, rowIndex: number): BatchValue =>
+      batch.columns[column]?.[rowIndex] ?? null;
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "insert",
+      firings.inserts.length,
+      (source, column, index) =>
+        source === "new" ? batchValue(column, firings.inserts[index] ?? -1) : null,
+      timing,
+      cascadeBudget,
+    );
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "update",
+      firings.updates.length,
+      (source, column, index) => {
+        const rowIndex = firings.updates[index] ?? -1;
+        if (source === "new") return batchValue(column, rowIndex);
+        return firings.oldImages[rowIndex]?.[column] ?? null;
+      },
+      timing,
+      cascadeBudget,
+    );
   }
 
   /**
@@ -2497,6 +2769,14 @@ export class MinnowDatabase {
     compiled.columns.forEach((name, columnIndex) => {
       columns[name] = derivedRows.map((row) => row[columnIndex] ?? null);
     });
+    // Unlisted columns pad with NULL exactly like a top-level INSERT: defaults fill their
+    // null slots, nullable columns store NULL. CREATE TRIGGER rejects bodies omitting a
+    // non-nullable column without a default.
+    for (const column of target.columns) {
+      if (!(column.name in columns)) {
+        columns[column.name] = derivedRows.map(() => null);
+      }
+    }
     const filled = fillColumnDefaults(
       target,
       toColumnarBatch({ columns }),
@@ -2589,7 +2869,11 @@ export class MinnowDatabase {
         having: [],
         orderBy: [],
       };
-      const matched = (await this.#queryCompiled(plan, { memoize: false })).rows;
+      // The read goes through the transaction's staged overlay, exactly like a scope's
+      // tx.query: the body must see the triggering write, earlier statements of the same
+      // firing, and everything the enclosing scope staged — reading only committed state
+      // silently loses those updates.
+      const matched = (await this.#sessionQueryPlan(transaction, plan)).rows;
       for (const row of matched) {
         const key = row[keyColumn.name];
         if (key === null || key === undefined) {
@@ -2703,8 +2987,30 @@ export class MinnowDatabase {
     const transaction = await this.#transactions.begin();
     let closed = false;
     let staged = 0;
+    /**
+     * A stage that throws *after* registering part of its work (key membership, full-text
+     * deltas, derived segments, blocks) cannot be undone statement-by-statement, so the scope
+     * is poisoned: even if the callback catches the error, the commit refuses rather than
+     * publishing the fragment. A stage that fails validation before registering anything —
+     * updating a missing key, say — leaves the scope clean and usable.
+     */
+    let poisoned: unknown;
     const open = (): void => {
       if (closed) throw new Error("The write scope has ended");
+      if (poisoned !== undefined) {
+        throw new Error("The write scope already failed and can only roll back", {
+          cause: poisoned,
+        });
+      }
+    };
+    const guarded = async <T>(run: () => Promise<T>): Promise<T> => {
+      const before = transaction.stagedWorkCount;
+      try {
+        return await run();
+      } catch (error) {
+        if (transaction.stagedWorkCount !== before) poisoned ??= error;
+        throw error;
+      }
     };
     const session: WriteSession = {
       query: async (sql, options) => {
@@ -2714,27 +3020,36 @@ export class MinnowDatabase {
       insertBatch: async (tableName, input) => {
         open();
         staged += 1;
-        return this.#sessionInsert(transaction, tableName, input, "insert");
+        return guarded(() => this.#sessionInsert(transaction, tableName, input, "insert"));
       },
       upsertBatch: async (tableName, input) => {
         open();
         staged += 1;
-        return this.#sessionInsert(transaction, tableName, input, "upsert");
+        return guarded(() => this.#sessionInsert(transaction, tableName, input, "upsert"));
       },
       updateBatch: async (tableName, input) => {
         open();
         staged += 1;
-        return this.#sessionUpdate(transaction, tableName, input);
+        return guarded(() => this.#sessionUpdate(transaction, tableName, input));
       },
       deleteBatch: async (tableName, input) => {
         open();
         staged += 1;
-        return this.#sessionDelete(transaction, tableName, input);
+        return guarded(() => this.#sessionDelete(transaction, tableName, input));
       },
     };
     try {
       const result = await action(session);
       closed = true;
+      if (poisoned !== undefined) {
+        // The outer catch aborts the transaction.
+        throw new Error(
+          `The write scope failed mid-stage and was rolled back: ${
+            poisoned instanceof Error ? poisoned.message : "staging failed"
+          }`,
+          { cause: poisoned },
+        );
+      }
       if (staged === 0) {
         await transaction.abort();
         return { result, version: await this.store.getCurrentManifestVersion() };
@@ -2761,13 +3076,25 @@ export class MinnowDatabase {
     options: { params?: QueryOptions["params"] } = {},
   ): Promise<QueryResult> {
     const plan = bindPlanParameters(this.#compileCached(sql), options.params);
+    return this.#sessionQueryPlan(transaction, plan);
+  }
+
+  /** #sessionQuery for an already-bound plan: trigger bodies resolve their reads through it. */
+  async #sessionQueryPlan(
+    transaction: DatabaseTransaction,
+    plan: CompiledQuery,
+  ): Promise<QueryResult> {
     const names = collectRealTableNames(plan);
     const tables = await Promise.all(names.map((name) => this.#findTable(name)));
     const realTables = new Map(tables.map((table) => [table.name, table] as const));
     const pendingIds = new Set(transaction.pendingSegmentIds);
     const pendingBlocks = new Set(transaction.pendingBlockIds);
     const ourRecord = await this.store.getTransaction(transaction.id);
-    return this.#withLeasedSnapshot(undefined, async (snapshot) => {
+    // Pinned to the scope's own snapshot, not the current manifest: the documented contract
+    // is "the pre-scope snapshot plus everything this scope staged", and #assertKeysExist
+    // already validates against transaction.snapshotVersion — reading the current version
+    // here would let the two disagree mid-scope about a concurrent commit.
+    return this.#withLeasedSnapshot(transaction.snapshotVersion, async (snapshot) => {
       const overlaySnapshot = {
         get version() {
           return snapshot.version;
@@ -2928,6 +3255,19 @@ export class MinnowDatabase {
     }
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
+    // Session upserts classify against the scope's own staged state, so a row inserted
+    // earlier in the scope makes a later upsert of its key fire as an UPDATE.
+    const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
+    const sessionUpsertFirings =
+      sessionUpsertKeyColumn === undefined
+        ? undefined
+        : await this.#upsertTriggerFirings(
+            table,
+            sessionUpsertKeyColumn,
+            batch,
+            rowCount,
+            (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+          );
     if (kind === "insert") {
       await this.#stageTriggerDerivedInserts(
         transaction,
@@ -2935,6 +3275,15 @@ export class MinnowDatabase {
         "insert",
         rowCount,
         insertValueAt,
+        "before",
+        cascadeBudget,
+      );
+    } else if (sessionUpsertFirings !== undefined) {
+      await this.#stageUpsertTriggerFirings(
+        transaction,
+        table,
+        batch,
+        sessionUpsertFirings,
         "before",
         cascadeBudget,
       );
@@ -2954,6 +3303,15 @@ export class MinnowDatabase {
         "insert",
         rowCount,
         insertValueAt,
+        "after",
+        cascadeBudget,
+      );
+    } else if (sessionUpsertFirings !== undefined) {
+      await this.#stageUpsertTriggerFirings(
+        transaction,
+        table,
+        batch,
+        sessionUpsertFirings,
         "after",
         cascadeBudget,
       );
@@ -3097,13 +3455,17 @@ export class MinnowDatabase {
       remove: true,
       ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
     });
-    const preImages = await this.#triggerPreImages(
-      table,
-      keyColumn,
-      [...keys.values()],
-      "delete",
-      (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
-    );
+    // Fire only per existing row (session-visible state included): missing keys must not
+    // produce phantom all-null OLD images.
+    const preImages = (
+      await this.#triggerPreImages(
+        table,
+        keyColumn,
+        [...keys.values()],
+        "delete",
+        (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
+      )
+    ).filter((row) => row !== undefined);
     const sessionDeleteValueAt = (
       source: "new" | "old",
       column: string,
@@ -3113,7 +3475,7 @@ export class MinnowDatabase {
       transaction,
       table,
       "delete",
-      keys.size,
+      preImages.length,
       sessionDeleteValueAt,
       "before",
       cascadeBudget,
@@ -3156,7 +3518,7 @@ export class MinnowDatabase {
       transaction,
       table,
       "delete",
-      keys.size,
+      preImages.length,
       sessionDeleteValueAt,
       "after",
       cascadeBudget,
@@ -3244,6 +3606,50 @@ export class MinnowDatabase {
       const record = recordsByName.get(tableName);
       if (record === undefined) {
         throw new Error(`Migration target table is missing: ${tableName}`);
+      }
+      // A renamed column that a trigger references would silently bind NULL forever (NEW/OLD
+      // bindings) or fail every firing (body target columns), so reject the rename instead.
+      for (const step of steps) {
+        if (step.kind !== "rename-column") continue;
+        for (const owner of records) {
+          for (const trigger of owner.triggers ?? []) {
+            const referencesBinding =
+              owner.id === record.id &&
+              trigger.statements.some((statement) =>
+                statement.bindings.some((binding) => binding.column === step.from),
+              );
+            const referencesBody = trigger.statements.some((statement) => {
+              const compiled = compileStatement(statement.sql);
+              if (compiled.kind === "insert") {
+                return compiled.table === record.name && compiled.columns.includes(step.from);
+              }
+              if (compiled.kind !== "update" && compiled.kind !== "delete") return false;
+              if (compiled.table !== record.name) return false;
+              const referenced = new Set<string>();
+              for (const predicate of compiled.predicates) {
+                for (const side of [predicate.left, predicate.right]) {
+                  if (side.kind === "column") {
+                    referenced.add(side.reference.split(".").at(-1) ?? side.reference);
+                  }
+                }
+              }
+              if (compiled.kind === "update") {
+                for (const assignment of compiled.assignments) {
+                  referenced.add(assignment.column);
+                  for (const column of expressionColumnNames(assignment.expression)) {
+                    referenced.add(column.split(".").at(-1) ?? column);
+                  }
+                }
+              }
+              return referenced.has(step.from);
+            });
+            if (referencesBinding || referencesBody) {
+              throw new TypeError(
+                `Cannot rename ${record.name}.${step.from}: trigger ${trigger.name} references it`,
+              );
+            }
+          }
+        }
       }
       const columns = applyColumnSteps(record, steps, this.#createId);
       if (JSON.stringify(columns) === JSON.stringify(record.columns)) continue;
@@ -4245,6 +4651,14 @@ export class MinnowDatabase {
           ]),
         ),
       });
+    }
+    // Elimination read every predicate block, but only the surviving ones are worth handing
+    // to the scan; the rest are dropped here instead of riding along until the query ends.
+    const survivingIds = new Set(
+      prunedSegments.flatMap((segment) => Object.values(segment.columnBlockIds).flat()),
+    );
+    for (const id of [...storedBlocks.keys()]) {
+      if (!survivingIds.has(id)) storedBlocks.delete(id);
     }
     return { segments: prunedSegments, storedBlocks };
   }
@@ -8312,7 +8726,7 @@ export class MinnowDatabase {
     const fetchIds: string[] = [];
     for (let index = 0; index < ids.length; index += 1) {
       const id = ids[index] ?? "";
-      const cached = this.#cacheGet(`dpb ${id}`) as DecodedPhysicalBlock | undefined;
+      const cached = this.#cacheGet(`dpb\0${id}`) as DecodedPhysicalBlock | undefined;
       if (cached !== undefined) {
         decodedBlocks[index] = cached;
         continue;
@@ -8320,22 +8734,25 @@ export class MinnowDatabase {
       pendingIndexes.push(index);
       if (storedBlocks?.has(id) !== true) fetchIds.push(id);
     }
-    const bytesById = storedBlocks ?? new Map<string, Uint8Array>();
+    // Fetched bytes live in a local map that dies with this call. Writing them into the
+    // caller's `storedBlocks` would retain every block the scan ever touched for the whole
+    // query — outside the buffer pool's budget and never charged to the memory context.
+    const fetchedBytes = new Map<string, Uint8Array>();
     if (fetchIds.length > 0) {
       const fetched = await this.store.getBlocks(fetchIds);
       for (let index = 0; index < fetchIds.length; index += 1) {
         const id = fetchIds[index] ?? "";
         const bytes = fetched[index];
         if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-        bytesById.set(id, bytes);
+        fetchedBytes.set(id, bytes);
       }
     }
     for (const index of pendingIndexes) {
       const id = ids[index] ?? "";
-      const bytes = bytesById.get(id);
+      const bytes = fetchedBytes.get(id) ?? storedBlocks?.get(id);
       if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
       const decoded = await decodePhysicalBlock(bytes);
-      this.#cachePut(`dpb ${id}`, decoded, bytes.byteLength);
+      this.#cachePut(`dpb\0${id}`, decoded, bytes.byteLength);
       decodedBlocks[index] = decoded;
     }
     return decodedBlocks.map((decoded, index) => {

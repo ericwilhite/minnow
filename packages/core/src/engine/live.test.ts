@@ -1,7 +1,12 @@
-import { MemoryBlockStore, type CommitTransactionInput } from "../storage/index.js";
+import {
+  MemoryBlockStore,
+  type CommitTransactionInput,
+  type Manifest,
+  type StoragePage,
+} from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
-import { type LiveQueryHintChannel } from "./live.js";
+import { LiveQuerySet, type LiveQueryHintChannel, type LiveQueryInput } from "./live.js";
 import { type QueryResult } from "./query.js";
 
 /** A deterministic in-process stand-in for BroadcastChannel. */
@@ -16,6 +21,79 @@ function createChannelPair(): [LiveQueryHintChannel, LiveQueryHintChannel] {
     removeEventListener: (_type, listener) => own.delete(listener),
   });
   return [endpoint(listenersA, listenersB), endpoint(listenersB, listenersA)];
+}
+
+/**
+ * A deterministic host for interleaving tests: `commit()` advances the version and the single
+ * table's value together, and `blockNextExecute(query)` stalls that query's next execute so the
+ * test controls exactly when its (snapshot-at-call-time) result lands.
+ */
+function createRaceHost(): {
+  host: {
+    currentVersion(): Promise<number | null>;
+    manifestPage(
+      afterVersion: number | null,
+      limit: number,
+    ): Promise<StoragePage<Manifest, number>>;
+    dependencyTableIds(query: LiveQueryInput): Promise<Set<string>>;
+    execute(query: LiveQueryInput): Promise<QueryResult>;
+  };
+  commit(): void;
+  blockNextExecute(query: LiveQueryInput): { started: Promise<void>; release(): void };
+} {
+  const tableId = "table-1";
+  let version = 1;
+  let value = 1;
+  const manifests: Manifest[] = [
+    { version: 1, previousVersion: null, createdAt: "", blockIds: [], changedTableIds: [tableId] },
+  ];
+  const blocks = new Map<LiveQueryInput, { started: () => void; gate: Promise<void> }>();
+  return {
+    host: {
+      currentVersion: () => Promise.resolve(version),
+      manifestPage: (afterVersion, limit) =>
+        Promise.resolve({
+          records: manifests
+            .filter((manifest) => manifest.version > (afterVersion ?? -1))
+            .slice(0, limit),
+          nextCursor: null,
+        }),
+      dependencyTableIds: () => Promise.resolve(new Set([tableId])),
+      execute: async (query) => {
+        const snapshot = value;
+        const block = blocks.get(query);
+        if (block !== undefined) {
+          blocks.delete(query);
+          block.started();
+          await block.gate;
+        }
+        return { columns: ["v"], rows: [{ v: snapshot }] };
+      },
+    },
+    commit: () => {
+      version += 1;
+      value += 1;
+      manifests.push({
+        version,
+        previousVersion: version - 1,
+        createdAt: "",
+        blockIds: [],
+        changedTableIds: [tableId],
+      });
+    },
+    blockNextExecute: (query) => {
+      let started!: () => void;
+      const startedPromise = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      blocks.set(query, { started, gate });
+      return { started: startedPromise, release };
+    },
+  };
 }
 
 async function seeded(store: MemoryBlockStore): Promise<MinnowDatabase> {
@@ -230,6 +308,67 @@ describe("live queries", () => {
     store.close();
   });
 
+  it("re-runs when a same-table subquery can shift even though zones reject the insert", async () => {
+    const store = new MemoryBlockStore();
+    const database = await seeded(store);
+    await database.insertBatch("events", { columns: { value: [100, 200], label: [null, null] } });
+    const live = database.liveQueries();
+    const changes: QueryResult[] = [];
+    // Seeded values are [1, 2, 3, 100, 200]: AVG is 61.2, so exactly one row (100) satisfies
+    // value <= 100 AND value > AVG.
+    await live.subscribe(
+      "SELECT COUNT(*) AS n FROM events WHERE value <= 100 AND value > (SELECT AVG(value) FROM events)",
+      { onChange: (result) => changes.push(result) },
+    );
+    expect(changes[0]?.rows).toEqual([{ n: 1 }]);
+    // The new row zone-rejects value <= 100, but it drags AVG(value) above 100, which drops
+    // the existing match — base-scan zone proofs are unsound for subquery plans.
+    await database.insertBatch("events", { columns: { value: [1000], label: [null] } });
+    await live.refresh();
+    expect(live.stats.zoneSkips).toBe(0);
+    expect(changes).toHaveLength(2);
+    expect(changes[1]?.rows).toEqual([{ n: 0 }]);
+    live.close();
+    store.close();
+  });
+
+  it("re-runs when the changing segment was compacted away and garbage-collected", async () => {
+    const store = new MemoryBlockStore();
+    const writer = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await writer.createTable({
+      name: "scores",
+      uniqueKey: "name",
+      columns: [
+        { name: "name", type: "string" },
+        { name: "score", type: "number" },
+      ],
+    });
+    await writer.insertBatch("scores", {
+      columns: { name: ["a", "b", "c"], score: [150, 160, 170] },
+    });
+    // A prior upsert leaves a mutation segment so compaction rewrites the table.
+    await writer.upsertBatch("scores", { columns: { name: ["a"], score: [155] } });
+    // A separate reader instance so only explicit refresh() drives its sweeps.
+    const reader = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    const live = reader.liveQueries();
+    const changes: QueryResult[] = [];
+    await live.subscribe("SELECT COUNT(*) AS n FROM scores WHERE score >= 100", {
+      onChange: (result) => changes.push(result),
+    });
+    expect(changes[0]?.rows).toEqual([{ n: 3 }]);
+    // The matching insert's segment is compacted into a "base" rewrite and then reclaimed:
+    // by the time the reader sweeps, no surviving segment carries that commit. Absence of a
+    // segment must read as "cannot prove neutral", not as proof.
+    await writer.insertBatch("scores", { columns: { name: ["d"], score: [180] } });
+    await writer.compactTable("scores");
+    await writer.collectGarbage();
+    await live.refresh();
+    expect(changes).toHaveLength(2);
+    expect(changes[1]?.rows).toEqual([{ n: 4 }]);
+    live.close();
+    store.close();
+  });
+
   it("skips re-runs for data-neutral compaction commits", async () => {
     const store = new MemoryBlockStore();
     const database = await seeded(store);
@@ -251,6 +390,59 @@ describe("live queries", () => {
     expect(changes).toHaveLength(1);
     live.close();
     store.close();
+  });
+
+  it("converges a subscription whose initial execute raced a concurrent sweep", async () => {
+    const race = createRaceHost();
+    const live = new LiveQuerySet(race.host);
+    const aChanges: QueryResult[] = [];
+    await live.subscribe("A", { onChange: (result) => aChanges.push(result) });
+
+    // B reads the current version, then its initial execute stalls holding version-1 data.
+    const bBlock = race.blockNextExecute("B");
+    const bChanges: QueryResult[] = [];
+    const bPromise = live.subscribe("B", { onChange: (result) => bChanges.push(result) });
+    await bBlock.started;
+
+    // A commit and a full sweep land while B's initial execute is still in flight.
+    race.commit();
+    await live.refresh();
+    expect(aChanges.at(-1)?.rows).toEqual([{ v: 2 }]);
+
+    // B finishes subscribing with the stale snapshot it observed.
+    bBlock.release();
+    const bSubscription = await bPromise;
+    expect(bChanges).toHaveLength(1);
+    expect(bChanges[0]?.rows).toEqual([{ v: 1 }]);
+
+    // A refresh with no new commit must still bring the lagging subscription up to date.
+    await live.refresh();
+    expect(bChanges.at(-1)?.rows).toEqual([{ v: 2 }]);
+    bSubscription.close();
+    live.close();
+  });
+
+  it("never delivers onChange after onComplete when closed during an in-flight re-run", async () => {
+    const race = createRaceHost();
+    const live = new LiveQuerySet(race.host);
+    const events: string[] = [];
+    const subscription = await live.subscribe("A", {
+      onChange: () => events.push("change"),
+      onComplete: () => events.push("complete"),
+    });
+    expect(events).toEqual(["change"]);
+
+    // A commit triggers a sweep whose re-run stalls; the subscription closes mid-flight.
+    race.commit();
+    const block = race.blockNextExecute("A");
+    const refreshPromise = live.refresh();
+    await block.started;
+    subscription.close();
+    block.release();
+    await refreshPromise;
+
+    expect(events).toEqual(["change", "complete"]);
+    live.close();
   });
 
   it("tracks dependencies through CTEs and subqueries", async () => {

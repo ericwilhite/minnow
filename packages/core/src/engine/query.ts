@@ -2069,6 +2069,29 @@ export function topLevelFtsMatchConjuncts(plan: CompiledQuery): FtsMatchConjunct
   );
 }
 
+/**
+ * True when the plan reads anything beyond its single flat base scan: a nested block (derived
+ * table, set-operation branch, windowed or recursive source) or a subquery/EXISTS expression.
+ * Selectivity proofs that reason only about the base scan's predicates (the live-query zone
+ * gate) are unsound for such plans — a change the base predicates reject can still shift a
+ * value the nested read produces — so they must widen to "can affect".
+ */
+export function planReadsBeyondSingleScan(plan: CompiledQuery): boolean {
+  let found = false;
+  forEachNestedBlock(plan, () => {
+    found = true;
+  });
+  const check = (expression: Expression): void => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      found = true;
+      return;
+    }
+    childExpressions(expression).forEach(check);
+  };
+  forEachBlockExpression(plan, check);
+  return found;
+}
+
 /** True when any expression in the plan or its nested blocks is a full-text node. */
 export function planContainsFts(plan: CompiledQuery, op?: "match" | "bm25"): boolean {
   let found = false;
@@ -3120,7 +3143,7 @@ export function likeMatches(
   caseInsensitive = false,
   escape?: string,
 ): boolean {
-  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""} ${pattern}`;
+  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""}\0${pattern}`;
   let matcher = likeMatcherCache.get(key);
   if (matcher === undefined) {
     matcher = buildLikeMatcher(pattern, caseInsensitive, escape);

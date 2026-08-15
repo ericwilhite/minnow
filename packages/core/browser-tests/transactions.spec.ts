@@ -16,6 +16,16 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         lostResponseRecovered: boolean;
         leases: { renewed: boolean; released: boolean };
         rowIdsDisjoint: boolean;
+        writeScopes: {
+          scopeTotal: number | null;
+          scopeRolledBack: boolean;
+          ledgerAfterScopes: number[];
+          ledgerAuditActions: string[];
+          missingKeyDeleted: number;
+          auditRowsAfterDelete: number | null;
+          reopenedLedgerRows: number;
+          reopenedAuditRows: number | null;
+        };
         batchWrite: {
           tables: string[];
           rowCount: number;
@@ -87,6 +97,20 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
     lostResponseRecovered: true,
     leases: { renewed: true, released: true },
     rowIdsDisjoint: true,
+    writeScopes: {
+      // The in-scope read saw the staged update (60) plus the staged insert (40).
+      scopeTotal: 100,
+      scopeRolledBack: true,
+      // The failed scope published nothing, so only the committed rows remain.
+      ledgerAfterScopes: [40, 60],
+      // One insert trigger for the seed row, one per scope-staged mutation.
+      ledgerAuditActions: ["ins", "ins", "upd"],
+      // Only the key that existed was deleted, and the delete fires no audit rows.
+      missingKeyDeleted: 1,
+      auditRowsAfterDelete: 3,
+      reopenedLedgerRows: 1,
+      reopenedAuditRows: 3,
+    },
     batchWrite: {
       tables: ["events", "people"],
       rowCount: 3,
