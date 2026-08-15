@@ -118,6 +118,11 @@ export interface ReferenceEngineMeasurement {
   prepareMs: number;
   medianMs: number;
   p95Ms: number;
+  /**
+   * minnow only: median of the same statement with its result memo left on — the default an
+   * application gets. Absent for engines with no result cache, which re-execute every call.
+   */
+  cachedMedianMs?: number;
   resultRows: number;
   checksum: number;
   /** Result tuples match the independent JavaScript oracle. */

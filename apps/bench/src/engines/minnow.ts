@@ -99,6 +99,10 @@ export const minnowDriver: EngineDriver = {
             normalizeRows((await database.query(sql, { memoize: false })).rows).map(
               canonicalizeRow,
             ),
+          // The same statement with the memo left on, reported beside the execution number
+          // rather than instead of it.
+          executeCached: async () =>
+            normalizeRows((await database.query(sql)).rows).map(canonicalizeRow),
           close: () => undefined,
         };
       },

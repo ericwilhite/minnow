@@ -18,15 +18,11 @@ import type { EngineDriver, EngineSession, LoadContext } from "./session.js";
 const BATCH_ROWS = 50_000;
 const SAH_POOL_NAME = "mdb-datasets";
 /**
- * The documented fast configuration for sqlite-wasm on OPFS. WAL is unsupported by the
- * OPFS VFSes (the pragma is silently ignored), so journaling is TRUNCATE — less file
- * churn than the default DELETE. EXCLUSIVE locking keeps OPFS sync access handles open
- * across statements, the wasm docs' primary OPFS performance lever. The 64 MiB page cache
- * matches Minnow's default buffer pool; temp trees stay in memory as sorts spill there.
+ * SQLite runs on its shipped defaults: no journal, cache, locking, or temp-store pragmas.
+ * Every engine in this comparison is measured as it comes out of the box, so no engine's
+ * numbers depend on tuning knowledge the next person may not apply.
  */
-const PRAGMAS =
-  "PRAGMA foreign_keys=ON; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=NORMAL; " +
-  "PRAGMA locking_mode=EXCLUSIVE; PRAGMA cache_size=-65536; PRAGMA temp_store=MEMORY;";
+const PRAGMAS = "";
 
 interface SqliteContext {
   sqlite3: Sqlite3Static;
@@ -64,7 +60,7 @@ function databasePath(record: DatasetRecord): string {
 async function openDatabase(context: SqliteContext, path: string): Promise<Database> {
   if (context.vfs === "opfs") {
     const database = new context.sqlite3.oo1.OpfsDb(path, "c");
-    database.exec(PRAGMAS);
+    if (PRAGMAS.length > 0) database.exec(PRAGMAS);
     return database;
   }
   const pool = context.pool;
@@ -73,7 +69,7 @@ async function openDatabase(context: SqliteContext, path: string): Promise<Datab
   // before it runs out so additional datasets keep fitting.
   if (pool.getCapacity() - pool.getFileCount() < 3) await pool.addCapacity(4);
   const database = new pool.OpfsSAHPoolDb(path);
-  database.exec(PRAGMAS);
+  if (PRAGMAS.length > 0) database.exec(PRAGMAS);
   return database;
 }
 

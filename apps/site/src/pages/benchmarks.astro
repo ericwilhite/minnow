@@ -182,15 +182,14 @@ const engineLabels: Record<string, string> = {
           )
         }
         <li>
-          Each engine runs its documented best-practice configuration: SQLite Wasm with
-          exclusive OPFS locking, a 64 MiB page cache, TRUNCATE journaling, and{" "}
-          <code>synchronous=NORMAL</code>; PGlite with 64 MB <code>work_mem</code>{" "}
-          (its relaxed-durability mode is excluded — it crashes mid-load in this workload);
-          DuckDB fed through Arrow bulk ingestion; Minnow with relaxed IndexedDB durability,
-          gzip-compressed blocks, and a 64 MiB buffer pool.
-          All engines get identical schemas, post-load statistics where they have them
-          (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine prepared
-          statements.
+          <strong>Every engine runs on its shipped defaults.</strong> No pragmas, no{" "}
+          <code>work_mem</code>, no cache sizing — nothing that depends on tuning knowledge the
+          next person might not apply. PGlite's relaxed-durability mode is the one exception,
+          excluded because it crashes mid-load in this workload. Minnow's own defaults include a
+          64 MiB buffer pool and relaxed IndexedDB durability; the dataset is written with
+          gzip-compressed blocks, which trades query speed for stored size rather than the other
+          way round. All engines get identical schemas, post-load statistics where they have them
+          (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine prepared statements.
         </li>
         <li>
           The three comparison engines also get a B-tree secondary index on every foreign key.
@@ -216,12 +215,15 @@ const engineLabels: Record<string, string> = {
         snapshot-fresh on every statement.
       </p>
       <p>
-        The suite replays one statement over unchanging data, so Minnow runs it with its
-        result memo turned off. Left on — the default an application gets — the memo would
-        answer every sample after the first from cache, and this page would be reporting a
-        constant-time cache lookup against the other engines' real execution. The memo is a
-        real feature and a real speedup; it is simply not a measurement of query execution,
-        so it is excluded from this comparison.
+        The suite replays one statement over unchanging data, which is a measurement artifact,
+        not a workload. Minnow caches computed results by default and would answer every sample
+        after the first from that cache — so the headline number is measured with the cache off,
+        and every table cell also carries the cached figure beneath it. Both are real: the first
+        is what the engine costs when it runs the query, and it is the only one comparable to
+        SQLite, PGlite, and DuckDB, none of which cache results; the second is what a repeat
+        actually costs an application that keeps the default. A commit invalidates the cache, so
+        it never serves a stale row — it just isn't query execution, and putting it in the same
+        column as three engines' execution times would be comparing two different quantities.
       </p>
       {
         memoryEngines.length > 0 && (

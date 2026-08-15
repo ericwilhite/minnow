@@ -8,6 +8,14 @@ import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol
 export interface PreparedStatement {
   /** Rows with canonicalized values (see engines/shared.ts). */
   execute(): Promise<Array<Record<string, unknown>>>;
+  /**
+   * minnow only: the same statement run the way an application runs it, with the
+   * probe-validated result memo left on. Repeating a statement over data that has not changed
+   * is answered from cache, so this measures the cache, not execution — it is reported beside
+   * `execute()` rather than in place of it, because the other engines have no equivalent and
+   * would be re-executing.
+   */
+  executeCached?(): Promise<Array<Record<string, unknown>>>;
   /** minnow only: the optimized plan. */
   plan?: string;
   close(): void;

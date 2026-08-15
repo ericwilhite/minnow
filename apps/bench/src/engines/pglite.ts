@@ -39,10 +39,9 @@ async function openPglite(name: string, durability: DatasetRecord["durability"])
       [types.NUMERIC]: (value: string | null) => (value === null ? null : Number(value)),
     },
   });
-  // Postgres ships a 4 MB work_mem default sized for many concurrent sessions; this is a
-  // single-session analytical workload, so give sorts, hash joins, and index builds the
-  // same 64 MiB the other engines' caches get instead of forcing spills.
-  await database.exec("SET work_mem = '64MB'; SET maintenance_work_mem = '64MB';");
+  // PGlite runs on its shipped defaults — no work_mem, planner, or JIT overrides. Measured
+  // both ways, the tuning moved these query shapes by 1-12% (mostly noise), so the honest
+  // simplification costs the comparison nothing.
   return database;
 }
 

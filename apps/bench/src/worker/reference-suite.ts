@@ -223,6 +223,20 @@ async function measureOnSession(
         samples.push(performance.now() - started);
       }
       const { medianMs, p95Ms } = summarizeSamples(samples);
+      // Engines with a result cache also report what a repeat costs an application that keeps
+      // the default on. It is a different quantity from medianMs, so it gets its own field
+      // instead of replacing it.
+      let cachedMedianMs: number | undefined;
+      if (prepared.executeCached !== undefined) {
+        await prepared.executeCached();
+        const cachedSamples: number[] = [];
+        for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
+          const started = performance.now();
+          await prepared.executeCached();
+          cachedSamples.push(performance.now() - started);
+        }
+        cachedMedianMs = summarizeSamples(cachedSamples).medianMs;
+      }
       const tuples = canonicalTuples(rows, (row) =>
         definition.columns.map((column) => row[column]),
       );
@@ -232,6 +246,7 @@ async function measureOnSession(
         prepareMs,
         medianMs,
         p95Ms,
+        ...(cachedMedianMs === undefined ? {} : { cachedMedianMs }),
         resultRows: rows.length,
         checksum: referenceChecksum(tuples),
         verified: tuplesMatch(tuples, oracleTuples),

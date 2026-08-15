@@ -13,6 +13,8 @@ interface EngineRun {
   supported: boolean;
   prepareMs?: number;
   medianMs?: number;
+  /** Engines with a result cache: what a repeat costs with that cache left on (the default). */
+  cachedMedianMs?: number;
   p95Ms?: number;
   resultRows?: number;
   verified?: boolean;
@@ -356,7 +358,17 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
                 const run = query.engines.find((r) => r.engine === engine);
                 return run?.supported === true ? (
                   <>
-                    <td class="num">{fmtMs(run.medianMs ?? 0)}</td>
+                    <td class="num">
+                      {fmtMs(run.medianMs ?? 0)}
+                      {run.cachedMedianMs !== undefined && (
+                        <>
+                          <br />
+                          <small class="cached" title="Same statement with the result memo left on — the default an application gets. A cache lookup, not execution.">
+                            {fmtMs(run.cachedMedianMs)} cached
+                          </small>
+                        </>
+                      )}
+                    </td>
                     <td class="num">{fmtMs(run.p95Ms ?? 0)}</td>
                   </>
                 ) : (
@@ -554,6 +566,11 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   .bench-table td.num {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+  }
+
+  .bench-table .cached {
+    color: var(--text-secondary);
+    font-size: 0.78em;
   }
 
   .bench-table .totals td {
