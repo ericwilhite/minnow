@@ -24,6 +24,13 @@ export interface ReferenceQueryDefinition {
   name: string;
   complexity: "simple" | "moderate" | "complex";
   /**
+   * Access pattern, which is what actually separates these timings. "selective" queries reach
+   * a few rows through a key or an ordered range and are latency-bound; "analytical" queries
+   * scan and aggregate a table and are throughput-bound. Note an unanchored LIKE is a scan,
+   * not a lookup — classification follows the work done, not how the SQL reads.
+   */
+  workload: "selective" | "analytical";
+  /**
    * Submitted to MinnowDatabase verbatim. Queries outside the current SQL surface still
    * carry their complete intended statement and record the engine's refusal, so the
    * report shows the real gap instead of a placeholder.
@@ -158,6 +165,7 @@ export async function runReferenceSuite(
         id: definition.id,
         name: definition.name,
         complexity: definition.complexity,
+        workload: definition.workload,
         sql: definition.sql,
         tables: definition.tables,
         expectedRows: definition.expectedRows,
@@ -320,6 +328,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
   return [
     {
       id: "q1",
+      workload: "selective",
       name: "Order point lookup",
       complexity: "simple",
       tables: ["orders"],
@@ -352,6 +361,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q2",
+      workload: "selective",
       name: "Paid orders in a date range",
       complexity: "simple",
       tables: ["orders"],
@@ -371,6 +381,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q3",
+      workload: "analytical",
       name: "Revenue by order status",
       complexity: "moderate",
       tables: ["orders"],
@@ -383,6 +394,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q4",
+      workload: "analytical",
       name: "Top customers by captured revenue",
       complexity: "moderate",
       tables: ["customers", "orders", "payments"],
@@ -395,6 +407,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q5",
+      workload: "analytical",
       name: "Category revenue after discounts",
       complexity: "moderate",
       tables: ["order_items", "products"],
@@ -407,6 +420,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q6",
+      workload: "analytical",
       name: "Repeat customers without returns",
       complexity: "complex",
       tables: ["orders", "order_items", "returns"],
@@ -421,6 +435,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q7",
+      workload: "analytical",
       name: "Top products within each category",
       complexity: "complex",
       tables: ["order_items", "products"],
@@ -443,6 +458,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q8",
+      workload: "analytical",
       name: "Monthly cohort revenue and return rate",
       complexity: "complex",
       tables: ["customers", "orders", "order_items", "returns", "payments"],
@@ -462,6 +478,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q9",
+      workload: "analytical",
       name: "Region and segment revenue matrix",
       complexity: "complex",
       tables: ["regions", "customers", "orders", "payments"],
@@ -476,6 +493,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q10",
+      workload: "analytical",
       name: "Return rate by product category",
       complexity: "complex",
       tables: ["products", "order_items", "returns"],
@@ -490,6 +508,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q11",
+      workload: "analytical",
       name: "Tax collected by jurisdiction",
       complexity: "complex",
       tables: ["order_taxes", "tax_rates", "tax_jurisdictions"],
@@ -502,6 +521,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q12",
+      workload: "analytical",
       name: "Fulfillment volume by warehouse",
       complexity: "moderate",
       tables: ["shipments", "shipment_items", "warehouses"],
@@ -515,6 +535,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q13",
+      workload: "analytical",
       name: "Supplier inventory ledger",
       complexity: "moderate",
       tables: ["inventory_movements", "suppliers"],
@@ -527,6 +548,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q14",
+      workload: "analytical",
       name: "Payment transaction funnel",
       complexity: "simple",
       tables: ["payment_transactions"],
@@ -539,6 +561,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q15",
+      workload: "analytical",
       name: "Discount and tax burden by order status",
       complexity: "complex",
       tables: ["orders", "order_discounts", "order_taxes"],
@@ -551,6 +574,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q16",
+      workload: "analytical",
       name: "Support message text search",
       complexity: "simple",
       tables: ["support_messages"],

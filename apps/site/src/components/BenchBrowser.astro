@@ -22,6 +22,7 @@ interface EngineRun {
 }
 
 interface SuiteQuery {
+  workload?: "selective" | "analytical";
   id: string;
   name: string;
   complexity: string;
@@ -119,14 +120,67 @@ const barPath = (x: number, y: number, w: number, h: number): string => {
   return `M${x} ${y} h${w - r} a${r} ${r} 0 0 1 ${r} ${r} v${h - 2 * r} a${r} ${r} 0 0 1 -${r} ${r} h${-(w - r)} Z`;
 };
 
+/**
+ * Geometric mean, not the sum. These 16 queries span three orders of magnitude, so a sum is
+ * just the slowest few — one 33 ms cohort analysis outweighs ten 0.5 ms lookups, and an engine
+ * could lose every fast query and still "win" the total. The geometric mean gives each query
+ * the same weight whatever its absolute cost, which is why heterogeneous suites use it.
+ */
+const geomean = (values: number[]): number => {
+  const usable = values.filter((value) => value > 0);
+  if (usable.length === 0) return 0;
+  return Math.exp(usable.reduce((sum, value) => sum + Math.log(value), 0) / usable.length);
+};
+
+const medians = (engine: string, workload?: "selective" | "analytical"): number[] =>
+  results.suite.queries
+    .filter((query) => workload === undefined || query.workload === workload)
+    .map((query) => query.engines.find((run) => run.engine === engine))
+    .filter((run) => run?.supported === true)
+    .map((run) => run?.medianMs ?? 0);
+
+const cachedMedians = (workload?: "selective" | "analytical"): number[] =>
+  results.suite.queries
+    .filter((query) => workload === undefined || query.workload === workload)
+    .map((query) => query.engines.find((run) => run.engine === "minnow"))
+    .filter((run) => run?.supported === true && run.cachedMedianMs !== undefined)
+    .map((run) => run?.cachedMedianMs ?? 0);
+
+/** Minnow appears twice: what a query costs to run, and what a repeat costs from its cache. */
+type SummaryRow = { name: string; slot: number; value: number };
+const summaryRows = (workload?: "selective" | "analytical"): SummaryRow[] => {
+  const rows: SummaryRow[] = [];
+  for (const engine of engines) {
+    rows.push({ name: label(engine), slot: slot(engine), value: geomean(medians(engine, workload)) });
+    if (engine === "minnow") {
+      const cached = geomean(cachedMedians(workload));
+      if (cached > 0) {
+        rows.push({ name: "Minnow (cached repeat)", slot: slot(engine), value: cached });
+      }
+    }
+  }
+  return rows;
+};
+
 const totalBars = barChart(
-  engines.map((engine) => ({
-    name: label(engine),
-    slot: slot(engine),
-    value: results.suite.totalMsByEngine[engine] ?? 0,
-    valueLabel: fmtMs(results.suite.totalMsByEngine[engine] ?? 0),
+  summaryRows().map((row) => ({
+    name: row.name,
+    slot: row.slot,
+    value: row.value,
+    valueLabel: fmtMs(row.value),
   })),
 );
+
+const selectiveCount = results.suite.queries.filter((q) => q.workload === "selective").length;
+const analyticalCount = results.suite.queries.filter((q) => q.workload === "analytical").length;
+const splitRows =
+  selectiveCount > 0 && analyticalCount > 0
+    ? summaryRows(undefined).map((row, index) => ({
+        name: row.name,
+        selective: summaryRows("selective")[index]?.value ?? 0,
+        analytical: summaryRows("analytical")[index]?.value ?? 0,
+      }))
+    : [];
 
 const buildBars = barChart(
   engines.map((engine) => ({
@@ -184,9 +238,11 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
 
 <section class="bench-pane" id={paneId}>
   <div class="chart-card">
-    <h3>Full suite, total median time</h3>
+    <h3>Typical query time</h3>
     <p class="chart-sub">
-      Sum of per-query medians across all {results.suite.queries.length} queries — lower is better.
+      Geometric mean of per-query medians across all {results.suite.queries.length} queries —
+      lower is better. Every query counts once, whatever its absolute cost; a sum would report
+      only the slowest few.
     </p>
     <svg viewBox={`0 0 ${BAR_W} ${totalBars.height}`} role="img" aria-label="Total suite time by engine">
       {
@@ -206,6 +262,38 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
       }
     </svg>
   </div>
+
+  {
+    splitRows.length > 0 && (
+      <div class="chart-card">
+        <h3>By access pattern</h3>
+        <p class="chart-sub">
+          The same geometric mean, split by what the query actually does. Selective queries reach
+          a few rows through a key or an ordered range; analytical queries scan and aggregate a
+          table. This suite is mostly the second kind ({selectiveCount} selective,{" "}
+          {analyticalCount} analytical), which is worth knowing when reading the number above.
+        </p>
+        <table class="split-table">
+          <thead>
+            <tr>
+              <th>Engine</th>
+              <th class="num">Selective ({selectiveCount})</th>
+              <th class="num">Analytical ({analyticalCount})</th>
+            </tr>
+          </thead>
+          <tbody>
+            {splitRows.map((row) => (
+              <tr>
+                <td>{row.name}</td>
+                <td class="num">{fmtMs(row.selective)}</td>
+                <td class="num">{fmtMs(row.analytical)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
 
   <div class="chart-row">
     <div class="chart-card half">
@@ -566,6 +654,24 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   .bench-table td.num {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+  }
+
+  .split-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+  }
+
+  .split-table th,
+  .split-table td {
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+  }
+
+  .split-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   .bench-table .cached {

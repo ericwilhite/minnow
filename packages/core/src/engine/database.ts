@@ -569,6 +569,17 @@ export {
 };
 
 export interface MinnowDatabaseOptions {
+  /**
+   * Block codec for newly written blocks; defaults to "gzip", which is also what compaction
+   * rewrites to, so a table's blocks are encoded the same way however they got there.
+   *
+   * Measured over 200k rows on IndexedDB, gzip against raw: about half the stored bytes
+   * (4.9 MiB vs 10.0 MiB) and a *faster* cold scan (13.3 ms vs 17.9 ms) — reading half the
+   * bytes out of IndexedDB more than pays for decompressing them — at the cost of roughly
+   * 2.2x on bulk ingest (413 ms vs 184 ms). Warm scans are identical either way, because the
+   * buffer pool caches decoded blocks. Choose "raw" when ingest throughput matters more than
+   * storage quota; the browser usually makes the opposite trade worth it.
+   */
   compression?: Compression;
   rowsPerBlock?: number;
   maxCommitRetries?: number;
@@ -737,7 +748,7 @@ export class MinnowDatabase {
     private readonly store: BlockStore,
     options: MinnowDatabaseOptions = {},
   ) {
-    this.#compression = options.compression ?? "raw";
+    this.#compression = options.compression ?? "gzip";
     // The block is the streamed scan's row group and the buffer pool's residency unit.
     // Measured curve (400k rows, streamed filter/group/like/top-n, 2026-08): throughput is
     // flat from ~16k rows per block and 2k-row blocks cost up to 66% on top-n; 65,536 sits

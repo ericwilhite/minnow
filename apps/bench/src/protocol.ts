@@ -133,6 +133,8 @@ export interface ReferenceQueryReport {
   id: string;
   name: string;
   complexity: "simple" | "moderate" | "complex";
+  /** Access pattern: latency-bound key/range lookup, or throughput-bound scan and aggregate. */
+  workload: "selective" | "analytical";
   sql: string;
   tables: string[];
   expectedRows: number;

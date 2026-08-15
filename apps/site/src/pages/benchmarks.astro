@@ -215,6 +215,14 @@ const engineLabels: Record<string, string> = {
         snapshot-fresh on every statement.
       </p>
       <p>
+        Summaries are a <strong>geometric mean</strong>, not a sum. These queries span three
+        orders of magnitude, so adding them up reports the slowest few and nothing else — an
+        engine could lose every fast query and still win the total. A geometric mean weights
+        each query equally whatever it costs. The split by access pattern is there because it
+        changes the answer: engines that win on scanning and aggregating are frequently not the
+        ones that win on reaching a single row, and this suite is mostly the former.
+      </p>
+      <p>
         The suite replays one statement over unchanging data, which is a measurement artifact,
         not a workload. Minnow caches computed results by default and would answer every sample
         after the first from that cache — so the headline number is measured with the cache off,
