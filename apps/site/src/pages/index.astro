@@ -9,15 +9,16 @@ import Examples from "../components/Examples.astro";
     <section class="hero">
       <div class="hero-logo"><Logo size={72} water /></div>
       <h1>minnow</h1>
-      <p class="tagline">A tiny relational database that lives in your browser.</p>
+      <p class="tagline">A columnar SQL engine that lives in your browser.</p>
       <p class="sub">
-        Typed queries, real SQL, live results, and durable IndexedDB storage — no server, no WASM
-        blob, no build step.
+        Real SQL, live results, and durable IndexedDB storage — no server, no WASM blob, no build
+        step. Use the typed builder directly, or build your own framework binding on top of it.
       </p>
       <div class="install"><code>npm install @minnowdb/core</code></div>
       <div class="cta">
         <a class="button primary" href="/docs/getting-started/">Get started</a>
         <a class="button" href="/docs/architecture/">How it works</a>
+        <a class="button" href="/docs/api/">Build on it</a>
       </div>
     </section>
 
@@ -39,8 +40,8 @@ import Examples from "../components/Examples.astro";
       <div class="feature">
         <h3>Live queries</h3>
         <p>
-          Subscribe to a query and get fresh rows after every commit — across tabs, powered by
-          incremental recomputation.
+          Subscribe to a query and get fresh rows after every commit — across tabs, with re-runs
+          skipped when the data layer can prove the commit can't change the result.
         </p>
       </div>
       <div class="feature">

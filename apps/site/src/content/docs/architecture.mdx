@@ -24,8 +24,9 @@ These are fixed. Everything else is built around them.
 - **Durability ends at a committed transaction.** A committed write is safe. A write still in
   flight when the tab closes is not. Minnow flushes early when the page hides, but treats that as
   a bonus, not a guarantee.
-- **No database work on the main thread.** The engine runs in a worker; the page holds an async
-  proxy. The API is async everywhere, so your code looks the same either way.
+- **Where the engine runs is your choice.** Put it in a worker and hold an async proxy in the
+  page, or construct it on the main thread. The API is async everywhere, so your code — and any
+  adapter written against it — looks the same either way.
 - **Published data is immutable.** Once written, a block never changes. Most of the design falls
   out of this one rule.
 - **Nothing special to deploy.** No COOP/COEP headers, no SharedArrayBuffer, no WASM file to
@@ -104,11 +105,16 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   is allocated. Under a budget, sorts and grouped aggregations spill to durable temp pages instead
   of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.
 - Spill pages are lease-protected, so a query abandoned by a dead tab gets cleaned up.
-- Repeated work is cached at three levels, all inside one byte-bounded budget
-  (`prepareCacheBytes`): compiled plans by SQL text, decoded blocks by immutable block id, and
-  assembled column vectors by exact visible-segment fingerprint. A commit invalidates the
-  fingerprints, but unchanged blocks stay decoded — re-preparing after a small write costs
-  re-assembly, not re-fetch and re-decompression.
+- Compiled plans are cached separately, by statement text, so re-issuing a statement doesn't
+  re-parse or re-plan it.
+- Everything else repeated is cached in one byte-bounded buffer pool (`bufferPoolBytes`,
+  default 64 MiB): decoded blocks by immutable block id, assembled column vectors and zone
+  descriptions by the same, and computed results — whole-block results, the columnar forms of
+  derived and windowed sources, and whole statement results — by exact visible-segment
+  fingerprint. A commit moves the fingerprints, so computed entries stop matching, but
+  unchanged blocks stay decoded: the next statement pays re-assembly, not re-fetch and
+  re-decompression. Passing `memoize: false` to a query bypasses the computed-result entries
+  and measures execution, which is what the benchmarks do.
 
 The budget is a model, not a heap meter, and not every operator can spill yet — see
 [what we don't claim](#what-we-dont-claim).

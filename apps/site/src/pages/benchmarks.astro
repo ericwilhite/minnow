@@ -186,10 +186,18 @@ const engineLabels: Record<string, string> = {
           exclusive OPFS locking, a 64 MiB page cache, TRUNCATE journaling, and{" "}
           <code>synchronous=NORMAL</code>; PGlite with 64 MB <code>work_mem</code>{" "}
           (its relaxed-durability mode is excluded — it crashes mid-load in this workload);
-          DuckDB fed through Arrow bulk ingestion.
-          All engines get identical schemas, secondary indexes on every foreign key, post-load
-          statistics (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine
-          prepared statements.
+          DuckDB fed through Arrow bulk ingestion; Minnow with relaxed IndexedDB durability,
+          gzip-compressed blocks, and a 64 MiB buffer pool.
+          All engines get identical schemas, post-load statistics where they have them
+          (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine prepared
+          statements.
+        </li>
+        <li>
+          The three comparison engines also get a B-tree secondary index on every foreign key.
+          Minnow gets none: it has no secondary-index feature, and its scans are pruned by the
+          zone statistics carried in each column block. The comparison is deliberately run
+          this way — with the other engines indexed and Minnow not — rather than removing
+          indexes to flatter it.
         </li>
         <li>
           Captured headless on an {first.host.model} ({first.host.cpus} cores). Absolute numbers
@@ -206,6 +214,14 @@ const engineLabels: Record<string, string> = {
         planning — no engine pins data) and the median of fresh statement executions over
         current data. Minnow's executions stream through its block buffer pool and are
         snapshot-fresh on every statement.
+      </p>
+      <p>
+        The suite replays one statement over unchanging data, so Minnow runs it with its
+        result memo turned off. Left on — the default an application gets — the memo would
+        answer every sample after the first from cache, and this page would be reporting a
+        constant-time cache lookup against the other engines' real execution. The memo is a
+        real feature and a real speedup; it is simply not a measurement of query execution,
+        so it is excluded from this comparison.
       </p>
       {
         memoryEngines.length > 0 && (

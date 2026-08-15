@@ -1112,7 +1112,7 @@ async function benchmarkReferenceQueries(
       passed:
         integrityChecks.every((check) => check.passed) &&
         measurements.every((query) => query.verified),
-      note: `Each query is submitted to MinnowDatabase as SQL and executed through the public query() API, so every sample is a fresh statement over the warm buffer pool; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it does no planning and keeps whole tables resident, where the engine timing includes its buffer-pool reads. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
+      note: `Each query is submitted to MinnowDatabase as SQL and executed through the public query() API with the result memo disabled, so every sample re-executes over the warm buffer pool instead of being answered from cache; ${String(engineSupportedQueries)} of ${String(measurements.length)} compile against the current SQL surface, and the rest record the engine's own error. Engine results are verified tuple for tuple against an independent JavaScript oracle, with numbers compared inside a relative tolerance because aggregates accumulate in a different row order. The hand-written JavaScript column beside each engine timing is a baseline over rows already materialized in memory, not a second engine: it does no planning and keeps whole tables resident, where the engine timing includes its buffer-pool reads. Validation and each query load bounded table subsets and release them before the next query, so the complete 50-table dataset is never one JavaScript object graph.`,
     };
   } finally {
     store.close();
@@ -1213,14 +1213,18 @@ async function measureReferenceQueryOnEngine(
 ): Promise<BenchmarkResult["referenceQueries"]["queries"][number]["engine"]> {
   try {
     // Prepare-as-compile: the first query pays plan compilation plus cold block reads; the
-    // samples then measure fresh statement execution over the warm buffer pool.
+    // samples then measure fresh statement execution over the warm buffer pool. memoize:
+    // false keeps the probe-validated result memo out of it — replaying one statement over
+    // unchanging data would otherwise answer every sample from cache and report the cache's
+    // constant-time lookup as the query's cost.
+    const options = { memoize: false } as const;
     const prepareStarted = performance.now();
-    let result = await database.query(query.sql);
+    let result = await database.query(query.sql, options);
     const prepareMs = performance.now() - prepareStarted;
     const samples: number[] = [];
     for (let sample = 0; sample < sampleCount; sample += 1) {
       const started = performance.now();
-      result = await database.query(query.sql);
+      result = await database.query(query.sql, options);
       samples.push(performance.now() - started);
     }
     samples.sort((left, right) => left - right);

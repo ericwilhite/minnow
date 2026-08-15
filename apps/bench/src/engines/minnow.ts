@@ -86,12 +86,19 @@ export const minnowDriver: EngineDriver = {
     return {
       engine: "minnow",
       async prepare(sql) {
-        // Prepare compiles only; every execute() is a fresh statement over current data,
-        // exactly what the engine's public query() semantics are.
+        // Prepare compiles only; every execute() is a fresh statement over current data.
         const plan = await database.explain(sql);
         return {
           plan,
-          execute: async () => normalizeRows((await database.query(sql)).rows).map(canonicalizeRow),
+          // memoize: false measures execution, not the probe-validated result memo. The suite
+          // replays one statement over unchanging data, so the default (memo on) would answer
+          // every sample from cache — a constant-time lookup against the other engines' real
+          // execution, which is not a comparison. Applications keep the default and get the
+          // cache; this column is what the engine costs when it actually runs the query.
+          execute: async () =>
+            normalizeRows((await database.query(sql, { memoize: false })).rows).map(
+              canonicalizeRow,
+            ),
           close: () => undefined,
         };
       },

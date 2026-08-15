@@ -122,15 +122,11 @@ const themes = { light: "github-light", dark: "github-dark" } as const;
       into SQL would make query results depend on code the engine cannot snapshot or replay.
     </li>
     <li>
-      <strong>Triggers</strong> — trigger logic would run per-tab in whichever tab happened to
-      write, which is exactly the class of bug live queries exist to avoid. Subscribe to a live
-      query and react in application code instead.
-    </li>
-    <li>
-      <strong>SQL-level BEGIN/COMMIT/SAVEPOINT</strong> — transactions are the engine's
-      programmatic API, and each SQL statement is atomic. Holding an open interactive
-      transaction across await points in a browser tab (which can be frozen or killed at any
-      moment) invites lost work; the engine's write path is designed around that reality.
+      <strong>SQL-level BEGIN/COMMIT/SAVEPOINT</strong> — an atomic multi-statement scope is the
+      engine's programmatic API (<code>database.write(async (tx) =&gt; …)</code>), and each SQL
+      statement outside one is atomic on its own. Holding an open interactive transaction across
+      await points in a browser tab (which can be frozen or killed at any moment) invites lost
+      work; the engine's write path is designed around that reality.
     </li>
   </ul>
 

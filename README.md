@@ -1,7 +1,11 @@
 # Minnow `><(((('>`
 
-**A relational database that runs entirely in the browser.** Typed queries, real SQL, full-text
+**A columnar SQL engine that runs entirely in the browser.** Typed queries, real SQL, full-text
 search, live results, and durable storage on IndexedDB — no server, no WASM file, no build step.
+
+Minnow is the engine. Use its typed builder directly, or treat it as the layer a framework
+binding or ORM-style adapter is written against — the driver contract, the storage contract, and
+the worker RPC are all public seams.
 
 ```bash
 npm install @minnowdb/core
@@ -20,9 +24,11 @@ npm install @minnowdb/core
   feature matrix, and deliberate omissions are documented with reasons.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background on large tables.
-- **Fast** — columnar blocks, vectorized execution, and a perf gate that keeps every query class
-  ahead of native SQLite; in-browser, it leads SQLite Wasm and PGlite on queries and bulk ingest
-  at every published dataset scale.
+- **Fast** — columnar blocks, vectorized execution, and a checked-in perf gate that pins every
+  query class against native SQLite, PGlite, and DuckDB so a regression can't land unnoticed.
+  In-browser, it leads SQLite Wasm and PGlite across the published dataset scales; the
+  [benchmarks](https://minnowdb.dev/benchmarks/) publish the raw captures, including the
+  shapes where it doesn't lead.
 - **Safe across tabs** — writes publish atomically; readers see the old version or the new one,
   never half a write. Reads never block writes.
 - **Always fresh** — every query observes the latest committed state, even commits from another

@@ -213,6 +213,23 @@ const rows = await sql<{ n: number }>`
 
 `query()` remains the raw read-only SQL API; every call observes the latest committed state.
 
+### Cached results
+
+Repeating a statement over data that hasn't changed is cheap: the engine keeps computed results —
+whole statement results, and the materialized forms of derived, CTE, and windowed sources — keyed
+by the exact set of visible segments. Any commit moves that key, so a cached answer is only ever
+served when it is provably identical to re-running the query. You never get a stale row.
+
+Pass `memoize: false` when you want the work done rather than the answer reused:
+
+```ts
+const rows = await database.query(sql, { memoize: false });
+```
+
+That is what the [benchmarks](/benchmarks/) do — replaying one statement over unchanging data with
+caching on measures a cache lookup, not query execution. Block and vector caches stay warm either
+way; those cache storage reads, not results.
+
 ### Locating a compile error
 
 SQL that fails to compile throws a `SqlCompileError` carrying the position of the token that

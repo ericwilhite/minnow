@@ -350,10 +350,14 @@ export interface StagedWriteResult {
 
 /**
  * The scope handed to `write()`: every mutation stages into one transaction and publishes
- * as one commit — all of it or none of it, in every tab. Reads inside the scope observe the
- * pre-scope snapshot: a scope cannot read or update rows it staged (validations run against
- * statement-start state), and AFTER triggers fire per staged operation exactly as they do
- * for standalone writes.
+ * as one commit — all of it or none of it, in every tab. Reads observe the pre-scope snapshot
+ * plus everything the scope has staged, so later statements (and trigger bodies) see earlier
+ * ones; AFTER triggers fire per staged operation exactly as they do for standalone writes.
+ *
+ * A mutation that fails after registering part of its work ends the scope: the registration
+ * cannot be undone in place, so later statements and the commit both reject even if the caller
+ * caught the original error. A mutation that fails validation before registering anything
+ * leaves the scope usable.
  */
 export interface WriteSession {
   /**
@@ -369,9 +373,14 @@ export interface WriteSession {
 
 export interface QueryOptions {
   /**
-   * false bypasses the probe-validated result memo for this statement (the default true
-   * serves provably-fresh cached results). Useful for benchmarking execution itself and for
-   * callers that re-run one statement in a tight loop over changing external state.
+   * false makes this statement compute its results instead of reusing any it has cached: the
+   * probe-validated result memo, cached block results, and the columnar forms of derived and
+   * windowed sources are all bypassed (the default true serves provably-fresh cached results
+   * from each). Block and vector caches stay warm — those cache storage reads, not results.
+   *
+   * Useful for benchmarking execution itself, and for callers that re-run one statement in a
+   * tight loop over changing external state. Note that replaying one statement over unchanging
+   * data with the default on measures cache lookups, not query execution.
    */
   memoize?: boolean;
   readonly version?: number;
@@ -1631,6 +1640,10 @@ export class MinnowDatabase {
           memory,
           realTables,
           typedSchemas,
+          undefined,
+          // memoize: false means "compute this statement's results" — that covers the
+          // columnar forms of derived and windowed sources too, not just the result memo.
+          options.memoize !== false,
         );
       };
       if (options.version !== undefined) {
@@ -1855,6 +1868,7 @@ export class MinnowDatabase {
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
     extraInputs?: ReadonlyMap<string, ColumnarTable>,
+    cacheResults = true,
   ): Promise<Map<string, ColumnarTable>> {
     const inputs = new Map<string, ColumnarTable>(extraInputs ?? []);
     const sources = [block.base, ...block.joins];
@@ -1869,6 +1883,7 @@ export class MinnowDatabase {
           memory,
           realTables,
           typedSchemas,
+          cacheResults,
         );
         typedSchemas.set(reference, schema);
         const state = createRecursiveCteState(baseResult, all);
@@ -1948,6 +1963,7 @@ export class MinnowDatabase {
           snapshot,
           visibility,
           realTables,
+          cacheResults,
         );
         const columnarKey =
           innerKey === undefined
@@ -1969,6 +1985,7 @@ export class MinnowDatabase {
           memory,
           realTables,
           typedSchemas,
+          cacheResults,
         );
         const windowed = applyWindowFunctions(inner, source.windowed.windows);
         const schema = [
@@ -1988,7 +2005,13 @@ export class MinnowDatabase {
       }
       const derived = source.derived;
       if (derived === undefined) continue;
-      const derivedKey = await this.#blockResultCacheKey(derived, snapshot, visibility, realTables);
+      const derivedKey = await this.#blockResultCacheKey(
+        derived,
+        snapshot,
+        visibility,
+        realTables,
+        cacheResults,
+      );
       const columnarKey = derivedKey === undefined ? undefined : `ctd|${derivedKey}`;
       if (columnarKey !== undefined) {
         const hit = this.#cacheGet(columnarKey) as
@@ -2006,6 +2029,7 @@ export class MinnowDatabase {
         memory,
         realTables,
         typedSchemas,
+        cacheResults,
       );
       typedSchemas.set(source.table, schema);
       const derivedTable = derivedColumnarTable(source.table, result, schema);
@@ -3143,6 +3167,7 @@ export class MinnowDatabase {
     snapshot: LeasedSnapshot,
     visibility: SegmentVisibilityCatalog,
     realTables: ReadonlyMap<string, TableRecord>,
+    cacheResults = true,
   ): Promise<QueryResult> {
     plan = expandFtsColumns(plan, (name) => searchableFtsColumns(realTables.get(name)));
     const typedSchemas = new Map<string, SqlColumnSchema[]>(
@@ -3163,6 +3188,8 @@ export class MinnowDatabase {
             memory,
             realTables,
             typedSchemas,
+            undefined,
+            cacheResults,
           ),
         );
       }
@@ -3176,6 +3203,8 @@ export class MinnowDatabase {
             memory,
             realTables,
             typedSchemas,
+            undefined,
+            cacheResults,
           ),
           wrapper.aliases,
         );
@@ -3187,6 +3216,8 @@ export class MinnowDatabase {
         memory,
         realTables,
         typedSchemas,
+        undefined,
+        cacheResults,
       );
     } finally {
       memory.close();
@@ -5387,6 +5418,7 @@ export class MinnowDatabase {
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
     extraInputs?: ReadonlyMap<string, ColumnarTable>,
+    cacheResults = true,
   ): Promise<QueryResult> {
     const ftsStats = await this.#ftsIndexStats(block, realTables, snapshot, visibility);
     const inputs = await this.#prepareBlockInputs(
@@ -5397,6 +5429,7 @@ export class MinnowDatabase {
       realTables,
       typedSchemas,
       extraInputs,
+      cacheResults,
     );
     const prepared = createPreparedColumnarQuery(
       block,
@@ -5425,8 +5458,15 @@ export class MinnowDatabase {
     memory: QueryMemoryContext,
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
+    cacheResults = true,
   ): Promise<QueryResult> {
-    const key = await this.#blockResultCacheKey(block, snapshot, visibility, realTables);
+    const key = await this.#blockResultCacheKey(
+      block,
+      snapshot,
+      visibility,
+      realTables,
+      cacheResults,
+    );
     if (key !== undefined) {
       const cached = this.#cacheGet(key) as QueryResult | undefined;
       if (cached !== undefined) return cached;
@@ -5438,6 +5478,8 @@ export class MinnowDatabase {
       memory,
       realTables,
       typedSchemas,
+      undefined,
+      cacheResults,
     );
     if (key !== undefined) this.#cachePut(key, result, queryResultRetainedBytes(result));
     return result;
@@ -5456,8 +5498,15 @@ export class MinnowDatabase {
     memory: QueryMemoryContext,
     realTables: ReadonlyMap<string, TableRecord>,
     typedSchemas: Map<string, SqlColumnSchema[]>,
+    cacheResults = true,
   ): Promise<{ result: QueryResult; schema: SqlColumnSchema[] }> {
-    const key = await this.#blockResultCacheKey(block, snapshot, visibility, realTables);
+    const key = await this.#blockResultCacheKey(
+      block,
+      snapshot,
+      visibility,
+      realTables,
+      cacheResults,
+    );
     const schemaKey = key === undefined ? undefined : `s${key}`;
     if (schemaKey !== undefined) {
       const cached = this.#cacheGet(schemaKey) as
@@ -5471,6 +5520,8 @@ export class MinnowDatabase {
       memory,
       realTables,
       typedSchemas,
+      undefined,
+      cacheResults,
     );
     const schema = inferBlockSchema(block, typedSchemas);
     const entry = { result, schema };
@@ -5485,7 +5536,13 @@ export class MinnowDatabase {
     snapshot: LeasedSnapshot,
     visibility: SegmentVisibilityCatalog,
     realTables: ReadonlyMap<string, TableRecord>,
+    cacheResults = true,
   ): Promise<string | undefined> {
+    // Every computed-result cache — whole-block results, their schemas, and the columnar
+    // forms of derived and windowed sources — is keyed from here, and each one skips both
+    // its read and its write when the key is undefined. Returning undefined is therefore
+    // the single switch that makes a statement compute its results instead of reusing them.
+    if (!cacheResults) return undefined;
     if (this.#prepareCacheLimitBytes === 0) return undefined;
     const parts: string[] = [];
     for (const name of collectRealTableNames(block).sort()) {

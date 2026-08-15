@@ -131,6 +131,72 @@ await database.insertBatch("people", {
 Every column must be present and every array the same length; there is no padding here. Both
 forms take the same validation and the same commit path.
 
+## Atomic write scopes
+
+`database.write(callback)` stages any number of mutations and publishes them as **one commit**.
+Every tab sees all of it or none of it — there is no version in which half the scope happened.
+
+```ts
+const { result, version } = await database.write(async (tx) => {
+  await tx.updateBatch("accounts", { keys: [1], changes: { balance: [400] } });
+  await tx.updateBatch("accounts", { keys: [2], changes: { balance: [200] } });
+  await tx.insertBatch("transfers", { columns: { from_id: [1], to_id: [2], amount: [100] } });
+  // Reads inside the scope see the pre-scope snapshot plus everything staged so far.
+  return (await tx.query("SELECT SUM(balance) AS total FROM accounts")).rows[0]?.total;
+});
+```
+
+Things worth knowing before you reach for it:
+
+- **It returns `{ result, version }`** — your callback's return value plus the published version,
+  not the value on its own.
+- **The scope exposes batch methods, not the typed builder**: `query`, `insertBatch`,
+  `upsertBatch`, `updateBatch`, `deleteBatch`. The builder's `write()` equivalent is not wired
+  yet.
+- **Reads are pinned.** `tx.query()` observes the snapshot the scope opened on, plus the scope's
+  own staged rows — never another tab's commit that landed mid-scope.
+- **A concurrent commit loses the race explicitly.** If another writer commits first, the scope
+  throws instead of silently rebasing; retry it.
+- **A failed mutation ends the scope.** A mutation that fails after registering part of its work
+  poisons the scope: later statements and the commit both throw, even if you caught the original
+  error, because a fragment of it cannot be un-staged. A mutation that fails validation cleanly —
+  updating a key that doesn't exist — registers nothing and leaves the scope usable.
+
+There is no SQL `BEGIN`/`COMMIT`; this is the transaction API. Statements issued outside a scope
+are each atomic on their own.
+
+## Triggers
+
+`CREATE TRIGGER` persists a row trigger in the catalog. It is fired by the engine inside the same
+commit as the write that triggered it, so the write and everything it derives publish together —
+and it fires in whichever tab does the writing, without that tab running any application code.
+
+```ts
+await database.execute(
+  "CREATE TRIGGER account_audit AFTER UPDATE ON accounts BEGIN " +
+    "INSERT INTO audit (account_id, balance) VALUES (NEW.id, NEW.balance); END",
+);
+```
+
+- **Timing and events**: `BEFORE` or `AFTER`, on `INSERT`, `UPDATE`, or `DELETE`. `FOR EACH ROW`
+  is accepted and is the only mode. There is no `WHEN` clause.
+- **Bodies** are `INSERT ... VALUES` into a keyless table, or `UPDATE`/`DELETE` against a keyed
+  table, referencing `NEW.`/`OLD.` columns or constants — not expressions over them. Bodies take
+  no parameters and support no `RETURNING` or `ON CONFLICT`.
+- **A body reads the commit's staged state**, so repeated firings in one commit compound: two
+  inserts each running `SET n = n + 1` leave `n` two higher.
+- **Firing counts follow rows actually written.** Deleting a key that isn't there fires nothing.
+  An upsert fires INSERT triggers for new keys and UPDATE triggers — with the replaced row as
+  `OLD` — for keys that already existed.
+- **A failing body fails the whole write**, atomically, including the row that triggered it.
+- **One cascade level** is allowed; a deeper chain errors at write time.
+- **Column lists may be partial**: unlisted columns take their default or NULL, and a body that
+  omits a non-nullable column without a default is rejected at `CREATE TRIGGER` rather than on
+  every later write.
+
+Triggers have no programmatic API — `execute("CREATE TRIGGER …")` and `execute("DROP TRIGGER …")`
+are the surface. Renaming a column a trigger references is rejected by `migrate`.
+
 ## Reading tables
 
 `readTable` takes a column projection and, optionally, a historical version:
