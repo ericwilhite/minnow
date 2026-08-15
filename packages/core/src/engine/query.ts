@@ -2409,44 +2409,47 @@ export function applyWindowFunctions(
   const rows = result.rows.map((row) => ({ ...row }));
   for (const window of windows) {
     const indexes = rows.map((_, index) => index);
+    // Decorate before sorting: `comparable` was being re-run inside the comparator, so every
+    // key was converted O(n log n) times per alias instead of once per row. Precomputing the
+    // comparable value per row per alias makes the comparator pure array reads, and the
+    // partition/peer checks below read the same arrays.
+    const partitionKeys = window.partitionAliases.map((alias) =>
+      rows.map((row) => comparable(row[alias] ?? null)),
+    );
+    const orderKeys = window.orderAliases.map(({ alias }) =>
+      rows.map((row) => comparable(row[alias] ?? null)),
+    );
     const compare = (left: number, right: number): number => {
-      const leftRow = rows[left];
-      const rightRow = rows[right];
-      if (leftRow === undefined || rightRow === undefined) return 0;
-      for (const alias of window.partitionAliases) {
-        const comparison = compareValues(
-          comparable(leftRow[alias] ?? null),
-          comparable(rightRow[alias] ?? null),
-        );
+      for (const keys of partitionKeys) {
+        const comparison = compareValues(keys[left], keys[right]);
         if (comparison !== 0) return comparison;
       }
-      for (const { alias, direction, nulls } of window.orderAliases) {
-        const leftValue = comparable(leftRow[alias] ?? null);
-        const rightValue = comparable(rightRow[alias] ?? null);
-        const placed = explicitNullOrder(leftValue, rightValue, nulls);
+      for (let index = 0; index < window.orderAliases.length; index += 1) {
+        const term = window.orderAliases[index];
+        if (term === undefined) continue;
+        const keys = orderKeys[index] ?? [];
+        const leftValue = keys[left];
+        const rightValue = keys[right];
+        const placed = explicitNullOrder(leftValue, rightValue, term.nulls);
         if (placed !== undefined && placed !== 0) return placed;
         const comparison = compareValues(leftValue, rightValue);
-        if (comparison !== 0) return direction === "desc" ? -comparison : comparison;
+        if (comparison !== 0) return term.direction === "desc" ? -comparison : comparison;
       }
       return left - right;
     };
     indexes.sort(compare);
-    const samePartition = (left: number, right: number): boolean =>
-      window.partitionAliases.every(
-        (alias) =>
-          compareValues(
-            comparable(rows[left]?.[alias] ?? null),
-            comparable(rows[right]?.[alias] ?? null),
-          ) === 0,
-      );
-    const sameOrderKeys = (left: number, right: number): boolean =>
-      window.orderAliases.every(
-        ({ alias }) =>
-          compareValues(
-            comparable(rows[left]?.[alias] ?? null),
-            comparable(rows[right]?.[alias] ?? null),
-          ) === 0,
-      );
+    const samePartition = (left: number, right: number): boolean => {
+      for (const keys of partitionKeys) {
+        if (compareValues(keys[left], keys[right]) !== 0) return false;
+      }
+      return true;
+    };
+    const sameOrderKeys = (left: number, right: number): boolean => {
+      for (const keys of orderKeys) {
+        if (compareValues(keys[left], keys[right]) !== 0) return false;
+      }
+      return true;
+    };
     if (window.name === "LAG" || window.name === "LEAD") {
       applyOffsetWindow(rows, indexes, window, samePartition);
       continue;

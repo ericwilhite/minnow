@@ -3544,6 +3544,20 @@ function consumeBatch(
   }
 }
 
+/**
+ * Shared accumulator arrays for groups in a plan with no aggregates — a `GROUP BY` that only
+ * produces its keys, which is exactly the inner block `COUNT(DISTINCT x)` desugars into. That
+ * block makes one group per distinct (key, x) pair, so allocating five per-group accumulators
+ * that nothing can ever write costs five allocations per distinct value. Every writer is bounded
+ * by the aggregate count, so with none there is nothing to write; the plain arrays are frozen so
+ * a future writer that ignores that bound fails loudly instead of corrupting every group.
+ */
+const EMPTY_ACCUMULATOR = new Float64Array(0);
+const EMPTY_VALUES = Object.freeze([]) as unknown as Array<QueryValue | undefined>;
+const EMPTY_RESERVATIONS = Object.freeze([]) as unknown as Array<
+  QueryMemoryReservation | undefined
+>;
+
 function createGroupState(
   groupValues: QueryValue[],
   plan: BoundPlan,
@@ -3562,7 +3576,20 @@ function createGroupState(
     ),
     "Group state",
   );
-  memory.reserve(payloadBytes, "Group state");
+  // tally, not reserve: a group state lives until the context closes and is never released
+  // on its own, so a per-group QueryMemoryReservation object — retained in the context's Set
+  // for the whole query — is pure overhead at one per distinct group.
+  memory.tally(payloadBytes, "Group state");
+  if (plan.aggregates.length === 0) {
+    return {
+      groupValues,
+      counts: EMPTY_ACCUMULATOR,
+      sums: EMPTY_ACCUMULATOR,
+      values: EMPTY_VALUES,
+      valueReservations: EMPTY_RESERVATIONS,
+      valueReservationBytes: EMPTY_ACCUMULATOR,
+    };
+  }
   return {
     groupValues,
     counts: new Float64Array(plan.aggregates.length),
@@ -4579,9 +4606,13 @@ function required<T>(value: T | undefined, message: string): T {
 }
 
 function queryRowPayloadBytes(row: QueryRow): number {
+  // for-in rather than Object.values: this runs once per result row, and Object.values
+  // allocates a throwaway array of every value each time. Every term is non-negative, so one
+  // range check at the end is equivalent to checking each addition.
   let total = QUERY_REFERENCE_BYTES;
-  for (const value of Object.values(row)) {
-    total = safeMemorySum(total, queryValuePayloadBytes(value), "Result row payload");
+  for (const key in row) total += queryValuePayloadBytes(row[key] ?? null);
+  if (!Number.isSafeInteger(total) || total < 0) {
+    throw new RangeError("Result row payload exceeds the safe integer range");
   }
   return total;
 }
