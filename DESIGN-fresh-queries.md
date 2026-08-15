@@ -294,6 +294,14 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
 - **Buffer pool stats** + **read-triggered auto-compaction** (48-segment threshold,
   fire-and-forget, autoCompact: false opts out).
 
+- **Atomic write scopes (landed):** `database.write(async tx => { ... })` on engine and
+  worker client — one commit for any number of mutations across keyed and keyless tables,
+  triggers included; commit channels widened to per-table lists with the single-entry
+  bulk-load path preserved verbatim.
+- **Derived/windowed columnar caching (landed):** window-running 10.9 → 2.7 ms and
+  distinct-aggregate 23.4 → 7.2 ms on the gate; every query beats sqlite and half beat
+  in-memory DuckDB.
+
 ## Live queries and triggers — architecture assessment (2026-08-14)
 
 **Should the live-query engine be driven by the SQL/data layer?** Yes for invalidation, and

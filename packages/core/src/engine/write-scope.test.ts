@@ -173,6 +173,59 @@ describe("atomic write scopes", () => {
     });
   }
 
+  it("surfaces concurrent commits as explicit conflicts; a retry succeeds", async () => {
+    const store = new MemoryBlockStore();
+    const database = await bank(store);
+    const other = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await expect(
+      database.write(async (tx) => {
+        await tx.updateBatch("accounts", { keys: [1], changes: { balance: [401] } });
+        // A commit from another instance lands while the scope is open.
+        await other.insertBatch("accounts", { columns: { id: [50], balance: [1] } });
+      }),
+    ).rejects.toThrow();
+    // The losing scope published nothing; the interloper's row is there.
+    expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
+      { balance: 500 },
+    ]);
+    expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 3 }]);
+    // Retrying the scope succeeds against the new state.
+    const { version } = await database.write(async (tx) => {
+      await tx.updateBatch("accounts", { keys: [1], changes: { balance: [401] } });
+    });
+    expect(version).not.toBeNull();
+    expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
+      { balance: 401 },
+    ]);
+  });
+
+  it("delivers one live notification and one fresh memo per scope", async () => {
+    const database = await bank(new MemoryBlockStore());
+    const live = database.liveQueries();
+    const changes: unknown[] = [];
+    await live.subscribe("SELECT SUM(balance) AS total FROM accounts", {
+      onChange: (result) => changes.push(result.rows),
+    });
+    expect(changes).toEqual([[{ total: 600 }]]);
+    const sql = "SELECT SUM(balance) AS total FROM accounts";
+    expect((await database.query(sql)).rows).toEqual([{ total: 600 }]);
+    await database.write(async (tx) => {
+      await tx.updateBatch("accounts", { keys: [1], changes: { balance: [450] } });
+      await tx.updateBatch("accounts", { keys: [2], changes: { balance: [151] } });
+    });
+    await live.refresh();
+    // One scope, one re-run, one notification — never an intermediate state.
+    expect(changes).toEqual([[{ total: 600 }], [{ total: 601 }]]);
+    expect(live.stats.reruns).toBe(1);
+    // The memo cannot serve the pre-scope answer: the scope moved the epoch.
+    expect((await database.query(sql)).rows).toEqual([{ total: 601 }]);
+    await database.write(async (tx) => {
+      await tx.deleteBatch("accounts", { keys: [2] });
+    });
+    expect((await database.query(sql)).rows).toEqual([{ total: 450 }]);
+    live.close();
+  });
+
   it("stages nothing, publishes nothing", async () => {
     const database = await bank(new MemoryBlockStore());
     const versionBefore = (await database.query("SELECT COUNT(*) AS n FROM accounts")).rows;
