@@ -695,8 +695,14 @@ export interface CommitTransactionInput {
   expectedTransactionRevision: number;
   expectedManifestVersion: number | null;
   removedBlockIds?: readonly string[];
-  uniqueKeyChanges?: UniqueKeyChanges;
-  ftsChanges?: FtsChanges;
+  /**
+   * Per-table unique-key changes, in operation order. Multi-entry commits come from atomic
+   * write scopes; entries for the same table apply sequentially, so in-scope conflicts
+   * (inserting one key twice) fail exactly like cross-commit conflicts.
+   */
+  uniqueKeyChanges?: readonly UniqueKeyChanges[];
+  /** Per-table full-text deltas; at most one entry per table. */
+  ftsChanges?: readonly FtsChanges[];
   committedAt: string;
 }
 

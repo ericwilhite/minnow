@@ -6712,7 +6712,9 @@ for (const implementation of implementations()) {
     await expect(database.execute("DELETE FROM sql_events")).rejects.toThrow(
       "DELETE requires a table with a unique key",
     );
-    await expect(database.execute("DROP TABLE sql_people")).rejects.toThrow("Expected SELECT");
+    await expect(database.execute("DROP TABLE sql_people")).rejects.toThrow(
+      "DROP supports: DROP TRIGGER name",
+    );
     await expect(database.query("DELETE FROM sql_people")).rejects.toThrow("Expected SELECT");
     await expect(
       database.execute("INSERT INTO sql_people (name, score) VALUES ('Zoe')"),

@@ -14,6 +14,7 @@ import {
   type BlockWrite,
   type CatalogProbe,
   type TriggerRecord,
+  type UniqueKeyChanges,
   collectFtsCandidates,
   invalidateUncoveredFtsColumns,
   type FtsCandidates,
@@ -1162,7 +1163,11 @@ export class IndexedDbBlockStore implements BlockStore {
       throw new Error(`Segment ${foreignSegment.id} belongs to another transaction`);
     }
 
-    const uniqueKeyChanges = input.uniqueKeyChanges;
+    // The single-entry path below is the hot bulk-load path and keeps the membership cache;
+    // multi-entry commits (atomic write scopes) take the simpler merged path further down and
+    // drop the cache.
+    const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
+    const uniqueKeyChanges = uniqueKeyEntries.length === 1 ? uniqueKeyEntries[0] : undefined;
     const keyMode = uniqueKeyChanges?.storageMode;
     const chunkedKeys = keyMode === "chunks-v1" || keyMode === "chunks-v2";
     const keyCache = this.#uniqueKeyCache;
@@ -1222,6 +1227,62 @@ export class IndexedDbBlockStore implements BlockStore {
         transaction.abort();
         await ignoreAbort(transaction);
         throw new UniqueKeyConflictError(uniqueKeyChanges.tableId, conflictToken);
+      }
+    }
+    /**
+     * Multi-entry key work, resolved before the manifest writes: per table, read the union
+     * of touched tokens once, then replay the entries in operation order over a working set
+     * so in-scope conflicts fail exactly like cross-commit conflicts. The net add/remove
+     * per table applies after the manifest version is known.
+     */
+    const multiKeyWork: Array<{
+      tableId: string;
+      mode?: "chunks-v1" | "chunks-v2";
+      addedTokens: string[];
+      removedTokens: string[];
+    }> = [];
+    if (uniqueKeyEntries.length > 1) {
+      const byTable = new Map<string, UniqueKeyChanges[]>();
+      for (const entry of uniqueKeyEntries) {
+        const list = byTable.get(entry.tableId) ?? [];
+        list.push(entry);
+        byTable.set(entry.tableId, list);
+      }
+      for (const [tableId, entries] of byTable) {
+        const mode = entries[0]?.storageMode;
+        const chunked = mode === "chunks-v1" || mode === "chunks-v2";
+        const unionTokens = [...new Set(entries.flatMap((entry) => entry.keyTokens))];
+        let present: Set<string>;
+        if (chunked) {
+          const state = await readChunkedUniqueKeys(catalog, tableId, unionTokens, mode);
+          present = state.existing;
+        } else {
+          const stored = await Promise.all(
+            unionTokens.map((token) => requestResult(catalog.getKey(uniqueKeyKey(tableId, token)))),
+          );
+          present = new Set(unionTokens.filter((_, index) => stored[index] !== undefined));
+        }
+        const original = new Set(present);
+        for (const entry of entries) {
+          for (const token of entry.keyTokens) {
+            if (entry.remove === true) {
+              present.delete(token);
+              continue;
+            }
+            if (entry.requireAbsent && present.has(token)) {
+              transaction.abort();
+              await ignoreAbort(transaction);
+              throw new UniqueKeyConflictError(tableId, token);
+            }
+            present.add(token);
+          }
+        }
+        multiKeyWork.push({
+          tableId,
+          ...(mode === undefined ? {} : { mode }),
+          addedTokens: unionTokens.filter((token) => present.has(token) && !original.has(token)),
+          removedTokens: unionTokens.filter((token) => !present.has(token) && original.has(token)),
+        });
       }
     }
 
@@ -1411,6 +1472,35 @@ export class IndexedDbBlockStore implements BlockStore {
         });
       }
     }
+    for (const work of multiKeyWork) {
+      if (work.mode === "chunks-v1" || work.mode === "chunks-v2") {
+        if (work.addedTokens.length > 0 || work.removedTokens.length > 0) {
+          const indexValue = (await requestResult(
+            catalog.get(uniqueKeyChunkIndexKey(work.tableId)),
+          )) as UniqueKeyChunkIndex | undefined;
+          const index = indexValue ?? { versions: [], hasBase: false };
+          catalog.put(
+            { addedTokens: work.addedTokens, removedTokens: work.removedTokens },
+            uniqueKeyChunkKey(work.tableId, manifest.version),
+          );
+          catalog.put(
+            {
+              versions: [...index.versions, manifest.version],
+              hasBase: index.hasBase,
+              ...(index.partitions === undefined ? {} : { partitions: index.partitions }),
+            },
+            uniqueKeyChunkIndexKey(work.tableId),
+          );
+        }
+      } else {
+        for (const token of work.addedTokens) {
+          catalog.put(manifest.version, uniqueKeyKey(work.tableId, token));
+        }
+        for (const token of work.removedTokens) {
+          catalog.delete(uniqueKeyKey(work.tableId, token));
+        }
+      }
+    }
     // Full-text deltas apply atomically with the publish; a stale writer (one that committed
     // segments to an indexed table without deltas) flips the affected columns to "invalid"
     // instead of failing the data commit — the index self-heals through a rebuild.
@@ -1418,11 +1508,8 @@ export class IndexedDbBlockStore implements BlockStore {
     for (const tableId of changedFtsTableIds) {
       const tableValue: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
       if (tableValue === undefined) continue;
-      const covered = new Set(
-        input.ftsChanges?.tableId === tableId
-          ? input.ftsChanges.columns.map((column) => column.columnId)
-          : [],
-      );
+      const forTable = (input.ftsChanges ?? []).find((entry) => entry.tableId === tableId);
+      const covered = new Set(forTable?.columns.map((column) => column.columnId) ?? []);
       const invalidated = invalidateUncoveredFtsColumns(
         structuredClone(tableValue) as TableRecord,
         covered,
@@ -1431,16 +1518,16 @@ export class IndexedDbBlockStore implements BlockStore {
         catalog.put(structuredClone(invalidated), `${TABLE_ID_PREFIX}${tableId}`);
       }
     }
-    if (input.ftsChanges !== undefined) {
-      for (const column of input.ftsChanges.columns) {
+    for (const ftsEntry of input.ftsChanges ?? []) {
+      for (const column of ftsEntry.columns) {
         catalog.put(
           structuredClone({
             postings: column.postings,
             totalTokens: column.totalTokens,
           } satisfies FtsDeltaChunk),
-          ftsChunkKey(input.ftsChanges.tableId, column.columnId, manifest.version),
+          ftsChunkKey(ftsEntry.tableId, column.columnId, manifest.version),
         );
-        const indexKey = ftsChunkIndexKey(input.ftsChanges.tableId, column.columnId);
+        const indexKey = ftsChunkIndexKey(ftsEntry.tableId, column.columnId);
         const chunkIndex = (await requestResult(catalog.get(indexKey))) as
           { versions: number[] } | undefined;
         catalog.put({ versions: [...(chunkIndex?.versions ?? []), manifest.version] }, indexKey);
@@ -1448,6 +1535,11 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     transactionStore.put(committed, committed.id);
     await transactionDone(transaction);
+    if (uniqueKeyEntries.length > 1) {
+      // Multi-entry commits take the merged path above; the single-table membership cache
+      // cannot describe them, so it drops and rebuilds on the next bulk load.
+      this.#uniqueKeyCache = undefined;
+    }
     // The unique-key cache follows the same rule as the manifest cache below: advance it only
     // after the durable commit. Commits from this instance cannot silently change another
     // table's key records, so a cache for a different table just moves to the new version.

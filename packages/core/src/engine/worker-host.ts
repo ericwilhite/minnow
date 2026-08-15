@@ -8,6 +8,7 @@ import {
   type RpcRequest,
 } from "../worker-protocol/index.js";
 import {
+  type WriteSession,
   MinnowDatabase,
   type MinnowDatabaseOptions,
   type BufferedTableWriter,
@@ -41,6 +42,14 @@ export interface DatabaseInitPayload {
   options?: WireDatabaseOptions;
 }
 
+class WriteScopeAbortedError extends Error {
+  override readonly name = "WriteScopeAbortedError";
+
+  constructor() {
+    super("Write scope aborted");
+  }
+}
+
 /** The slice of DedicatedWorkerGlobalScope (or MessagePort) the host needs. */
 export interface RpcScope {
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
@@ -59,6 +68,12 @@ export interface AttachDatabaseWorkerOptions {
 
 type Handle =
   | { type: "snapshot"; release: () => void }
+  | {
+      type: "write";
+      session: WriteSession;
+      finish: (commit: boolean) => void;
+      done: Promise<{ version: number | null }>;
+    }
   | { type: "writer"; writer: BufferedTableWriter }
   | { type: "live-set"; set: LiveQuerySet; subscriptionIds: Set<string> }
   | { type: "live-subscription"; subscription: LiveQuerySubscription; setId: string };
@@ -132,6 +147,30 @@ class DatabaseRpcServer {
           steps: serializeMigrationSteps(result.steps),
         };
       }
+      case "writeOpen": {
+        // Same deferred-callback shape as snapshotOpen: the scoped write() stays pending
+        // until the client commits or aborts, so its staged transaction spans the RPC session.
+        const handleId = crypto.randomUUID();
+        let sessionResolve!: (session: WriteSession) => void;
+        const sessionReady = new Promise<WriteSession>((resolveSession) => {
+          sessionResolve = resolveSession;
+        });
+        let finish!: (commit: boolean) => void;
+        const done = this.database
+          .write(async (session) => {
+            sessionResolve(session);
+            await new Promise<void>((resolveCommit, rejectAbort) => {
+              finish = (commit) => {
+                if (commit) resolveCommit();
+                else rejectAbort(new WriteScopeAbortedError());
+              };
+            });
+          })
+          .then((outcome) => ({ version: outcome.version }));
+        const session = await sessionReady;
+        this.#handles.set(handleId, { type: "write", session, finish, done });
+        return { handleId };
+      }
       case "snapshotOpen": {
         // The scoped snapshot() holds its lease until the callback settles; the handle keeps
         // the callback pending until the client closes it, so the pin spans the RPC session.
@@ -197,6 +236,26 @@ class DatabaseRpcServer {
         handle.release();
         this.#handles.delete(handleId);
         return undefined;
+      }
+      case "write": {
+        if (method === "stage") {
+          const [op, tableName, input] = args as [keyof WriteSession, string, never];
+          return handle.session[op](tableName, input);
+        }
+        if (method === "commit") {
+          handle.finish(true);
+          this.#handles.delete(handleId);
+          return handle.done;
+        }
+        if (method === "abort") {
+          handle.finish(false);
+          this.#handles.delete(handleId);
+          return handle.done.catch((error: unknown) => {
+            if (error instanceof WriteScopeAbortedError) return undefined;
+            throw error;
+          });
+        }
+        throw new Error(`Unsupported write method: ${method}`);
       }
       case "writer":
         return this.#callWriter(handleId, handle.writer, method, args);
@@ -311,7 +370,10 @@ class DatabaseRpcServer {
     for (const [handleId, handle] of handles) {
       try {
         if (handle.type === "snapshot") handle.release();
-        else if (handle.type === "writer") await handle.writer.close();
+        else if (handle.type === "write") {
+          handle.finish(false);
+          await handle.done.catch(() => undefined);
+        } else if (handle.type === "writer") await handle.writer.close();
         else if (handle.type === "live-set") this.#closeLiveSet(handleId, handle);
       } catch {
         // Dispose every handle even when one close fails; the client is already gone.

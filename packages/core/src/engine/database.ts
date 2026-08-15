@@ -68,6 +68,7 @@ import {
   type MergeCompactionSourceColumn,
   type MergeCompactionSourceSegment,
   type QueryCatalogState,
+  type RowIdRange,
   type RechunkCompactionOutputWindow,
   type RechunkCompactionRewritePlan,
   type RechunkCompactionSourceBlock,
@@ -323,6 +324,27 @@ export interface BufferPoolStats {
   hits: number;
   misses: number;
   evictions: number;
+}
+
+/** One staged mutation inside a write scope; the commit version arrives on the scope. */
+export interface StagedWriteResult {
+  tableName: string;
+  segmentId: string | null;
+  rowCount: number;
+}
+
+/**
+ * The scope handed to `write()`: every mutation stages into one transaction and publishes
+ * as one commit — all of it or none of it, in every tab. Reads inside the scope observe the
+ * pre-scope snapshot: a scope cannot read or update rows it staged (validations run against
+ * statement-start state), and AFTER triggers fire per staged operation exactly as they do
+ * for standalone writes.
+ */
+export interface WriteSession {
+  insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
+  upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
+  updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
+  deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
 }
 
 export interface QueryOptions {
@@ -1815,6 +1837,28 @@ export class MinnowDatabase {
         continue;
       }
       if (source.windowed !== undefined) {
+        // The windowed source's columnar form is a pure function of the inner block's cache
+        // key plus the window spec, so a warm repeat skips the window pass and the
+        // rows-to-columnar conversion entirely.
+        const innerKey = await this.#blockResultCacheKey(
+          source.windowed.block,
+          snapshot,
+          visibility,
+          realTables,
+        );
+        const columnarKey =
+          innerKey === undefined
+            ? undefined
+            : `ctw|${JSON.stringify(source.windowed.windows)}|${innerKey}`;
+        if (columnarKey !== undefined) {
+          const hit = this.#cacheGet(columnarKey) as
+            { table: ColumnarTable; schema: SqlColumnSchema[] } | undefined;
+          if (hit !== undefined) {
+            typedSchemas.set(source.table, hit.schema);
+            inputs.set(source.table, hit.table);
+            continue;
+          }
+        }
         const { result: inner, schema: innerSchema } = await this.#executeBlockWithSchemaCached(
           source.windowed.block,
           snapshot,
@@ -1832,11 +1876,26 @@ export class MinnowDatabase {
           })),
         ];
         typedSchemas.set(source.table, schema);
-        inputs.set(source.table, derivedColumnarTable(source.table, windowed, schema));
+        const table = derivedColumnarTable(source.table, windowed, schema);
+        if (columnarKey !== undefined) {
+          this.#cachePut(columnarKey, { table, schema }, derivedTableRetainedBytes(table));
+        }
+        inputs.set(source.table, table);
         continue;
       }
       const derived = source.derived;
       if (derived === undefined) continue;
+      const derivedKey = await this.#blockResultCacheKey(derived, snapshot, visibility, realTables);
+      const columnarKey = derivedKey === undefined ? undefined : `ctd|${derivedKey}`;
+      if (columnarKey !== undefined) {
+        const hit = this.#cacheGet(columnarKey) as
+          { table: ColumnarTable; schema: SqlColumnSchema[] } | undefined;
+        if (hit !== undefined) {
+          typedSchemas.set(source.table, hit.schema);
+          inputs.set(source.table, hit.table);
+          continue;
+        }
+      }
       const { result, schema } = await this.#executeBlockWithSchemaCached(
         derived,
         snapshot,
@@ -1846,7 +1905,15 @@ export class MinnowDatabase {
         typedSchemas,
       );
       typedSchemas.set(source.table, schema);
-      inputs.set(source.table, derivedColumnarTable(source.table, result, schema));
+      const derivedTable = derivedColumnarTable(source.table, result, schema);
+      if (columnarKey !== undefined) {
+        this.#cachePut(
+          columnarKey,
+          { table: derivedTable, schema },
+          derivedTableRetainedBytes(derivedTable),
+        );
+      }
+      inputs.set(source.table, derivedTable);
     }
     const nameSchemas = new Map(
       sources.map((source) => [
@@ -2361,7 +2428,19 @@ export class MinnowDatabase {
     batch: ColumnarBatch,
     rowCount: number,
   ): Promise<void> {
-    const rowIds = await this.store.reserveRowIds(table.id, rowCount);
+    await this.#stageInsertSegment(transaction, table, batch, rowCount, "insert");
+  }
+
+  /** Encodes and stages one insert/upsert segment into an already-open transaction. */
+  async #stageInsertSegment(
+    transaction: DatabaseTransaction,
+    table: TableRecord,
+    batch: ColumnarBatch,
+    rowCount: number,
+    kind: "insert" | "upsert",
+    reservedRowIds?: RowIdRange,
+  ): Promise<string> {
+    const rowIds = reservedRowIds ?? (await this.store.reserveRowIds(table.id, rowCount));
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
@@ -2394,11 +2473,278 @@ export class MinnowDatabase {
       rowIdStart: rowIds.start,
       rowIdEndExclusive: rowIds.endExclusive,
       columnBlockIds,
-      kind: "insert",
+      kind,
+      ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
       level: 0,
       createdAt: this.#now().toISOString(),
     };
     await transaction.stageArtifacts(blockWrites, [segment]);
+    return segmentId;
+  }
+
+  /**
+   * Runs the callback against one shared write transaction: every staged mutation — across
+   * any number of keyed or keyless tables, with their AFTER triggers — publishes as one
+   * atomic commit. A concurrent commit surfaces as a WriteConflictError from the scope
+   * (nothing published); retry the whole scope. An error thrown by the callback aborts the
+   * scope with nothing published. A scope that stages nothing publishes nothing.
+   */
+  async write<T>(
+    action: (session: WriteSession) => Promise<T>,
+  ): Promise<{ result: T; version: number | null }> {
+    const transaction = await this.#transactions.begin();
+    let closed = false;
+    let staged = 0;
+    const open = (): void => {
+      if (closed) throw new Error("The write scope has ended");
+    };
+    const session: WriteSession = {
+      insertBatch: async (tableName, input) => {
+        open();
+        staged += 1;
+        return this.#sessionInsert(transaction, tableName, input, "insert");
+      },
+      upsertBatch: async (tableName, input) => {
+        open();
+        staged += 1;
+        return this.#sessionInsert(transaction, tableName, input, "upsert");
+      },
+      updateBatch: async (tableName, input) => {
+        open();
+        staged += 1;
+        return this.#sessionUpdate(transaction, tableName, input);
+      },
+      deleteBatch: async (tableName, input) => {
+        open();
+        staged += 1;
+        return this.#sessionDelete(transaction, tableName, input);
+      },
+    };
+    try {
+      const result = await action(session);
+      closed = true;
+      if (staged === 0) {
+        await transaction.abort();
+        return { result, version: await this.store.getCurrentManifestVersion() };
+      }
+      const manifest = await transaction.commit();
+      this.#notifyLiveCommit();
+      return { result, version: manifest.version };
+    } catch (error) {
+      closed = true;
+      await transaction.abort().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #sessionInsert(
+    transaction: DatabaseTransaction,
+    tableName: string,
+    input: InsertBatchInput,
+    kind: "insert" | "upsert",
+  ): Promise<StagedWriteResult> {
+    const table = await this.#findTable(tableName);
+    const { batch, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
+      const values = await this.store.reserveAutoIncrement(
+        table.id,
+        autoIncrement.column.id,
+        autoIncrement.missingIndexes.length,
+        autoIncrement.atLeast,
+      );
+      patchAutoIncrementValues(batch, autoIncrement, values);
+      const patched = batch.columns[autoIncrement.column.name] ?? [];
+      for (const rowIndex of autoIncrement.missingIndexes) {
+        validateValue(autoIncrement.column, patched[rowIndex] ?? null, rowIndex);
+      }
+    }
+    const keys = batchKeys(table, batch);
+    if (keys !== undefined) {
+      transaction.setUniqueKeyChanges({
+        tableId: table.id,
+        keyTokens: [...keys.keys()],
+        requireAbsent: kind === "insert",
+        ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
+      });
+    }
+    const rowIds = await this.store.reserveRowIds(table.id, rowCount);
+    if (kind === "insert") {
+      const ftsDeltas = buildFtsColumnDeltas(table, batch, rowIds.start);
+      if (ftsDeltas.length > 0) {
+        transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
+      }
+    }
+    const segmentId = await this.#stageInsertSegment(
+      transaction,
+      table,
+      batch,
+      rowCount,
+      kind,
+      rowIds,
+    );
+    if (kind === "insert") {
+      await this.#stageTriggerDerivedInserts(
+        transaction,
+        table,
+        "insert",
+        rowCount,
+        (source, column, rowIndex) =>
+          source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null,
+      );
+    }
+    return { tableName: table.name, segmentId, rowCount };
+  }
+
+  async #sessionUpdate(
+    transaction: DatabaseTransaction,
+    tableName: string,
+    input: UpdateBatchInput,
+  ): Promise<StagedWriteResult> {
+    const table = await this.#findTable(tableName);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) {
+      throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
+    }
+    const keys = validateUpdateBatch(table, keyColumn, input);
+    await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, keys);
+    const preImages = await this.#triggerPreImages(
+      table,
+      keyColumn,
+      input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
+      "update",
+    );
+    const changedColumns = Object.keys(input.changes).sort();
+    const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
+    const segmentId = this.#createId();
+    const columnBlockIds: Record<string, string[]> = {};
+    const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
+    for (const column of columns) {
+      const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
+      const blockIds: string[] = [];
+      for (
+        let start = 0, part = 0;
+        start < input.keys.length;
+        start += this.#rowsPerBlock, part += 1
+      ) {
+        const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, input.keys.length));
+        const bytes = await encodeBlock(asColumnInput(column.type, slice), this.#compression);
+        const blockId = [
+          "table",
+          table.id,
+          "segment",
+          segmentId,
+          "update-column",
+          column.id,
+          "part",
+          String(part).padStart(6, "0"),
+        ].join("/");
+        blockWrites.push({ id: blockId, bytes });
+        blockIds.push(blockId);
+      }
+      columnBlockIds[column.id] = blockIds;
+    }
+    await transaction.stageArtifacts(blockWrites, [
+      {
+        id: segmentId,
+        tableId: table.id,
+        transactionId: transaction.id,
+        rowCount: input.keys.length,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        columnBlockIds,
+        kind: "update",
+        keyColumnId: keyColumn.id,
+        level: 0,
+        createdAt: this.#now().toISOString(),
+      },
+    ]);
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "update",
+      input.keys.length,
+      (source, column, rowIndex) => {
+        if (source === "old") return preImages[rowIndex]?.[column] ?? null;
+        const changed = input.changes[column];
+        return changed === undefined
+          ? (preImages[rowIndex]?.[column] ?? null)
+          : (changed[rowIndex] ?? null);
+      },
+    );
+    return { tableName: table.name, segmentId, rowCount: input.keys.length };
+  }
+
+  async #sessionDelete(
+    transaction: DatabaseTransaction,
+    tableName: string,
+    input: DeleteBatchInput,
+  ): Promise<StagedWriteResult> {
+    const table = await this.#findTable(tableName);
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) {
+      throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
+    }
+    if (input.keys.length === 0) throw new TypeError("A delete batch needs at least one key");
+    const keys = new Map<string, Exclude<BatchValue, null>>();
+    input.keys.forEach((value, index) => {
+      validateValue(keyColumn, value, index);
+      if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
+      const token = keyToken(keyColumn.type, value);
+      if (keys.has(token))
+        throw new TypeError(`Duplicate key in delete batch: ${formatValue(value)}`);
+      keys.set(token, value);
+    });
+    transaction.setUniqueKeyChanges({
+      tableId: table.id,
+      keyTokens: [...keys.keys()],
+      requireAbsent: false,
+      remove: true,
+      ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
+    });
+    const preImages = await this.#triggerPreImages(table, keyColumn, [...keys.values()], "delete");
+    const values = [...keys.values()];
+    const segmentId = this.#createId();
+    const blockIds: string[] = [];
+    const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
+    for (let start = 0, part = 0; start < values.length; start += this.#rowsPerBlock, part += 1) {
+      const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, values.length));
+      const bytes = await encodeBlock(asColumnInput(keyColumn.type, slice), this.#compression);
+      const blockId = [
+        "table",
+        table.id,
+        "segment",
+        segmentId,
+        "delete-key",
+        keyColumn.id,
+        "part",
+        String(part).padStart(6, "0"),
+      ].join("/");
+      blockWrites.push({ id: blockId, bytes });
+      blockIds.push(blockId);
+    }
+    await transaction.stageBlocks(blockWrites);
+    await transaction.stageSegment({
+      id: segmentId,
+      tableId: table.id,
+      transactionId: transaction.id,
+      rowCount: keys.size,
+      rowIdStart: 0n,
+      rowIdEndExclusive: 0n,
+      columnBlockIds: { [keyColumn.id]: blockIds },
+      kind: "delete",
+      keyColumnId: keyColumn.id,
+      level: 0,
+      createdAt: this.#now().toISOString(),
+    });
+    await this.#stageTriggerDerivedInserts(
+      transaction,
+      table,
+      "delete",
+      values.length,
+      (source, column, rowIndex) =>
+        source === "old" ? (preImages[rowIndex]?.[column] ?? null) : null,
+    );
+    return { tableName: table.name, segmentId, rowCount: keys.size };
   }
 
   #notifyLiveCommit(): void {
@@ -9753,6 +10099,13 @@ function collectRealTableNames(plan: CompiledQuery): string[] {
 }
 
 /** Retained payload of a cached column vector: typed arrays plus dictionary characters. */
+/** Retained payload of a cached derived columnar table: its vectors plus fixed overhead. */
+function derivedTableRetainedBytes(table: ColumnarTable): number {
+  let bytes = 128;
+  for (const vector of table.columns.values()) bytes += columnVectorRetainedBytes(vector);
+  return bytes;
+}
+
 function columnVectorRetainedBytes(vector: ColumnVector): number {
   const base = vector.validity.byteLength;
   if (vector.kind === "string") {

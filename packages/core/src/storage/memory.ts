@@ -323,20 +323,22 @@ export class MemoryBlockStore implements BlockStore {
    */
   #applyFtsChanges(
     pendingSegments: readonly SegmentRecord[],
-    changes: FtsChanges | undefined,
+    changeList: readonly FtsChanges[] | undefined,
     version: number,
   ): void {
     const changedTableIds = new Set(pendingSegments.map((segment) => segment.tableId));
     for (const tableId of changedTableIds) {
       const record = this.#tables.get(tableId);
       if (record === undefined) continue;
-      const covered = new Set(
-        changes?.tableId === tableId ? changes.columns.map((column) => column.columnId) : [],
-      );
+      const forTable = (changeList ?? []).find((entry) => entry.tableId === tableId);
+      const covered = new Set(forTable?.columns.map((column) => column.columnId) ?? []);
       const invalidated = invalidateUncoveredFtsColumns(record, covered);
       if (invalidated !== undefined) this.#tables.set(record.id, invalidated);
     }
-    if (changes === undefined) return;
+    for (const changes of changeList ?? []) this.#applyFtsEntry(changes, version);
+  }
+
+  #applyFtsEntry(changes: FtsChanges, version: number): void {
     for (const column of changes.columns) {
       const key = `${changes.tableId}/${column.columnId}`;
       const deltas =
@@ -725,13 +727,26 @@ export class MemoryBlockStore implements BlockStore {
           }
           return segment;
         });
-        const uniqueKeyChanges = input.uniqueKeyChanges;
-        if (uniqueKeyChanges !== undefined) {
-          const existing = this.#uniqueKeys.get(uniqueKeyChanges.tableId) ?? new Set<string>();
-          if (uniqueKeyChanges.requireAbsent) {
-            const conflict = uniqueKeyChanges.keyTokens.find((token) => existing.has(token));
-            if (conflict !== undefined) {
-              throw new UniqueKeyConflictError(uniqueKeyChanges.tableId, conflict);
+        const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
+        {
+          // Entries apply in operation order over per-table working sets, so a scope that
+          // inserts the same key twice conflicts exactly like two separate commits would.
+          const working = new Map<string, Set<string>>();
+          for (const entry of uniqueKeyEntries) {
+            let tokens = working.get(entry.tableId);
+            if (tokens === undefined) {
+              tokens = new Set(this.#uniqueKeys.get(entry.tableId) ?? []);
+              working.set(entry.tableId, tokens);
+            }
+            for (const token of entry.keyTokens) {
+              if (entry.remove === true) {
+                tokens.delete(token);
+                continue;
+              }
+              if (entry.requireAbsent && tokens.has(token)) {
+                throw new UniqueKeyConflictError(entry.tableId, token);
+              }
+              tokens.add(token);
             }
           }
         }
@@ -758,13 +773,13 @@ export class MemoryBlockStore implements BlockStore {
             logicalOrder: segment.logicalOrder ?? manifest.version,
           });
         }
-        if (uniqueKeyChanges !== undefined) {
-          const existing = this.#uniqueKeys.get(uniqueKeyChanges.tableId) ?? new Set<string>();
-          uniqueKeyChanges.keyTokens.forEach((token) => {
-            if (uniqueKeyChanges.remove === true) existing.delete(token);
+        for (const entry of uniqueKeyEntries) {
+          const existing = this.#uniqueKeys.get(entry.tableId) ?? new Set<string>();
+          entry.keyTokens.forEach((token) => {
+            if (entry.remove === true) existing.delete(token);
             else existing.add(token);
           });
-          this.#uniqueKeys.set(uniqueKeyChanges.tableId, existing);
+          this.#uniqueKeys.set(entry.tableId, existing);
         }
         this.#applyFtsChanges(pendingSegments, input.ftsChanges, manifest.version);
         this.#catalogEpoch += 1;

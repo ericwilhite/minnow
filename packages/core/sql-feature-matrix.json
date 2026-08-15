@@ -533,7 +533,7 @@
       "status": "unsupported",
       "example": "BEGIN",
       "error": "Expected SELECT, found BEGIN",
-      "notes": "Transactions are a programmatic API."
+      "notes": "Transactions are a programmatic API: database.write(async tx => { ... }) stages any number of mutations across tables and publishes them as one atomic commit."
     },
     {
       "id": "where.parenthesized",

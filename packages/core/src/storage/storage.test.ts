@@ -1491,16 +1491,18 @@ for (const implementation of stores()) {
           changedTableIds: ["articles-id"],
           ...(withDelta
             ? {
-                ftsChanges: {
-                  tableId: "articles-id",
-                  columns: [
-                    {
-                      columnId: "title-id",
-                      postings: [{ term: "quick", rowIds: [BigInt(ordinal)], tf: [1] }],
-                      totalTokens: 1,
-                    },
-                  ],
-                },
+                ftsChanges: [
+                  {
+                    tableId: "articles-id",
+                    columns: [
+                      {
+                        columnId: "title-id",
+                        postings: [{ term: "quick", rowIds: [BigInt(ordinal)], tf: [1] }],
+                        totalTokens: 1,
+                      },
+                    ],
+                  },
+                ],
               }
             : {}),
           committedAt: timestamp,
@@ -3080,11 +3082,13 @@ for (const implementation of stores()) {
         transactionId: "first-transaction",
         expectedTransactionRevision: 0,
         expectedManifestVersion: null,
-        uniqueKeyChanges: {
-          tableId: "accounts",
-          keyTokens: ["string:ada@example.com"],
-          requireAbsent: true,
-        },
+        uniqueKeyChanges: [
+          {
+            tableId: "accounts",
+            keyTokens: ["string:ada@example.com"],
+            requireAbsent: true,
+          },
+        ],
         committedAt: timestamp,
       });
       expect(
@@ -3111,11 +3115,13 @@ for (const implementation of stores()) {
           transactionId: "second-transaction",
           expectedTransactionRevision: 0,
           expectedManifestVersion: 0,
-          uniqueKeyChanges: {
-            tableId: "accounts",
-            keyTokens: ["string:ada@example.com"],
-            requireAbsent: true,
-          },
+          uniqueKeyChanges: [
+            {
+              tableId: "accounts",
+              keyTokens: ["string:ada@example.com"],
+              requireAbsent: true,
+            },
+          ],
           committedAt: timestamp,
         }),
       ).rejects.toBeInstanceOf(UniqueKeyConflictError);
@@ -3361,13 +3367,15 @@ for (const storageMode of ["chunks-v1", "chunks-v2"] as const) {
         transactionId: id,
         expectedTransactionRevision: 0,
         expectedManifestVersion,
-        uniqueKeyChanges: {
-          tableId: "events",
-          storageMode,
-          keyTokens: tokens,
-          requireAbsent: !remove,
-          ...(remove ? { remove: true } : {}),
-        },
+        uniqueKeyChanges: [
+          {
+            tableId: "events",
+            storageMode,
+            keyTokens: tokens,
+            requireAbsent: !remove,
+            ...(remove ? { remove: true } : {}),
+          },
+        ],
         committedAt: timestamp,
       });
     };

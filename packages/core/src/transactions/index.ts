@@ -128,8 +128,8 @@ export class LeasedSnapshot extends Snapshot {
 
 export class DatabaseTransaction {
   #record: TransactionRecord;
-  #uniqueKeyChanges: UniqueKeyChanges | undefined;
-  #ftsChanges: FtsChanges | undefined;
+  readonly #uniqueKeyChanges: UniqueKeyChanges[] = [];
+  readonly #ftsChanges: FtsChanges[] = [];
   readonly #supersededBlockIds = new Set<string>();
   readonly #changedTableIds = new Set<string>();
   #logicallyUnchanged = false;
@@ -288,21 +288,27 @@ export class DatabaseTransaction {
     this.#logicallyUnchanged = true;
   }
 
+  /** Appends one operation's key changes; entries commit in operation order. */
   setUniqueKeyChanges(changes: UniqueKeyChanges): void {
     this.#assertActive();
-    this.#uniqueKeyChanges = {
+    this.#uniqueKeyChanges.push({
       tableId: changes.tableId,
       keyTokens: [...new Set(changes.keyTokens)].sort(),
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
       ...(changes.storageMode === undefined ? {} : { storageMode: changes.storageMode }),
-    };
+    });
   }
 
-  /** Attaches the commit's full-text index deltas; applied atomically with the publish. */
+  /** Attaches one table's full-text deltas; applied atomically with the publish. */
   setFtsChanges(changes: FtsChanges): void {
     this.#assertActive();
-    this.#ftsChanges = changes;
+    if (this.#ftsChanges.some((entry) => entry.tableId === changes.tableId)) {
+      throw new Error(
+        `A transaction already carries full-text deltas for table: ${changes.tableId}`,
+      );
+    }
+    this.#ftsChanges.push(changes);
   }
 
   supersedeBlocks(blockIds: readonly string[]): void {
@@ -330,10 +336,10 @@ export class DatabaseTransaction {
         ...(this.#supersededBlockIds.size === 0
           ? {}
           : { removedBlockIds: [...this.#supersededBlockIds] }),
-        ...(this.#uniqueKeyChanges === undefined
+        ...(this.#uniqueKeyChanges.length === 0
           ? {}
           : { uniqueKeyChanges: this.#uniqueKeyChanges }),
-        ...(this.#ftsChanges === undefined ? {} : { ftsChanges: this.#ftsChanges }),
+        ...(this.#ftsChanges.length === 0 ? {} : { ftsChanges: this.#ftsChanges }),
         committedAt,
       });
       this.#record = {

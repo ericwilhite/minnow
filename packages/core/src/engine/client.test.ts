@@ -213,6 +213,33 @@ describe("MinnowDatabaseClient", () => {
     expect(rows).toEqual([{ name: "Grace" }, { name: "Ada" }]);
   });
 
+  it("runs an atomic write scope across the channel", async () => {
+    const client = connect();
+    await createPeopleTable(client);
+    await client.insert("people", { id: 1, name: "Ada", joined: new Date() });
+    const { result, version } = await client.write(async (tx) => {
+      const staged = await tx.insertBatch("people", {
+        columns: { id: [2], name: ["Grace"], joined: [new Date()] },
+      });
+      await tx.updateBatch("people", { keys: [1], changes: { name: ["Countess"] } });
+      return staged.rowCount;
+    });
+    expect(result).toBe(1);
+    expect(version).not.toBeNull();
+    expect((await client.query("SELECT name FROM people ORDER BY name")).rows).toEqual([
+      { name: "Countess" },
+      { name: "Grace" },
+    ]);
+    // A failing scope publishes nothing.
+    await expect(
+      client.write(async (tx) => {
+        await tx.deleteBatch("people", { keys: [2] });
+        throw new Error("abort it");
+      }),
+    ).rejects.toThrow("abort it");
+    expect((await client.query("SELECT COUNT(*) AS n FROM people")).rows).toEqual([{ n: 2 }]);
+  });
+
   it("pins a snapshot scope across the channel while writes continue", async () => {
     const client = connect();
     await createPeopleTable(client);

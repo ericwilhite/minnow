@@ -20,6 +20,7 @@ import { toColumnarBatch, type BatchRow, type InsertBatchInput } from "./batch.j
 import type {
   BatchValue,
   BufferPoolStats,
+  StagedWriteResult,
   BufferedFlushResult,
   BufferedWriterOptions,
   CancelCompactionJobResult,
@@ -334,6 +335,40 @@ export class MinnowDatabaseClient {
     }
   }
 
+  /**
+   * Runs the callback against one worker-side write transaction, exactly like the in-worker
+   * `MinnowDatabase.write()`: every staged mutation crosses the channel into the shared
+   * transaction and publishes as one atomic commit when the callback returns; an error
+   * aborts the scope with nothing published.
+   */
+  async write<T>(
+    action: (session: ClientWriteSession) => Promise<T>,
+  ): Promise<{ result: T; version: number | null }> {
+    const opened = (await this.#call("writeOpen", [])) as { handleId: string };
+    const stage = (
+      op: "insertBatch" | "upsertBatch" | "updateBatch" | "deleteBatch",
+      tableName: string,
+      input: unknown,
+    ): Promise<StagedWriteResult> =>
+      this._invoke(opened.handleId, "stage", [op, tableName, input]) as Promise<StagedWriteResult>;
+    const session: ClientWriteSession = {
+      insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
+      upsertBatch: (tableName, input) => stage("upsertBatch", tableName, input),
+      updateBatch: (tableName, input) => stage("updateBatch", tableName, input),
+      deleteBatch: (tableName, input) => stage("deleteBatch", tableName, input),
+    };
+    try {
+      const result = await action(session);
+      const committed = (await this._invoke(opened.handleId, "commit", [])) as {
+        version: number | null;
+      };
+      return { result, version: committed.version };
+    } catch (error) {
+      await this._invoke(opened.handleId, "abort", []).catch(() => undefined);
+      throw error;
+    }
+  }
+
   /** The worker-side buffer pool's byte budget, residency, and lifetime counters. */
   async bufferPoolStats(): Promise<BufferPoolStats> {
     return (await this.#call("bufferPoolStats", [])) as BufferPoolStats;
@@ -520,6 +555,14 @@ export class MinnowDatabaseClient {
  * The scope handed to the client `snapshot()`: queries pinned to one manifest version,
  * consistent with each other for the lifetime of the callback.
  */
+/** The scope handed to the client `write()`; mirrors the in-worker WriteSession. */
+export interface ClientWriteSession {
+  insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
+  upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
+  updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
+  deleteBatch(tableName: string, input: DeleteBatchInput): Promise<StagedWriteResult>;
+}
+
 export interface ClientSnapshotSession {
   /** The pinned manifest version; null only on a database with no commits yet. */
   readonly version: number | null;
