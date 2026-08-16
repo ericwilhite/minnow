@@ -27,7 +27,7 @@ export function validateCreatePayload(value: unknown): DatasetCreatePayload {
     throw new Error("Scale must be between 0.1 and 100");
   }
   const { compression, durability } = payload;
-  if (compression !== "raw" && compression !== "rle" && compression !== "gzip") {
+  if (compression !== "raw" && compression !== "gzip") {
     throw new Error("Invalid compression");
   }
   if (

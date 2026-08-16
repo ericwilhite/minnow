@@ -1,7 +1,7 @@
 export const logicalTypes = ["boolean", "number", "string", "datetime"] as const;
 
 export type LogicalType = (typeof logicalTypes)[number];
-export type Compression = "raw" | "rle" | "gzip";
+export type Compression = "raw" | "gzip";
 
 export interface ColumnValues {
   boolean: boolean;

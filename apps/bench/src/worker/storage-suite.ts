@@ -1563,7 +1563,7 @@ export function validateConfig(value: unknown): BenchmarkConfig {
     throw new Error("Rows must be between 1 and 5,000,000");
   }
   if (!durabilityModes.includes(config.durability as never)) throw new Error("Invalid durability");
-  if (!["raw", "rle", "gzip"].includes(String(config.compression))) {
+  if (!["raw", "gzip"].includes(String(config.compression))) {
     throw new Error("Invalid compression");
   }
   if (

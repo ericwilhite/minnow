@@ -365,7 +365,7 @@ storageRun.addEventListener("click", () => {
 storageMatrix.addEventListener("click", () => {
   const base = readStorageConfig();
   const blockSizes = [262_144, 524_288, 1_048_576, 2_097_152, 4_194_304];
-  const compressions: Array<BenchmarkConfig["compression"]> = ["raw", "rle", "gzip"];
+  const compressions: Array<BenchmarkConfig["compression"]> = ["raw", "gzip"];
   beginBatch(
     compressions.flatMap((compression) =>
       blockSizes.map((targetBlockBytes) => ({ ...base, compression, targetBlockBytes })),

@@ -16,7 +16,7 @@ export const engineNames: Record<EngineId, string> = {
   pglite: "PGlite",
 };
 
-export type CompressionCodec = "raw" | "rle" | "gzip";
+export type CompressionCodec = "raw" | "gzip";
 
 /** One engine's materialized copy of a dataset. */
 export interface EngineMaterialization {

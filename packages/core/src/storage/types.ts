@@ -348,7 +348,7 @@ export interface RechunkCompactionOutputWindow {
   readonly rowCount: number;
 }
 
-export const compactionOutputCompressions = ["raw", "rle", "gzip"] as const;
+export const compactionOutputCompressions = ["raw", "gzip"] as const;
 export type CompactionOutputCompression = (typeof compactionOutputCompressions)[number];
 
 export interface RechunkCompactionRewritePlan {

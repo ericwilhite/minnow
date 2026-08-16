@@ -33,7 +33,7 @@ export const rawCodec: CompressionCodec = {
 
 function assertInputLength(inputLength: number, codec: Compression): void {
   if (!Number.isSafeInteger(inputLength) || inputLength < 0) {
-    throw new RangeError(`Invalid ${codec === "rle" ? "RLE" : codec} input length`);
+    throw new RangeError(`Invalid ${codec} input length`);
   }
 }
 
@@ -45,17 +45,9 @@ function checkedLinearBound(
 ): number {
   assertInputLength(inputLength, codec);
   if (inputLength > Math.floor((Number.MAX_SAFE_INTEGER - overhead) / multiplier)) {
-    throw new RangeError(`Invalid ${codec === "rle" ? "RLE" : codec} input length`);
+    throw new RangeError(`Invalid ${codec} input length`);
   }
   return inputLength * multiplier + overhead;
-}
-
-export function maximumRleCompressedLength(inputLength: number): number {
-  return checkedLinearBound(inputLength, 2, 0, "rle");
-}
-
-export function rleCompressionMemoryBound(inputLength: number): CompressionMemoryBound {
-  return { maximumOutputBytes: maximumRleCompressedLength(inputLength), scratchBytes: 0 };
 }
 
 export function getCompressionMemoryBound(
@@ -66,8 +58,6 @@ export function getCompressionMemoryBound(
     case "raw":
       assertInputLength(inputLength, compression);
       return { maximumOutputBytes: inputLength, scratchBytes: 0 };
-    case "rle":
-      return rleCompressionMemoryBound(inputLength);
     case "gzip": {
       // Native gzip encoders stay well below two bytes per input byte. The extra envelope keeps
       // small and empty streams bounded too. `transform` retains an input copy and its output
@@ -78,52 +68,6 @@ export function getCompressionMemoryBound(
     }
   }
 }
-
-function rleCompressedLength(bytes: Uint8Array): number {
-  let outputLength = 0;
-  for (let offset = 0; offset < bytes.length;) {
-    const value = bytes[offset];
-    if (value === undefined) break;
-    let count = 1;
-    while (count < 255 && bytes[offset + count] === value) count += 1;
-    outputLength += 2;
-    offset += count;
-  }
-  return outputLength;
-}
-
-export const rleCodec: CompressionCodec = {
-  id: "rle",
-  compress(bytes) {
-    const output = new Uint8Array(rleCompressedLength(bytes));
-    let outputOffset = 0;
-    for (let offset = 0; offset < bytes.length;) {
-      const value = bytes[offset];
-      if (value === undefined) break;
-      let count = 1;
-      while (count < 255 && bytes[offset + count] === value) count += 1;
-      output[outputOffset] = count;
-      output[outputOffset + 1] = value;
-      outputOffset += 2;
-      offset += count;
-    }
-    return Promise.resolve(output);
-  },
-  decompress(bytes, expectedLength) {
-    if (bytes.length % 2 !== 0) throw new Error("Invalid RLE payload");
-    const output = new Uint8Array(expectedLength);
-    let offset = 0;
-    for (let index = 0; index < bytes.length; index += 2) {
-      const count = bytes[index] ?? 0;
-      const value = bytes[index + 1] ?? 0;
-      if (count === 0 || offset + count > expectedLength) throw new Error("Invalid RLE run");
-      output.fill(value, offset, offset + count);
-      offset += count;
-    }
-    if (offset !== expectedLength) throw new Error("RLE payload length mismatch");
-    return Promise.resolve(output);
-  },
-};
 
 async function transform(
   bytes: Uint8Array,
@@ -192,8 +136,6 @@ export function getCodec(id: Compression): CompressionCodec {
   switch (id) {
     case "raw":
       return rawCodec;
-    case "rle":
-      return rleCodec;
     case "gzip":
       return gzipCodec;
   }

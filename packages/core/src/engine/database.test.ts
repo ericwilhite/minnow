@@ -2344,7 +2344,7 @@ it("physically rechunks every simple type on shared bitmap-aligned row windows",
 
   const result = await database.compactTable("readings", {
     targetBlockBytes: 75,
-    outputCompression: "rle",
+    outputCompression: "raw",
     maxBlocksPerStep: 1,
   });
 
@@ -2355,7 +2355,7 @@ it("physically rechunks every simple type on shared bitmap-aligned row windows",
     outputBlockCount: 8,
     rowCount: 17,
     targetBlockBytes: 75,
-    outputCompression: "rle",
+    outputCompression: "raw",
   });
   expect(await database.readTable("readings")).toEqual(expected);
   expect(await database.readTable("readings", first.version)).toEqual(expected.slice(0, 5));
@@ -2382,7 +2382,7 @@ it("physically rechunks every simple type on shared bitmap-aligned row windows",
       if (bytes === undefined) throw new Error(`Expected compaction block ${blockId}`);
       const description = inspectBlock(bytes);
       outputTypes.add(description.type);
-      expect(description.compression).toBe("rle");
+      expect(description.compression).toBe("raw");
       expect(description.rowCount).toBe(job.rewritePlan.outputs[outputIndex]?.rowCount);
     }
   }
@@ -2424,7 +2424,7 @@ it("prepares append and compacted snapshots directly into stable vectors", async
     const before = await session.query(readingsSql);
     await database.compactTable("vector_readings", {
       targetBlockBytes: 64,
-      outputCompression: "rle",
+      outputCompression: "raw",
     });
     // The pinned session keeps observing the pre-compaction snapshot mid-scope.
     expect(await session.query(readingsSql)).toEqual(before);
@@ -2468,7 +2468,7 @@ it("prepares append and compacted snapshots directly into stable vectors", async
 
 it("replays keyed mutations into typed vectors without changing historical results", async () => {
   const store = new MemoryBlockStore();
-  const database = new MinnowDatabase(store, { compression: "rle", rowsPerBlock: 1 });
+  const database = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 1 });
   await database.createTable({
     name: "vector_accounts",
     uniqueKey: "email",
@@ -2609,7 +2609,7 @@ it("refines skewed strings to exact target-sized windows before persisting the p
   store.close();
 });
 
-for (const outputCompression of ["raw", "rle", "gzip"] as const) {
+for (const outputCompression of ["raw", "gzip"] as const) {
   it(`rewrites mixed source codecs to persisted ${outputCompression} output after reopen`, async () => {
     const store = new MemoryBlockStore();
     const raw = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 64 });
@@ -2623,8 +2623,8 @@ for (const outputCompression of ["raw", "rle", "gzip"] as const) {
     const rawInsert = await raw.insertBatch("events", {
       columns: { value: [1, 2], label: ["a", null] },
     });
-    const rle = new MinnowDatabase(store, { compression: "rle", rowsPerBlock: 64 });
-    const rleInsert = await rle.insertBatch("events", {
+    const secondRaw = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 64 });
+    const secondRawInsert = await secondRaw.insertBatch("events", {
       columns: { value: [null, 4], label: ["b", "c"] },
     });
     const gzip = new MinnowDatabase(store, { compression: "gzip", rowsPerBlock: 64 });
@@ -2642,7 +2642,7 @@ for (const outputCompression of ["raw", "rle", "gzip"] as const) {
 
     for (const [segmentId, compression] of [
       [rawInsert.segmentId, "raw"],
-      [rleInsert.segmentId, "rle"],
+      [secondRawInsert.segmentId, "raw"],
       [gzipInsert.segmentId, "gzip"],
     ] as const) {
       const segment = await store.getSegment(segmentId);
@@ -2798,7 +2798,7 @@ it("resumes with persisted rewrite settings after an IndexedDB close and reopen"
   store.close();
 
   store = await IndexedDbBlockStore.open({ name, indexedDB });
-  const reopened = new MinnowDatabase(store, { compression: "rle", rowsPerBlock: 2048 });
+  const reopened = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 2048 });
   while (progress.result === null) {
     progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
   }
@@ -2868,9 +2868,9 @@ it("rejects a rechunk target whose codec worst case exceeds the block format lim
   await expect(
     database.compactTable("events", {
       targetBlockBytes: 32 * 1024 * 1024 + 1,
-      outputCompression: "rle",
+      outputCompression: "gzip",
     }),
-  ).rejects.toThrow("Compaction target block bytes exceed the rle worst-case format limit");
+  ).rejects.toThrow("Compaction target block bytes exceed the gzip worst-case format limit");
   expect(await store.listCompactionJobs()).toEqual([]);
   store.close();
 });
@@ -3914,14 +3914,14 @@ for (const implementation of implementations()) {
     const second = await fixture.database.compactTable(tableName, {
       maxBlocksPerStep: 1,
       targetBlockBytes: 64,
-      outputCompression: "rle",
+      outputCompression: "raw",
     });
     if (second.jobId === undefined) throw new Error("Expected a second mutation compaction");
     expect(second).toMatchObject({
       compacted: true,
       sourceSegmentCount: 4,
       rowCount: secondExpectedRows.length,
-      outputCompression: "rle",
+      outputCompression: "raw",
     });
     await assertPublishedMutationMerge(
       store,
@@ -4022,7 +4022,7 @@ for (const implementation of recoveryImplementations()) {
     });
 
     store = await harness.reopen();
-    const reopened = new MinnowDatabase(store, { compression: "rle", rowsPerBlock: 1 });
+    const reopened = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 1 });
     while (progress.result === null) {
       progress = await reopened.resumeCompactionJob(jobId, { maxBlocks: 1 });
     }

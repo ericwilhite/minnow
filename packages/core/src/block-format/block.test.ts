@@ -18,7 +18,7 @@ const columns: ColumnInput[] = [
   },
 ];
 
-for (const compression of ["raw", "rle", "gzip"] satisfies Compression[]) {
+for (const compression of ["raw", "gzip"] satisfies Compression[]) {
   describe(compression, () => {
     for (const column of columns) {
       it(`round trips ${column.type}`, async () => {
@@ -66,14 +66,11 @@ it("bounds the complete stored block including its exact metadata envelope", asy
   expect(maximumPhysicalBlockByteLength(encodedByteLength, metadata, "raw")).toBe(
     40 + metadataByteLength + encodedByteLength,
   );
-  expect(maximumPhysicalBlockByteLength(encodedByteLength, metadata, "rle")).toBe(
-    40 + metadataByteLength + encodedByteLength * 2,
-  );
   expect(maximumPhysicalBlockByteLength(encodedByteLength, metadata, "gzip")).toBe(
     40 + metadataByteLength + encodedByteLength * 2 + 64,
   );
 
-  for (const compression of ["raw", "rle", "gzip"] satisfies Compression[]) {
+  for (const compression of ["raw", "gzip"] satisfies Compression[]) {
     const block = await encodeBlock(input, compression);
     expect(block.byteLength).toBeLessThanOrEqual(
       maximumPhysicalBlockByteLength(

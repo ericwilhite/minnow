@@ -10162,8 +10162,8 @@ function clearBitmapValue(bitmap: Uint8Array, index: number): void {
 }
 
 function validateCompression(value: unknown, name: string): Compression {
-  if (value !== "raw" && value !== "rle" && value !== "gzip") {
-    throw new TypeError(`${name} must be raw, rle, or gzip`);
+  if (value !== "raw" && value !== "gzip") {
+    throw new TypeError(`${name} must be raw or gzip`);
   }
   return value;
 }

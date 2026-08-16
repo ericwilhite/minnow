@@ -43,7 +43,10 @@ const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 const typeIds: Record<LogicalType, number> = { boolean: 1, number: 2, string: 3, datetime: 4 };
 const typesById = new Map(Object.entries(typeIds).map(([type, id]) => [id, type as LogicalType]));
-const codecIds: Record<Compression, number> = { raw: 0, rle: 1, gzip: 2 };
+// Codec 1 was run-length encoding, removed because it was both slower and larger than raw on
+// every column shape measured. The ids of the survivors do not move: renumbering would make an
+// old block decode as the wrong codec instead of failing.
+const codecIds: Record<Compression, number> = { raw: 0, gzip: 2 };
 const codecsById = new Map(
   Object.entries(codecIds).map(([codec, id]) => [id, codec as Compression]),
 );
@@ -208,8 +211,15 @@ export function inspectBlock(bytes: Uint8Array): BlockDescription {
   const type = typesById.get(view.getUint8(12));
   if (type === undefined) throw new Error("Unknown logical type");
   if (view.getUint8(13) !== typeIds[type]) throw new Error("Unsupported physical encoding");
-  const compression = codecsById.get(view.getUint8(14));
-  if (compression === undefined) throw new Error("Unknown compression codec");
+  const codecId = view.getUint8(14);
+  const compression = codecsById.get(codecId);
+  if (compression === undefined) {
+    throw new Error(
+      codecId === 1
+        ? "Block uses the removed RLE codec; rewrite it as raw or gzip with an older build"
+        : "Unknown compression codec",
+    );
+  }
   if (view.getUint8(15) !== 0) throw new Error("Unsupported mandatory block flags");
   const rowCount = view.getUint32(16, true);
   const nullCount = view.getUint32(20, true);

@@ -152,7 +152,7 @@ function isDatasetRecord(value: unknown): value is DatasetRecord {
     typeof record.totalRows === "number" &&
     typeof record.tableRows === "object" &&
     record.tableRows !== null &&
-    ["raw", "rle", "gzip"].includes(String(record.compression)) &&
+    ["raw", "gzip"].includes(String(record.compression)) &&
     typeof record.targetBlockBytes === "number" &&
     ["relaxed", "strict"].includes(String(record.durability)) &&
     typeof record.engines === "object" &&

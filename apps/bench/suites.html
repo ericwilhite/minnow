@@ -79,7 +79,7 @@
         MinnowDatabase only: writes and reads back the full dataset through the block store,
         verifies every value, probes transaction conflicts and recovery, benchmarks the write API,
         and runs the reference queries with JavaScript baselines. Uses throwaway databases; nothing
-        is retained. “Full matrix” runs raw/rle/gzip across five block sizes.
+        is retained. “Full matrix” runs raw/gzip across five block sizes.
       </p>
       <fieldset>
         <div>
@@ -96,7 +96,6 @@
           <label for="storage-compression">Compression</label>
           <select id="storage-compression">
             <option value="raw">raw</option>
-            <option value="rle">rle</option>
             <option value="gzip" selected>gzip</option>
           </select>
         </div>

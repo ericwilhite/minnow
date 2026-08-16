@@ -55,7 +55,7 @@ it("rejects unknown physical logical types at runtime", () => {
   ).toThrow("Unknown logical type: binary");
 });
 
-for (const compression of ["raw", "rle", "gzip"] satisfies Compression[]) {
+for (const compression of ["raw", "gzip"] satisfies Compression[]) {
   describe(`${compression} physical blocks`, () => {
     for (const column of columns) {
       it(`round trips ${column.type} without materializing rows`, async () => {
