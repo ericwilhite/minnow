@@ -62,6 +62,7 @@ export default tseslint.config(
       "apps/site/tests/serve-dist.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
       "packages/core/src/engine/sql-mutation-conformance.test.ts",
+      "packages/core/src/engine/scan-kernels.test.ts",
       "scripts/*.mts",
     ],
     rules: { "no-restricted-imports": "off" },

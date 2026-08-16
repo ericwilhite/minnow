@@ -45,6 +45,8 @@ import {
 import { compareSqlStrings, defineSqlResultProperty } from "./sql-semantics.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
+/** Above this, locating each IN member separately costs more than scanning between them. */
+const MAX_SPLIT_LIST_MEMBERS = 64;
 /**
  * Upper bound on the direct-address slot space for compound dictionary-code grouping: 65,536
  * slots reserve 512 KiB of references, small against the default budget while covering typical
@@ -256,6 +258,17 @@ interface BoundPredicate {
   readonly primitive?: PrimitiveComparison;
   /** Unboxed membership of a bare numeric/datetime column in a literal list. */
   readonly primitiveIn?: PrimitiveInList;
+  /** OR of AND-groups, each group's predicates compiled like any other. */
+  readonly disjunction?: BoundDisjunction;
+}
+
+/**
+ * A disjunction in disjunctive normal form: every branch is a conjunction of predicates that
+ * compile their own kernels. Only present when every leaf is a plain condition -- anything else
+ * keeps the generic row-at-a-time evaluator for the whole predicate.
+ */
+interface BoundDisjunction {
+  readonly branches: ReadonlyArray<readonly BoundPredicate[]>;
 }
 
 interface PrimitiveComparison {
@@ -273,6 +286,8 @@ interface PrimitiveInList {
   /** Smallest and largest member: the range an ascending column can restrict the scan to. */
   readonly minimum: number;
   readonly maximum: number;
+  /** True for NOT IN, which keeps exactly the non-null rows the list does not contain. */
+  readonly negated: boolean;
 }
 
 interface DictionaryEquality {
@@ -598,6 +613,71 @@ function columnarTablePayloadBytes(table: ColumnarTable): number {
   return total;
 }
 
+/** One conjunction of a disjunction: plain conditions only, or undefined if any leaf is not. */
+function conjunctionLeaves(
+  expression: Expression,
+  output: Array<{
+    left: Expression;
+    operator: PredicateOperator;
+    right: Expression;
+    escape?: string;
+  }>,
+): boolean {
+  if (expression.kind === "logical" && expression.operator === "and") {
+    return (
+      conjunctionLeaves(expression.left, output) && conjunctionLeaves(expression.right, output)
+    );
+  }
+  if (expression.kind !== "condition") return false;
+  // A quantified comparison or a subquery leaf carries evaluation rules of its own; leaving it
+  // to the generic evaluator is always correct, just slower.
+  if (expression.left.kind === "subquery" || expression.right.kind === "subquery") return false;
+  output.push({
+    left: expression.left,
+    operator: expression.operator,
+    right: expression.right,
+    ...(expression.escape === undefined ? {} : { escape: expression.escape }),
+  });
+  return true;
+}
+
+/**
+ * Reads a predicate as an OR of AND-groups. Only a bare boolean expression -- one the parser
+ * wrapped in IS TRUE -- can be a disjunction, and every leaf must be a plain condition, so the
+ * branches evaluate under the same three-valued rules the whole expression did: a branch is
+ * taken only where it is true, and false and unknown are both simply not taken.
+ */
+function disjunctiveNormalForm(predicate: {
+  left: Expression;
+  operator: PredicateOperator;
+  right: Expression;
+}):
+  | Array<
+      Array<{ left: Expression; operator: PredicateOperator; right: Expression; escape?: string }>
+    >
+  | undefined {
+  if (predicate.operator !== "IS TRUE") return undefined;
+  if (predicate.left.kind !== "logical" || predicate.left.operator !== "or") return undefined;
+  const branches: Array<
+    Array<{ left: Expression; operator: PredicateOperator; right: Expression; escape?: string }>
+  > = [];
+  const visit = (node: Expression): boolean => {
+    if (node.kind === "logical" && node.operator === "or") {
+      return visit(node.left) && visit(node.right);
+    }
+    const group: Array<{
+      left: Expression;
+      operator: PredicateOperator;
+      right: Expression;
+      escape?: string;
+    }> = [];
+    if (!conjunctionLeaves(node, group)) return false;
+    branches.push(group);
+    return true;
+  };
+  return visit(predicate.left) && branches.length > 1 ? branches : undefined;
+}
+
 function bindPlan(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
@@ -634,7 +714,12 @@ function bindPlan(
   const groupIndexBySignature = new Map(
     groupBy.map((expression, index) => [expression.signature, index]),
   );
-  const predicates = plan.predicates.map((predicate) => {
+  const bindPredicate = (predicate: {
+    left: Expression;
+    operator: PredicateOperator;
+    right: Expression;
+    escape?: string;
+  }): BoundPredicate => {
     const bound: BoundPredicate = {
       left: bind(predicate.left),
       operator: predicate.operator,
@@ -649,6 +734,17 @@ function bindPlan(
     if (primitive !== undefined) return { ...bound, primitive };
     const primitiveIn = detectPrimitiveInList(bound);
     return primitiveIn === undefined ? bound : { ...bound, primitiveIn };
+  };
+  const predicates = plan.predicates.map((predicate) => {
+    const bound = bindPredicate(predicate);
+    if (bound.primitive !== undefined || bound.primitiveIn !== undefined) return bound;
+    if (bound.dictionaryEquality !== undefined || bound.dictionaryLike !== undefined) return bound;
+    const branches = disjunctiveNormalForm(predicate);
+    if (branches === undefined) return bound;
+    return {
+      ...bound,
+      disjunction: { branches: branches.map((group) => group.map(bindPredicate)) },
+    };
   });
   const having = plan.having.map((predicate) => ({
     left: bind(predicate.left),
@@ -1379,10 +1475,14 @@ function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryRes
   const output = new ResultSink(plan, memory, true);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
   const narrowed = ascendingScanRange(plan, 0, scanRows);
-  const scanEnd = narrowed?.end ?? scanRows;
-  for (let start = narrowed?.begin ?? 0; start < scanEnd; start += DEFAULT_BATCH_ROWS) {
-    const length = Math.min(DEFAULT_BATCH_ROWS, scanEnd - start);
-    if (runScanBatch(plan, start, length, groups, output, memory)) break;
+  const ranges = narrowed?.ranges ?? [
+    { begin: narrowed?.begin ?? 0, end: narrowed?.end ?? scanRows },
+  ];
+  scan: for (const range of ranges) {
+    for (let start = range.begin; start < range.end; start += DEFAULT_BATCH_ROWS) {
+      const length = Math.min(DEFAULT_BATCH_ROWS, range.end - start);
+      if (runScanBatch(plan, start, length, groups, output, memory)) break scan;
+    }
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
@@ -1422,12 +1522,16 @@ async function executeBoundPlanAsync(
     // are forward-only, so re-entering with a start part-way into a resident window would ask
     // one to serve ground it has already passed.
     let stopped = false;
-    for (let row = narrowed.begin; row < narrowed.end; row += DEFAULT_BATCH_ROWS) {
-      const rows = Math.min(DEFAULT_BATCH_ROWS, narrowed.end - row);
-      if (runScanBatch(plan, row, rows, groups, output, memory)) {
-        stopped = true;
-        break;
+    const ranges = narrowed.ranges ?? [{ begin: narrowed.begin, end: narrowed.end }];
+    for (const range of ranges) {
+      for (let row = range.begin; row < range.end; row += DEFAULT_BATCH_ROWS) {
+        const rows = Math.min(DEFAULT_BATCH_ROWS, range.end - row);
+        if (runScanBatch(plan, row, rows, groups, output, memory)) {
+          stopped = true;
+          break;
+        }
       }
+      if (stopped) break;
     }
     if (stopped) break;
     start = windowEnd;
@@ -2236,7 +2340,7 @@ function ascendingScanRange(
   plan: BoundPlan,
   begin: number,
   end: number,
-): { begin: number; end: number } | undefined {
+): { begin: number; end: number; ranges?: Array<{ begin: number; end: number }> } | undefined {
   if (end - begin < DEFAULT_BATCH_ROWS) return undefined;
   let low = begin;
   let high = end;
@@ -2254,6 +2358,9 @@ function ascendingScanRange(
     if (!windowIsAscending(vector)) continue;
     const values = vector.values;
     if (!("operator" in primitive)) {
+      // NOT IN is satisfied by exactly the rows outside the member span, so the span narrows
+      // nothing -- restricting to it would drop every row the predicate keeps.
+      if (primitive.negated) continue;
       // A literal list restricts the scan to the span between its smallest and largest member;
       // the membership test still runs, and decides the rows inside that span.
       low = lowerBoundSlot(values, slotBegin, slotEnd, primitive.minimum) + windowStart;
@@ -2289,7 +2396,58 @@ function ascendingScanRange(
     narrowed = true;
     if (low >= high) return { begin: low, end: low };
   }
+  if (low >= high) return narrowed ? { begin: low, end: low } : undefined;
+  const split = splitByListMembers(plan, low, high);
+  if (split !== undefined) return { begin: low, end: high, ranges: split };
   return narrowed ? { begin: low, end: high } : undefined;
+}
+
+/**
+ * The span between a list's smallest and largest member is only useful when the members sit
+ * close together; for keys spread across the table it is the whole table. On an ascending
+ * column each member can instead be located on its own, turning `key IN (5 scattered values)`
+ * into five binary searches over five tiny ranges rather than one scan of everything between
+ * them. Returns undefined when no list qualifies, or when the split would not pay for itself.
+ */
+function splitByListMembers(
+  plan: BoundPlan,
+  low: number,
+  high: number,
+): Array<{ begin: number; end: number }> | undefined {
+  for (const predicate of plan.predicates) {
+    const list = predicate.primitiveIn;
+    if (list === undefined || list.negated || list.source !== plan.scanSource) continue;
+    // Each member costs a binary search and yields a batch of its own, so the split only pays
+    // while the member count stays far below the rows it is skipping.
+    if (list.members.size > MAX_SPLIT_LIST_MEMBERS) continue;
+    const vector = list.vector;
+    const windowStart = vector.window?.start ?? 0;
+    const slotBegin = low - windowStart;
+    const slotEnd = high - windowStart;
+    if (slotBegin < 0 || slotEnd > vector.values.length) continue;
+    if (!windowIsAscending(vector)) continue;
+    const values = vector.values;
+    const ranges: Array<{ begin: number; end: number }> = [];
+    // Ascending members keep the ranges ascending, which the forward-only streamed scan needs.
+    for (const member of [...list.members].sort((left, right) => left - right)) {
+      const first = lowerBoundSlot(values, slotBegin, slotEnd, member);
+      const last = upperBoundSlot(values, first, slotEnd, member);
+      if (first >= last) continue;
+      const previous = ranges[ranges.length - 1];
+      // Adjacent members land in adjacent runs; merging them keeps the batch count down.
+      if (previous !== undefined && previous.end >= first + windowStart) {
+        previous.end = last + windowStart;
+        continue;
+      }
+      ranges.push({ begin: first + windowStart, end: last + windowStart });
+    }
+    let covered = 0;
+    for (const range of ranges) covered += range.end - range.begin;
+    // A split that still visits most of the span saves nothing and costs extra batches.
+    if (covered * 2 > high - low) continue;
+    return ranges;
+  }
+  return undefined;
 }
 
 /** Compacts the selection in place to rows where the primitive comparison holds. */
@@ -2345,6 +2503,7 @@ function filterPrimitiveInList(
   const vectorLength = vector.length;
   const rows = batch.rowsBySource[primitive.source];
   const members = primitive.members;
+  const negated = primitive.negated;
   let kept = 0;
   for (let index = 0; index < survivors; index += 1) {
     const row = selection[index] ?? 0;
@@ -2355,7 +2514,7 @@ function filterPrimitiveInList(
       throw new RangeError("Streamed vector row is outside the resident window");
     }
     if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
-    if (!members.has(values[slot] ?? 0)) continue;
+    if (members.has(values[slot] ?? 0) === negated) continue;
     selection[kept] = row;
     kept += 1;
   }
@@ -2452,6 +2611,95 @@ function filterDictionaryLike(
 let selectionScratch = new Uint32Array(DEFAULT_BATCH_ROWS);
 
 /**
+ * Compacts the selection with whatever unboxed kernel a predicate compiled to, or returns
+ * undefined when it has none and the caller should fall back to the per-row evaluator.
+ */
+function applyPredicateKernel(
+  plan: BoundPlan,
+  predicate: BoundPredicate,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number | undefined {
+  if (predicate.primitive !== undefined) {
+    return filterPrimitive(predicate.primitive, batch, selection, survivors);
+  }
+  if (predicate.primitiveIn !== undefined) {
+    return filterPrimitiveInList(predicate.primitiveIn, batch, selection, survivors);
+  }
+  if (predicate.dictionaryEquality !== undefined) {
+    return filterDictionaryEquality(predicate.dictionaryEquality, batch, selection, survivors);
+  }
+  if (predicate.dictionaryLike !== undefined) {
+    return filterDictionaryLike(predicate.dictionaryLike, batch, selection, survivors);
+  }
+  if (predicate.disjunction !== undefined) {
+    return filterDisjunction(plan, predicate.disjunction, batch, selection, survivors);
+  }
+  return undefined;
+}
+
+// Scratch for the disjunction kernel. Branch predicates are always plain conditions, so a
+// branch never carries a disjunction of its own and these buffers are never reentered.
+let disjunctionCandidates = new Uint32Array(DEFAULT_BATCH_ROWS);
+let disjunctionWork = new Uint32Array(DEFAULT_BATCH_ROWS);
+let disjunctionMask = new Uint8Array(DEFAULT_BATCH_ROWS);
+
+/**
+ * The union kernel: each branch narrows its own copy of the incoming rows, and a row survives
+ * the disjunction if any branch kept it. Marking hits in a byte mask keeps the result in the
+ * original ascending order and costs one pass per branch plus one to compact, instead of
+ * walking the whole boolean tree once per row.
+ */
+function filterDisjunction(
+  plan: BoundPlan,
+  disjunction: BoundDisjunction,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number {
+  if (disjunctionCandidates.length < survivors) {
+    disjunctionCandidates = new Uint32Array(survivors);
+    disjunctionWork = new Uint32Array(survivors);
+  }
+  if (disjunctionMask.length < batch.length) disjunctionMask = new Uint8Array(batch.length);
+  const candidates = disjunctionCandidates;
+  const work = disjunctionWork;
+  const mask = disjunctionMask;
+  for (let index = 0; index < survivors; index += 1) candidates[index] = selection[index] ?? 0;
+  for (const branch of disjunction.branches) {
+    for (let index = 0; index < survivors; index += 1) work[index] = candidates[index] ?? 0;
+    let kept = survivors;
+    for (const predicate of branch) {
+      if (kept === 0) break;
+      const compacted = applyPredicateKernel(plan, predicate, batch, work, kept);
+      if (compacted !== undefined) {
+        kept = compacted;
+        continue;
+      }
+      let generic = 0;
+      for (let index = 0; index < kept; index += 1) {
+        const row = work[index] ?? 0;
+        if (!evaluateBatchPredicate(plan, predicate, batch, row)) continue;
+        work[generic] = row;
+        generic += 1;
+      }
+      kept = generic;
+    }
+    for (let index = 0; index < kept; index += 1) mask[work[index] ?? 0] = 1;
+  }
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = candidates[index] ?? 0;
+    if (mask[row] !== 1) continue;
+    mask[row] = 0;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
+/**
  * The no-join predicate kernel: primitive comparisons and dictionary equality/LIKE compact a
  * shared selection in tight unboxed loops, and only rows surviving those reach the generic
  * per-row evaluator for whatever predicates remain. Batches with no predicates skip it.
@@ -2467,22 +2715,9 @@ function filterScanBatch(
   let generic: BoundPredicate[] | undefined;
   for (const predicate of plan.predicates) {
     if (survivors === 0) return { selection, survivors };
-    if (predicate.primitive !== undefined) {
-      survivors = filterPrimitive(predicate.primitive, batch, selection, survivors);
-    } else if (predicate.primitiveIn !== undefined) {
-      survivors = filterPrimitiveInList(predicate.primitiveIn, batch, selection, survivors);
-    } else if (predicate.dictionaryEquality !== undefined) {
-      survivors = filterDictionaryEquality(
-        predicate.dictionaryEquality,
-        batch,
-        selection,
-        survivors,
-      );
-    } else if (predicate.dictionaryLike !== undefined) {
-      survivors = filterDictionaryLike(predicate.dictionaryLike, batch, selection, survivors);
-    } else {
-      (generic ??= []).push(predicate);
-    }
+    const compacted = applyPredicateKernel(plan, predicate, batch, selection, survivors);
+    if (compacted === undefined) (generic ??= []).push(predicate);
+    else survivors = compacted;
   }
   if (generic !== undefined) {
     for (const predicate of generic) {
@@ -4149,7 +4384,8 @@ function detectPrimitiveComparison(predicate: BoundPredicate): PrimitiveComparis
  * answer instead of becoming a plain false.
  */
 function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | undefined {
-  if (predicate.operator !== "IN") return undefined;
+  const negated = predicate.operator === "NOT IN";
+  if (predicate.operator !== "IN" && !negated) return undefined;
   if (predicate.left.kind !== "column" || predicate.right.kind !== "list") return undefined;
   const vector = predicate.left.vector;
   if (vector.kind !== "number" && vector.kind !== "datetime") return undefined;
@@ -4159,7 +4395,13 @@ function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | und
   for (const item of predicate.right.items) {
     if (item.kind !== "literal") return undefined;
     const value = item.value;
-    if (value === null) continue;
+    if (value === null) {
+      // A NULL member only ever turns a non-match into unknown, which the filter discards
+      // exactly as it discards false -- so IN may ignore it. NOT IN cannot: with a NULL in
+      // the list it is never true, and a kernel over the remaining members would keep rows.
+      if (negated) return undefined;
+      continue;
+    }
     if (vector.kind === "number") {
       if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
       members.add(value);
@@ -4173,7 +4415,7 @@ function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | und
     if (member < minimum) minimum = member;
     if (member > maximum) maximum = member;
   }
-  return { source: predicate.left.source, vector, members, minimum, maximum };
+  return { source: predicate.left.source, vector, members, minimum, maximum, negated };
 }
 
 function reverseComparisonOperator(operator: ComparisonOperator): ComparisonOperator {

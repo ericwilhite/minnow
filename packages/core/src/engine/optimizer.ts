@@ -9,6 +9,7 @@ import {
   type CompiledQuery,
   type Expression,
   type Predicate,
+  type PredicateOperator,
   type QueryValue,
   type TableSource,
 } from "./query.js";
@@ -68,10 +69,138 @@ function optimizeBlock(block: CompiledQuery): void {
     }
   }
   foldBlockConstants(block);
+  normalizeBooleanPredicates(block);
   coalesceOrEqualityLists(block);
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
+}
+
+// --- Boolean predicate normalization --------------------------------------------------------------
+//
+// The scan compiles an unboxed kernel per predicate, but only for a predicate that *is* a
+// comparison -- a NOT, or a conjunction nested inside one predicate, has no kernel and sends
+// every row through the generic expression evaluator. Both shapes have kernel-compilable
+// equivalents. NOT distributes into its operand (De Morgan, and each comparison into its
+// complement), and a conjunction splits into independent predicates. Every rewrite below holds
+// in three-valued logic: negating a comparison keeps NULL comparisons unknown, exactly as
+// negating the original did.
+
+/** The comparison that is true exactly when `operator` is false, and unknown where it is. */
+const complementaryOperators = new Map<PredicateOperator, PredicateOperator>([
+  ["=", "!="],
+  ["!=", "="],
+  ["<>", "="],
+  [">", "<="],
+  [">=", "<"],
+  ["<", ">="],
+  ["<=", ">"],
+  ["IN", "NOT IN"],
+  ["NOT IN", "IN"],
+  ["LIKE", "NOT LIKE"],
+  ["NOT LIKE", "LIKE"],
+  ["ILIKE", "NOT ILIKE"],
+  ["NOT ILIKE", "ILIKE"],
+  ["IS NULL", "IS NOT NULL"],
+  ["IS NOT NULL", "IS NULL"],
+  ["IS DISTINCT FROM", "IS NOT DISTINCT FROM"],
+  ["IS NOT DISTINCT FROM", "IS DISTINCT FROM"],
+]);
+
+/** Rewrites `NOT x` into an equivalent form without the NOT, or undefined when x has none. */
+function negated(expression: Expression): Expression | undefined {
+  if (expression.kind === "not") return simplifyNegations(expression.operand);
+  if (expression.kind === "logical") {
+    // De Morgan. Both branches must lose their NOT too, or the rewrite trades one for two.
+    const left = negated(expression.left);
+    const right = negated(expression.right);
+    if (left === undefined || right === undefined) return undefined;
+    return { kind: "logical", operator: expression.operator === "and" ? "or" : "and", left, right };
+  }
+  if (expression.kind !== "condition") return undefined;
+  const complement = complementaryOperators.get(expression.operator);
+  if (complement === undefined) return undefined;
+  return {
+    ...expression,
+    operator: complement,
+    left: simplifyNegations(expression.left),
+    right: simplifyNegations(expression.right),
+  };
+}
+
+function simplifyNegations(expression: Expression): Expression {
+  if (expression.kind === "not") {
+    return (
+      negated(expression.operand) ?? { kind: "not", operand: simplifyNegations(expression.operand) }
+    );
+  }
+  if (expression.kind === "logical" || expression.kind === "condition") {
+    return {
+      ...expression,
+      left: simplifyNegations(expression.left),
+      right: simplifyNegations(expression.right),
+    };
+  }
+  if (expression.kind === "list") {
+    return { kind: "list", items: expression.items.map(simplifyNegations) };
+  }
+  if (expression.kind === "case") {
+    return {
+      ...expression,
+      branches: expression.branches.map((branch) => ({
+        when: simplifyNegations(branch.when),
+        then: simplifyNegations(branch.then),
+      })),
+      ...(expression.otherwise === undefined
+        ? {}
+        : { otherwise: simplifyNegations(expression.otherwise) }),
+    };
+  }
+  return expression;
+}
+
+/**
+ * Expands one predicate into the conjunction it represents. A bare boolean expression arrives
+ * wrapped in IS TRUE, which keeps a row exactly when the expression is true -- the same test the
+ * WHERE filter applies -- so a comparison inside the wrapper becomes the predicate itself, and an
+ * AND inside it becomes separate predicates that each compile their own kernel.
+ */
+function expandPredicate(predicate: Predicate, output: Predicate[]): void {
+  if (predicate.operator !== "IS TRUE") {
+    output.push(predicate);
+    return;
+  }
+  const inner = predicate.left;
+  if (inner.kind === "logical" && inner.operator === "and") {
+    expandPredicate({ left: inner.left, operator: "IS TRUE", right: predicate.right }, output);
+    expandPredicate({ left: inner.right, operator: "IS TRUE", right: predicate.right }, output);
+    return;
+  }
+  if (inner.kind === "condition") {
+    output.push({
+      left: inner.left,
+      operator: inner.operator,
+      right: inner.right,
+      ...(inner.escape === undefined ? {} : { escape: inner.escape }),
+    });
+    return;
+  }
+  output.push(predicate);
+}
+
+function normalizeBooleanPredicates(block: CompiledQuery): void {
+  const expanded: Predicate[] = [];
+  for (const predicate of block.predicates) {
+    expandPredicate(
+      {
+        ...predicate,
+        left: simplifyNegations(predicate.left),
+        right: simplifyNegations(predicate.right),
+      },
+      expanded,
+    );
+  }
+  block.predicates = expanded;
 }
 
 // --- OR-of-equalities to IN ---------------------------------------------------------------------

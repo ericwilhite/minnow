@@ -190,9 +190,27 @@ SELECT * FROM orders WHERE status = 'paid' OR status = 'shipped'
 SELECT * FROM orders WHERE status IN ('paid', 'shipped')
 ```
 
-A disjunction that mixes columns (`status = 'paid' OR total > 100`) cannot become a list, so it
-is checked row by row. When one of those branches is selective, splitting the query and combining
-with `UNION` lets each branch prune on its own.
+A disjunction that mixes columns (`status = 'paid' OR total > 100`) stays a disjunction, but each
+branch is still evaluated a column at a time and the results combined, so it costs a small
+multiple of a single filter rather than a row-by-row walk of the whole expression.
+
+`NOT` is rewritten into whatever its operand's opposite already expresses — `NOT (total > 100)`
+becomes `total <= 100`, and `NOT (a AND b)` becomes `NOT a OR NOT b` — so a negated filter is as
+fast as writing the opposite yourself. Rows where the comparison is unknown, because a value is
+NULL, are dropped by the negated form exactly as they were by the original.
+
+### Keyed lookups
+
+When a column's values ascend — which a generated or inserted-in-order key does — the engine
+binary searches it instead of scanning. That covers a point lookup, a range, and an `IN` list:
+
+```sql
+SELECT * FROM orders WHERE order_id IN (12, 8801, 45002)
+```
+
+Each of those keys is located on its own, so the query reads three short runs rather than
+everything between the first key and the last. Long lists fall back to scanning, because past a
+few dozen keys the searches cost more than the rows they skip.
 
 ## Parameters
 

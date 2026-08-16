@@ -46,6 +46,56 @@ describe("deterministic plan rewrites", () => {
     expectEquivalent("SELECT ROUND(2.345, 2) AS folded, amount FROM rows WHERE amount > 2 + 3");
   });
 
+  it("rewrites NOT into the complement its operand already expresses", () => {
+    const whereOf = (sql: string): string => {
+      const rendered = renderPlan(optimizePlan(compileQuery(sql, { optimize: false })));
+      return rendered
+        .split("\n")
+        .filter((line) => line.includes("where"))
+        .join(" | ");
+    };
+    expect(whereOf("SELECT region FROM rows WHERE NOT (amount = 10)")).toContain("amount != 10");
+    expect(whereOf("SELECT region FROM rows WHERE NOT (amount > 10)")).toContain("amount <= 10");
+    expect(whereOf("SELECT region FROM rows WHERE NOT (region IS NULL)")).toContain(
+      "region IS NOT NULL",
+    );
+    expect(whereOf("SELECT region FROM rows WHERE NOT (amount IN (1, 2))")).toContain("NOT IN");
+    expect(whereOf("SELECT region FROM rows WHERE NOT (NOT (amount = 10))")).toContain(
+      "amount = 10",
+    );
+    // De Morgan: a negated conjunction becomes a disjunction, a negated disjunction becomes
+    // two independent predicates the scan can compile a kernel for apiece.
+    expect(whereOf("SELECT region FROM rows WHERE NOT (amount > 1 AND amount < 5)")).toContain(
+      "(amount <= 1) or (amount >= 5)",
+    );
+    const negatedOr = optimizePlan(
+      compileQuery("SELECT region FROM rows WHERE NOT (amount = 1 OR amount = 5)", {
+        optimize: false,
+      }),
+    );
+    expect(negatedOr.predicates).toHaveLength(2);
+    expect(negatedOr.predicates.map((predicate) => predicate.operator)).toEqual(["!=", "!="]);
+    for (const sql of [
+      "SELECT region FROM rows WHERE NOT (amount = 10)",
+      "SELECT region FROM rows WHERE NOT (amount > 1 AND amount < 5)",
+      "SELECT region FROM rows WHERE NOT (amount = 1 OR amount = 5)",
+      "SELECT region FROM rows WHERE NOT (region IS NULL)",
+      "SELECT region FROM rows WHERE NOT (ratio IS NULL) AND NOT (amount = 8)",
+    ]) {
+      expectEquivalent(sql);
+    }
+  });
+
+  it("splits a conjunction inside one predicate into independent predicates", () => {
+    const split = optimizePlan(
+      compileQuery("SELECT region FROM rows WHERE (amount > 1 AND amount < 20) AND ratio > 0", {
+        optimize: false,
+      }),
+    );
+    expect(split.predicates).toHaveLength(3);
+    expectEquivalent("SELECT region FROM rows WHERE (amount > 1 AND amount < 20) AND ratio > 0");
+  });
+
   it("normalizes a disjunction of equalities on one column into an IN list", () => {
     const optimized = optimizePlan(
       compileQuery("SELECT region FROM rows WHERE amount = 10 OR amount = 20 OR amount = 5", {
