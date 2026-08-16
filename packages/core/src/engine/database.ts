@@ -4973,7 +4973,7 @@ export class MinnowDatabase {
         ? { kind: "string", length: rows, validity, codes, dictionary: builder.dictionary }
         : { kind: column.type, length: rows, validity, values }
     ) as ColumnVector;
-    this.#cachePut(`dbv ${blockId}`, vector, columnVectorRetainedBytes(vector));
+    this.#cachePut(`dbv ${blockId}`, vector, blockVectorRetainedBytes(vector));
     return vector;
   }
 
@@ -9761,7 +9761,7 @@ function installStreamedWindow(
   if (single !== undefined) {
     const block = single.vector;
     if (single.startRow === windowStart && block.length === windowRows) {
-      reservations.push(memory.reserve(columnVectorRetainedBytes(block), label));
+      reservations.push(memory.reserve(blockVectorRetainedBytes(block), label));
       mutable.validity = block.validity;
       if (block.kind === "string") {
         mutable.codes = block.codes;
@@ -10950,7 +10950,6 @@ function collectRealTableNames(plan: CompiledQuery): string[] {
   return [...names];
 }
 
-/** Retained payload of a cached column vector: typed arrays plus dictionary characters. */
 /** Retained payload of a cached derived columnar table: its vectors plus fixed overhead. */
 function derivedTableRetainedBytes(table: ColumnarTable): number {
   let bytes = 128;
@@ -10958,6 +10957,7 @@ function derivedTableRetainedBytes(table: ColumnarTable): number {
   return bytes;
 }
 
+/** Retained payload of a column vector: typed arrays plus dictionary characters. */
 function columnVectorRetainedBytes(vector: ColumnVector): number {
   const base = vector.validity.byteLength;
   if (vector.kind === "string") {
@@ -10966,6 +10966,23 @@ function columnVectorRetainedBytes(vector: ColumnVector): number {
     return base + vector.codes.byteLength + dictionaryBytes;
   }
   return base + vector.values.byteLength;
+}
+
+/**
+ * Memoized retained size of a *block* vector. A block vector is built once per block id and
+ * then shared by reference across every query that scans it, so its size never changes —
+ * but a streamed scan re-reserves that size on every window install, and for a string column
+ * the size walks the whole per-block dictionary. On a point lookup that dictionary walk cost
+ * more than the lookup itself. Only pool-owned block vectors go through here: the streamed
+ * vector they are installed into is a different object, and it is mutated.
+ */
+const blockVectorRetainedBytesMemo = new WeakMap<ColumnVector, number>();
+function blockVectorRetainedBytes(vector: ColumnVector): number {
+  const memoized = blockVectorRetainedBytesMemo.get(vector);
+  if (memoized !== undefined) return memoized;
+  const bytes = columnVectorRetainedBytes(vector);
+  blockVectorRetainedBytesMemo.set(vector, bytes);
+  return bytes;
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { MinnowDatabase } from "./database.js";
 import { QueryMemoryBudgetError, QueryMemoryContext } from "./memory.js";
+import { MemoryBlockStore } from "../storage/index.js";
 
 describe("query memory context", () => {
   it("tracks shared child reservations and peak bytes", () => {
@@ -68,6 +70,44 @@ describe("query memory context", () => {
     expect(root.usage).toEqual({ budgetBytes: 16, usedBytes: 0, peakBytes: 10 });
     expect(() => child.tally(1, "closed")).toThrow("Query memory context is closed");
     root.close();
+  });
+
+  /**
+   * A block vector's retained size is computed once and reused for every later scan of that
+   * block, because the vector is immutable and shared by reference. This pins the invariant the
+   * reuse depends on: the size a scan reserves must account for the whole string dictionary and
+   * must not drift between the run that computes it and the runs that reuse it.
+   */
+  it("accounts a string block's dictionary identically on first and repeated scans", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "data",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    const rows = 20_000;
+    await database.insertBatch("data", {
+      columns: {
+        id: Array.from({ length: rows }, (_, index) => index + 1),
+        // Every label distinct, so the dictionary dominates the block's retained size.
+        label: Array.from({ length: rows }, (_, index) => `label-${String(index)}`),
+      },
+    });
+    const peaks: number[] = [];
+    for (let run = 0; run < 3; run += 1) {
+      await database.query("SELECT id, label FROM data WHERE id = 12345", {
+        memoize: false,
+        onStats: (stats) => peaks.push(stats.peakMemoryBytes),
+      });
+    }
+    expect(peaks).toHaveLength(3);
+    // Stable across runs: a stale or recomputed size would show up as a differing peak.
+    expect(new Set(peaks).size).toBe(1);
+    // And large enough to include the dictionary's characters rather than the codes alone.
+    expect(peaks[0]).toBeGreaterThan(rows * 16);
   });
 
   it("rejects invalid budgets and reservation sizes", () => {

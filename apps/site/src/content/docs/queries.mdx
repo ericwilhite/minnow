@@ -176,6 +176,24 @@ SQL -> lexer -> parser ----------------+
 Typed builder -> compile() ------------+
 ```
 
+### Filters that skip whole blocks
+
+Columns are stored as blocks that each record the range of values they hold, so a filter the
+engine can compare against that range skips every block it cannot match. Comparisons (`=`, `<`,
+`BETWEEN`) and `IN` lists on a number or datetime column all narrow this way.
+
+A run of equalities on one column is normalized into an `IN` list before planning, so these two
+filters are the same query — write whichever reads better:
+
+```sql
+SELECT * FROM orders WHERE status = 'paid' OR status = 'shipped'
+SELECT * FROM orders WHERE status IN ('paid', 'shipped')
+```
+
+A disjunction that mixes columns (`status = 'paid' OR total > 100`) cannot become a list, so it
+is checked row by row. When one of those branches is selective, splitting the query and combining
+with `UNION` lets each branch prune on its own.
+
 ## Parameters
 
 Every SQL entry point takes `?` (positional) or `$1`-style (numbered) placeholders. Values bind

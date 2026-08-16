@@ -68,9 +68,75 @@ function optimizeBlock(block: CompiledQuery): void {
     }
   }
   foldBlockConstants(block);
+  coalesceOrEqualityLists(block);
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
+}
+
+// --- OR-of-equalities to IN ---------------------------------------------------------------------
+//
+// `col = a OR col = b OR col = c` is exactly how SQL defines `col IN (a, b, c)` -- same result,
+// same three-valued NULL behaviour -- but the two shapes execute nothing alike. An OR is one
+// predicate the scan cannot compile a kernel for, so every row walks the generic expression
+// evaluator; an IN list compiles to an unboxed membership kernel and, because zone maps
+// understand IN, prunes whole blocks the list cannot reach. Normalizing the disjunction into
+// the list form is the difference between reading the table and reading one block of it.
+
+/** The column reference an `=` leaf tests, with the value it is compared against. */
+function orEqualityLeaf(
+  expression: Expression,
+): { reference: string; value: Expression } | undefined {
+  if (expression.kind !== "condition" || expression.operator !== "=") return undefined;
+  // Only literals and placeholders become list members: they are side-effect free and stay
+  // valid when the list binds later. Anything else keeps its own evaluation order.
+  const isValue = (candidate: Expression): boolean =>
+    candidate.kind === "literal" || candidate.kind === "parameter";
+  const { left, right } = expression;
+  if (left.kind === "column" && isValue(right)) return { reference: left.reference, value: right };
+  if (right.kind === "column" && isValue(left)) return { reference: right.reference, value: left };
+  return undefined;
+}
+
+/**
+ * Flattens an OR tree into `=` leaves that all test the same column, or undefined when any
+ * branch is something else -- a mixed disjunction keeps its original shape rather than being
+ * split into a partial rewrite that would still leave an OR behind.
+ */
+function sameColumnOrEqualities(
+  expression: Expression,
+): { reference: string; values: Expression[] } | undefined {
+  const values: Expression[] = [];
+  let reference: string | undefined;
+  const visit = (node: Expression): boolean => {
+    if (node.kind === "logical" && node.operator === "or") {
+      return visit(node.left) && visit(node.right);
+    }
+    const leaf = orEqualityLeaf(node);
+    if (leaf === undefined) return false;
+    reference ??= leaf.reference;
+    if (leaf.reference !== reference) return false;
+    values.push(leaf.value);
+    return true;
+  };
+  if (!visit(expression)) return undefined;
+  if (reference === undefined || values.length < 2) return undefined;
+  return { reference, values };
+}
+
+function coalesceOrEqualityLists(block: CompiledQuery): void {
+  block.predicates = block.predicates.map((predicate) => {
+    // A bare OR reaches the predicate list wrapped in IS TRUE, which collapses unknown to
+    // false exactly as the WHERE filter does -- so dropping the wrapper changes nothing.
+    if (predicate.operator !== "IS TRUE" || predicate.left.kind !== "logical") return predicate;
+    const coalesced = sameColumnOrEqualities(predicate.left);
+    if (coalesced === undefined) return predicate;
+    return {
+      left: { kind: "column", reference: coalesced.reference },
+      operator: "IN",
+      right: { kind: "list", items: coalesced.values },
+    } satisfies Predicate;
+  });
 }
 
 // --- Correlated subquery decorrelation ----------------------------------------------------------

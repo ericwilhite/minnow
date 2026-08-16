@@ -180,6 +180,44 @@ const templates: Template[] = [
     params: [pick(rng, someRegions), pick(rng, someRegions)],
     ordered: true,
   }),
+  // A disjunction of equalities on one column is normalized into an IN list. The rewrite is
+  // only sound if it matches the oracle on a nullable column, where every non-matching row
+  // evaluates to unknown rather than false.
+  (rng) => ({
+    sql: `SELECT id, region FROM data WHERE region = ? OR region = ? OR region = ? ORDER BY id`,
+    params: [pick(rng, someRegions), pick(rng, someRegions), pick(rng, someRegions)],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id, amount FROM data WHERE amount = ? OR amount = ? ORDER BY id`,
+    params: [Math.floor(rng() * 400) / 4, Math.floor(rng() * 400) / 4],
+    ordered: true,
+  }),
+  // A NULL member makes the whole list unknown for non-matching rows; IN and OR must agree.
+  (rng) => ({
+    sql: `SELECT id, region FROM data WHERE region = ? OR region = NULL ORDER BY id`,
+    params: [pick(rng, someRegions)],
+    ordered: true,
+  }),
+  // Reversed operands, and a negated disjunction: NOT over the rewritten list must still
+  // propagate unknown the way the original OR tree did.
+  (rng) => ({
+    sql: `SELECT id, region FROM data WHERE NOT (? = region OR ? = region) ORDER BY id`,
+    params: [pick(rng, someRegions), pick(rng, someRegions)],
+    ordered: true,
+  }),
+  // Mixed disjunctions must keep their original shape; these pin that the rewrite declines
+  // rather than mis-firing across columns or past a non-equality branch.
+  (rng) => ({
+    sql: `SELECT id FROM data WHERE region = ? OR amount = ? ORDER BY id`,
+    params: [pick(rng, someRegions), Math.floor(rng() * 400) / 4],
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT id FROM data WHERE amount = ? OR amount > ? ORDER BY id`,
+    params: [Math.floor(rng() * 400) / 4, Math.floor(rng() * 400) / 4],
+    ordered: true,
+  }),
   (rng) => ({
     sql: `SELECT id FROM data WHERE region NOT IN (?, ?) ORDER BY id`,
     params: [pick(rng, someRegions), pick(rng, someRegions)],

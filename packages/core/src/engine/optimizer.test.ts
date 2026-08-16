@@ -46,6 +46,54 @@ describe("deterministic plan rewrites", () => {
     expectEquivalent("SELECT ROUND(2.345, 2) AS folded, amount FROM rows WHERE amount > 2 + 3");
   });
 
+  it("normalizes a disjunction of equalities on one column into an IN list", () => {
+    const optimized = optimizePlan(
+      compileQuery("SELECT region FROM rows WHERE amount = 10 OR amount = 20 OR amount = 5", {
+        optimize: false,
+      }),
+    );
+    expect(renderPlan(optimized)).toContain("where amount IN (10, 20, 5)");
+    expectEquivalent("SELECT region FROM rows WHERE amount = 10 OR amount = 20 OR amount = 5");
+    // Reversed operands reach the same list, and placeholders stay placeholders so the
+    // rewritten list still binds at query time.
+    expect(
+      renderPlan(
+        optimizePlan(
+          compileQuery("SELECT region FROM rows WHERE 10 = amount OR amount = 20", {
+            optimize: false,
+          }),
+        ),
+      ),
+    ).toContain("where amount IN (10, 20)");
+    const parameterized = optimizePlan(
+      compileQuery("SELECT region FROM rows WHERE amount = ? OR amount = ?", { optimize: false }),
+    );
+    expect(parameterized.predicates[0]?.operator).toBe("IN");
+    expect(parameterized.parameterCount).toBe(2);
+  });
+
+  it("keeps a NULL member's unknown result when a disjunction becomes an IN list", () => {
+    // region is NULL in one row: `region = 'west' OR region = NULL` must match only 'west',
+    // and NOT of it must drop both the match and every unknown row -- exactly IN semantics.
+    expectEquivalent("SELECT region FROM rows WHERE region = 'west' OR region = NULL");
+    expectEquivalent("SELECT region FROM rows WHERE NOT (region = 'west' OR region = 'east')");
+    expectEquivalent("SELECT region FROM rows WHERE region = 'west' OR region = 'east'");
+  });
+
+  it("declines the IN rewrite for disjunctions that are not one column's equalities", () => {
+    const decline = (sql: string): void => {
+      expect(
+        optimizePlan(compileQuery(sql, { optimize: false })).predicates[0]?.operator,
+        sql,
+      ).not.toBe("IN");
+      expectEquivalent(sql);
+    };
+    decline("SELECT region FROM rows WHERE region = 'west' OR amount = 10");
+    decline("SELECT region FROM rows WHERE amount = 10 OR amount > 15");
+    decline("SELECT region FROM rows WHERE amount = 10 OR amount = ratio");
+    decline("SELECT region FROM rows WHERE amount = 10 AND region = 'west'");
+  });
+
   it("pushes predicates into derived tables and CTEs", () => {
     const optimized = optimizePlan(
       compileQuery(
