@@ -1,5 +1,5 @@
 /**
- * SQL/DDL helpers and value canonicalization shared by the three engine drivers.
+ * SQL/DDL helpers and value canonicalization shared by the engine drivers.
  * Descended from the old engine-comparison module; the monolithic four-engine comparison
  * run is gone, but the portable DDL, row conversion, and checksum machinery survives here.
  */
@@ -14,7 +14,7 @@ export interface SqlQueryDefinition {
 }
 
 /**
- * Portable aggregation queries that run unchanged on all three engines. Kept for the
+ * Portable aggregation queries that run unchanged on every comparison engine. Kept for the
  * engine-comparison vitest and as ready-made examples for the query page.
  */
 export const comparisonQueries: SqlQueryDefinition[] = [

@@ -2,7 +2,7 @@
  * Memory probes shared by the storage benchmark and the engine comparison.
  *
  * `performance.memory.usedJSHeapSize` only counts the JavaScript heap, which is the wrong
- * number for a comparison against SQLite, DuckDB, and PGlite: those engines keep nearly all
+ * number for a comparison against SQLite and PGlite: those engines keep nearly all
  * of their state inside a WebAssembly memory that never appears in the JS heap.
  * `performance.measureUserAgentSpecificMemory()` does count it, so it is the primary signal
  * here and the JS heap is reported beside it as a narrower one.

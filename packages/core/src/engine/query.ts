@@ -13,6 +13,12 @@ import {
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { optimizePlan } from "./optimizer.js";
 import {
+  compareSqlValues as compareValues,
+  compileLikePattern,
+  encodeSqlEqualityValue,
+  roundSqlNumber,
+} from "./sql-semantics.js";
+import {
   columnarTableFromRows,
   prepareVectorQuery,
   type ColumnarTable,
@@ -248,8 +254,7 @@ export function scalarFunctionValue(
     case "ROUND": {
       if (values.length > 1 && (values[1] === null || values[1] === undefined)) return null;
       const digits = values.length > 1 ? numeric(values[1]) : 0;
-      const factor = 10 ** digits;
-      return Math.round(numeric(first) * factor) / factor;
+      return roundSqlNumber(numeric(first), digits);
     }
     case "ABS":
       return Math.abs(numeric(first));
@@ -1825,7 +1830,7 @@ export function executeQuery(
 /**
  * Combines set-operation member results positionally under the first member's column names,
  * folding left: UNION deduplicates the entire accumulated set, UNION ALL concatenates. Values
- * compare with SQL grouping semantics (NULLs equal, dates by instant, -0 distinct from 0).
+ * compare with SQL grouping semantics (NULLs equal, dates by instant, signed zeros equal).
  */
 export function combineUnionResults(
   results: readonly QueryResult[],
@@ -1848,12 +1853,7 @@ export function combineUnionResults(
   const encode = (row: QueryRow): string =>
     JSON.stringify(
       columns.map((name) => {
-        const value = row[name] ?? null;
-        if (value === null) return [0];
-        if (typeof value === "boolean") return [1, value];
-        if (typeof value === "number") return [2, Object.is(value, -0) ? "-0" : String(value)];
-        if (typeof value === "string") return [3, value];
-        return [4, value.getTime()];
+        return encodeSqlEqualityValue(row[name] ?? null);
       }),
     );
   const dedupe = (rows: readonly QueryRow[]): QueryRow[] => {
@@ -1907,12 +1907,7 @@ function encodeRowKey(columns: readonly string[]): (row: QueryRow) => string {
   return (row) =>
     JSON.stringify(
       columns.map((name) => {
-        const value = row[name] ?? null;
-        if (value === null) return [0];
-        if (typeof value === "boolean") return [1, value];
-        if (typeof value === "number") return [2, Object.is(value, -0) ? "-0" : String(value)];
-        if (typeof value === "string") return [3, value];
-        return [4, value.getTime()];
+        return encodeSqlEqualityValue(row[name] ?? null);
       }),
     );
 }
@@ -3045,36 +3040,9 @@ export function cachedListMembership(
   return cached;
 }
 
-const likeCache = new Map<string, RegExp>();
-
 /** Compiles a LIKE pattern (% = any run, _ = any character) to an anchored RegExp, cached. */
 export function likeRegExp(pattern: string, caseInsensitive = false, escape?: string): RegExp {
-  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""}${pattern}`;
-  const cached = likeCache.get(key);
-  if (cached !== undefined) return cached;
-  let source = "^";
-  let escaped = false;
-  for (const character of pattern) {
-    if (escaped) {
-      // The character after the escape is literal, wildcards included.
-      source += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      escaped = false;
-      continue;
-    }
-    if (escape !== undefined && character === escape) {
-      escaped = true;
-      continue;
-    }
-    if (character === "%") source += "[\\s\\S]*";
-    else if (character === "_") source += "[\\s\\S]";
-    else source += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-  if (escaped) throw new TypeError("LIKE pattern ends with a dangling escape character");
-  source += "$";
-  const regExp = new RegExp(source, caseInsensitive ? "i" : "");
-  if (likeCache.size >= 128) likeCache.clear();
-  likeCache.set(key, regExp);
-  return regExp;
+  return compileLikePattern(pattern, caseInsensitive, escape);
 }
 
 const extractFields: ReadonlySet<string> = new Set([
@@ -3533,24 +3501,6 @@ export function explicitNullOrder(
   if (!leftNull && !rightNull) return undefined;
   if (leftNull && rightNull) return 0;
   return (leftNull ? -1 : 1) * (nulls === "first" ? 1 : -1);
-}
-
-function compareValues(left: unknown, right: unknown): number {
-  const a = comparable(left);
-  const b = comparable(right);
-  if (a === b) return 0;
-  if (a === null || a === undefined) return -1;
-  if (b === null || b === undefined) return 1;
-  if (typeof a === "number" && typeof b === "number") {
-    if (Number.isNaN(a)) return Number.isNaN(b) ? 0 : 1;
-    if (Number.isNaN(b)) return -1;
-    return a - b;
-  }
-  // Codepoint order, not locale collation: identical in every browser and matching SQLite's
-  // byte order for ASCII. Locale-aware ordering is a deliberate omission — see the docs.
-  if (typeof a === "string" && typeof b === "string") return a < b ? -1 : 1;
-  if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
-  throw new TypeError("Values must have comparable SQL types");
 }
 
 function numeric(value: unknown): number {

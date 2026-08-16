@@ -1,5 +1,5 @@
 /**
- * The 15-query relational reference suite: definitions, hand-written JavaScript
+ * The relational read suite: definitions, hand-written JavaScript
  * baselines, independent oracles, and the cross-engine runner. The dataset is
  * deterministic, so oracles run over tables regenerated in memory rather than rows read
  * back from any engine — the same inputs every engine received.
@@ -7,29 +7,33 @@
 import type { DatabaseRow } from "@minnowdb/core";
 import { generateEntityBatch, getScenario, type EntityDefinition } from "../benchmark.js";
 import { loadDriver, requireMaterialization, type EngineSession } from "../engines/session.js";
-import { engineIds } from "../protocol.js";
 import type {
   EngineId,
   ReferenceEngineMeasurement,
   ReferenceQueryReport,
   ReferenceSuitePayload,
   ReferenceSuiteResult,
+  WorkloadKind,
 } from "../protocol.js";
 import { canonicalTuples, referenceChecksum, tuplesMatch } from "./canonical.js";
 import { getDataset } from "./registry.js";
-import { assertNotCancelled, progress, summarizeSamples } from "./support.js";
+import {
+  assertNotCancelled,
+  progress,
+  summarizeSamples,
+  validateDatasetSuitePayload,
+} from "./support.js";
 
 export interface ReferenceQueryDefinition {
   id: string;
   name: string;
   complexity: "simple" | "moderate" | "complex";
   /**
-   * Access pattern, which is what actually separates these timings. "selective" queries reach
-   * a few rows through a key or an ordered range and are latency-bound; "analytical" queries
-   * scan and aggregate a table and are throughput-bound. Note an unanchored LIKE is a scan,
-   * not a lookup — classification follows the work done, not how the SQL reads.
+   * OLTP reads reach a few rows through a key or an ordered range and are latency-bound. OLAP
+   * reads scan, join, or aggregate and are throughput-bound. Note an unanchored LIKE is OLAP:
+   * classification follows the work done, not how the SQL reads.
    */
-  workload: "selective" | "analytical";
+  workload: WorkloadKind;
   /**
    * Submitted to MinnowDatabase verbatim. Queries outside the current SQL surface still
    * carry their complete intended statement and record the engine's refusal, so the
@@ -68,17 +72,7 @@ export interface ReferenceQueryContext {
 const SAMPLE_COUNT = 7;
 
 export function validateReferencePayload(value: unknown): ReferenceSuitePayload {
-  if (typeof value !== "object" || value === null) throw new Error("Invalid suite payload");
-  const payload = value as Partial<ReferenceSuitePayload>;
-  if (typeof payload.datasetId !== "string") throw new TypeError("Dataset id must be a string");
-  if (
-    !Array.isArray(payload.engines) ||
-    payload.engines.length === 0 ||
-    !payload.engines.every((engine): engine is EngineId => engineIds.includes(engine))
-  ) {
-    throw new Error("Select at least one engine");
-  }
-  return { datasetId: payload.datasetId, engines: [...new Set(payload.engines)] };
+  return validateDatasetSuitePayload(value);
 }
 
 /** Materializes one full table as row objects from the deterministic generator. */
@@ -342,7 +336,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
   return [
     {
       id: "q1",
-      workload: "selective",
+      workload: "oltp",
       name: "Order point lookup",
       complexity: "simple",
       tables: ["orders"],
@@ -375,7 +369,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "s1",
-      workload: "selective",
+      workload: "oltp",
       name: "Customer by key",
       complexity: "simple",
       tables: ["customers"],
@@ -394,7 +388,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "s2",
-      workload: "selective",
+      workload: "oltp",
       name: "Line items for one order",
       complexity: "simple",
       tables: ["order_items"],
@@ -414,7 +408,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "s3",
-      workload: "selective",
+      workload: "oltp",
       name: "Small key set",
       complexity: "simple",
       tables: ["products"],
@@ -435,7 +429,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "s4",
-      workload: "selective",
+      workload: "oltp",
       name: "Keyed range window",
       complexity: "simple",
       tables: ["orders"],
@@ -462,7 +456,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "s5",
-      workload: "selective",
+      workload: "oltp",
       name: "Order exists check",
       complexity: "simple",
       tables: ["orders"],
@@ -480,7 +474,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q2",
-      workload: "selective",
+      workload: "oltp",
       name: "Paid orders in a date range",
       complexity: "simple",
       tables: ["orders"],
@@ -500,7 +494,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q3",
-      workload: "analytical",
+      workload: "olap",
       name: "Revenue by order status",
       complexity: "moderate",
       tables: ["orders"],
@@ -513,7 +507,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q4",
-      workload: "analytical",
+      workload: "olap",
       name: "Top customers by captured revenue",
       complexity: "moderate",
       tables: ["customers", "orders", "payments"],
@@ -526,7 +520,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q5",
-      workload: "analytical",
+      workload: "olap",
       name: "Category revenue after discounts",
       complexity: "moderate",
       tables: ["order_items", "products"],
@@ -539,7 +533,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q6",
-      workload: "analytical",
+      workload: "olap",
       name: "Repeat customers without returns",
       complexity: "complex",
       tables: ["orders", "order_items", "returns"],
@@ -554,7 +548,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q7",
-      workload: "analytical",
+      workload: "olap",
       name: "Top products within each category",
       complexity: "complex",
       tables: ["order_items", "products"],
@@ -577,7 +571,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q8",
-      workload: "analytical",
+      workload: "olap",
       name: "Monthly cohort revenue and return rate",
       complexity: "complex",
       tables: ["customers", "orders", "order_items", "returns", "payments"],
@@ -597,7 +591,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q9",
-      workload: "analytical",
+      workload: "olap",
       name: "Region and segment revenue matrix",
       complexity: "complex",
       tables: ["regions", "customers", "orders", "payments"],
@@ -612,7 +606,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q10",
-      workload: "analytical",
+      workload: "olap",
       name: "Return rate by product category",
       complexity: "complex",
       tables: ["products", "order_items", "returns"],
@@ -627,7 +621,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q11",
-      workload: "analytical",
+      workload: "olap",
       name: "Tax collected by jurisdiction",
       complexity: "complex",
       tables: ["order_taxes", "tax_rates", "tax_jurisdictions"],
@@ -640,7 +634,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q12",
-      workload: "analytical",
+      workload: "olap",
       name: "Fulfillment volume by warehouse",
       complexity: "moderate",
       tables: ["shipments", "shipment_items", "warehouses"],
@@ -654,7 +648,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q13",
-      workload: "analytical",
+      workload: "olap",
       name: "Supplier inventory ledger",
       complexity: "moderate",
       tables: ["inventory_movements", "suppliers"],
@@ -667,7 +661,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q14",
-      workload: "analytical",
+      workload: "olap",
       name: "Payment transaction funnel",
       complexity: "simple",
       tables: ["payment_transactions"],
@@ -680,7 +674,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q15",
-      workload: "analytical",
+      workload: "olap",
       name: "Discount and tax burden by order status",
       complexity: "complex",
       tables: ["orders", "order_discounts", "order_taxes"],
@@ -693,7 +687,7 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
     },
     {
       id: "q16",
-      workload: "analytical",
+      workload: "olap",
       name: "Support message text search",
       complexity: "simple",
       tables: ["support_messages"],

@@ -5,9 +5,31 @@
  */
 import { protocolVersion, type ProgressResponse } from "@minnowdb/core/worker-protocol";
 import { unavailableMemorySample, type MemorySample } from "../memory-probe.js";
-import type { WorkProgress } from "../protocol.js";
+import { engineIds } from "../protocol.js";
+import type { EngineId, WorkProgress } from "../protocol.js";
 
 export const cancelledRuns = new Set<string>();
+
+export function validateDatasetSuitePayload(value: unknown): {
+  datasetId: string;
+  engines: EngineId[];
+} {
+  if (typeof value !== "object" || value === null) throw new Error("Invalid suite payload");
+  const payload = value as { datasetId?: unknown; engines?: unknown };
+  if (typeof payload.datasetId !== "string" || payload.datasetId.length === 0) {
+    throw new TypeError("Dataset id must be a non-empty string");
+  }
+  const rawEngines: unknown = payload.engines;
+  if (!Array.isArray(rawEngines) || rawEngines.length === 0) {
+    throw new Error("Select at least one valid engine");
+  }
+  const engines = rawEngines.filter(
+    (engine: unknown): engine is EngineId =>
+      typeof engine === "string" && engineIds.some((candidate) => candidate === engine),
+  );
+  if (engines.length !== rawEngines.length) throw new Error("Select at least one valid engine");
+  return { datasetId: payload.datasetId, engines: [...new Set(engines)] };
+}
 
 export function assertNotCancelled(requestId: string): void {
   if (cancelledRuns.has(requestId)) throw new DOMException("Run cancelled", "AbortError");

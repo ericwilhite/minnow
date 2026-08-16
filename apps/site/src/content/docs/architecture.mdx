@@ -83,6 +83,10 @@ orphaned blocks for the garbage collector — never a manifest pointing at half-
 Step 4 is the concurrency control. If another tab published first, the commit fails cleanly and
 retries against the new version. Conflicts surface as typed errors, never as silent interleaving.
 
+Encoding is bounded but parallel across independent columns. Blocks within each column keep their
+original order, and the staged metadata stays in schema order, so native compressors can overlap
+without making the committed layout depend on completion timing.
+
 ## Sharing the database across tabs
 
 Minnow assumes several tabs, unaware of each other, some frozen or already gone.
@@ -101,6 +105,9 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
 - Data flows through the executor in typed batches of 2,048 rows: numbers and dates in
   `Float64Array`s, strings dictionary-coded, nulls in packed bitmaps. Tight loops over typed
   arrays instead of millions of short-lived objects.
+- Grouping on dictionary-coded strings reuses their integer codes. Small compound domains use
+  direct-address slots; high-cardinality sparse domains pack the codes into a numeric key. Both
+  avoid repeatedly encoding and hashing the same strings for every input row.
 - Queries accept a **memory budget** (`executionMemoryBudgetBytes`). Memory is reserved before it
   is allocated. Under a budget, sorts and grouped aggregations spill to durable temp pages instead
   of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.

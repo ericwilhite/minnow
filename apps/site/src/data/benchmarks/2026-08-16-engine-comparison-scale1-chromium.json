@@ -1,6 +1,7 @@
 {
+  "schemaVersion": 1,
   "kind": "engine-comparison",
-  "capturedAt": "2026-08-15T23:24:41.045Z",
+  "capturedAt": "2026-08-16T11:53:54.823Z",
   "browser": {
     "project": "chromium",
     "version": "151.0.7922.34",
@@ -10,19 +11,19 @@
     "storage": "persistent profile (disk-backed)"
   },
   "wallClock": {
-    "totalMs": 40158
+    "totalMs": 36128
   },
-  "progressCount": 352,
+  "progressCount": 270,
   "config": {
     "scale": 1,
     "compression": "gzip",
     "targetBlockBytes": 1048576,
     "durability": "relaxed",
-    "engines": ["minnow", "sqlite", "pglite", "duckdb"]
+    "engines": ["minnow", "sqlite", "pglite"]
   },
   "dataset": {
-    "id": "63938d20-5e25-498d-a881-182ee61d8457",
-    "createdAt": "2026-08-15T23:24:01.020Z",
+    "id": "a895498e-5074-4de1-ba2a-9221a46685ff",
+    "createdAt": "2026-08-16T11:53:18.841Z",
     "scale": 1,
     "totalRows": 95616,
     "tableRows": {
@@ -84,57 +85,47 @@
       "minnow": {
         "engine": "minnow",
         "status": "ready",
-        "storageName": "mdb-dataset-63938d20-5e25-498d-a881-182ee61d8457",
+        "storageName": "mdb-dataset-a895498e-5074-4de1-ba2a-9221a46685ff",
         "version": "workspace",
         "persistence": "IndexedDB · immutable compressed column blocks",
         "storedBytes": 2018994,
-        "buildMs": 398.0750000476837,
-        "insertMs": 292.2250006198883
+        "buildMs": 416.3400000333786,
+        "insertMs": 288.51999974250793
       },
       "sqlite": {
         "engine": "sqlite",
         "status": "ready",
-        "storageName": "/mdb-dataset-63938d20-5e25-498d-a881-182ee61d8457.sqlite3",
+        "storageName": "/mdb-dataset-a895498e-5074-4de1-ba2a-9221a46685ff.sqlite3",
         "vfs": "sah-pool",
         "version": "3.53.0",
         "persistence": "OPFS SAH-pool VFS · persistent SQLite file",
         "storedBytes": 9035776,
-        "buildMs": 934.7450000047684,
-        "insertMs": 546.740000128746
+        "buildMs": 1144.7050000429153,
+        "insertMs": 633.5599998235703
       },
       "pglite": {
         "engine": "pglite",
         "status": "ready",
-        "storageName": "/pglite/mdb-dataset-63938d20-5e25-498d-a881-182ee61d8457",
+        "storageName": "/pglite/mdb-dataset-a895498e-5074-4de1-ba2a-9221a46685ff",
         "version": "0.5.x",
-        "persistence": "IndexedDB VFS · persistent PostgreSQL data directory",
+        "persistence": "IndexedDB VFS · persistent PostgreSQL data directory · relaxed flush on reads, strict on writes",
         "storedBytes": 25559567,
-        "buildMs": 8926.689999938011,
-        "insertMs": 2569.2799994945526
-      },
-      "duckdb": {
-        "engine": "duckdb",
-        "status": "ready",
-        "storageName": "memory:mdb-dataset-63938d20-5e25-498d-a881-182ee61d8457",
-        "version": "v1.5.4",
-        "persistence": "in-memory only — no disk-backed storage; all numbers exclude storage I/O entirely",
-        "storedBytes": null,
-        "buildMs": 802.2299998998642,
-        "insertMs": 229.2250006198883
+        "buildMs": 9126.615000009537,
+        "insertMs": 2623.6550006866455
       }
     }
   },
-  "suite": {
-    "datasetId": "63938d20-5e25-498d-a881-182ee61d8457",
+  "reads": {
+    "datasetId": "a895498e-5074-4de1-ba2a-9221a46685ff",
     "scale": 1,
     "sampleCount": 7,
-    "engines": ["minnow", "sqlite", "pglite", "duckdb"],
+    "engines": ["minnow", "sqlite", "pglite"],
     "queries": [
       {
         "id": "q1",
         "name": "Order point lookup",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT * FROM orders WHERE order_id = 500",
         "tables": ["orders"],
         "expectedRows": 1,
@@ -143,10 +134,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.934999942779541,
-            "medianMs": 0.2749999761581421,
-            "p95Ms": 0.4799998998641968,
-            "cachedMedianMs": 0.1499999761581421,
+            "prepareMs": 4.669999957084656,
+            "medianMs": 0.36000001430511475,
+            "p95Ms": 3.7899999618530273,
+            "cachedMedianMs": 0.20000004768371582,
             "peakMemoryBytes": 57062,
             "resultRows": 1,
             "checksum": 3024742219,
@@ -155,9 +146,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.7050000429153442,
-            "medianMs": 0.020000100135803223,
-            "p95Ms": 0.039999961853027344,
+            "prepareMs": 0.6899999380111694,
+            "medianMs": 0.019999980926513672,
+            "p95Ms": 0.034999966621398926,
             "resultRows": 1,
             "checksum": 3024742219,
             "verified": true
@@ -165,19 +156,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.18999993801117,
-            "medianMs": 20.174999952316284,
-            "p95Ms": 21.575000047683716,
-            "resultRows": 1,
-            "checksum": 3024742219,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.9000000953674316,
-            "medianMs": 0.25,
-            "p95Ms": 0.49499988555908203,
+            "prepareMs": 0.7299998998641968,
+            "medianMs": 0.13499999046325684,
+            "p95Ms": 0.18999993801116943,
             "resultRows": 1,
             "checksum": 3024742219,
             "verified": true
@@ -188,7 +169,7 @@
         "id": "s1",
         "name": "Customer by key",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT customer_id, region_id, segment FROM customers WHERE customer_id = 125",
         "tables": ["customers"],
         "expectedRows": 1,
@@ -197,10 +178,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.440000057220459,
-            "medianMs": 0.21500003337860107,
-            "p95Ms": 3.149999976158142,
-            "cachedMedianMs": 0.16999995708465576,
+            "prepareMs": 3.7750000953674316,
+            "medianMs": 0.2099999189376831,
+            "p95Ms": 1.3200000524520874,
+            "cachedMedianMs": 0.1499999761581421,
             "peakMemoryBytes": 5002,
             "resultRows": 1,
             "checksum": 1906686656,
@@ -209,9 +190,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.0849999189376831,
-            "medianMs": 0.014999985694885254,
-            "p95Ms": 0.019999980926513672,
+            "prepareMs": 0.06499993801116943,
+            "medianMs": 0.009999990463256836,
+            "p95Ms": 0.02499997615814209,
             "resultRows": 1,
             "checksum": 1906686656,
             "verified": true
@@ -219,19 +200,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 20.695000052452087,
-            "medianMs": 20.93499994277954,
-            "p95Ms": 22.12999999523163,
-            "resultRows": 1,
-            "checksum": 1906686656,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.2549999952316284,
-            "medianMs": 0.18500006198883057,
-            "p95Ms": 0.31000006198883057,
+            "prepareMs": 0.26499998569488525,
+            "medianMs": 0.11000001430511475,
+            "p95Ms": 0.13999998569488525,
             "resultRows": 1,
             "checksum": 1906686656,
             "verified": true
@@ -242,7 +213,7 @@
         "id": "s2",
         "name": "Line items for one order",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT item_id, product_id, quantity FROM order_items WHERE order_id = 333 ORDER BY item_id",
         "tables": ["order_items"],
         "expectedRows": 3,
@@ -251,11 +222,11 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.4299999475479126,
-            "medianMs": 0.20500004291534424,
-            "p95Ms": 1.1299999952316284,
-            "cachedMedianMs": 0.11000001430511475,
-            "peakMemoryBytes": 105797,
+            "prepareMs": 0.48000001907348633,
+            "medianMs": 0.21500003337860107,
+            "p95Ms": 0.7400000095367432,
+            "cachedMedianMs": 0.48000001907348633,
+            "peakMemoryBytes": 97656,
             "resultRows": 3,
             "checksum": 4115159835,
             "verified": true
@@ -263,8 +234,8 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.2049999237060547,
-            "medianMs": 0.019999980926513672,
+            "prepareMs": 0.20500004291534424,
+            "medianMs": 0.020000100135803223,
             "p95Ms": 0.02499997615814209,
             "resultRows": 3,
             "checksum": 4115159835,
@@ -273,19 +244,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 27.759999990463257,
-            "medianMs": 21.139999985694885,
-            "p95Ms": 21.46999990940094,
-            "resultRows": 3,
-            "checksum": 4115159835,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.2050000429153442,
-            "medianMs": 0.31000006198883057,
-            "p95Ms": 0.4099999666213989,
+            "prepareMs": 0.35500001907348633,
+            "medianMs": 0.16000008583068848,
+            "p95Ms": 0.23000001907348633,
             "resultRows": 3,
             "checksum": 4115159835,
             "verified": true
@@ -296,7 +257,7 @@
         "id": "s3",
         "name": "Small key set",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT product_id, category, unit_cost FROM products WHERE product_id IN (1, 2, 3, 5, 8) ORDER BY product_id",
         "tables": ["products"],
         "expectedRows": 5,
@@ -305,10 +266,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.6050000190734863,
-            "medianMs": 0.2849999666213989,
-            "p95Ms": 1.1649999618530273,
-            "cachedMedianMs": 0.12000000476837158,
+            "prepareMs": 0.9500000476837158,
+            "medianMs": 0.26499998569488525,
+            "p95Ms": 1.5449999570846558,
+            "cachedMedianMs": 0.1549999713897705,
             "peakMemoryBytes": 5211,
             "resultRows": 5,
             "checksum": 2918335380,
@@ -317,9 +278,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.28999996185302734,
-            "medianMs": 0.02500009536743164,
-            "p95Ms": 0.034999966621398926,
+            "prepareMs": 0.2749999761581421,
+            "medianMs": 0.029999971389770508,
+            "p95Ms": 0.040000081062316895,
             "resultRows": 5,
             "checksum": 2918335380,
             "verified": true
@@ -327,19 +288,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 26.710000038146973,
-            "medianMs": 20.699999928474426,
-            "p95Ms": 21.545000076293945,
-            "resultRows": 5,
-            "checksum": 2918335380,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 4.5950000286102295,
-            "medianMs": 0.44499993324279785,
-            "p95Ms": 0.7199999094009399,
+            "prepareMs": 0.30500006675720215,
+            "medianMs": 0.13499999046325684,
+            "p95Ms": 0.1650000810623169,
             "resultRows": 5,
             "checksum": 2918335380,
             "verified": true
@@ -350,7 +301,7 @@
         "id": "s4",
         "name": "Keyed range window",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT order_id, status, total FROM orders WHERE order_id >= 250 AND order_id < 350 ORDER BY order_id LIMIT 10",
         "tables": ["orders"],
         "expectedRows": 10,
@@ -359,10 +310,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.4549999237060547,
-            "medianMs": 0.309999942779541,
-            "p95Ms": 3.450000047683716,
-            "cachedMedianMs": 0.11000001430511475,
+            "prepareMs": 0.4450000524520874,
+            "medianMs": 0.41499996185302734,
+            "p95Ms": 4.0950000286102295,
+            "cachedMedianMs": 0.16499996185302734,
             "peakMemoryBytes": 24914,
             "resultRows": 10,
             "checksum": 2685055240,
@@ -371,9 +322,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.19000005722045898,
-            "medianMs": 0.04499995708465576,
-            "p95Ms": 0.0549999475479126,
+            "prepareMs": 0.17499995231628418,
+            "medianMs": 0.0549999475479126,
+            "p95Ms": 0.0849999189376831,
             "resultRows": 10,
             "checksum": 2685055240,
             "verified": true
@@ -381,19 +332,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 23.050000071525574,
-            "medianMs": 21.05999994277954,
-            "p95Ms": 27.91000008583069,
-            "resultRows": 10,
-            "checksum": 2685055240,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.615000009536743,
-            "medianMs": 0.6949999332427979,
-            "p95Ms": 1.0350000858306885,
+            "prepareMs": 0.4049999713897705,
+            "medianMs": 0.13499999046325684,
+            "p95Ms": 0.17499995231628418,
             "resultRows": 10,
             "checksum": 2685055240,
             "verified": true
@@ -404,7 +345,7 @@
         "id": "s5",
         "name": "Order exists check",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT COUNT(*) AS found FROM orders WHERE order_id = 500",
         "tables": ["orders"],
         "expectedRows": 1,
@@ -413,10 +354,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.49000000953674316,
-            "medianMs": 0.2250000238418579,
-            "p95Ms": 3.774999976158142,
-            "cachedMedianMs": 0.11000001430511475,
+            "prepareMs": 0.3700000047683716,
+            "medianMs": 0.26999998092651367,
+            "p95Ms": 1.4250000715255737,
+            "cachedMedianMs": 0.16999995708465576,
             "peakMemoryBytes": 12257,
             "resultRows": 1,
             "checksum": 1962762164,
@@ -425,9 +366,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.20500004291534424,
+            "prepareMs": 0.17500007152557373,
             "medianMs": 0.009999990463256836,
-            "p95Ms": 0.014999985694885254,
+            "p95Ms": 0.019999980926513672,
             "resultRows": 1,
             "checksum": 1962762164,
             "verified": true
@@ -435,19 +376,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 22.074999928474426,
-            "medianMs": 21.27999997138977,
-            "p95Ms": 21.664999961853027,
-            "resultRows": 1,
-            "checksum": 1962762164,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.3350000381469727,
-            "medianMs": 0.13499999046325684,
-            "p95Ms": 0.2749999761581421,
+            "prepareMs": 0.4100000858306885,
+            "medianMs": 0.11500000953674316,
+            "p95Ms": 0.13499999046325684,
             "resultRows": 1,
             "checksum": 1962762164,
             "verified": true
@@ -458,7 +389,7 @@
         "id": "q2",
         "name": "Paid orders in a date range",
         "complexity": "simple",
-        "workload": "selective",
+        "workload": "oltp",
         "sql": "SELECT order_id, customer_id, total FROM orders WHERE status = 'paid' AND placed_at >= DATE '2025-04-01' AND placed_at < DATE '2025-07-01' ORDER BY total DESC, order_id LIMIT 25",
         "tables": ["orders"],
         "expectedRows": 25,
@@ -467,10 +398,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.45500004291534424,
-            "medianMs": 0.3799999952316284,
-            "p95Ms": 1.3550000190734863,
-            "cachedMedianMs": 0.12999999523162842,
+            "prepareMs": 0.4500000476837158,
+            "medianMs": 0.434999942779541,
+            "p95Ms": 4.25,
+            "cachedMedianMs": 0.18499994277954102,
             "peakMemoryBytes": 42119,
             "resultRows": 25,
             "checksum": 1243287058,
@@ -479,9 +410,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.09500002861022949,
-            "medianMs": 0.18000006675720215,
-            "p95Ms": 0.26499998569488525,
+            "prepareMs": 0.12000000476837158,
+            "medianMs": 0.16000008583068848,
+            "p95Ms": 0.3200000524520874,
             "resultRows": 25,
             "checksum": 1243287058,
             "verified": true
@@ -489,19 +420,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 30.78500008583069,
-            "medianMs": 21.084999918937683,
-            "p95Ms": 22.144999980926514,
-            "resultRows": 25,
-            "checksum": 1243287058,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.259999990463257,
-            "medianMs": 0.6200000047683716,
-            "p95Ms": 0.9800000190734863,
+            "prepareMs": 0.5349999666213989,
+            "medianMs": 0.33500003814697266,
+            "p95Ms": 0.36500000953674316,
             "resultRows": 25,
             "checksum": 1243287058,
             "verified": true
@@ -512,7 +433,7 @@
         "id": "q3",
         "name": "Revenue by order status",
         "complexity": "moderate",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT status, COUNT(*) AS orders, SUM(total) AS revenue, AVG(total) AS avg_order FROM orders GROUP BY status ORDER BY revenue DESC",
         "tables": ["orders"],
         "expectedRows": 4,
@@ -521,10 +442,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.3999999761581421,
-            "medianMs": 0.3500000238418579,
-            "p95Ms": 1.6549999713897705,
-            "cachedMedianMs": 0.17500007152557373,
+            "prepareMs": 0.49000000953674316,
+            "medianMs": 0.31000006198883057,
+            "p95Ms": 1.2799999713897705,
+            "cachedMedianMs": 0.1499999761581421,
             "peakMemoryBytes": 16756,
             "resultRows": 4,
             "checksum": 2651821803,
@@ -533,9 +454,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.18500006198883057,
-            "medianMs": 0.3049999475479126,
-            "p95Ms": 0.43000006675720215,
+            "prepareMs": 0.21500003337860107,
+            "medianMs": 0.31000006198883057,
+            "p95Ms": 0.42500007152557373,
             "resultRows": 4,
             "checksum": 2651821803,
             "verified": true
@@ -543,19 +464,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 22.625,
-            "medianMs": 21.335000038146973,
-            "p95Ms": 21.539999961853027,
-            "resultRows": 4,
-            "checksum": 2651821803,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 4.194999933242798,
+            "prepareMs": 0.4950000047683716,
             "medianMs": 0.4750000238418579,
-            "p95Ms": 0.8700000047683716,
+            "p95Ms": 0.5,
             "resultRows": 4,
             "checksum": 2651821803,
             "verified": true
@@ -566,7 +477,7 @@
         "id": "q4",
         "name": "Top customers by captured revenue",
         "complexity": "moderate",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT c.customer_id, c.segment, SUM(p.captured_amount) AS revenue FROM customers c JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY c.customer_id, c.segment ORDER BY revenue DESC, c.customer_id LIMIT 20",
         "tables": ["customers", "orders", "payments"],
         "expectedRows": 20,
@@ -575,10 +486,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.26499998569488525,
-            "medianMs": 2.009999990463257,
-            "p95Ms": 4.9700000286102295,
-            "cachedMedianMs": 0.13999998569488525,
+            "prepareMs": 0.2200000286102295,
+            "medianMs": 2.0800000429153442,
+            "p95Ms": 5.465000033378601,
+            "cachedMedianMs": 0.18000006675720215,
             "peakMemoryBytes": 174679,
             "resultRows": 20,
             "checksum": 3242348960,
@@ -587,9 +498,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.1950000524520874,
-            "medianMs": 0.8300000429153442,
-            "p95Ms": 0.9100000858306885,
+            "prepareMs": 0.18500006198883057,
+            "medianMs": 0.8400000333786011,
+            "p95Ms": 0.9099999666213989,
             "resultRows": 20,
             "checksum": 3242348960,
             "verified": true
@@ -597,19 +508,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 22.3400000333786,
-            "medianMs": 21.8400000333786,
-            "p95Ms": 22.514999985694885,
-            "resultRows": 20,
-            "checksum": 3242348960,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 5.205000042915344,
-            "medianMs": 0.9800000190734863,
-            "p95Ms": 1.1699999570846558,
+            "prepareMs": 0.41999995708465576,
+            "medianMs": 1.1349999904632568,
+            "p95Ms": 1.3700000047683716,
             "resultRows": 20,
             "checksum": 3242348960,
             "verified": true
@@ -620,7 +521,7 @@
         "id": "q5",
         "name": "Category revenue after discounts",
         "complexity": "moderate",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT p.category, SUM(i.quantity * i.unit_price * (1 - i.discount_pct)) AS net_revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category ORDER BY net_revenue DESC",
         "tables": ["order_items", "products"],
         "expectedRows": 5,
@@ -629,10 +530,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.19000005722045898,
-            "medianMs": 1.100000023841858,
-            "p95Ms": 4.769999980926514,
-            "cachedMedianMs": 0.125,
+            "prepareMs": 0.18000006675720215,
+            "medianMs": 1.1100000143051147,
+            "p95Ms": 2.799999952316284,
+            "cachedMedianMs": 0.19499993324279785,
             "peakMemoryBytes": 133607,
             "resultRows": 5,
             "checksum": 4182359534,
@@ -641,9 +542,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.125,
-            "medianMs": 1.5750000476837158,
-            "p95Ms": 1.659999966621399,
+            "prepareMs": 0.10500001907348633,
+            "medianMs": 1.6100000143051147,
+            "p95Ms": 1.8550000190734863,
             "resultRows": 5,
             "checksum": 2904312021,
             "verified": true
@@ -651,19 +552,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.549999952316284,
-            "medianMs": 22.365000009536743,
-            "p95Ms": 23.225000023841858,
-            "resultRows": 5,
-            "checksum": 4182359534,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.1850000619888306,
-            "medianMs": 0.7949999570846558,
-            "p95Ms": 1.0099999904632568,
+            "prepareMs": 0.5149999856948853,
+            "medianMs": 1.3599998950958252,
+            "p95Ms": 1.4450000524520874,
             "resultRows": 5,
             "checksum": 4182359534,
             "verified": true
@@ -674,7 +565,7 @@
         "id": "q6",
         "name": "Repeat customers without returns",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "WITH returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id) SELECT o.customer_id, COUNT(*) AS orders FROM orders o WHERE o.order_id NOT IN (SELECT order_id FROM returned_orders) GROUP BY o.customer_id HAVING COUNT(*) >= 2",
         "tables": ["orders", "order_items", "returns"],
         "expectedRows": 180,
@@ -683,10 +574,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 1.459999918937683,
-            "medianMs": 0.8299999237060547,
-            "p95Ms": 3.565000057220459,
-            "cachedMedianMs": 0.16999995708465576,
+            "prepareMs": 0.7249999046325684,
+            "medianMs": 0.9700000286102295,
+            "p95Ms": 2.0749999284744263,
+            "cachedMedianMs": 0.24500000476837158,
             "peakMemoryBytes": 38398,
             "resultRows": 180,
             "checksum": 3011239883,
@@ -695,9 +586,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.5499999523162842,
-            "medianMs": 0.7799999713897705,
-            "p95Ms": 0.8999999761581421,
+            "prepareMs": 0.6450001001358032,
+            "medianMs": 0.8949999809265137,
+            "p95Ms": 0.9700000286102295,
             "resultRows": 180,
             "checksum": 3011239883,
             "verified": true
@@ -705,19 +596,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 22.9099999666214,
-            "medianMs": 22.950000047683716,
-            "p95Ms": 36.33999991416931,
-            "resultRows": 180,
-            "checksum": 3011239883,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 4.060000061988831,
-            "medianMs": 0.7200000286102295,
-            "p95Ms": 0.9900000095367432,
+            "prepareMs": 0.4299999475479126,
+            "medianMs": 1,
+            "p95Ms": 1.4399999380111694,
             "resultRows": 180,
             "checksum": 3011239883,
             "verified": true
@@ -728,7 +609,7 @@
         "id": "q7",
         "name": "Top products within each category",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
         "tables": ["order_items", "products"],
         "expectedRows": 15,
@@ -737,10 +618,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.8250000476837158,
-            "medianMs": 2.0399999618530273,
-            "p95Ms": 3.284999966621399,
-            "cachedMedianMs": 0.14499998092651367,
+            "prepareMs": 0.6699999570846558,
+            "medianMs": 2.1299999952316284,
+            "p95Ms": 3.0199999809265137,
+            "cachedMedianMs": 0.20500004291534424,
             "peakMemoryBytes": 121942,
             "resultRows": 15,
             "checksum": 1947833560,
@@ -749,9 +630,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.625,
-            "medianMs": 2.0549999475479126,
-            "p95Ms": 2.1050000190734863,
+            "prepareMs": 0.5549999475479126,
+            "medianMs": 2.0399999618530273,
+            "p95Ms": 2.1899999380111694,
             "resultRows": 15,
             "checksum": 1947833560,
             "verified": true
@@ -759,19 +640,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 23.649999976158142,
-            "medianMs": 22.880000114440918,
-            "p95Ms": 23.430000066757202,
-            "resultRows": 15,
-            "checksum": 1947833560,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.5549999475479126,
-            "medianMs": 1.4850000143051147,
-            "p95Ms": 1.9799998998641968,
+            "prepareMs": 0.5400000810623169,
+            "medianMs": 1.6400001049041748,
+            "p95Ms": 1.9550000429153442,
             "resultRows": 15,
             "checksum": 1947833560,
             "verified": true
@@ -782,7 +653,7 @@
         "id": "q8",
         "name": "Monthly cohort revenue and return rate",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "WITH cohorts AS (SELECT customer_id AS customer_id, DATE_TRUNC('month', joined_at) AS cohort_month FROM customers), returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id), captured AS (SELECT k.cohort_month AS cohort_month, o.customer_id AS customer_id, SUM(p.captured_amount) AS revenue, COUNT(*) AS orders FROM payments p JOIN orders o ON o.order_id = p.order_id JOIN cohorts k ON k.customer_id = o.customer_id WHERE p.status = 'captured' GROUP BY k.cohort_month, o.customer_id) SELECT cohort_month, COUNT(*) AS customers, SUM(revenue) AS revenue FROM captured GROUP BY cohort_month ORDER BY cohort_month",
         "tables": ["customers", "orders", "order_items", "returns", "payments"],
         "expectedRows": 12,
@@ -791,10 +662,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.31999993324279785,
-            "medianMs": 1.3100000619888306,
-            "p95Ms": 1.4399999380111694,
-            "cachedMedianMs": 0.125,
+            "prepareMs": 0.2849999666213989,
+            "medianMs": 1.4649999141693115,
+            "p95Ms": 2.3249999284744263,
+            "cachedMedianMs": 0.20500004291534424,
             "peakMemoryBytes": 109615,
             "resultRows": 12,
             "checksum": 1815198888,
@@ -803,9 +674,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.2250000238418579,
-            "medianMs": 1.065000057220459,
-            "p95Ms": 1.2200000286102295,
+            "prepareMs": 0.24500000476837158,
+            "medianMs": 1.0699999332427979,
+            "p95Ms": 1.3300000429153442,
             "resultRows": 12,
             "checksum": 1815198888,
             "verified": true
@@ -813,19 +684,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.975000023841858,
-            "medianMs": 21.8400000333786,
-            "p95Ms": 22.799999952316284,
-            "resultRows": 12,
-            "checksum": 1815198888,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.4200000762939453,
-            "medianMs": 0.8350000381469727,
-            "p95Ms": 1.340000033378601,
+            "prepareMs": 0.44999992847442627,
+            "medianMs": 0.8450000286102295,
+            "p95Ms": 0.940000057220459,
             "resultRows": 12,
             "checksum": 1815198888,
             "verified": true
@@ -836,7 +697,7 @@
         "id": "q9",
         "name": "Region and segment revenue matrix",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "WITH per_customer AS (SELECT r.name AS region, c.segment AS segment, c.customer_id AS customer_id, SUM(p.captured_amount) AS revenue FROM regions r JOIN customers c ON c.region_id = r.region_id JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY r.name, c.segment, c.customer_id) SELECT region, segment, COUNT(*) AS customers, SUM(revenue) AS revenue FROM per_customer GROUP BY region, segment ORDER BY region, segment",
         "tables": ["regions", "customers", "orders", "payments"],
         "expectedRows": 48,
@@ -845,10 +706,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.1950000524520874,
-            "medianMs": 1.7400000095367432,
-            "p95Ms": 3.5,
-            "cachedMedianMs": 0.16999995708465576,
+            "prepareMs": 0.17500007152557373,
+            "medianMs": 1.4550000429153442,
+            "p95Ms": 3.3499999046325684,
+            "cachedMedianMs": 0.2950000762939453,
             "peakMemoryBytes": 220287,
             "resultRows": 48,
             "checksum": 1834383778,
@@ -857,9 +718,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.15999996662139893,
-            "medianMs": 1.2450000047683716,
-            "p95Ms": 1.2750000953674316,
+            "prepareMs": 0.18499994277954102,
+            "medianMs": 1.2200000286102295,
+            "p95Ms": 1.2799999713897705,
             "resultRows": 48,
             "checksum": 1834383778,
             "verified": true
@@ -867,19 +728,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 20.945000052452087,
-            "medianMs": 22.384999990463257,
-            "p95Ms": 23.174999952316284,
-            "resultRows": 48,
-            "checksum": 1834383778,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 2.9700000286102295,
-            "medianMs": 1.209999918937683,
-            "p95Ms": 1.4250000715255737,
+            "prepareMs": 0.44499993324279785,
+            "medianMs": 1.1899999380111694,
+            "p95Ms": 1.340000033378601,
             "resultRows": 48,
             "checksum": 1834383778,
             "verified": true
@@ -890,7 +741,7 @@
         "id": "q10",
         "name": "Return rate by product category",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT p.category, COUNT(*) AS items, COUNT(r.item_id) AS returns, COUNT(r.item_id) * 1.0 / COUNT(*) AS return_rate FROM products p JOIN order_items i ON i.product_id = p.product_id LEFT JOIN (SELECT DISTINCT item_id AS item_id FROM returns) r ON r.item_id = i.item_id GROUP BY p.category ORDER BY p.category",
         "tables": ["products", "order_items", "returns"],
         "expectedRows": 5,
@@ -899,10 +750,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.16499996185302734,
-            "medianMs": 0.9700000286102295,
-            "p95Ms": 3.5149999856948853,
-            "cachedMedianMs": 0.1700000762939453,
+            "prepareMs": 0.14499998092651367,
+            "medianMs": 1.0750000476837158,
+            "p95Ms": 2.1399999856948853,
+            "cachedMedianMs": 0.19499993324279785,
             "peakMemoryBytes": 123222,
             "resultRows": 5,
             "checksum": 2882466819,
@@ -911,9 +762,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.21499991416931152,
-            "medianMs": 13.97000002861023,
-            "p95Ms": 14.069999933242798,
+            "prepareMs": 0.23500001430511475,
+            "medianMs": 14.434999942779541,
+            "p95Ms": 14.75,
             "resultRows": 5,
             "checksum": 2882466819,
             "verified": true
@@ -921,19 +772,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.5900000333786,
-            "medianMs": 21.7849999666214,
-            "p95Ms": 22.800000071525574,
-            "resultRows": 5,
-            "checksum": 2882466819,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.5549999475479126,
-            "medianMs": 0.7899999618530273,
-            "p95Ms": 1.4049999713897705,
+            "prepareMs": 0.45500004291534424,
+            "medianMs": 1.1200000047683716,
+            "p95Ms": 1.34499990940094,
             "resultRows": 5,
             "checksum": 2882466819,
             "verified": true
@@ -944,7 +785,7 @@
         "id": "q11",
         "name": "Tax collected by jurisdiction",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT j.name, SUM(t.tax_amount) AS tax_collected FROM order_taxes t JOIN tax_rates r ON r.tax_rate_id = t.tax_rate_id JOIN tax_jurisdictions j ON j.jurisdiction_id = r.jurisdiction_id GROUP BY j.name ORDER BY tax_collected DESC",
         "tables": ["order_taxes", "tax_rates", "tax_jurisdictions"],
         "expectedRows": 24,
@@ -953,10 +794,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.125,
-            "medianMs": 0.5299999713897705,
-            "p95Ms": 4.064999938011169,
-            "cachedMedianMs": 0.1350001096725464,
+            "prepareMs": 0.09500002861022949,
+            "medianMs": 0.6399999856948853,
+            "p95Ms": 4.365000009536743,
+            "cachedMedianMs": 0.18500006198883057,
             "peakMemoryBytes": 99719,
             "resultRows": 24,
             "checksum": 1706384325,
@@ -965,9 +806,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.10500001907348633,
-            "medianMs": 1.2899999618530273,
-            "p95Ms": 1.4149999618530273,
+            "prepareMs": 0.15500009059906006,
+            "medianMs": 1.334999918937683,
+            "p95Ms": 1.4299999475479126,
             "resultRows": 24,
             "checksum": 1706384325,
             "verified": true
@@ -975,19 +816,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.430000066757202,
-            "medianMs": 22.27500009536743,
-            "p95Ms": 22.65000009536743,
-            "resultRows": 24,
-            "checksum": 1706384325,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.190000057220459,
-            "medianMs": 1.3100000619888306,
-            "p95Ms": 1.4499999284744263,
+            "prepareMs": 0.5100001096725464,
+            "medianMs": 1.3799999952316284,
+            "p95Ms": 1.5600000619888306,
             "resultRows": 24,
             "checksum": 1706384325,
             "verified": true
@@ -998,7 +829,7 @@
         "id": "q12",
         "name": "Fulfillment volume by warehouse",
         "complexity": "moderate",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "WITH per_shipment AS (SELECT w.name AS name, s.shipment_id AS shipment_id, SUM(si.quantity) AS units FROM warehouses w JOIN shipments s ON s.warehouse_id = w.warehouse_id JOIN shipment_items si ON si.shipment_id = s.shipment_id GROUP BY w.name, s.shipment_id) SELECT name, COUNT(*) AS shipments, SUM(units) AS units FROM per_shipment GROUP BY name ORDER BY units DESC",
         "tables": ["shipments", "shipment_items", "warehouses"],
         "expectedRows": 8,
@@ -1007,10 +838,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.14499998092651367,
-            "medianMs": 1.5099999904632568,
-            "p95Ms": 1.9900000095367432,
-            "cachedMedianMs": 0.12000000476837158,
+            "prepareMs": 0.1499999761581421,
+            "medianMs": 1.6349999904632568,
+            "p95Ms": 4.870000004768372,
+            "cachedMedianMs": 0.30000007152557373,
             "peakMemoryBytes": 241391,
             "resultRows": 8,
             "checksum": 1360082373,
@@ -1019,9 +850,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.13999998569488525,
-            "medianMs": 1.5600000619888306,
-            "p95Ms": 1.7350000143051147,
+            "prepareMs": 0.14499998092651367,
+            "medianMs": 1.6100000143051147,
+            "p95Ms": 1.709999918937683,
             "resultRows": 8,
             "checksum": 1360082373,
             "verified": true
@@ -1029,19 +860,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.43499994277954,
-            "medianMs": 22.06000006198883,
-            "p95Ms": 23.06499993801117,
-            "resultRows": 8,
-            "checksum": 1360082373,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.2649999856948853,
-            "medianMs": 1.3799999952316284,
-            "p95Ms": 1.7649999856948853,
+            "prepareMs": 0.36000001430511475,
+            "medianMs": 1.5,
+            "p95Ms": 1.7599999904632568,
             "resultRows": 8,
             "checksum": 1360082373,
             "verified": true
@@ -1052,7 +873,7 @@
         "id": "q13",
         "name": "Supplier inventory ledger",
         "complexity": "moderate",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT s.name, COUNT(*) AS movements, SUM(m.quantity_delta) AS net_units FROM suppliers s JOIN inventory_movements m ON m.supplier_id = s.supplier_id GROUP BY s.name ORDER BY movements DESC",
         "tables": ["inventory_movements", "suppliers"],
         "expectedRows": 40,
@@ -1061,11 +882,11 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.09500002861022949,
-            "medianMs": 0.684999942779541,
-            "p95Ms": 1.0099999904632568,
-            "cachedMedianMs": 0.13499999046325684,
-            "peakMemoryBytes": 105039,
+            "prepareMs": 0.10000002384185791,
+            "medianMs": 0.5,
+            "p95Ms": 1.3550000190734863,
+            "cachedMedianMs": 0.15999996662139893,
+            "peakMemoryBytes": 100352,
             "resultRows": 40,
             "checksum": 3439141575,
             "verified": true
@@ -1073,9 +894,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.1099998950958252,
-            "medianMs": 1.8799999952316284,
-            "p95Ms": 1.9550000429153442,
+            "prepareMs": 0.12999999523162842,
+            "medianMs": 1.975000023841858,
+            "p95Ms": 2.009999990463257,
             "resultRows": 40,
             "checksum": 3439141575,
             "verified": true
@@ -1083,19 +904,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.43500006198883,
-            "medianMs": 22.40499997138977,
-            "p95Ms": 23.125,
-            "resultRows": 40,
-            "checksum": 3439141575,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.5149999856948853,
-            "medianMs": 0.8700000047683716,
-            "p95Ms": 1.1850000619888306,
+            "prepareMs": 0.30000007152557373,
+            "medianMs": 1.5199999809265137,
+            "p95Ms": 1.7300000190734863,
             "resultRows": 40,
             "checksum": 3439141575,
             "verified": true
@@ -1106,7 +917,7 @@
         "id": "q14",
         "name": "Payment transaction funnel",
         "complexity": "simple",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT kind, status, COUNT(*) AS transactions, SUM(amount) AS amount FROM payment_transactions GROUP BY kind, status ORDER BY kind, status",
         "tables": ["payment_transactions"],
         "expectedRows": 4,
@@ -1115,10 +926,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.38999998569488525,
-            "medianMs": 0.7200000286102295,
-            "p95Ms": 1.2599999904632568,
-            "cachedMedianMs": 0.12999999523162842,
+            "prepareMs": 3.649999976158142,
+            "medianMs": 0.8650000095367432,
+            "p95Ms": 4.460000038146973,
+            "cachedMedianMs": 0.12000000476837158,
             "peakMemoryBytes": 41402,
             "resultRows": 4,
             "checksum": 1737592820,
@@ -1127,9 +938,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.09999990463256836,
-            "medianMs": 0.690000057220459,
-            "p95Ms": 0.7450000047683716,
+            "prepareMs": 0.09000003337860107,
+            "medianMs": 0.7549999952316284,
+            "p95Ms": 0.7849999666213989,
             "resultRows": 4,
             "checksum": 1737592820,
             "verified": true
@@ -1137,19 +948,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.59500002861023,
-            "medianMs": 21.454999923706055,
-            "p95Ms": 22.2150000333786,
-            "resultRows": 4,
-            "checksum": 1737592820,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.4100000858306885,
-            "medianMs": 0.5149999856948853,
-            "p95Ms": 0.7300000190734863,
+            "prepareMs": 0.2549999952316284,
+            "medianMs": 0.6799999475479126,
+            "p95Ms": 0.7050000429153442,
             "resultRows": 4,
             "checksum": 1737592820,
             "verified": true
@@ -1160,7 +961,7 @@
         "id": "q15",
         "name": "Discount and tax burden by order status",
         "complexity": "complex",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "WITH discounts AS (SELECT order_id AS order_id, SUM(amount) AS amount FROM order_discounts GROUP BY order_id), taxes AS (SELECT order_id AS order_id, SUM(tax_amount) AS amount FROM order_taxes GROUP BY order_id) SELECT o.status, SUM(COALESCE(d.amount, 0)) AS discounts, SUM(COALESCE(t.amount, 0)) AS taxes FROM orders o LEFT JOIN discounts d ON d.order_id = o.order_id LEFT JOIN taxes t ON t.order_id = o.order_id GROUP BY o.status ORDER BY o.status",
         "tables": ["orders", "order_discounts", "order_taxes"],
         "expectedRows": 4,
@@ -1169,10 +970,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.21500003337860107,
-            "medianMs": 1.7600001096725464,
-            "p95Ms": 2.9700000286102295,
-            "cachedMedianMs": 0.17500007152557373,
+            "prepareMs": 0.1950000524520874,
+            "medianMs": 1.7699999809265137,
+            "p95Ms": 2.9550000429153442,
+            "cachedMedianMs": 0.1549999713897705,
             "peakMemoryBytes": 156710,
             "resultRows": 4,
             "checksum": 69998926,
@@ -1181,9 +982,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.2849999666213989,
-            "medianMs": 1.5,
-            "p95Ms": 1.6899999380111694,
+            "prepareMs": 0.36000001430511475,
+            "medianMs": 1.4899998903274536,
+            "p95Ms": 1.7599999904632568,
             "resultRows": 4,
             "checksum": 69998926,
             "verified": true
@@ -1191,19 +992,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 24.835000038146973,
-            "medianMs": 22.475000023841858,
-            "p95Ms": 23.039999961853027,
-            "resultRows": 4,
-            "checksum": 69998926,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.3550000190734863,
-            "medianMs": 1.0550000667572021,
-            "p95Ms": 1.165000081062317,
+            "prepareMs": 0.33500003814697266,
+            "medianMs": 1.465000033378601,
+            "p95Ms": 1.5549999475479126,
             "resultRows": 4,
             "checksum": 69998926,
             "verified": true
@@ -1214,7 +1005,7 @@
         "id": "q16",
         "name": "Support message text search",
         "complexity": "simple",
-        "workload": "analytical",
+        "workload": "olap",
         "sql": "SELECT message_id, ticket_id, author_type, sent_at FROM support_messages WHERE body LIKE '%message 12%' ORDER BY sent_at DESC, message_id LIMIT 25",
         "tables": ["support_messages"],
         "expectedRows": 25,
@@ -1223,10 +1014,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.4450000524520874,
-            "medianMs": 0.43999993801116943,
-            "p95Ms": 0.5349999666213989,
-            "cachedMedianMs": 0.15000009536743164,
+            "prepareMs": 0.6650000810623169,
+            "medianMs": 0.4299999475479126,
+            "p95Ms": 1.684999942779541,
+            "cachedMedianMs": 0.17499995231628418,
             "peakMemoryBytes": 180345,
             "resultRows": 25,
             "checksum": 720090480,
@@ -1236,8 +1027,8 @@
             "engine": "sqlite",
             "supported": true,
             "prepareMs": 0.13999998569488525,
-            "medianMs": 0.3799999952316284,
-            "p95Ms": 0.5049999952316284,
+            "medianMs": 0.33500003814697266,
+            "p95Ms": 0.49000000953674316,
             "resultRows": 25,
             "checksum": 720090480,
             "verified": true
@@ -1245,19 +1036,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 21.790000081062317,
-            "medianMs": 21.634999990463257,
-            "p95Ms": 21.790000081062317,
-            "resultRows": 25,
-            "checksum": 720090480,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "prepareMs": 3.309999942779541,
-            "medianMs": 0.6749999523162842,
-            "p95Ms": 0.9700000286102295,
+            "prepareMs": 0.3999999761581421,
+            "medianMs": 0.4650000333786011,
+            "p95Ms": 0.5450000762939453,
             "resultRows": 25,
             "checksum": 720090480,
             "verified": true
@@ -1266,30 +1047,29 @@
       }
     ],
     "totalMsByEngine": {
-      "minnow": 17.889999985694885,
-      "sqlite": 29.440000295639038,
-      "pglite": 456.05999994277954,
-      "duckdb": 15.735000014305115
+      "minnow": 18.604999899864197,
+      "sqlite": 30.22499990463257,
+      "pglite": 16.90000009536743
     },
     "supportedByEngine": {
       "minnow": 21,
       "sqlite": 21,
-      "pglite": 21,
-      "duckdb": 21
+      "pglite": 21
     },
     "passed": true
   },
   "writes": {
-    "datasetId": "63938d20-5e25-498d-a881-182ee61d8457",
+    "datasetId": "a895498e-5074-4de1-ba2a-9221a46685ff",
     "scale": 1,
     "sampleCount": 5,
-    "engines": ["minnow", "sqlite", "pglite", "duckdb"],
+    "engines": ["minnow", "sqlite", "pglite"],
     "tableColumns": ["key_id", "payload_num", "payload_text", "updated_at"],
     "cases": [
       {
         "id": "insert-1",
         "name": "Insert 1 row",
         "operation": "insert",
+        "workload": "oltp",
         "rows": 1,
         "seedRows": 0,
         "expectedTableRows": 1,
@@ -1298,9 +1078,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 2.9149999618530273,
-            "p95Ms": 3.090000033378601,
-            "rowsPerSecond": 343.0531777311973,
+            "medianMs": 3.5600000619888306,
+            "p95Ms": 5.629999995231628,
+            "rowsPerSecond": 280.8988715133167,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1308,9 +1088,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.4350000619888306,
-            "p95Ms": 2.559999942779541,
-            "rowsPerSecond": 410.6776076150207,
+            "medianMs": 2.524999976158142,
+            "p95Ms": 5.875,
+            "rowsPerSecond": 396.03960769992875,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1318,19 +1098,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 21.729999899864197,
-            "p95Ms": 22.894999980926514,
-            "rowsPerSecond": 46.01932832987494,
-            "tableRows": 1,
-            "checksum": 3378540503,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 0.44499993324279785,
-            "p95Ms": 0.875,
-            "rowsPerSecond": 2247.191348351027,
+            "medianMs": 23.5,
+            "p95Ms": 25.68499994277954,
+            "rowsPerSecond": 42.5531914893617,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1342,6 +1112,7 @@
         "id": "insert-100",
         "name": "Insert 100 rows",
         "operation": "insert",
+        "workload": "oltp",
         "rows": 100,
         "seedRows": 0,
         "expectedTableRows": 100,
@@ -1350,9 +1121,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 3.5649999380111694,
-            "p95Ms": 3.674999952316284,
-            "rowsPerSecond": 28050.49137133721,
+            "medianMs": 3.5850000381469727,
+            "p95Ms": 4.195000052452087,
+            "rowsPerSecond": 27894.002492588075,
             "tableRows": 100,
             "checksum": 2448242640,
             "verified": true
@@ -1360,9 +1131,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 3.1399999856948853,
-            "p95Ms": 3.459999918937683,
-            "rowsPerSecond": 31847.13390304997,
+            "medianMs": 2.8850001096725464,
+            "p95Ms": 3.8450000286102295,
+            "rowsPerSecond": 34662.043742989736,
             "tableRows": 100,
             "checksum": 2448242640,
             "verified": true
@@ -1370,19 +1141,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 22.359999895095825,
-            "p95Ms": 23.144999980926514,
-            "rowsPerSecond": 4472.27193511449,
-            "tableRows": 100,
-            "checksum": 2448242640,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 0.5750000476837158,
-            "p95Ms": 1.034999966621399,
-            "rowsPerSecond": 173913.02905596618,
+            "medianMs": 23.694999933242798,
+            "p95Ms": 25.460000038146973,
+            "rowsPerSecond": 4220.299653164609,
             "tableRows": 100,
             "checksum": 2448242640,
             "verified": true
@@ -1394,6 +1155,7 @@
         "id": "insert-10000",
         "name": "Insert 10,000 rows",
         "operation": "insert",
+        "workload": "olap",
         "rows": 10000,
         "seedRows": 0,
         "expectedTableRows": 10000,
@@ -1402,9 +1164,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 21.055000066757202,
-            "p95Ms": 21.924999952316284,
-            "rowsPerSecond": 474946.56700517196,
+            "medianMs": 21.889999985694885,
+            "p95Ms": 23.65499997138977,
+            "rowsPerSecond": 456829.60285678395,
             "tableRows": 10000,
             "checksum": 3631069831,
             "verified": true
@@ -1412,9 +1174,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 43.049999952316284,
-            "p95Ms": 49.59500002861023,
-            "rowsPerSecond": 232288.03742337646,
+            "medianMs": 40.75499999523163,
+            "p95Ms": 49.110000014305115,
+            "rowsPerSecond": 245368.66645000633,
             "tableRows": 10000,
             "checksum": 3631069831,
             "verified": true
@@ -1422,19 +1184,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 91.93999993801117,
-            "p95Ms": 93.3199999332428,
-            "rowsPerSecond": 108766.58697783678,
-            "tableRows": 10000,
-            "checksum": 3631069831,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 4.649999976158142,
-            "p95Ms": 5.009999990463257,
-            "rowsPerSecond": 2150537.6454350133,
+            "medianMs": 93.1800000667572,
+            "p95Ms": 96.66000008583069,
+            "rowsPerSecond": 107319.16712637553,
             "tableRows": 10000,
             "checksum": 3631069831,
             "verified": true
@@ -1446,6 +1198,7 @@
         "id": "insert-100000",
         "name": "Insert 100,000 rows",
         "operation": "insert",
+        "workload": "olap",
         "rows": 100000,
         "seedRows": 0,
         "expectedTableRows": 100000,
@@ -1454,9 +1207,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 160.15499997138977,
-            "p95Ms": 173.34499990940094,
-            "rowsPerSecond": 624395.1173417257,
+            "medianMs": 163.31000006198883,
+            "p95Ms": 191.4300000667572,
+            "rowsPerSecond": 612332.3737801863,
             "tableRows": 100000,
             "checksum": 1988997717,
             "verified": true
@@ -1464,9 +1217,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 434.70500004291534,
-            "p95Ms": 467.13499999046326,
-            "rowsPerSecond": 230041.0623069155,
+            "medianMs": 451.7900000810623,
+            "p95Ms": 480.1600000858307,
+            "rowsPerSecond": 221341.7737932613,
             "tableRows": 100000,
             "checksum": 1988997717,
             "verified": true
@@ -1474,19 +1227,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 748.5449999570847,
-            "p95Ms": 778.3300000429153,
-            "rowsPerSecond": 133592.50279640258,
-            "tableRows": 100000,
-            "checksum": 1988997717,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 49.22499990463257,
-            "p95Ms": 50.4650000333786,
-            "rowsPerSecond": 2031488.0689433783,
+            "medianMs": 744.3949999809265,
+            "p95Ms": 774.0600000619888,
+            "rowsPerSecond": 134337.28061387068,
             "tableRows": 100000,
             "checksum": 1988997717,
             "verified": true
@@ -1498,6 +1241,7 @@
         "id": "update-1",
         "name": "Update 1 row",
         "operation": "update",
+        "workload": "oltp",
         "rows": 1,
         "seedRows": 1,
         "expectedTableRows": 1,
@@ -1506,9 +1250,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 2.975000023841858,
-            "p95Ms": 3.090000033378601,
-            "rowsPerSecond": 336.13445108770765,
+            "medianMs": 2.2549999952316284,
+            "p95Ms": 2.3899999856948853,
+            "rowsPerSecond": 443.45898098207414,
             "tableRows": 1,
             "checksum": 3001480155,
             "verified": true
@@ -1516,9 +1260,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 1.2799999713897705,
-            "p95Ms": 2.65500009059906,
-            "rowsPerSecond": 781.2500174622987,
+            "medianMs": 2.3899999856948853,
+            "p95Ms": 2.884999990463257,
+            "rowsPerSecond": 418.41004434535716,
             "tableRows": 1,
             "checksum": 3001480155,
             "verified": true
@@ -1526,19 +1270,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 36.295000076293945,
-            "p95Ms": 36.53999996185303,
-            "rowsPerSecond": 27.552004350404985,
-            "tableRows": 1,
-            "checksum": 3001480155,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 1.1449999809265137,
-            "p95Ms": 3.3350000381469727,
-            "rowsPerSecond": 873.3624599633772,
+            "medianMs": 35.74000000953674,
+            "p95Ms": 38.25,
+            "rowsPerSecond": 27.979854497290525,
             "tableRows": 1,
             "checksum": 3001480155,
             "verified": true
@@ -1550,6 +1284,7 @@
         "id": "update-100",
         "name": "Update 100 rows",
         "operation": "update",
+        "workload": "oltp",
         "rows": 100,
         "seedRows": 100,
         "expectedTableRows": 100,
@@ -1558,9 +1293,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 3.450000047683716,
-            "p95Ms": 3.700000047683716,
-            "rowsPerSecond": 28985.50684575749,
+            "medianMs": 3.475000023841858,
+            "p95Ms": 3.7649999856948853,
+            "rowsPerSecond": 28776.978219828306,
             "tableRows": 100,
             "checksum": 4161863616,
             "verified": true
@@ -1568,9 +1303,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.6200000047683716,
-            "p95Ms": 3.3399999141693115,
-            "rowsPerSecond": 38167.938861832474,
+            "medianMs": 2.59499990940094,
+            "p95Ms": 3.100000023841858,
+            "rowsPerSecond": 38535.64681745409,
             "tableRows": 100,
             "checksum": 4161863616,
             "verified": true
@@ -1578,19 +1313,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 36.40499997138977,
-            "p95Ms": 37.4099999666214,
-            "rowsPerSecond": 2746.8754313580207,
-            "tableRows": 100,
-            "checksum": 4161863616,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 1.4649999141693115,
-            "p95Ms": 1.6949999332427979,
-            "rowsPerSecond": 68259.38966467605,
+            "medianMs": 36.49000000953674,
+            "p95Ms": 37.079999923706055,
+            "rowsPerSecond": 2740.476842254447,
             "tableRows": 100,
             "checksum": 4161863616,
             "verified": true
@@ -1602,6 +1327,7 @@
         "id": "update-10000",
         "name": "Update 10,000 rows",
         "operation": "update",
+        "workload": "olap",
         "rows": 10000,
         "seedRows": 10000,
         "expectedTableRows": 10000,
@@ -1610,9 +1336,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 13.620000004768372,
-            "p95Ms": 13.84500002861023,
-            "rowsPerSecond": 734214.3903450068,
+            "medianMs": 14.794999957084656,
+            "p95Ms": 16.1599999666214,
+            "rowsPerSecond": 675904.0235895001,
             "tableRows": 10000,
             "checksum": 994742411,
             "verified": true
@@ -1620,9 +1346,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 29.12999999523163,
-            "p95Ms": 30.264999985694885,
-            "rowsPerSecond": 343288.705857773,
+            "medianMs": 22.205000042915344,
+            "p95Ms": 29.514999985694885,
+            "rowsPerSecond": 450349.01962049614,
             "tableRows": 10000,
             "checksum": 994742411,
             "verified": true
@@ -1630,19 +1356,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 114.88999998569489,
-            "p95Ms": 126.54499995708466,
-            "rowsPerSecond": 87039.77718900786,
-            "tableRows": 10000,
-            "checksum": 994742411,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 2.8249999284744263,
-            "p95Ms": 2.9850000143051147,
-            "rowsPerSecond": 3539823.098473585,
+            "medianMs": 115.01499998569489,
+            "p95Ms": 125.13499999046326,
+            "rowsPerSecond": 86945.18107415347,
             "tableRows": 10000,
             "checksum": 994742411,
             "verified": true
@@ -1654,6 +1370,7 @@
         "id": "upsert-1",
         "name": "Upsert 1 row",
         "operation": "upsert",
+        "workload": "oltp",
         "rows": 1,
         "seedRows": 1,
         "expectedTableRows": 1,
@@ -1662,9 +1379,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 2.9950000047683716,
-            "p95Ms": 3.1649999618530273,
-            "rowsPerSecond": 333.88981582901147,
+            "medianMs": 2.9149999618530273,
+            "p95Ms": 3.0950000286102295,
+            "rowsPerSecond": 343.0531777311973,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1672,9 +1389,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 1.834999918937683,
-            "p95Ms": 2.9199999570846558,
-            "rowsPerSecond": 544.9591521393196,
+            "medianMs": 2.4350000619888306,
+            "p95Ms": 2.5199999809265137,
+            "rowsPerSecond": 410.6776076150207,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1682,19 +1399,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 42.860000014305115,
-            "p95Ms": 43.0699999332428,
-            "rowsPerSecond": 23.331777873687265,
-            "tableRows": 1,
-            "checksum": 3378540503,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 1.875,
-            "p95Ms": 5.585000038146973,
-            "rowsPerSecond": 533.3333333333334,
+            "medianMs": 41.125,
+            "p95Ms": 42.375,
+            "rowsPerSecond": 24.316109422492403,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1706,6 +1413,7 @@
         "id": "upsert-100",
         "name": "Upsert 100 rows",
         "operation": "upsert",
+        "workload": "oltp",
         "rows": 100,
         "seedRows": 100,
         "expectedTableRows": 150,
@@ -1714,9 +1422,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 3.7950000762939453,
-            "p95Ms": 3.9800000190734863,
-            "rowsPerSecond": 26350.46060332527,
+            "medianMs": 4.014999985694885,
+            "p95Ms": 4.240000009536743,
+            "rowsPerSecond": 24906.600337806172,
             "tableRows": 150,
             "checksum": 3844696883,
             "verified": true
@@ -1724,9 +1432,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.9199999570846558,
-            "p95Ms": 3.1699999570846558,
-            "rowsPerSecond": 34246.5758457889,
+            "medianMs": 2.880000114440918,
+            "p95Ms": 4.730000019073486,
+            "rowsPerSecond": 34722.22084248513,
             "tableRows": 150,
             "checksum": 3844696883,
             "verified": true
@@ -1734,19 +1442,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 43.74500000476837,
-            "p95Ms": 44,
-            "rowsPerSecond": 2285.9755398125412,
-            "tableRows": 150,
-            "checksum": 3844696883,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 2.0800000429153442,
-            "p95Ms": 2.8550000190734863,
-            "rowsPerSecond": 48076.922084981896,
+            "medianMs": 43.24500000476837,
+            "p95Ms": 45.31000006198883,
+            "rowsPerSecond": 2312.406058248898,
             "tableRows": 150,
             "checksum": 3844696883,
             "verified": true
@@ -1758,6 +1456,7 @@
         "id": "upsert-10000",
         "name": "Upsert 10,000 rows",
         "operation": "upsert",
+        "workload": "olap",
         "rows": 10000,
         "seedRows": 10000,
         "expectedTableRows": 15000,
@@ -1766,9 +1465,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 20.709999918937683,
-            "p95Ms": 21.865000009536743,
-            "rowsPerSecond": 482858.5243429083,
+            "medianMs": 21.5349999666214,
+            "p95Ms": 22.580000042915344,
+            "rowsPerSecond": 464360.34434639884,
             "tableRows": 15000,
             "checksum": 1579950473,
             "verified": true
@@ -1776,9 +1475,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 45.36500000953674,
-            "p95Ms": 51.769999980926514,
-            "rowsPerSecond": 220434.2554369619,
+            "medianMs": 50.45999991893768,
+            "p95Ms": 51.93499994277954,
+            "rowsPerSecond": 198176.77400048886,
             "tableRows": 15000,
             "checksum": 1579950473,
             "verified": true
@@ -1786,19 +1485,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 131.09999990463257,
-            "p95Ms": 149.29999995231628,
-            "rowsPerSecond": 76277.65070384747,
-            "tableRows": 15000,
-            "checksum": 1579950473,
-            "verified": true
-          },
-          {
-            "engine": "duckdb",
-            "supported": true,
-            "medianMs": 8.855000019073486,
-            "p95Ms": 9.819999933242798,
-            "rowsPerSecond": 1129305.4746990635,
+            "medianMs": 132.68500006198883,
+            "p95Ms": 154.4800000190735,
+            "rowsPerSecond": 75366.46942252794,
             "tableRows": 15000,
             "checksum": 1579950473,
             "verified": true
@@ -1808,16 +1497,14 @@
       }
     ],
     "totalMsByEngine": {
-      "minnow": 235.23500001430511,
-      "sqlite": 566.4799998998642,
-      "pglite": 1289.8699996471405,
-      "duckdb": 73.1399997472763
+      "minnow": 241.33500003814697,
+      "sqlite": 580.9200001955032,
+      "pglite": 1289.070000052452
     },
     "supportedByEngine": {
       "minnow": 10,
       "sqlite": 10,
-      "pglite": 10,
-      "duckdb": 10
+      "pglite": 10
     },
     "passed": true
   },

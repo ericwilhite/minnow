@@ -682,6 +682,10 @@ describe("public SQL queries", () => {
         input,
       ),
     ).toThrow("UNION members must select the same number of columns");
+
+    const signedZero = compileQuery("SELECT -0 AS value UNION SELECT 0 AS value");
+    expect(executeRowQuery(signedZero, new Map()).rows).toHaveLength(1);
+    expect(executeQuery(signedZero, new Map()).rows).toHaveLength(1);
   });
 
   it("rejects unsupported subquery forms explicitly", () => {
@@ -1035,6 +1039,11 @@ describe("public SQL queries", () => {
       { region: "east" },
       { region: "least" },
     ]);
+
+    const unicodeLike = compileQuery("SELECT '😀' LIKE '_' AS one, '😀' LIKE '__' AS two");
+    const unicodeResult = { columns: ["one", "two"], rows: [{ one: true, two: false }] };
+    expect(executeRowQuery(unicodeLike, new Map())).toEqual(unicodeResult);
+    expect(executeQuery(unicodeLike, new Map())).toEqual(unicodeResult);
   });
 
   it("evaluates EXISTS, set operations, and OFFSET in both executors", () => {

@@ -181,8 +181,6 @@ async function createRunner(engine: EngineId): Promise<FeatureRunner> {
       return sqliteRunner();
     case "pglite":
       return pgliteRunner();
-    case "duckdb":
-      return duckdbRunner();
   }
 }
 
@@ -268,31 +266,6 @@ async function sqliteRunner(): Promise<FeatureRunner> {
     close() {
       database.close();
       return Promise.resolve();
-    },
-  };
-}
-
-async function duckdbRunner(): Promise<FeatureRunner> {
-  const { duckdbConnection } = await import("../engines/duckdb.js");
-  const connection = await duckdbConnection();
-  return {
-    async execute(feature) {
-      for (const sql of fixtureTeardown) await connection.query(sql);
-      for (const sql of fixtureDdl) await connection.query(sql);
-      for (const sql of feature.setup ?? []) await connection.query(sql);
-      if (feature.params === undefined) {
-        await connection.query(feature.example);
-      } else {
-        const statement = await connection.prepare(feature.example);
-        try {
-          await statement.query(...(feature.params as unknown[]));
-        } finally {
-          await statement.close();
-        }
-      }
-    },
-    async close() {
-      await connection.close();
     },
   };
 }

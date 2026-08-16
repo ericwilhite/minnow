@@ -1,8 +1,8 @@
 /**
  * The SQL performance gate: a seeded dataset and query suite timed on the full MinnowDatabase
- * pipeline against three engines — native SQLite (node:sqlite), PGlite (Wasm Postgres), and
- * DuckDB (native vectorized OLAP). Native builds are a deliberately harsh baseline: the
- * browser competitors are the Wasm builds, which run slower than what is measured here.
+ * pipeline against native SQLite (node:sqlite) and PGlite (Wasm Postgres). Native SQLite is a
+ * deliberately harsh baseline: the browser competitor is its Wasm build, which runs slower
+ * than what is measured here.
  *
  * Each query's minnow/engine time ratio must stay at or below the checked-in threshold in
  * packages/core/perf-baseline.json. Thresholds pin the current ratios with headroom, so the
@@ -190,10 +190,10 @@ await minnow.createTable({
 });
 /**
  * Wall time to load the 200k-row table, per engine, measured on each engine's load path as
- * configured here (Minnow insertBatch, SQLite one transaction, PGlite/DuckDB literal batches).
+ * configured here (Minnow insertBatch, SQLite one transaction, PGlite literal batches).
  * Single-sample by nature, but hundreds of milliseconds, so noise is proportionally small.
  */
-const ingestMs = { minnow: 0, sqlite: 0, pglite: 0, duckdb: 0 };
+const ingestMs = { minnow: 0, sqlite: 0, pglite: 0 };
 {
   const started = performance.now();
   for (let start = 0; start < rows.length; start += 50_000) {
@@ -275,34 +275,6 @@ await pglite.exec(
   `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
 );
 
-console.log("loading duckdb...");
-const { DuckDBInstance } = await import("@duckdb/node-api");
-const duckdbInstance = await DuckDBInstance.create(":memory:");
-const duckdb = await duckdbInstance.connect();
-await duckdb.run(
-  `CREATE TABLE data (id INTEGER, region TEXT, amount DOUBLE, active BOOLEAN, joined TIMESTAMPTZ, label TEXT)`,
-);
-await duckdb.run(`CREATE TABLE dims (region TEXT, label TEXT, rank DOUBLE)`);
-{
-  const started = performance.now();
-  for (let start = 0; start < rows.length; start += 2000) {
-    const batch = rows
-      .slice(start, start + 2000)
-      .map(
-        (row) =>
-          `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
-            .map(sqlLiteral)
-            .join(", ")})`,
-      )
-      .join(", ");
-    await duckdb.run(`INSERT INTO data VALUES ${batch}`);
-  }
-  ingestMs.duckdb = performance.now() - started;
-}
-await duckdb.run(
-  `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
-);
-
 async function timePglite(query: PerfQuery): Promise<number> {
   const sql = positionalToNumbered(query.sql);
   const params = [...(query.params ?? [])];
@@ -316,26 +288,8 @@ async function timePglite(query: PerfQuery): Promise<number> {
   return median(samples);
 }
 
-async function timeDuckdb(query: PerfQuery): Promise<number> {
-  const params = [...(query.params ?? [])];
-  const prepared = await duckdb.prepare(query.sql);
-  const readAll = async (): Promise<void> => {
-    prepared.bind(params as never);
-    const reader = await prepared.runAndReadAll();
-    reader.getRowObjects();
-  };
-  for (let index = 0; index < WARMUP; index += 1) await readAll();
-  const samples: number[] = [];
-  for (let index = 0; index < RUNS; index += 1) {
-    const started = performance.now();
-    await readAll();
-    samples.push(performance.now() - started);
-  }
-  return median(samples);
-}
-
-type EngineName = "sqlite" | "pglite" | "duckdb";
-const ENGINES: readonly EngineName[] = ["sqlite", "pglite", "duckdb"];
+type EngineName = "sqlite" | "pglite";
+const ENGINES: readonly EngineName[] = ["sqlite", "pglite"];
 
 interface Baseline {
   rows: number;
@@ -357,7 +311,7 @@ const results: Result[] = [
   {
     name: "bulk-ingest",
     minnowMs: ingestMs.minnow,
-    engineMs: { sqlite: ingestMs.sqlite, pglite: ingestMs.pglite, duckdb: ingestMs.duckdb },
+    engineMs: { sqlite: ingestMs.sqlite, pglite: ingestMs.pglite },
   },
 ];
 for (const query of QUERIES) {
@@ -368,18 +322,14 @@ for (const query of QUERIES) {
     engineMs: {
       sqlite: timeSqlite(sqlite, query),
       pglite: await timePglite(query),
-      duckdb: await timeDuckdb(query),
     },
   });
 }
 sqlite.close();
 await pglite.close();
-duckdb.closeSync();
 
 console.log(`\nSQL performance gate — ${String(ROWS)} rows, median of ${String(RUNS)} runs`);
-console.log(
-  "query                minnow(ms)      sqlite(ms)            pglite(ms)            duckdb(ms)",
-);
+console.log("query                minnow(ms)      sqlite(ms)            pglite(ms)");
 const versus = (minnowMs: number, engineMs: number): string => {
   const ratio = minnowMs / engineMs;
   return ratio <= 1 ? `${(1 / ratio).toFixed(1)}x faster` : `${ratio.toFixed(1)}x slower`;

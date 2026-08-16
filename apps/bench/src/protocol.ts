@@ -5,15 +5,15 @@
  */
 import type { DurabilityMode } from "./benchmark.js";
 
-export type EngineId = "minnow" | "sqlite" | "pglite" | "duckdb";
+export type EngineId = "minnow" | "sqlite" | "pglite";
+export type WorkloadKind = "oltp" | "olap";
 
-export const engineIds: readonly EngineId[] = ["minnow", "sqlite", "pglite", "duckdb"];
+export const engineIds: readonly EngineId[] = ["minnow", "sqlite", "pglite"];
 
 export const engineNames: Record<EngineId, string> = {
   minnow: "MinnowDatabase",
   sqlite: "SQLite Wasm",
   pglite: "PGlite",
-  duckdb: "DuckDB",
 };
 
 export type CompressionCodec = "raw" | "rle" | "gzip";
@@ -38,7 +38,7 @@ export interface EngineMaterialization {
   error?: string;
 }
 
-/** One generated dataset, materialized into up to three engines. */
+/** One generated dataset, materialized into any of the registered engines. */
 export interface DatasetRecord {
   id: string;
   createdAt: string;
@@ -141,8 +141,8 @@ export interface ReferenceQueryReport {
   id: string;
   name: string;
   complexity: "simple" | "moderate" | "complex";
-  /** Access pattern: latency-bound key/range lookup, or throughput-bound scan and aggregate. */
-  workload: "selective" | "analytical";
+  /** OLTP is a selective lookup; OLAP is a scan, join, or aggregate. */
+  workload: WorkloadKind;
   sql: string;
   tables: string[];
   expectedRows: number;
@@ -192,6 +192,8 @@ export interface WriteCaseReport {
   id: string;
   name: string;
   operation: WriteOperation;
+  /** OLTP is a point/small-batch mutation; OLAP is a bulk data-loading mutation. */
+  workload: WorkloadKind;
   /** Rows the measured statement writes. */
   rows: number;
   /** Rows seeded (unmeasured) before the measured statement. */

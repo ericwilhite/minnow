@@ -1,6 +1,7 @@
 ---
 import Base from "../layouts/Base.astro";
 import BenchBrowser, { type BenchResults } from "../components/BenchBrowser.astro";
+import librarySizes from "../data/library-sizes.json";
 
 // Pick the newest engine-comparison capture per browser, decided by the recorded
 // capturedAt timestamp rather than filename order. The site is the only home for
@@ -9,11 +10,32 @@ const resultModules = import.meta.glob<{ default: BenchResults }>(
   "../data/benchmarks/*engine-comparison*.json",
   { eager: true },
 );
+const benchmarkEngineIds = ["minnow", "sqlite", "pglite"];
+const hasBenchmarkEngines = (engines: string[]): boolean =>
+  engines.length === benchmarkEngineIds.length &&
+  benchmarkEngineIds.every((engine) => engines.includes(engine));
 // Captures key on (scale, browser): different scales publish side by side, and within a
 // key the newest capturedAt wins.
 const byPane = new Map<string, BenchResults>();
 for (const module of Object.values(resultModules)) {
   const results = module.default;
+  if (
+    results.schemaVersion !== 1 ||
+    results.kind !== "engine-comparison" ||
+    !hasBenchmarkEngines(results.config.engines) ||
+    !hasBenchmarkEngines(results.reads.engines) ||
+    !hasBenchmarkEngines(results.writes.engines) ||
+    !hasBenchmarkEngines(Object.keys(results.dataset.engines)) ||
+    !results.reads.passed ||
+    !results.writes.passed ||
+    !["oltp", "olap"].every(
+      (workload) =>
+        results.reads.queries.some((query) => query.workload === workload) &&
+        results.writes.cases.some((entry) => entry.workload === workload),
+    )
+  ) {
+    throw new Error(`Invalid or failed benchmark capture: ${results.capturedAt}`);
+  }
   const key = `${String(results.config.scale)}-${results.browser.project}`;
   const current = byPane.get(key);
   if (current === undefined || results.capturedAt > current.capturedAt) {
@@ -45,14 +67,25 @@ const scaleStats = scales.map((scale) => {
 });
 const fmtRows = (rows: number): string =>
   rows >= 1_000_000 ? `${(rows / 1_000_000).toFixed(1)}M` : `${(rows / 1000).toFixed(0)}k`;
-// Engines whose materialization records an in-memory (non-disk) store; the disclosure below
-// is generated from this metadata so the page and the capture record cannot disagree.
-const memoryEngines = engineMeta.filter(([, meta]) => meta.persistence.includes("in-memory"));
 const engineLabels: Record<string, string> = {
   minnow: "Minnow",
   sqlite: "SQLite WASM",
   pglite: "PGlite",
-  duckdb: "DuckDB",
+};
+
+// Download size, measured from the installed packages by scripts/measure-library-sizes.mts.
+// Ordered smallest first, and scaled against the smallest so the bars read as a ratio.
+const sizes = [...librarySizes.engines].sort((left, right) => left.totalGzipBytes - right.totalGzipBytes);
+const smallestGzip = sizes[0]?.totalGzipBytes ?? 1;
+const largestGzip = sizes.at(-1)?.totalGzipBytes ?? 1;
+const sizeMeasuredDate = librarySizes.measuredAt.slice(0, 10);
+const fmtBytes = (bytes: number): string =>
+  bytes >= 1024 * 1024
+    ? `${(bytes / 1024 / 1024).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`
+    : `${(bytes / 1024).toFixed(0)} KB`;
+const fmtMultiple = (bytes: number): string => {
+  const multiple = bytes / smallestGzip;
+  return multiple < 1.05 ? "smallest" : `${multiple.toFixed(multiple < 10 ? 1 : 0)}× larger`;
 };
 ---
 
@@ -64,11 +97,11 @@ const engineLabels: Record<string, string> = {
     <header class="bench-header">
       <h1>Benchmarks</h1>
       <p class="lede">
-        {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} loading and
-        querying identical commerce datasets ({scaleStats
+        {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} running OLTP and
+        OLAP reads and writes against identical commerce datasets ({scaleStats
           .map((entry) => fmtRows(entry.totalRows))
-          .join(", ")} rows) in real browsers. Every query result is checksum-verified identical
-        across all engines before any timing counts.
+          .join(", ")} rows) in real browsers. Every result is verified against an independent
+        oracle before any timing counts.
       </p>
     </header>
 
@@ -80,12 +113,12 @@ const engineLabels: Record<string, string> = {
             <div class="stat-label">rows across {tableCount} tables</div>
           </div>
           <div class="stat" role="listitem">
-            <div class="stat-value">{first.suite.queries.length}</div>
-            <div class="stat-label">reference queries, point lookups to cohort analyses</div>
+            <div class="stat-value">{first.reads.queries.length}</div>
+            <div class="stat-label">verified read queries</div>
           </div>
           <div class="stat" role="listitem">
-            <div class="stat-value">{first.suite.sampleCount}</div>
-            <div class="stat-label">samples per query; medians reported</div>
+            <div class="stat-value">{first.writes.cases.length}</div>
+            <div class="stat-label">verified write cases</div>
           </div>
           <div class="stat" role="listitem">
             <div class="stat-value">{projects.length}</div>
@@ -94,6 +127,85 @@ const engineLabels: Record<string, string> = {
         </div>
       ))
     }
+
+    <section class="library-size" aria-labelledby="size-heading">
+      <div class="section-heading">
+        <p class="eyebrow">Download size</p>
+        <h2 id="size-heading">What the browser has to fetch first</h2>
+        <p>
+          Before any query runs, the page pays for the engine itself. Gzipped bytes over the
+          wire, measured {sizeMeasuredDate} from the published packages: each engine's browser
+          entry bundled and minified the same way, plus the WebAssembly and data files it
+          fetches at run time.
+        </p>
+      </div>
+      <ol class="size-list">
+        {
+          sizes.map((engine) => (
+            <li class:list={["size-row", { "size-row-minnow": engine.id === "minnow" }]}>
+              <div class="size-name">
+                <strong>{engine.name}</strong>
+                <span class="size-version">{engine.package} {engine.version}</span>
+              </div>
+              <div class="size-bar-track">
+                <div
+                  class="size-bar"
+                  style={`width: ${String(Math.max(1.5, (engine.totalGzipBytes / largestGzip) * 100))}%`}
+                />
+              </div>
+              <div class="size-numbers">
+                <strong>{fmtBytes(engine.totalGzipBytes)}</strong>
+                <span class="size-raw">{fmtBytes(engine.totalBytes)} uncompressed</span>
+              </div>
+              <div class="size-multiple">{fmtMultiple(engine.totalGzipBytes)}</div>
+              <p class="size-note">
+                {engine.note}{" "}
+                {engine.assets.length > 1 && (
+                  <span class="size-breakdown">
+                    {engine.assets
+                      .map((asset) => `${asset.name.replace(" (bundled, minified)", "")} ${fmtBytes(asset.gzipBytes)}`)
+                      .join(" · ")}
+                  </span>
+                )}
+              </p>
+            </li>
+          ))
+        }
+      </ol>
+      <p class="size-method">
+        Reproduce with <code>npm run benchmark:sizes</code>; the measurement lands in{" "}
+        <code>apps/site/src/data/library-sizes.json</code>, which this section is generated from.
+      </p>
+    </section>
+
+    <section class="workload-coverage" aria-labelledby="workload-heading">
+      <div class="section-heading">
+        <p class="eyebrow">Coverage</p>
+        <h2 id="workload-heading">Four workloads, kept separate</h2>
+        <p>
+          A single blended score hides the trade-offs that matter. The results below preserve the
+          read/write and OLTP/OLAP boundaries from capture through rendering.
+        </p>
+      </div>
+      <div class="workload-grid">
+        <article>
+          <strong>OLTP reads</strong>
+          <span>Keys, small sets, and bounded ranges</span>
+        </article>
+        <article>
+          <strong>OLAP reads</strong>
+          <span>Scans, joins, windows, and aggregates</span>
+        </article>
+        <article>
+          <strong>OLTP writes</strong>
+          <span>Point and small-batch mutations</span>
+        </article>
+        <article>
+          <strong>OLAP writes</strong>
+          <span>Bulk ingestion and mutation batches</span>
+        </article>
+      </div>
+    </section>
 
     {
       scales.length > 1 && (
@@ -149,13 +261,13 @@ const engineLabels: Record<string, string> = {
             .join("; ")}; {tableCount} tables) with the same SQL.
         </li>
         <li>
-          Each query runs {first.suite.sampleCount} samples after one prepare step (each
+          Each query runs {first.reads.sampleCount} samples after one prepare step (each
           engine's genuine prepared statement — compile/plan only); the charts show medians of
           fresh statement executions, with p95 and prepare time in the tooltips and table.
         </li>
         <li>
-          Results are compared by checksum across engines — a timing only counts when all engines
-          return identical rows.
+          Reads are compared against independent JavaScript oracles and across engines. Writes
+          read the final table back and compare every row with an independent oracle.
         </li>
         <li>
           Storage backends:
@@ -184,15 +296,20 @@ const engineLabels: Record<string, string> = {
         <li>
           <strong>Every engine runs on its shipped defaults.</strong> No pragmas, no{" "}
           <code>work_mem</code>, no cache sizing — nothing that depends on tuning knowledge the
-          next person might not apply. PGlite's relaxed-durability mode is the one exception,
-          excluded because it crashes mid-load in this workload. Minnow's own defaults include a
+          next person might not apply. Durability is the one setting that is matched rather than
+          left alone: Minnow's IndexedDB store runs relaxed, so PGlite's read sessions open with{" "}
+          <code>relaxedDurability</code> too. Without it PGlite flushes its whole filesystem
+          image to IndexedDB after every statement, which put a fixed ~13–20 ms round trip on
+          every read — a single-row key lookup cost the same as a full aggregate. PGlite's
+          writes stay strict, because its relaxed flush races its own IndexedDB connection under
+          sustained writes and loses data mid-load. Minnow's own defaults include a
           64 MiB buffer pool and relaxed IndexedDB durability; the dataset is written with
           gzip-compressed blocks, which trades query speed for stored size rather than the other
           way round. All engines get identical schemas, post-load statistics where they have them
           (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine prepared statements.
         </li>
         <li>
-          The three comparison engines also get a B-tree secondary index on every foreign key.
+          The two comparison engines also get a B-tree secondary index on every foreign key.
           Minnow gets none: it has no secondary-index feature, and its scans are pruned by the
           zone statistics carried in each column block. The comparison is deliberately run
           this way — with the other engines indexed and Minnow not — rather than removing
@@ -221,7 +338,7 @@ const engineLabels: Record<string, string> = {
         throws <code>SecurityError</code> in the Chromium build Playwright ships (it needs full
         site isolation), is not exposed inside workers at all, where these engines actually run,
         and does not exist in Firefox. Launch flags do not change that; we tried. So rather than
-        publish a number we cannot stand behind for four engines, the page publishes the one
+        publish a number we cannot stand behind across engines, the page publishes the one
         that is exact: Minnow reserves memory before it allocates it, so it knows its own peak
         for each statement and reports it. Compare it across queries, not across engines.
       </p>
@@ -229,9 +346,9 @@ const engineLabels: Record<string, string> = {
         Summaries are a <strong>geometric mean</strong>, not a sum. These queries span three
         orders of magnitude, so adding them up reports the slowest few and nothing else — an
         engine could lose every fast query and still win the total. A geometric mean weights
-        each query equally whatever it costs. The split by access pattern is there because it
-        changes the answer: engines that win on scanning and aggregating are frequently not the
-        ones that win on reaching a single row, and this suite is mostly the former.
+        each query equally whatever it costs. OLTP and OLAP reads get separate summaries because
+        engines that win on scanning and aggregating are frequently not the ones that win on
+        reaching a single row.
       </p>
       <p>
         The suite replays one statement over unchanging data, which is a measurement artifact,
@@ -239,34 +356,19 @@ const engineLabels: Record<string, string> = {
         after the first from that cache — so the headline number is measured with the cache off,
         and every table cell also carries the cached figure beneath it. Both are real: the first
         is what the engine costs when it runs the query, and it is the only one comparable to
-        SQLite, PGlite, and DuckDB, none of which cache results; the second is what a repeat
+        SQLite and PGlite, neither of which cache results; the second is what a repeat
         actually costs an application that keeps the default. A commit invalidates the cache, so
         it never serves a stale row — it just isn't query execution, and putting it in the same
-        column as three engines' execution times would be comparing two different quantities.
+        column as the comparison engines' execution times would be comparing two different
+        quantities.
       </p>
-      {
-        memoryEngines.length > 0 && (
-          <p class="disclosure">
-            <strong>Not a storage peer:</strong>{" "}
-            {memoryEngines
-              .map(([engine]) => engineLabels[engine] ?? engine)
-              .join(" and ")}{" "}
-            runs fully in memory in this harness ({memoryEngines
-              .map(([, meta]) => meta.persistence)
-              .join("; ")}). Its numbers exclude all storage I/O and are not directly comparable
-            to the disk-backed engines; it is included as an executor reference. Its ingest
-            timing carries the same caveat, since ingest for the other engines is dominated by
-            exactly the storage writes it skips.
-          </p>
-        )
-      }
     </section>
   </main>
 </Base>
 
 <style define:vars={{}}>
   .bench {
-    max-width: 60rem;
+    max-width: 74rem;
     margin: 0 auto;
     padding: 2.5rem 1.5rem 0;
 
@@ -275,7 +377,6 @@ const engineLabels: Record<string, string> = {
     --viz-series-1: #2a78d6;
     --viz-series-2: #eb6834;
     --viz-series-3: #1baf7a;
-    --viz-series-4: #8b63d6;
     --viz-muted: #898781;
     --viz-grid: #e1e0d9;
   }
@@ -285,7 +386,6 @@ const engineLabels: Record<string, string> = {
       --viz-series-1: #3987e5;
       --viz-series-2: #d95926;
       --viz-series-3: #199e70;
-      --viz-series-4: #9a75e3;
       --viz-grid: #2c2c2a;
     }
   }
@@ -294,7 +394,6 @@ const engineLabels: Record<string, string> = {
     --viz-series-1: #3987e5;
     --viz-series-2: #d95926;
     --viz-series-3: #199e70;
-    --viz-series-4: #9a75e3;
     --viz-grid: #2c2c2a;
   }
 
@@ -352,6 +451,149 @@ const engineLabels: Record<string, string> = {
     margin-bottom: 1.25rem;
   }
 
+  .workload-coverage {
+    margin: 2rem 0;
+  }
+  .library-size {
+    margin: 2rem 0;
+  }
+  .size-list {
+    list-style: none;
+    margin: 1rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+  }
+  .size-row {
+    display: grid;
+    grid-template-columns: minmax(9rem, 1fr) minmax(0, 2.2fr) minmax(7rem, auto) minmax(5.5rem, auto);
+    align-items: center;
+    gap: 0.5rem 1rem;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+  }
+  .size-row-minnow {
+    border-color: var(--viz-series-1);
+  }
+  .size-name strong {
+    display: block;
+    font-size: 1rem;
+  }
+  .size-version {
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .size-bar-track {
+    height: 0.6rem;
+    border-radius: 0.3rem;
+    background: var(--viz-grid);
+    overflow: hidden;
+  }
+  .size-bar {
+    height: 100%;
+    border-radius: 0.3rem;
+    background: var(--viz-series-2);
+  }
+  .size-row-minnow .size-bar {
+    background: var(--viz-series-1);
+  }
+  .size-numbers {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .size-numbers strong {
+    display: block;
+    font-size: 1.05rem;
+  }
+  .size-raw {
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  .size-multiple {
+    text-align: right;
+    font-size: 0.85rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .size-note {
+    grid-column: 1 / -1;
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .size-breakdown {
+    font-variant-numeric: tabular-nums;
+  }
+  .size-method {
+    margin-top: 0.9rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  @media (max-width: 720px) {
+    .size-row {
+      grid-template-columns: 1fr auto;
+    }
+    .size-bar-track {
+      grid-column: 1 / -1;
+      order: 3;
+    }
+    .size-note {
+      order: 4;
+    }
+  }
+
+  .section-heading h2 {
+    font-size: 1.35rem;
+    margin: 0.1rem 0 0.25rem;
+  }
+
+  .section-heading p:not(.eyebrow) {
+    color: var(--text-secondary);
+    margin: 0;
+    max-width: 48rem;
+  }
+
+  .eyebrow {
+    color: var(--accent);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    margin: 0;
+    text-transform: uppercase;
+  }
+
+  .workload-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .workload-grid article {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+  }
+
+  .workload-grid strong,
+  .workload-grid span {
+    display: block;
+  }
+
+  .workload-grid span {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-top: 0.2rem;
+  }
+
+  @media (max-width: 760px) {
+    .workload-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
   .browser-toggle input {
     position: absolute;
     opacity: 0;
@@ -379,6 +621,10 @@ const engineLabels: Record<string, string> = {
   .methodology h2 {
     font-size: 1.3rem;
     font-weight: 650;
+  }
+
+  .methodology code {
+    overflow-wrap: anywhere;
   }
 
   .methodology .disclosure {

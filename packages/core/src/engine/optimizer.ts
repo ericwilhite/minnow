@@ -25,6 +25,37 @@ export function optimizePlan(plan: CompiledQuery): CompiledQuery {
   return optimized;
 }
 
+/**
+ * Cost-based build-side selection using prepared or catalog-derived row counts. A single inner
+ * equi-join probes from the base into an index over the joined table, so a joined input more than
+ * twice the base size swaps sides and builds over the smaller input. Asymmetric and observable
+ * source-order shapes stay unchanged.
+ */
+export function chooseJoinOrder(
+  plan: CompiledQuery,
+  inputs: ReadonlyMap<string, { readonly rowCount: number }>,
+): CompiledQuery {
+  const join = plan.joins[0];
+  if (
+    plan.joins.length !== 1 ||
+    join?.kind !== "inner" ||
+    join.on !== undefined ||
+    plan.select[0]?.expression.kind === "wildcard"
+  ) {
+    return plan;
+  }
+  const baseRows = inputs.get(plan.base.table)?.rowCount ?? 0;
+  const joinRows = inputs.get(join.table)?.rowCount ?? 0;
+  if (joinRows <= baseRows * 2) return plan;
+  const { kind, left, right, ...joinSource } = join;
+  void kind;
+  return {
+    ...plan,
+    base: joinSource,
+    joins: [{ ...plan.base, kind: "inner", left, right }],
+  };
+}
+
 function optimizeBlock(block: CompiledQuery): void {
   decorrelateBlock(block);
   for (const source of [block.base, ...block.joins]) {

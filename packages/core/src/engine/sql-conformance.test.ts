@@ -1,9 +1,9 @@
 /**
  * Differential SQL conformance harness. A seeded generator produces a corpus of queries over
  * the supported SQL surface; every query executes through the full MinnowDatabase pipeline,
- * through the row executor, and through SQLite (the reference oracle, via node:sqlite — no
- * dependency added). The two Minnow paths must agree exactly; Minnow and SQLite must agree
- * after normalizing representation differences (booleans, dates, float rounding).
+ * through the row executor, and through SQLite and PGlite. The two Minnow paths must agree
+ * exactly; Minnow and the independent engines must agree after normalizing representation
+ * differences (booleans, dates, float rounding).
  *
  * The corpus deliberately avoids forms where the engines' documented semantics differ:
  * `/` (SQLite does integer division on integers), ROUND (half-away-from-zero vs half-even),
@@ -141,7 +141,7 @@ function sqliteFixture(): DatabaseSync {
 
 // --- Query corpus -------------------------------------------------------------------------------
 
-type OracleName = "sqlite" | "pglite" | "duckdb";
+type OracleName = "sqlite" | "pglite";
 
 interface Case {
   sql: string;
@@ -356,8 +356,8 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT id, CAST(amount AS INTEGER) AS whole, CAST(id AS TEXT) AS label, CAST('42.5' AS REAL) AS parsed FROM data ORDER BY id`,
     ordered: true,
-    // PostgreSQL and DuckDB round float-to-integer casts; Minnow truncates, matching SQLite.
-    skip: ["pglite", "duckdb"],
+    // PostgreSQL rounds float-to-integer casts; Minnow truncates, matching SQLite.
+    skip: ["pglite"],
   }),
   (rng) => ({
     sql: `SELECT "id", "data"."amount" AS "amt" FROM "data" WHERE "amount" >= ? ORDER BY "id"`,
@@ -367,9 +367,9 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT id, region FROM data ORDER BY region, id`,
     ordered: true,
-    // Default NULL ordering: Minnow matches SQLite (NULLs first ascending); PostgreSQL and
-    // DuckDB default to NULLs last. Explicit NULLS FIRST/LAST agrees on all engines.
-    skip: ["pglite", "duckdb"],
+    // Default NULL ordering: Minnow matches SQLite (NULLs first ascending); PostgreSQL defaults
+    // to NULLs last. Explicit NULLS FIRST/LAST agrees on all engines.
+    skip: ["pglite"],
   }),
   (rng) => ({
     sql:
@@ -474,23 +474,19 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT v.column1 AS n, v.column2 AS tag FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) v ORDER BY n`,
     ordered: true,
-    // DuckDB names bare VALUES columns col0..colN; Minnow follows PostgreSQL/SQLite.
-    skip: ["duckdb"],
   }),
   () => ({
     sql: `SELECT v.n AS n, v.tag AS tag FROM (VALUES (1, 'one'), (2, 'two')) AS v(n, tag) ORDER BY n`,
     ordered: true,
-    // SQLite has no derived-table column alias lists; PostgreSQL and DuckDB check this one.
+    // SQLite has no derived-table column alias lists; PGlite checks this one.
     skip: ["sqlite"],
   }),
   (rng) => ({
     sql: `SELECT d.id AS id, x.column2 AS tag FROM data d JOIN (VALUES ('west', 'W'), ('east', 'E')) x ON x.column1 = d.region WHERE d.id <= ? ORDER BY id`,
     params: [20 + Math.floor(rng() * 40)],
     ordered: true,
-    // DuckDB names bare VALUES columns col0..colN; Minnow follows PostgreSQL/SQLite.
-    skip: ["duckdb"],
   }),
-  // The next three exercise features SQLite lacks; PGlite and DuckDB are the oracles.
+  // The next three exercise features SQLite lacks; PGlite is the oracle.
   (rng) => ({
     sql: `SELECT id FROM data WHERE amount > ALL (SELECT rank + ? FROM dims) ORDER BY id`,
     params: [Math.floor(rng() * 200) / 4],
@@ -528,10 +524,6 @@ function normalize(value: unknown): unknown {
   if (typeof value === "number") {
     if (Object.is(value, -0)) return 0;
     return Number(value.toFixed(9));
-  }
-  // DuckDB returns timestamp values as {micros} wrappers.
-  if (typeof value === "object" && value !== null && "micros" in value) {
-    return new Date(Number((value as { micros: bigint }).micros) / 1000).toISOString();
   }
   return value;
 }
@@ -636,54 +628,13 @@ async function pgliteOracle(): Promise<Oracle> {
   };
 }
 
-async function duckdbOracle(): Promise<Oracle> {
-  const { DuckDBInstance } = await import("@duckdb/node-api");
-  const instance = await DuckDBInstance.create(":memory:");
-  const connection = await instance.connect();
-  await connection.run(
-    `CREATE TABLE data (id INTEGER, region TEXT, amount DOUBLE, active BOOLEAN, joined TIMESTAMPTZ, label TEXT)`,
-  );
-  await connection.run(`CREATE TABLE dims (region TEXT, label TEXT, rank DOUBLE)`);
-  const literal = (value: QueryValue): string => {
-    if (value === null) return "NULL";
-    if (value instanceof Date) return `'${value.toISOString()}'`;
-    if (typeof value === "string") return `'${value.replaceAll("'", "''")}'`;
-    if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-    return String(value);
-  };
-  const dataRows = fixture
-    .map(
-      (row) =>
-        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label].map(literal).join(", ")})`,
-    )
-    .join(", ");
-  await connection.run(`INSERT INTO data VALUES ${dataRows}`);
-  const dimRows = dims
-    .map((dim) => `(${[dim.region, dim.label, dim.rank].map(literal).join(", ")})`)
-    .join(", ");
-  await connection.run(`INSERT INTO dims VALUES ${dimRows}`);
-  return {
-    name: "duckdb",
-    execute: async (testCase) => {
-      const params = (testCase.params ?? []).map((value) =>
-        value instanceof Date ? value.toISOString() : value,
-      );
-      const reader = await connection.runAndReadAll(testCase.sql, params);
-      return reader.getRowObjects();
-    },
-    close: () => {
-      connection.closeSync();
-    },
-  };
-}
-
 // --- The harness --------------------------------------------------------------------------------
 
-describe("SQL conformance against SQLite, PGlite, and DuckDB", () => {
+describe("SQL conformance against SQLite and PGlite", () => {
   it("agrees on the generated corpus across all execution paths and oracles", async () => {
     const corpus = buildCorpus();
     const database = await minnowFixture();
-    const oracles: Oracle[] = [sqliteOracle(), await pgliteOracle(), await duckdbOracle()];
+    const oracles: Oracle[] = [sqliteOracle(), await pgliteOracle()];
     const failures: string[] = [];
     try {
       for (const [index, testCase] of corpus.entries()) {

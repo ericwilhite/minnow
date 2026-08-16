@@ -42,6 +42,7 @@ import {
   type QueryMemoryReservation,
   type QueryMemoryUsage,
 } from "./memory.js";
+import { compareSqlStrings, defineSqlResultProperty } from "./sql-semantics.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
 /**
@@ -55,6 +56,8 @@ const NULL_STRING_CODE = 0xffffffff;
 const QUERY_REFERENCE_BYTES = 8;
 const QUERY_VALUE_TAG_BYTES = 1;
 const AGGREGATE_ACCUMULATOR_BYTES = 24;
+/** Modeled sparse-map bookkeeping for one packed compound dictionary-code group. */
+const PACKED_GROUP_ENTRY_BYTES = 24;
 const SPILL_PAGE_MAGIC = 0x5350494c;
 const SPILL_PAGE_HEADER_BYTES = 8;
 const vectorTextEncoder = new TextEncoder();
@@ -251,6 +254,8 @@ interface BoundPredicate {
   readonly dictionaryLike?: DictionaryLike;
   /** Unboxed comparison of a bare numeric/datetime/boolean column against a literal. */
   readonly primitive?: PrimitiveComparison;
+  /** Unboxed membership of a bare numeric/datetime column in a literal list. */
+  readonly primitiveIn?: PrimitiveInList;
 }
 
 interface PrimitiveComparison {
@@ -259,6 +264,15 @@ interface PrimitiveComparison {
   readonly operator: ComparisonOperator;
   /** The literal as a float: numbers as-is, datetimes as epoch millis, booleans as 0/1. */
   readonly value: number;
+}
+
+interface PrimitiveInList {
+  readonly source: number;
+  readonly vector: NumberVector | DateTimeVector;
+  readonly members: ReadonlySet<number>;
+  /** Smallest and largest member: the range an ascending column can restrict the scan to. */
+  readonly minimum: number;
+  readonly maximum: number;
 }
 
 interface DictionaryEquality {
@@ -632,7 +646,9 @@ function bindPlan(
     const dictionaryLike = detectDictionaryLike(bound);
     if (dictionaryLike !== undefined) return { ...bound, dictionaryLike };
     const primitive = detectPrimitiveComparison(bound);
-    return primitive === undefined ? bound : { ...bound, primitive };
+    if (primitive !== undefined) return { ...bound, primitive };
+    const primitiveIn = detectPrimitiveInList(bound);
+    return primitiveIn === undefined ? bound : { ...bound, primitiveIn };
   });
   const having = plan.having.map((predicate) => ({
     left: bind(predicate.left),
@@ -1362,8 +1378,10 @@ function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryRes
   const groups = new GroupAccumulator(plan, memory);
   const output = new ResultSink(plan, memory, true);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-  for (let start = 0; start < scanRows; start += DEFAULT_BATCH_ROWS) {
-    const length = Math.min(DEFAULT_BATCH_ROWS, scanRows - start);
+  const narrowed = ascendingScanRange(plan, 0, scanRows);
+  const scanEnd = narrowed?.end ?? scanRows;
+  for (let start = narrowed?.begin ?? 0; start < scanEnd; start += DEFAULT_BATCH_ROWS) {
+    const length = Math.min(DEFAULT_BATCH_ROWS, scanEnd - start);
     if (runScanBatch(plan, start, length, groups, output, memory)) break;
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
@@ -1389,8 +1407,30 @@ async function executeBoundPlanAsync(
     if (typeof residentEnd === "number" && residentEnd > start) {
       length = Math.min(length, residentEnd - start);
     }
-    if (runScanBatch(plan, start, length, groups, output, memory)) break;
-    start += length;
+    // Narrowing runs against the resident window, so a streamed scan skips the batches this
+    // window cannot answer instead of stepping through them. `windowEnd` is where the loader
+    // stopped, which is the block boundary — exactly the span the ordering check covers.
+    const windowEnd =
+      typeof residentEnd === "number" && residentEnd > start ? residentEnd : start + length;
+    const narrowed = ascendingScanRange(plan, start, windowEnd);
+    if (narrowed === undefined) {
+      if (runScanBatch(plan, start, length, groups, output, memory)) break;
+      start += length;
+      continue;
+    }
+    // The window is consumed to its end before the loader is asked for anything else: loaders
+    // are forward-only, so re-entering with a start part-way into a resident window would ask
+    // one to serve ground it has already passed.
+    let stopped = false;
+    for (let row = narrowed.begin; row < narrowed.end; row += DEFAULT_BATCH_ROWS) {
+      const rows = Math.min(DEFAULT_BATCH_ROWS, narrowed.end - row);
+      if (runScanBatch(plan, row, rows, groups, output, memory)) {
+        stopped = true;
+        break;
+      }
+    }
+    if (stopped) break;
+    start = windowEnd;
   }
   const rows = plan.grouped ? finishGroups(plan, groups.values(), memory) : output.finish();
   return finishResult(plan, rows, memory);
@@ -2119,6 +2159,139 @@ interface PrefilteredBatch {
   readonly complete: boolean;
 }
 
+/**
+ * Remembers which value buffers hold an ascending, null-free run. The key is the buffer
+ * itself, not the vector: a streamed window that covers one block aliases that block's
+ * decoded array, and decoded blocks live in the buffer pool, so a repeated keyed query pays
+ * the ordering check once per block rather than once per scan. A window stitched from several
+ * blocks gets a freshly allocated buffer and so a fresh entry, which is correct because that
+ * buffer describes exactly one window.
+ */
+const ascendingValueBuffers = new WeakMap<object, boolean>();
+
+/**
+ * True when every slot of the vector's resident window carries a value and those values never
+ * decrease. Non-ascending columns bail at the first violation, so the check costs a couple of
+ * iterations for the columns it cannot help.
+ */
+function windowIsAscending(vector: NumberVector | DateTimeVector): boolean {
+  const values = vector.values;
+  const cached = ascendingValueBuffers.get(values);
+  if (cached !== undefined) return cached;
+  const length = vector.window?.length ?? Math.min(vector.length, values.length);
+  const validity = vector.validity;
+  let ascending = true;
+  let previous = Number.NEGATIVE_INFINITY;
+  for (let slot = 0; slot < length; slot += 1) {
+    // A null has no position in the ordering, and NaN compares false against everything, so
+    // either one puts the window outside what a binary search can answer.
+    if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) {
+      ascending = false;
+      break;
+    }
+    const value = values[slot] ?? 0;
+    if (!(value >= previous)) {
+      ascending = false;
+      break;
+    }
+    previous = value;
+  }
+  ascendingValueBuffers.set(values, ascending);
+  return ascending;
+}
+
+/** First slot in [begin, end) whose value is at least `target`, over an ascending run. */
+function lowerBoundSlot(values: Float64Array, begin: number, end: number, target: number): number {
+  let low = begin;
+  let high = end;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((values[middle] ?? 0) < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/** First slot in [begin, end) whose value is greater than `target`, over an ascending run. */
+function upperBoundSlot(values: Float64Array, begin: number, end: number, target: number): number {
+  let low = begin;
+  let high = end;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((values[middle] ?? 0) <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/**
+ * Narrows a scan over [begin, end) to the rows a comparison against an ascending column can
+ * still satisfy — the shape a generated key has, and the one a keyed lookup needs to stop
+ * costing a block scan. Returns undefined when no predicate qualifies.
+ *
+ * This only removes rows that provably fail a predicate the scan was going to apply anyway,
+ * so every predicate loop downstream runs unchanged: narrowing subtracts work, never a check.
+ */
+function ascendingScanRange(
+  plan: BoundPlan,
+  begin: number,
+  end: number,
+): { begin: number; end: number } | undefined {
+  if (end - begin < DEFAULT_BATCH_ROWS) return undefined;
+  let low = begin;
+  let high = end;
+  let narrowed = false;
+  for (const predicate of plan.predicates) {
+    const primitive = predicate.primitive ?? predicate.primitiveIn;
+    if (primitive?.source !== plan.scanSource) continue;
+    const vector = primitive.vector;
+    if (vector.kind !== "number" && vector.kind !== "datetime") continue;
+    const windowStart = vector.window?.start ?? 0;
+    const slotBegin = low - windowStart;
+    const slotEnd = high - windowStart;
+    // The range has to sit inside the resident window for the search to read real values.
+    if (slotBegin < 0 || slotEnd > vector.values.length) continue;
+    if (!windowIsAscending(vector)) continue;
+    const values = vector.values;
+    if (!("operator" in primitive)) {
+      // A literal list restricts the scan to the span between its smallest and largest member;
+      // the membership test still runs, and decides the rows inside that span.
+      low = lowerBoundSlot(values, slotBegin, slotEnd, primitive.minimum) + windowStart;
+      high = upperBoundSlot(values, low - windowStart, slotEnd, primitive.maximum) + windowStart;
+      narrowed = true;
+      if (low >= high) return { begin: low, end: low };
+      continue;
+    }
+    const target = primitive.value;
+    switch (primitive.operator) {
+      case "=": {
+        const first = lowerBoundSlot(values, slotBegin, slotEnd, target);
+        high = upperBoundSlot(values, first, slotEnd, target) + windowStart;
+        low = first + windowStart;
+        break;
+      }
+      case ">":
+        low = upperBoundSlot(values, slotBegin, slotEnd, target) + windowStart;
+        break;
+      case ">=":
+        low = lowerBoundSlot(values, slotBegin, slotEnd, target) + windowStart;
+        break;
+      case "<":
+        high = lowerBoundSlot(values, slotBegin, slotEnd, target) + windowStart;
+        break;
+      case "<=":
+        high = upperBoundSlot(values, slotBegin, slotEnd, target) + windowStart;
+        break;
+      // `!=` keeps rows on both sides of the target, which is not a range.
+      default:
+        continue;
+    }
+    narrowed = true;
+    if (low >= high) return { begin: low, end: low };
+  }
+  return narrowed ? { begin: low, end: high } : undefined;
+}
+
 /** Compacts the selection in place to rows where the primitive comparison holds. */
 function filterPrimitive(
   primitive: PrimitiveComparison,
@@ -2151,6 +2324,38 @@ function filterPrimitive(
     if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
     const value = values[slot] ?? 0;
     if (!(value < target ? passBelow : value > target ? passAbove : passEqual)) continue;
+    selection[kept] = row;
+    kept += 1;
+  }
+  return kept;
+}
+
+/** Compacts the selection in place to rows whose value is a member of the literal list. */
+function filterPrimitiveInList(
+  primitive: PrimitiveInList,
+  batch: BatchRows,
+  selection: Uint32Array,
+  survivors: number,
+): number {
+  const vector = primitive.vector;
+  const values = vector.values;
+  const validity = vector.validity;
+  const windowStart = vector.window?.start ?? 0;
+  const slots = values.length;
+  const vectorLength = vector.length;
+  const rows = batch.rowsBySource[primitive.source];
+  const members = primitive.members;
+  let kept = 0;
+  for (let index = 0; index < survivors; index += 1) {
+    const row = selection[index] ?? 0;
+    const sourceRow = rows?.[row] ?? -1;
+    if (sourceRow < 0 || sourceRow >= vectorLength) continue;
+    const slot = sourceRow - windowStart;
+    if (slot < 0 || slot >= slots) {
+      throw new RangeError("Streamed vector row is outside the resident window");
+    }
+    if (((validity[slot >>> 3] ?? 0) & (1 << (slot & 7))) === 0) continue;
+    if (!members.has(values[slot] ?? 0)) continue;
     selection[kept] = row;
     kept += 1;
   }
@@ -2264,6 +2469,8 @@ function filterScanBatch(
     if (survivors === 0) return { selection, survivors };
     if (predicate.primitive !== undefined) {
       survivors = filterPrimitive(predicate.primitive, batch, selection, survivors);
+    } else if (predicate.primitiveIn !== undefined) {
+      survivors = filterPrimitiveInList(predicate.primitiveIn, batch, selection, survivors);
     } else if (predicate.dictionaryEquality !== undefined) {
       survivors = filterDictionaryEquality(
         predicate.dictionaryEquality,
@@ -3117,6 +3324,7 @@ class GroupAccumulator {
   #ordered: GroupState[] | undefined;
   readonly #codeColumns: ReadonlyArray<{ source: number; vector: StringVector } | undefined>;
   #multiCodeColumns: ReadonlyArray<{ source: number; vector: StringVector }> | undefined;
+  #multiCodeStates: Map<number, GroupState> | undefined;
   readonly #multiCodeScratch: number[] = [];
   readonly #keyScratch: GroupIndexKey[] = [];
   // The miss factories live on the accumulator and read the pending row through these fields, so
@@ -3179,9 +3387,9 @@ class GroupAccumulator {
           )
         : [];
     // When every compound key column is dictionary-coded and the combined code space is small,
-    // group lookup skips hashing entirely: the codes multiply into one direct array slot. Each
-    // column contributes (dictionary size + 1) slots, the extra one for NULL. Falls back to the
-    // byte index when the slot space is too large or its reservation exceeds the query budget.
+    // group lookup packs codes into one exact integer. Small domains use a direct array; large,
+    // sparse domains use a numeric Map instead of byte-encoding and hashing each compound key.
+    // Each column contributes (dictionary size + 1) slots, the extra one for NULL.
     if (this.#codeColumns.length > 1 && this.#codeColumns.every((column) => column !== undefined)) {
       const columns = this.#codeColumns as ReadonlyArray<{ source: number; vector: StringVector }>;
       let slots = 1;
@@ -3198,6 +3406,10 @@ class GroupAccumulator {
         }
         this.#multiCodeColumns = columns;
         this.#codeStates = new Array<GroupState | undefined>(slots).fill(undefined);
+        this.#ordered = [];
+      } else if (Number.isSafeInteger(slots)) {
+        this.#multiCodeColumns = columns;
+        this.#multiCodeStates = new Map<number, GroupState>();
         this.#ordered = [];
       }
     }
@@ -3424,7 +3636,10 @@ class GroupAccumulator {
       return required(this.#index.getEmpty(), "Grouped query state is missing");
     }
     const multiCode = this.#multiCodeColumns;
-    if (multiCode !== undefined && this.#codeStates !== undefined) {
+    if (
+      multiCode !== undefined &&
+      (this.#codeStates !== undefined || this.#multiCodeStates !== undefined)
+    ) {
       let slot = 0;
       for (let index = 0; index < multiCode.length; index += 1) {
         const column = required(multiCode[index], "Group code column is missing");
@@ -3438,7 +3653,7 @@ class GroupAccumulator {
         this.#multiCodeScratch[index] = code;
         slot = slot * (vector.dictionary.length + 1) + code;
       }
-      let state = this.#codeStates[slot];
+      let state = this.#codeStates?.[slot] ?? this.#multiCodeStates?.get(slot);
       if (state === undefined) {
         const groupValues: QueryValue[] = [];
         for (let index = 0; index < multiCode.length; index += 1) {
@@ -3449,7 +3664,11 @@ class GroupAccumulator {
           );
         }
         state = createGroupState(groupValues, plan, this.#memory);
-        this.#codeStates[slot] = state;
+        if (this.#codeStates !== undefined) this.#codeStates[slot] = state;
+        else {
+          this.#memory.tally(PACKED_GROUP_ENTRY_BYTES, "Packed group index entry");
+          this.#multiCodeStates?.set(slot, state);
+        }
         this.#ordered?.push(state);
       }
       return state;
@@ -3832,7 +4051,9 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
   const result: QueryRow = {};
   if (!plan.wildcard) {
     for (const item of plan.select) {
-      result[item.alias] = asQueryValue(evaluateBatchExpression(plan, item.expression, batch, row));
+      const value = asQueryValue(evaluateBatchExpression(plan, item.expression, batch, row));
+      if (item.alias === "__proto__") defineSqlResultProperty(result, item.alias, value);
+      else result[item.alias] = value;
     }
     return result;
   }
@@ -3842,7 +4063,10 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
     const rowIndex = batch.rowsBySource[source]?.[row] ?? -1;
     const prefix = multiple ? `${plan.sourceAliases[source] ?? ""}.` : "";
     for (const [name, vector] of table.columns) {
-      result[multiple ? prefix + name : name] = vectorValue(vector, rowIndex);
+      const outputName = multiple ? prefix + name : name;
+      const value = vectorValue(vector, rowIndex);
+      if (outputName === "__proto__") defineSqlResultProperty(result, outputName, value);
+      else result[outputName] = value;
     }
   }
   return result;
@@ -3916,6 +4140,40 @@ function detectPrimitiveComparison(predicate: BoundPredicate): PrimitiveComparis
     }
   }
   return undefined;
+}
+
+/**
+ * Detects `column IN (literal, ...)` over a numeric/datetime column. NULL members are dropped:
+ * a value can never equal NULL, so they add nothing to the membership test — but a list that
+ * is entirely NULL is left to the general path, where `IN (NULL)` keeps its three-valued
+ * answer instead of becoming a plain false.
+ */
+function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | undefined {
+  if (predicate.operator !== "IN") return undefined;
+  if (predicate.left.kind !== "column" || predicate.right.kind !== "list") return undefined;
+  const vector = predicate.left.vector;
+  if (vector.kind !== "number" && vector.kind !== "datetime") return undefined;
+  const members = new Set<number>();
+  let minimum = Number.POSITIVE_INFINITY;
+  let maximum = Number.NEGATIVE_INFINITY;
+  for (const item of predicate.right.items) {
+    if (item.kind !== "literal") return undefined;
+    const value = item.value;
+    if (value === null) continue;
+    if (vector.kind === "number") {
+      if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+      members.add(value);
+    } else {
+      if (!(value instanceof Date)) return undefined;
+      members.add(value.getTime());
+    }
+  }
+  if (members.size === 0) return undefined;
+  for (const member of members) {
+    if (member < minimum) minimum = member;
+    if (member > maximum) maximum = member;
+  }
+  return { source: predicate.left.source, vector, members, minimum, maximum };
 }
 
 function reverseComparisonOperator(operator: ComparisonOperator): ComparisonOperator {
@@ -4511,7 +4769,7 @@ function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
       const rightKey = keys[rightIndex * termCount + term];
       const placed = explicitNullOrder(leftKey, rightKey, order.nulls);
       if (placed !== undefined && placed !== 0) return placed;
-      const comparison = compareComparables(leftKey, rightKey);
+      const comparison = compareValues(leftKey, rightKey);
       if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
     }
     return 0;
@@ -4556,17 +4814,9 @@ function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
   }
 }
 
-/**
- * Shares one default-locale collator across all string comparisons: `left.localeCompare(right)`
- * with no arguments is specified to order identically, but re-resolves locale data per call.
- */
-const defaultCollator = new Intl.Collator();
-
 function compareValues(left: unknown, right: unknown): number {
-  return compareComparables(comparable(left), comparable(right));
-}
-
-function compareComparables(a: unknown, b: unknown): number {
+  const a = left instanceof Date ? left.getTime() : left;
+  const b = right instanceof Date ? right.getTime() : right;
   if (a === b) return 0;
   if (a === null || a === undefined) return -1;
   if (b === null || b === undefined) return 1;
@@ -4575,7 +4825,7 @@ function compareComparables(a: unknown, b: unknown): number {
     if (Number.isNaN(b)) return -1;
     return a - b;
   }
-  if (typeof a === "string" && typeof b === "string") return defaultCollator.compare(a, b);
+  if (typeof a === "string" && typeof b === "string") return compareSqlStrings(a, b);
   if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
   throw new TypeError("Values must have comparable SQL types");
 }

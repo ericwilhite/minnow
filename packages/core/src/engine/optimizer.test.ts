@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { chooseJoinOrder, type DatabaseRow } from "./database.js";
-import { optimizePlan, renderPlan } from "./optimizer.js";
+import type { DatabaseRow } from "./database.js";
+import { chooseJoinOrder, optimizePlan, renderPlan } from "./optimizer.js";
 import { compileQuery, executeQuery, executeRowQuery } from "./query.js";
 import { columnarTableFromRows } from "./vector.js";
 

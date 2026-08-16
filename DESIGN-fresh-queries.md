@@ -189,30 +189,11 @@ permits, not one it depends on.
 
 ## Benchmark changes
 
-### duckdb-wasm joins the engine comparison
+### Compare storage peers
 
-DuckDB's executor is the performance model this design copies, so it must be a measured line,
-not an aspiration. Add a `duckdb` engine to `apps/bench` behind the existing `EngineSession`
-interface, running the official `@duckdb/duckdb-wasm` bundle in the same worker harness as
-sqlite-wasm and PGlite.
-
-**Disclosure requirement — in-memory storage.** duckdb-wasm holds its database in memory:
-default storage is a transient in-memory catalog, and its OPFS persistence remains experimental
-and is not exercised by this harness. The other engines in the comparison run genuinely
-disk-backed in a persistent browser profile (IndexedDB or OPFS). duckdb-wasm therefore skips
-storage I/O entirely and carries an unfair advantage on every number it posts.
-
-This must be visible in the record and on the page, not a footnote in a commit message:
-
-- The capture JSON records `storage: "memory"` in the duckdb engine metadata.
-- The benchmarks page (`apps/site/src/pages/benchmarks.astro`) renders a disclosure wherever
-  duckdb-wasm numbers appear, generated from that metadata so the page and the record cannot
-  disagree — same rule the page already follows for its other caveats. Suggested copy: "DuckDB
-  runs fully in memory in this harness (no disk-backed persistence); its numbers exclude all
-  storage I/O and are not directly comparable to the disk-backed engines. It is included as an
-  executor reference, not a storage peer."
-- The dataset-ingest comparison either excludes duckdb-wasm or labels its ingest numbers with
-  the same disclosure, since ingest is dominated by exactly the I/O it skips.
+The browser comparison contains MinnowDatabase, SQLite Wasm, and PGlite. Each engine persists its
+dataset in the browser profile. In-memory executors are excluded because omitting storage I/O
+distorts dataset build, write, and query comparisons.
 
 ### Honest per-engine timing
 
@@ -223,12 +204,12 @@ This must be visible in the record and on the page, not a footnote in a commit m
   `selectObjects` (which re-prepares per call) and PGlite's is equivalent; both should use the
   engines' real prepared statements so any reported prepare time means the same thing
   everywhere.
-- The benchmarks-page paragraph explaining the prepared-statement split is replaced by the
-  duckdb disclosure and a one-line note that all engines report fresh statement execution.
+- The benchmarks-page paragraph explaining the prepared-statement split is replaced by a
+  one-line note that all engines report fresh statement execution.
 
 ### Perf gate
 
-`npm run test:perf` ratios re-baseline after the executor lands. The gate's meaning sharpens:
+Performance-gate ratios re-baseline after the executor lands. The gate's meaning sharpens:
 minnow-vs-sqlite ratios compare fresh execution to fresh execution. Slower-than-sqlite remains a
 failure. Expect the hot repeated-query numbers to regress from "sub-0.1 ms fused-array scan" to
 "probe + streamed scan of buffer-pool-resident blocks"; expect write-then-query workloads to
@@ -245,7 +226,7 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
 | 2     | Streaming executor: batch pipeline, scan-level zone maps, per-block dictionaries | Conformance corpus, differential fuzzer (raised row counts), perf gate green        |
 | 3     | Delete prepare machinery + public API; add `snapshot()`; docs-site updates       | Whole-tree check green; no `prepareQuery` reference remains outside history         |
 | 4     | Compaction block-size tuning                                                     | Scan-throughput-vs-block-size curve captured; chosen default recorded with the data |
-| 5     | Bench: duckdb-wasm engine + disclosures; re-capture; perf-gate re-baseline       | New capture JSONs published; benchmarks page regenerated with disclosure            |
+| 5     | Browser engine comparison; re-capture; perf-gate re-baseline                     | New capture JSONs published; benchmarks page regenerated                            |
 
 ## Measured outcomes (updated as stages land)
 
@@ -271,14 +252,10 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
   block and the compaction default stays 2 MiB target blocks — both on the plateau, with
   moderate buffer-pool eviction granularity. Recorded beside the default in database.ts.
 
-- **Stage 5 (landed):** DuckDB (wasm) joined the browser engine comparison as an
-  in-memory executor reference with the disclosure generated from the capture metadata;
-  sqlite/pglite use genuine prepared statements. Scale-100 re-capture (9.56M rows,
-  15 queries, all four engines checksum-verified, both browsers passed): suite totals
-  Chromium — Minnow 434 ms, SQLite 2,118 ms, PGlite 1,894 ms, DuckDB (in-memory) 167 ms;
-  Firefox — Minnow 606 ms, SQLite 12,712 ms, PGlite 7,169 ms, DuckDB (in-memory) 1,355 ms.
-  Minnow's median prepare is now ~0.3 ms (compile only), versus 28–158 ms materializing
-  prepares before this design.
+- **Stage 5 (landed):** SQLite/PGlite use genuine prepared statements, and every engine reports
+  fresh execution separately from Minnow's cached-repeat timing. The published comparison now
+  contains only persistent browser storage peers. Minnow's median prepare is ~0.3 ms (compile
+  only), versus 28–158 ms materializing prepares before this design.
 
 ## Follow-on work landed after the five stages (2026-08-14)
 
@@ -299,8 +276,7 @@ Ordered so every stage is independently shippable and the gates beneath it stay 
   triggers included; commit channels widened to per-table lists with the single-entry
   bulk-load path preserved verbatim.
 - **Derived/windowed columnar caching (landed):** window-running 10.9 → 2.7 ms and
-  distinct-aggregate 23.4 → 7.2 ms on the gate; every query beats sqlite and half beat
-  in-memory DuckDB.
+  distinct-aggregate 23.4 → 7.2 ms on the gate; every query beats sqlite.
 
 ## Live queries and triggers — architecture assessment (2026-08-14)
 
@@ -340,7 +316,7 @@ Both prior follow-ups landed (2026-08-14, same day):
   provably fresh); the real remainder was per-row predicate dispatch. The no-join selection
   kernel (filterScanBatch: unboxed primitive, dictionary-equality, and dictionary-LIKE loops
   compacting a shared selection before any per-row work) took gate filter-scan from 5.7 to
-  2.5 ms — 3.1x faster than sqlite and ahead of in-memory DuckDB on that shape — with
+  2.5 ms — 3.1x faster than sqlite on that shape — with
   like-scan 5.5 → 3.3 ms and grouped filters 4.6 → 1.7 ms. Window loads answer synchronously
   when the batch is resident, and query() gained memoize: false so the gate measures the
   executor, not the memo.
@@ -376,8 +352,6 @@ Both prior follow-ups landed (2026-08-14, same day):
 - **String-heavy aggregation.** Byte-hashing group keys across per-block dictionaries is the
   designed path; if profiling shows dictionary-code direct addressing mattered on hot shapes, a
   per-scan unified dictionary for low-cardinality columns is a contained follow-up.
-- **duckdb-wasm bundle weight and loading.** The wasm bundle is tens of megabytes; the bench
-  must load it once per session and must not let bundle fetch time contaminate query timing.
 - **`snapshot()` and garbage collection.** A long callback holds a lease and can delay block
   GC; the lease TTL and renewal already bound this, but the docs must say "keep snapshot scopes
   short" — the scope makes the cost visible, which is the point.

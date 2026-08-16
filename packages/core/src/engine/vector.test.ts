@@ -696,6 +696,28 @@ describe("vector query execution", () => {
     }
   });
 
+  it("uses packed dictionary codes for sparse high-cardinality compound groups", () => {
+    // 4 region slots (including NULL) * 16,385 label slots is just above the dense
+    // 65,536-slot cutoff. This exercises the sparse numeric index used by COUNT DISTINCT's
+    // desugared (region, label) grouping without making the common dense path pay for a Map.
+    const rows: DatabaseRow[] = Array.from({ length: 16_384 }, (_, index) => ({
+      region: `region-${String(index % 3)}`,
+      label: `label-${String(index)}`,
+    }));
+    const tables = new Map([["rows", rows]]);
+    const plan = compileQuery(
+      "SELECT region, COUNT(DISTINCT label) AS labels FROM rows GROUP BY region ORDER BY region",
+    );
+
+    const result = executeQuery(plan, tables);
+    expect(result).toEqual(executeRowQuery(plan, tables));
+    expect(result.rows).toEqual([
+      { region: "region-0", labels: 5_462 },
+      { region: "region-1", labels: 5_461 },
+      { region: "region-2", labels: 5_461 },
+    ]);
+  });
+
   it("preserves SQL empty-input aggregate results with explicit vectors", () => {
     const empty = createColumnarTable(
       "events",

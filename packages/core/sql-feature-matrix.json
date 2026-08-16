@@ -35,7 +35,8 @@
     {
       "id": "expression.round",
       "status": "supported",
-      "example": "SELECT ROUND(amount / 3, 2) AS thirds FROM rows"
+      "example": "SELECT ROUND(amount / 3, 2) AS thirds FROM rows",
+      "notes": "Precision truncates to an integer and clamps to 0..30; halfway values round away from zero, matching SQLite."
     },
     {
       "id": "literal.string",
@@ -247,7 +248,7 @@
       "id": "mutation.upsert-partial",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score, bonus) VALUES ('x', 50, 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
-      "notes": "Assigning a subset of inserted columns merges only those into existing rows; unassigned columns keep their stored values."
+      "notes": "Assigning a subset of inserted columns merges only those into existing rows; unassigned columns keep their stored values. Mixed update/insert batches publish atomically or roll back together."
     },
     {
       "id": "where.or",
@@ -257,7 +258,8 @@
     {
       "id": "where.like",
       "status": "supported",
-      "example": "SELECT region FROM rows WHERE region LIKE 'w%'"
+      "example": "SELECT region FROM rows WHERE region LIKE 'w%'",
+      "notes": "% matches any run and _ matches one Unicode codepoint."
     },
     {
       "id": "predicate.is-distinct-from",

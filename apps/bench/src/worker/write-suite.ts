@@ -2,7 +2,7 @@
  * The write suite: insert, update, and upsert at several batch sizes, on every engine, each
  * through that engine's own bulk path — minnow's batch write API, one sqlite prepared
  * statement stepped inside a transaction, PGlite's multi-row statements inside a
- * transaction, and duckdb's Arrow append. No engine is tuned; every one runs on its shipped
+ * transaction. No engine is tuned; every one runs on its shipped
  * defaults, exactly as in the read comparison.
  *
  * Four rules keep the numbers meaningful:
@@ -22,7 +22,6 @@
  *    against an oracle built in JavaScript from the same deterministic inputs. A timing an
  *    engine cannot back with the right table state is reported unverified, never as a win.
  */
-import { engineIds } from "../protocol.js";
 import type {
   EngineId,
   WriteCaseReport,
@@ -30,6 +29,7 @@ import type {
   WriteOperation,
   WriteSuitePayload,
   WriteSuiteResult,
+  WorkloadKind,
 } from "../protocol.js";
 import {
   loadDriver,
@@ -41,7 +41,12 @@ import {
 } from "../engines/session.js";
 import { canonicalTuples, referenceChecksum, tuplesMatch } from "./canonical.js";
 import { getDataset } from "./registry.js";
-import { assertNotCancelled, progress, summarizeSamples } from "./support.js";
+import {
+  assertNotCancelled,
+  progress,
+  summarizeSamples,
+  validateDatasetSuitePayload,
+} from "./support.js";
 
 const SAMPLE_COUNT = 5;
 
@@ -57,6 +62,7 @@ export interface WriteCaseDefinition {
   id: string;
   name: string;
   operation: WriteOperation;
+  workload: WorkloadKind;
   /** Rows the measured statement writes. */
   rows: number;
   /** Rows written before the measurement, unmeasured, so the operation has something to hit. */
@@ -67,17 +73,7 @@ export interface WriteCaseDefinition {
 }
 
 export function validateWritePayload(value: unknown): WriteSuitePayload {
-  if (typeof value !== "object" || value === null) throw new Error("Invalid suite payload");
-  const payload = value as Partial<WriteSuitePayload>;
-  if (typeof payload.datasetId !== "string") throw new TypeError("Dataset id must be a string");
-  if (
-    !Array.isArray(payload.engines) ||
-    payload.engines.length === 0 ||
-    !payload.engines.every((engine): engine is EngineId => engineIds.includes(engine))
-  ) {
-    throw new Error("Select at least one engine");
-  }
-  return { datasetId: payload.datasetId, engines: [...new Set(payload.engines)] };
+  return validateDatasetSuitePayload(value);
 }
 
 /**
@@ -93,6 +89,7 @@ export function writeCaseDefinitions(): WriteCaseDefinition[] {
     id: `insert-${String(rows)}`,
     name: `Insert ${formatRows(rows)}`,
     operation: "insert",
+    workload: writeWorkload(rows),
     rows,
     seedRows: 0,
     firstKey: 1,
@@ -103,6 +100,7 @@ export function writeCaseDefinitions(): WriteCaseDefinition[] {
       id: `update-${String(rows)}`,
       name: `Update ${formatRows(rows)}`,
       operation: "update",
+      workload: writeWorkload(rows),
       rows,
       seedRows: rows,
       firstKey: 1,
@@ -115,6 +113,7 @@ export function writeCaseDefinitions(): WriteCaseDefinition[] {
       id: `upsert-${String(rows)}`,
       name: `Upsert ${formatRows(rows)}`,
       operation: "upsert",
+      workload: writeWorkload(rows),
       rows,
       seedRows: rows,
       firstKey,
@@ -122,6 +121,11 @@ export function writeCaseDefinitions(): WriteCaseDefinition[] {
     });
   }
   return cases;
+}
+
+/** Small transactions model application writes; large batches model analytical ingestion. */
+function writeWorkload(rows: number): WorkloadKind {
+  return rows <= 100 ? "oltp" : "olap";
 }
 
 function formatRows(rows: number): string {
@@ -179,6 +183,7 @@ export async function runWriteSuite(
         id: definition.id,
         name: definition.name,
         operation: definition.operation,
+        workload: definition.workload,
         rows: definition.rows,
         seedRows: definition.seedRows,
         expectedTableRows: definition.expectedTableRows,

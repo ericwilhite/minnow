@@ -112,6 +112,22 @@ const { title, description = "Minnow — a tiny relational database that lives i
     color: var(--text);
   }
 
+  @media (max-width: 480px) {
+    .header-inner {
+      gap: 0.5rem;
+      padding-inline: 0.75rem;
+    }
+
+    .brand {
+      gap: 0.35rem;
+    }
+
+    .site-nav a {
+      font-size: 0.82rem;
+      padding-inline: 0.4rem;
+    }
+  }
+
   .site-footer {
     border-top: 1px solid var(--border);
     margin-top: 5rem;

@@ -79,6 +79,11 @@ The conventions:
 
 Result types don't lie: `sum` over an empty group is `null`, so its type is `number | null`.
 
+SQL value behavior is deterministic across browsers: strings compare in Unicode codepoint order,
+`LIKE` `_` matches one Unicode codepoint, and set operations treat `-0` and `0` as the same numeric
+value. `ROUND(value, precision)` rounds halfway values away from zero; precision truncates to an
+integer and is clamped to `0..30`, matching SQLite's supported range.
+
 ## Full-text search
 
 Any column is searchable — no index DDL, no schema marking. A search treats the row as one

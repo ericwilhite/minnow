@@ -19,6 +19,5 @@ npm install @minnowdb/core
 - **Subpath exports** — `/storage`, `/client`, `/worker`, `/transactions`, `/block-format`,
   `/testing`.
 
-Quick start, guides, benchmark results, and the complete API reference live in the docs site in
-the [minnow repository](https://github.com/ericwilhite/minnow) — the single source of truth —
-via `npm run site:dev`.
+Quick start, guides, benchmark results, contributor workflows, and the complete API reference live
+in the [Minnow docs](https://minnowdb.dev/docs/) — the single source of truth.

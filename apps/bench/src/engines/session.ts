@@ -57,8 +57,8 @@ export interface WriteBatch {
  * One created table, driven through its engine's own bulk write paths.
  *
  * Each `prepare*` converts the batch into the form its engine's API takes — row tuples to
- * bind for sqlite, statement text and flat parameters for PGlite, an Arrow table for duckdb,
- * the columnar batch itself for minnow — and returns the call that applies it. Only that
+ * bind for SQLite, statement text and flat parameters for PGlite, and the columnar batch
+ * itself for Minnow — and returns the call that applies it. Only that
  * returned call is timed. The split exists because reshaping JavaScript is the harness's
  * cost, not the engine's: pivoting 100,000 columnar rows into tuples takes ~60ms, which
  * would otherwise be charged to the engines whose APIs want rows and to no others.
@@ -129,7 +129,5 @@ export async function loadDriver(engine: EngineId): Promise<EngineDriver> {
       return (await import("./sqlite.js")).sqliteDriver;
     case "pglite":
       return (await import("./pglite.js")).pgliteDriver;
-    case "duckdb":
-      return (await import("./duckdb.js")).duckdbDriver;
   }
 }

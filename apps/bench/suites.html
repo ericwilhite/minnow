@@ -19,10 +19,11 @@
 
       <h2 id="reference">Reference query suite</h2>
       <p class="note">
-        15 relational queries over a persisted dataset. Each engine prepares once and executes seven
-        measured iterations per query; every result is compared tuple-for-tuple against an
-        independent JavaScript oracle computed from the deterministic generator. A query an engine
-        cannot compile is reported as outside that engine's surface, with the engine's own error.
+        OLTP and OLAP relational reads over a persisted dataset. Each engine prepares once and
+        executes seven measured iterations per query; every result is compared tuple-for-tuple
+        against an independent JavaScript oracle computed from the deterministic generator. A query
+        an engine cannot compile is reported as outside that engine's surface, with the engine's own
+        error.
       </p>
       <fieldset>
         <div>
@@ -45,14 +46,14 @@
 
       <h2 id="writes">Write suite</h2>
       <p class="note">
-        Inserts, updates, and upserts at 1, 100, and 10,000 rows (inserts also at 100,000), each
-        through the engine's own bulk path: MinnowDatabase's batch write API, one SQLite prepared
-        statement stepped inside a transaction, PGlite's multi-row statements inside a transaction,
-        and DuckDB's Arrow append. Every sample writes into a table created for that sample, so no
-        sample measures a table an earlier one grew. Each final table is read back and compared row
-        for row against a JavaScript oracle. The suite adds its own tables to the selected dataset
-        and never reads or writes the dataset's own tables; MinnowDatabase has no DROP TABLE, so its
-        copies stay until the dataset is deleted.
+        OLTP inserts, updates, and upserts at 1–100 rows, plus OLAP bulk mutations at 10,000 rows
+        (inserts also at 100,000), each through the engine's own bulk path: MinnowDatabase's batch
+        write API, one SQLite prepared statement stepped inside a transaction, PGlite's multi-row
+        statements inside a transaction. Every sample writes into a table created for that sample,
+        so no sample measures a table an earlier one grew. Each final table is read back and
+        compared row for row against a JavaScript oracle. The suite adds its own tables to the
+        selected dataset and never reads or writes the dataset's own tables; MinnowDatabase has no
+        DROP TABLE, so its copies stay until the dataset is deleted.
       </p>
       <fieldset>
         <div>

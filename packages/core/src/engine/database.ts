@@ -5,6 +5,18 @@ import {
   type ColumnarBatch,
   type InsertBatchInput,
 } from "./batch.js";
+import { ArtifactCache } from "./artifact-cache.js";
+import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writer.js";
+export {
+  attachLifecycleFlush,
+  BufferedTableWriter,
+  type BufferedFlushResult,
+  type BufferedWriterOptions,
+  type LifecycleDocumentTarget,
+  type LifecycleFlushOptions,
+  type LifecycleFlushRequester,
+  type LifecyclePageTarget,
+} from "./buffered-writer.js";
 import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
@@ -132,12 +144,18 @@ import {
   type SqlColumnSchema,
 } from "./query.js";
 import {
+  copyQueryResult,
+  queryResultMemoKey,
+  queryResultRetainedBytes,
+  RESULT_MEMO_MAX_BYTES,
+} from "./query-cache.js";
+import {
   QueryMemoryBudgetError,
   QueryMemoryContext,
   type QueryMemoryReservation,
 } from "./memory.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySetOptions } from "./live.js";
-import { renderPlan } from "./optimizer.js";
+import { chooseJoinOrder, renderPlan } from "./optimizer.js";
 import {
   applyColumnSteps,
   planMigration,
@@ -194,6 +212,8 @@ class StaleTriggerDerivationsError extends Error {
 }
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
 const PLAN_CACHE_LIMIT = 512;
+/** Bounds concurrent compression work without serializing independent column blocks. */
+const WRITE_ENCODE_CONCURRENCY = 6;
 
 type PhysicalCompactionRewritePlan = RechunkCompactionRewritePlan | MergeCompactionRewritePlan;
 
@@ -239,8 +259,11 @@ interface SegmentVisibilityCatalog {
 
 interface ZonePredicate {
   readonly column: TableColumnRecord;
-  readonly operator: ComparisonOperator;
+  readonly operator: ComparisonOperator | "IN";
+  /** The compared literal; for IN, the smallest list member. */
   readonly value: number;
+  /** IN only: every distinct member, ascending, so a block test is one binary search. */
+  readonly members?: Float64Array;
 }
 
 interface SelectedAppendSegment {
@@ -669,42 +692,17 @@ function boundInsertValue(value: InsertValue): QueryValue {
   return value;
 }
 
+/** Quotes a catalog identifier for internally generated SQL. */
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
 export interface RunStatementOptions {
   /**
    * Projects the affected rows back: column names, or "*" for every table column. Inserts echo
    * the written values; updates return post-update values; deletes return the rows as read.
    */
   readonly returning?: readonly string[] | "*";
-}
-
-export interface BufferedWriterOptions {
-  mode?: "insert" | "upsert";
-  maxRows?: number;
-  maxBytes?: number;
-  maxAgeMs?: number;
-  onError?: (error: unknown) => void;
-}
-
-export type BufferedFlushResult = InsertBatchResult | UpsertBatchResult;
-
-export interface LifecycleFlushRequester {
-  requestFlush(): void;
-}
-
-export interface LifecycleDocumentTarget {
-  readonly visibilityState: string;
-  addEventListener(type: "visibilitychange", listener: () => void): void;
-  removeEventListener(type: "visibilitychange", listener: () => void): void;
-}
-
-export interface LifecyclePageTarget {
-  addEventListener(type: "pagehide", listener: () => void): void;
-  removeEventListener(type: "pagehide", listener: () => void): void;
-}
-
-export interface LifecycleFlushOptions {
-  document?: LifecycleDocumentTarget;
-  page?: LifecyclePageTarget;
 }
 
 export interface VisibleSegment {
@@ -724,17 +722,11 @@ export class MinnowDatabase {
   readonly #internalLeaseOwnerId = `minnow/${crypto.randomUUID()}`;
   readonly #liveSets = new Set<LiveQuerySet>();
   #internalLeaseSequence = 0;
-  readonly #prepareCacheLimitBytes: number;
+  readonly #artifactCache: ArtifactCache;
   readonly #ftsAutoIndexRows: number;
   readonly #autoCompact: boolean;
   /** One background build attempt per (table, column) per session; misses just stay scans. */
   readonly #ftsBuildsInFlight = new Set<string>();
-  /** Insertion order doubles as LRU order; hits re-insert their entry. */
-  readonly #prepareCache = new Map<string, { payload: unknown; bytes: number }>();
-  #prepareCacheUsedBytes = 0;
-  #bufferPoolHits = 0;
-  #bufferPoolMisses = 0;
-  #bufferPoolEvictions = 0;
   /** Tables with a fire-and-forget compaction step already running. */
   readonly #autoCompactionsInFlight = new Set<string>();
   /**
@@ -784,10 +776,7 @@ export class MinnowDatabase {
     if (!Number.isSafeInteger(this.#spillOwnerLeaseMs) || this.#spillOwnerLeaseMs <= 0) {
       throw new RangeError("Spill owner lease lifetime must be a positive whole number");
     }
-    this.#prepareCacheLimitBytes = options.bufferPoolBytes ?? 64 * 1024 * 1024;
-    if (!Number.isSafeInteger(this.#prepareCacheLimitBytes) || this.#prepareCacheLimitBytes < 0) {
-      throw new RangeError("Prepare cache bytes must be a non-negative whole number");
-    }
+    this.#artifactCache = new ArtifactCache(options.bufferPoolBytes ?? 64 * 1024 * 1024);
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
     this.#autoCompact = options.autoCompact ?? true;
     if (!Number.isSafeInteger(this.#ftsAutoIndexRows) || this.#ftsAutoIndexRows < 0) {
@@ -1406,33 +1395,55 @@ export class MinnowDatabase {
           transaction.setFtsChanges({ tableId: table.id, columns: ftsDeltas });
         }
       }
-      for (const column of table.columns) {
-        const values = input.columns[column.name] ?? [];
-        const blockIds: string[] = [];
-        const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
-        const encodeStarted = performance.now();
-        for (let start = 0, part = 0; start < rowCount; start += this.#rowsPerBlock, part += 1) {
-          const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
-          const bytes = await encodeBlock(asColumnInput(column.type, slice), this.#compression);
-          const blockId = [
-            "table",
-            table.id,
-            "segment",
-            segmentId,
-            "column",
-            column.id,
-            "part",
-            String(part).padStart(6, "0"),
-          ].join("/");
-          blockWrites.push({ id: blockId, bytes });
-          blockIds.push(blockId);
+      const encodeStarted = performance.now();
+      for (
+        let columnStart = 0;
+        columnStart < table.columns.length;
+        columnStart += WRITE_ENCODE_CONCURRENCY
+      ) {
+        const encodedColumns = await Promise.all(
+          table.columns
+            .slice(columnStart, columnStart + WRITE_ENCODE_CONCURRENCY)
+            .map(async (column) => {
+              const values = input.columns[column.name] ?? [];
+              const blockIds: string[] = [];
+              const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
+              for (
+                let start = 0, part = 0;
+                start < rowCount;
+                start += this.#rowsPerBlock, part += 1
+              ) {
+                const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
+                const bytes = await encodeBlock(
+                  asColumnInput(column.type, slice),
+                  this.#compression,
+                );
+                const blockId = [
+                  "table",
+                  table.id,
+                  "segment",
+                  segmentId,
+                  "column",
+                  column.id,
+                  "part",
+                  String(part).padStart(6, "0"),
+                ].join("/");
+                blockWrites.push({ id: blockId, bytes });
+                blockIds.push(blockId);
+              }
+              return { columnId: column.id, blockIds, blockWrites };
+            }),
+        );
+        // Promise.all preserves schema order, keeping metadata and staged writes deterministic
+        // regardless of which native compressor finishes first.
+        for (const encoded of encodedColumns) {
+          columnBlockIds[encoded.columnId] = encoded.blockIds;
+          storedBytes += sumBytes(encoded.blockWrites);
+          blockCount += encoded.blockWrites.length;
+          batchBlockWrites.push(...encoded.blockWrites);
         }
-        encodeMs += performance.now() - encodeStarted;
-        columnBlockIds[column.id] = blockIds;
-        storedBytes += sumBytes(blockWrites);
-        blockCount += blockWrites.length;
-        batchBlockWrites.push(...blockWrites);
       }
+      encodeMs += performance.now() - encodeStarted;
 
       const segment: SegmentRecord = {
         id: segmentId,
@@ -2118,15 +2129,7 @@ export class MinnowDatabase {
       options.spillPageRows === undefined &&
       probe !== undefined;
     if (probe === undefined || !memoizable) return this.#queryCompiled(plan, options);
-    // Params serialize with a type tag: JSON alone renders a Date and its ISO string
-    // identically, yet they bind as different literal types with different comparison
-    // semantics, so an untagged key would serve one result for the other.
-    const paramKey = (options.params ?? [])
-      .map((value) =>
-        value instanceof Date ? `d${String(value.getTime())}` : `${typeof value}:${String(value)}`,
-      )
-      .join(`\u0001`);
-    const key = `res ${sql}\u0001${paramKey}`;
+    const key = `res ${queryResultMemoKey(sql, options.params ?? [])}`;
     const before = await probe();
     const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
       QueryResult | undefined;
@@ -3870,8 +3873,8 @@ export class MinnowDatabase {
 
   /**
    * ON CONFLICT (key) DO UPDATE SET with a column subset: rows whose key exists merge only the
-   * assigned EXCLUDED columns through the keyed update path, and the rest insert. The existence
-   * read and the writes are separate steps at one snapshot, like every SQL mutation here.
+   * assigned EXCLUDED columns through the keyed update path, and the rest insert. Classification,
+   * update, insert, and RETURNING all run in one write scope, so any failure aborts the statement.
    */
   async #mergeConflictingInsertRows(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
@@ -3891,148 +3894,87 @@ export class MinnowDatabase {
       void onConflict;
       return this.runStatement(plain, options);
     }
-    const assigned = statement.onConflict.columns ?? [];
-    const keyToken = (value: QueryValue): string =>
-      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
-    const existing = await this.#existingInsertKeys(table, keyColumn, statement);
-    const freshRows: InsertValue[][] = [];
-    const conflictingRows: InsertValue[][] = [];
-    for (const row of statement.rows) {
-      const key = boundInsertValue(row[keyIndex] ?? null);
-      if (key !== null && existing.has(keyToken(key))) conflictingRows.push(row);
-      else freshRows.push(row);
-    }
-    let updateVersion: number | undefined;
-    if (conflictingRows.length > 0) {
-      const changes: Record<string, BatchValue[]> = {};
-      for (const name of assigned) {
-        const columnIndex = statement.columns.indexOf(name);
-        changes[name] = conflictingRows.map((row) => boundInsertValue(row[columnIndex] ?? null));
+    for (const name of statement.columns) {
+      if (!table.columns.some((column) => column.name === name)) {
+        throw new TypeError(`INSERT column does not exist: ${name}`);
       }
-      const keys = conflictingRows.map((row) => {
-        const value = boundInsertValue(row[keyIndex] ?? null);
-        if (value === null)
-          throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
-        return value;
-      });
-      const result = await this.updateBatch(table.name, { keys, changes });
-      updateVersion = result.version;
     }
-    let insertResult: ExecuteResult | undefined;
-    if (freshRows.length > 0) {
-      const { onConflict, ...plain } = statement;
-      void onConflict;
-      insertResult = await this.runStatement({ ...plain, rows: freshRows }, options);
-    }
-    const insertVersion = insertResult?.kind === "insert" ? insertResult.version : undefined;
-    const returning =
+    const returningColumns =
       options.returning === undefined
         ? undefined
-        : await this.#mergedUpsertReturnedRows(
-            table,
-            keyColumn,
-            statement,
-            conflictingRows,
-            insertResult,
-            options.returning,
-          );
-    const version = insertVersion ?? updateVersion;
-    return {
-      kind: "insert",
-      table: statement.table,
-      rowCount: statement.rows.length,
-      ...(version === undefined ? {} : { version }),
-      ...(returning === undefined ? {} : { returnedRows: returning }),
-    };
-  }
-
-  /** Post-merge RETURNING: updated rows read at the snapshot with assignments applied. */
-  async #mergedUpsertReturnedRows(
-    table: TableRecord,
-    keyColumn: TableRecord["columns"][number],
-    statement: Extract<CompiledStatement, { kind: "insert" }>,
-    conflictingRows: readonly InsertValue[][],
-    insertResult: ExecuteResult | undefined,
-    returning: readonly string[] | "*",
-  ): Promise<QueryRow[]> {
-    const names = returning === "*" ? table.columns.map(({ name }) => name) : [...returning];
-    for (const name of names) {
+        : options.returning === "*"
+          ? table.columns.map(({ name }) => name)
+          : [...options.returning];
+    for (const name of returningColumns ?? []) {
       if (!table.columns.some((column) => column.name === name)) {
         throw new TypeError(`RETURNING column does not exist: ${name}`);
       }
     }
-    const keyIndex = statement.columns.indexOf(keyColumn.name);
-    const assigned = new Set(statement.onConflict?.columns ?? []);
-    const updatedByKey = new Map<QueryValue | string, InsertValue[]>();
-    for (const row of conflictingRows) {
-      const key = boundInsertValue(row[keyIndex] ?? null);
-      updatedByKey.set(key instanceof Date ? key.toISOString() : key, row);
-    }
-    // One snapshot read serves every updated row's unassigned columns.
-    const rowsByKey = new Map<QueryValue | string, QueryRow>();
-    if (conflictingRows.length > 0) {
-      const plan: CompiledQuery = {
-        sql: "(on conflict returning)",
-        base: { table: table.name, alias: table.name },
-        joins: [],
-        select: [...new Set([keyColumn.name, ...names])].map((name) => ({
-          expression: { kind: "column", reference: name },
-          alias: name,
-        })),
-        predicates: [
-          {
-            left: { kind: "column", reference: keyColumn.name },
-            operator: "IN",
-            right: {
-              kind: "list",
-              items: [...updatedByKey.keys()].map((value) => ({
-                kind: "literal",
-                value: typeof value === "string" || value === null ? value : (value as QueryValue),
-              })),
-            },
-          },
-        ],
-        groupBy: [],
-        having: [],
-        orderBy: [],
-      };
-      const prepared = await this.#prepareCompiledPlan(plan);
-      try {
-        for (const row of prepared.execute().rows) {
-          const key = row[keyColumn.name] ?? null;
-          rowsByKey.set(key instanceof Date ? key.toISOString() : key, row);
-        }
-      } finally {
-        prepared.close();
-      }
-    }
-    const insertedEcho =
-      insertResult?.kind === "insert" ? [...(insertResult.returnedRows ?? [])] : [];
-    const output: QueryRow[] = [];
-    for (const row of statement.rows) {
-      const key = boundInsertValue(row[keyIndex] ?? null);
-      const token = key instanceof Date ? key.toISOString() : key;
-      const updated = updatedByKey.get(token);
-      if (updated === undefined) {
-        const echoed = insertedEcho.shift();
-        if (echoed !== undefined) output.push(echoed);
-        continue;
-      }
-      const snapshot = rowsByKey.get(token) ?? {};
-      output.push(
-        Object.fromEntries(
-          names.map((name) => {
-            if (assigned.has(name)) {
-              const columnIndex = statement.columns.indexOf(name);
-              return [name, boundInsertValue(updated[columnIndex] ?? null)];
-            }
-            if (name === keyColumn.name) return [name, key];
-            return [name, snapshot[name] ?? null];
-          }),
-        ),
+    const assigned = statement.onConflict.columns ?? [];
+    const keyToken = (value: QueryValue): string =>
+      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+    const { result: returnedRows, version } = await this.write(async (transaction) => {
+      const existing = await this.#existingInsertKeys(table, keyColumn, statement, (sql, params) =>
+        transaction.query(sql, { params }),
       );
-    }
-    return output;
+      const freshRows: InsertValue[][] = [];
+      const conflictingRows: InsertValue[][] = [];
+      for (const row of statement.rows) {
+        const key = boundInsertValue(row[keyIndex] ?? null);
+        if (key !== null && existing.has(keyToken(key))) conflictingRows.push(row);
+        else freshRows.push(row);
+      }
+      if (conflictingRows.length > 0) {
+        const changes: Record<string, BatchValue[]> = {};
+        for (const name of assigned) {
+          const columnIndex = statement.columns.indexOf(name);
+          changes[name] = conflictingRows.map((row) => boundInsertValue(row[columnIndex] ?? null));
+        }
+        const keys = conflictingRows.map((row) => {
+          const value = boundInsertValue(row[keyIndex] ?? null);
+          if (value === null) {
+            throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
+          }
+          return value;
+        });
+        await transaction.updateBatch(table.name, { keys, changes });
+      }
+      if (freshRows.length > 0) {
+        const columns: Record<string, BatchValue[]> = {};
+        statement.columns.forEach((column, index) => {
+          columns[column] = freshRows.map((row) => boundInsertValue(row[index] ?? null));
+        });
+        for (const column of table.columns) {
+          if (!(column.name in columns)) columns[column.name] = freshRows.map(() => null);
+        }
+        await transaction.insertBatch(table.name, { columns });
+      }
+      if (returningColumns === undefined) return undefined;
+      const keys = statement.rows.map((row) => boundInsertValue(row[keyIndex] ?? null));
+      const selectedColumns = [...new Set([keyColumn.name, ...returningColumns])];
+      const selected = selectedColumns.map(quoteSqlIdentifier).join(", ");
+      const result = await transaction.query(
+        `SELECT ${selected} FROM ${quoteSqlIdentifier(table.name)} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keys.map(() => "?").join(", ")})`,
+        { params: keys },
+      );
+      const rowsByKey = new Map(
+        result.rows.map((row) => {
+          const key = row[keyColumn.name] ?? null;
+          return [keyToken(key), row] as const;
+        }),
+      );
+      return keys.map((key) => {
+        const row = rowsByKey.get(keyToken(key)) ?? {};
+        return Object.fromEntries(returningColumns.map((name) => [name, row[name] ?? null]));
+      });
+    });
+    return {
+      kind: "insert",
+      table: statement.table,
+      rowCount: statement.rows.length,
+      ...(version === null ? {} : { version }),
+      ...(returnedRows === undefined ? {} : { returnedRows }),
+    };
   }
 
   /** Existing unique keys among an insert statement's rows, read at one snapshot. */
@@ -4040,6 +3982,8 @@ export class MinnowDatabase {
     table: TableRecord,
     keyColumn: TableRecord["columns"][number],
     statement: Extract<CompiledStatement, { kind: "insert" }>,
+    query: (sql: string, params: readonly QueryValue[]) => Promise<QueryResult> = (sql, params) =>
+      this.query(sql, { params }),
   ): Promise<Set<string>> {
     const keyIndex = statement.columns.indexOf(keyColumn.name);
     const keys = statement.rows
@@ -4048,28 +3992,11 @@ export class MinnowDatabase {
     if (keys.length === 0) return new Set();
     const keyToken = (value: QueryValue): string =>
       value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
-    const plan: CompiledQuery = {
-      sql: "(on conflict existence)",
-      base: { table: table.name, alias: table.name },
-      joins: [],
-      select: [{ expression: { kind: "column", reference: keyColumn.name }, alias: "key" }],
-      predicates: [
-        {
-          left: { kind: "column", reference: keyColumn.name },
-          operator: "IN",
-          right: { kind: "list", items: keys.map((value) => ({ kind: "literal", value })) },
-        },
-      ],
-      groupBy: [],
-      having: [],
-      orderBy: [],
-    };
-    const prepared = await this.#prepareCompiledPlan(plan);
-    try {
-      return new Set(prepared.execute().rows.map((row) => keyToken(row.key ?? null)));
-    } finally {
-      prepared.close();
-    }
+    const result = await query(
+      `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(table.name)} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keys.map(() => "?").join(", ")})`,
+      keys,
+    );
+    return new Set(result.rows.map((row) => keyToken(row.key ?? null)));
   }
 
   /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
@@ -4470,6 +4397,26 @@ export class MinnowDatabase {
       tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
     );
     const columns = referencedColumns(plan, schemas);
+    // Streaming must choose the scan/build orientation before creating its sliding base view.
+    // Plain append histories have exact row counts in segment metadata; mutation histories keep
+    // their written order because their visible cardinality requires replay to determine.
+    const visibleByTable = new Map<string, SegmentRecord[]>();
+    const rowCounts = new Map<string, { rowCount: number }>();
+    for (const table of tables) {
+      const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+      visibleByTable.set(table.name, segments);
+      if (
+        segments.every((segment) => {
+          const kind = segment.kind ?? "insert";
+          return kind === "insert" || kind === "base";
+        })
+      ) {
+        rowCounts.set(table.name, {
+          rowCount: segments.reduce((total, segment) => total + segment.rowCount, 0),
+        });
+      }
+    }
+    if (rowCounts.size === tables.length) plan = chooseJoinOrder(plan, rowCounts);
     const baseTable = tables.find((table) => table.name === plan.base.table);
     if (baseTable === undefined) throw new TypeError(`Unknown table: ${plan.base.table}`);
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
@@ -4498,11 +4445,9 @@ export class MinnowDatabase {
       if (planContainsFts(plan, "bm25") && ftsStats === undefined) return undefined;
       // The streamed scan honors the same index pruning as the materialized path; a budgeted
       // MATCH query must not silently pay the full scan just because it streams.
-      const visibleBaseSegments = await this.#visibleSegmentRecords(
-        freshBaseTable,
-        snapshot,
-        visibility,
-      );
+      const visibleBaseSegments =
+        visibleByTable.get(freshBaseTable.name) ??
+        (await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility));
       this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments.length);
       const baseSegments = await this.#ftsPrunedSegments(
         freshBaseTable,
@@ -4543,11 +4488,9 @@ export class MinnowDatabase {
           if (
             projectedBuildColumns.some((column) => column.name === partitionedShape.buildKeyName)
           ) {
-            const buildSegments = await this.#visibleSegmentRecords(
-              buildTable,
-              snapshot,
-              visibility,
-            );
+            const buildSegments =
+              visibleByTable.get(buildTable.name) ??
+              (await this.#visibleSegmentRecords(buildTable, snapshot, visibility));
             const buildView = this.#streamedViewFactory(
               buildTable,
               projectedBuildColumns,
@@ -5340,6 +5283,14 @@ export class MinnowDatabase {
       if (window !== undefined && start < window.start) {
         throw new Error(`Streamed scan moved backward: ${table.name}`);
       }
+      // The cursor stops at the end of the window it last built, which can sit past a start
+      // that falls inside that window. Rewinding costs one pass over the dead-row bitmap and
+      // keeps the window aligned with what was asked for, rather than with where the cursor
+      // happened to stop.
+      if (cursorOutput > start) {
+        cursorOutput = 0;
+        cursorBase = 0;
+      }
       while (cursorOutput < start && cursorBase < baseRows) {
         if (!bitmapHasValue(dead, cursorBase)) cursorOutput += 1;
         cursorBase += 1;
@@ -5635,7 +5586,7 @@ export class MinnowDatabase {
     // its read and its write when the key is undefined. Returning undefined is therefore
     // the single switch that makes a statement compute its results instead of reusing them.
     if (!cacheResults) return undefined;
-    if (this.#prepareCacheLimitBytes === 0) return undefined;
+    if (!this.#artifactCache.enabled) return undefined;
     const parts: string[] = [];
     for (const name of collectRealTableNames(block).sort()) {
       const table = realTables.get(name);
@@ -8076,16 +8027,7 @@ export class MinnowDatabase {
   }
 
   #cacheGet(key: string): unknown {
-    if (this.#prepareCacheLimitBytes === 0) return undefined;
-    const entry = this.#prepareCache.get(key);
-    if (entry === undefined) {
-      this.#bufferPoolMisses += 1;
-      return undefined;
-    }
-    this.#bufferPoolHits += 1;
-    this.#prepareCache.delete(key);
-    this.#prepareCache.set(key, entry);
-    return entry.payload;
+    return this.#artifactCache.get(key);
   }
 
   /**
@@ -8094,14 +8036,7 @@ export class MinnowDatabase {
    * derived results, memoized results). Use it to size bufferPoolBytes from real workloads.
    */
   bufferPoolStats(): BufferPoolStats {
-    return {
-      limitBytes: this.#prepareCacheLimitBytes,
-      usedBytes: this.#prepareCacheUsedBytes,
-      entries: this.#prepareCache.size,
-      hits: this.#bufferPoolHits,
-      misses: this.#bufferPoolMisses,
-      evictions: this.#bufferPoolEvictions,
-    };
+    return this.#artifactCache.stats();
   }
 
   /**
@@ -8110,21 +8045,7 @@ export class MinnowDatabase {
    * matching and age out the same way evicted entries do.
    */
   #cachePut(key: string, payload: unknown, bytes: number): void {
-    if (this.#prepareCacheLimitBytes === 0 || bytes > this.#prepareCacheLimitBytes) return;
-    const existing = this.#prepareCache.get(key);
-    if (existing !== undefined) {
-      this.#prepareCache.delete(key);
-      this.#prepareCacheUsedBytes -= existing.bytes;
-    }
-    this.#prepareCache.set(key, { payload, bytes });
-    this.#prepareCacheUsedBytes += bytes;
-    for (const [oldestKey, entry] of this.#prepareCache) {
-      if (this.#prepareCacheUsedBytes <= this.#prepareCacheLimitBytes) break;
-      if (oldestKey === key) continue;
-      this.#prepareCache.delete(oldestKey);
-      this.#prepareCacheUsedBytes -= entry.bytes;
-      this.#bufferPoolEvictions += 1;
-    }
+    this.#artifactCache.put(key, payload, bytes);
   }
 
   /**
@@ -9199,143 +9120,6 @@ export class MinnowDatabase {
   }
 }
 
-export class BufferedTableWriter {
-  readonly #mode: "insert" | "upsert";
-  readonly #maxRows: number;
-  readonly #maxBytes: number;
-  readonly #maxAgeMs: number;
-  readonly #onError: ((error: unknown) => void) | undefined;
-  readonly #rows: Array<Readonly<Record<string, BatchValue>>> = [];
-  #estimatedBytes = 0;
-  #timer: ReturnType<typeof setTimeout> | undefined;
-  #inFlight: Promise<BufferedFlushResult> | undefined;
-  #closed = false;
-
-  constructor(
-    private readonly database: MinnowDatabase,
-    private readonly tableName: string,
-    options: BufferedWriterOptions = {},
-  ) {
-    this.#mode = options.mode ?? "insert";
-    this.#maxRows = positiveWholeNumber(options.maxRows ?? 1_000, "Buffered row limit");
-    this.#maxBytes = positiveWholeNumber(options.maxBytes ?? 1024 * 1024, "Buffered byte limit");
-    this.#maxAgeMs = positiveWholeNumber(options.maxAgeMs ?? 1_000, "Buffered age limit");
-    this.#onError = options.onError;
-  }
-
-  get pendingRowCount(): number {
-    return this.#rows.length;
-  }
-
-  get estimatedBytes(): number {
-    return this.#estimatedBytes;
-  }
-
-  async add(row: Readonly<Record<string, BatchValue>>): Promise<BufferedFlushResult | undefined> {
-    this.#assertOpen();
-    const copy = cloneRow(row);
-    this.#rows.push(copy);
-    this.#estimatedBytes += estimateRowBytes(copy);
-    this.#scheduleAgeFlush();
-    if (this.#rows.length >= this.#maxRows || this.#estimatedBytes >= this.#maxBytes) {
-      return this.flush();
-    }
-    return undefined;
-  }
-
-  async flush(): Promise<BufferedFlushResult | undefined> {
-    if (this.#inFlight !== undefined) return this.#inFlight;
-    if (this.#rows.length === 0) return undefined;
-    this.#clearTimer();
-    const rows = this.#rows.splice(0);
-    this.#estimatedBytes = 0;
-    const operation =
-      this.#mode === "upsert"
-        ? this.database.upsertBatch(this.tableName, rows)
-        : this.database.insertBatch(this.tableName, rows);
-    this.#inFlight = operation;
-    try {
-      return await operation;
-    } catch (error) {
-      this.#rows.unshift(...rows);
-      this.#estimatedBytes = this.#rows.reduce((total, row) => total + estimateRowBytes(row), 0);
-      throw error;
-    } finally {
-      this.#inFlight = undefined;
-    }
-  }
-
-  requestFlush(): void {
-    if (this.#closed) return;
-    void this.#flushPending().catch((error: unknown) => this.#onError?.(error));
-  }
-
-  async close(): Promise<BufferedFlushResult | undefined> {
-    if (this.#closed) return undefined;
-    let result: BufferedFlushResult | undefined;
-    while (this.#inFlight !== undefined || this.#rows.length > 0) {
-      result = await this.flush();
-      if (this.#inFlight !== undefined) await this.#inFlight;
-    }
-    this.#closed = true;
-    this.#clearTimer();
-    return result;
-  }
-
-  discard(): number {
-    this.#assertOpen();
-    const discarded = this.#rows.length;
-    this.#rows.length = 0;
-    this.#estimatedBytes = 0;
-    this.#clearTimer();
-    return discarded;
-  }
-
-  async #flushPending(): Promise<void> {
-    while (this.#inFlight !== undefined || this.#rows.length > 0) {
-      if (this.#inFlight !== undefined) await this.#inFlight;
-      else await this.flush();
-    }
-  }
-
-  #scheduleAgeFlush(): void {
-    if (this.#timer !== undefined || this.#rows.length === 0 || this.#closed) return;
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      void this.#flushPending().catch((error: unknown) => this.#onError?.(error));
-    }, this.#maxAgeMs);
-  }
-
-  #clearTimer(): void {
-    if (this.#timer === undefined) return;
-    clearTimeout(this.#timer);
-    this.#timer = undefined;
-  }
-
-  #assertOpen(): void {
-    if (this.#closed) throw new Error("Buffered writer is closed");
-  }
-}
-
-export function attachLifecycleFlush(
-  requester: LifecycleFlushRequester,
-  options: LifecycleFlushOptions = {},
-): () => void {
-  const documentTarget =
-    options.document ?? (typeof document === "undefined" ? undefined : document);
-  const pageTarget = options.page ?? (typeof window === "undefined" ? undefined : window);
-  const onVisibilityChange = (): void => {
-    if (documentTarget?.visibilityState === "hidden") requester.requestFlush();
-  };
-  const onPageHide = (): void => requester.requestFlush();
-  documentTarget?.addEventListener("visibilitychange", onVisibilityChange);
-  pageTarget?.addEventListener("pagehide", onPageHide);
-  return () => {
-    documentTarget?.removeEventListener("visibilitychange", onVisibilityChange);
-    pageTarget?.removeEventListener("pagehide", onPageHide);
-  };
-}
-
 /** True when a compiled block groups rows, either explicitly or through select aggregates. */
 function compiledPlanIsGrouped(plan: CompiledQuery): boolean {
   return plan.groupBy.length > 0 || plan.select.some((item) => hasAggregate(item.expression));
@@ -9998,38 +9782,6 @@ function installStreamedWindow(
   mutable.window = { start: windowStart, length: windowRows };
 }
 
-/**
- * Cost-based build-side selection using exact prepared row counts: a single inner equi-join
- * probes from the scanned base into a built index over the joined table, so when the joined
- * table is much larger than the base the two swap, building over the smaller input instead.
- * Left joins are asymmetric and wildcard selects expose source order, so both keep the written
- * order; multi-join reordering remains open.
- */
-export function chooseJoinOrder(
-  plan: CompiledQuery,
-  inputs: ReadonlyMap<string, ColumnarTable>,
-): CompiledQuery {
-  const join = plan.joins[0];
-  if (
-    plan.joins.length !== 1 ||
-    join?.kind !== "inner" ||
-    join.on !== undefined ||
-    plan.select[0]?.expression.kind === "wildcard"
-  ) {
-    return plan;
-  }
-  const baseRows = inputs.get(plan.base.table)?.rowCount ?? 0;
-  const joinRows = inputs.get(join.table)?.rowCount ?? 0;
-  if (joinRows <= baseRows * 2) return plan;
-  const { kind, left, right, ...joinSource } = join;
-  void kind;
-  return {
-    ...plan,
-    base: joinSource,
-    joins: [{ ...plan.base, kind: "inner", left, right }],
-  };
-}
-
 /** Converts an executed derived-block result into a typed columnar input table. */
 function derivedColumnarTable(
   name: string,
@@ -10258,7 +10010,42 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
   const comparisons = new Set<ComparisonOperator>(["=", "!=", "<>", ">", ">=", "<", "<="]);
   const asComparison = (operator: PredicateOperator): ComparisonOperator | undefined =>
     comparisons.has(operator as ComparisonOperator) ? (operator as ComparisonOperator) : undefined;
+  const literalValue = (column: TableColumnRecord, expression: Expression): number | undefined => {
+    if (expression.kind !== "literal") return undefined;
+    const value =
+      column.type === "datetime"
+        ? expression.value instanceof Date
+          ? expression.value.getTime()
+          : undefined
+        : typeof expression.value === "number"
+          ? expression.value
+          : undefined;
+    return value === undefined || !Number.isFinite(value) ? undefined : value;
+  };
   for (const predicate of plan.predicates) {
+    // A literal list prunes like a comparison does: a block whose range holds no member of
+    // the list cannot contain a matching row.
+    if (predicate.operator === "IN" && predicate.left.kind === "column") {
+      const column = resolveColumn(predicate.left.reference);
+      if (column === undefined || predicate.right.kind !== "list") continue;
+      const members = new Set<number>();
+      let usable = true;
+      for (const item of predicate.right.items) {
+        // A NULL member matches nothing, so it narrows nothing either; anything that is not a
+        // literal of the column's type leaves the list unprunable.
+        if (item.kind === "literal" && item.value === null) continue;
+        const value = literalValue(column, item);
+        if (value === undefined) {
+          usable = false;
+          break;
+        }
+        members.add(value);
+      }
+      if (!usable || members.size === 0) continue;
+      const sorted = Float64Array.from(members).sort();
+      output.push({ column, operator: "IN", value: sorted[0] ?? 0, members: sorted });
+      continue;
+    }
     // Zone-map pruning understands plain comparisons only; every other operator scans.
     const comparisonOperator = asComparison(predicate.operator);
     if (comparisonOperator === undefined) continue;
@@ -10288,6 +10075,18 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
   return output;
 }
 
+/** Index of the first ascending member at or above `value`, or the member count. */
+function firstMemberAtLeast(members: Float64Array, value: number): number {
+  let low = 0;
+  let high = members.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((members[middle] ?? 0) < value) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
 function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
   if (operator === ">") return "<";
   if (operator === ">=") return "<=";
@@ -10303,6 +10102,12 @@ function zoneMapCanMatch(
   if (description.nullCount === description.rowCount) return false;
   const zoneMap = description.metadata.zoneMap;
   if (zoneMap === undefined) return true;
+  if (predicate.operator === "IN") {
+    const members = predicate.members;
+    if (members === undefined) return true;
+    const first = firstMemberAtLeast(members, zoneMap.min);
+    return first < members.length && (members[first] ?? 0) <= zoneMap.max;
+  }
   if (predicate.operator === "=") {
     return predicate.value >= zoneMap.min && predicate.value <= zoneMap.max;
   }
@@ -10328,6 +10133,12 @@ function vectorPredicateMatches(
     throw new Error("Predicate vector type mismatch");
   }
   const value = vector.values[row] ?? Number.NaN;
+  if (predicate.operator === "IN") {
+    const members = predicate.members;
+    if (members === undefined) return true;
+    const first = firstMemberAtLeast(members, value);
+    return first < members.length && (members[first] ?? 0) === value;
+  }
   if (predicate.operator === "=") return value === predicate.value;
   if (predicate.operator === "!=" || predicate.operator === "<>") return value !== predicate.value;
   if (predicate.operator === ">") return value > predicate.value;
@@ -11102,35 +10913,6 @@ function columnVectorRetainedBytes(vector: ColumnVector): number {
   return base + vector.values.byteLength;
 }
 
-/** Retained payload of a cached block result: column names plus estimated row values. */
-/** Modest per-entry cap so one giant result cannot thrash the buffer pool. */
-const RESULT_MEMO_MAX_BYTES = 4 * 1024 * 1024;
-
-/**
- * Defensive copy for memoized results: callers own their rows and may mutate them, so both
- * the stored entry and every hit are fresh shallow row copies (values are primitives and
- * Dates; a new Date guards against setTime-style mutation).
- */
-function copyQueryResult(result: QueryResult): QueryResult {
-  return {
-    columns: [...result.columns],
-    rows: result.rows.map((row) => {
-      const copy: QueryRow = {};
-      for (const [name, value] of Object.entries(row)) {
-        copy[name] = value instanceof Date ? new Date(value.getTime()) : value;
-      }
-      return copy;
-    }),
-  };
-}
-
-function queryResultRetainedBytes(result: QueryResult): number {
-  let bytes = 64;
-  for (const column of result.columns) bytes += 16 + column.length * 2;
-  for (const row of result.rows) bytes += estimateRowBytes(row);
-  return bytes;
-}
-
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
 }
@@ -11458,15 +11240,6 @@ function compactTableSkipped(
     version,
     metrics: null,
   };
-}
-
-function cloneRow(row: Readonly<Record<string, BatchValue>>): Readonly<Record<string, BatchValue>> {
-  return Object.fromEntries(
-    Object.entries(row).map(([name, value]) => [
-      name,
-      value instanceof Date ? new Date(value.getTime()) : value,
-    ]),
-  );
 }
 
 function estimateRowBytes(row: Readonly<Record<string, BatchValue>>): number {

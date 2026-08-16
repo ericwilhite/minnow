@@ -29,15 +29,28 @@ function dataDirName(record: DatasetRecord): string {
  * Datetime columns come back as raw Postgres text (via identity parsers) instead of JS
  * Date objects: the generator writes UTC wall-clock values, and letting a Date parser
  * reinterpret them in the local zone would corrupt cross-engine comparison.
+ *
+ * Under strict durability PGlite flushes its IDBFS image to IndexedDB after every statement,
+ * which puts a fixed ~13-20ms IndexedDB round trip on every query — including a single-row
+ * key lookup. Relaxed durability removes it: measured in Chromium against a 400,000-row
+ * table, a prepared point lookup goes from 13.5ms to 0.09ms and a full aggregate from 16.6ms
+ * to 2.1ms. Reads therefore open relaxed whenever the dataset asks for relaxed durability,
+ * which is the same setting Minnow's store runs under.
+ *
+ * Writes stay strict in every mode. PGlite 0.5.5's relaxed flush races its own IDBFS
+ * connection under sustained writes: a bulk load loses its own CREATE TABLE ("relation does
+ * not exist") and the worker dies with "The database connection is closing". Strict is the
+ * only mode the write path survives, so the loader and the write suite pay for it.
  */
-async function openPglite(name: string, durability: DatasetRecord["durability"]): Promise<PGlite> {
+async function openPglite(
+  name: string,
+  durability: DatasetRecord["durability"],
+  access: "read" | "write",
+): Promise<PGlite> {
   const identity = (value: string | null): string | null => value;
-  // relaxedDurability would mirror Minnow's relaxed IndexedDB mode, but PGlite 0.5.4's
-  // relaxed flush races its own IDBFS connection during bulk loads and crashes the worker
-  // ("The database connection is closing"), so the driver stays on strict durability —
-  // the only mode that survives the workload.
-  void durability;
+  const relaxed = access === "read" && durability === "relaxed";
   const database = await PGlite.create(`idb://${name}`, {
+    ...(relaxed ? { relaxedDurability: true } : {}),
     parsers: {
       [types.TIMESTAMP]: identity,
       [types.TIMESTAMPTZ]: identity,
@@ -47,10 +60,37 @@ async function openPglite(name: string, durability: DatasetRecord["durability"])
       [types.NUMERIC]: (value: string | null) => (value === null ? null : Number(value)),
     },
   });
-  // PGlite runs on its shipped defaults — no work_mem, planner, or JIT overrides. Measured
-  // both ways, the tuning moved these query shapes by 1-12% (mostly noise), so the honest
-  // simplification costs the comparison nothing.
+  // PGlite runs on its shipped defaults otherwise — no work_mem, planner, or JIT overrides.
+  // Measured both ways, the tuning moved these query shapes by 1-12% (mostly noise), so the
+  // honest simplification costs the comparison nothing.
   return database;
+}
+
+/**
+ * How long a relaxed handle is left alone before closing it. PGlite schedules its relaxed
+ * flush without awaiting it — `relaxed ? run() : await run()` in its own source, with no
+ * public way to observe the pending one — so the IndexedDB transaction can still be in flight
+ * when `close()` tears the connection down, and it then throws from inside IDBFS. Waiting
+ * while the connection is still open is what makes the flush land; two seconds is far longer
+ * than the ~20ms a flush takes, and teardown is not part of any measurement.
+ */
+const RELAXED_CLOSE_SETTLE_MS = 2_000;
+
+/**
+ * Closes a handle, settling first when it was opened relaxed. A close that fails anyway is
+ * logged and stepped over: the dataset is about to be dropped, so a stuck handle is not worth
+ * losing a capture that has already produced its numbers.
+ */
+async function closePglite(database: PGlite, relaxed = false): Promise<void> {
+  if (database.closed) return;
+  if (relaxed) {
+    await new Promise((resolve) => setTimeout(resolve, RELAXED_CLOSE_SETTLE_MS));
+  }
+  try {
+    await database.close();
+  } catch (error) {
+    console.warn(`PGlite close failed, continuing: ${String(error)}`);
+  }
 }
 
 /**
@@ -78,7 +118,7 @@ export const pgliteDriver: EngineDriver = {
     const { record } = context;
     const started = performance.now();
     const name = dataDirName(record);
-    let database = await openPglite(name, record.durability);
+    let database = await openPglite(name, record.durability, "write");
     let insertMs = 0;
     try {
       const entities = getScenario("commerce").entities;
@@ -120,7 +160,7 @@ export const pgliteDriver: EngineDriver = {
       await database.syncToFs();
       // Close and reopen so what the record marks "ready" is what actually persisted.
       await database.close();
-      database = await openPglite(name, record.durability);
+      database = await openPglite(name, record.durability, "write");
       const orderRows =
         entities.find((entity) => entity.name === "orders")?.rows(record.scale) ?? 0;
       const counted = await database.query<{ row_count: number | bigint }>(
@@ -140,19 +180,23 @@ export const pgliteDriver: EngineDriver = {
         status: "ready",
         storageName: await observedIndexedDbName(name),
         version: "0.5.x",
-        persistence: "IndexedDB VFS · persistent PostgreSQL data directory",
+        persistence:
+          record.durability === "relaxed"
+            ? "IndexedDB VFS · persistent PostgreSQL data directory · relaxed flush on reads, strict on writes"
+            : "IndexedDB VFS · persistent PostgreSQL data directory · strict flush",
         storedBytes:
           sizeResult.rows[0]?.bytes === undefined ? null : Number(sizeResult.rows[0].bytes),
         buildMs: performance.now() - started,
         insertMs,
       };
     } finally {
-      if (!database.closed) await database.close();
+      await closePglite(database);
     }
   },
 
   async openSession(record: DatasetRecord): Promise<EngineSession> {
-    const database = await openPglite(dataDirName(record), record.durability);
+    const relaxed = record.durability === "relaxed";
+    const database = await openPglite(dataDirName(record), record.durability, "read");
     let nextStatement = 0;
     return {
       engine: "pglite",
@@ -172,13 +216,13 @@ export const pgliteDriver: EngineDriver = {
         };
       },
       async close() {
-        if (!database.closed) await database.close();
+        await closePglite(database, relaxed);
       },
     };
   },
 
   async openWriteSession(record: DatasetRecord): Promise<WriteSession> {
-    const database = await openPglite(dataDirName(record), record.durability);
+    const database = await openPglite(dataDirName(record), record.durability, "write");
     return {
       engine: "pglite",
       async createTable(schema: WriteTableSchema) {
@@ -280,7 +324,7 @@ export const pgliteDriver: EngineDriver = {
         };
       },
       async close() {
-        if (!database.closed) await database.close();
+        await closePglite(database);
       },
     };
   },

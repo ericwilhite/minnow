@@ -40,7 +40,7 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
 Keep the mount behind a development check. This is a separate package so it never reaches a
 production bundle unless you put it there.
 
-Full guide: [`apps/site/src/content/docs/devtools.mdx`](../../apps/site/src/content/docs/devtools.mdx).
+Full guide: [Devtools](https://minnowdb.dev/docs/devtools/).
 
 ## Demo
 

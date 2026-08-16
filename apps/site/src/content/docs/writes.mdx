@@ -165,7 +165,9 @@ Things worth knowing before you reach for it:
   updating a key that doesn't exist — registers nothing and leaves the scope usable.
 
 There is no SQL `BEGIN`/`COMMIT`; this is the transaction API. Statements issued outside a scope
-are each atomic on their own.
+are each atomic on their own. That includes mixed `INSERT ... ON CONFLICT DO UPDATE` batches: the
+existing-row updates and fresh-row inserts publish together, and a validation or constraint error
+rolls back both parts.
 
 ## Triggers
 

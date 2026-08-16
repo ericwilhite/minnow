@@ -720,6 +720,58 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("keeps wide-table block layout deterministic while encoding columns concurrently", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "gzip" });
+      await database.createTable({
+        name: "wide_rows",
+        columns: [
+          { name: "c0", type: "number" },
+          { name: "c1", type: "number" },
+          { name: "c2", type: "number" },
+          { name: "c3", type: "number" },
+          { name: "c4", type: "number" },
+          { name: "c5", type: "number" },
+          { name: "c6", type: "number" },
+          { name: "c7", type: "number" },
+        ],
+      });
+      const result = await database.insertBatch("wide_rows", {
+        columns: {
+          c0: [0, 1, 2, 3, 4],
+          c1: [10, 11, 12, 13, 14],
+          c2: [20, 21, 22, 23, 24],
+          c3: [30, 31, 32, 33, 34],
+          c4: [40, 41, 42, 43, 44],
+          c5: [50, 51, 52, 53, 54],
+          c6: [60, 61, 62, 63, 64],
+          c7: [70, 71, 72, 73, 74],
+        },
+      });
+
+      expect(result.blockCount).toBe(24);
+      const table = (await store.listTables())[0];
+      const segment = (await store.listSegments(table?.id))[0];
+      expect(segment).toBeDefined();
+      for (const column of table?.columns ?? []) {
+        const ids = segment?.columnBlockIds[column.id];
+        expect(ids).toHaveLength(3);
+        expect(ids?.map((id) => id.slice(id.lastIndexOf("/") + 1))).toEqual([
+          "000000",
+          "000001",
+          "000002",
+        ]);
+      }
+      expect((await database.query("SELECT * FROM wide_rows ORDER BY c0")).rows).toEqual(
+        Array.from({ length: 5 }, (_, row) =>
+          Object.fromEntries(
+            Array.from({ length: 8 }, (_, column) => [`c${String(column)}`, column * 10 + row]),
+          ),
+        ),
+      );
+      store.close();
+    });
+
     it("round-trips column defaults through the catalog and validates them", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store);
@@ -6206,10 +6258,12 @@ for (const implementation of [
       expect(expectedKeys.has(`${String(row.pid)}|${String(row.payload)}`)).toBe(true);
     }
 
-    // An ordered join is outside the partitioned slice and keeps today's budget failure.
-    await expect(
-      database.query(`${sql} ORDER BY pid`, { executionMemoryBudgetBytes: budget }),
-    ).rejects.toThrow(QueryMemoryBudgetError);
+    // Streaming reorders the append-only join before it chooses the scan side: the large table
+    // streams while the small table becomes the build index, so ordering also fits the budget.
+    const ordered = await database.query(`${sql} ORDER BY pid`, {
+      executionMemoryBudgetBytes: budget,
+    });
+    expect(ordered.rows).toEqual(sorted(expected.rows));
     store.close();
   });
 
@@ -7491,6 +7545,37 @@ describe("prepared-input cache and shared read lease", () => {
     await database.insertBatch("orders", { columns: { region: ["east"], amount: [100] } });
     const fresh = await database.query(sql);
     expect(fresh.rows[0]).toEqual({ region: "east", total: 114 });
+  });
+
+  it("keeps memoized parameter tuples collision-free", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const sql = "SELECT ? AS x, ? AS y";
+    const first = ["a\u0001string:b", "c"] as const;
+    const second = ["a", "b\u0001string:c"] as const;
+
+    expect((await database.query(sql, { params: first })).rows).toEqual([
+      { x: first[0], y: first[1] },
+    ]);
+    expect((await database.query(sql, { params: second })).rows).toEqual([
+      { x: second[0], y: second[1] },
+    ]);
+  });
+
+  it("preserves special JavaScript property names in projected rows", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "special_names",
+      columns: [{ name: "__proto__", type: "string" }],
+    });
+    await database.insertBatch("special_names", { columns: { __proto__: ["kept"] } });
+
+    const result = await database.query('SELECT "__proto__" FROM special_names');
+    expect(result.columns).toEqual(["__proto__"]);
+    expect(Object.hasOwn(result.rows[0] ?? {}, "__proto__")).toBe(true);
+    expect(Reflect.get(result.rows[0] ?? {}, "__proto__")).toBe("kept");
+    const memoized = await database.query('SELECT "__proto__" FROM special_names');
+    expect(Object.hasOwn(memoized.rows[0] ?? {}, "__proto__")).toBe(true);
+    expect(Reflect.get(memoized.rows[0] ?? {}, "__proto__")).toBe("kept");
   });
 
   it("serves another instance's committed writes on the very next query", async () => {

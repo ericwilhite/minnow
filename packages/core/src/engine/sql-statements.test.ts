@@ -161,10 +161,14 @@ describe("ON CONFLICT", () => {
         { name: "Linus", score: 1, city: "Helsinki" },
       ],
     });
+    const scoreOnly = await database.execute(
+      "INSERT INTO p (name, score, city) VALUES ('Grace', 30, 'ignored') ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score RETURNING score",
+    );
+    expect(scoreOnly).toMatchObject({ returnedRows: [{ score: 30 }] });
     const rows = await database.query("SELECT name, score, city FROM p ORDER BY name");
     expect(rows.rows).toEqual([
       { name: "Ada", score: 99, city: "London" },
-      { name: "Grace", score: 25, city: "DC" },
+      { name: "Grace", score: 30, city: "DC" },
       { name: "Linus", score: 1, city: "Helsinki" },
     ]);
     await expect(
@@ -172,6 +176,33 @@ describe("ON CONFLICT", () => {
         "INSERT INTO p (name, score) VALUES ('x', 1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name",
       ),
     ).rejects.toThrow("cannot reassign the conflict key");
+  });
+
+  it("rolls back conflicting updates when a fresh row fails validation", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "atomic_upsert",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "required", type: "string" },
+        { name: "score", type: "number" },
+        { name: "tag", type: "string", nullable: true },
+      ],
+    });
+    await database.execute(
+      "INSERT INTO atomic_upsert (id, required, score, tag) VALUES (1, 'kept', 10, NULL)",
+    );
+
+    await expect(
+      database.execute(
+        "INSERT INTO atomic_upsert (id, score, tag) VALUES (1, 20, 'changed'), (2, 30, 'new') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score",
+      ),
+    ).rejects.toThrow("cannot be null");
+
+    expect(
+      (await database.query("SELECT id, required, score, tag FROM atomic_upsert ORDER BY id")).rows,
+    ).toEqual([{ id: 1, required: "kept", score: 10, tag: null }]);
   });
 
   it("pads unlisted insert columns with NULL and returns them", async () => {

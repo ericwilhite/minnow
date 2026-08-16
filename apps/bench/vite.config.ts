@@ -23,9 +23,9 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    // Pre-bundle at server start: a dep first discovered mid-session triggers a full page
-    // reload, which kills any in-flight capture worker.
-    include: ["apache-arrow"],
+    // Nothing left to pre-bundle: `include` existed for apache-arrow, which came in with the
+    // DuckDB engine and left with it. The Wasm engines stay excluded — Vite's optimizer
+    // cannot rewrite their asset URLs.
     exclude: ["@sqlite.org/sqlite-wasm", "@electric-sql/pglite"],
   },
   worker: {

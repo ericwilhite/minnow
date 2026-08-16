@@ -129,7 +129,9 @@ configurable. A 50-table scale-100 capture is currently infeasible because each 
 the measured per-cell reference suite; bounding that work, larger quota-dependent tiers, and
 repeated-sample distributions remain open.
 
-Later comparison adapters may benchmark SQLite-Wasm and DuckDB-Wasm as opt-in development-only competitors. They must never be imported by engine packages or used for correctness.
+Later comparison adapters may benchmark other persistent browser databases as opt-in
+development-only competitors. They must never be imported by engine packages or used for
+correctness.
 
 Exit gate: checked-in measurements from at least two browser engines, with a documented block-size decision or a documented reason to keep it configurable.
 
@@ -197,9 +199,9 @@ These are single-scale observations; the broader Phase 5 exit gate still calls f
 curves.
 
 The 2026-08-08 1.93-million-row comparison records 303,723 MinnowDatabase rows/s after the key
-chunk and batch-staging optimization, versus 213,557 for persistent SQLite, 87,938 for persistent
-PGlite, and 1,589,803 for in-memory DuckDB in the same host Chromium run. MinnowDatabase's total
-logical persisted payload is reported separately from implementation-specific physical page sizes.
+chunk and batch-staging optimization, versus 213,557 for persistent SQLite and 87,938 for
+persistent PGlite in the same host Chromium run. MinnowDatabase's total logical persisted payload
+is reported separately from implementation-specific physical page sizes.
 
 Exit gate: published benchmark curves for insert, upsert, update, delete, and competing commits under relaxed and strict durability. Upsert tests cover new rows, matching rows, duplicate keys, null keys, and two writers updating the same key.
 
@@ -741,14 +743,14 @@ tiers remain outstanding.
 - [x] Close SQL gaps for IS [NOT] NULL, inclusive BETWEEN, COUNT(DISTINCT), and constants
       alongside aggregates; add the aligned bulk decode fast path and version-only manifest
       reads.
-- [x] Execute the 15 reference queries as SQL through `prepareQuery()`, decide engine support by
+- [x] Execute the reference read suite as SQL through `prepareQuery()`, decide engine support by
       compiling during the run, and verify results against independent JavaScript oracles.
 - [x] Show optimized `explain()` plans and the checked-in SQL feature matrix in the dashboard.
 - [x] Record whole-agent memory and JavaScript heap for the storage run and for all four compared
       engines, sampled on the main thread.
 - [x] Add date truncation and `COALESCE` so the monthly cohort and adjustment-burden reference
       queries compile; they are the only two the current surface cannot express.
-- [x] Provide `npm run check:release` for quality checks plus both real-browser suites.
+- [x] Provide one release gate for quality checks plus all real-browser suites.
 - [x] Add auto-increment keys and declarative column defaults (`uuid`/`nanoid`/`now`/literals):
       counters reserved atomically with transaction begin (cross-tab safe, explicit values bump
       past their maximum), generated values echoed through `returning`/RETURNING, and

@@ -25,10 +25,13 @@ npm install @minnowdb/core
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background on large tables.
 - **Fast** — columnar blocks, vectorized execution, and a checked-in perf gate that pins every
-  query class against native SQLite, PGlite, and DuckDB so a regression can't land unnoticed.
-  In-browser, it leads SQLite Wasm and PGlite across the published dataset scales; the
-  [benchmarks](https://minnowdb.dev/benchmarks/) publish the raw captures, including the
-  shapes where it doesn't lead.
+  query class against native SQLite and PGlite so a regression can't land unnoticed. In-browser
+  it leads on analytical reads and on bulk writes at every published scale; SQLite Wasm still
+  wins single-key lookups and small writes. The
+  [benchmarks](https://minnowdb.dev/benchmarks/) publish the raw captures, including the shapes
+  where it loses.
+- **Small** — 143 KB gzipped, and no WebAssembly to fetch: about a third of SQLite Wasm and a
+  fortieth of PGlite, both of which download a Wasm build before answering anything.
 - **Safe across tabs** — writes publish atomically; readers see the old version or the new one,
   never half a write. Reads never block writes.
 - **Always fresh** — every query observes the latest committed state, even commits from another
@@ -45,30 +48,18 @@ npm install @minnowdb/core
 - **Our own engine** — parser, planner, optimizer, and executor implemented here; no SQLite or
   DuckDB underneath.
 - **Differentially tested** — a seeded query corpus runs through the engine's two executors and
-  three independent oracles (native SQLite, PGlite, DuckDB) on every test run; results must
-  agree.
+  two independent oracles (native SQLite and PGlite) on every test run; results must agree.
 
 ## Documentation
 
 Everything else — quick start, the schema DSL, queries, writes, live queries, workers, devtools,
-the full SQL feature matrix, benchmark results, and the API reference — lives in the docs site,
-which is the single source of truth. It isn't published publicly yet; run it locally:
-
-```bash
-npm run site:dev
-```
+the full SQL feature matrix, benchmark results, contributor test runners, and the API reference —
+lives in the [docs site](https://minnowdb.dev/docs/), the single source of truth.
 
 [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) are internal engineering
 records of the design and milestone gates.
 
 ## Development
 
-```bash
-npm install
-npm run check
-```
-
-`npm run check` is the local format, lint, type, build, and unit-test gate;
-`npm run check:release` adds real-browser suites (run `npx playwright install chromium firefox
-webkit` once first). `@minnowdb/bench` is the internal measurement harness; `@minnowdb/site` is
-the docs site.
+See [Testing & benchmarks](https://minnowdb.dev/docs/testing/) for the contributor workflow,
+runner map, release gate, and benchmark capture process.

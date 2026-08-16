@@ -12,12 +12,22 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const BROWSERS = { chromium, firefox };
-const engineIds = ["minnow", "sqlite", "pglite", "duckdb"];
-const engines = (process.env.CAPTURE_ENGINES ?? engineIds.join(","))
+const engineIds = ["minnow", "sqlite", "pglite"];
+const requestedEngines = (process.env.CAPTURE_ENGINES ?? engineIds.join(","))
   .split(",")
   .map((engine) => engine.trim())
-  .filter((engine) => engineIds.includes(engine));
+  .filter(Boolean);
+const invalidEngines = requestedEngines.filter((engine) => !engineIds.includes(engine));
+if (requestedEngines.length === 0 || invalidEngines.length > 0) {
+  throw new Error(
+    `CAPTURE_ENGINES must contain one or more of ${engineIds.join(", ")}; invalid: ${invalidEngines.join(", ") || "empty list"}`,
+  );
+}
+const engines = [...new Set(requestedEngines)];
 const scale = Number(process.env.CAPTURE_SCALE ?? 100);
+if (!Number.isFinite(scale) || scale <= 0) {
+  throw new Error("CAPTURE_SCALE must be a positive number");
+}
 const outDir = path.resolve(repoRoot, process.env.CAPTURE_OUT ?? ".captures");
 
 // Playwright requires the destructuring pattern; this test drives its own persistent context.
@@ -62,7 +72,7 @@ test("capture engine comparison", async ({}, testInfo) => {
         }
       };
       const dataset = await worker.request("datasetCreate", config, report("load"));
-      const suite = await worker.request(
+      const reads = await worker.request(
         "suiteReference",
         { datasetId: dataset.id, engines: config.engines },
         report("suite"),
@@ -76,7 +86,7 @@ test("capture engine comparison", async ({}, testInfo) => {
       );
       return {
         dataset,
-        suite,
+        reads,
         writes,
         progressCount,
         browserMeta: {
@@ -86,7 +96,47 @@ test("capture engine comparison", async ({}, testInfo) => {
         },
       };
     }, config);
+    const failedMaterializations = engines.filter(
+      (engine) => payload.dataset.engines[engine]?.status !== "ready",
+    );
+    const incompleteReads = payload.reads.queries.filter((query) =>
+      engines.some((engine) => {
+        const run = query.engines.find((candidate) => candidate.engine === engine);
+        return run?.supported !== true || run.verified !== true;
+      }),
+    );
+    const incompleteWrites = payload.writes.cases.filter((entry) =>
+      engines.some((engine) => {
+        const run = entry.engines.find((candidate) => candidate.engine === engine);
+        return run?.supported !== true || run.verified !== true;
+      }),
+    );
+    if (
+      failedMaterializations.length > 0 ||
+      !payload.reads.passed ||
+      !payload.writes.passed ||
+      incompleteReads.length > 0 ||
+      incompleteWrites.length > 0
+    ) {
+      throw new Error(
+        [
+          `Capture failed correctness checks for ${testInfo.project.name}.`,
+          failedMaterializations.length > 0
+            ? `materializations: ${failedMaterializations.join(", ")}`
+            : undefined,
+          incompleteReads.length > 0
+            ? `reads: ${incompleteReads.map(({ id }) => id).join(", ")}`
+            : undefined,
+          incompleteWrites.length > 0
+            ? `writes: ${incompleteWrites.map(({ id }) => id).join(", ")}`
+            : undefined,
+        ]
+          .filter(Boolean)
+          .join(" "),
+      );
+    }
     const bundle = {
+      schemaVersion: 1,
       kind: "engine-comparison",
       capturedAt: new Date().toISOString(),
       browser: {
@@ -101,7 +151,7 @@ test("capture engine comparison", async ({}, testInfo) => {
       progressCount: payload.progressCount,
       config,
       dataset: payload.dataset,
-      suite: payload.suite,
+      reads: payload.reads,
       writes: payload.writes,
       host: {
         platform: os.platform(),
@@ -120,7 +170,7 @@ test("capture engine comparison", async ({}, testInfo) => {
     );
     writeFileSync(file, JSON.stringify(bundle, null, 1) + "\n");
     console.log(
-      `[done:${testInfo.project.name}] passed=${payload.suite.passed} writesPassed=${payload.writes.passed} -> ${file} totals=${JSON.stringify(payload.suite.totalMsByEngine)}`,
+      `[done:${testInfo.project.name}] readsPassed=${payload.reads.passed} writesPassed=${payload.writes.passed} -> ${file} totals=${JSON.stringify(payload.reads.totalMsByEngine)}`,
     );
   } finally {
     await context.close();

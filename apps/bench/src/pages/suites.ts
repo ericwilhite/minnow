@@ -192,7 +192,7 @@ function renderReferenceResult(result: ReferenceSuiteResult): void {
       return `<tr>
         <td>
           <strong>${escapeHtml(query.id.toUpperCase())}</strong> ${escapeHtml(query.name)}
-          <small class="note"> · ${escapeHtml(query.complexity)} · ${escapeHtml(query.tables.join(", "))}</small>
+          <small class="note"> · ${escapeHtml(query.workload.toUpperCase())} read · ${escapeHtml(query.complexity)} · ${escapeHtml(query.tables.join(", "))}</small>
           <details><summary>SQL</summary><pre><code data-lang="sql">${escapeHtml(query.sql)}</code></pre>${gap}</details>
         </td>
         <td class="num">${formatInteger(query.oracleRows)}</td>
@@ -295,7 +295,7 @@ function renderWriteResult(result: WriteSuiteResult): void {
           : `${formatInteger(report.seedRows)} rows already present`;
       return `<tr>
         <td>
-          <strong>${escapeHtml(report.operation)}</strong> ${formatInteger(report.rows)} rows
+          <strong>${escapeHtml(report.workload.toUpperCase())} · ${escapeHtml(report.operation)}</strong> ${formatInteger(report.rows)} rows
           <small class="note"> · ${escapeHtml(seeded)} · ${formatInteger(report.expectedTableRows)} rows after</small>
         </td>
         <td>${report.checksumAgreement === null ? "—" : report.checksumAgreement === "match" ? `<span class="badge ok">agree</span>` : `<span class="badge fail">disagree</span>`}</td>

@@ -36,12 +36,15 @@ interface WriteCase {
   id: string;
   name: string;
   operation: string;
+  workload: WorkloadKind;
   rows: number;
   engines: WriteRun[];
 }
 
+type WorkloadKind = "oltp" | "olap";
+
 interface SuiteQuery {
-  workload?: "selective" | "analytical";
+  workload: WorkloadKind;
   id: string;
   name: string;
   complexity: string;
@@ -51,10 +54,12 @@ interface SuiteQuery {
 }
 
 export interface BenchResults {
+  schemaVersion: 1;
+  kind: "engine-comparison";
   capturedAt: string;
   browser: { project: string; version: string; storage?: string };
   host: { model: string; cpus: number };
-  config: { scale: number };
+  config: { scale: number; engines: string[] };
   dataset: {
     totalRows: number;
     tableRows: Record<string, number>;
@@ -70,15 +75,14 @@ export interface BenchResults {
       }
     >;
   };
-  suite: {
+  reads: {
     sampleCount: number;
     engines: string[];
     queries: SuiteQuery[];
     totalMsByEngine: Record<string, number>;
     passed: boolean;
   };
-  /** Present once a capture includes the write suite; older bundles simply omit it. */
-  writes?: {
+  writes: {
     sampleCount: number;
     engines: string[];
     cases: WriteCase[];
@@ -97,9 +101,8 @@ const ENGINE_META: Record<string, { label: string; slot: number }> = {
   minnow: { label: "Minnow", slot: 1 },
   sqlite: { label: "SQLite WASM", slot: 2 },
   pglite: { label: "PGlite", slot: 3 },
-  duckdb: { label: "DuckDB (in-memory)", slot: 4 },
 };
-const engines = results.suite.engines;
+const engines = results.reads.engines;
 const label = (engine: string): string => ENGINE_META[engine]?.label ?? engine;
 const slot = (engine: string): number => ENGINE_META[engine]?.slot ?? 1;
 
@@ -114,11 +117,11 @@ const fmtBytes = (bytes: number): string =>
     : `${(bytes / 1024).toFixed(0)} KB`;
 
 /* ---------- horizontal bar chart geometry ---------- */
-const BAR_W = 860;
-const BAR_LABEL_W = 152;
-const BAR_VALUE_W = 84;
-const BAR_H = 22;
-const BAR_GAP = 12;
+const BAR_W = 640;
+const BAR_LABEL_W = 160;
+const BAR_VALUE_W = 92;
+const BAR_H = 28;
+const BAR_GAP = 14;
 
 interface BarDatum {
   name: string;
@@ -163,15 +166,15 @@ const geomean = (values: number[]): number => {
   return Math.exp(usable.reduce((sum, value) => sum + Math.log(value), 0) / usable.length);
 };
 
-const medians = (engine: string, workload?: "selective" | "analytical"): number[] =>
-  results.suite.queries
+const medians = (engine: string, workload?: WorkloadKind): number[] =>
+  results.reads.queries
     .filter((query) => workload === undefined || query.workload === workload)
     .map((query) => query.engines.find((run) => run.engine === engine))
     .filter((run) => run?.supported === true)
     .map((run) => run?.medianMs ?? 0);
 
-const cachedMedians = (workload?: "selective" | "analytical"): number[] =>
-  results.suite.queries
+const cachedMedians = (workload?: WorkloadKind): number[] =>
+  results.reads.queries
     .filter((query) => workload === undefined || query.workload === workload)
     .map((query) => query.engines.find((run) => run.engine === "minnow"))
     .filter((run) => run?.supported === true && run.cachedMedianMs !== undefined)
@@ -179,7 +182,7 @@ const cachedMedians = (workload?: "selective" | "analytical"): number[] =>
 
 /** Minnow appears twice: what a query costs to run, and what a repeat costs from its cache. */
 type SummaryRow = { name: string; slot: number; value: number };
-const summaryRows = (workload?: "selective" | "analytical"): SummaryRow[] => {
+const summaryRows = (workload?: WorkloadKind): SummaryRow[] => {
   const rows: SummaryRow[] = [];
   for (const engine of engines) {
     rows.push({ name: label(engine), slot: slot(engine), value: geomean(medians(engine, workload)) });
@@ -193,25 +196,40 @@ const summaryRows = (workload?: "selective" | "analytical"): SummaryRow[] => {
   return rows;
 };
 
-const totalBars = barChart(
-  summaryRows().map((row) => ({
-    name: row.name,
-    slot: row.slot,
-    value: row.value,
-    valueLabel: fmtMs(row.value),
-  })),
-);
-
-const selectiveCount = results.suite.queries.filter((q) => q.workload === "selective").length;
-const analyticalCount = results.suite.queries.filter((q) => q.workload === "analytical").length;
-const splitRows =
-  selectiveCount > 0 && analyticalCount > 0
-    ? summaryRows(undefined).map((row, index) => ({
+const workloads: readonly WorkloadKind[] = ["oltp", "olap"];
+const workloadLabels: Record<WorkloadKind, string> = { oltp: "OLTP", olap: "OLAP" };
+const workloadDescriptions: Record<WorkloadKind, { read: string; write: string }> = {
+  oltp: {
+    read: "Selective key, set, and bounded-range lookups. Lower latency is better.",
+    write: "Point and small-batch inserts, updates, and upserts (1–100 rows).",
+  },
+  olap: {
+    read: "Scans, joins, windows, and aggregates. Lower execution time is better.",
+    write: "Bulk ingestion and mutation batches (10,000–100,000 rows).",
+  },
+};
+const readCounts = Object.fromEntries(
+  workloads.map((workload) => [
+    workload,
+    results.reads.queries.filter((query) => query.workload === workload).length,
+  ]),
+) as Record<WorkloadKind, number>;
+const readBars = Object.fromEntries(
+  workloads.map((workload) => [
+    workload,
+    barChart(
+      summaryRows(workload).map((row) => ({
         name: row.name,
-        selective: summaryRows("selective")[index]?.value ?? 0,
-        analytical: summaryRows("analytical")[index]?.value ?? 0,
-      }))
-    : [];
+        slot: row.slot,
+        value: row.value,
+        valueLabel: fmtMs(row.value),
+      })),
+    ),
+  ]),
+) as Record<WorkloadKind, ReturnType<typeof barChart>>;
+const writeCasesOrdered = workloads.flatMap((workload) =>
+  (results.writes?.cases ?? []).filter((entry) => entry.workload === workload),
+);
 
 const buildBars = barChart(
   engines.map((engine) => ({
@@ -222,8 +240,8 @@ const buildBars = barChart(
   })),
 );
 
-// Engines with no stored bytes to report (in-memory DuckDB) are omitted rather than
-// drawn as a misleading zero-length bar.
+// Engines with no stored bytes to report are omitted rather than drawn as a misleading
+// zero-length bar.
 const sizeBars = barChart(
   engines
     .filter((engine) => (results.dataset.engines[engine]?.storedBytes ?? null) !== null)
@@ -236,11 +254,11 @@ const sizeBars = barChart(
 );
 
 /* ---------- per-query dot plot (log scale) ---------- */
-const DOT_W = 860;
-const DOT_LABEL_W = 300;
-const DOT_ROW_H = 30;
-const DOT_TOP = 26;
-const DOT_R = 5;
+const DOT_W = 1_040;
+const DOT_LABEL_W = 330;
+const DOT_ROW_H = 36;
+const DOT_TOP = 30;
+const DOT_R = 6.5;
 // Shared log domain across both browser panes so toggling compares like with like.
 const LOG_MIN = 0.01;
 const LOG_MAX = 200;
@@ -254,90 +272,118 @@ const ticks = [0.01, 0.1, 1, 10, 100];
 const tickLabel = (t: number): string => (t < 1 ? String(t) : `${t}`);
 
 const complexityOrder = ["simple", "moderate", "complex"];
-const queriesOrdered = complexityOrder.flatMap((complexity) =>
-  results.suite.queries.filter((q) => q.complexity === complexity),
+const queriesOrdered = workloads.flatMap((workload) =>
+  complexityOrder.flatMap((complexity) =>
+    results.reads.queries.filter(
+      (query) => query.workload === workload && query.complexity === complexity,
+    ),
+  ),
 );
 const dotRows = queriesOrdered.map((q, i) => ({
   query: q,
   y: DOT_TOP + i * DOT_ROW_H,
   groupStart:
-    i === 0 || queriesOrdered[i - 1]?.complexity !== q.complexity ? q.complexity : undefined,
+    i === 0 || queriesOrdered[i - 1]?.workload !== q.workload
+      ? `${workloadLabels[q.workload]} read`
+      : undefined,
 }));
 const dotHeight = DOT_TOP + dotRows.length * DOT_ROW_H + 30;
 const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
 ---
 
 <section class="bench-pane" id={paneId}>
-  <div class="chart-card">
-    <h3>Typical query time</h3>
-    <p class="chart-sub">
-      Geometric mean of per-query medians across all {results.suite.queries.length} queries —
-      lower is better. Every query counts once, whatever its absolute cost; a sum would report
-      only the slowest few.
+  <div class="section-heading">
+    <p class="eyebrow">Read workloads</p>
+    <h2>Latency and query execution</h2>
+    <p>
+      OLTP and OLAP are reported separately so selective lookup latency never disappears inside
+      scan-heavy analytical totals.
     </p>
-    <svg viewBox={`0 0 ${BAR_W} ${totalBars.height}`} role="img" aria-label="Total suite time by engine">
-      {
-        totalBars.bars.map((bar) => (
-          <>
-            <text class="row-label" x={BAR_LABEL_W - 10} y={bar.y + BAR_H / 2}>
-              {bar.name}
-            </text>
-            <path d={barPath(BAR_LABEL_W, bar.y, bar.width, BAR_H)} class={`series-${bar.slot}`}>
-              <title>{`${bar.name}: ${bar.valueLabel}`}</title>
-            </path>
-            <text class="value-label" x={BAR_LABEL_W + bar.width + 8} y={bar.y + BAR_H / 2}>
-              {bar.valueLabel}
-            </text>
-          </>
-        ))
-      }
-    </svg>
+  </div>
+
+  <div class="chart-row read-summary">
+    {
+      workloads.map((workload) => {
+        const bars = readBars[workload];
+        return (
+          <div class="chart-card half">
+            <h3>{workloadLabels[workload]} reads · {readCounts[workload]} queries</h3>
+            <p class="chart-sub">
+              {workloadDescriptions[workload].read} Geometric mean of per-query medians; every
+              query carries equal weight.
+            </p>
+            <svg class="bar-chart" viewBox={`0 0 ${BAR_W} ${bars.height}`} role="img" aria-label={`${workloadLabels[workload]} read time by engine`}>
+              {bars.bars.map((bar) => (
+                <>
+                  <text class="row-label" x={BAR_LABEL_W - 10} y={bar.y + BAR_H / 2}>
+                    {bar.name}
+                  </text>
+                  <path d={barPath(BAR_LABEL_W, bar.y, bar.width, BAR_H)} class={`series-${bar.slot}`}>
+                    <title>{`${bar.name}: ${bar.valueLabel}`}</title>
+                  </path>
+                  <text class="value-label" x={BAR_LABEL_W + bar.width + 8} y={bar.y + BAR_H / 2}>
+                    {bar.valueLabel}
+                  </text>
+                </>
+              ))}
+            </svg>
+          </div>
+        );
+      })
+    }
   </div>
 
   {
     results.writes !== undefined && results.writes.cases.length > 0 && (
-      <div class="chart-card">
-        <h3>Writes</h3>
-        <p class="chart-sub">
-          Inserts, updates, and upserts at several batch sizes, each against a table the suite
-          creates empty so every sample does the same work. Rows per second — higher is better;
-          the fastest engine in each row is marked. Every engine's final table is compared
-          against an independent JavaScript oracle, so a timing only counts when the data is
-          right.
-        </p>
-        <table class="split-table">
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th class="num">Rows</th>
-              {results.writes.engines.map((engine) => (
-                <th class="num">{label(engine)}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {results.writes.cases.map((entry) => {
+      <>
+        <div class="section-heading">
+          <p class="eyebrow">Write workloads</p>
+          <h2>Transactional mutations and bulk ingestion</h2>
+          <p>
+            OLTP covers 1–100 row operations; OLAP covers 10,000–100,000 row batches. Throughput
+            is higher-is-better, and the latency for each batch remains visible underneath.
+          </p>
+        </div>
+        <div class="chart-card">
+          <p class="chart-sub">
+            Every sample gets a new table, and every final table is checked row-for-row against an
+            independent JavaScript oracle before its timing is accepted.
+          </p>
+          <table class="split-table">
+            <thead>
+              <tr>
+                <th>Workload</th>
+                <th>Operation</th>
+                <th class="num">Rows</th>
+                {results.writes.engines.map((engine) => (
+                  <th class="num engine-start">{label(engine)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+            {writeCasesOrdered.map((entry, index) => {
               const best = Math.max(
                 ...entry.engines
                   .filter((run) => run.supported && typeof run.rowsPerSecond === "number")
                   .map((run) => run.rowsPerSecond ?? 0),
               );
               return (
-                <tr>
+                <tr class={index > 0 && writeCasesOrdered[index - 1]?.workload !== entry.workload ? "workload-start" : undefined}>
+                  <td><strong>{workloadLabels[entry.workload]}</strong></td>
                   <td>{entry.name}</td>
                   <td class="num">{entry.rows.toLocaleString("en-US")}</td>
                   {results.writes?.engines.map((engine) => {
                     const run = entry.engines.find((candidate) => candidate.engine === engine);
                     if (run?.supported !== true) {
                       return (
-                        <td class="num" title={run?.error ?? "not supported"}>
+                        <td class="num engine-start" title={run?.error ?? "not supported"}>
                           —
                         </td>
                       );
                     }
                     const isBest = (run.rowsPerSecond ?? 0) === best && best > 0;
                     return (
-                      <td class={isBest ? "num best" : "num"}>
+                      <td class={isBest ? "num best engine-start" : "num engine-start"}>
                         {isBest && <span class="best-mark">●</span>}
                         {Math.round(run.rowsPerSecond ?? 0).toLocaleString("en-US")}/s
                         <br />
@@ -348,43 +394,18 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
                 </tr>
               );
             })}
-          </tbody>
-        </table>
-      </div>
+            </tbody>
+          </table>
+        </div>
+      </>
     )
   }
 
-  {
-    splitRows.length > 0 && (
-      <div class="chart-card">
-        <h3>By access pattern</h3>
-        <p class="chart-sub">
-          The same geometric mean, split by what the query actually does. Selective queries reach
-          a few rows through a key or an ordered range; analytical queries scan and aggregate a
-          table. This suite is mostly the second kind ({selectiveCount} selective,{" "}
-          {analyticalCount} analytical), which is worth knowing when reading the number above.
-        </p>
-        <table class="split-table">
-          <thead>
-            <tr>
-              <th>Engine</th>
-              <th class="num">Selective ({selectiveCount})</th>
-              <th class="num">Analytical ({analyticalCount})</th>
-            </tr>
-          </thead>
-          <tbody>
-            {splitRows.map((row) => (
-              <tr>
-                <td>{row.name}</td>
-                <td class="num">{fmtMs(row.selective)}</td>
-                <td class="num">{fmtMs(row.analytical)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    )
-  }
+  <div class="section-heading">
+    <p class="eyebrow">Dataset</p>
+    <h2>Build time and stored size</h2>
+    <p>The same deterministic commerce dataset is materialized independently in every engine.</p>
+  </div>
 
   <div class="chart-row">
     <div class="chart-card half">
@@ -392,7 +413,7 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
       <p class="chart-sub">
         Ingesting all {results.dataset.totalRows.toLocaleString("en-US")} rows.
       </p>
-      <svg viewBox={`0 0 ${BAR_W} ${buildBars.height}`} role="img" aria-label="Dataset build time by engine">
+      <svg class="bar-chart" viewBox={`0 0 ${BAR_W} ${buildBars.height}`} role="img" aria-label="Dataset build time by engine">
         {
           buildBars.bars.map((bar) => (
             <>
@@ -417,7 +438,7 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
         <code>page_count × page_size</code>, PGlite's <code>pg_database_size</code>. The dataset
         is deterministic, so these are identical across browsers by construction.
       </p>
-      <svg viewBox={`0 0 ${BAR_W} ${sizeBars.height}`} role="img" aria-label="Stored size by engine">
+      <svg class="bar-chart" viewBox={`0 0 ${BAR_W} ${sizeBars.height}`} role="img" aria-label="Stored size by engine">
         {
           sizeBars.bars.map((bar) => (
             <>
@@ -437,10 +458,15 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     </div>
   </div>
 
+  <div class="section-heading">
+    <p class="eyebrow">Read details</p>
+    <h2>Every measured query</h2>
+  </div>
+
   <div class="chart-card">
     <h3>Per-query median latency</h3>
     <p class="chart-sub">
-      Median of {results.suite.sampleCount} samples, log scale. Hover a dot for p95 and prepare
+      Median of {results.reads.sampleCount} samples, log scale. Hover a dot for p95 and prepare
       time. Every result is checksum-verified identical across engines.
     </p>
     <div class="legend" role="list">
@@ -453,7 +479,7 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
         ))
       }
     </div>
-    <svg viewBox={`0 0 ${DOT_W} ${dotHeight}`} role="img" aria-label="Per-query median latency by engine, log scale">
+    <svg class="detail-chart" viewBox={`0 0 ${DOT_W} ${dotHeight}`} role="img" aria-label="Per-query median latency by engine, log scale">
       {ticks.map((t) => (
         <>
           <line class="grid" x1={xLog(t)} y1={DOT_TOP - 12} x2={xLog(t)} y2={axisY}></line>
@@ -507,89 +533,83 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
 
   <details class="bench-table" open>
     <summary>Every number in the charts above</summary>
-    <table>
-      <thead>
-        <tr>
-          <th>Query</th>
-          <th>Complexity</th>
-          {engines.map((engine) => <th colspan="2">{label(engine)}</th>)}
-        </tr>
-        <tr>
-          <th></th>
-          <th></th>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Query</th>
+            <th>Workload</th>
+            <th>Complexity</th>
+            {engines.map((engine) => <th class="engine-group" colspan="2">{label(engine)}</th>)}
+          </tr>
+          <tr>
+            <th></th>
+            <th></th>
+            <th></th>
+            {
+              engines.map(() => (
+                <>
+                  <th class="num engine-start">median</th>
+                  <th class="num">p95</th>
+                </>
+              ))
+            }
+          </tr>
+        </thead>
+        <tbody>
           {
-            engines.map(() => (
-              <>
-                <th>median</th>
-                <th>p95</th>
-              </>
+            queriesOrdered.map((query, index) => (
+              <tr class={index > 0 && queriesOrdered[index - 1]?.workload !== query.workload ? "workload-start" : undefined}>
+                <td>{query.name}</td>
+                <td>{workloadLabels[query.workload]}</td>
+                <td>{query.complexity}</td>
+                {engines.map((engine) => {
+                  const run = query.engines.find((r) => r.engine === engine);
+                  // Best in this row: the lowest median among engines that ran it. Marked so a
+                  // reader can see who wins each query without comparing sixteen numbers by eye.
+                  const best = Math.min(
+                    ...query.engines
+                      .filter((r) => r.supported && typeof r.medianMs === "number")
+                      .map((r) => r.medianMs ?? Number.POSITIVE_INFINITY),
+                  );
+                  const isBest =
+                    run?.supported === true &&
+                    typeof run.medianMs === "number" &&
+                    run.medianMs === best;
+                  return run?.supported === true ? (
+                    <>
+                      <td class={isBest ? "num best engine-start" : "num engine-start"}>
+                        {isBest && <span class="best-mark" title="Fastest engine for this query">●</span>}
+                        {fmtMs(run.medianMs ?? 0)}
+                        {run.cachedMedianMs !== undefined && (
+                          <>
+                            <br />
+                            <small class="cached" title="Same statement with the result memo left on — the default an application gets. A cache lookup, not execution.">
+                              {fmtMs(run.cachedMedianMs)} cached
+                            </small>
+                          </>
+                        )}
+                        {run.peakMemoryBytes !== undefined && (
+                          <>
+                            <br />
+                            <small class="cached" title="Peak modeled execution memory this engine reserved for the statement. Self-reported: the browser exposes no cross-engine memory API here.">
+                              {fmtBytes(run.peakMemoryBytes)} peak
+                            </small>
+                          </>
+                        )}
+                      </td>
+                      <td class="num">{fmtMs(run.p95Ms ?? 0)}</td>
+                    </>
+                  ) : (
+                    <td class="engine-start" colspan="2">not supported</td>
+                  );
+                })}
+              </tr>
             ))
           }
-        </tr>
-      </thead>
-      <tbody>
-        {
-          queriesOrdered.map((query) => (
-            <tr>
-              <td>{query.name}</td>
-              <td>{query.complexity}</td>
-              {engines.map((engine) => {
-                const run = query.engines.find((r) => r.engine === engine);
-                // Best in this row: the lowest median among engines that ran it. Marked so a
-                // reader can see who wins each query without comparing sixteen numbers by eye.
-                const best = Math.min(
-                  ...query.engines
-                    .filter((r) => r.supported && typeof r.medianMs === "number")
-                    .map((r) => r.medianMs ?? Number.POSITIVE_INFINITY),
-                );
-                const isBest =
-                  run?.supported === true &&
-                  typeof run.medianMs === "number" &&
-                  run.medianMs === best;
-                return run?.supported === true ? (
-                  <>
-                    <td class={isBest ? "num best" : "num"}>
-                      {isBest && <span class="best-mark" title="Fastest engine for this query">●</span>}
-                      {fmtMs(run.medianMs ?? 0)}
-                      {run.cachedMedianMs !== undefined && (
-                        <>
-                          <br />
-                          <small class="cached" title="Same statement with the result memo left on — the default an application gets. A cache lookup, not execution.">
-                            {fmtMs(run.cachedMedianMs)} cached
-                          </small>
-                        </>
-                      )}
-                      {run.peakMemoryBytes !== undefined && (
-                        <>
-                          <br />
-                          <small class="cached" title="Peak modeled execution memory this engine reserved for the statement. Self-reported: the browser exposes no cross-engine memory API here.">
-                            {fmtBytes(run.peakMemoryBytes)} peak
-                          </small>
-                        </>
-                      )}
-                    </td>
-                    <td class="num">{fmtMs(run.p95Ms ?? 0)}</td>
-                  </>
-                ) : (
-                  <td colspan="2">not supported</td>
-                );
-              })}
-            </tr>
-          ))
-        }
-        <tr class="totals">
-          <td>Total (sum of medians)</td>
-          <td></td>
-          {
-            engines.map((engine) => (
-              <td class="num" colspan="2">
-                {fmtMs(results.suite.totalMsByEngine[engine] ?? 0)}
-              </td>
-            ))
-          }
-        </tr>
-      </tbody>
-    </table>
+        </tbody>
+      </table>
+    </div>
   </details>
 </section>
 
@@ -602,25 +622,56 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   .chart-row {
     display: grid;
     grid-template-columns: 1fr;
-    gap: 1.25rem;
+    gap: 1.5rem;
+  }
+
+  @media (min-width: 760px) {
+    .chart-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  .section-heading {
+    margin-top: 1.25rem;
+  }
+
+  .section-heading h2 {
+    font-size: 1.35rem;
+    margin: 0.1rem 0 0.25rem;
+  }
+
+  .section-heading p:not(.eyebrow) {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin: 0;
+    max-width: 48rem;
+  }
+
+  .eyebrow {
+    color: var(--accent);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    margin: 0;
+    text-transform: uppercase;
   }
 
   .chart-card {
     border: 1px solid var(--border);
     border-radius: 10px;
     background: var(--viz-surface);
-    padding: 1.1rem 1.25rem 0.9rem;
+    padding: 1.3rem 1.4rem 1.1rem;
     overflow-x: auto;
   }
 
   .chart-card h3 {
-    font-size: 0.98rem;
+    font-size: 1.05rem;
     font-weight: 650;
     margin: 0 0 0.15rem;
   }
 
   .chart-sub {
-    font-size: 0.82rem;
+    font-size: 0.88rem;
     color: var(--text-secondary);
     margin: 0 0 0.9rem;
   }
@@ -628,8 +679,15 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
   svg {
     width: 100%;
     height: auto;
-    min-width: 540px;
     display: block;
+  }
+
+  .bar-chart {
+    min-width: 520px;
+  }
+
+  .detail-chart {
+    min-width: 780px;
   }
 
   .series-1 {
@@ -642,9 +700,6 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     fill: var(--viz-series-3);
   }
 
-  .series-4 {
-    fill: var(--viz-series-4);
-  }
   .series-bg-1 {
     background: var(--viz-series-1);
   }
@@ -655,9 +710,6 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     background: var(--viz-series-3);
   }
 
-  .series-bg-4 {
-    background: var(--viz-series-4);
-  }
 
   .dot {
     stroke: var(--viz-surface);
@@ -666,26 +718,26 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
 
   .row-label {
     fill: var(--text);
-    font-size: 13px;
+    font-size: 14px;
     text-anchor: end;
     dominant-baseline: central;
   }
 
   .query-label {
     fill: var(--text-secondary);
-    font-size: 12.5px;
+    font-size: 14px;
   }
 
   .value-label {
     fill: var(--text-secondary);
-    font-size: 12px;
+    font-size: 13px;
     dominant-baseline: central;
     font-variant-numeric: tabular-nums;
   }
 
   .tick-label {
     fill: var(--viz-muted);
-    font-size: 11px;
+    font-size: 12px;
     text-anchor: middle;
     font-variant-numeric: tabular-nums;
   }
@@ -696,7 +748,7 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
 
   .group-label {
     fill: var(--viz-muted);
-    font-size: 10.5px;
+    font-size: 11.5px;
     font-weight: 650;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -723,13 +775,13 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
-    font-size: 0.8rem;
+    font-size: 0.86rem;
     color: var(--text-secondary);
   }
 
   .swatch {
-    width: 10px;
-    height: 10px;
+    width: 12px;
+    height: 12px;
     border-radius: 3px;
     display: inline-block;
   }
@@ -741,11 +793,22 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     padding: 0.5rem 0;
   }
 
+  .bench-table {
+    min-width: 0;
+  }
+
   .bench-table table {
     border-collapse: collapse;
     width: 100%;
-    font-size: 0.82rem;
-    margin-top: 0.5rem;
+    min-width: 950px;
+    font-size: 0.86rem;
+  }
+
+  .table-scroll {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    max-width: 100%;
+    overflow-x: auto;
   }
 
   .bench-table th {
@@ -753,12 +816,12 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     font-weight: 600;
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
-    padding: 0.35rem 0.7rem 0.35rem 0;
+    padding: 0.55rem 0.7rem;
   }
 
   .bench-table td {
     border-bottom: 1px solid var(--border);
-    padding: 0.35rem 0.7rem 0.35rem 0;
+    padding: 0.55rem 0.7rem;
     vertical-align: top;
   }
 
@@ -769,13 +832,19 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
 
   .split-table {
     width: 100%;
+    min-width: 820px;
     border-collapse: collapse;
     font-size: 0.88rem;
   }
 
+  .bench-table thead th,
+  .split-table thead th {
+    background: color-mix(in srgb, var(--text) 1.8%, transparent);
+  }
+
   .split-table th,
   .split-table td {
-    padding: 0.35rem 0.6rem;
+    padding: 0.55rem 0.7rem;
     border-bottom: 1px solid var(--border);
     text-align: left;
   }
@@ -785,11 +854,41 @@ const axisY = DOT_TOP + dotRows.length * DOT_ROW_H;
     font-variant-numeric: tabular-nums;
   }
 
-  .bench-table td.best {
+  .bench-table th.num {
+    text-align: right;
+  }
+
+  .bench-table .engine-group {
+    text-align: center;
+    border-left: 2px solid var(--border-strong);
+  }
+
+  .engine-start {
+    border-left: 2px solid var(--border-strong) !important;
+  }
+
+  .bench-table tbody tr:nth-child(even) > td,
+  .split-table tbody tr:nth-child(even) > td {
+    background: color-mix(in srgb, var(--text) 2.5%, transparent);
+  }
+
+  .bench-table tbody tr:hover > td,
+  .split-table tbody tr:hover > td {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+
+  .bench-table tr.workload-start > td,
+  .split-table tr.workload-start > td {
+    border-top: 2px solid var(--border-strong);
+  }
+
+  .bench-table td.best,
+  .split-table td.best {
     font-weight: 650;
   }
 
-  .bench-table .best-mark {
+  .bench-table .best-mark,
+  .split-table .best-mark {
     color: var(--viz-series-1, #2a78d6);
     margin-right: 0.3em;
     font-size: 0.7em;

@@ -1,11 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
 import { referenceQueryDefinitions } from "../src/worker/reference-suite.js";
+import { writeCaseDefinitions } from "../src/worker/write-suite.js";
 
 /**
  * Derived from the suite itself, so adding a reference query updates the expectation instead
  * of silently breaking this smoke test (the row count is independent of dataset size).
  */
 const referenceQueryCount = referenceQueryDefinitions(1000).length;
+const writeCaseCount = writeCaseDefinitions().length;
 
 const pages = [
   { path: "/", title: "Minnow bench", nav: "Overview" },
@@ -55,7 +57,7 @@ test("stays usable at a phone viewport", async ({ page }) => {
   }
 });
 
-test("generates, queries, verifies, and deletes a dataset on all three engines", async ({
+test("generates, queries, verifies, and deletes a dataset on the default engines", async ({
   page,
   browserName,
 }) => {
@@ -74,7 +76,7 @@ test("generates, queries, verifies, and deletes a dataset on all three engines",
   await expect(page.locator("#dataset-rows tr")).toHaveCount(1);
   await expect(page.locator("#dataset-rows .badge.ok")).toHaveCount(3);
 
-  // Run the default query against all three engines and require checksum agreement.
+  // Run the default query against every default engine and require checksum agreement.
   await page.goto("/query.html");
   await expect(page.locator("#dataset-select option")).toHaveCount(1);
   await expect(page.locator("#engine-checks input:checked")).toHaveCount(3);
@@ -85,7 +87,7 @@ test("generates, queries, verifies, and deletes a dataset on all three engines",
   await expect(page.locator("#plan-details")).toBeAttached();
   expect(await page.locator("#result-rows tr").count()).toBeGreaterThan(0);
 
-  // Reference suite: 15 queries, every supported engine execution must agree with its oracle.
+  // Every supported read-suite execution must agree with its oracle.
   await page.goto("/suites.html");
   await expect(page.locator("#ref-dataset option")).toHaveCount(1);
   await expect(page.locator("#ref-engines input:checked")).toHaveCount(3);
@@ -101,6 +103,15 @@ test("generates, queries, verifies, and deletes a dataset on all three engines",
   await expect(page.locator("#ref-results")).toContainText(
     `${String(referenceQueryCount)}/${String(referenceQueryCount)} supported`,
   );
+
+  // The write suite must also preserve its oracle contract through the browser worker.
+  await page.locator("#write-run").click();
+  await expect(page.locator("#write-status")).toContainText(
+    "left the table exactly as the oracle predicts",
+    { timeout: 240_000 },
+  );
+  await expect(page.locator("#write-results tbody tr")).toHaveCount(writeCaseCount);
+  await expect(page.locator("#write-results .badge.fail")).toHaveCount(0);
 
   // Delete the dataset from every engine's storage.
   await page.goto("/datasets.html");

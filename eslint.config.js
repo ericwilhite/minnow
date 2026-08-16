@@ -3,7 +3,15 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["**/dist/**", "**/coverage/**", "**/playwright-report/**", "**/.astro/**"] },
+  {
+    ignores: [
+      "**/dist/**",
+      "**/coverage/**",
+      "**/playwright-report/**",
+      "**/test-results/**",
+      "**/.astro/**",
+    ],
+  },
   eslint.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
@@ -45,8 +53,8 @@ export default tseslint.config(
   },
   {
     // Bench engines compare against SQLite/PGlite on purpose, the conformance harness uses
-    // node:sqlite as its differential oracle, and the site test server is a Node process
-    // that never ships.
+    // node:sqlite as its differential oracle, the site test server is a Node process that
+    // never ships, and the measurement scripts are Node tooling by definition.
     files: [
       "apps/bench/src/engines/**/*.ts",
       "apps/bench/vite.config.ts",
@@ -54,7 +62,7 @@ export default tseslint.config(
       "apps/site/tests/serve-dist.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
       "packages/core/src/engine/sql-mutation-conformance.test.ts",
-      "scripts/perf-gate.mts",
+      "scripts/*.mts",
     ],
     rules: { "no-restricted-imports": "off" },
   },

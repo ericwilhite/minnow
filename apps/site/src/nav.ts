@@ -28,6 +28,7 @@ export const docsNav: NavSection[] = [
       { title: "Workers & multi-tab", href: "/docs/workers/" },
       { title: "Devtools", href: "/docs/devtools/" },
       { title: "Architecture", href: "/docs/architecture/" },
+      { title: "Testing & benchmarks", href: "/docs/testing/" },
     ],
   },
   {
