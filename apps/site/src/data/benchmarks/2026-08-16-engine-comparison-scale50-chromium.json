@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "kind": "engine-comparison",
-  "capturedAt": "2026-08-16T22:03:05.031Z",
+  "capturedAt": "2026-08-16T23:34:56.348Z",
   "browser": {
     "project": "chromium",
     "version": "151.0.7922.34",
@@ -11,7 +11,7 @@
     "storage": "persistent profile (disk-backed)"
   },
   "wallClock": {
-    "totalMs": 172961
+    "totalMs": 170147
   },
   "progressCount": 498,
   "config": {
@@ -22,8 +22,8 @@
     "engines": ["minnow", "sqlite", "pglite"]
   },
   "dataset": {
-    "id": "59d2028b-1f58-4021-8dbc-7ca7c55798b3",
-    "createdAt": "2026-08-16T22:00:12.197Z",
+    "id": "1743ef5d-e40a-4660-9bc5-853a9a34a65c",
+    "createdAt": "2026-08-16T23:32:06.332Z",
     "scale": 50,
     "totalRows": 4780800,
     "tableRows": {
@@ -85,38 +85,38 @@
       "minnow": {
         "engine": "minnow",
         "status": "ready",
-        "storageName": "mdb-dataset-59d2028b-1f58-4021-8dbc-7ca7c55798b3",
+        "storageName": "mdb-dataset-1743ef5d-e40a-4660-9bc5-853a9a34a65c",
         "version": "workspace",
         "persistence": "IndexedDB · immutable compressed column blocks",
         "storedBytes": 100874559,
-        "buildMs": 12912.364999890327,
-        "insertMs": 10519.079999923706
+        "buildMs": 12700.804999947548,
+        "insertMs": 10323.465000152588
       },
       "sqlite": {
         "engine": "sqlite",
         "status": "ready",
-        "storageName": "/mdb-dataset-59d2028b-1f58-4021-8dbc-7ca7c55798b3.sqlite3",
+        "storageName": "/mdb-dataset-1743ef5d-e40a-4660-9bc5-853a9a34a65c.sqlite3",
         "vfs": "sah-pool",
         "version": "3.53.0",
         "persistence": "OPFS SAH-pool VFS · persistent SQLite file",
         "storedBytes": 410263552,
-        "buildMs": 31079.46500003338,
-        "insertMs": 25185.389999747276
+        "buildMs": 30713.959999918938,
+        "insertMs": 25033.025000572205
       },
       "pglite": {
         "engine": "pglite",
         "status": "ready",
-        "storageName": "/pglite/mdb-dataset-59d2028b-1f58-4021-8dbc-7ca7c55798b3",
+        "storageName": "/pglite/mdb-dataset-1743ef5d-e40a-4660-9bc5-853a9a34a65c",
         "version": "0.5.x",
         "persistence": "IndexedDB VFS · persistent PostgreSQL data directory · relaxed flush on reads, strict on writes",
         "storedBytes": 701137423,
-        "buildMs": 81210.68000006676,
-        "insertMs": 55913.56499969959
+        "buildMs": 79171.16499996185,
+        "insertMs": 54214.54999983311
       }
     }
   },
   "reads": {
-    "datasetId": "59d2028b-1f58-4021-8dbc-7ca7c55798b3",
+    "datasetId": "1743ef5d-e40a-4660-9bc5-853a9a34a65c",
     "scale": 50,
     "sampleCount": 7,
     "engines": ["minnow", "sqlite", "pglite"],
@@ -134,10 +134,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 2.534999966621399,
-            "medianMs": 0.30500006675720215,
-            "p95Ms": 0.6050000190734863,
-            "cachedMedianMs": 0.12999999523162842,
+            "prepareMs": 2.5649999380111694,
+            "medianMs": 0.25,
+            "p95Ms": 0.5,
+            "cachedMedianMs": 0.11500000953674316,
             "peakMemoryBytes": 2643941,
             "resultRows": 1,
             "checksum": 3069924467,
@@ -146,9 +146,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 1.0149999856948853,
-            "medianMs": 0.019999980926513672,
-            "p95Ms": 0.029999971389770508,
+            "prepareMs": 0.7799999713897705,
+            "medianMs": 0.020000100135803223,
+            "p95Ms": 0.0549999475479126,
             "resultRows": 1,
             "checksum": 3069924467,
             "verified": true
@@ -156,9 +156,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.7400000095367432,
+            "prepareMs": 4.7149999141693115,
             "medianMs": 0.125,
-            "p95Ms": 0.15999996662139893,
+            "p95Ms": 0.17500007152557373,
             "resultRows": 1,
             "checksum": 3069924467,
             "verified": true
@@ -178,10 +178,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 4.060000061988831,
-            "medianMs": 0.26499998569488525,
-            "p95Ms": 1.3899999856948853,
-            "cachedMedianMs": 0.125,
+            "prepareMs": 0.6499999761581421,
+            "medianMs": 0.1950000524520874,
+            "p95Ms": 1.524999976158142,
+            "cachedMedianMs": 0.15000009536743164,
             "peakMemoryBytes": 203882,
             "resultRows": 1,
             "checksum": 1347072786,
@@ -190,9 +190,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.0549999475479126,
-            "medianMs": 0.014999985694885254,
-            "p95Ms": 0.020000100135803223,
+            "prepareMs": 0.06500005722045898,
+            "medianMs": 0.010000109672546387,
+            "p95Ms": 0.02499997615814209,
             "resultRows": 1,
             "checksum": 1347072786,
             "verified": true
@@ -200,9 +200,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.2250000238418579,
-            "medianMs": 0.10499989986419678,
-            "p95Ms": 0.125,
+            "prepareMs": 0.26999998092651367,
+            "medianMs": 0.12000000476837158,
+            "p95Ms": 0.13499999046325684,
             "resultRows": 1,
             "checksum": 1347072786,
             "verified": true
@@ -222,10 +222,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 1.2050000429153442,
-            "medianMs": 0.32499992847442627,
-            "p95Ms": 0.5399999618530273,
-            "cachedMedianMs": 0.3049999475479126,
+            "prepareMs": 1.1050000190734863,
+            "medianMs": 0.2200000286102295,
+            "p95Ms": 1.7799999713897705,
+            "cachedMedianMs": 0.1950000524520874,
             "peakMemoryBytes": 1625156,
             "resultRows": 3,
             "checksum": 3328128986,
@@ -234,9 +234,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.21999990940093994,
+            "prepareMs": 0.20500004291534424,
             "medianMs": 0.019999980926513672,
-            "p95Ms": 0.034999966621398926,
+            "p95Ms": 0.029999971389770508,
             "resultRows": 3,
             "checksum": 3328128986,
             "verified": true
@@ -244,9 +244,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.3950001001358032,
-            "medianMs": 0.10500001907348633,
-            "p95Ms": 0.13999998569488525,
+            "prepareMs": 0.36500000953674316,
+            "medianMs": 0.11500000953674316,
+            "p95Ms": 0.12999999523162842,
             "resultRows": 3,
             "checksum": 3328128986,
             "verified": true
@@ -267,9 +267,9 @@
             "engine": "minnow",
             "supported": true,
             "prepareMs": 0.6299999952316284,
-            "medianMs": 0.24000000953674316,
-            "p95Ms": 1.3200000524520874,
-            "cachedMedianMs": 0.1650000810623169,
+            "medianMs": 0.2250000238418579,
+            "p95Ms": 1.4250000715255737,
+            "cachedMedianMs": 0.16999995708465576,
             "peakMemoryBytes": 204171,
             "resultRows": 5,
             "checksum": 2918335380,
@@ -278,9 +278,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.2749999761581421,
-            "medianMs": 0.02500009536743164,
-            "p95Ms": 0.029999971389770508,
+            "prepareMs": 0.2850000858306885,
+            "medianMs": 0.029999971389770508,
+            "p95Ms": 0.034999966621398926,
             "resultRows": 5,
             "checksum": 2918335380,
             "verified": true
@@ -288,9 +288,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.30000007152557373,
-            "medianMs": 0.125,
-            "p95Ms": 0.1700000762939453,
+            "prepareMs": 0.4049999713897705,
+            "medianMs": 0.11500000953674316,
+            "p95Ms": 0.15999996662139893,
             "resultRows": 5,
             "checksum": 2918335380,
             "verified": true
@@ -310,10 +310,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.5600000619888306,
-            "medianMs": 0.33000004291534424,
-            "p95Ms": 0.7100000381469727,
-            "cachedMedianMs": 0.3200000524520874,
+            "prepareMs": 0.48000001907348633,
+            "medianMs": 0.3700000047683716,
+            "p95Ms": 3.940000057220459,
+            "cachedMedianMs": 0.26999998092651367,
             "peakMemoryBytes": 1019693,
             "resultRows": 10,
             "checksum": 3601176919,
@@ -322,9 +322,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.28000009059906006,
+            "prepareMs": 0.16499996185302734,
             "medianMs": 0.05000007152557373,
-            "p95Ms": 0.06500005722045898,
+            "p95Ms": 0.05500006675720215,
             "resultRows": 10,
             "checksum": 3601176919,
             "verified": true
@@ -332,9 +332,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.45500004291534424,
-            "medianMs": 0.14499998092651367,
-            "p95Ms": 0.16499996185302734,
+            "prepareMs": 0.46000003814697266,
+            "medianMs": 0.1499999761581421,
+            "p95Ms": 0.17499995231628418,
             "resultRows": 10,
             "checksum": 3601176919,
             "verified": true
@@ -354,10 +354,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.6150000095367432,
-            "medianMs": 0.26999998092651367,
-            "p95Ms": 1.2400000095367432,
-            "cachedMedianMs": 0.1799999475479126,
+            "prepareMs": 0.5699999332427979,
+            "medianMs": 0.2549999952316284,
+            "p95Ms": 1.4249999523162842,
+            "cachedMedianMs": 0.12000000476837158,
             "peakMemoryBytes": 406395,
             "resultRows": 1,
             "checksum": 1962762164,
@@ -367,8 +367,8 @@
             "engine": "sqlite",
             "supported": true,
             "prepareMs": 0.16499996185302734,
-            "medianMs": 0.009999990463256836,
-            "p95Ms": 0.009999990463256836,
+            "medianMs": 0.004999995231628418,
+            "p95Ms": 0.014999985694885254,
             "resultRows": 1,
             "checksum": 1962762164,
             "verified": true
@@ -376,9 +376,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.3200000524520874,
-            "medianMs": 0.09000003337860107,
-            "p95Ms": 0.11500000953674316,
+            "prepareMs": 0.3049999475479126,
+            "medianMs": 0.10000002384185791,
+            "p95Ms": 0.12000000476837158,
             "resultRows": 1,
             "checksum": 1962762164,
             "verified": true
@@ -398,10 +398,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.6100000143051147,
-            "medianMs": 1.465000033378601,
-            "p95Ms": 3.1850000619888306,
-            "cachedMedianMs": 0.33000004291534424,
+            "prepareMs": 0.6150000095367432,
+            "medianMs": 1.3600000143051147,
+            "p95Ms": 4.159999966621399,
+            "cachedMedianMs": 0.14499998092651367,
             "peakMemoryBytes": 1840936,
             "resultRows": 25,
             "checksum": 583285823,
@@ -410,9 +410,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.09000003337860107,
-            "medianMs": 3.2100000381469727,
-            "p95Ms": 3.3899999856948853,
+            "prepareMs": 0.09500002861022949,
+            "medianMs": 3.4199999570846558,
+            "p95Ms": 3.6700000762939453,
             "resultRows": 25,
             "checksum": 583285823,
             "verified": true
@@ -420,9 +420,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.4549999237060547,
-            "medianMs": 4.004999995231628,
-            "p95Ms": 4.175000071525574,
+            "prepareMs": 0.4950000047683716,
+            "medianMs": 4.134999990463257,
+            "p95Ms": 4.349999904632568,
             "resultRows": 25,
             "checksum": 583285823,
             "verified": true
@@ -442,10 +442,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.6149998903274536,
-            "medianMs": 2.924999952316284,
-            "p95Ms": 3.684999942779541,
-            "cachedMedianMs": 0.12000000476837158,
+            "prepareMs": 0.7049999237060547,
+            "medianMs": 2.625,
+            "p95Ms": 4.129999995231628,
+            "cachedMedianMs": 0.125,
             "peakMemoryBytes": 621198,
             "resultRows": 4,
             "checksum": 3091834284,
@@ -454,9 +454,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.20500004291534424,
-            "medianMs": 14.590000033378601,
-            "p95Ms": 14.940000057220459,
+            "prepareMs": 0.19000005722045898,
+            "medianMs": 14.455000042915344,
+            "p95Ms": 14.764999985694885,
             "resultRows": 4,
             "checksum": 3091834284,
             "verified": true
@@ -464,9 +464,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.4549999237060547,
-            "medianMs": 11.639999985694885,
-            "p95Ms": 11.885000109672546,
+            "prepareMs": 0.48000001907348633,
+            "medianMs": 11.894999980926514,
+            "p95Ms": 12.475000023841858,
             "resultRows": 4,
             "checksum": 3091834284,
             "verified": true
@@ -486,10 +486,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.2999999523162842,
-            "medianMs": 36.0900000333786,
-            "p95Ms": 41.99000000953674,
-            "cachedMedianMs": 0.3200000524520874,
+            "prepareMs": 0.2799999713897705,
+            "medianMs": 35.170000076293945,
+            "p95Ms": 40.610000014305115,
+            "cachedMedianMs": 0.17499995231628418,
             "peakMemoryBytes": 7248278,
             "resultRows": 20,
             "checksum": 1591998333,
@@ -498,9 +498,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.22499990463256836,
-            "medianMs": 43.49000000953674,
-            "p95Ms": 44.235000014305115,
+            "prepareMs": 0.24500000476837158,
+            "medianMs": 43.4449999332428,
+            "p95Ms": 43.61500000953674,
             "resultRows": 20,
             "checksum": 1591998333,
             "verified": true
@@ -508,9 +508,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.49000000953674316,
-            "medianMs": 33.20999991893768,
-            "p95Ms": 33.85000002384186,
+            "prepareMs": 0.4750000238418579,
+            "medianMs": 32.9650000333786,
+            "p95Ms": 33.485000014305115,
             "resultRows": 20,
             "checksum": 1591998333,
             "verified": true
@@ -530,10 +530,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.2850000858306885,
-            "medianMs": 28.5900000333786,
-            "p95Ms": 30.014999985694885,
-            "cachedMedianMs": 0.1650000810623169,
+            "prepareMs": 0.2200000286102295,
+            "medianMs": 28.5,
+            "p95Ms": 30.105000019073486,
+            "cachedMedianMs": 0.12000000476837158,
             "peakMemoryBytes": 2194045,
             "resultRows": 5,
             "checksum": 806978105,
@@ -542,9 +542,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.12000000476837158,
-            "medianMs": 92.9099999666214,
-            "p95Ms": 93.85500001907349,
+            "prepareMs": 0.125,
+            "medianMs": 92.75,
+            "p95Ms": 93.89999997615814,
             "resultRows": 5,
             "checksum": 4050897312,
             "verified": true
@@ -552,9 +552,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.44999992847442627,
-            "medianMs": 52.0550000667572,
-            "p95Ms": 52.72500002384186,
+            "prepareMs": 0.48000001907348633,
+            "medianMs": 53.949999928474426,
+            "p95Ms": 54.330000042915344,
             "resultRows": 5,
             "checksum": 806978105,
             "verified": true
@@ -574,10 +574,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 3.0549999475479126,
-            "medianMs": 15.230000019073486,
-            "p95Ms": 22.794999957084656,
-            "cachedMedianMs": 3.350000023841858,
+            "prepareMs": 3.165000081062317,
+            "medianMs": 13.444999933242798,
+            "p95Ms": 16.02999997138977,
+            "cachedMedianMs": 3.319999933242798,
             "peakMemoryBytes": 1874252,
             "resultRows": 9000,
             "checksum": 1233977070,
@@ -586,9 +586,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.5550000667572021,
-            "medianMs": 43.33999991416931,
-            "p95Ms": 44.0200001001358,
+            "prepareMs": 0.6000000238418579,
+            "medianMs": 43.625,
+            "p95Ms": 44.450000047683716,
             "resultRows": 9000,
             "checksum": 1233977070,
             "verified": true
@@ -596,9 +596,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.4950000047683716,
-            "medianMs": 45.90499997138977,
-            "p95Ms": 46.39999997615814,
+            "prepareMs": 0.5149999856948853,
+            "medianMs": 45.825000047683716,
+            "p95Ms": 46.2849999666214,
             "resultRows": 9000,
             "checksum": 1233977070,
             "verified": true
@@ -618,10 +618,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.7400000095367432,
-            "medianMs": 53.269999980926514,
-            "p95Ms": 57.889999985694885,
-            "cachedMedianMs": 0.2549999952316284,
+            "prepareMs": 0.7100000381469727,
+            "medianMs": 53.1599999666214,
+            "p95Ms": 68.97500002384186,
+            "cachedMedianMs": 0.1799999475479126,
             "peakMemoryBytes": 5262615,
             "resultRows": 15,
             "checksum": 2612041306,
@@ -630,9 +630,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.6850000619888306,
-            "medianMs": 117,
-            "p95Ms": 117.72500002384186,
+            "prepareMs": 0.6600000858306885,
+            "medianMs": 115.35000002384186,
+            "p95Ms": 117.72000002861023,
             "resultRows": 15,
             "checksum": 2612041306,
             "verified": true
@@ -640,9 +640,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.6349999904632568,
-            "medianMs": 72.49500000476837,
-            "p95Ms": 73.34500002861023,
+            "prepareMs": 0.6600000858306885,
+            "medianMs": 74.81000006198883,
+            "p95Ms": 75.74000000953674,
             "resultRows": 15,
             "checksum": 2612041306,
             "verified": true
@@ -662,10 +662,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.33500003814697266,
-            "medianMs": 31.165000081062317,
-            "p95Ms": 45.71000003814697,
-            "cachedMedianMs": 0.35500001907348633,
+            "prepareMs": 0.3500000238418579,
+            "medianMs": 32.53999996185303,
+            "p95Ms": 37.49500000476837,
+            "cachedMedianMs": 0.1400001049041748,
             "peakMemoryBytes": 4593412,
             "resultRows": 12,
             "checksum": 502447944,
@@ -674,9 +674,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.28999996185302734,
-            "medianMs": 58.394999980926514,
-            "p95Ms": 59.079999923706055,
+            "prepareMs": 0.30000007152557373,
+            "medianMs": 59.29000008106232,
+            "p95Ms": 60.18999993801117,
             "resultRows": 12,
             "checksum": 502447944,
             "verified": true
@@ -684,9 +684,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.5499999523162842,
-            "medianMs": 36.424999952316284,
-            "p95Ms": 36.7849999666214,
+            "prepareMs": 0.5550000667572021,
+            "medianMs": 36.21000003814697,
+            "p95Ms": 36.75,
             "resultRows": 12,
             "checksum": 502447944,
             "verified": true
@@ -706,10 +706,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.22999989986419678,
-            "medianMs": 36.12999999523163,
-            "p95Ms": 38.18500006198883,
-            "cachedMedianMs": 1.8600000143051147,
+            "prepareMs": 0.25999999046325684,
+            "medianMs": 36.97500002384186,
+            "p95Ms": 41.52999997138977,
+            "cachedMedianMs": 2.1850000619888306,
             "peakMemoryBytes": 7657445,
             "resultRows": 2400,
             "checksum": 1778224121,
@@ -718,9 +718,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.21500003337860107,
-            "medianMs": 69.41999995708466,
-            "p95Ms": 70.10000002384186,
+            "prepareMs": 0.20000004768371582,
+            "medianMs": 70.4099999666214,
+            "p95Ms": 71.44500005245209,
             "resultRows": 2400,
             "checksum": 1778224121,
             "verified": true
@@ -728,9 +728,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.46000003814697266,
-            "medianMs": 50.329999923706055,
-            "p95Ms": 50.6800000667572,
+            "prepareMs": 0.4549999237060547,
+            "medianMs": 50.889999985694885,
+            "p95Ms": 52.2849999666214,
             "resultRows": 2400,
             "checksum": 1778224121,
             "verified": true
@@ -750,10 +750,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.19000005722045898,
-            "medianMs": 26.945000052452087,
-            "p95Ms": 27.9650000333786,
-            "cachedMedianMs": 0.32499992847442627,
+            "prepareMs": 0.2549999952316284,
+            "medianMs": 27.490000009536743,
+            "p95Ms": 28.079999923706055,
+            "cachedMedianMs": 0.14499998092651367,
             "peakMemoryBytes": 4203718,
             "resultRows": 5,
             "checksum": 1685465412,
@@ -762,9 +762,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.31499993801116943,
-            "medianMs": 88.16499996185303,
-            "p95Ms": 88.98500001430511,
+            "prepareMs": 0.40000009536743164,
+            "medianMs": 90.3050000667572,
+            "p95Ms": 90.89499998092651,
             "resultRows": 5,
             "checksum": 1685465412,
             "verified": true
@@ -772,9 +772,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.5900000333786011,
-            "medianMs": 53.99500000476837,
-            "p95Ms": 54.68500006198883,
+            "prepareMs": 0.5749999284744263,
+            "medianMs": 55.29000008106232,
+            "p95Ms": 55.9650000333786,
             "resultRows": 5,
             "checksum": 1685465412,
             "verified": true
@@ -794,10 +794,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.15000009536743164,
-            "medianMs": 14.485000014305115,
-            "p95Ms": 15.870000004768372,
-            "cachedMedianMs": 0.6050000190734863,
+            "prepareMs": 0.1499999761581421,
+            "medianMs": 14.340000033378601,
+            "p95Ms": 16.074999928474426,
+            "cachedMedianMs": 0.5849999189376831,
             "peakMemoryBytes": 1365044,
             "resultRows": 1200,
             "checksum": 531296153,
@@ -807,8 +807,8 @@
             "engine": "sqlite",
             "supported": true,
             "prepareMs": 0.125,
-            "medianMs": 80.14999997615814,
-            "p95Ms": 83.00499999523163,
+            "medianMs": 85.125,
+            "p95Ms": 87.36500000953674,
             "resultRows": 1200,
             "checksum": 531296153,
             "verified": true
@@ -817,8 +817,8 @@
             "engine": "pglite",
             "supported": true,
             "prepareMs": 0.4450000524520874,
-            "medianMs": 65.14999997615814,
-            "p95Ms": 65.69999992847443,
+            "medianMs": 66.47500002384186,
+            "p95Ms": 66.81500005722046,
             "resultRows": 1200,
             "checksum": 531296153,
             "verified": true
@@ -838,10 +838,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.19499993324279785,
-            "medianMs": 59.52999997138977,
-            "p95Ms": 71.99500000476837,
-            "cachedMedianMs": 0.3700000047683716,
+            "prepareMs": 0.2200000286102295,
+            "medianMs": 58.389999985694885,
+            "p95Ms": 74.72500002384186,
+            "cachedMedianMs": 0.4599999189376831,
             "peakMemoryBytes": 11767464,
             "resultRows": 400,
             "checksum": 223931867,
@@ -851,8 +851,8 @@
             "engine": "sqlite",
             "supported": true,
             "prepareMs": 0.15999996662139893,
-            "medianMs": 96.36500000953674,
-            "p95Ms": 96.75999999046326,
+            "medianMs": 97.01999998092651,
+            "p95Ms": 97.99500000476837,
             "resultRows": 400,
             "checksum": 223931867,
             "verified": true
@@ -860,9 +860,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.45500004291534424,
-            "medianMs": 78.24000000953674,
-            "p95Ms": 78.80999994277954,
+            "prepareMs": 0.4650000333786011,
+            "medianMs": 79.96000003814697,
+            "p95Ms": 80.5,
             "resultRows": 400,
             "checksum": 223931867,
             "verified": true
@@ -882,10 +882,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 0.1499999761581421,
-            "medianMs": 13.444999933242798,
-            "p95Ms": 21.014999985694885,
-            "cachedMedianMs": 1.165000081062317,
+            "prepareMs": 0.15500009059906006,
+            "medianMs": 13.56000006198883,
+            "p95Ms": 14.919999957084656,
+            "cachedMedianMs": 1.0950000286102295,
             "peakMemoryBytes": 1431044,
             "resultRows": 2000,
             "checksum": 397674043,
@@ -895,8 +895,8 @@
             "engine": "sqlite",
             "supported": true,
             "prepareMs": 0.11000001430511475,
-            "medianMs": 122.62999999523163,
-            "p95Ms": 123.00999999046326,
+            "medianMs": 123.98500001430511,
+            "p95Ms": 133.2149999141693,
             "resultRows": 2000,
             "checksum": 397674043,
             "verified": true
@@ -904,9 +904,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.44999992847442627,
-            "medianMs": 72.07999992370605,
-            "p95Ms": 72.87999999523163,
+            "prepareMs": 0.5149999856948853,
+            "medianMs": 73.38999998569489,
+            "p95Ms": 74.46999990940094,
             "resultRows": 2000,
             "checksum": 397674043,
             "verified": true
@@ -926,10 +926,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 2.0899999141693115,
-            "medianMs": 23.18499994277954,
-            "p95Ms": 24.205000042915344,
-            "cachedMedianMs": 0.16999995708465576,
+            "prepareMs": 1.6649999618530273,
+            "medianMs": 23.15499997138977,
+            "p95Ms": 23.509999990463257,
+            "cachedMedianMs": 0.30500006675720215,
             "peakMemoryBytes": 1225652,
             "resultRows": 4,
             "checksum": 2133796639,
@@ -938,9 +938,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.1099998950958252,
-            "medianMs": 44.30499994754791,
-            "p95Ms": 44.63499999046326,
+            "prepareMs": 0.125,
+            "medianMs": 44.299999952316284,
+            "p95Ms": 44.72499990463257,
             "resultRows": 4,
             "checksum": 2133796639,
             "verified": true
@@ -948,9 +948,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.375,
-            "medianMs": 27.450000047683716,
-            "p95Ms": 27.75,
+            "prepareMs": 0.4100000858306885,
+            "medianMs": 27.860000014305115,
+            "p95Ms": 28.365000009536743,
             "resultRows": 4,
             "checksum": 2133796639,
             "verified": true
@@ -971,9 +971,9 @@
             "engine": "minnow",
             "supported": true,
             "prepareMs": 0.25999999046325684,
-            "medianMs": 63.264999985694885,
-            "p95Ms": 83.97500002384186,
-            "cachedMedianMs": 0.17499995231628418,
+            "medianMs": 63.18500006198883,
+            "p95Ms": 82.80499994754791,
+            "cachedMedianMs": 0.19000005722045898,
             "peakMemoryBytes": 7884652,
             "resultRows": 4,
             "checksum": 139361073,
@@ -982,9 +982,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.19499993324279785,
-            "medianMs": 83.22500002384186,
-            "p95Ms": 84.70500004291534,
+            "prepareMs": 0.1950000524520874,
+            "medianMs": 85.04499995708466,
+            "p95Ms": 85.30000007152557,
             "resultRows": 4,
             "checksum": 1531535075,
             "verified": true
@@ -992,11 +992,11 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.4950000047683716,
-            "medianMs": 72.66999995708466,
-            "p95Ms": 73.70000004768372,
+            "prepareMs": 0.48500001430511475,
+            "medianMs": 72.0349999666214,
+            "p95Ms": 73.85500001907349,
             "resultRows": 4,
-            "checksum": 4132450480,
+            "checksum": 139361073,
             "verified": true
           }
         ]
@@ -1014,10 +1014,10 @@
           {
             "engine": "minnow",
             "supported": true,
-            "prepareMs": 10.365000009536743,
-            "medianMs": 1.715000033378601,
-            "p95Ms": 1.9250000715255737,
-            "cachedMedianMs": 0.2099999189376831,
+            "prepareMs": 1.6999999284744263,
+            "medianMs": 1.965000033378601,
+            "p95Ms": 37.11500000953674,
+            "cachedMedianMs": 0.28999996185302734,
             "peakMemoryBytes": 7451220,
             "resultRows": 25,
             "checksum": 2931895083,
@@ -1026,9 +1026,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "prepareMs": 0.14499998092651367,
-            "medianMs": 8.254999995231628,
-            "p95Ms": 8.815000057220459,
+            "prepareMs": 0.17500007152557373,
+            "medianMs": 8,
+            "p95Ms": 8.600000023841858,
             "resultRows": 25,
             "checksum": 2931895083,
             "verified": true
@@ -1036,9 +1036,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "prepareMs": 0.5,
-            "medianMs": 10.975000023841858,
-            "p95Ms": 11.429999947547913,
+            "prepareMs": 0.3999999761581421,
+            "medianMs": 11.299999952316284,
+            "p95Ms": 11.570000052452087,
             "resultRows": 25,
             "checksum": 2931895083,
             "verified": true
@@ -1047,9 +1047,9 @@
       }
     ],
     "totalMsByEngine": {
-      "minnow": 409.17000007629395,
-      "sqlite": 965.5899999141693,
-      "pglite": 687.3199996948242
+      "minnow": 407.3750002384186,
+      "sqlite": 976.66000020504,
+      "pglite": 697.7150001525879
     },
     "supportedByEngine": {
       "minnow": 21,
@@ -1059,7 +1059,7 @@
     "passed": true
   },
   "writes": {
-    "datasetId": "59d2028b-1f58-4021-8dbc-7ca7c55798b3",
+    "datasetId": "1743ef5d-e40a-4660-9bc5-853a9a34a65c",
     "scale": 50,
     "sampleCount": 5,
     "engines": ["minnow", "sqlite", "pglite"],
@@ -1078,9 +1078,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 4.725000023841858,
-            "p95Ms": 7.5,
-            "rowsPerSecond": 211.64021057229718,
+            "medianMs": 4.690000057220459,
+            "p95Ms": 5.950000047683716,
+            "rowsPerSecond": 213.21961360329973,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1088,9 +1088,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.4800000190734863,
-            "p95Ms": 2.8300000429153442,
-            "rowsPerSecond": 403.2258033504347,
+            "medianMs": 2.4600000381469727,
+            "p95Ms": 2.740000009536743,
+            "rowsPerSecond": 406.50405873703284,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1098,9 +1098,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 24.06499993801117,
-            "p95Ms": 24.87000000476837,
-            "rowsPerSecond": 41.554124353870414,
+            "medianMs": 23.56499993801117,
+            "p95Ms": 25.399999976158142,
+            "rowsPerSecond": 42.43581594018869,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1121,9 +1121,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 2.5950000286102295,
-            "p95Ms": 2.990000009536743,
-            "rowsPerSecond": 38535.64504720091,
+            "medianMs": 2.375,
+            "p95Ms": 2.884999990463257,
+            "rowsPerSecond": 42105.26315789474,
             "tableRows": 100,
             "checksum": 2448242640,
             "verified": true
@@ -1131,9 +1131,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.965000033378601,
-            "p95Ms": 3.049999952316284,
-            "rowsPerSecond": 33726.812436507986,
+            "medianMs": 2.7350000143051147,
+            "p95Ms": 2.9800000190734863,
+            "rowsPerSecond": 36563.071106749936,
             "tableRows": 100,
             "checksum": 2448242640,
             "verified": true
@@ -1141,9 +1141,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 26.985000014305115,
-            "p95Ms": 39.06499993801117,
-            "rowsPerSecond": 3705.762458661799,
+            "medianMs": 24.834999918937683,
+            "p95Ms": 25.34999990463257,
+            "rowsPerSecond": 4026.5754107672046,
             "tableRows": 100,
             "checksum": 2448242640,
             "verified": true
@@ -1164,9 +1164,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 19.3400000333786,
-            "p95Ms": 20.790000081062317,
-            "rowsPerSecond": 517063.08080357587,
+            "medianMs": 18.830000042915344,
+            "p95Ms": 20.25,
+            "rowsPerSecond": 531067.4443552342,
             "tableRows": 10000,
             "checksum": 3631069831,
             "verified": true
@@ -1174,9 +1174,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 49.50499999523163,
-            "p95Ms": 50.769999980926514,
-            "rowsPerSecond": 201999.7980196588,
+            "medianMs": 47.22000002861023,
+            "p95Ms": 49.53999996185303,
+            "rowsPerSecond": 211774.67162094617,
             "tableRows": 10000,
             "checksum": 3631069831,
             "verified": true
@@ -1184,9 +1184,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 91.0200001001358,
-            "p95Ms": 114.5699999332428,
-            "rowsPerSecond": 109865.96340363089,
+            "medianMs": 92.41499996185303,
+            "p95Ms": 116.0550000667572,
+            "rowsPerSecond": 108207.54211034777,
             "tableRows": 10000,
             "checksum": 3631069831,
             "verified": true
@@ -1207,9 +1207,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 162.01499998569489,
-            "p95Ms": 186.7150000333786,
-            "rowsPerSecond": 617226.8000421536,
+            "medianMs": 162.18999993801117,
+            "p95Ms": 182.3050000667572,
+            "rowsPerSecond": 616560.8239609094,
             "tableRows": 100000,
             "checksum": 1988997717,
             "verified": true
@@ -1217,9 +1217,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 440.3049999475479,
-            "p95Ms": 468.3899999856949,
-            "rowsPerSecond": 227115.29510660266,
+            "medianMs": 441.29499995708466,
+            "p95Ms": 478.3600000143051,
+            "rowsPerSecond": 226605.78526773443,
             "tableRows": 100000,
             "checksum": 1988997717,
             "verified": true
@@ -1227,9 +1227,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 745.7699999809265,
-            "p95Ms": 765.9499999284744,
-            "rowsPerSecond": 134089.5986732606,
+            "medianMs": 736.579999923706,
+            "p95Ms": 778.2999999523163,
+            "rowsPerSecond": 135762.57841695112,
             "tableRows": 100000,
             "checksum": 1988997717,
             "verified": true
@@ -1250,9 +1250,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 3.5049999952316284,
-            "p95Ms": 3.7050000429153442,
-            "rowsPerSecond": 285.30670509570564,
+            "medianMs": 2.909999966621399,
+            "p95Ms": 3.440000057220459,
+            "rowsPerSecond": 343.642615625536,
             "tableRows": 1,
             "checksum": 3001480155,
             "verified": true
@@ -1260,9 +1260,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.259999990463257,
-            "p95Ms": 2.4149999618530273,
-            "rowsPerSecond": 442.4778779733619,
+            "medianMs": 1.75,
+            "p95Ms": 2.5,
+            "rowsPerSecond": 571.4285714285714,
             "tableRows": 1,
             "checksum": 3001480155,
             "verified": true
@@ -1270,9 +1270,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 52.580000042915344,
-            "p95Ms": 57.35000002384186,
-            "rowsPerSecond": 19.018638249977343,
+            "medianMs": 50.6949999332428,
+            "p95Ms": 54.125,
+            "rowsPerSecond": 19.725811249962323,
             "tableRows": 1,
             "checksum": 3001480155,
             "verified": true
@@ -1293,9 +1293,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 2.4000000953674316,
-            "p95Ms": 4.15500009059906,
-            "rowsPerSecond": 41666.66501098216,
+            "medianMs": 2.1549999713897705,
+            "p95Ms": 3.200000047683716,
+            "rowsPerSecond": 46403.71291304913,
             "tableRows": 100,
             "checksum": 4161863616,
             "verified": true
@@ -1303,9 +1303,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.4350000619888306,
-            "p95Ms": 2.7949999570846558,
-            "rowsPerSecond": 41067.760761502075,
+            "medianMs": 2.6050000190734863,
+            "p95Ms": 2.694999933242798,
+            "rowsPerSecond": 38387.715649832026,
             "tableRows": 100,
             "checksum": 4161863616,
             "verified": true
@@ -1313,9 +1313,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 54.33500003814697,
-            "p95Ms": 56.27499997615814,
-            "rowsPerSecond": 1840.4343412127175,
+            "medianMs": 52.55999994277954,
+            "p95Ms": 53.40499997138977,
+            "rowsPerSecond": 1902.587521097164,
             "tableRows": 100,
             "checksum": 4161863616,
             "verified": true
@@ -1336,9 +1336,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 12.264999985694885,
-            "p95Ms": 12.394999980926514,
-            "rowsPerSecond": 815328.1705392061,
+            "medianMs": 12.09500002861023,
+            "p95Ms": 13,
+            "rowsPerSecond": 826787.926940505,
             "tableRows": 10000,
             "checksum": 994742411,
             "verified": true
@@ -1346,9 +1346,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 20.920000076293945,
-            "p95Ms": 24.889999985694885,
-            "rowsPerSecond": 478011.47053205635,
+            "medianMs": 21.78000009059906,
+            "p95Ms": 29.9650000333786,
+            "rowsPerSecond": 459136.8208632982,
             "tableRows": 10000,
             "checksum": 994742411,
             "verified": true
@@ -1356,9 +1356,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 125.51999998092651,
-            "p95Ms": 127.375,
-            "rowsPerSecond": 79668.57872466187,
+            "medianMs": 123.41499996185303,
+            "p95Ms": 124.73500001430511,
+            "rowsPerSecond": 81027.42780935018,
             "tableRows": 10000,
             "checksum": 994742411,
             "verified": true
@@ -1379,9 +1379,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 3.5950000286102295,
-            "p95Ms": 3.7949999570846558,
-            "rowsPerSecond": 278.1641146152047,
+            "medianMs": 3.174999952316284,
+            "p95Ms": 3.3799999952316284,
+            "rowsPerSecond": 314.960634651494,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1389,9 +1389,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.180000066757202,
-            "p95Ms": 2.5399999618530273,
-            "rowsPerSecond": 458.7155822832253,
+            "medianMs": 1.8700000047683716,
+            "p95Ms": 2.71999990940094,
+            "rowsPerSecond": 534.7593569251704,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1399,9 +1399,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 56.30999994277954,
-            "p95Ms": 57.30499994754791,
-            "rowsPerSecond": 17.758835038468632,
+            "medianMs": 53.674999952316284,
+            "p95Ms": 54.59499990940094,
+            "rowsPerSecond": 18.630647431548738,
             "tableRows": 1,
             "checksum": 3378540503,
             "verified": true
@@ -1422,9 +1422,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 4.055000066757202,
-            "p95Ms": 4.5,
-            "rowsPerSecond": 24660.91204776979,
+            "medianMs": 3.165000081062317,
+            "p95Ms": 3.759999990463257,
+            "rowsPerSecond": 31595.57581004405,
             "tableRows": 150,
             "checksum": 3844696883,
             "verified": true
@@ -1432,9 +1432,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 2.694999933242798,
-            "p95Ms": 2.8299999237060547,
-            "rowsPerSecond": 37105.75231060341,
+            "medianMs": 2.799999952316284,
+            "p95Ms": 2.930000066757202,
+            "rowsPerSecond": 35714.28632249639,
             "tableRows": 150,
             "checksum": 3844696883,
             "verified": true
@@ -1442,9 +1442,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 56.10000002384186,
-            "p95Ms": 57.2849999666214,
-            "rowsPerSecond": 1782.5311935383447,
+            "medianMs": 54.50999999046326,
+            "p95Ms": 55.705000042915344,
+            "rowsPerSecond": 1834.5257754080976,
             "tableRows": 150,
             "checksum": 3844696883,
             "verified": true
@@ -1465,9 +1465,9 @@
           {
             "engine": "minnow",
             "supported": true,
-            "medianMs": 19.240000009536743,
-            "p95Ms": 21.199999928474426,
-            "rowsPerSecond": 519750.51949289354,
+            "medianMs": 19.070000052452087,
+            "p95Ms": 21.455000042915344,
+            "rowsPerSecond": 524383.8475351323,
             "tableRows": 15000,
             "checksum": 1579950473,
             "verified": true
@@ -1475,9 +1475,9 @@
           {
             "engine": "sqlite",
             "supported": true,
-            "medianMs": 52.36500000953674,
-            "p95Ms": 53.985000014305115,
-            "rowsPerSecond": 190967.2490819974,
+            "medianMs": 53.16499996185303,
+            "p95Ms": 55.31500005722046,
+            "rowsPerSecond": 188093.67078294375,
             "tableRows": 15000,
             "checksum": 1579950473,
             "verified": true
@@ -1485,9 +1485,9 @@
           {
             "engine": "pglite",
             "supported": true,
-            "medianMs": 142.74500000476837,
-            "p95Ms": 143.9649999141693,
-            "rowsPerSecond": 70054.99316729799,
+            "medianMs": 138.68500006198883,
+            "p95Ms": 139.44999992847443,
+            "rowsPerSecond": 72105.85135761072,
             "tableRows": 15000,
             "checksum": 1579950473,
             "verified": true
@@ -1497,9 +1497,9 @@
       }
     ],
     "totalMsByEngine": {
-      "minnow": 233.7350002527237,
-      "sqlite": 578.1100001335144,
-      "pglite": 1375.4300000667572
+      "minnow": 230.65500009059906,
+      "sqlite": 577.6800000667572,
+      "pglite": 1350.9349995851517
     },
     "supportedByEngine": {
       "minnow": 10,
