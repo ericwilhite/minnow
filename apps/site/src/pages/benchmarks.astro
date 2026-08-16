@@ -87,6 +87,18 @@ const fmtMultiple = (bytes: number): string => {
   const multiple = bytes / smallestGzip;
   return multiple < 1.05 ? "smallest" : `${multiple.toFixed(multiple < 10 ? 1 : 0)}× larger`;
 };
+
+// The scale and browser toggles are CSS-only, so the rule that reveals the checked pane has to
+// name it. Deriving those selectors from the captures that exist is what stops publishing a new
+// scale from silently hiding every pane — which is what a hand-maintained list did.
+const scaleChecked = (scale: number): string =>
+  scales.length > 1 ? `:has(#scale-${String(scale)}:checked)` : "";
+const paneCss = `${panes
+  .map(
+    (pane) =>
+      `.bench${scaleChecked(pane.scale)}:has(#toggle-${pane.project}:checked) #pane-${String(pane.scale)}-${pane.project}`,
+  )
+  .join(",\n")} {\n  display: grid;\n}`;
 ---
 
 <Base
@@ -97,36 +109,33 @@ const fmtMultiple = (bytes: number): string => {
     <header class="bench-header">
       <h1>Benchmarks</h1>
       <p class="lede">
-        {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} running OLTP and
-        OLAP reads and writes against identical commerce datasets ({scaleStats
-          .map((entry) => fmtRows(entry.totalRows))
-          .join(", ")} rows) in real browsers. Every result is verified against an independent
-        oracle before any timing counts.
+        {engineMeta.map(([engine]) => engineLabels[engine] ?? engine).join(", ")} running the same
+        SQL over identical commerce datasets in real browsers. Reads and writes stay split by
+        OLTP and OLAP throughout, because a blended score hides the trade-off. Every result is
+        checked against an independent oracle before any timing counts.
       </p>
     </header>
 
-    {
-      scaleStats.map((entry) => (
-        <div class={`stats scale-stats scale-stats-${String(entry.scale)}`} role="list">
-          <div class="stat" role="listitem">
-            <div class="stat-value">{fmtRows(entry.totalRows)}</div>
-            <div class="stat-label">rows across {tableCount} tables</div>
-          </div>
-          <div class="stat" role="listitem">
-            <div class="stat-value">{first.reads.queries.length}</div>
-            <div class="stat-label">verified read queries</div>
-          </div>
-          <div class="stat" role="listitem">
-            <div class="stat-value">{first.writes.cases.length}</div>
-            <div class="stat-label">verified write cases</div>
-          </div>
-          <div class="stat" role="listitem">
-            <div class="stat-value">{projects.length}</div>
-            <div class="stat-label">browsers, captured {capturedDate}</div>
-          </div>
+    <div class="stats" role="list">
+      <div class="stat" role="listitem">
+        <div class="stat-value">
+          {scaleStats.map((entry) => fmtRows(entry.totalRows)).join(" · ")}
         </div>
-      ))
-    }
+        <div class="stat-label">rows across {tableCount} tables</div>
+      </div>
+      <div class="stat" role="listitem">
+        <div class="stat-value">{first.reads.queries.length}</div>
+        <div class="stat-label">verified read queries</div>
+      </div>
+      <div class="stat" role="listitem">
+        <div class="stat-value">{first.writes.cases.length}</div>
+        <div class="stat-label">verified write cases</div>
+      </div>
+      <div class="stat" role="listitem">
+        <div class="stat-value">{projects.length}</div>
+        <div class="stat-label">browsers, captured {capturedDate}</div>
+      </div>
+    </div>
 
     <section class="library-size" aria-labelledby="size-heading">
       <div class="section-heading">
@@ -178,35 +187,6 @@ const fmtMultiple = (bytes: number): string => {
       </p>
     </section>
 
-    <section class="workload-coverage" aria-labelledby="workload-heading">
-      <div class="section-heading">
-        <p class="eyebrow">Coverage</p>
-        <h2 id="workload-heading">Four workloads, kept separate</h2>
-        <p>
-          A single blended score hides the trade-offs that matter. The results below preserve the
-          read/write and OLTP/OLAP boundaries from capture through rendering.
-        </p>
-      </div>
-      <div class="workload-grid">
-        <article>
-          <strong>OLTP reads</strong>
-          <span>Keys, small sets, and bounded ranges</span>
-        </article>
-        <article>
-          <strong>OLAP reads</strong>
-          <span>Scans, joins, windows, and aggregates</span>
-        </article>
-        <article>
-          <strong>OLTP writes</strong>
-          <span>Point and small-batch mutations</span>
-        </article>
-        <article>
-          <strong>OLAP writes</strong>
-          <span>Bulk ingestion and mutation batches</span>
-        </article>
-      </div>
-    </section>
-
     {
       scales.length > 1 && (
         <div class="browser-toggle scale-toggle" role="tablist" aria-label="Dataset scale">
@@ -256,18 +236,18 @@ const fmtMultiple = (bytes: number): string => {
       <h2>Methodology</h2>
       <ul>
         <li>
-          Every engine runs in the same page, loading identical datasets ({scaleStats
-            .map((entry) => `scale ${String(entry.scale)}: ${entry.totalRows.toLocaleString("en-US")} rows`)
-            .join("; ")}; {tableCount} tables) with the same SQL.
+          Every engine runs in the same page over identical datasets ({scaleStats
+            .map((entry) => entry.totalRows.toLocaleString("en-US"))
+            .join(" and ")} rows across {tableCount} tables) with the same SQL.
         </li>
         <li>
-          Each query runs {first.reads.sampleCount} samples after one prepare step (each
-          engine's genuine prepared statement — compile/plan only); the charts show medians of
-          fresh statement executions, with p95 and prepare time in the tooltips and table.
+          Each query runs {first.reads.sampleCount} samples after one prepare — each engine's
+          genuine prepared statement, compile and plan only. Charts show the median of fresh
+          executions; p95 and prepare time are in the tooltips and table.
         </li>
         <li>
-          Reads are compared against independent JavaScript oracles and across engines. Writes
-          read the final table back and compare every row with an independent oracle.
+          Reads are checked against independent JavaScript oracles and across engines; writes are
+          read back and compared row for row.
         </li>
         <li>
           Storage backends:
@@ -294,74 +274,47 @@ const fmtMultiple = (bytes: number): string => {
           )
         }
         <li>
-          <strong>Every engine runs on its shipped defaults.</strong> No pragmas, no{" "}
-          <code>work_mem</code>, no cache sizing — nothing that depends on tuning knowledge the
-          next person might not apply. Durability is the one setting that is matched rather than
-          left alone: Minnow's IndexedDB store runs relaxed, so PGlite's read sessions open with{" "}
-          <code>relaxedDurability</code> too. Without it PGlite flushes its whole filesystem
-          image to IndexedDB after every statement, which put a fixed ~13–20 ms round trip on
-          every read — a single-row key lookup cost the same as a full aggregate. PGlite's
-          writes stay strict, because its relaxed flush races its own IndexedDB connection under
-          sustained writes and loses data mid-load. Minnow's own defaults include a
-          64 MiB buffer pool and relaxed IndexedDB durability; the dataset is written with
-          gzip-compressed blocks, which trades query speed for stored size rather than the other
-          way round. All engines get identical schemas, post-load statistics where they have them
-          (<code>PRAGMA optimize</code> / <code>ANALYZE</code>), and genuine prepared statements.
+          <strong>Every engine runs on its shipped defaults</strong> — no pragmas, no{" "}
+          <code>work_mem</code>, no cache sizing. Durability is matched rather than left alone:
+          Minnow's store runs relaxed, so PGlite's read sessions open with{" "}
+          <code>relaxedDurability</code> too. Without it PGlite flushes its filesystem image to
+          IndexedDB after every statement, putting a fixed ~13–20 ms round trip on every read, so
+          a key lookup cost the same as a full aggregate. PGlite's writes stay strict — its
+          relaxed flush races its own IndexedDB connection and loses data mid-load.
         </li>
         <li>
-          The two comparison engines also get a B-tree secondary index on every foreign key.
-          Minnow gets none: it has no secondary-index feature, and its scans are pruned by the
-          zone statistics carried in each column block. The comparison is deliberately run
-          this way — with the other engines indexed and Minnow not — rather than removing
-          indexes to flatter it.
+          Both comparison engines get a B-tree secondary index on every foreign key. Minnow gets
+          none — it has no such feature, and prunes scans with the zone statistics in each column
+          block. The comparison runs that way deliberately rather than removing indexes to
+          flatter it.
+        </li>
+        <li>
+          Summaries are a <strong>geometric mean</strong>. These queries span three orders of
+          magnitude, so a sum would report the slowest few and nothing else — an engine could
+          lose every fast query and still win it. OLTP and OLAP are summarised apart because
+          winning at scanning and winning at reaching one row are rarely the same engine.
+        </li>
+        <li>
+          <strong>Memory is Minnow's only</strong>, and comparable across queries rather than
+          across engines. <code>measureUserAgentSpecificMemory()</code> — the one API that counts
+          a WebAssembly heap too — throws in Playwright's Chromium, is absent from workers where
+          these engines run, and does not exist in Firefox. Minnow reserves before it allocates,
+          so its own peak is exact; publishing that beats publishing a number we cannot stand
+          behind.
+        </li>
+        <li>
+          Replaying one statement over unchanging data is a measurement artifact, so the headline
+          number runs with Minnow's result cache <strong>off</strong> — the only figure
+          comparable to SQLite and PGlite, which do not cache results. Each cell carries the
+          cached figure beneath it, which is what a repeat costs an application on the defaults.
         </li>
         <li>
           Captured headless on an {first.host.model} ({first.host.cpus} cores). Absolute numbers
-          vary by machine; the relationships are the point.
-        </li>
-        <li>
-          The harness and dataset generator are in the repository, and the raw capture JSON lives
-          beside this page (<code>apps/site/src/data/benchmarks/</code>) — this page is generated
-          from it, so the page and the record cannot disagree.
+          vary by machine; the relationships are the point. The harness, the generator, and the
+          raw capture JSON are all in the repository (<code>apps/site/src/data/benchmarks/</code>),
+          and this page is generated from that JSON, so the two cannot disagree.
         </li>
       </ul>
-      <p>
-        Every engine reports the same two numbers: a one-time prepare (statement compilation and
-        planning — no engine pins data) and the median of fresh statement executions over
-        current data. Minnow's executions stream through its block buffer pool and are
-        snapshot-fresh on every statement.
-      </p>
-      <p>
-        <strong>Memory</strong> is reported per query, and only by Minnow, because the browser
-        gives us nothing comparable. <code>performance.measureUserAgentSpecificMemory()</code> —
-        the one API that counts a WebAssembly engine's heap as well as the JavaScript one —
-        throws <code>SecurityError</code> in the Chromium build Playwright ships (it needs full
-        site isolation), is not exposed inside workers at all, where these engines actually run,
-        and does not exist in Firefox. Launch flags do not change that; we tried. So rather than
-        publish a number we cannot stand behind across engines, the page publishes the one
-        that is exact: Minnow reserves memory before it allocates it, so it knows its own peak
-        for each statement and reports it. Compare it across queries, not across engines.
-      </p>
-      <p>
-        Summaries are a <strong>geometric mean</strong>, not a sum. These queries span three
-        orders of magnitude, so adding them up reports the slowest few and nothing else — an
-        engine could lose every fast query and still win the total. A geometric mean weights
-        each query equally whatever it costs. OLTP and OLAP reads get separate summaries because
-        engines that win on scanning and aggregating are frequently not the ones that win on
-        reaching a single row.
-      </p>
-      <p>
-        The suite replays one statement over unchanging data, which is a measurement artifact,
-        not a workload. Minnow caches computed results by default and would answer every sample
-        after the first from that cache — so the headline number is measured with the cache off,
-        and every table cell also carries the cached figure beneath it. Both are real: the first
-        is what the engine costs when it runs the query, and it is the only one comparable to
-        SQLite and PGlite, neither of which cache results; the second is what a repeat
-        actually costs an application that keeps the default. A commit invalidates the cache, so
-        it never serves a stale row — it just isn't query execution, and putting it in the same
-        column as the comparison engines' execution times would be comparing two different
-        quantities.
-      </p>
     </section>
   </main>
 </Base>
@@ -451,9 +404,6 @@ const fmtMultiple = (bytes: number): string => {
     margin-bottom: 1.25rem;
   }
 
-  .workload-coverage {
-    margin: 2rem 0;
-  }
   .library-size {
     margin: 2rem 0;
   }
@@ -564,35 +514,12 @@ const fmtMultiple = (bytes: number): string => {
     text-transform: uppercase;
   }
 
-  .workload-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 0.75rem;
-    margin-top: 1rem;
-  }
 
-  .workload-grid article {
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 0.85rem 1rem;
-  }
 
-  .workload-grid strong,
-  .workload-grid span {
-    display: block;
-  }
 
-  .workload-grid span {
-    color: var(--text-secondary);
-    font-size: 0.8rem;
-    margin-top: 0.2rem;
-  }
 
   @media (max-width: 760px) {
-    .workload-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-  }
 
   .browser-toggle input {
     position: absolute;
@@ -636,33 +563,10 @@ const fmtMultiple = (bytes: number): string => {
 </style>
 
 <style is:global>
-  /* Radio-driven pane switching: hide every pane, show the checked (scale, browser) one.
-     Selectors enumerate the published matrix; a new scale adds one line per browser. */
+  /* Radio-driven pane switching: hide every pane, then reveal the checked (scale, browser) one
+     through the generated rule below, which names exactly the panes this page published. */
   .bench section.bench-pane {
     display: none;
-  }
-
-  .bench .scale-stats {
-    display: none;
-  }
-
-  .bench:not(:has(input[name="bench-scale"])) .scale-stats,
-  .bench:has(#scale-1:checked) .scale-stats-1,
-  .bench:has(#scale-5:checked) .scale-stats-5,
-  .bench:has(#scale-25:checked) .scale-stats-25 {
-    display: grid;
-  }
-
-  .bench:not(:has(input[name="bench-scale"])):has(#toggle-chromium:checked)
-    section[id$="-chromium"],
-  .bench:not(:has(input[name="bench-scale"])):has(#toggle-firefox:checked) section[id$="-firefox"],
-  .bench:has(#scale-1:checked):has(#toggle-chromium:checked) #pane-1-chromium,
-  .bench:has(#scale-1:checked):has(#toggle-firefox:checked) #pane-1-firefox,
-  .bench:has(#scale-5:checked):has(#toggle-chromium:checked) #pane-5-chromium,
-  .bench:has(#scale-5:checked):has(#toggle-firefox:checked) #pane-5-firefox,
-  .bench:has(#scale-25:checked):has(#toggle-chromium:checked) #pane-25-chromium,
-  .bench:has(#scale-25:checked):has(#toggle-firefox:checked) #pane-25-firefox {
-    display: grid;
   }
 
   .bench .browser-toggle input:checked + label {
@@ -670,3 +574,4 @@ const fmtMultiple = (bytes: number): string => {
     color: var(--accent);
   }
 </style>
+<style is:global set:html={paneCss}></style>

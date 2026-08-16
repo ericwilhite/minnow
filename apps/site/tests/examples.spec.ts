@@ -17,12 +17,10 @@ test("home page runs a showcase example against an in-memory store", async ({ pa
 test("benchmarks keep OLTP and OLAP reads and writes visible", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/benchmarks/");
-  await expect(page.getByRole("heading", { name: "Four workloads, kept separate" })).toBeVisible();
-  for (const label of ["OLTP reads", "OLAP reads", "OLTP writes", "OLAP writes"]) {
-    await expect(page.getByText(label, { exact: true }).first()).toBeVisible();
-  }
   const pane = page.locator("section.bench-pane:visible");
   await expect(pane).toHaveCount(1);
+  await expect(pane).toContainText("OLTP");
+  await expect(pane).toContainText("OLAP");
   await expect(pane).toContainText("Every measured query");
   await expect(pane).toContainText(/bulk ingestion/i);
   await expect(pane.locator(".split-table th.engine-start")).toHaveCount(3);
@@ -55,6 +53,34 @@ test("benchmarks keep OLTP and OLAP reads and writes visible", async ({ page }) 
     scrollWidth: scroller.scrollWidth,
   }));
   expect(tableOverflow.scrollWidth).toBeGreaterThan(tableOverflow.clientWidth);
+});
+
+// The toggles are CSS-only, so the rule revealing a pane has to name every published scale and
+// browser. A hand-maintained list of those selectors once went stale against a new scale and
+// hid every pane on the page, so this walks the whole matrix rather than trusting the default.
+test("every published scale and browser reveals exactly one pane", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/benchmarks/");
+  const scaleIds = await page
+    .locator('input[name="bench-scale"]')
+    .evaluateAll((inputs) => inputs.map((input) => input.id));
+  const browserIds = await page
+    .locator('input[name="bench-browser"]')
+    .evaluateAll((inputs) => inputs.map((input) => input.id));
+  expect(browserIds.length).toBeGreaterThan(0);
+
+  for (const browserId of browserIds) {
+    for (const scaleId of scaleIds.length > 0 ? scaleIds : [undefined]) {
+      // The radios sit behind their labels, which is what a visitor clicks.
+      if (scaleId !== undefined) await page.locator(`label[for="${scaleId}"]`).click();
+      await page.locator(`label[for="${browserId}"]`).click();
+      const visible = page.locator("section.bench-pane:visible");
+      await expect(visible, `${scaleId ?? "single scale"} / ${browserId}`).toHaveCount(1);
+      const paneId = await visible.evaluate((pane) => pane.id);
+      if (scaleId !== undefined) expect(paneId).toContain(scaleId.replace("scale-", ""));
+      expect(paneId).toContain(browserId.replace("toggle-", ""));
+    }
+  }
 });
 
 test("testing guide is the contributor runner reference", async ({ page }) => {
