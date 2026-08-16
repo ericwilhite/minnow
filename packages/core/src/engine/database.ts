@@ -212,6 +212,24 @@ class StaleTriggerDerivationsError extends Error {
 }
 /** Distinct SQL statements whose optimized plans stay cached; plans are a few KB each. */
 const PLAN_CACHE_LIMIT = 512;
+
+/**
+ * Below this ratio, gzip is not paying for itself: it costs the write a full compression pass
+ * and every read a decompression pass, to save almost nothing. Measured on 129,000-row blocks,
+ * the shapes worth compressing land far above it — the weakest, random UUID text, still reaches
+ * 1.8x — while a column of unstructured doubles reaches 1.07x for 16ms a block.
+ */
+const GZIP_WORTHWHILE_RATIO = 1.2;
+
+/**
+ * How many blocks a column may be written raw before gzip is tried again. A column's shape is
+ * usually stable across its blocks, which is what makes one observation worth reusing; this
+ * bounds how long a wrong observation can persist if the data changes underneath it.
+ */
+const GZIP_REPROBE_BLOCKS = 32;
+
+/** Blocks smaller than this are written with the configured codec; the choice cannot repay. */
+const GZIP_DECISION_MIN_BYTES = 64 * 1024;
 /** Bounds concurrent compression work without serializing independent column blocks. */
 const WRITE_ENCODE_CONCURRENCY = 6;
 
@@ -714,6 +732,8 @@ export interface VisibleSegment {
 export class MinnowDatabase {
   readonly #transactions: TransactionManager;
   readonly #compression: Compression;
+  /** Per-column record of whether gzip repaid itself, and how many blocks ago that was seen. */
+  readonly #gzipVerdicts = new Map<string, { worthwhile: boolean; blocksSince: number }>();
   readonly #rowsPerBlock: number;
   readonly #maxCommitRetries: number;
   readonly #now: () => Date;
@@ -1031,7 +1051,10 @@ export class MinnowDatabase {
       for (let start = 0, part = 0; start < values.length; start += this.#rowsPerBlock, part += 1) {
         const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, values.length));
         const encodeStarted = performance.now();
-        const bytes = await encodeBlock(asColumnInput(keyColumn.type, slice), this.#compression);
+        const bytes = await this.#encodeColumnBlock(
+          keyColumn.id,
+          asColumnInput(keyColumn.type, slice),
+        );
         encodeMs += performance.now() - encodeStarted;
         const blockId = [
           "table",
@@ -1184,7 +1207,7 @@ export class MinnowDatabase {
             start,
             Math.min(start + this.#rowsPerBlock, input.keys.length),
           );
-          const bytes = await encodeBlock(asColumnInput(column.type, slice), this.#compression);
+          const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
           const blockId = [
             "table",
             table.id,
@@ -1414,9 +1437,9 @@ export class MinnowDatabase {
                 start += this.#rowsPerBlock, part += 1
               ) {
                 const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
-                const bytes = await encodeBlock(
+                const bytes = await this.#encodeColumnBlock(
+                  column.id,
                   asColumnInput(column.type, slice),
-                  this.#compression,
                 );
                 const blockId = [
                   "table",
@@ -3035,7 +3058,7 @@ export class MinnowDatabase {
       const blockIds: string[] = [];
       for (let start = 0, part = 0; start < rowCount; start += this.#rowsPerBlock, part += 1) {
         const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, rowCount));
-        const bytes = await encodeBlock(asColumnInput(column.type, slice), this.#compression);
+        const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
         const blockId = [
           "table",
           table.id,
@@ -3504,7 +3527,7 @@ export class MinnowDatabase {
         start += this.#rowsPerBlock, part += 1
       ) {
         const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, input.keys.length));
-        const bytes = await encodeBlock(asColumnInput(column.type, slice), this.#compression);
+        const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
         const blockId = [
           "table",
           table.id,
@@ -3606,7 +3629,10 @@ export class MinnowDatabase {
     const blockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
     for (let start = 0, part = 0; start < values.length; start += this.#rowsPerBlock, part += 1) {
       const slice = values.slice(start, Math.min(start + this.#rowsPerBlock, values.length));
-      const bytes = await encodeBlock(asColumnInput(keyColumn.type, slice), this.#compression);
+      const bytes = await this.#encodeColumnBlock(
+        keyColumn.id,
+        asColumnInput(keyColumn.type, slice),
+      );
       const blockId = [
         "table",
         table.id,
@@ -9111,6 +9137,35 @@ export class MinnowDatabase {
       return;
     }
     await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
+  }
+
+  /**
+   * Encodes one column block, choosing its codec from what gzip achieved on this column's
+   * previous block. Columns are homogeneous down their length, so one observation predicts the
+   * next block; a column that gzip cannot compress is written raw until it is re-probed, and
+   * the codec each block actually used is recorded in the block itself, so a wrong guess costs
+   * bytes and never correctness.
+   */
+  async #encodeColumnBlock(columnId: string, input: ColumnInput): Promise<Uint8Array> {
+    if (this.#compression !== "gzip") return encodeBlock(input, this.#compression);
+    const verdict = this.#gzipVerdicts.get(columnId);
+    if (verdict !== undefined && !verdict.worthwhile) {
+      if (verdict.blocksSince < GZIP_REPROBE_BLOCKS) {
+        verdict.blocksSince += 1;
+        return encodeBlock(input, "raw");
+      }
+      this.#gzipVerdicts.delete(columnId);
+    }
+    const bytes = await encodeBlock(input, "gzip");
+    const description = inspectBlock(bytes);
+    if (description.encodedLength >= GZIP_DECISION_MIN_BYTES) {
+      const worthwhile = description.encodedLength >= bytes.byteLength * GZIP_WORTHWHILE_RATIO;
+      this.#gzipVerdicts.set(columnId, { worthwhile, blocksSince: 0 });
+      // Nothing was gained, so hand back the uncompressed form rather than make every read of
+      // this block pay to inflate it.
+      if (!worthwhile) return encodeBlock(input, "raw");
+    }
+    return bytes;
   }
 
   async #findTable(name: string): Promise<TableRecord> {
