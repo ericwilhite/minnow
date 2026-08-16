@@ -1369,40 +1369,114 @@ export class IndexedDbBlockStore implements BlockStore {
             if (keyMode === "chunks-v2") {
               // Fold the tail into hash-partitioned base chunks, atomically with the manifest
               // publication: hundreds of records regardless of key count, never one per key.
-              let nextPresent = priorPresent;
-              if (nextPresent === undefined) {
-                nextPresent = await readAllV2BaseTokens(catalog, tableId, index);
-                for (const tail of keyState?.chunks ?? []) applyChunk(nextPresent, tail);
-              } else if (nextPresent === keyState?.fullPresent) {
-                // The cache's own set must not be mutated before the commit is durable.
-                nextPresent = new Set(nextPresent);
+              //
+              // A tail of point writes is worth almost nothing next to the base it would be
+              // folded into, and folding it would rewrite whole partitions to record a handful
+              // of tokens — a cost that grows with the table while the write does not. Such a
+              // tail collapses into a single equivalent chunk instead, leaving the base alone.
+              // The base is only rewritten once the tail is big enough to be worth it.
+              const merged =
+                index.hasBase && countTailTokens(tailChunks) < UNIQUE_KEY_PARTITION_TARGET
+                  ? mergeTailChunks(tailChunks)
+                  : undefined;
+              // A token's partition is fixed by its hash and the partition count, so a tail
+              // that leaves the count unchanged only disturbs the partitions its own tokens
+              // land in. That path reads and rewrites those, and nothing else. Everything else
+              // (no recorded size, a partition count that has to change, a base written before
+              // this existed) takes the full rewrite below.
+              const incremental =
+                merged !== undefined
+                  ? undefined
+                  : await foldTailIntoTouchedPartitions(catalog, tableId, index, tailChunks);
+              if (merged !== undefined) {
+                for (const version of index.versions) {
+                  catalog.delete(uniqueKeyChunkKey(tableId, version));
+                }
+                catalog.put(merged, uniqueKeyChunkKey(tableId, manifest.version));
+                const nextIndex: UniqueKeyChunkIndex = {
+                  versions: [manifest.version],
+                  hasBase: true,
+                  ...(index.partitions === undefined ? {} : { partitions: index.partitions }),
+                  ...(index.tokenCount === undefined ? {} : { tokenCount: index.tokenCount }),
+                };
+                catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
+                let cachePresent = priorPresent;
+                if (cachePresent !== undefined) {
+                  if (cachePresent === keyState?.fullPresent) cachePresent = new Set(cachePresent);
+                  applyChunk(cachePresent, chunk);
+                }
+                keyCachePlan =
+                  cachePresent === undefined
+                    ? { action: "drop" }
+                    : {
+                        action: "replace",
+                        present: cachePresent,
+                        chunks: [merged],
+                        index: nextIndex,
+                      };
+              } else if (incremental !== undefined) {
+                for (const version of index.versions) {
+                  catalog.delete(uniqueKeyChunkKey(tableId, version));
+                }
+                const nextIndex: UniqueKeyChunkIndex = {
+                  versions: [],
+                  hasBase: true,
+                  partitions: incremental.partitions,
+                  tokenCount: incremental.tokenCount,
+                };
+                catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
+                // The membership cache only survives when it was already complete; rebuilding
+                // it here would re-read every partition and undo the saving.
+                let cachePresent = priorPresent;
+                if (cachePresent !== undefined) {
+                  if (cachePresent === keyState?.fullPresent) cachePresent = new Set(cachePresent);
+                  applyChunk(cachePresent, chunk);
+                }
+                keyCachePlan =
+                  cachePresent === undefined
+                    ? { action: "drop" }
+                    : { action: "replace", present: cachePresent, chunks: [], index: nextIndex };
+              } else {
+                let nextPresent = priorPresent;
+                if (nextPresent === undefined) {
+                  nextPresent = await readAllV2BaseTokens(catalog, tableId, index);
+                  for (const tail of keyState?.chunks ?? []) applyChunk(nextPresent, tail);
+                } else if (nextPresent === keyState?.fullPresent) {
+                  // The cache's own set must not be mutated before the commit is durable.
+                  nextPresent = new Set(nextPresent);
+                }
+                applyChunk(nextPresent, chunk);
+                const partitions = Math.max(
+                  1,
+                  Math.ceil(nextPresent.size / UNIQUE_KEY_PARTITION_TARGET),
+                );
+                const parts: string[][] = Array.from({ length: partitions }, () => []);
+                for (const token of nextPresent) {
+                  parts[fnv1a(token) % partitions]?.push(token);
+                }
+                parts.forEach((tokens, ordinal) => {
+                  catalog.put(tokens, uniqueKeyBasePartKey(tableId, ordinal));
+                });
+                for (let ordinal = partitions; ordinal < (index.partitions ?? 0); ordinal += 1) {
+                  catalog.delete(uniqueKeyBasePartKey(tableId, ordinal));
+                }
+                for (const version of index.versions) {
+                  catalog.delete(uniqueKeyChunkKey(tableId, version));
+                }
+                const nextIndex: UniqueKeyChunkIndex = {
+                  versions: [],
+                  hasBase: true,
+                  partitions,
+                  tokenCount: nextPresent.size,
+                };
+                catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
+                keyCachePlan = {
+                  action: "replace",
+                  present: nextPresent,
+                  chunks: [],
+                  index: nextIndex,
+                };
               }
-              applyChunk(nextPresent, chunk);
-              const partitions = Math.max(
-                1,
-                Math.ceil(nextPresent.size / UNIQUE_KEY_PARTITION_TARGET),
-              );
-              const parts: string[][] = Array.from({ length: partitions }, () => []);
-              for (const token of nextPresent) {
-                parts[fnv1a(token) % partitions]?.push(token);
-              }
-              parts.forEach((tokens, ordinal) => {
-                catalog.put(tokens, uniqueKeyBasePartKey(tableId, ordinal));
-              });
-              for (let ordinal = partitions; ordinal < (index.partitions ?? 0); ordinal += 1) {
-                catalog.delete(uniqueKeyBasePartKey(tableId, ordinal));
-              }
-              for (const version of index.versions) {
-                catalog.delete(uniqueKeyChunkKey(tableId, version));
-              }
-              const nextIndex: UniqueKeyChunkIndex = { versions: [], hasBase: true, partitions };
-              catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
-              keyCachePlan = {
-                action: "replace",
-                present: nextPresent,
-                chunks: [],
-                index: nextIndex,
-              };
             } else {
               // chunks-v1 folds into per-key base records, incrementally over the tail.
               for (const tail of tailChunks) {
@@ -1438,6 +1512,9 @@ export class IndexedDbBlockStore implements BlockStore {
               versions: [...index.versions, manifest.version],
               hasBase: index.hasBase,
               ...(index.partitions === undefined ? {} : { partitions: index.partitions }),
+              // The base is untouched here, so its recorded size still describes it. Dropping
+              // it would cost the next fold its incremental path.
+              ...(index.tokenCount === undefined ? {} : { tokenCount: index.tokenCount }),
             };
             catalog.put(nextIndex, uniqueKeyChunkIndexKey(tableId));
             if (keyCacheValid) {
@@ -1488,6 +1565,8 @@ export class IndexedDbBlockStore implements BlockStore {
               versions: [...index.versions, manifest.version],
               hasBase: index.hasBase,
               ...(index.partitions === undefined ? {} : { partitions: index.partitions }),
+              // Appending a tail chunk leaves the base alone, so its recorded size still holds.
+              ...(index.tokenCount === undefined ? {} : { tokenCount: index.tokenCount }),
             },
             uniqueKeyChunkIndexKey(work.tableId),
           );
@@ -2972,6 +3051,13 @@ interface UniqueKeyChunkIndex {
   hasBase: boolean;
   /** chunks-v2 only: how many hash partitions the folded base is spread across. */
   partitions?: number;
+  /**
+   * chunks-v2 only: how many tokens the folded base holds. Knowing the size without reading
+   * every partition is what lets a fold rewrite only the partitions its tail touched. Absent
+   * on bases written before this was recorded; the next fold rewrites them in full and fills
+   * it in.
+   */
+  tokenCount?: number;
 }
 
 /** Accepts the legacy bare-array shape (tail only, no base) and the current object shape. */
@@ -2988,6 +3074,9 @@ function asUniqueKeyChunkIndex(value: unknown): UniqueKeyChunkIndex {
       hasBase: record.hasBase === true,
       ...(Number.isSafeInteger(record.partitions) && (record.partitions as number) > 0
         ? { partitions: record.partitions as number }
+        : {}),
+      ...(Number.isSafeInteger(record.tokenCount) && (record.tokenCount as number) >= 0
+        ? { tokenCount: record.tokenCount as number }
         : {}),
     };
   }
@@ -3029,6 +3118,102 @@ function asBasePartition(value: unknown): string[] {
 }
 
 /** Reads every chunks-v2 base partition into one membership set. */
+/** How many distinct tokens a tail carries, counting a token touched twice once. */
+function countTailTokens(tailChunks: readonly UniqueKeyChunk[]): number {
+  const seen = new Set<string>();
+  for (const tail of tailChunks) {
+    for (const token of tail.addedTokens) seen.add(token);
+    for (const token of tail.removedTokens) seen.add(token);
+  }
+  return seen.size;
+}
+
+/**
+ * Collapses a run of tail chunks into one chunk with the same effect. Replaying in commit
+ * order and keeping the two sets disjoint is what makes it equivalent: a token added and then
+ * removed ends up only in `removedTokens`, and the reverse ends up only in `addedTokens`, so
+ * applying the result once lands exactly where applying the run in order would.
+ */
+function mergeTailChunks(tailChunks: readonly UniqueKeyChunk[]): UniqueKeyChunk {
+  const added = new Set<string>();
+  const removed = new Set<string>();
+  for (const tail of tailChunks) {
+    for (const token of tail.addedTokens) {
+      removed.delete(token);
+      added.add(token);
+    }
+    for (const token of tail.removedTokens) {
+      added.delete(token);
+      removed.add(token);
+    }
+  }
+  return { addedTokens: [...added], removedTokens: [...removed] };
+}
+
+/**
+ * Folds a tail into the folded base by touching only the partitions its tokens hash into.
+ * Returns undefined when that cannot be done correctly and the caller must rewrite the whole
+ * base: no folded base yet, no recorded token count, or a resulting size that needs a
+ * different partition count (which moves every token, since the partition is `hash % count`).
+ *
+ * The touched partitions are read, replayed in commit order, and written back. Their sizes
+ * before and after give the new total exactly, so the count stays true without a full read.
+ */
+async function foldTailIntoTouchedPartitions(
+  store: IDBObjectStore,
+  tableId: string,
+  index: UniqueKeyChunkIndex,
+  tailChunks: readonly UniqueKeyChunk[],
+): Promise<{ partitions: number; tokenCount: number } | undefined> {
+  const partitions = index.partitions;
+  const priorCount = index.tokenCount;
+  if (!index.hasBase || partitions === undefined || priorCount === undefined) return undefined;
+
+  const touchedOrdinals = new Set<number>();
+  for (const tail of tailChunks) {
+    for (const token of tail.addedTokens) touchedOrdinals.add(fnv1a(token) % partitions);
+    for (const token of tail.removedTokens) touchedOrdinals.add(fnv1a(token) % partitions);
+  }
+  if (touchedOrdinals.size === 0) return { partitions, tokenCount: priorCount };
+  // No threshold on how many partitions are touched. Even a tail that reaches most of them
+  // still hashes only its own tokens, where the rewrite hashes every token in the table —
+  // and that hashing, not the record I/O, is what a fold spends its time on.
+
+  const ordinals = [...touchedOrdinals];
+  const stored = await Promise.all(
+    ordinals.map((ordinal) =>
+      requestResult<unknown>(store.get(uniqueKeyBasePartKey(tableId, ordinal))),
+    ),
+  );
+  const buckets = new Map<number, Set<string>>();
+  let sizeBefore = 0;
+  for (let index = 0; index < ordinals.length; index += 1) {
+    const value = stored[index];
+    const tokens = new Set(value === undefined ? [] : asBasePartition(value));
+    sizeBefore += tokens.size;
+    buckets.set(ordinals[index] ?? 0, tokens);
+  }
+
+  // Replay in commit order, exactly as a full replay would: a token added then removed by a
+  // later chunk must end up absent, and the reverse must end up present.
+  for (const tail of tailChunks) {
+    for (const token of tail.addedTokens) buckets.get(fnv1a(token) % partitions)?.add(token);
+    for (const token of tail.removedTokens) buckets.get(fnv1a(token) % partitions)?.delete(token);
+  }
+
+  let sizeAfter = 0;
+  for (const tokens of buckets.values()) sizeAfter += tokens.size;
+  const tokenCount = priorCount - sizeBefore + sizeAfter;
+  // A size that now wants a different partition count has to be rehashed in full.
+  if (Math.max(1, Math.ceil(tokenCount / UNIQUE_KEY_PARTITION_TARGET)) !== partitions) {
+    return undefined;
+  }
+  for (const [ordinal, tokens] of buckets) {
+    store.put([...tokens], uniqueKeyBasePartKey(tableId, ordinal));
+  }
+  return { partitions, tokenCount };
+}
+
 async function readAllV2BaseTokens(
   store: IDBObjectStore,
   tableId: string,
