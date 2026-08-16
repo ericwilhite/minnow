@@ -2440,6 +2440,38 @@ export class MinnowDatabase {
   }
 
   /**
+   * True when every manifest published in (after, until] changed no row in any table: the
+   * explicitly empty `changedTableIds` that compaction publishes through
+   * `markLogicallyUnchanged`. Such a commit is invisible to readers, so a write scope may
+   * rebase across it rather than fail — it can invalidate neither what the scope read nor
+   * what it staged, whichever tables those were.
+   *
+   * Everything else answers false, keeping the conflict. An *absent* `changedTableIds` is
+   * unknown provenance rather than a claim of neutrality, and a window with a pruned or
+   * missing version is absence of evidence rather than evidence of neutrality — the same
+   * distinction `#liveChangeCanAffect` draws. Manifest versions are consecutive
+   * (`createManifest` publishes `expectedVersion + 1`), so a gap is detectable.
+   */
+  async #commitsChangedNoData(after: number | null, until: number | null): Promise<boolean> {
+    if (until === null) return false;
+    let expected = after === null ? 0 : after + 1;
+    let cursor = after;
+    while (expected <= until) {
+      const page = await this.store.listManifestPage(cursor, 64);
+      if (page.records.length === 0) return false;
+      for (const manifest of page.records) {
+        if (expected > until) break;
+        if (manifest.version !== expected) return false;
+        if (manifest.changedTableIds?.length !== 0) return false;
+        expected += 1;
+      }
+      if (page.nextCursor === null) break;
+      cursor = page.nextCursor;
+    }
+    return expected > until;
+  }
+
+  /**
    * Read-triggered self-maintenance: a streamed scan that observes heavy fragmentation
    * schedules one incremental compaction step in the background, exactly like the full-text
    * auto index — fire-and-forget, never awaited by the read, one per table at a time.
@@ -3036,8 +3068,10 @@ export class MinnowDatabase {
   /**
    * Runs the callback against one shared write transaction: every staged mutation — across
    * any number of keyed or keyless tables, with their AFTER triggers — publishes as one
-   * atomic commit. A concurrent commit surfaces as a WriteConflictError from the scope
-   * (nothing published); retry the whole scope. An error thrown by the callback aborts the
+   * atomic commit. A concurrent *write* surfaces as a WriteConflictError from the scope
+   * (nothing published); retry the whole scope. Background self-maintenance is not a
+   * concurrent write: the scope rebases over data-neutral manifests and commits anyway, so
+   * compaction landing mid-scope never fails it. An error thrown by the callback aborts the
    * scope with nothing published. A scope that stages nothing publishes nothing.
    */
   async write<T>(
@@ -3113,9 +3147,26 @@ export class MinnowDatabase {
         await transaction.abort();
         return { result, version: await this.store.getCurrentManifestVersion() };
       }
-      const manifest = await transaction.commit();
-      this.#notifyLiveCommit();
-      return { result, version: manifest.version };
+      for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
+        try {
+          const manifest = await transaction.commit();
+          this.#notifyLiveCommit();
+          return { result, version: manifest.version };
+        } catch (error) {
+          if (!(error instanceof WriteConflictError) || attempt === this.#maxCommitRetries) {
+            throw error;
+          }
+          // Losing the version CAS to background self-maintenance is spurious: compaction
+          // publishes a manifest that changed no row anywhere, so it cannot conflict with
+          // what this scope read or staged. Rebase across those and commit again. The scope
+          // still does not rebase over a commit that actually changed data — a concurrent
+          // write loses the race explicitly, exactly as before.
+          const from = transaction.snapshotVersion;
+          const rebased = await transaction.rebase();
+          if (!(await this.#commitsChangedNoData(from, rebased.version))) throw error;
+        }
+      }
+      throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       closed = true;
       await transaction.abort().catch(() => undefined);

@@ -19,6 +19,26 @@ const implementations = [
   },
 ];
 
+/**
+ * Runs one compaction through to publication and returns the manifest version it published,
+ * asserting it really published one — a compaction with nothing to do would make the tests
+ * that use it vacuous rather than failing them.
+ */
+async function compactToPublication(
+  database: MinnowDatabase,
+  store: BlockStore,
+  tableName: string,
+): Promise<number | null> {
+  const before = await store.getCurrentManifestVersion();
+  let progress = await database.compactTableStep(tableName, { maxBlocks: 8 });
+  while (progress.result === null) {
+    progress = await database.compactTableStep(tableName, { maxBlocks: 8 });
+  }
+  const after = await store.getCurrentManifestVersion();
+  expect(after).not.toEqual(before);
+  return after;
+}
+
 async function bank(store: BlockStore): Promise<MinnowDatabase> {
   const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
   await database.createTable({
@@ -343,6 +363,71 @@ describe("atomic write scopes", () => {
     expect(version).not.toBeNull();
     expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
       { balance: 401 },
+    ]);
+  });
+
+  /**
+   * Background compaction publishes a manifest of its own, and with `autoCompact` on (the
+   * default) a read inside the scope can trigger one. That commit changes no row, so it must
+   * not cost the scope its version CAS: the scope rebases over it and commits. The previous
+   * behaviour surfaced a spurious "Manifest changed" failure under load.
+   */
+  for (const implementation of implementations) {
+    it(`${implementation.name} commits a scope that a compaction lands under`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      // Enough separate segments that compaction has real work to publish.
+      for (let id = 100; id < 112; id += 1) {
+        await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
+      }
+      const before = await database.query("SELECT COUNT(*) AS n FROM accounts");
+
+      const { version } = await database.write(async (tx) => {
+        await tx.updateBatch("accounts", { keys: [1], changes: { balance: [401] } });
+        // A data-neutral compaction manifest lands while the scope is open, on the very
+        // table the scope is writing.
+        await compactToPublication(database, store, "accounts");
+        await tx.insertBatch("accounts", { columns: { id: [200], balance: [7] } });
+      });
+
+      // The scope published, and published everything.
+      expect(version).not.toBeNull();
+      expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
+        { balance: 401 },
+      ]);
+      expect((await database.query("SELECT balance FROM accounts WHERE id = 200")).rows).toEqual([
+        { balance: 7 },
+      ]);
+      // Compaction stayed data-neutral: one new row on top of the pre-scope count.
+      const beforeCount = (before.rows[0] as { n: number }).n;
+      expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([
+        { n: beforeCount + 1 },
+      ]);
+    });
+  }
+
+  /**
+   * The rebase is narrow on purpose: only a manifest that changed nothing is skipped over. A
+   * compaction *and* a genuine concurrent write in the same window still costs the scope the
+   * race, so the neutral commit cannot be used to smuggle a real conflict past the CAS.
+   */
+  it("still loses to a concurrent write that a compaction is mixed in with", async () => {
+    const store = new MemoryBlockStore();
+    const database = await bank(store);
+    for (let id = 100; id < 112; id += 1) {
+      await database.insertBatch("accounts", { columns: { id: [id], balance: [id] } });
+    }
+    const other = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await expect(
+      database.write(async (tx) => {
+        await tx.updateBatch("accounts", { keys: [1], changes: { balance: [401] } });
+        await compactToPublication(database, store, "accounts");
+        await other.insertBatch("accounts", { columns: { id: [50], balance: [1] } });
+      }),
+    ).rejects.toThrow(/Manifest changed/);
+    // The losing scope published nothing.
+    expect((await database.query("SELECT balance FROM accounts WHERE id = 1")).rows).toEqual([
+      { balance: 500 },
     ]);
   });
 

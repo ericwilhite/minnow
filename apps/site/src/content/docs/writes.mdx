@@ -155,8 +155,10 @@ Things worth knowing before you reach for it:
   yet.
 - **Reads are pinned.** `tx.query()` observes the snapshot the scope opened on, plus the scope's
   own staged rows — never another tab's commit that landed mid-scope.
-- **A concurrent commit loses the race explicitly.** If another writer commits first, the scope
-  throws instead of silently rebasing; retry it.
+- **A concurrent write loses the race explicitly.** If another writer changes data first, the
+  scope throws instead of silently rebasing; retry it. Background maintenance is not a concurrent
+  write: compaction changes no rows, so a compaction that publishes mid-scope is skipped over and
+  your scope still commits.
 - **A failed mutation ends the scope.** A mutation that fails after registering part of its work
   poisons the scope: later statements and the commit both throw, even if you caught the original
   error, because a fragment of it cannot be un-staged. A mutation that fails validation cleanly —
