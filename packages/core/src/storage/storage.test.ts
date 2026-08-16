@@ -3650,3 +3650,81 @@ it("persists merge source maps and row-ID spans across IndexedDB connections", a
   });
   store.close();
 });
+
+describe("table lookup memo", () => {
+  for (const implementation of stores()) {
+    it(`${implementation.name} resolves each name to its own record across repeats`, async () => {
+      const store = await implementation.create();
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      await store.addTable({
+        id: "events-id",
+        name: "events",
+        columns: [{ id: "value-column", name: "value", type: "number", nullable: false }],
+        createdAt,
+      });
+      await store.addTable({
+        id: "people-id",
+        name: "people",
+        columns: [{ id: "label-column", name: "label", type: "string", nullable: false }],
+        createdAt,
+      });
+      // Repeats are the point: the first read fills the remembered mapping and the rest go
+      // through it, so a mapping that answered with the wrong table would show up here.
+      for (let round = 0; round < 3; round += 1) {
+        expect((await store.getTableByName("events"))?.id).toBe("events-id");
+        expect((await store.getTableByName("people"))?.id).toBe("people-id");
+        expect(await store.getTableByName("missing")).toBeUndefined();
+      }
+    });
+  }
+});
+
+it("re-resolves a table name when the remembered record no longer carries it", async () => {
+  // No public call renames or drops a table, so the disagreement is staged directly in the
+  // catalog: the remembered mapping must be treated as a hint that the record itself confirms,
+  // never as an answer.
+  const indexedDB = new IDBFactory();
+  const name = crypto.randomUUID();
+  const store = await IndexedDbBlockStore.open({ name, indexedDB });
+  await store.addTable({
+    id: "events-id",
+    name: "events",
+    columns: [{ id: "value-column", name: "value", type: "number", nullable: false }],
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  expect((await store.getTableByName("events"))?.id).toBe("events-id");
+
+  const connection = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(name);
+    request.onsuccess = () => {
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      reject(request.error ?? new Error("open failed"));
+    };
+  });
+  await new Promise<void>((resolve, reject) => {
+    const transaction = connection.transaction("catalog", "readwrite");
+    const catalog = transaction.objectStore("catalog");
+    const read = catalog.get("table/id/events-id");
+    read.onsuccess = () => {
+      catalog.put(
+        { ...(read.result as Record<string, unknown>), name: "renamed" },
+        "table/id/events-id",
+      );
+      catalog.delete("table/name/events");
+      catalog.put("events-id", "table/name/renamed");
+    };
+    transaction.oncomplete = () => {
+      resolve();
+    };
+    transaction.onerror = () => {
+      reject(transaction.error ?? new Error("stage failed"));
+    };
+  });
+  connection.close();
+
+  expect(await store.getTableByName("events")).toBeUndefined();
+  expect((await store.getTableByName("renamed"))?.id).toBe("events-id");
+  store.close();
+});

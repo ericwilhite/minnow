@@ -113,6 +113,8 @@ export interface IndexedDbBlockStoreOptions {
 export class IndexedDbBlockStore implements BlockStore {
   readonly #db: IDBDatabase;
   readonly #durability: IDBTransactionDurability;
+  /** Remembered name-to-id mappings; see getTableByName for why they need no invalidation. */
+  readonly #tableIdsByName = new Map<string, string>();
   /**
    * Memoized unique-key state for the most recently written keyed table, mirroring
    * #manifestCache's validity rule: usable only while the next commit's expected manifest
@@ -531,15 +533,38 @@ export class IndexedDbBlockStore implements BlockStore {
     };
   }
 
+  /**
+   * Resolving a name means two reads — name to id, then id to record — and the second cannot
+   * start until the first lands, so the write path pays two serialized round trips for one
+   * lookup. A remembered id collapses that to one read, and needs no invalidation: the record
+   * carries its own name, so a mapping that has gone stale fails the check below and falls
+   * back to the full resolution. Table ids are unique per creation, so a dropped and recreated
+   * table cannot be mistaken for its predecessor.
+   */
   async getTableByName(name: string): Promise<TableRecord | undefined> {
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
+    const rememberedId = this.#tableIdsByName.get(name);
+    if (rememberedId !== undefined) {
+      const cached: unknown = await requestResult(store.get(`${TABLE_ID_PREFIX}${rememberedId}`));
+      if (cached !== undefined) {
+        const record = asTableRecord(cached);
+        if (record.name === name) {
+          await transactionDone(transaction);
+          return record;
+        }
+      }
+      this.#tableIdsByName.delete(name);
+    }
     const id = (await requestResult(store.get(`${TABLE_NAME_PREFIX}${name}`))) as
       string | undefined;
     const value: unknown =
       id === undefined ? undefined : await requestResult(store.get(`${TABLE_ID_PREFIX}${id}`));
     await transactionDone(transaction);
-    return value === undefined ? undefined : asTableRecord(value);
+    if (value === undefined) return undefined;
+    const record = asTableRecord(value);
+    if (record.name === name) this.#tableIdsByName.set(name, record.id);
+    return record;
   }
 
   async listTables(): Promise<TableRecord[]> {
