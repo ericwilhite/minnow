@@ -21,13 +21,32 @@ const RUNS = 7;
 /** Headroom multiplier applied to a measured ratio when writing a new baseline. */
 const MARGIN = 1.5;
 /**
- * Sub-millisecond medians are timer-noise-dominated, so both sides of a ratio are floored:
- * a 0.08ms query gates as 0.5ms and only trips once it genuinely leaves the fast-path range,
- * instead of flaking on scheduler jitter.
+ * Sub-millisecond queries are timed in batches rather than floored. Flooring both sides of the
+ * ratio — the old approach — made every fast query gate as 0.5ms against 0.5ms, so a point
+ * lookup could degrade sevenfold and still pass: exactly how a per-query catalog scan once
+ * reached main unnoticed. Batching removes the noise instead of hiding it. Each sample runs the
+ * query enough times to take at least this long, and the per-iteration cost is the total over
+ * the count, which makes a 0.07ms query as measurable as a 7ms one and keeps the gate's
+ * cross-engine ratio — the part that survives a change of machine — meaningful at every scale.
  */
-const FLOOR_MS = 0.5;
+const TARGET_SAMPLE_MS = 5;
+const MAX_ITERATIONS = 2_000;
+/** A tiny floor remains, against a divide-by-zero on an engine that answers instantly. */
 const ratioOf = (minnowMs: number, engineMs: number): number =>
-  Math.max(minnowMs, FLOOR_MS) / Math.max(engineMs, FLOOR_MS);
+  Math.max(minnowMs, 0.0001) / Math.max(engineMs, 0.0001);
+
+/**
+ * How many times to repeat one query per timed sample. Measured once from a single run, so the
+ * count reflects this machine, and shared by all three engines for a given query so the ratio
+ * compares like with like.
+ */
+function iterationsFor(singleRunMs: number): number {
+  if (singleRunMs >= TARGET_SAMPLE_MS) return 1;
+  return Math.min(
+    MAX_ITERATIONS,
+    Math.max(1, Math.ceil(TARGET_SAMPLE_MS / Math.max(singleRunMs, 0.001))),
+  );
+}
 
 function mulberry32(seed: number): () => number {
   let state = seed;
@@ -130,6 +149,15 @@ const QUERIES: readonly PerfQuery[] = [
     params: [150_000, 154_000],
   },
   {
+    // The same point lookup, run while the catalog holds many more tables than the query
+    // touches. Per-query work that scales with the schema rather than the data shows up here
+    // and nowhere else: a catalog scan per query once made this five times slower than the
+    // plain point lookup while every other case stayed flat.
+    name: "catalog-point-lookup",
+    sql: "SELECT id, amount, label FROM data WHERE id = ?",
+    params: [123_456],
+  },
+  {
     // Same statement repeated unchanged: Minnow answers from the probe-validated memo while
     // the other engines re-execute. Gates the memo probe's own latency.
     name: "memo-hit-aggregate",
@@ -143,35 +171,42 @@ function median(samples: number[]): number {
   return sorted[Math.floor(sorted.length / 2)] ?? 0;
 }
 
-async function timeMinnow(database: MinnowDatabase, query: PerfQuery): Promise<number> {
+/** Median per-iteration time over RUNS samples, each sample running the query `iterations` times. */
+async function timeRepeated(
+  run: () => Promise<unknown> | unknown,
+  iterations: number,
+): Promise<number> {
+  const samples: number[] = [];
+  for (let index = 0; index < RUNS; index += 1) {
+    const started = performance.now();
+    for (let repeat = 0; repeat < iterations; repeat += 1) await run();
+    samples.push((performance.now() - started) / iterations);
+  }
+  return median(samples);
+}
+
+function minnowRunner(database: MinnowDatabase, query: PerfQuery): () => Promise<unknown> {
   // By default the gate measures execution, not the probe-validated result memo (which would
   // answer every repeat sample from cache); memo-hit shapes opt in to measure the memo path.
   const options = {
     memoize: query.memoize ?? false,
     ...(query.params === undefined ? {} : { params: query.params as never }),
   };
-  for (let index = 0; index < WARMUP; index += 1) await database.query(query.sql, options);
-  const samples: number[] = [];
-  for (let index = 0; index < RUNS; index += 1) {
-    const started = performance.now();
-    await database.query(query.sql, options);
-    samples.push(performance.now() - started);
-  }
-  return median(samples);
+  return () => database.query(query.sql, options);
 }
 
-function timeSqlite(database: DatabaseSync, query: PerfQuery): number {
-  const statement = database.prepare(query.sql);
-  const params = (query.params ?? []) as Array<number | string>;
-  for (let index = 0; index < WARMUP; index += 1) statement.all(...params);
-  const samples: number[] = [];
-  for (let index = 0; index < RUNS; index += 1) {
-    const started = performance.now();
-    statement.all(...params);
-    samples.push(performance.now() - started);
-  }
-  return median(samples);
+async function warmUp(run: () => Promise<unknown> | unknown): Promise<number> {
+  for (let index = 0; index < WARMUP; index += 1) await run();
+  const started = performance.now();
+  await run();
+  return performance.now() - started;
 }
+
+/**
+ * How many tables beyond the two the queries use. Enough that a per-query catalog scan is
+ * unmistakable, small enough that creating them costs a fraction of the ingest.
+ */
+const CATALOG_TABLES = 100;
 
 const rows = buildRows();
 
@@ -216,9 +251,18 @@ await minnow.createTable({
   ],
 });
 await minnow.insertBatch("dims", DIMS);
+for (let index = 0; index < CATALOG_TABLES; index += 1) {
+  await minnow.createTable({
+    name: `spare_${String(index)}`,
+    columns: [{ name: "id", type: "number" }],
+  });
+}
 
 const sqlite = new DatabaseSync(":memory:");
 sqlite.exec("PRAGMA case_sensitive_like = ON");
+for (let index = 0; index < CATALOG_TABLES; index += 1) {
+  sqlite.exec(`CREATE TABLE spare_${String(index)} ("id" INTEGER)`);
+}
 sqlite.exec(
   `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
 );
@@ -255,6 +299,9 @@ await pglite.exec(
   `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
 await pglite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
+for (let index = 0; index < CATALOG_TABLES; index += 1) {
+  await pglite.exec(`CREATE TABLE spare_${String(index)} ("id" INTEGER)`);
+}
 {
   const started = performance.now();
   for (let start = 0; start < rows.length; start += 2000) {
@@ -275,17 +322,10 @@ await pglite.exec(
   `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
 );
 
-async function timePglite(query: PerfQuery): Promise<number> {
+function pgliteRunner(query: PerfQuery): () => Promise<unknown> {
   const sql = positionalToNumbered(query.sql);
   const params = [...(query.params ?? [])];
-  for (let index = 0; index < WARMUP; index += 1) await pglite.query(sql, params);
-  const samples: number[] = [];
-  for (let index = 0; index < RUNS; index += 1) {
-    const started = performance.now();
-    await pglite.query(sql, params);
-    samples.push(performance.now() - started);
-  }
-  return median(samples);
+  return () => pglite.query(sql, params);
 }
 
 type EngineName = "sqlite" | "pglite";
@@ -315,13 +355,28 @@ const results: Result[] = [
   },
 ];
 for (const query of QUERIES) {
-  const minnowMs = await timeMinnow(minnow, query);
+  const statement = sqlite.prepare(query.sql);
+  const sqliteParams = (query.params ?? []) as Array<number | string>;
+  const runners = {
+    minnow: minnowRunner(minnow, query),
+    sqlite: () => statement.all(...sqliteParams),
+    pglite: pgliteRunner(query),
+  };
+  // One iteration count per query, taken from the slowest engine's single run so that every
+  // engine's sample clears the timer's resolution, and shared so the ratio compares like with
+  // like.
+  const singleRuns = [
+    await warmUp(runners.minnow),
+    await warmUp(runners.sqlite),
+    await warmUp(runners.pglite),
+  ];
+  const iterations = iterationsFor(Math.max(...singleRuns));
   results.push({
     name: query.name,
-    minnowMs,
+    minnowMs: await timeRepeated(runners.minnow, iterations),
     engineMs: {
-      sqlite: timeSqlite(sqlite, query),
-      pglite: await timePglite(query),
+      sqlite: await timeRepeated(runners.sqlite, iterations),
+      pglite: await timeRepeated(runners.pglite, iterations),
     },
   });
 }
@@ -342,7 +397,10 @@ for (const result of results) {
   for (const engine of ENGINES) {
     const engineMs = result.engineMs[engine];
     const ratio = ratioOf(result.minnowMs, engineMs);
-    newThresholds[result.name][engine] = Number((ratio * MARGIN).toFixed(2));
+    // Significant digits rather than fixed decimals: a memo hit against a re-executing engine
+    // is a ratio of 0.00015, which two decimals would round to a threshold of zero that nothing
+    // can satisfy.
+    newThresholds[result.name][engine] = Number((ratio * MARGIN).toPrecision(3));
     const threshold = baseline?.thresholds[result.name]?.[engine];
     const flag = threshold !== undefined && ratio > threshold ? "!" : " ";
     line.push(
