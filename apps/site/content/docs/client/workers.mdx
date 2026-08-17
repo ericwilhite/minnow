@@ -3,8 +3,6 @@ title: Workers & multi-tab
 description: The shipped worker entry, the main-thread client, and bundler setups.
 ---
 
-# Workers & multi-tab
-
 Minnow ships both sides of the worker setup: a ready-made worker entry (`@minnowdb/core/worker`)
 and a main-thread client (`@minnowdb/core/client`). Your app contributes one line — the `new
   Worker(...)` call — because that's the only line your bundler needs to see.
@@ -75,7 +73,7 @@ starts and stops) and satisfies `worker-src` content-security policies from your
   a custom entry (below).
 
 The typed facade doesn't care about any of this: compiled plans cross the channel by structured
-clone, so `selectFrom`, typed [writes](/docs/writes/), and `.live()` behave identically.
+clone, so `selectFrom`, typed [writes](/docs/sql/dml), and `.live()` behave identically.
 
 ## Buffered writers and live queries
 
@@ -157,4 +155,4 @@ change. Underneath both sits `@minnowdb/core/worker-protocol`: versioned, struct
 RPC where each handle answers a fixed list of methods — never arbitrary property access.
 
 > The worker changes where work runs, not the rules: IndexedDB stays authoritative, and
-> durability still ends at a committed transaction. See [Architecture](/docs/architecture/).
+> durability still ends at a committed transaction. See [Architecture](/docs/reference/architecture).

@@ -1,0 +1,91 @@
+---
+title: Snapshots
+description: Copy one committed version out as a portable file, and load it back into any store.
+---
+
+A snapshot is one committed version of a database, copied out as a single byte array and loadable
+into any block store. It is how you back a database up, seed a test fixture from real data, ship a
+prepared database as a static asset, or hand a colleague exactly what you were looking at.
+
+```ts
+import { encodeSnapshot, decodeSnapshot } from "@minnowdb/core/storage";
+
+const bytes = await encodeSnapshot(await store.exportSnapshot());
+```
+
+## Loading
+
+Into a fresh in-memory store:
+
+```ts
+import { MemoryBlockStore } from "@minnowdb/core/storage";
+
+const db = new MinnowDatabase(MemoryBlockStore.fromSnapshot(await decodeSnapshot(bytes)));
+```
+
+Or into IndexedDB, where it is durable and available on the next visit:
+
+```ts
+const store = await IndexedDbBlockStore.open({ name: "seeded" });
+await store.importSnapshot(await decodeSnapshot(bytes), {
+  onProgress: ({ writtenBytes, totalBytes }) => {
+    setProgress(writtenBytes / totalBytes);
+  },
+});
+```
+
+The target store must be empty. Loading into a database that already holds one throws rather than
+merging two histories.
+
+## What it carries
+
+Everything needed to read the data and to keep writing correctly afterwards:
+
+- The block bytes the current manifest points at — verbatim, already compressed.
+- One checkpoint manifest, the table catalog, the live segments, and the committed transactions
+  that segment visibility resolves through.
+- The row-id and auto-increment counters, so later writes continue past the high-water mark
+  instead of colliding with rows that are there but hidden.
+- Unique-key membership, so an insert that duplicates an existing key still conflicts.
+- Full-text bases, when they already cover the exported version.
+
+And what it deliberately drops: leases, query spill pages, garbage-collection and compaction job
+records, in-flight transactions, and **version history**. A database with ten thousand commits
+behind it loads as one clean version. Superseded blocks a compaction left behind are not copied,
+so a snapshot is usually smaller than the database it came from.
+
+A full-text index that does not already cover the exported version is marked for rebuild rather
+than shipped stale. The index is a pruning accelerator that the scan re-verifies, so that costs a
+rebuild, never a wrong answer.
+
+## The container
+
+A magic number, a format version, a gzipped JSON header, and the block payloads laid end to end.
+Blocks are already self-describing and doubly CRC-checked, so loading authenticates every block
+header without decompressing any payload — a corrupt file fails at load rather than mid-query.
+
+Read the header alone when you only need to know what a file is:
+
+```ts
+import { readSnapshotSummary } from "@minnowdb/core/storage";
+
+const summary = await readSnapshotSummary(bytes);
+// { formatVersion, version, createdAt, tableCount, blockCount, payloadBytes, byteLength }
+```
+
+Cheap enough to run against a large file before deciding whether to load it.
+
+## Exporting safely
+
+`MemoryBlockStore#exportSnapshot` runs on the store's commit queue, so it always sees one
+consistent version.
+
+`IndexedDbBlockStore#exportSnapshot` reads across several transactions, so a concurrent commit
+could move the version underneath it. Hold a backup lease across the call when another writer is
+possible; a build script that is the only writer in its process does not need one.
+
+<Callout type="warn">
+  The snapshot format is versioned and validated, but like the block format it carries no
+  compatibility promise while the library is version zero. Treat a snapshot as a copy of a database
+  you can rebuild, not as an archival format.
+</Callout>

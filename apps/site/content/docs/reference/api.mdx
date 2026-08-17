@@ -3,8 +3,6 @@ title: API reference
 description: Every public export of @minnowdb/core, organized by entry point.
 ---
 
-# API reference
-
 Everything ships in one package, `@minnowdb/core`. The root export is the everyday surface; the
 subpaths expose the layers it's built from.
 
@@ -24,7 +22,7 @@ subpaths expose the layers it's built from.
 
 ## Schema DSL
 
-From `@minnowdb/core`. See [Schema & migrations](/docs/schema/).
+From `@minnowdb/core`. See [Schema & migrations](/docs/schema).
 
 | Export                                                                                                   | Description                                                                                                                                                                                                             |
 | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -43,7 +41,7 @@ From `@minnowdb/core`. See [Schema & migrations](/docs/schema/).
 
 ## Typed facade
 
-From `@minnowdb/core`. See [Typed queries](/docs/queries/) and [Writes](/docs/writes/).
+From `@minnowdb/core`. See [Typed queries](/docs/sql/select) and [Writes](/docs/sql/dml).
 
 | Export                                     | Description                                                                                                                                                                                                         |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -75,7 +73,7 @@ From `@minnowdb/core`. See [Typed queries](/docs/queries/) and [Writes](/docs/wr
 | `as(alias)`                                               | Turns the query into a derived table for `selectFrom` / joins.                                                                                                            |
 | `compile()`                                               | The typed plan envelope — the same object `.execute()` runs and `.live()` subscribes.                                                                                     |
 | `execute / executeTakeFirst / executeTakeFirstOrThrow()`  | Run and return `TRow[]`, the first row or `undefined`, or throw `NoResultError`.                                                                                          |
-| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/live-queries/).                                                                                             |
+| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/sql).                                                                                                       |
 
 ### Mutation builders
 
@@ -108,7 +106,7 @@ aggregates and scalar functions, window functions with `.over(...)`,
 
 ## Live queries
 
-From `@minnowdb/core`. See [Live queries](/docs/live-queries/).
+From `@minnowdb/core`. See [Live queries](/docs/sql).
 
 | Export                                                                                                                              | Description                                                                                                                                                  |
 | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -121,7 +119,7 @@ From `@minnowdb/core`. See [Live queries](/docs/live-queries/).
 ## The engine — `MinnowDatabase`
 
 From `@minnowdb/core`. The low-level asynchronous engine the facade drives. See
-[Writes & transactions](/docs/writes/).
+[Writes & transactions](/docs/sql/dml).
 
 ```ts
 new MinnowDatabase(store: BlockStore, options?: MinnowDatabaseOptions)
@@ -173,7 +171,7 @@ All are rehydrated across the worker channel — `instanceof` works on the clien
 
 ## Worker hosting
 
-From `@minnowdb/core`. See [Workers & multi-tab](/docs/workers/).
+From `@minnowdb/core`. See [Workers & multi-tab](/docs/client/workers).
 
 | Export                                                          | Description                                                                                           |
 | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -250,6 +248,6 @@ worker never dispatches arbitrary property access.
 
 ## `@minnowdb/core/sql-feature-matrix.json`
 
-The checked-in conformance matrix rendered at [SQL support](/docs/sql/): every SQL feature the
+The checked-in conformance matrix rendered at [SQL support](/docs/sql/feature-matrix): every SQL feature the
 engine claims, with per-feature support status. The engine's conformance suite reports drift
 against this file, so the docs and the engine cannot silently disagree.

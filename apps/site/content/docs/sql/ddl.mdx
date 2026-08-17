@@ -1,0 +1,90 @@
+---
+title: Tables and types
+description: CREATE TABLE, the column types, and what a unique key buys you.
+---
+
+## CREATE TABLE
+
+```sql
+CREATE TABLE orders (
+  order_id INTEGER PRIMARY KEY,
+  customer_id INTEGER NOT NULL,
+  employee_id INTEGER,
+  status VARCHAR(20) NOT NULL,
+  total DOUBLE PRECISION NOT NULL,
+  refunded BOOLEAN NOT NULL,
+  placed_at TIMESTAMP NOT NULL
+)
+```
+
+Columns are nullable unless marked `NOT NULL`. Exactly one column may be `PRIMARY KEY`, and it is
+the table's unique key: the column that `UPDATE`, `DELETE`, and `ON CONFLICT` address rows
+through, and the only uniqueness the engine enforces.
+
+A table without a `PRIMARY KEY` is append-only. That is a reasonable choice for an event log, and
+a mistake for anything a user edits, because it cannot be changed later without recreating the
+table.
+
+## Column types
+
+Four logical types, chosen because they are what a browser can store and compare without
+ambiguity. The usual SQL spellings map onto them:
+
+| Type       | SQL spellings                                                                     | JavaScript |
+| ---------- | --------------------------------------------------------------------------------- | ---------- |
+| `number`   | `INTEGER`, `BIGINT`, `SMALLINT`, `DOUBLE PRECISION`, `REAL`, `NUMERIC`, `DECIMAL` | `number`   |
+| `string`   | `VARCHAR(n)`, `TEXT`, `CHAR(n)`                                                   | `string`   |
+| `boolean`  | `BOOLEAN`                                                                         | `boolean`  |
+| `datetime` | `TIMESTAMP`, `DATE`                                                               | `Date`     |
+
+Widths in `VARCHAR(80)` are accepted and ignored — they document intent, and nothing truncates.
+`NUMERIC` is IEEE-754 double precision, not arbitrary precision: money is safe to the cent in the
+ranges an application deals with, but this is not the engine to settle accounts in.
+
+Types the engine deliberately does not have — `JSON`/`JSONB`, arrays, `UUID`, `INTERVAL` as a
+stored type, enums as a database type — are rejected at `CREATE TABLE` rather than silently
+stored as text.
+
+## Defaults
+
+Column defaults are not part of the `CREATE TABLE` grammar — declare them through `createTable`,
+which is also the form the [schema DSL](/docs/schema) compiles to:
+
+```ts
+await db.createTable({
+  name: "events",
+  uniqueKey: "event_id",
+  columns: [
+    { name: "event_id", type: "number", defaultValue: { kind: "autoincrement" } },
+    { name: "kind", type: "string" },
+    { name: "noted_at", type: "datetime", defaultValue: { kind: "now" } },
+    { name: "source", type: "string", defaultValue: { kind: "literal", value: "app" } },
+  ],
+});
+```
+
+Three kinds: `now`, a `literal`, and `autoincrement` on the key column. They fill null-or-absent
+slots at insert time and are never applied at read time, so adding a default later does not
+rewrite the rows already stored. Arbitrary expressions are deliberately not representable — the
+spec is stored in the catalog and crosses the worker boundary, so it has to be plain data.
+
+## Evolving a table
+
+Tables can gain nullable columns and widen a `NOT NULL` column to nullable. Both are catalog-only
+changes: no blocks are rewritten, so they are effectively instant however large the table is.
+
+Narrowing a column, changing its type, dropping it, or adding a `NOT NULL` column to a table with
+rows in it are all refused — each would need a rewrite of every block, and doing that silently
+behind a DDL statement is how a browser tab freezes.
+
+The [schema DSL](/docs/schema) plans those changes for you from a declared schema, with
+`migrate()` applying only the steps that are safe.
+
+## Reading the catalog
+
+```ts
+const tables = await db.listTables();
+// [{ name: "orders", columns: [{ name: "order_id", type: "number", nullable: false }, …] }]
+```
+
+This is what the devtools schema rail and the SQL editor's autocompletion are built on.

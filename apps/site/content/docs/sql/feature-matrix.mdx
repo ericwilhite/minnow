@@ -1,0 +1,45 @@
+---
+title: Feature matrix
+description: Every SQL form the engine supports, and every one it deliberately rejects.
+---
+
+This page is generated from `sql-feature-matrix.json`, which is a **test fixture** rather than a
+description. On every test run, each supported example below is executed through both of the
+engine's executors, and each rejected example is checked to still fail with the recorded error. A
+page built from it cannot drift from what the engine does.
+
+## Deliberate omissions
+
+Some of what is missing is missing on purpose. The reasons fall into three groups.
+
+### Because the browser is the runtime
+
+`BEGIN` / `COMMIT` as statement text are not supported. A transaction that a statement string can
+open is one that a lost reference, a closed tab, or a thrown error can leave open forever, holding
+storage a background sweep then cannot reclaim. Transactions are a scope instead —
+`db.write(async (tx) => { … })` — which ends when its callback does, however it ends.
+
+There are no `JSON`, array, `UUID`, or `INTERVAL` column types. Each would need an encoding, a
+comparison order, and a set of operators that the columnar format would carry forever, for a gain
+an application can get today by storing text and parsing it.
+
+### Because of how mutations work
+
+`UPDATE` and `DELETE` need the table to have a unique key. Mutation segments address rows by that
+key; a table without one can only be appended to. This is not a SQL-layer restriction — it holds
+for every write path.
+
+### Not yet, rather than never
+
+Correlated `NOT IN` and correlated subqueries joined on a non-equality predicate are rejected
+because the decorrelation rewrite cannot preserve their semantics, and running them row-by-row
+would turn a query that looks ordinary into one that takes minutes. `NOT EXISTS` expresses the
+first correctly today.
+
+## Supported
+
+<SqlFeatureMatrix status="supported" />
+
+## Rejected
+
+<SqlFeatureMatrix status="unsupported" />

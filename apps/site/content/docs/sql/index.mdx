@@ -1,0 +1,127 @@
+---
+title: Running SQL
+description: The four calls that execute statements, how parameters bind, and what comes back.
+---
+
+Every statement goes through one of four methods. They differ in what they return, not in what
+they can run.
+
+| Call                               | Use it for                                    | Returns                            |
+| ---------------------------------- | --------------------------------------------- | ---------------------------------- |
+| `query(sql, options?)`             | `SELECT`                                      | `{ rows, columns }`                |
+| `execute(sql, params?)`            | Any statement, including DDL and writes       | A tagged result per statement kind |
+| `explain(sql)`                     | Understanding a plan                          | The optimized plan as text         |
+| `runStatement(compiled, options?)` | Re-running a statement compiled ahead of time | Same as `execute`                  |
+
+## Reading
+
+```ts
+const { rows, columns } = await db.query(`
+  SELECT category, ROUND(SUM(line_total), 2) AS revenue
+  FROM order_items i
+  JOIN products p ON p.product_id = i.product_id
+  GROUP BY category
+  ORDER BY revenue DESC
+`);
+```
+
+`rows` is an array of plain objects in result order. Values arrive as their JavaScript
+equivalents: numbers as `number`, `TIMESTAMP` as `Date`, `BOOLEAN` as `boolean`, and SQL `NULL`
+as `null`. `columns` describes the shape — name and type per column — so a table component can
+render headers before it has looked at a single value.
+
+`query` accepts only statements that produce rows. Hand it an `INSERT` and it throws rather than
+silently writing.
+
+## Parameters
+
+Placeholders are `?` in order, or `$1`, `$2` by position. Bind through `params`; never
+concatenate values into the text.
+
+```ts
+await db.query("SELECT * FROM orders WHERE status = ? AND total >= ?", {
+  params: ["completed", 50],
+});
+
+await db.execute("UPDATE orders SET status = $2 WHERE order_id = $1", [1001, "refunded"]);
+```
+
+This matters for speed as well as safety. Compiled plans are cached on the statement text, so a
+parameterized statement is parsed, planned, and optimized once and then re-bound per execution.
+Interpolating values produces a new statement string every time and throws that work away.
+
+A statement's placeholders must all be bound: passing too few or too many is an error, not a
+silently-null column.
+
+## Writing
+
+`execute` returns a tagged union, so the result tells you what the statement did:
+
+```ts
+const result = await db.execute(
+  "UPDATE orders SET status = 'refunded' WHERE order_id = ? RETURNING order_id, total",
+  [1001],
+);
+
+if (result.kind === "update") {
+  result.rowCount; // rows changed
+  result.version; // the version this commit published
+  result.returnedRows; // present because of RETURNING
+}
+```
+
+The kinds are `rows`, `create-table`, `create-trigger`, `drop-trigger`, `insert`, `update`, and
+`delete`. Write kinds carry `rowCount` and the published `version`; `returnedRows` appears only
+when the statement had a `RETURNING` clause.
+
+## Compiling once, running many times
+
+When the same statement runs in a loop, compile it once and skip even the plan-cache lookup:
+
+```ts
+import { compileStatement } from "@minnowdb/core";
+
+const statement = compileStatement("INSERT INTO events (id, kind) VALUES (?, ?)");
+for (const event of batch) {
+  await db.runStatement(statement, { params: [event.id, event.kind] });
+}
+```
+
+For bulk loading, prefer [`insertBatch`](/docs/client#bulk-writes), which takes rows or columns
+directly and never touches the parser.
+
+## Result caching, and turning it off
+
+A statement re-run over data that has not changed is answered from a memo rather than executed
+again. The memo is validated against the catalog before it is served, so it can never return a
+stale answer — a commit anywhere in the tables the statement reads invalidates it.
+
+That is what you want in an application and exactly what you do not want in a benchmark:
+
+```ts
+// Measures execution. Without `memoize: false` a timing loop measures the cache.
+await db.query(sql, { memoize: false });
+```
+
+## Multiple statements
+
+One call runs one statement. To make several writes land together — or fail together — use a
+[write scope](/docs/client/transactions):
+
+```ts
+await db.write(async (tx) => {
+  await tx.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [1, sku]);
+  await tx.execute("INSERT INTO shipments (sku, shipped_at) VALUES (?, ?)", [sku, new Date()]);
+});
+```
+
+`BEGIN` / `COMMIT` as SQL text are deliberately not supported: a transaction that a statement
+string can open is a transaction a lost reference can leave open forever. Scopes end when their
+callback does.
+
+## What the language covers
+
+Joins, subqueries, CTEs including recursive ones, window functions, set operations, grouping
+sets, `RETURNING`, upserts, triggers, and full-text search. The exact surface — every supported
+form and every deliberately rejected one — is the [feature matrix](/docs/sql/feature-matrix),
+which is a test fixture rather than a description: each example is executed on every test run.

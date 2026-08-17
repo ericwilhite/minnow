@@ -1,0 +1,42 @@
+---
+title: Memory
+description: The in-process adapter, for tests and throwaway work.
+---
+
+```ts
+import { MemoryBlockStore } from "@minnowdb/core/storage";
+import { MinnowDatabase } from "@minnowdb/core";
+
+const db = new MinnowDatabase(new MemoryBlockStore());
+```
+
+No options, nothing to open, nothing to clean up. It implements the same `BlockStore` contract as
+the IndexedDB adapter, including atomic commits, snapshot reads, leases, and conflict detection —
+so a test against it exercises the same engine paths an application uses, not a simplified
+stand-in.
+
+## What it is for
+
+**Tests.** A fresh database per test with no cleanup and no shared state between them.
+
+```ts
+function freshDatabase(): MinnowDatabase {
+  return new MinnowDatabase(new MemoryBlockStore());
+}
+```
+
+**Ephemeral analysis.** A file a user dropped in, queried, and will never look at again does not
+need to touch their disk or their quota.
+
+**Building data to publish.** A [snapshot](/docs/storage/snapshots) exported from a memory store
+is how a prepared database becomes a file — a build script loads rows in memory and writes one
+portable artifact.
+
+## What it costs
+
+Everything lives in JavaScript memory: block payloads stay compressed, but they stay resident.
+Budget roughly what the same data would occupy in IndexedDB, plus the catalog.
+
+Nothing survives a reload, and nothing is shared between tabs — two tabs each get their own
+database. Where the IndexedDB adapter's cross-tab behaviour needs testing, that has to be a
+browser test against the real store.

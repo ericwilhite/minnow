@@ -1,0 +1,83 @@
+---
+title: Memory
+description: The execution budget, spilling, and the buffer pool.
+---
+
+A browser tab does not get to use all the memory it likes. Two separate mechanisms keep a database
+inside a bound you choose: a per-execution budget with spilling, and a byte-bounded cache of
+decoded blocks.
+
+## The execution budget
+
+Set a ceiling for what one statement may allocate:
+
+```ts
+await db.query(sql, { executionMemoryBudgetBytes: 32 * 1024 * 1024 });
+```
+
+The budget covers the modeled vectors, row-index arrays, grouping and result payloads, and
+ordering buffers — the parts the engine allocates and can therefore account for. It does not cover
+JavaScript container overhead, the lifetime of the result you are handed, or the browser's own
+allocator overhead.
+
+When an operator would exceed the budget, it **spills** to storage and continues. A sort, a hash
+join, or a grouping over more data than fits writes runs to temporary pages and merges them. The
+query gets slower; it does not fail.
+
+If a statement cannot proceed even with spilling, it throws `QueryMemoryBudgetError` rather than
+letting the tab die.
+
+```ts
+import { QueryMemoryBudgetError } from "@minnowdb/core";
+```
+
+## Measuring what a query used
+
+```ts
+await db.query(sql, {
+  memoize: false,
+  onStats: (stats) => {
+    console.log(stats);
+  },
+});
+```
+
+The engine can report its own peak because it reserves before it allocates — a measurement neither
+the storage layer nor a caller could take from outside.
+
+## The buffer pool
+
+Separately from execution, decoded blocks are cached so a warm scan does not re-read and
+re-decompress storage:
+
+```ts
+const db = new MinnowDatabase(store, { bufferPoolBytes: 64 * 1024 * 1024 });
+db.bufferPoolStats(); // what is resident right now
+```
+
+It holds decoded physical blocks, their vectorized per-block column forms, zone-map descriptions,
+and derived-subquery results. Every entry is keyed by an immutable identity — a block id, or an
+exact visible-segment fingerprint — so a cached entry can never serve stale data. Superseded
+entries simply stop being referenced and age out of the byte-bounded LRU.
+
+`0` disables it, which is the right setting for a one-shot import that will never re-read what it
+writes.
+
+## Spill cleanup
+
+Spilled pages are owned by a lease that is renewed while the query runs, so a tab that disappears
+mid-query leaves pages that a later session can identify as abandoned and reclaim:
+
+```ts
+await db.cleanupQuerySpill();
+```
+
+Worth calling at startup in a long-lived application. It is bounded work and safe to run
+concurrently with queries.
+
+## Choosing numbers
+
+The defaults — 64 MiB of buffer pool, no explicit execution budget — suit an application working
+over tens of megabytes of data. Lower the pool on a memory-constrained device or when many
+databases are open at once. Set an execution budget when a user can write arbitrary queries, which
+is exactly the case the [playground](/playground) is in.

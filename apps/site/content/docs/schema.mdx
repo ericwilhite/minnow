@@ -3,8 +3,6 @@ title: Schema & migrations
 description: Define tables once in TypeScript; migrate with safe, metadata-only steps.
 ---
 
-# Schema & migrations
-
 Define tables once in TypeScript. The same declaration drives migrations, row types, and every
 query builder — and `migrate()` never rewrites stored data.
 
@@ -108,7 +106,7 @@ widen an enum's value set (or drop it to a plain string), and add/change/remove 
   re-running.
 - **Concurrent migrators can't interleave** — the loser fails with a typed conflict.
 - **Nothing is rewritten.** A column added later reads as NULL in old data without touching it;
-  physical rewrites are [compaction](/docs/writes/)'s job.
+  physical rewrites are [compaction](/docs/sql/dml)'s job.
 
 Rejected outright, rather than attempted:
 
@@ -136,5 +134,5 @@ per-table helpers (used by `typedTable()`, the schema-typed handle over the batc
 Each table definition also carries a Standard Schema-compatible `~standard` validator, so any
 library that speaks that interface can validate rows at runtime with your definitions.
 
-> Raw `createTable` (see [Writes](/docs/writes/)) remains available when compile-time types aren't
+> Raw `createTable` (see [Writes](/docs/sql/dml)) remains available when compile-time types aren't
 > needed.

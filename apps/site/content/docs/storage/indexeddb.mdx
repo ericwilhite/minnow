@@ -1,0 +1,70 @@
+---
+title: IndexedDB
+description: The durable adapter — options, durability, quota, and what it stores.
+---
+
+```ts
+import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+
+const store = await IndexedDbBlockStore.open({
+  name: "shop",
+  durability: "relaxed",
+});
+```
+
+| Option       | Default     | Effect                                                                            |
+| ------------ | ----------- | --------------------------------------------------------------------------------- |
+| `name`       | —           | The IndexedDB database name. Two stores with the same name are the same database. |
+| `durability` | `"relaxed"` | `"strict"` flushes to disk per commit.                                            |
+| `indexedDB`  | the global  | An `IDBFactory` to use instead, for tests.                                        |
+
+## Durability
+
+`relaxed` lets the browser batch flushes to disk. A commit is still atomic and still ordered — a
+tab that closes, crashes, or is killed loses nothing committed — but a power loss can lose the
+most recent commits, because the operating system had not written them yet.
+
+`strict` pays a real flush per commit. It is measurably slower on write-heavy work, and it is the
+right choice when data must survive the machine losing power rather than the tab going away.
+
+## Quota
+
+Browsers give an origin a share of free disk, not a fixed number, and evict from origins the user
+has not visited when space runs low.
+
+```ts
+const { quota, usage } = await navigator.storage.estimate();
+await navigator.storage.persist(); // ask to be exempt from eviction
+```
+
+`persist()` prompts or silently grants depending on the browser and how engaged the user is with
+the site. Ask before writing a lot, and handle a refusal by writing less rather than by failing.
+
+`getLogicalStorageBytes()` reports what this database occupies, which is the number to show a user
+and the one to watch before a bulk load:
+
+```ts
+await store.getLogicalStorageBytes();
+```
+
+## What it creates
+
+One IndexedDB database with nine object stores: `blocks`, `manifests`, `segments`, `transactions`,
+`catalog`, `leases`, `temp`, `gc`, and `statistics`. Block payloads are stored as `Uint8Array`
+values keyed by block id; everything else is small structured records.
+
+Manifests are stored as a checkpoint every 32 commits with deltas in between, so publishing a
+commit writes work proportional to the blocks that changed rather than to the database's total
+size. Reads resolve a version by walking back to the nearest checkpoint.
+
+## Multiple tabs
+
+Several tabs may open the same database at once. Readers never block writers; competing writers
+conflict, rebase, and retry. No coordination channel is involved — correctness comes from the
+storage transactions themselves, so it holds even when `BroadcastChannel` is unavailable or a
+message is lost.
+
+One caveat worth knowing: a browser may throttle or suspend a background tab's IndexedDB activity.
+A long compaction in a hidden tab can simply stop making progress until it is foregrounded, which
+is why [maintenance](/docs/storage/maintenance) is stepped and resumable rather than one long
+operation.

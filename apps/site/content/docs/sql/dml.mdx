@@ -1,0 +1,143 @@
+---
+title: Writing data
+description: Insert, update, delete, upsert, and RETURNING.
+---
+
+## Insert
+
+```sql
+INSERT INTO customers (customer_id, name, city, signed_up_on)
+VALUES (?, ?, ?, ?)
+```
+
+Multiple row tuples in one statement are fine, and so is `INSERT … SELECT`, which materializes
+the query at one version before writing:
+
+```sql
+INSERT INTO archived_orders (order_id, customer_id, total, placed_at)
+SELECT order_id, customer_id, total, placed_at
+FROM orders
+WHERE placed_at < TIMESTAMP '2024-01-01'
+```
+
+Columns you leave out are written as `NULL`, so a nullable column can simply be omitted. A
+`NOT NULL` column without a value or a default is an error.
+
+## Update and delete
+
+```sql
+UPDATE orders SET status = 'refunded', total = total - ? WHERE order_id = ?
+DELETE FROM orders WHERE placed_at < ?
+```
+
+Any `WHERE` clause works — the engine resolves it to the affected rows and writes a mutation
+segment addressing them. `SET` expressions can read the row's current values, as `total - ?` does
+above.
+
+<Callout title="The table needs a unique key">
+  `UPDATE` and `DELETE` are rejected on a table with no `PRIMARY KEY`:
+
+```
+UPDATE requires a table with a unique key: logs
+```
+
+Mutation segments identify rows by unique key, so a table without one can only be appended to.
+This holds for every write path, not just SQL. Give a table a key if it will ever be edited.
+
+</Callout>
+
+When you already hold the keys, the batch APIs skip the parser and the lookup:
+
+```ts
+await db.deleteBatch("orders", { keys: [1001, 1002, 1003] });
+```
+
+## Upsert
+
+```sql
+INSERT INTO customers (customer_id, name, city, signed_up_on)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (customer_id) DO UPDATE SET name = EXCLUDED.name, city = EXCLUDED.city
+```
+
+`DO NOTHING` is also available. `EXCLUDED` refers to the row that would have been inserted, which
+is how you write "keep the newer value" without reading first.
+
+## RETURNING
+
+Any of the four statements can return the rows it touched — post-update values for `UPDATE`, and
+the removed rows for `DELETE`:
+
+```sql
+UPDATE products SET list_price = list_price * 1.05
+WHERE product_id = ?
+RETURNING product_id, name, list_price
+```
+
+```ts
+const result = await db.execute(sql, [productId]);
+result.returnedRows; // [{ product_id: 42, name: "…", list_price: 18.85 }]
+```
+
+This is one round trip instead of a write followed by a read, and it observes exactly the rows the
+statement wrote — no window in which something else changes them.
+
+## Unique keys
+
+A `PRIMARY KEY` column is enforced: inserting a key that already exists throws
+`UniqueConstraintError` rather than duplicating the row. Membership is tracked separately from the
+data blocks, so the check does not scan the table.
+
+```ts
+import { UniqueConstraintError } from "@minnowdb/core";
+
+try {
+  await db.execute("INSERT INTO customers (customer_id, name) VALUES (?, ?)", [1, "Ada"]);
+} catch (error) {
+  if (error instanceof UniqueConstraintError) {
+    // error.tableName, error.keys
+  }
+}
+```
+
+## Triggers
+
+`AFTER` and `BEFORE` triggers fire inside the same commit as the write that caused them, so a row
+and everything derived from it publish together or not at all.
+
+```sql
+CREATE TRIGGER log_refunds AFTER UPDATE ON orders
+FOR EACH ROW
+BEGIN
+  INSERT INTO audit (order_id, old_status, new_status, at)
+  VALUES (OLD.order_id, OLD.status, NEW.status, CURRENT_TIMESTAMP);
+END
+```
+
+`DROP TRIGGER log_refunds` removes it.
+
+## Atomicity
+
+One statement is one commit. Several statements that must land together belong in a
+[write scope](/docs/client/transactions):
+
+```ts
+const { version } = await db.write(async (tx) => {
+  await tx.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [qty, sku]);
+  await tx.execute("INSERT INTO shipments (sku, qty, at) VALUES (?, ?, ?)", [sku, qty, new Date()]);
+});
+```
+
+Either both are visible or neither is — including to another tab, which never sees the stock
+decremented without the shipment.
+
+## Bulk loading
+
+Parsing a statement per row is the wrong shape for loading a lot of data. The batch APIs take
+rows or columns directly:
+
+```ts
+await db.insertBatch("orders", rows); // an array of plain objects
+```
+
+See [bulk writes](/docs/client#bulk-writes) for the columnar form and the buffered writer.

@@ -1,0 +1,67 @@
+---
+title: Compaction and collection
+description: Merging small segments and reclaiming superseded blocks, without blocking anything.
+---
+
+Writes append. A table written in many small batches ends up as many small segments, and every
+update or delete leaves the blocks it superseded on disk until something reclaims them. Two
+background jobs handle both, and both are stepped and resumable — a browser tab can be
+backgrounded, throttled, or closed mid-job.
+
+## Compaction
+
+Merges small segments into larger ones, which is what keeps a scan from paying per-segment
+overhead after a long run of small writes.
+
+```ts
+await db.compactTable("orders");
+```
+
+It runs automatically by default. To drive it yourself — a slice per idle callback, so it never
+holds the main thread:
+
+```ts
+const db = new MinnowDatabase(store, { autoCompact: false });
+
+const job = await db.compactTable("orders", { maxItems: 64 });
+requestIdleCallback(async function step() {
+  const next = await db.compactTableStep({ jobId: job.jobId, maxItems: 64 });
+  if (!next.done) requestIdleCallback(step);
+});
+```
+
+Jobs are records in the store, so `listCompactionJobs()` finds one a previous session left behind
+and `resumeCompactionJob(jobId)` picks it up. `cancelCompactionJob(jobId)` stops one cleanly —
+compaction is visible-data-neutral by construction, so cancelling it can never lose data.
+
+## Garbage collection
+
+Reclaims blocks no live version references any more:
+
+```ts
+await db.collectGarbage();
+```
+
+A block is only collectable when no manifest, no open reader lease, and no non-terminal job still
+roots it. That is what makes it safe to run while a report is being read: an open
+[snapshot scope](/docs/client/transactions#stable-reads) pins its version, and collection skips
+everything that version needs.
+
+The same stepped shape applies:
+
+```ts
+await db.collectGarbageStep({ jobId, maxItems: 128 });
+```
+
+## Scheduling
+
+Neither job needs to run on a timer. Reasonable triggers:
+
+- After a bulk load, compact the tables it touched.
+- On an idle callback, take one step of whatever is outstanding.
+- At startup, resume jobs a previous session left and call
+  [`cleanupQuerySpill()`](/docs/client/memory#spill-cleanup).
+
+Leaving them undone costs storage and scan speed. It never costs correctness — a database that
+is never compacted or collected still answers every query correctly, just over more blocks and
+more bytes than it needs.

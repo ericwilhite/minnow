@@ -1,0 +1,96 @@
+---
+title: Transactions and snapshots
+description: Making several writes atomic, holding one version across several reads, and what happens when two writers collide.
+---
+
+## Atomic writes
+
+A write scope stages any number of mutations across any number of tables and publishes them as one
+commit:
+
+```ts
+const { result, version } = await db.write(async (tx) => {
+  await tx.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [qty, sku]);
+  await tx.insertBatch("shipments", [{ sku, qty, shipped_at: new Date() }]);
+  return sku;
+});
+```
+
+Everything inside becomes visible at once, including to other tabs: nobody observes the stock
+decremented without the shipment. If the callback throws, nothing is published.
+
+Scopes are a callback rather than `begin()` / `commit()` calls on purpose. A transaction a caller
+holds is a transaction a caller can drop — through a thrown error, a closed tab, a forgotten
+`await` — and a dropped transaction pins storage that background collection then cannot reclaim.
+A scope ends when its callback does, however it ends. This is also why `BEGIN` as SQL text is
+[rejected](/docs/sql/feature-matrix).
+
+### A failed scope stays failed
+
+A statement that fails _after_ registering part of its work — key membership, full-text deltas,
+staged blocks — cannot be undone statement by statement. The scope is poisoned: even if your code
+catches the error and carries on, the commit refuses rather than publishing a fragment.
+
+A statement that fails validation _before_ registering anything — updating a key that does not
+exist, say — leaves the scope clean and usable.
+
+## Stable reads
+
+Every single query already executes against one version. A snapshot scope extends that to several:
+
+```ts
+const report = await db.snapshot(async (session) => {
+  const orders = await session.query("SELECT COUNT(*) AS n FROM orders");
+  const items = await session.query("SELECT COUNT(*) AS n FROM order_items");
+  return { orders: orders.rows[0].n, items: items.rows[0].n };
+});
+```
+
+Both queries see the same version, so the counts are consistent with each other however many
+commits land while the scope is open.
+
+The scope holds a lease on that version so background collection cannot reclaim it underneath, and
+releases it when the callback returns. Hold one for as long as you need consistency and no longer:
+a scope kept open across a user's whole session pins every version since it started.
+
+## Freshness
+
+Outside a snapshot scope, every query observes the latest committed state — including commits from
+another tab. Stale reads are not something you can accidentally get; they are unrepresentable.
+
+That is a stronger guarantee than it sounds, and it is why cross-tab consistency does not depend on
+`BroadcastChannel` or Web Locks. A reader checks the current version in the same storage
+transaction it reads through.
+
+## Conflicts
+
+Readers never block writers and writers never block readers. Two writers that touch overlapping
+data do conflict, and the loser rebases onto the winner's version and retries — up to
+`maxCommitRetries`, eight by default. Past that you get a `WriteConflictError` to handle yourself.
+
+```ts
+import { WriteConflictError } from "@minnowdb/core";
+
+try {
+  await db.write(async (tx) => {
+    /* … */
+  });
+} catch (error) {
+  if (error instanceof WriteConflictError) {
+    // Another writer won repeatedly. Re-read and decide what the write should now be.
+  }
+}
+```
+
+Retrying is safe because a scope's callback runs again from the top against the new version, so
+a read-modify-write inside it re-reads.
+
+## Durability
+
+Durability ends at a committed IndexedDB transaction. Nothing depends on a page-close handler
+firing, because they do not reliably fire — a tab that vanishes loses only writes that had not
+committed.
+
+The IndexedDB store defaults to `relaxed` durability, which lets the browser batch flushes to
+disk. For data that must survive a power loss rather than a tab closing, open the store with
+`durability: "strict"` and pay the flush per commit.

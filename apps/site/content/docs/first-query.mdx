@@ -1,0 +1,127 @@
+---
+title: Your first query
+description: Create a table, write rows, and read them back — all in SQL.
+---
+
+Everything below runs in a browser tab. Nothing is sent anywhere.
+
+<Steps>
+
+<Step>
+
+### Open a database
+
+```ts
+import { MinnowDatabase } from "@minnowdb/core";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+
+const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }));
+```
+
+</Step>
+
+<Step>
+
+### Create tables
+
+DDL is SQL like everything else. `PRIMARY KEY` declares the table's unique key — the column that
+`UPDATE`, `DELETE`, and upserts address rows through.
+
+```ts
+await db.execute(`CREATE TABLE customers (
+  customer_id INTEGER PRIMARY KEY,
+  name VARCHAR(80) NOT NULL,
+  city VARCHAR(80),
+  signed_up_on TIMESTAMP NOT NULL
+)`);
+
+await db.execute(`CREATE TABLE orders (
+  order_id INTEGER PRIMARY KEY,
+  customer_id INTEGER NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  total DOUBLE PRECISION NOT NULL,
+  placed_at TIMESTAMP NOT NULL
+)`);
+```
+
+</Step>
+
+<Step>
+
+### Write rows
+
+`execute` runs any statement. Bind values with `?` rather than building SQL strings — the compiled
+plan is cached on the statement text and re-bound per execution, so parameters are faster as well
+as safer.
+
+```ts
+await db.execute(
+  `INSERT INTO customers (customer_id, name, city, signed_up_on)
+   VALUES (?, ?, ?, ?), (?, ?, ?, ?)`,
+  [1, "Ada Lovelace", "London", new Date("2024-03-02")],
+);
+
+const inserted = await db.execute(
+  `INSERT INTO orders (order_id, customer_id, status, total, placed_at)
+   VALUES (?, ?, 'completed', ?, ?)
+   RETURNING order_id, total`,
+  [1001, 1, 24.5, new Date("2025-11-14")],
+);
+// inserted.kind === "insert", inserted.returnedRows === [{ order_id: 1001, total: 24.5 }]
+```
+
+For loading a lot of rows at once, [`insertBatch`](/docs/client#bulk-writes) takes them
+columnar and skips the parser entirely.
+
+</Step>
+
+<Step>
+
+### Query
+
+```ts
+const { rows, columns } = await db.query(
+  `SELECT c.name, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+   FROM customers c
+   JOIN orders o ON o.customer_id = c.customer_id
+   WHERE o.status = ?
+   GROUP BY c.name
+   ORDER BY revenue DESC
+   LIMIT 10`,
+  { params: ["completed"] },
+);
+```
+
+`rows` are plain objects — numbers are numbers, `TIMESTAMP` columns come back as `Date`. `columns`
+carries the result's names and types, which is what a grid needs to render without inspecting
+values.
+
+</Step>
+
+<Step>
+
+### See what it decided to do
+
+```ts
+console.log(await db.explain("SELECT * FROM orders WHERE order_id = 1001"));
+```
+
+The plan shows which access path the optimizer chose, where predicates were pushed, and which
+joins were reordered. [Query plans](/docs/sql/plans) reads one line by line.
+
+</Step>
+
+</Steps>
+
+## Try it without installing anything
+
+The [playground](/playground) is this, already set up: a generated retailer's database of around
+590,000 rows, built in your browser and kept in IndexedDB. Every query on this site runs against
+it for real.
+
+## Where to go next
+
+- [Running SQL](/docs/sql) — the full statement API, parameters, and result shapes.
+- [Writing data](/docs/sql/dml) — inserts, updates, deletes, upserts, `RETURNING`.
+- [Transactions](/docs/client/transactions) — atomic multi-statement writes and stable reads.
+- [Workers](/docs/client/workers) — moving the engine off the main thread.

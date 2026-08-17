@@ -1,0 +1,91 @@
+---
+title: Full-text search
+description: MATCH and BM25 over any column, with no index DDL.
+---
+
+Search is a predicate, not a separate subsystem. There is no `CREATE INDEX` and no shadow table:
+name the columns to search and the engine handles the rest.
+
+```sql
+SELECT product_id, name
+FROM products
+WHERE MATCH(name) AGAINST 'espresso grinder'
+```
+
+Several columns at once, or every column in the row:
+
+```sql
+SELECT name FROM products WHERE MATCH(name, brand) AGAINST 'copper kettle'
+SELECT name FROM products WHERE MATCH(*) AGAINST 'yirgacheffe'
+```
+
+`MATCH(*)` searches numbers and datetimes through their canonical rendering, so `MATCH(*) AGAINST
+'2025'` finds rows by a date column as well as by text.
+
+## Ranking
+
+`BM25` scores a row against the same query, and is an ordinary expression — select it, order by
+it, filter on it:
+
+```sql
+SELECT name,
+       BM25(name, brand) AGAINST 'single origin ethiopia' AS score
+FROM products
+WHERE MATCH(name, brand) AGAINST 'single origin ethiopia'
+ORDER BY score DESC
+LIMIT 20
+```
+
+Scores use the whole column's term statistics, so they are comparable across rows in a way a
+naive term count is not.
+
+## Prefix matching
+
+A trailing `*` matches by prefix, which is what a search-as-you-type box needs:
+
+```sql
+SELECT name FROM products WHERE MATCH(name) AGAINST 'grind*'
+```
+
+Multiple terms are combined; a row matches when it contains all of them.
+
+## Indexes build themselves
+
+A `MATCH` on an unindexed column scans and re-verifies, which is fast enough on small tables and
+slow on large ones. Above a threshold — 4,096 visible rows by default — the first `MATCH` on an
+append-only column schedules a background index build and answers from the scan meanwhile.
+Correctness never waits on it.
+
+To build one explicitly, before a user's first search rather than during it:
+
+```ts
+await db.buildFtsIndex("products", "name");
+```
+
+<Callout title="Append-only columns only">
+  A full-text index can only cover a table that has not been updated or deleted from:
+
+```
+Full-text indexes support append-only tables; orders has keyed mutations
+```
+
+`MATCH` still works on such a table — it just scans. The index is a pruning accelerator that the
+scan re-verifies, so a missing, stale, or invalidated index costs time, never correctness.
+
+</Callout>
+
+## What it does to a term
+
+Terms are lowercased and split on non-alphanumeric boundaries. There is no stemming, no stop-word
+list, and no language configuration: `running` does not match `run`. That is a deliberate floor —
+a tokenizer that guesses a language is a tokenizer that is wrong for somebody, and the behaviour
+here is one a caller can predict and pre-process around.
+
+## Tuning the threshold
+
+```ts
+const db = new MinnowDatabase(store, { ftsAutoIndexRows: 20_000 });
+```
+
+Raise it when tables are small and searches rare; lower it to zero to disable background building
+entirely and manage indexes yourself.

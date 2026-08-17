@@ -1,0 +1,61 @@
+---
+title: Storage adapters
+description: The block store contract, and choosing between IndexedDB and memory.
+---
+
+A database is an engine plus a store. The engine decides what to write; the store decides where it
+goes. Two adapters ship today, both implementing the same `BlockStore` contract, so swapping one
+for the other changes nothing else about your code.
+
+| Adapter                                          | Import                   | Survives a reload | Use it for                               |
+| ------------------------------------------------ | ------------------------ | ----------------- | ---------------------------------------- |
+| [`IndexedDbBlockStore`](/docs/storage/indexeddb) | `@minnowdb/core/storage` | Yes               | Applications.                            |
+| [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage` | No                | Tests, scratch work, throwaway analysis. |
+
+OPFS is a likely third: it is a better fit for large sequential writes than IndexedDB, at the cost
+of needing cross-origin isolation to use its fast synchronous handles.
+
+## What a store holds
+
+Not rows. The engine hands the store immutable, compressed, self-describing **blocks** — one
+column's values for one row group — plus the records that say which blocks are live:
+
+- **Blocks** — the data, keyed by an immutable id.
+- **Manifests** — which block ids are live at each version. Publishing a manifest is what makes a
+  commit visible.
+- **Segments** — which blocks belong to which table, and which row ids they cover.
+- **Transactions** — the commit each segment belongs to, which is how visibility resolves.
+- **Catalog** — tables, columns, counters, unique-key membership, full-text index state.
+- **Leases, temp pages, and job records** — reader pins, query spill, and the cursors that let
+  compaction and collection resume.
+
+Because published blocks are immutable and a version is just a set of block ids, a reader can hold
+a version open while writers keep committing. That is the whole concurrency story, and it is a
+property of this layout rather than of any locking.
+
+## Writing your own
+
+`BlockStore` is a public interface. Implementing it against another substrate — OPFS, a remote
+object store, an encrypted wrapper — gives you a working database with no engine changes.
+
+Several methods are optional (`getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
+`stageTransactionArtifacts`). They exist so an adapter that can do something atomically may say
+so; callers fall back to the individual calls when they are absent. Be honest about which you
+implement — the engine trusts a present method to be atomic.
+
+`FaultInjectingBlockStore` from `@minnowdb/core/testing` wraps any store and fails at named points,
+which is how the engine's own crash-recovery behaviour is tested:
+
+```ts
+import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
+
+const store = new FaultInjectingBlockStore(new MemoryBlockStore(), (point) =>
+  point === "beforeManifestCommit" ? new Error("boom") : undefined,
+);
+```
+
+## Moving data between stores
+
+A [snapshot](/docs/storage/snapshots) copies one committed version out as a single portable file
+and loads it into any store — memory to IndexedDB, one browser to another, or a build script to a
+published asset.

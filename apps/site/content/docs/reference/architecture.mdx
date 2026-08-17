@@ -3,8 +3,6 @@ title: Architecture
 description: How Minnow works and why it's built this way.
 ---
 
-# Architecture
-
 Minnow is built for how browsers actually behave: tabs close without warning, storage is slow, and
 the same app may be open in five tabs at once. Everything below follows from that.
 
@@ -31,7 +29,7 @@ These are fixed. Everything else is built around them.
   host. `npm install` and go.
 - **The engine is our own.** No SQLite or DuckDB underneath — engines built for POSIX files carry
   assumptions browsers don't honor. The trade-off: the SQL surface is a careful subset, tracked in
-  the [feature matrix](/docs/sql/).
+  the [feature matrix](/docs/sql/feature-matrix).
 
 ## Why columns, why immutable
 
@@ -93,7 +91,7 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   same time; only one publishes, the other retries.
 - **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
   reconciles against IndexedDB. A missed message costs a little latency, never a stale result.
-  [Live queries](/docs/live-queries/) are built on this.
+  [Live queries](/docs/sql) are built on this.
 - **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
   expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
   pinned becomes reclaimable. No heartbeats, no guessing.
@@ -150,7 +148,7 @@ Storage                IndexedDB, block codecs, manifests, leases, GC
 - Each tab owns its own coordinator worker.
 - Buffers cross the boundary as transferable `ArrayBuffer`s — no shared memory, which is why no
   cross-origin isolation is needed.
-- The [worker protocol](/docs/workers/) is versioned RPC; each handle answers a fixed list of
+- The [worker protocol](/docs/client/workers) is versioned RPC; each handle answers a fixed list of
   methods, nothing else.
 - Inside `@minnowdb/core`, the layers are separate modules — `block-format`, `storage`,
   `transactions`, and the engine — each importable on its own.
@@ -175,7 +173,7 @@ so your own tests can crash the engine on purpose too.
   before accounting starts, and some join shapes can't spill. The budget catches whole classes of
   blowups; it is not a hard cap on the heap.
 - **No big-dataset performance claims** until real browser measurements back them. The
-  [benchmarks](/benchmarks/) publish what has been measured, methodology included.
+  [benchmarks](/benchmarks) publish what has been measured, methodology included.
 - **The early block format may change.** Formats only ever grow (new codecs get new IDs; old
   bytes are never reinterpreted), but this early format — currently version 1, whose header and
   statistics are independently checksummed — carries no compatibility promise yet.

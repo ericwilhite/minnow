@@ -1,0 +1,73 @@
+---
+title: Query plans
+description: What EXPLAIN shows, and what the optimizer does before it.
+---
+
+```ts
+console.log(
+  await db.explain(`
+    SELECT c.city, COUNT(*) AS orders
+    FROM orders o JOIN customers c ON c.customer_id = o.customer_id
+    WHERE o.status = 'completed' AND o.total > 100
+    GROUP BY c.city
+  `),
+);
+```
+
+The plan is the optimized one — what will actually run, not the shape you wrote.
+
+## What the optimizer does
+
+**Predicate pushdown.** Filters move as close to their table scan as they can get, so rows are
+discarded before a join builds a hash table out of them.
+
+**Zone-map pruning.** Every block records the minimum and maximum of the column it holds. A
+predicate that cannot be satisfied inside a block's range skips the block without decoding or
+decompressing it. This is why `WHERE placed_at >= '2025-01-01'` on a table written in date order
+reads a fraction of the bytes.
+
+**Column pruning.** Only the columns a query mentions are read. A `SELECT` of two columns from a
+fourteen-column table reads two columns' worth of blocks.
+
+**Join reordering.** Joins are ordered by estimated cardinality, and the smaller side becomes the
+hash build side. An equality join against a unique key takes an index-nested-loop path instead.
+
+**Decorrelation.** A correlated `EXISTS` or `IN` subquery is rewritten into a semi-join rather than
+executed once per outer row. The two correlated forms that cannot be rewritten this way are
+rejected rather than run row-by-row — see the
+[feature matrix](/docs/sql/feature-matrix).
+
+**Top-N.** `ORDER BY … LIMIT n` keeps a bounded heap instead of sorting the whole input.
+
+## Execution
+
+The executor is vectorized: it works on batches of column values rather than a row at a time, and
+scans stream block by block so a table is never required to be resident. When a hash table,
+sort, or grouping payload would exceed the [memory budget](/docs/client/memory), the operator
+spills to storage and continues rather than failing.
+
+## Measuring a query honestly
+
+Repeating one statement over unchanging data measures the result memo, not execution. In a timing
+loop, turn it off:
+
+```ts
+const start = performance.now();
+await db.query(sql, { memoize: false });
+const elapsed = performance.now() - start;
+```
+
+`onStats` reports what an execution actually cost, including peak modeled memory — something the
+engine can report because it reserves before it allocates:
+
+```ts
+await db.query(sql, {
+  memoize: false,
+  onStats: (stats) => {
+    console.log(stats);
+  },
+});
+```
+
+The [benchmarks page](/benchmarks) runs the full read and write suites against SQLite WASM and
+PGlite in your own browser, on a dataset size you pick.

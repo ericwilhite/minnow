@@ -48,8 +48,9 @@ export function SqlFeatureMatrix({ status }: { status: "supported" | "unsupporte
   return (
     <div className="not-prose my-6 flex flex-col gap-3">
       <p className="text-sm text-fd-muted-foreground">
-        {selected.length} {status === "supported" ? "supported forms" : "rejected forms"}, each one
-        executed on every test run.
+        {status === "supported"
+          ? `${String(selected.length)} forms, each executed through both executors on every test run.`
+          : `${String(selected.length)} forms, each checked on every test run to still fail with the error below.`}
       </p>
       {selected.map((feature) => (
         <Feature key={feature.id} feature={feature} />

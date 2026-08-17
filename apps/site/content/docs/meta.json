@@ -2,18 +2,14 @@
   "title": "Documentation",
   "pages": [
     "index",
-    "getting-started",
-    "playground",
-    "---SQL---",
+    "installation",
+    "first-query",
     "sql",
-    "---Client---",
-    "workers",
-    "---Storage---",
+    "client",
+    "storage",
+    "---Also---",
     "schema",
-    "---Reference---",
-    "api",
-    "architecture",
     "devtools",
-    "testing"
+    "reference"
   ]
 }

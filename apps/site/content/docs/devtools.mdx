@@ -3,19 +3,17 @@ title: Devtools
 description: An embeddable SQL console for your database — a floating panel in dev, an inline playground in docs.
 ---
 
-# Devtools
-
 A panel you drop into any app to browse, edit, and query the database it is already using. It
 floats over your page without blocking it, and every change asks first.
 
 ## Try it on this page
 
 The launcher below is the real thing, in its production shape: a database running in a web worker
-(the same [worker client](/docs/workers/) an app ships), loaded with a generated five-table
+(the same [worker client](/docs/client/workers) an app ships), loaded with a generated five-table
 commerce dataset — 165,808 rows of regions, customers, products, orders, and order items. The
 panel floats over these docs exactly as it would float over your app, and the title-bar badge
 reads **worker** because the queries genuinely leave the page. For the same panel rendered inline
-against a small in-memory database, see the [playground](/docs/playground/).
+against a small in-memory database, see the [playground](/playground).
 
 ## Install
 
@@ -26,7 +24,7 @@ npm install @minnowdb/devtools
 ## Mount it
 
 The panel attaches to a `MinnowDatabase`, a `MinnowDatabaseClient`, or the `Minnow` facade over
-either — it reaches the database behind a facade through [`db.driver`](/docs/api/).
+either — it reaches the database behind a facade through [`db.driver`](/docs/reference/api).
 
 ```ts
 import { mountMinnowDevtools } from "@minnowdb/devtools";
@@ -171,7 +169,7 @@ table picker, so choosing a table never depends on the rail being there.
 Two badges in the title bar say what you are working with:
 
 - **worker** or **main thread** — a database built in the page runs queries on the main thread, so
-  a slow one will freeze it. The [worker client](/docs/workers/) does not.
+  a slow one will freeze it. The [worker client](/docs/client/workers) does not.
 - **write on** or **read-only** — whether `permissions.write` allows changes.
 
 ## Running statements
@@ -205,7 +203,7 @@ page, so nothing is sent to the worker and no query is executed to find out that
 Where the failure names a capability the engine records as unsupported, the message says which one
 and what stands in for it — "Expected SELECT, found BEGIN" also explains that transactions are
 scoped through the API rather than opened in SQL. That comes from the shipped
-[feature matrix](/docs/sql/), so it stays true as the engine changes. A message that several
+[feature matrix](/docs/sql/feature-matrix), so it stays true as the engine changes. A message that several
 features share explains nothing rather than guessing between them.
 
 ## Plan
@@ -227,7 +225,7 @@ everything. History is namespaced by `storageKey`, so two panels on a page keep 
 ## Embedding a playground
 
 `mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
-panel, in flow, sized by its container. The [playground](/docs/playground/) is exactly this,
+panel, in flow, sized by its container. The [playground](/playground) is exactly this,
 pointed at an in-memory database:
 
 ```ts

@@ -1,0 +1,147 @@
+---
+title: Reading data
+description: Joins, subqueries, CTEs, window functions, set operations, and grouping sets.
+---
+
+The examples on this page run against the [playground](/playground) schema: `stores`,
+`employees`, `products`, `customers`, `orders`, `order_items`, and `returns`.
+
+## Filtering and projection
+
+```sql
+SELECT order_id, total, placed_at
+FROM orders
+WHERE status = 'completed'
+  AND placed_at >= TIMESTAMP '2025-01-01'
+  AND total BETWEEN 20 AND 500
+ORDER BY placed_at DESC
+LIMIT 50
+```
+
+`WHERE` supports comparison, `BETWEEN`, `IN`, `LIKE`, `IS NULL`, `AND` / `OR` / `NOT`, and
+`CASE`. Predicates on columns with block-level zone maps skip whole row groups without decoding
+them — see [Query plans](/docs/sql/plans).
+
+`ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, and ordinals.
+`LIMIT` and `OFFSET` both work, and a `LIMIT` without an `ORDER BY` returns rows in no promised
+order, as in any SQL engine.
+
+## Joins
+
+```sql
+SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+FROM stores s
+JOIN orders o ON o.store_id = s.store_id
+LEFT JOIN employees e ON e.employee_id = o.employee_id
+WHERE o.status = 'completed'
+GROUP BY s.store_id, s.name
+ORDER BY revenue DESC
+```
+
+`INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS` joins are all supported, with `USING` as well as
+`ON`. The optimizer reorders joins by estimated cardinality and builds hash tables on the smaller
+side; equality joins take an index-nested-loop path when one side is a unique key.
+
+## Aggregation
+
+```sql
+SELECT p.category,
+       COUNT(*) AS lines,
+       COUNT(DISTINCT i.order_id) AS baskets,
+       ROUND(SUM(i.line_total), 2) AS revenue,
+       ROUND(AVG(i.line_total), 2) AS average_line,
+       MIN(i.unit_price) AS cheapest,
+       MAX(i.unit_price) AS dearest
+FROM order_items i
+JOIN products p ON p.product_id = i.product_id
+GROUP BY p.category
+HAVING SUM(i.line_total) > 10000
+ORDER BY revenue DESC
+```
+
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, and `COUNT(DISTINCT …)` are available, with `FILTER (WHERE …)`
+for conditional aggregates. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`, and `CUBE`.
+
+An aggregate over a whole column reads only that column. This is the shape columnar storage is
+for: summing one column of a fourteen-column table touches a fourteenth of the bytes.
+
+## Subqueries and derived tables
+
+```sql
+SELECT category, name, revenue
+FROM (
+  SELECT p.category, p.name, SUM(i.line_total) AS revenue,
+         ROW_NUMBER() OVER (PARTITION BY p.category ORDER BY SUM(i.line_total) DESC) AS rank
+  FROM order_items i
+  JOIN products p ON p.product_id = i.product_id
+  GROUP BY p.category, p.name
+) AS ranked
+WHERE rank <= 3
+```
+
+A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXISTS` all work, and
+correlated `EXISTS` decorrelates into a semi-join rather than executing per row.
+
+Two correlated forms are rejected rather than executed slowly: `NOT IN` with a correlated
+subquery, and correlated subqueries joined on a non-equality predicate. Both would need a
+per-row nested execution, and the error says so instead of quietly taking minutes.
+
+## Common table expressions
+
+```sql
+WITH monthly AS (
+  SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total) AS revenue
+  FROM orders WHERE status = 'completed'
+  GROUP BY DATE_TRUNC('month', placed_at)
+)
+SELECT month, revenue,
+       revenue - LAG(revenue) OVER (ORDER BY month) AS change
+FROM monthly
+ORDER BY month
+```
+
+`WITH RECURSIVE` is supported too, for hierarchies and generated series:
+
+```sql
+WITH RECURSIVE months(month) AS (
+  SELECT TIMESTAMP '2025-01-01'
+  UNION ALL
+  SELECT month + INTERVAL '1 month' FROM months WHERE month < TIMESTAMP '2025-12-01'
+)
+SELECT month FROM months
+```
+
+## Window functions
+
+```sql
+SELECT customer_id,
+       placed_at,
+       total,
+       SUM(total) OVER (PARTITION BY customer_id ORDER BY placed_at) AS running_total,
+       RANK() OVER (PARTITION BY customer_id ORDER BY total DESC) AS biggest_basket,
+       LAG(placed_at) OVER (PARTITION BY customer_id ORDER BY placed_at) AS previous_order
+FROM orders
+```
+
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and the
+aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and explicit `ROWS` / `RANGE`
+frames.
+
+## Set operations
+
+```sql
+SELECT customer_id FROM orders WHERE placed_at >= TIMESTAMP '2025-01-01'
+EXCEPT
+SELECT customer_id FROM orders WHERE placed_at >= TIMESTAMP '2025-07-01'
+```
+
+`UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT`, each requiring matching column counts and
+compatible types.
+
+## Consistency
+
+One `query` call executes against one version of the database. A join across seven tables sees
+all seven as they were at a single point, whatever else commits while it runs.
+
+To hold that same version across _several_ calls, open a
+[snapshot scope](/docs/client/transactions#stable-reads).

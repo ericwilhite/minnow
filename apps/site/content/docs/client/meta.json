@@ -1,0 +1,4 @@
+{
+  "title": "Client",
+  "pages": ["index", "transactions", "workers", "memory"]
+}
