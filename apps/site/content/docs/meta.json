@@ -1,0 +1,19 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "getting-started",
+    "playground",
+    "---SQL---",
+    "sql",
+    "---Client---",
+    "workers",
+    "---Storage---",
+    "schema",
+    "---Reference---",
+    "api",
+    "architecture",
+    "devtools",
+    "testing"
+  ]
+}

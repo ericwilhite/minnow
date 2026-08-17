@@ -14,6 +14,12 @@ export interface DevtoolsHandle {
   open(): void;
   close(): void;
   toggle(): void;
+  /**
+   * Replaces the statement in the console and shows it, opening the panel if it was closed.
+   * This is how an embedder offers a query to start from — a docs page suggesting one, or an
+   * application dropping the user into the query behind the screen they were looking at.
+   */
+  setQuery(sql: string): void;
   readonly isOpen: boolean;
   /** Removes every listener and empties the root. Safe to call twice. */
   destroy(): void;
@@ -134,7 +140,7 @@ export function createDevtools(
   /** The catalog is read when the panel is first opened, never at mount. */
   let catalogLoaded = false;
 
-  function setOpen(next: boolean): void {
+  function setOpen(next: boolean, moveFocus = true): void {
     if (destroyed || open === next) return;
     open = next;
     panel.node.hidden = !next;
@@ -146,9 +152,13 @@ export function createDevtools(
         void loadCatalog();
       }
       // Focus follows the view that is actually showing; focusing the console while the data
-      // grid is up left a keyboard user outside the panel with nothing selected.
-      if (panel.activeView() === "query") view.focus();
-      else panel.focusActiveView();
+      // grid is up left a keyboard user outside the panel with nothing selected. It is skipped
+      // on the initial open of an inline panel, where taking focus would scroll the page down
+      // to a panel the reader has not asked for yet.
+      if (moveFocus) {
+        if (panel.activeView() === "query") view.focus();
+        else panel.focusActiveView();
+      }
     } else {
       confirm.dismiss();
     }
@@ -173,7 +183,7 @@ export function createDevtools(
 
   panel.node.hidden = true;
   launcher?.setOpen(false);
-  if (resolved.defaultOpen) setOpen(true);
+  if (resolved.defaultOpen) setOpen(true, false);
 
   return {
     open: () => {
@@ -181,6 +191,12 @@ export function createDevtools(
     },
     close,
     toggle,
+    setQuery: (sql: string) => {
+      if (destroyed) return;
+      setOpen(true);
+      panel.show("query");
+      view.setQuery(sql);
+    },
     get isOpen() {
       return open;
     },

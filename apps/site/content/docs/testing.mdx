@@ -1,0 +1,121 @@
+---
+title: Testing & benchmarks
+description: The test runners, release gate, benchmark workloads, and capture workflow.
+---
+
+# Testing & benchmarks
+
+One set of focused runners covers fast correctness checks, real-browser behavior, performance
+regressions, and reproducible browser benchmarks.
+
+This page is the source of truth for running and maintaining Minnow's tests and benchmarks.
+
+## Choose the smallest runner that proves the change
+
+| Command                        | What it runs                                                          | Use it for                                  |
+| ------------------------------ | --------------------------------------------------------------------- | ------------------------------------------- |
+| `npm test`                     | Vitest unit, conformance, differential, and harness tests             | Normal implementation work                  |
+| `npm run test:browser:library` | Core IndexedDB and transaction tests in Chromium and Firefox          | Storage or browser-runtime changes          |
+| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                 | Docs, examples, and site changes            |
+| `npm run test:browser:bench`   | Benchmark-lab smoke and correctness suites in real browsers           | Harness, engine adapter, or dataset changes |
+| `npm run test:browser`         | All three browser runners, in sequence                                | Cross-browser regression checks             |
+| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline        | Query-executor performance changes          |
+| `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages | Dependency or public-entry changes          |
+| `npm run check`                | Formatting, types, lint, build, and unit tests                        | The local merge gate                        |
+| `npm run check:release`        | The local gate, performance gate, and all browser runners             | Release candidates                          |
+
+Install the browser binaries once before using a browser runner:
+
+```bash
+npx playwright install chromium firefox webkit
+```
+
+Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
+defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
+`playwright.*.config.ts` file. This keeps every runner independently callable without hiding which
+application it starts.
+
+## What each layer proves
+
+- **Unit and conformance tests** stay beside the source they exercise. They cover deterministic
+  behavior, SQL and mutation conformance, differential execution, fault injection, and benchmark
+  generator/oracle contracts.
+- **Library browser tests** exercise IndexedDB and transaction behavior that a Node substitute
+  cannot prove.
+- **Site browser tests** execute the public examples, so documentation cannot drift into
+  non-running sample code.
+- **Benchmark-lab browser tests** verify the whole dataset → engine → query/write → oracle path.
+- **The performance gate** detects regressions on stable seeded query shapes. It is a guardrail,
+  not a published cross-engine benchmark.
+
+When adding a runner, give it one responsibility and make it independently runnable. When adding a
+suite case, derive smoke-test counts from the suite itself instead of copying totals into tests or
+HTML.
+
+## Benchmark workload model
+
+Published captures preserve four workload classes. They are never combined into one score:
+
+| Workload | Read measurement                                    | Write measurement                                                |
+| -------- | --------------------------------------------------- | ---------------------------------------------------------------- |
+| **OLTP** | Selective key, small-set, and bounded-range latency | Point and small-batch inserts, updates, and upserts (1–100 rows) |
+| **OLAP** | Scan, join, window, and aggregate execution         | Bulk ingestion and mutation throughput (10,000–100,000 rows)     |
+
+Read summaries use the geometric mean of per-query medians within one workload. Write results keep
+every operation and batch size visible, reporting both median latency and rows per second. Every
+read must match an independent JavaScript oracle. Every write is read back and compared row for row
+with its oracle. A failed, unsupported, or unverified requested engine makes a publishing capture
+fail before it can write JSON.
+
+The [benchmarks page](/benchmarks/) renders the checked-in captures and explains the measurement
+methodology, storage differences, caching, and memory caveats.
+
+## Capture and publish results
+
+Local captures are disposable and go to `.captures/` by default:
+
+```bash
+npm run benchmark:capture
+```
+
+Use environment variables to narrow an iteration:
+
+```bash
+CAPTURE_ENGINES=minnow CAPTURE_SCALE=1 npm run benchmark:capture -- --project chromium
+```
+
+For a publishing run, capture the intended scale/browser matrix directly into the docs data
+directory:
+
+```bash
+CAPTURE_SCALE=1 \
+CAPTURE_OUT=apps/site/src/data/benchmarks \
+npm run benchmark:capture -- --project chromium
+```
+
+Then run `npm run test:unit`, `npm run site:build`, and `npm run test:browser:site`. Commit the raw
+JSON with the code that interprets it. The docs site only selects the newest capture for each
+scale/browser pair by its recorded timestamp; it never silently merges runs.
+
+After an intentional executor change, inspect the performance-gate output before updating its
+thresholds:
+
+```bash
+npm run benchmark:gate -- --update
+```
+
+Treat that update as a code change: explain it in review and run the gate again without `--update`.
+
+## Refresh the download-size comparison
+
+The benchmarks page opens with what a browser downloads to run each engine. It is measured from
+the installed packages rather than quoted, so refresh it whenever a dependency version or the
+public entry point changes:
+
+```bash
+npm run benchmark:sizes
+```
+
+Each engine's browser entry is bundled and minified with identical esbuild settings, and the
+WebAssembly and data files it fetches at run time are added at their shipped size. The result
+lands in `apps/site/src/data/library-sizes.json`, which the page renders directly.

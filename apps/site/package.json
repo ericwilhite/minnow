@@ -4,14 +4,27 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "astro dev",
-    "build": "astro build",
-    "preview": "astro preview"
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
-    "@astrojs/mdx": "^7.0.5",
     "@minnowdb/core": "0.0.0",
-    "astro": "^7.2.1",
-    "@minnowdb/devtools": "0.0.0"
+    "@minnowdb/devtools": "0.0.0",
+    "fumadocs-core": "^16.14.4",
+    "fumadocs-mdx": "^15.2.3",
+    "fumadocs-ui": "^16.14.4",
+    "next": "^16.3.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/mdx": "^2.0.14",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^4.3.3"
   }
 }

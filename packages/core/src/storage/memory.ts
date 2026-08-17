@@ -50,6 +50,7 @@ import {
   updateTransactionRecord,
   WriteConflictError,
 } from "./types.js";
+import { selectLiveRecords, type DatabaseSnapshot, type SnapshotFtsIndex } from "./snapshot.js";
 
 export class MemoryBlockStore implements BlockStore {
   readonly #blocks = new Map<string, Uint8Array>();
@@ -1183,6 +1184,121 @@ export class MemoryBlockStore implements BlockStore {
     return this.#runAtomic(() => {
       this.#garbageCollectionJobs.delete(id);
     });
+  }
+
+  /**
+   * Copies the current version out as a portable snapshot. Runs on the commit queue, so it sees
+   * one consistent version rather than a commit in progress.
+   *
+   * Only blocks the current manifest still points at are copied, which drops every superseded
+   * block a compaction left behind, and only full-text bases that already cover this exact
+   * version are carried; any other indexed column is exported as `invalid` so the loaded
+   * database rebuilds it. That costs a rebuild, never a wrong answer — the index is a pruning
+   * accelerator and the scan re-verifies every candidate.
+   */
+  exportSnapshot(): Promise<DatabaseSnapshot> {
+    return this.#runAtomic(() => {
+      const version = this.#currentVersion;
+      if (version === null) throw new Error("There is no committed version to snapshot");
+      const manifest = this.#manifests.get(version);
+      if (manifest === undefined) throw new SnapshotManifestMissingError(version);
+
+      const liveBlockIds = new Set(manifest.blockIds);
+      const blocks = manifest.blockIds.map((id) => {
+        const bytes = this.#blocks.get(id);
+        if (bytes === undefined) throw new Error(`Manifest references missing block: ${id}`);
+        return { id, bytes: bytes.slice() };
+      });
+
+      const { segments, transactions } = selectLiveRecords({
+        liveBlockIds,
+        segments: [...this.#segments.values()].map((record) => normalizeSegmentRecord(record)),
+        transactions: [...this.#transactions.values()],
+        version,
+      });
+
+      const tables = [...this.#tables.values()].map((table) => {
+        const fts: SnapshotFtsIndex[] = [];
+        const ftsColumns = { ...(table.ftsColumns ?? {}) };
+        for (const [columnId, state] of Object.entries(ftsColumns)) {
+          const base = this.#ftsBases.get(`${table.id}/${columnId}`);
+          if (state.state === "ready" && base?.coversVersion === version) {
+            fts.push({ columnId, ...structuredClone(base) });
+          } else {
+            ftsColumns[columnId] = { ...state, state: "invalid" };
+          }
+        }
+        return {
+          record: {
+            ...structuredClone(table),
+            ...(Object.keys(ftsColumns).length === 0 ? {} : { ftsColumns }),
+          },
+          nextRowId: this.#nextRowIds.get(table.id) ?? 1n,
+          autoIncrement: table.columns.flatMap((column) => {
+            const next = this.#nextAutoIncrement.get(`${table.id}/${column.id}`);
+            return next === undefined ? [] : [{ columnId: column.id, next }];
+          }),
+          uniqueKeyTokens: [...(this.#uniqueKeys.get(table.id) ?? [])],
+          fts,
+        };
+      });
+
+      return {
+        version,
+        createdAt: new Date().toISOString(),
+        tables,
+        segments,
+        transactions,
+        blocks,
+      };
+    });
+  }
+
+  /** Builds a store holding exactly what the snapshot captured. */
+  static fromSnapshot(snapshot: DatabaseSnapshot): MemoryBlockStore {
+    const store = new MemoryBlockStore();
+    store.#loadSnapshot(snapshot);
+    return store;
+  }
+
+  #loadSnapshot(snapshot: DatabaseSnapshot): void {
+    for (const block of snapshot.blocks) this.#blocks.set(block.id, block.bytes.slice());
+    for (const segment of snapshot.segments) {
+      this.#segments.set(segment.id, normalizeSegmentRecord(segment));
+    }
+    for (const record of snapshot.transactions) {
+      this.#transactions.set(record.id, structuredClone(record));
+    }
+    for (const table of snapshot.tables) {
+      const record = structuredClone(table.record);
+      this.#tables.set(record.id, record);
+      this.#tableIdsByName.set(record.name, record.id);
+      this.#nextRowIds.set(record.id, table.nextRowId);
+      for (const entry of table.autoIncrement) {
+        this.#nextAutoIncrement.set(`${record.id}/${entry.columnId}`, entry.next);
+      }
+      if (table.uniqueKeyTokens.length > 0) {
+        this.#uniqueKeys.set(record.id, new Set(table.uniqueKeyTokens));
+      }
+      for (const index of table.fts) {
+        this.#ftsBases.set(`${record.id}/${index.columnId}`, {
+          coversVersion: index.coversVersion,
+          chunks: structuredClone(index.chunks),
+          totalTokens: index.totalTokens,
+        });
+      }
+    }
+    // One checkpoint, not the captured history: a snapshot restores as a single readable
+    // version, and the version number itself is preserved so committed transactions still
+    // sort and compare against it.
+    this.#manifests.set(snapshot.version, {
+      version: snapshot.version,
+      previousVersion: null,
+      blockIds: snapshot.blocks.map((block) => block.id),
+      createdAt: snapshot.createdAt,
+    });
+    this.#currentVersion = snapshot.version;
+    this.#catalogEpoch += 1;
   }
 
   close(): void {

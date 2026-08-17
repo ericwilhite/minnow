@@ -2,33 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "bench",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--workspace", "@minnowdb/bench"],
-      "port": 4173,
-      "autoPort": true
-    },
-    {
-      "name": "devtools-demo",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["vite", "--port", "4180"],
-      "port": 4180,
-      "url": "http://localhost:4180",
-      "autoPort": true
-    },
-    {
-      "name": "site-preview",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "preview", "--workspace", "@minnowdb/site", "--", "--port", "4322"],
-      "port": 4322,
-      "autoPort": true
-    },
-    {
       "name": "site",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--workspace", "@minnowdb/site"],
-      "port": 4321,
-      "autoPort": true
+      "runtimeArgs": ["run", "site:dev"],
+      "port": 3000
     }
   ]
 }

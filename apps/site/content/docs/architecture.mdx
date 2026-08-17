@@ -1,0 +1,186 @@
+---
+title: Architecture
+description: How Minnow works and why it's built this way.
+---
+
+# Architecture
+
+Minnow is built for how browsers actually behave: tabs close without warning, storage is slow, and
+the same app may be open in five tabs at once. Everything below follows from that.
+
+The short version: data lives in compressed columnar blocks inside IndexedDB, reads see consistent
+snapshots (MVCC), and queries run through a vectorized executor. The full design document is
+`ARCHITECTURE.md` in the repository. This page covers the choices and the reasons.
+
+## The ground rules
+
+These are fixed. Everything else is built around them.
+
+- **IndexedDB is the source of truth.** BroadcastChannel, Web Locks, and page lifecycle events can
+  all fail silently. Minnow uses them to speed things up, never for correctness. Correct behavior
+  always rests on a committed IndexedDB transaction.
+- **Durability ends at a committed transaction.** A committed write is safe. A write still in
+  flight when the tab closes is not. Minnow flushes early when the page hides, but treats that as
+  a bonus, not a guarantee.
+- **Where the engine runs is your choice.** Put it in a worker and hold an async proxy in the
+  page, or construct it on the main thread. The API is async everywhere, so your code — and any
+  adapter written against it — looks the same either way.
+- **Published data is immutable.** Once written, a block never changes. Most of the design falls
+  out of this one rule.
+- **Nothing special to deploy.** No COOP/COEP headers, no SharedArrayBuffer, no WASM file to
+  host. `npm install` and go.
+- **The engine is our own.** No SQLite or DuckDB underneath — engines built for POSIX files carry
+  assumptions browsers don't honor. The trade-off: the SQL surface is a careful subset, tracked in
+  the [feature matrix](/docs/sql/).
+
+## Why columns, why immutable
+
+IndexedDB charges a lot per operation and little per byte. So Minnow stores a few large values
+instead of many small ones:
+
+- Data is packed into **compressed columnar blocks** — one column for a group of rows, roughly a
+  megabyte before compression.
+- No row is ever its own IndexedDB entry, and no table is one giant entry.
+- Each block carries **checksums** (one over the payload, one over the header and its statistics)
+  and min/max stats, so queries can skip blocks that can't match a filter without even
+  decompressing them. There are no user-managed indexes.
+
+Columns beat rows here because most reads touch a few columns across many rows: filter, aggregate,
+scan. Similar values sit together, so they compress well, and queries fetch only the columns they
+use.
+
+Immutability is the rule that pays for everything else:
+
+- A crash can strand unused data — it can never corrupt visible data.
+- Retrying a write is always safe.
+- Another tab can keep reading old data for as long as it needs.
+- A snapshot is just a list of blocks, so snapshots cost nothing.
+
+Writes append small **delta segments**: an update stores just the key and the changed columns, a
+delete stores a key marker. Background compaction folds deltas into larger read-friendly segments
+later. Nothing is ever edited in place.
+
+## How a write commits
+
+Readers see the database through a **manifest** — the list of exactly which blocks make up
+version N. Physically each commit stores only what changed (a full checkpoint lands every 32
+versions), so publishing costs the size of the change, not the size of the database. A commit
+publishes version N + 1, in strict order:
+
+```
+1. encode and compress the new blocks
+2. write the blocks               (nothing points to them yet)
+3. open a short metadata transaction
+4. check the manifest is still at version N
+5. publish manifest N + 1
+```
+
+Data first, pointer last, and the pointer flip is atomic. A crash anywhere in between leaves
+orphaned blocks for the garbage collector — never a manifest pointing at half-written data.
+
+Step 4 is the concurrency control. If another tab published first, the commit fails cleanly and
+retries against the new version. Conflicts surface as typed errors, never as silent interleaving.
+
+Encoding is bounded but parallel across independent columns. Blocks within each column keep their
+original order, and the staged metadata stays in schema order, so native compressors can overlap
+without making the committed layout depend on completion timing.
+
+## Sharing the database across tabs
+
+Minnow assumes several tabs, unaware of each other, some frozen or already gone.
+
+- **One writer wins.** IndexedDB serializes the manifest flip. Two tabs can prepare writes at the
+  same time; only one publishes, the other retries.
+- **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
+  reconciles against IndexedDB. A missed message costs a little latency, never a stale result.
+  [Live queries](/docs/live-queries/) are built on this.
+- **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
+  expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
+  pinned becomes reclaimable. No heartbeats, no guessing.
+
+## How queries run
+
+- Data flows through the executor in typed batches of 2,048 rows: numbers and dates in
+  `Float64Array`s, strings dictionary-coded, nulls in packed bitmaps. Tight loops over typed
+  arrays instead of millions of short-lived objects.
+- Grouping on dictionary-coded strings reuses their integer codes. Small compound domains use
+  direct-address slots; high-cardinality sparse domains pack the codes into a numeric key. Both
+  avoid repeatedly encoding and hashing the same strings for every input row.
+- Queries accept a **memory budget** (`executionMemoryBudgetBytes`). Memory is reserved before it
+  is allocated. Under a budget, sorts and grouped aggregations spill to durable temp pages instead
+  of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.
+- Spill pages are lease-protected, so a query abandoned by a dead tab gets cleaned up.
+- Compiled plans are cached separately, by statement text, so re-issuing a statement doesn't
+  re-parse or re-plan it.
+- Everything else repeated is cached in one byte-bounded buffer pool (`bufferPoolBytes`,
+  default 64 MiB): decoded blocks by immutable block id, assembled column vectors and zone
+  descriptions by the same, and computed results — whole-block results, the columnar forms of
+  derived and windowed sources, and whole statement results — by exact visible-segment
+  fingerprint. A commit moves the fingerprints, so computed entries stop matching, but
+  unchanged blocks stay decoded: the next statement pays re-assembly, not re-fetch and
+  re-decompression. Passing `memoize: false` to a query bypasses the computed-result entries
+  and measures execution, which is what the benchmarks do.
+
+The budget is a model, not a heap meter, and not every operator can spill yet — see
+[what we don't claim](#what-we-dont-claim).
+
+## Background work
+
+Compaction and garbage collection run for a long time inside a tab that can die at any moment. So:
+
+- **Every job is a durable record.** Plan first, persist the plan, then advance in small
+  checkpointed steps. A dead tab costs one step, not the whole job.
+- **Cancellation is a real outcome.** Cancel and publish settle atomically — exactly one wins.
+- **Garbage collection is reachability.** Whatever the current manifest, unexpired leases, live
+  transactions, and running compactions still reference is kept. Each deletion re-checks liveness
+  atomically, so nothing is revived after it's gone.
+- **Compaction has a write budget.** A rewrite that would cost more than a set multiple of the
+  data it consolidates is refused up front, not discovered in the quota bill.
+
+## The shape of the system
+
+```
+Page (UI thread)       async proxy: requests, cancellation, results
+        |
+Coordinator worker     catalog, snapshots, transactions, planning, live queries
+        |
+Storage                IndexedDB, block codecs, manifests, leases, GC
+```
+
+- Each tab owns its own coordinator worker.
+- Buffers cross the boundary as transferable `ArrayBuffer`s — no shared memory, which is why no
+  cross-origin isolation is needed.
+- The [worker protocol](/docs/workers/) is versioned RPC; each handle answers a fixed list of
+  methods, nothing else.
+- Inside `@minnowdb/core`, the layers are separate modules — `block-format`, `storage`,
+  `transactions`, and the engine — each importable on its own.
+
+## Crash testing
+
+Fault injection has been required since the first storage code. Tests kill the engine before and
+after every block write and manifest commit, and these must hold no matter where the crash lands:
+
+1. A visible manifest only references complete, checksum-valid blocks.
+2. A stale manifest check cannot publish anything.
+3. Retrying a block write cannot change published bytes.
+4. Unpublished data never affects a read and is always safe to collect.
+5. The UI stays responsive regardless of operation size.
+
+The same hook is public: `FaultInjectingBlockStore` in `@minnowdb/core/testing` wraps any store,
+so your own tests can crash the engine on purpose too.
+
+## What we don't claim
+
+- **Bounded memory is a goal, not a guarantee yet.** Projected columns still materialize in full
+  before accounting starts, and some join shapes can't spill. The budget catches whole classes of
+  blowups; it is not a hard cap on the heap.
+- **No big-dataset performance claims** until real browser measurements back them. The
+  [benchmarks](/benchmarks/) publish what has been measured, methodology included.
+- **The early block format may change.** Formats only ever grow (new codecs get new IDs; old
+  bytes are never reinterpreted), but this early format — currently version 1, whose header and
+  statistics are independently checksummed — carries no compatibility promise yet.
+- **No index DDL.** Skipping comes from block statistics. That's a feature, not a gap.
+
+One working rule sits behind all of this: each layer advances only when measurements support it —
+storage throughput before query work, atomic commits under injected faults before multi-tab
+features. Finding out early is cheap. Finding out late is a rewrite.

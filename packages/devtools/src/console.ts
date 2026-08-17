@@ -32,6 +32,8 @@ export interface ConsoleView {
   setSchema(schema: EditorSchema): void;
   /** Drops text in at the caret — how the rail contributes to a query. */
   insert(text: string): void;
+  /** Replaces the whole statement. Embedders use this to offer a query to start from. */
+  setQuery(sql: string): void;
   /** Releases the editor. CodeMirror registers observers that outlive its DOM node. */
   destroy(): void;
 }
@@ -328,6 +330,10 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     },
     insert: (text) => {
       editor.insert(text);
+    },
+    setQuery: (sql) => {
+      editor.setValue(sql);
+      editor.focus();
     },
     destroy: () => {
       editor.destroy();

@@ -55,6 +55,12 @@ import {
   updateTransactionRecord,
   WriteConflictError,
 } from "./types.js";
+import {
+  selectLiveRecords,
+  type DatabaseSnapshot,
+  type SnapshotFtsIndex,
+  type SnapshotTable,
+} from "./snapshot.js";
 
 const SCHEMA_VERSION = 2;
 const CURRENT_MANIFEST_KEY = "manifest/current";
@@ -88,6 +94,17 @@ const COMPACTION_JOB_KEY_PREFIX = "compaction-job/";
 const GARBAGE_COLLECTION_JOB_KEY_PREFIX = "garbage-collection-job/";
 const storageTextEncoder = new TextEncoder();
 const storageTextBuffer = new Uint8Array(1_024);
+/** Blocks per read when copying a database out; keeps one export request list bounded. */
+const SNAPSHOT_BLOCK_BATCH = 512;
+/** Bytes per write transaction when loading a snapshot in. */
+const SNAPSHOT_BATCH_BYTES = 8 * 1024 * 1024;
+
+/** Where a snapshot load has got to, for a progress bar over a multi-megabyte file. */
+export interface SnapshotLoadProgress {
+  phase: "blocks" | "catalog" | "done";
+  writtenBytes: number;
+  totalBytes: number;
+}
 
 interface UniqueKeyChunk {
   addedTokens: string[];
@@ -2198,6 +2215,222 @@ export class IndexedDbBlockStore implements BlockStore {
     return total;
   }
 
+  /**
+   * Copies the current version out as a portable snapshot. See `./snapshot.ts` for what a
+   * snapshot carries and what it deliberately leaves behind.
+   *
+   * This reads across several transactions rather than one, so a concurrent commit could move
+   * the version underneath it. Hold a `backup` lease (see `../transactions/index.ts`) around
+   * the call when that is possible; the offline generators that produce published datasets are
+   * the only writer in their process and do not need one.
+   */
+  async exportSnapshot(): Promise<DatabaseSnapshot> {
+    const manifest = await this.getCurrentManifest();
+    if (manifest === undefined) throw new Error("There is no committed version to snapshot");
+    const version = manifest.version;
+
+    const blocks: Array<{ id: string; bytes: Uint8Array }> = [];
+    for (let start = 0; start < manifest.blockIds.length; start += SNAPSHOT_BLOCK_BATCH) {
+      const ids = manifest.blockIds.slice(start, start + SNAPSHOT_BLOCK_BATCH);
+      const values = await this.getBlocks(ids);
+      values.forEach((bytes, index) => {
+        const id = ids[index] ?? "";
+        if (bytes === undefined) throw new Error(`Manifest references missing block: ${id}`);
+        blocks.push({ id, bytes });
+      });
+    }
+
+    const { segments, transactions } = selectLiveRecords({
+      liveBlockIds: new Set(manifest.blockIds),
+      segments: await this.listSegments(),
+      transactions: await this.listTransactions(),
+      version,
+    });
+
+    const tables: SnapshotTable[] = [];
+    for (const record of await this.listTables()) {
+      const transaction = this.#transaction("catalog", "readonly");
+      const catalog = transaction.objectStore("catalog");
+      const [rowIdValue, ...autoIncrementValues] = await Promise.all([
+        requestResult<unknown>(catalog.get(`${ROW_ID_PREFIX}${record.id}`)),
+        ...record.columns.map((column) =>
+          requestResult<unknown>(catalog.get(`${AUTO_INCREMENT_PREFIX}${record.id}/${column.id}`)),
+        ),
+      ]);
+      const uniqueKeyTokens =
+        record.uniqueKeyColumnId === undefined
+          ? []
+          : [...(await readAllUniqueKeyTokens(catalog, record.id, record.uniqueKeyStorage))];
+
+      const fts: SnapshotFtsIndex[] = [];
+      const ftsColumns = { ...(record.ftsColumns ?? {}) };
+      for (const [columnId, state] of Object.entries(ftsColumns)) {
+        const toc = (await requestResult<unknown>(
+          catalog.get(`${FTS_BASE_INDEX_PREFIX}${record.id}/${columnId}`),
+        )) as FtsBaseToc | undefined;
+        if (state.state !== "ready" || toc?.coversVersion !== version) {
+          // Anything not already covering this exact version restores as a rebuild. The index
+          // is a pruning accelerator that the scan re-verifies, so that costs speed, not truth.
+          ftsColumns[columnId] = { ...state, state: "invalid" };
+          continue;
+        }
+        const prefix = `${FTS_BASE_PREFIX}${record.id}/${columnId}/`;
+        const chunks = (await Promise.all(
+          toc.boundaries.map((_, ordinal) =>
+            requestResult<unknown>(catalog.get(`${prefix}${String(ordinal).padStart(6, "0")}`)),
+          ),
+        )) as Array<FtsPosting[] | undefined>;
+        fts.push({
+          columnId,
+          coversVersion: toc.coversVersion,
+          totalTokens: toc.totalTokens,
+          chunks: chunks.map((chunk) => chunk ?? []),
+        });
+      }
+      await transactionDone(transaction);
+
+      tables.push({
+        record: {
+          ...record,
+          ...(Object.keys(ftsColumns).length === 0 ? {} : { ftsColumns }),
+        },
+        nextRowId: (rowIdValue as bigint | undefined) ?? 1n,
+        autoIncrement: record.columns.flatMap((column, index) => {
+          const next = autoIncrementValues[index] as bigint | undefined;
+          return next === undefined ? [] : [{ columnId: column.id, next }];
+        }),
+        uniqueKeyTokens,
+        fts,
+      });
+    }
+
+    return { version, createdAt: new Date().toISOString(), tables, segments, transactions, blocks };
+  }
+
+  /**
+   * Loads a snapshot into this store, which must be empty. Block payloads go in batched
+   * transactions so a large dataset does not build one enormous write, and the current-version
+   * pointer is written last: until it lands, an interrupted load leaves a store that still reads
+   * as empty rather than as half a database.
+   */
+  async importSnapshot(
+    snapshot: DatabaseSnapshot,
+    options: { onProgress?: (progress: SnapshotLoadProgress) => void } = {},
+  ): Promise<void> {
+    const existing = await this.getCurrentManifestVersion();
+    if (existing !== null) throw new Error("This store already holds a database");
+    if ((await this.listTables()).length > 0) {
+      throw new Error("This store already holds a catalog");
+    }
+
+    const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
+    let writtenBytes = 0;
+    options.onProgress?.({ phase: "blocks", writtenBytes, totalBytes });
+
+    let batch: Array<{ id: string; bytes: Uint8Array }> = [];
+    let batchBytes = 0;
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) return;
+      await this.addBlocks(batch);
+      writtenBytes += batchBytes;
+      options.onProgress?.({ phase: "blocks", writtenBytes, totalBytes });
+      batch = [];
+      batchBytes = 0;
+    };
+    for (const block of snapshot.blocks) {
+      batch.push(block);
+      batchBytes += block.bytes.byteLength;
+      if (batchBytes >= SNAPSHOT_BATCH_BYTES) await flush();
+    }
+    await flush();
+
+    options.onProgress?.({ phase: "catalog", writtenBytes, totalBytes });
+    for (const table of snapshot.tables) await this.#importSnapshotTable(table, snapshot.version);
+
+    const transaction = this.#transaction(["manifests", "segments", "transactions"], "readwrite");
+    const manifests = transaction.objectStore("manifests");
+    const segments = transaction.objectStore("segments");
+    const transactions = transaction.objectStore("transactions");
+    // One checkpoint carrying the complete block list, so nothing resolves through a delta
+    // chain that no longer exists.
+    const record: StoredManifestRecord = {
+      version: snapshot.version,
+      previousVersion: null,
+      blockIds: snapshot.blocks.map((block) => block.id),
+      createdAt: snapshot.createdAt,
+      deltaDepth: 0,
+    };
+    manifests.put(record, snapshot.version);
+    for (const segment of snapshot.segments) {
+      segments.put(normalizeSegmentRecord(segment), segment.id);
+    }
+    for (const entry of snapshot.transactions) transactions.put(structuredClone(entry), entry.id);
+    await transactionDone(transaction);
+
+    const pointer = this.#transaction("catalog", "readwrite");
+    const catalog = pointer.objectStore("catalog");
+    catalog.put(snapshot.version, CURRENT_MANIFEST_KEY);
+    await bumpCatalogEpoch(catalog);
+    await transactionDone(pointer);
+    options.onProgress?.({ phase: "done", writtenBytes, totalBytes });
+  }
+
+  async #importSnapshotTable(table: SnapshotTable, version: number): Promise<void> {
+    const keyed = table.record.uniqueKeyColumnId !== undefined;
+    // The snapshot carries logical membership, not a storage layout, so it always loads as the
+    // current one. Writing the base pre-folded is what keeps it that way: replaying the tokens
+    // as commit chunks instead would leave a tail long enough to make the first write crawl.
+    const record: TableRecord = {
+      ...table.record,
+      ...(keyed ? { uniqueKeyLookupReady: true, uniqueKeyStorage: "chunks-v2" as const } : {}),
+    };
+
+    const transaction = this.#transaction("catalog", "readwrite");
+    const catalog = transaction.objectStore("catalog");
+    catalog.put(structuredClone(record), `${TABLE_ID_PREFIX}${record.id}`);
+    catalog.put(record.id, `${TABLE_NAME_PREFIX}${record.name}`);
+    catalog.put(table.nextRowId, `${ROW_ID_PREFIX}${record.id}`);
+    for (const entry of table.autoIncrement) {
+      catalog.put(entry.next, `${AUTO_INCREMENT_PREFIX}${record.id}/${entry.columnId}`);
+    }
+
+    if (keyed) {
+      const partitions = Math.max(
+        1,
+        Math.ceil(table.uniqueKeyTokens.length / UNIQUE_KEY_PARTITION_TARGET),
+      );
+      const parts: string[][] = Array.from({ length: partitions }, () => []);
+      for (const token of table.uniqueKeyTokens) parts[fnv1a(token) % partitions]?.push(token);
+      parts.forEach((tokens, ordinal) => {
+        catalog.put(tokens, uniqueKeyBasePartKey(record.id, ordinal));
+      });
+      const index: UniqueKeyChunkIndex = {
+        versions: [],
+        hasBase: true,
+        partitions,
+        tokenCount: table.uniqueKeyTokens.length,
+      };
+      catalog.put(index, uniqueKeyChunkIndexKey(record.id));
+    }
+
+    for (const entry of table.fts) {
+      const prefix = `${FTS_BASE_PREFIX}${record.id}/${entry.columnId}/`;
+      const boundaries = entry.chunks.map((chunk) => ({
+        first: chunk[0]?.term ?? "",
+        last: chunk[chunk.length - 1]?.term ?? "",
+      }));
+      entry.chunks.forEach((chunk, ordinal) => {
+        catalog.put(structuredClone(chunk), `${prefix}${String(ordinal).padStart(6, "0")}`);
+      });
+      catalog.put(
+        { coversVersion: version, boundaries, totalTokens: entry.totalTokens },
+        `${FTS_BASE_INDEX_PREFIX}${record.id}/${entry.columnId}`,
+      );
+      catalog.put({ versions: [] }, ftsChunkIndexKey(record.id, entry.columnId));
+    }
+    await transactionDone(transaction);
+  }
+
   close(): void {
     this.#db.close();
   }
@@ -3288,6 +3521,37 @@ async function readAllV2BaseTokens(
   return present;
 }
 
+/**
+ * A table's complete unique-key membership: the folded base for whichever layout it uses, plus
+ * every unfolded tail chunk replayed in commit order. Snapshots need the whole set, where the
+ * commit path only ever needs the tokens it is about to write.
+ */
+async function readAllUniqueKeyTokens(
+  store: IDBObjectStore,
+  tableId: string,
+  mode: "chunks-v1" | "chunks-v2" | undefined,
+): Promise<Set<string>> {
+  if (mode !== "chunks-v1" && mode !== "chunks-v2") {
+    // The pre-chunk layout stored one record per key and predates every shipped writer.
+    return scanLegacyUniqueKeyTokens(store, tableId);
+  }
+  const index = asUniqueKeyChunkIndex(
+    await requestResult<unknown>(store.get(uniqueKeyChunkIndexKey(tableId))),
+  );
+  const present = index.hasBase
+    ? mode === "chunks-v2"
+      ? await readAllV2BaseTokens(store, tableId, index)
+      : await scanUniqueKeyBaseTokens(store, tableId)
+    : new Set<string>();
+  const chunks = await Promise.all(
+    index.versions.map((version) =>
+      requestResult<unknown>(store.get(uniqueKeyChunkKey(tableId, version))),
+    ),
+  );
+  for (const chunk of chunks) applyChunk(present, asUniqueKeyChunk(chunk));
+  return present;
+}
+
 async function readChunkedUniqueKeys(
   store: IDBObjectStore,
   tableId: string,
@@ -3380,9 +3644,22 @@ async function readChunkedUniqueKeys(
  * range (or throws because the cursor is already beyond it) means the walk is complete.
  */
 function scanUniqueKeyBaseTokens(store: IDBObjectStore, tableId: string): Promise<Set<string>> {
+  return scanUniqueKeyTokenRange(store, UNIQUE_KEY_BASE, tableId);
+}
+
+/** The same walk over the pre-chunk layout, where each key was its own record. */
+function scanLegacyUniqueKeyTokens(store: IDBObjectStore, tableId: string): Promise<Set<string>> {
+  return scanUniqueKeyTokenRange(store, "unique-key", tableId);
+}
+
+function scanUniqueKeyTokenRange(
+  store: IDBObjectStore,
+  prefix: string,
+  tableId: string,
+): Promise<Set<string>> {
   return new Promise((resolve, reject) => {
     const tokens = new Set<string>();
-    const rangeStart: IDBValidKey = [UNIQUE_KEY_BASE, tableId, ""];
+    const rangeStart: IDBValidKey = [prefix, tableId, ""];
     const request = store.openKeyCursor();
     let seeked = false;
     request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
@@ -3395,7 +3672,7 @@ function scanUniqueKeyBaseTokens(store: IDBObjectStore, tableId: string): Promis
       const key = cursor.key;
       if (
         Array.isArray(key) &&
-        key[0] === UNIQUE_KEY_BASE &&
+        key[0] === prefix &&
         key[1] === tableId &&
         typeof key[2] === "string"
       ) {

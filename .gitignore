@@ -5,5 +5,8 @@ playwright-report/
 test-results/
 *.tsbuildinfo
 .DS_Store
+.dataset-cache/
 apps/site/.astro/
-.captures/
+apps/site/.next/
+apps/site/out/
+apps/site/.source/

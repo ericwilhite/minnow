@@ -50,6 +50,9 @@ export function mountMinnowDevtools(
     open: () => {
       handle.open();
     },
+    setQuery: (sql: string) => {
+      handle.setQuery(sql);
+    },
     close: () => {
       handle.close();
     },

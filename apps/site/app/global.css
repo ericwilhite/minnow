@@ -1,0 +1,117 @@
+@import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+
+/*
+ * Minnow's palette over Fumadocs' tokens. The look carries over from the previous site: a
+ * near-white canvas, quiet warm greys, decoration by omission, and one blue that does all the
+ * signalling. Fumadocs reads everything through `--color-fd-*`, so restating those is the whole
+ * theme — no component overrides, and UI updates keep landing.
+ */
+@theme {
+  --color-fd-background: #ffffff;
+  --color-fd-foreground: rgb(55, 53, 47);
+  --color-fd-muted: #f7f7f5;
+  --color-fd-muted-foreground: rgba(55, 53, 47, 0.65);
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: rgb(55, 53, 47);
+  --color-fd-card: #ffffff;
+  --color-fd-card-foreground: rgb(55, 53, 47);
+  --color-fd-border: rgba(55, 53, 47, 0.11);
+  --color-fd-primary: #2383e2;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #f7f7f5;
+  --color-fd-secondary-foreground: rgb(55, 53, 47);
+  --color-fd-accent: rgba(55, 53, 47, 0.06);
+  --color-fd-accent-foreground: rgb(55, 53, 47);
+  --color-fd-ring: rgba(35, 131, 226, 0.45);
+
+  --font-sans:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica,
+    "Apple Color Emoji", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+.dark {
+  --color-fd-background: #191919;
+  --color-fd-foreground: rgba(255, 255, 255, 0.81);
+  --color-fd-muted: #202020;
+  --color-fd-muted-foreground: rgba(255, 255, 255, 0.46);
+  --color-fd-popover: #202020;
+  --color-fd-popover-foreground: rgba(255, 255, 255, 0.81);
+  --color-fd-card: #202020;
+  --color-fd-card-foreground: rgba(255, 255, 255, 0.81);
+  --color-fd-border: rgba(255, 255, 255, 0.1);
+  --color-fd-primary: #529cca;
+  --color-fd-primary-foreground: #101010;
+  --color-fd-secondary: #202020;
+  --color-fd-secondary-foreground: rgba(255, 255, 255, 0.81);
+  --color-fd-accent: rgba(255, 255, 255, 0.06);
+  --color-fd-accent-foreground: rgba(255, 255, 255, 0.81);
+  --color-fd-ring: rgba(82, 156, 202, 0.5);
+}
+
+:root {
+  --fd-layout-width: 1440px;
+}
+
+/* A reading measure rather than a full-bleed column: prose is easier to follow narrow. */
+#nd-page article {
+  --fd-page-width: 46rem;
+}
+
+/*
+ * The devtools panel mounts into a shadow root, so Tailwind's preflight cannot reach inside it.
+ * The host element still needs a size and a frame from this side.
+ */
+.minnow-panel {
+  border: 1px solid var(--color-fd-border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--color-fd-muted);
+}
+
+/* The logo's motion, kept here so the component stays markup only. */
+.minnow-eye {
+  fill: var(--color-fd-background);
+}
+
+.minnow-tail {
+  transform-origin: 30px 31px;
+}
+
+.minnow-swim .minnow-tail {
+  animation: minnow-flick 1.6s ease-in-out infinite;
+}
+
+.minnow-water path {
+  animation: minnow-drift 7s ease-in-out infinite;
+}
+
+@keyframes minnow-flick {
+  0%,
+  100% {
+    transform: rotate(-7deg);
+  }
+  50% {
+    transform: rotate(7deg);
+  }
+}
+
+@keyframes minnow-drift {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(-6px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .minnow-swim .minnow-tail,
+  .minnow-water path {
+    animation: none;
+  }
+}

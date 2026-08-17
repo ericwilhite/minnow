@@ -1,0 +1,13 @@
+# Cloudflare Pages headers.
+#
+# The benchmarks page loads SQLite's WebAssembly build, whose OPFS VFS needs SharedArrayBuffer
+# and therefore a cross-origin isolated document. Isolation is scoped to that route on purpose:
+# `require-corp` blocks every cross-origin subresource on any page it covers, and applying it
+# site-wide would be a standing constraint on pages that gain nothing from it.
+/benchmarks
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/benchmarks/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

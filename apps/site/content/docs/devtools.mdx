@@ -1,0 +1,250 @@
+---
+title: Devtools
+description: An embeddable SQL console for your database — a floating panel in dev, an inline playground in docs.
+---
+
+# Devtools
+
+A panel you drop into any app to browse, edit, and query the database it is already using. It
+floats over your page without blocking it, and every change asks first.
+
+## Try it on this page
+
+The launcher below is the real thing, in its production shape: a database running in a web worker
+(the same [worker client](/docs/workers/) an app ships), loaded with a generated five-table
+commerce dataset — 165,808 rows of regions, customers, products, orders, and order items. The
+panel floats over these docs exactly as it would float over your app, and the title-bar badge
+reads **worker** because the queries genuinely leave the page. For the same panel rendered inline
+against a small in-memory database, see the [playground](/docs/playground/).
+
+## Install
+
+```bash
+npm install @minnowdb/devtools
+```
+
+## Mount it
+
+The panel attaches to a `MinnowDatabase`, a `MinnowDatabaseClient`, or the `Minnow` facade over
+either — it reaches the database behind a facade through [`db.driver`](/docs/api/).
+
+```ts
+import { mountMinnowDevtools } from "@minnowdb/devtools";
+
+if (import.meta.env.DEV) {
+  mountMinnowDevtools(db, { corner: "bottom-right" });
+}
+```
+
+That adds a launcher button in the corner. Click it, or press `Cmd/Ctrl + Shift + D`.
+
+Keep the mount behind a development check. The devtools are a separate package precisely so they
+can be left out of a production bundle.
+
+## Or use the element
+
+`<minnow-devtools>` is a custom element, so it works unchanged in React, Vue, Svelte, Solid, Astro,
+and plain HTML. Its shadow root keeps your styles out and its own styles in.
+
+```ts
+import { defineMinnowDevtools } from "@minnowdb/devtools";
+
+defineMinnowDevtools();
+document.querySelector("minnow-devtools").target = db;
+```
+
+```html
+<minnow-devtools corner="bottom-left" hotkey="mod+k"></minnow-devtools>
+```
+
+The database is a property rather than an attribute, because it is an object.
+
+## Options
+
+| Option         | Attribute       | Default             | What it does                                                   |
+| -------------- | --------------- | ------------------- | -------------------------------------------------------------- |
+| `mode`         | `mode`          | `"launcher"`        | `"launcher"` floats over the page; `"inline"` renders in flow. |
+| `corner`       | `corner`        | `"bottom-right"`    | Which corner the launcher and the opening panel use.           |
+| `hotkey`       | `hotkey`        | `"mod+shift+d"`     | Toggle shortcut. `mod` is Cmd or Ctrl. Empty turns it off.     |
+| `defaultOpen`  | `open`          | `false`             | Open on mount. Inline panels are always open.                  |
+| `zIndex`       | `z-index`       | `2147483000`        | Stacking against your own overlays.                            |
+| `permissions`  | `write`         | `{ write: true }`   | `write: false` refuses every statement that changes data.      |
+| `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                   |
+| `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                   |
+
+## The schema rail
+
+Your tables sit down the left of both tabs, each expanding to its columns with their types,
+nullability, and which one is the unique key. Knowing what a column is called is as useful for
+writing a query as it is for browsing a table, so the rail never goes away.
+
+What clicking does follows the tab you are on:
+
+- On **Query**, a table or column name is inserted at the caret — `orders`, or `orders.total` —
+  spaced from whatever precedes it.
+- On **Data**, a table opens in the grid.
+
+The chevron expands a table either way, so you can read its columns without loading it.
+
+## Browsing data
+
+The **Data** tab browses one table at a time. Pick it from the rail, or from the picker in the
+toolbar.
+
+**Sorting.** Click a column header to sort ascending, again for descending, again to return to the
+table's own order. The unique key is appended to every sort, so rows with equal values keep a
+stable order instead of shuffling between pages.
+
+**Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `contains`, `starts with`, `<`, `≤`,
+`>`, `≥`, `like`, `in`, `between`, `is null`, `is not null`, offered per column type. Values are
+converted to the column's type before they reach SQL, so `score > 10` compares numbers. Filters
+combine with AND.
+
+For text, **`contains` is the one you usually want** — it adds the wildcards, so `crea` finds
+`created`. `like` takes a pattern exactly as written, which is standard SQL: `like crea` matches
+only the string `crea`, and you need `%crea%` to search inside a value. The value box hints which
+one you are in.
+
+Both are case-sensitive. A `contains` or `starts with` value is treated as literal text — `_` and
+`%` typed into it are escaped, so searching for `100%` finds `100%` and nothing else. In `like`
+they stay live as wildcards, because there you are writing the pattern yourself (with
+`ESCAPE '\'` available when you need a literal one).
+
+**Paging.** Rows load as you scroll. Where it can, the explorer asks for "the rows after the last
+one I saw" rather than "skip the first N", so reading deep into a table costs the same as reading
+the start of it. The status bar always says which it is using.
+
+A cursor needs a total order it can address exactly, so the explorer counts from the start instead
+when the table has no unique key, when the sort column is nullable (no comparison matches NULL), or
+when it is a datetime (the engine's date literals carry no time of day). Both give the same rows;
+one just gets slower the further in you go.
+
+**Counting.** `COUNT(*)` scans the whole table, so it runs alongside the first page rather than
+delaying it. Until it lands, the status bar says how many rows are loaded.
+
+## Editing rows
+
+Double-click a cell to edit it, then save with the check beside the input or with `Enter`; the ×
+or `Escape` discards it. Clicking elsewhere leaves the editor open rather than throwing the edit
+away. Click a row to select it, then **Delete row**. **Add row** opens a form with one input per
+column. Every one of them describes what it is about to do and waits for you to agree — the
+confirmation names the table, the key, and the before and after values.
+
+Values are typed as the column is typed, and checked in the editor rather than after you confirm:
+`twelve` in a number column is refused on the spot. A blank input means NULL where the column
+allows it, and `NULL` typed into a text column means the same thing (a literal `'NULL'` string
+needs the quotes).
+
+Writes go through the keyed batch API rather than generated SQL, so a datetime is written to the
+millisecond — the day-granular limit applies only to filters, which have to compile to SQL.
+
+After a write the row is re-read rather than patched in place, so the grid shows what actually
+landed.
+
+**When editing is unavailable**, the panel says so in a banner instead of leaving a dead button:
+
+| Situation                   | What you can still do                                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `permissions.write: false`  | Browse only.                                                                                            |
+| The target has no write API | Browse only.                                                                                            |
+| The table has no unique key | Browse and insert — the engine keys updates and deletes by the unique key and refuses them without one. |
+
+## The window
+
+It is a window, not a modal. There is no backdrop over your page and no focus trap — the app
+underneath stays fully clickable while the panel is open. Drag it by its title bar and resize it
+from any edge or corner; dragging a left or top edge holds the opposite one still, the way a
+window manager does.
+
+**Maximize** next to the close button fills the screen, and restores to the size the window was
+actually left at — double-clicking the title bar does the same. In the console, the divider
+between the editor and the results is draggable, and the height you give the editor is remembered.
+
+Both sidebars collapse to a narrow strip with the chevron in their header, which is how you give
+the editor or the grid the full width. The panel reopens where you left it, with the same sidebars
+collapsed.
+
+They also step aside on their own as the panel narrows — history first, then the tables — so a
+small panel spends its width on the thing you are looking at. The Data toolbar carries its own
+table picker, so choosing a table never depends on the rail being there.
+
+Two badges in the title bar say what you are working with:
+
+- **worker** or **main thread** — a database built in the page runs queries on the main thread, so
+  a slow one will freeze it. The [worker client](/docs/workers/) does not.
+- **write on** or **read-only** — whether `permissions.write` allows changes.
+
+## Running statements
+
+The **Query** tab is a SQL console over the same database, with syntax highlighting and completion
+drawn from your own catalog: type a table name and its columns are offered, `events.` narrows to
+that table's columns. `Cmd/Ctrl + Enter` runs.
+
+The editor loads the first time you open the tab, not when the panel mounts — the launcher and the
+data explorer never pay for it. Until it arrives (and if it fails to arrive at all) the console is a
+plain text box that runs queries exactly the same way.
+
+Queries return rows; anything that changes data is described and confirmed first:
+
+- The prompt names the table, the operation, and the statement itself before it runs.
+- An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
+- With `permissions.write: false`, the statement is refused outright and never reaches the database.
+
+What a statement does is read off the compiled plan, not its text, so a `SELECT` that merely
+mentions `DELETE` in a string literal is still a query.
+
+SQL that fails to compile is reported with the offending token selected in the editor — the
+position comes from [`SqlCompileError`](/docs/queries/#locating-a-compile-error).
+
+## Diagnostics
+
+The editor compiles as you type and underlines what it cannot parse, on the token rather than the
+line. This costs nothing per keystroke: `compileStatement` is part of the library and runs in the
+page, so nothing is sent to the worker and no query is executed to find out that the SQL is wrong.
+
+Where the failure names a capability the engine records as unsupported, the message says which one
+and what stands in for it — "Expected SELECT, found BEGIN" also explains that transactions are
+scoped through the API rather than opened in SQL. That comes from the shipped
+[feature matrix](/docs/sql/), so it stays true as the engine changes. A message that several
+features share explains nothing rather than guessing between them.
+
+## Plan
+
+The **Plan** tab beside the results shows what the optimizer made of the statement — the join
+order, which predicates were pushed down, and whether the scan can stream. It is asked for only
+when you look at it, and running a query returns you to the rows.
+
+## History
+
+The last 50 runs are kept beside the console, newest first, each with its row count, timing, and
+age — or its error message, in red, if it failed. Click one to put it back in the editor.
+
+The query text and those timings persist, so history survives a reload. Result sets do not: fifty
+of them would exhaust the storage quota on the first wide query, so recent rows are cached in
+memory only and a recalled entry offers to run again once its rows have aged out. **Clear** forgets
+everything. History is namespaced by `storageKey`, so two panels on a page keep their own.
+
+## Embedding a playground
+
+`mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
+panel, in flow, sized by its container. The [playground](/docs/playground/) is exactly this,
+pointed at an in-memory database:
+
+```ts
+mountMinnowDevtools(db, {
+  container: document.querySelector("#playground"),
+  mode: "inline",
+  initialQuery: "SELECT * FROM people",
+});
+```
+
+## Cleaning up
+
+`mountMinnowDevtools` returns a handle:
+
+```ts
+const devtools = mountMinnowDevtools(db);
+devtools.open();
+devtools.close();
+devtools.destroy(); // removes every listener and the element it created
+```
