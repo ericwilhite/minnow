@@ -43,6 +43,7 @@ import {
   type QueryMemoryUsage,
 } from "./memory.js";
 import { compareSqlStrings, defineSqlResultProperty } from "./sql-semantics.js";
+import { buildSortKeyColumn } from "./sort-keys.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
 /** Above this, locating each IN member separately costs more than scanning between them. */
@@ -2231,8 +2232,10 @@ function finishResult(
         rows.length,
         Uint32Array.BYTES_PER_ELEMENT * 2 +
           Uint8Array.BYTES_PER_ELEMENT +
-          // One reference slot per extracted sort key (stableSortRows key columns).
-          plan.orderBy.length * QUERY_REFERENCE_BYTES,
+          // Per extracted sort key: one slot, plus the null mask a numeric column adds beside
+          // its Float64Array. Modeled for every term, since which columns specialize is only
+          // known once the values are read.
+          plan.orderBy.length * (QUERY_REFERENCE_BYTES + Uint8Array.BYTES_PER_ELEMENT),
         "Ordering typed scratch",
       ),
       "Ordering typed scratch",
@@ -3383,18 +3386,26 @@ class ResultSink {
     this.#selectionReservedBytes = this.#selectionBytes;
   }
 
-  /** Sorts the selection, keeps the best `capacity` entries, and advances the cut line. */
+  /**
+   * Trims the selection to the best `capacity` entries and advances the cut line.
+   *
+   * Partition, not sort: which rows survive is all that matters here, because `finish` hands
+   * them back in arrival order for the query's own ORDER BY to sort. Quickselect puts the
+   * capacity-th best entry at its final index with everything better ahead of it, in linear
+   * comparisons rather than n log n. The retained set is identical to what sorting and
+   * truncating produced — the comparator is the same, ties included — and so is the memory,
+   * which is the point: a deep page keeps its bound and stops paying a full sort for it.
+   */
   #compactSelection(): void {
     const capacity = this.#capacity ?? 0;
     if (this.#selection.length <= capacity) return;
-    this.#selection.sort((left, right) => {
-      const comparison = this.#compareKeys(left.keys, right.keys);
-      return comparison !== 0 ? comparison : left.seq - right.seq;
-    });
+    this.#selectBest(capacity);
     this.#selection.length = capacity;
     let retainedBytes = 0;
     for (const entry of this.#selection) retainedBytes += entry.bytes;
     this.#selectionBytes = retainedBytes;
+    // Quickselect leaves the capacity-th best entry at the last retained index, which is the
+    // worst of what survived and therefore the new cut line.
     this.#threshold = this.#selection[capacity - 1];
     const first = this.#threshold?.keys[0];
     this.#thresholdFirst =
@@ -3407,6 +3418,69 @@ class ResultSink {
             : first instanceof Date
               ? first.getTime()
               : undefined;
+  }
+
+  /**
+   * Quickselect over the selection buffer: after it returns, the first `count` entries are the
+   * `count` best in some order and index `count - 1` holds the worst of them, which is the cut
+   * line. Median-of-three pivots keep the already-sorted input — the common case, since scans
+   * arrive in key order often enough — off the quadratic path.
+   */
+  #selectBest(count: number): void {
+    const entries = this.#selection;
+    const worse = (left: DeferredTopRow, right: DeferredTopRow): boolean => {
+      const comparison = this.#compareKeys(left.keys, right.keys);
+      return comparison !== 0 ? comparison > 0 : left.seq > right.seq;
+    };
+    const swap = (left: number, right: number): void => {
+      const held = required(entries[left], "Selection entry is missing");
+      entries[left] = required(entries[right], "Selection entry is missing");
+      entries[right] = held;
+    };
+    let low = 0;
+    let high = entries.length - 1;
+    const target = count - 1;
+    while (low < high) {
+      // Median of three, moved to the front as the pivot.
+      const middle = (low + high) >> 1;
+      if (
+        worse(
+          required(entries[low], "Selection entry is missing"),
+          required(entries[middle], "Selection entry is missing"),
+        )
+      )
+        swap(low, middle);
+      if (
+        worse(
+          required(entries[low], "Selection entry is missing"),
+          required(entries[high], "Selection entry is missing"),
+        )
+      )
+        swap(low, high);
+      if (
+        worse(
+          required(entries[middle], "Selection entry is missing"),
+          required(entries[high], "Selection entry is missing"),
+        )
+      )
+        swap(middle, high);
+      swap(low, middle);
+      const pivot = required(entries[low], "Selection entry is missing");
+      let left = low;
+      let right = high + 1;
+      for (;;) {
+        do left += 1;
+        while (left <= high && worse(pivot, required(entries[left], "Selection entry is missing")));
+        do right -= 1;
+        while (worse(required(entries[right], "Selection entry is missing"), pivot));
+        if (left >= right) break;
+        swap(left, right);
+      }
+      swap(low, right);
+      if (right === target) return;
+      if (right > target) high = right - 1;
+      else low = right + 1;
+    }
   }
 
   #addEager(batch: BatchRows, row: number): void {
@@ -5059,27 +5133,36 @@ function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
   for (let index = 0; index < indexes.length; index += 1) indexes[index] = index;
   let source = indexes;
   let target = scratch;
-  // Sort keys are extracted once per row: the merge performs O(n log n) comparisons, and
-  // re-reading string-keyed row properties (plus Date unboxing) inside every comparison
-  // dominates the sort for wide inputs. The keys land in one flat array in row-major order.
+  // One prepared column per term, extracted once; see sort-keys.ts for why the comparison
+  // rather than the merge is what a sort costs. Direction and explicit NULL placement are
+  // resolved here, outside the comparison, because they never vary row to row.
   const termCount = orderBy.length;
-  const keys = new Array<unknown>(rows.length * termCount);
-  for (let index = 0; index < rows.length; index += 1) {
-    const row = required(rows[index], "Ordering row is missing");
-    for (let term = 0; term < termCount; term += 1) {
-      const order = required(orderBy[term], "Order term is missing");
-      keys[index * termCount + term] = comparable(row[order.outputName]);
-    }
-  }
+  const terms = orderBy.map((order) => ({
+    /** Signed placement for an explicit NULLS FIRST/LAST, or 0 when the default applies. */
+    nullPlacement: order.nulls === undefined ? 0 : order.nulls === "first" ? 1 : -1,
+    descending: order.direction === "desc",
+  }));
+  const columns = orderBy.map((order) =>
+    buildSortKeyColumn(
+      rows.length,
+      (index) => required(rows[index], "Ordering row is missing")[order.outputName],
+    ),
+  );
   const compareIndexes = (leftIndex: number, rightIndex: number): number => {
     for (let term = 0; term < termCount; term += 1) {
-      const order = required(orderBy[term], "Order term is missing");
-      const leftKey = keys[leftIndex * termCount + term];
-      const rightKey = keys[rightIndex * termCount + term];
-      const placed = explicitNullOrder(leftKey, rightKey, order.nulls);
-      if (placed !== undefined && placed !== 0) return placed;
-      const comparison = compareValues(leftKey, rightKey);
-      if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
+      const column = required(columns[term], "Order keys are missing");
+      const { nullPlacement, descending } = required(terms[term], "Order term is missing");
+      if (nullPlacement !== 0) {
+        // An explicit placement is absolute: direction must not negate it.
+        const leftNull = column.isNull(leftIndex);
+        const rightNull = column.isNull(rightIndex);
+        if (leftNull || rightNull) {
+          if (leftNull && rightNull) continue;
+          return (leftNull ? -1 : 1) * nullPlacement;
+        }
+      }
+      const comparison = column.compare(leftIndex, rightIndex);
+      if (comparison !== 0) return descending ? -comparison : comparison;
     }
     return 0;
   };

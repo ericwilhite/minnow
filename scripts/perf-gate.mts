@@ -149,6 +149,13 @@ const QUERIES: readonly PerfQuery[] = [
     params: [150_000, 154_000],
   },
   {
+    // A full sort with no limit, on a numeric key. Distinct from top-n, which the bounded
+    // top-K sink answers without sorting: this one orders every row, which is what a window
+    // function and an unpaged report both pay for.
+    name: "sort-numeric",
+    sql: "SELECT id, amount FROM data ORDER BY amount",
+  },
+  {
     // A page deep enough that the bounded top-K sink retains most of what it scans. The bound
     // buys a memory guarantee — retention stays proportional to the limit rather than the table
     // — and past roughly a quarter of the rows it costs more time than sorting everything once.

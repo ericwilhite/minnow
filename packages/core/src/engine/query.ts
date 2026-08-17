@@ -12,6 +12,7 @@ import {
   type FtsStats,
 } from "./fts.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
+import { buildSortKeyColumn } from "./sort-keys.js";
 import { stringArgument } from "./sql-semantics.js";
 import { jsonAtPath, jsonConstructor, jsonIsValid, parseJsonPath } from "./sql-json.js";
 import { optimizePlan } from "./optimizer.js";
@@ -3230,34 +3231,53 @@ export function applyWindowFunctions(
     const orderKeys = window.orderAliases.map(({ alias }) =>
       rows.map((row) => comparable(row[alias] ?? null)),
     );
+    // A window sorts by partition then by its own ORDER BY, and then walks the result several
+    // times over — for peer groups, frame bounds, and the values themselves. Every one of those
+    // passes compares keys, so the terms are prepared once into comparison-ready columns rather
+    // than re-read and re-dispatched per comparison; see sort-keys.ts.
+    const partitionColumns = partitionKeys.map((keys) =>
+      buildSortKeyColumn(keys.length, (index) => keys[index]),
+    );
+    const orderColumns = orderKeys.map((keys) =>
+      buildSortKeyColumn(keys.length, (index) => keys[index]),
+    );
+    const orderTerms = window.orderAliases.map((term) => ({
+      nullPlacement: term.nulls === undefined ? 0 : term.nulls === "first" ? 1 : -1,
+      descending: term.direction === "desc",
+    }));
     const compare = (left: number, right: number): number => {
-      for (const keys of partitionKeys) {
-        const comparison = compareValues(keys[left], keys[right]);
+      for (const column of partitionColumns) {
+        const comparison = column.compare(left, right);
         if (comparison !== 0) return comparison;
       }
-      for (let index = 0; index < window.orderAliases.length; index += 1) {
-        const term = window.orderAliases[index];
-        if (term === undefined) continue;
-        const keys = orderKeys[index] ?? [];
-        const leftValue = keys[left];
-        const rightValue = keys[right];
-        const placed = explicitNullOrder(leftValue, rightValue, term.nulls);
-        if (placed !== undefined && placed !== 0) return placed;
-        const comparison = compareValues(leftValue, rightValue);
-        if (comparison !== 0) return term.direction === "desc" ? -comparison : comparison;
+      for (let index = 0; index < orderColumns.length; index += 1) {
+        const column = orderColumns[index];
+        const term = orderTerms[index];
+        if (column === undefined || term === undefined) continue;
+        if (term.nullPlacement !== 0) {
+          const leftNull = column.isNull(left);
+          const rightNull = column.isNull(right);
+          if (leftNull || rightNull) {
+            if (leftNull && rightNull) continue;
+            return (leftNull ? -1 : 1) * term.nullPlacement;
+          }
+        }
+        const comparison = column.compare(left, right);
+        if (comparison !== 0) return term.descending ? -comparison : comparison;
       }
+      // Arrival order breaks the remaining ties, which is what makes the walk deterministic.
       return left - right;
     };
     indexes.sort(compare);
     const samePartition = (left: number, right: number): boolean => {
-      for (const keys of partitionKeys) {
-        if (compareValues(keys[left], keys[right]) !== 0) return false;
+      for (const column of partitionColumns) {
+        if (column.compare(left, right) !== 0) return false;
       }
       return true;
     };
     const sameOrderKeys = (left: number, right: number): boolean => {
-      for (const keys of orderKeys) {
-        if (compareValues(keys[left], keys[right]) !== 0) return false;
+      for (const column of orderColumns) {
+        if (column.compare(left, right) !== 0) return false;
       }
       return true;
     };

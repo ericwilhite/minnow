@@ -146,16 +146,18 @@ describe("vector query execution", () => {
   it("accounts retained vectors, scan batches, results, and ordering at an exact budget", () => {
     const plan = compileQuery("SELECT id FROM rows ORDER BY id");
     const tables = new Map<string, DatabaseRow[]>([["rows", [{ id: 1 }, { id: 2 }]]]);
-    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 85 });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 85, usedBytes: 17, peakBytes: 17 });
+    // The ordering scratch carries one null-mask byte per row per order term beside the key
+    // slot, which is what lets a numeric term compare as typed values rather than references.
+    const prepared = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 87 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 87, usedBytes: 17, peakBytes: 17 });
     expect(prepared.execute()).toEqual({ columns: ["id"], rows: [{ id: 1 }, { id: 2 }] });
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 85, usedBytes: 17, peakBytes: 85 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 87, usedBytes: 17, peakBytes: 87 });
     prepared.close();
-    expect(prepared.memoryUsage).toEqual({ budgetBytes: 85, usedBytes: 0, peakBytes: 85 });
+    expect(prepared.memoryUsage).toEqual({ budgetBytes: 87, usedBytes: 0, peakBytes: 87 });
 
-    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 84 });
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 86 });
     expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
-    expect(below.memoryUsage).toEqual({ budgetBytes: 84, usedBytes: 17, peakBytes: 59 });
+    expect(below.memoryUsage).toEqual({ budgetBytes: 86, usedBytes: 17, peakBytes: 59 });
     below.close();
   });
 
@@ -199,10 +201,10 @@ describe("vector query execution", () => {
       ],
     };
 
-    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 382 });
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 382, usedBytes: 40, peakBytes: 40 });
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 385 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 385, usedBytes: 40, peakBytes: 40 });
     expect(exact.execute()).toEqual(expected);
-    expect(exact.memoryUsage).toEqual({ budgetBytes: 382, usedBytes: 40, peakBytes: 382 });
+    expect(exact.memoryUsage).toEqual({ budgetBytes: 385, usedBytes: 40, peakBytes: 385 });
     exact.close();
 
     const groupBelow = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: 271 });
