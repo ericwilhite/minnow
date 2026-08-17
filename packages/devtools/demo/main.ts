@@ -6,7 +6,7 @@
  */
 import { column, createMinnow, MinnowDatabase, schema, table } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { mountMinnowDevtools } from "@minnowdb/devtools";
+import { mountMinnowDevtools, type DevtoolsTheme } from "@minnowdb/devtools";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -105,12 +105,11 @@ const devtools = mountMinnowDevtools(db, {
   initialQuery: "SELECT name, score, city FROM people ORDER BY score DESC",
 });
 
-// The panel reads `theme` off its host element, so both palettes are reachable without changing
-// the operating system's setting.
+// What a host page with its own light/dark switch does: the panel repaints where it stands, so
+// nothing in it is lost. Both palettes are reachable without changing the operating system.
 const themeSelect = document.querySelector<HTMLSelectElement>("#theme");
 themeSelect?.addEventListener("change", () => {
-  if (themeSelect.value === "") devtools.element.removeAttribute("theme");
-  else devtools.element.setAttribute("theme", themeSelect.value);
+  devtools.setTheme(themeSelect.value === "" ? "system" : (themeSelect.value as DevtoolsTheme));
 });
 
 const log = document.querySelector("#log");

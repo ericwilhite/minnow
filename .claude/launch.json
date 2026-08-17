@@ -6,6 +6,18 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "site:dev"],
       "port": 3000
+    },
+    {
+      "name": "site-dist",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["apps/site/tests/serve-dist.mjs", "4186"],
+      "port": 4186
+    },
+    {
+      "name": "devtools-demo",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--port", "5174", "--strictPort"],
+      "port": 5174
     }
   ]
 }

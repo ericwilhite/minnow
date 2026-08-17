@@ -50,7 +50,12 @@ import {
   updateTransactionRecord,
   WriteConflictError,
 } from "./types.js";
-import { selectLiveRecords, type DatabaseSnapshot, type SnapshotFtsIndex } from "./snapshot.js";
+import {
+  selectLiveRecords,
+  type DatabaseSnapshot,
+  type SnapshotFtsIndex,
+  type SnapshotLoadProgress,
+} from "./snapshot.js";
 
 export class MemoryBlockStore implements BlockStore {
   readonly #blocks = new Map<string, Uint8Array>();
@@ -1252,6 +1257,29 @@ export class MemoryBlockStore implements BlockStore {
         blocks,
       };
     });
+  }
+
+  /**
+   * Loads a snapshot into this store, which must be empty — the same contract as the IndexedDB
+   * store, so a caller holding a `BlockStore` can restore into either without asking which it
+   * has. The load runs on the commit queue, so it cannot interleave with a commit.
+   *
+   * Progress is reported for parity with the IndexedDB store rather than because it is needed:
+   * an in-memory load is a handful of map writes with no transaction to break it into, so it
+   * reports the start and then the end.
+   */
+  async importSnapshot(
+    snapshot: DatabaseSnapshot,
+    options: { onProgress?: (progress: SnapshotLoadProgress) => void } = {},
+  ): Promise<void> {
+    const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
+    options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
+    await this.#runAtomic(() => {
+      if (this.#currentVersion !== null) throw new Error("This store already holds a database");
+      if (this.#tables.size > 0) throw new Error("This store already holds a catalog");
+      this.#loadSnapshot(snapshot);
+    });
+    options.onProgress?.({ phase: "done", writtenBytes: totalBytes, totalBytes });
   }
 
   /** Builds a store holding exactly what the snapshot captured. */

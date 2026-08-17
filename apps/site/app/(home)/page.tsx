@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { Playground } from "@/components/playground/playground";
-import { Logo } from "@/components/logo";
+import { HeroPond } from "@/components/pond/pond";
 
 const FACTS = [
   {
@@ -24,9 +24,10 @@ const FACTS = [
 export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col">
-      <section className="mx-auto w-full max-w-6xl px-4 pt-16 pb-8 text-center">
-        <div className="mb-6 flex justify-center text-fd-primary">
-          <Logo size={92} water />
+      <section className="mx-auto w-full max-w-6xl px-4 pt-10 pb-8 text-center">
+        {/* The mark, at size: one minnow in a pond that swims away from whoever reaches for it. */}
+        <div className="mb-8 h-[190px] sm:h-[240px] md:h-[280px]">
+          <HeroPond />
         </div>
         <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-5xl">
           A SQL engine that runs in the browser

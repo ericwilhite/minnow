@@ -119,10 +119,17 @@ export interface ReferenceEngineMeasurement {
   medianMs: number;
   p95Ms: number;
   /**
+   * Executions per timed window. A statement quicker than the clock's resolution is run many
+   * times inside one window and divided back down, so the reported median is its actual cost
+   * rather than the nearest tick. One means it was timed directly.
+   */
+  batchSize?: number;
+  /**
    * minnow only: median of the same statement with its result memo left on — the default an
    * application gets. Absent for engines with no result cache, which re-execute every call.
    */
   cachedMedianMs?: number;
+  cachedBatchSize?: number;
   /**
    * Peak modeled execution memory in bytes, self-reported by engines that measure their own
    * execution. The browser's cross-engine memory API is unavailable in this harness (Chromium
@@ -178,6 +185,11 @@ export interface WriteEngineMeasurement {
   error?: string;
   medianMs: number;
   p95Ms: number;
+  /**
+   * Writes per timed window. A write quicker than the clock's resolution is repeated across that
+   * many freshly prepared tables and divided back down; one means it was timed directly.
+   */
+  batchSize?: number;
   /** Batch rows divided by the median, so sizes compare on one axis. */
   rowsPerSecond: number;
   /** Rows in the table after the operation; the oracle's expectation is on the case. */
@@ -234,6 +246,13 @@ export interface FeatureEngineOutcome {
    * drift); for other engines it reports whether they accept the example.
    */
   outcome: "pass" | "fail" | "accepts" | "rejects";
+  /**
+   * Whether the statement ran at all. The verdict above answers a different question for Minnow
+   * than for the others — matrix drift versus surface survey — so the plain fact is carried
+   * separately, and a count of "what does this engine accept" reads it rather than inferring it
+   * from a verdict that does not mean the same thing in both columns.
+   */
+  accepted: boolean;
   ms: number;
   detail?: string;
 }

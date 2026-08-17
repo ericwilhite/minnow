@@ -6,6 +6,8 @@ import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from 
 
 interface MatrixFeature {
   id: string;
+  /** ISO/IEC 9075:2023 Annex F feature identifier, or "minnow" for an engine extension. */
+  feature: string;
   status: "supported" | "unsupported";
   example: string;
   /** Statements executed before the example, for examples that need prior state. */
@@ -66,6 +68,30 @@ describe("SQL feature matrix conformance", () => {
   it("covers every feature with a unique identifier", () => {
     expect(features.length).toBeGreaterThan(40);
     expect(new Set(features.map(({ id }) => id)).size).toBe(features.length);
+  });
+
+  it("keys every entry to the standard it claims", () => {
+    // An entry with no feature identifier cannot be checked against the standard at all, and a
+    // free-text one would drift; "minnow" is the single spelling for an extension SQL:2023 does
+    // not define, so the extensions stay countable.
+    const identifier = /^(?:[EFSTR]\d{3}(?:-\d{2})?|minnow)$/;
+    for (const feature of features) {
+      expect(`${feature.id}: ${feature.feature}`).toMatch(
+        new RegExp(`^${feature.id.replaceAll(".", "\\.")}: (?:[EFSTR]\\d{3}(?:-\\d{2})?|minnow)$`),
+      );
+      expect(identifier.test(feature.feature)).toBe(true);
+    }
+  });
+
+  it("explains every feature it does not support", () => {
+    // A bare "unsupported" reads as an oversight. Each one carries the error a caller actually
+    // sees plus the reason the engine declines, so the boundary is a decision, not a gap.
+    const unsupported = features.filter(({ status }) => status === "unsupported");
+    expect(unsupported.length).toBeGreaterThan(5);
+    for (const feature of unsupported) {
+      expect(feature.error ?? "").not.toBe("");
+      expect((feature.notes ?? "").length).toBeGreaterThan(20);
+    }
   });
 
   for (const feature of features.filter(({ status }) => status === "supported")) {

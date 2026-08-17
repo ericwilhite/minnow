@@ -58,10 +58,12 @@ export default tseslint.config(
   {
     // Bench engines compare against SQLite/PGlite on purpose, the conformance harness uses
     // node:sqlite as its differential oracle, the site test server and the vendoring script are
-    // Node processes that never ship, and the measurement scripts are Node tooling by definition.
+    // Node processes that never ship, the measurement scripts are Node tooling by definition,
+    // and the docs test reads the .mdx pages off disk to run the SQL printed in them.
     files: [
       "apps/site/bench/engines/**/*.ts",
       "apps/site/bench/worker/feature-suite.ts",
+      "apps/site/lib/dataset/docs-sql.test.ts",
       "apps/site/tests/serve-dist.mjs",
       "apps/site/scripts/*.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",

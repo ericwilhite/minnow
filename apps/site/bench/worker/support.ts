@@ -164,3 +164,52 @@ export function summarizeSamples(samples: number[]): { medianMs: number; p95Ms: 
   const p95Ms = sorted[Math.ceil(sorted.length * 0.95) - 1] ?? medianMs;
   return { medianMs, p95Ms };
 }
+
+/**
+ * How long one timed window should last. `performance.now()` is deliberately coarse — 100µs on an
+ * ordinary origin, 5µs on a cross-origin-isolated one — so timing a single execution of anything
+ * quick reads back as a multiple of the clock's step rather than as its cost. Five milliseconds
+ * puts even the coarse clock's quantization under 2% of the window.
+ */
+const TARGET_WINDOW_MS = 5;
+const MAX_BATCH = 4_096;
+
+export interface RepeatedMeasurement {
+  medianMs: number;
+  p95Ms: number;
+  /** Executions per timed window. One means the operation was slow enough to time directly. */
+  batchSize: number;
+}
+
+/**
+ * Times `run` by the batch: enough executions per window that the clock's resolution stops
+ * mattering, divided back down to the cost of one. A query that takes 4µs is measured as 4µs
+ * instead of landing on 0.00 or 0.10 depending on which side of a tick it fell.
+ *
+ * The batch is sized by doubling until a window is long enough, which costs a few extra untimed
+ * executions and needs no guess about how fast the engine is.
+ */
+export async function measureRepeated(
+  run: () => Promise<unknown>,
+  samples: number,
+): Promise<RepeatedMeasurement> {
+  let batchSize = 1;
+  for (;;) {
+    const started = performance.now();
+    for (let index = 0; index < batchSize; index += 1) await run();
+    const elapsed = performance.now() - started;
+    if (elapsed >= TARGET_WINDOW_MS || batchSize >= MAX_BATCH) break;
+    // Aim straight at the target from what this window cost, but never trust it to shrink the
+    // batch, and never take less than a doubling — a window under the clock's resolution reads
+    // as zero and would otherwise divide by nothing.
+    const projected = Math.ceil((batchSize * TARGET_WINDOW_MS) / Math.max(elapsed, 0.05));
+    batchSize = Math.min(MAX_BATCH, Math.max(batchSize * 2, projected));
+  }
+  const windows: number[] = [];
+  for (let sample = 0; sample < samples; sample += 1) {
+    const started = performance.now();
+    for (let index = 0; index < batchSize; index += 1) await run();
+    windows.push((performance.now() - started) / batchSize);
+  }
+  return { ...summarizeSamples(windows), batchSize };
+}

@@ -1,5 +1,5 @@
 import { createDevtools, type DevtoolsHandle } from "./devtools.js";
-import type { DevtoolsOptions } from "./options.js";
+import type { DevtoolsOptions, DevtoolsTheme } from "./options.js";
 import type { DevtoolsAttachable } from "./target.js";
 
 export { createDevtools, type DevtoolsHandle } from "./devtools.js";
@@ -9,6 +9,7 @@ export type {
   DevtoolsMode,
   DevtoolsOptions,
   DevtoolsPermissions,
+  DevtoolsTheme,
 } from "./options.js";
 export type { DevtoolsAttachable, DevtoolsTarget } from "./target.js";
 
@@ -52,6 +53,9 @@ export function mountMinnowDevtools(
     },
     setQuery: (sql: string) => {
       handle.setQuery(sql);
+    },
+    setTheme: (theme: DevtoolsTheme) => {
+      handle.setTheme(theme);
     },
     close: () => {
       handle.close();

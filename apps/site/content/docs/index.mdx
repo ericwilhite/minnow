@@ -30,8 +30,9 @@ const { rows } = await db.query(`
 
 <Callout type="warn" title="Experimental">
   The version-zero block format carries no compatibility promise, and the SQL surface is a
-  correctness-first subset rather than full SQL-92 coverage. Everything the engine does and
-  deliberately refuses to do is listed in the [feature matrix](/docs/sql/feature-matrix).
+  correctness-first subset of SQL:2023 rather than the whole standard. Everything the engine does
+  and deliberately refuses to do is listed, keyed to the standard's own feature identifiers, in the
+  [feature matrix](/docs/sql/feature-matrix).
 </Callout>
 
 ## What is here

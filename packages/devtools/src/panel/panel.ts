@@ -33,6 +33,8 @@ export interface PanelDeps {
   views: readonly PanelView[];
   /** Always-visible column to the left of the views. */
   rail?: HTMLElement;
+  /** Title-bar controls that act on the database as a whole, shown after the badges. */
+  actions?: readonly HTMLElement[];
   /** The confirmation layer, stacked above the content inside the panel. */
   overlay: HTMLElement;
   onClose(): void;
@@ -137,6 +139,7 @@ export function createPanel(deps: PanelDeps): Panel {
     el("span", { class: "spacer" }),
     threadBadge,
     writeBadge,
+    ...(deps.actions ?? []),
   ]);
   if (floating) titlebar.append(maximize, close);
 
@@ -166,6 +169,12 @@ export function createPanel(deps: PanelDeps): Panel {
   );
   if (floating) node.append(grip);
   node.style.zIndex = String(options.zIndex);
+  // An explicit height is exactly that: the minimum the stylesheet falls back to would otherwise
+  // hold a short panel open at 520px.
+  if (!floating && options.height.length > 0) {
+    node.style.setProperty("--mdt-height", options.height);
+    node.style.setProperty("--mdt-min-height", "0");
+  }
 
   close.addEventListener("click", () => {
     deps.onClose();

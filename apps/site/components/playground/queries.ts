@@ -107,7 +107,7 @@ ORDER BY return_rate DESC`,
   {
     id: "basket-pairs",
     label: "Bought together",
-    note: "A self-join on order lines: the classic market-basket query, and an expensive one.",
+    note: "A self-join on order lines: the classic market-basket query, hashed on the order.",
     sql: `SELECT a.category AS category_a,
        b.category AS category_b,
        COUNT(*) AS baskets
@@ -122,7 +122,7 @@ LIMIT 15`,
   {
     id: "cohorts",
     label: "Retention by signup month",
-    note: "A cohort table built with a recursive CTE and a conditional aggregate.",
+    note: "A cohort table built from chained CTEs and three DISTINCT counts over the same rows.",
     sql: `WITH cohort AS (
   SELECT customer_id, DATE_TRUNC('month', signed_up_on) AS joined FROM customers
 ),

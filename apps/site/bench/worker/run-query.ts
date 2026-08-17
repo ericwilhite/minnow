@@ -8,7 +8,7 @@ import { loadDriver, requireMaterialization } from "../engines/session";
 import type { EngineId, EngineQueryRun, RunQueryPayload, RunQueryResult } from "../protocol";
 import { engineIds } from "../protocol";
 import { getDataset } from "./registry";
-import { summarizeSamples } from "./support";
+import { measureRepeated } from "./support";
 
 const ITERATIONS = 7;
 const PREVIEW_ROWS = 50;
@@ -79,13 +79,9 @@ async function runOnEngine(
       const prepareMs = performance.now() - prepareStarted;
       try {
         let rows = await prepared.execute();
-        const samples: number[] = [];
-        for (let index = 0; index < ITERATIONS; index += 1) {
-          const started = performance.now();
+        const { medianMs, p95Ms } = await measureRepeated(async () => {
           rows = await prepared.execute();
-          samples.push(performance.now() - started);
-        }
-        const { medianMs, p95Ms } = summarizeSamples(samples);
+        }, ITERATIONS);
         const columns = rows.length > 0 ? Object.keys(rows[0] ?? {}) : [];
         return {
           engine,

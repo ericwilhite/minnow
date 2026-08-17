@@ -26,6 +26,30 @@ function format(value: number): string {
   return value.toLocaleString("en-US");
 }
 
+/**
+ * The theme the site is showing. Fumadocs switches themes with a class on `<html>`, and the panel
+ * lives in a shadow root that only knows the OS setting unless it is told otherwise — so a reader
+ * on a light machine reading these docs in dark mode would get a white panel in a dark page.
+ */
+function useSiteTheme(): "light" | "dark" {
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const read = (): void => {
+      setTheme(root.classList.contains("dark") ? "dark" : "light");
+    };
+    read();
+    const observer = new MutationObserver(read);
+    observer.observe(root, { attributes: true, attributeFilter: ["class"] });
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  return theme;
+}
+
 export function PlaygroundConsole({ height = 620 }: { height?: number }) {
   const mount = useRef<HTMLDivElement>(null);
   const panel = useRef<MountedDevtools | undefined>(undefined);
@@ -34,6 +58,15 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
   const [status, setStatus] = useState<Status>({ kind: "starting" });
   const [scale, setScale] = useState(0.25);
   const [generation, setGeneration] = useState(0);
+  const theme = useSiteTheme();
+  // Read through a ref by the mount below, so flipping the site's theme repaints the panel
+  // instead of rebuilding the database behind it.
+  const currentTheme = useRef(theme);
+
+  useEffect(() => {
+    currentTheme.current = theme;
+    panel.current?.setTheme(theme);
+  }, [theme]);
 
   useEffect(() => {
     const stored = window.localStorage.getItem(SIZE_KEY);
@@ -96,6 +129,7 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
         mode: "inline",
         initialQuery: defaultQuery,
         storageKey: "minnow-playground",
+        theme: currentTheme.current,
       });
       setStatus({ kind: "ready", rows, fresh: !already });
     }
@@ -169,9 +203,10 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
         </button>
       </div>
 
-      <div className="minnow-panel" style={{ minHeight: height }}>
+      {/* A box with a real height, because that is what the panel fills. */}
+      <div style={{ height }}>
         {status.kind === "ready" ? null : (
-          <div className="flex h-full min-h-[inherit] flex-col items-center justify-center gap-3 p-8 text-center">
+          <div className="minnow-placeholder flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
             {status.kind === "failed" ? (
               <p className="max-w-md text-sm text-red-500">
                 The playground could not start: {status.message}
@@ -201,7 +236,7 @@ export function PlaygroundConsole({ height = 620 }: { height?: number }) {
             )}
           </div>
         )}
-        <div ref={mount} style={{ minHeight: status.kind === "ready" ? height : 0 }} />
+        <div ref={mount} className={status.kind === "ready" ? "h-full" : "h-0"} />
       </div>
 
       {status.kind === "ready" ? (

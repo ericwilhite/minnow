@@ -59,6 +59,7 @@ import {
   selectLiveRecords,
   type DatabaseSnapshot,
   type SnapshotFtsIndex,
+  type SnapshotLoadProgress,
   type SnapshotTable,
 } from "./snapshot.js";
 
@@ -98,13 +99,6 @@ const storageTextBuffer = new Uint8Array(1_024);
 const SNAPSHOT_BLOCK_BATCH = 512;
 /** Bytes per write transaction when loading a snapshot in. */
 const SNAPSHOT_BATCH_BYTES = 8 * 1024 * 1024;
-
-/** Where a snapshot load has got to, for a progress bar over a multi-megabyte file. */
-export interface SnapshotLoadProgress {
-  phase: "blocks" | "catalog" | "done";
-  writtenBytes: number;
-  totalBytes: number;
-}
 
 interface UniqueKeyChunk {
   addedTokens: string[];

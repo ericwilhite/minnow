@@ -1,5 +1,5 @@
 import { createDevtools, type DevtoolsHandle } from "./devtools.js";
-import { optionsFromAttributes, type DevtoolsOptions } from "./options.js";
+import { optionsFromAttributes, type DevtoolsOptions, type DevtoolsTheme } from "./options.js";
 import type { DevtoolsAttachable } from "./target.js";
 
 export const elementName = "minnow-devtools";
@@ -52,6 +52,11 @@ export class MinnowDevtoolsElement extends HTMLElement {
 
   toggle(): void {
     this.#handle?.toggle();
+  }
+
+  /** Same as writing the `theme` attribute, for a page that switches themes from script. */
+  setTheme(theme: DevtoolsTheme): void {
+    this.#handle?.setTheme(theme);
   }
 
   connectedCallback(): void {

@@ -3,6 +3,8 @@ import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
 import {
   MinnowDatabase,
   QueryMemoryBudgetError,
+  UniqueConstraintError,
+  type BatchValue,
   type QueryResult,
   type SnapshotSession,
 } from "@minnowdb/core";
@@ -19,6 +21,28 @@ interface BrowserTransactionResult {
   lostResponseRecovered: boolean;
   leases: { renewed: boolean; released: boolean };
   rowIdsDisjoint: boolean;
+  staleRecovery: {
+    abortedTransactionIds: string[];
+    removedBlockIds: string[];
+    removedSegmentIds: string[];
+    orphanBlockRemoved: boolean;
+    orphanSegmentRemoved: boolean;
+    livePendingRetained: boolean;
+    persistedStates: { active: number; committed: number; aborted: number };
+  };
+  uniqueKeys: {
+    persistedUniqueKey: string | null;
+    persistedColumnTypes: string[];
+    existingKeyRejected: boolean;
+    duplicateKeyRejected: boolean;
+    nullKeyRejected: boolean;
+    rowsAfterRejections: number;
+    concurrentInsertVersionsConsecutive: boolean;
+    rowsAfterConcurrentInserts: number;
+    competingUpsertCounts: string[];
+    competingUpsertRows: number;
+    competingUpsertKeptLatest: boolean;
+  };
   batchWrite: {
     tables: string[];
     rowCount: number;
@@ -30,6 +54,11 @@ interface BrowserTransactionResult {
     finalRows: number;
     updatedValue: number | null;
     partialUpdatedRows: number;
+    updatePatch: {
+      changedColumns: string[];
+      segmentKind: string | null;
+      patchedColumnBlocks: number;
+    };
     projectedColumns: string[];
     deletedRows: number;
     writeMetricsValid: boolean;
@@ -131,6 +160,52 @@ window.runTransactionBrowserTest = async () => {
   recoveryStore.close();
   await deleteDatabase(recoveryName);
 
+  // Crash recovery: a transaction whose tab went away is aborted and everything it staged is
+  // reclaimed, while a transaction that is merely young keeps its staged work. The clock and the
+  // ID generator are injected so "stale" and "live" are decided by the cutoff, not by wall time.
+  const staleName = `minnow-stale-${crypto.randomUUID()}`;
+  const staleStore = await IndexedDbBlockStore.open({ name: staleName });
+  const committedTransaction = await new TransactionManager(staleStore).begin();
+  await committedTransaction.stageBlock("committed", Uint8Array.of(6));
+  await committedTransaction.commit();
+  let recoveryClock = new Date("2026-01-01T00:00:00.000Z");
+  let recoveryId = "stale";
+  const staleManager = new TransactionManager(staleStore, {
+    now: () => recoveryClock,
+    createId: () => recoveryId,
+  });
+  const staleTransaction = await staleManager.begin();
+  await staleTransaction.stageBlock("orphan", Uint8Array.of(7));
+  await staleTransaction.stageSegment({
+    id: "orphan-segment",
+    tableId: "orphan-table",
+    transactionId: staleTransaction.id,
+    rowCount: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    columnBlockIds: { probe: ["orphan"] },
+    createdAt: recoveryClock.toISOString(),
+  });
+  recoveryClock = new Date("2026-01-01T01:00:00.000Z");
+  recoveryId = "live";
+  const liveTransaction = await staleManager.begin();
+  await liveTransaction.stageBlock("live-pending", Uint8Array.of(8));
+  const recoveryReport = await staleManager.recover({
+    staleBefore: new Date("2026-01-01T00:30:00.000Z"),
+  });
+  const orphanBlockRemoved = (await staleStore.getBlock("orphan")) === undefined;
+  const orphanSegmentRemoved = (await staleStore.getSegment("orphan-segment")) === undefined;
+  const livePendingRetained = (await staleStore.getBlock("live-pending")) !== undefined;
+  const staleRecords = await staleStore.listTransactions();
+  const persistedStates = {
+    active: staleRecords.filter((record) => record.status === "active").length,
+    committed: staleRecords.filter((record) => record.status === "committed").length,
+    aborted: staleRecords.filter((record) => record.status === "aborted").length,
+  };
+  await liveTransaction.abort();
+  staleStore.close();
+  await deleteDatabase(staleName);
+
   const libraryName = `minnow-library-${crypto.randomUUID()}`;
   const libraryStore = await IndexedDbBlockStore.open({ name: libraryName });
   const database = new MinnowDatabase(libraryStore, { rowsPerBlock: 2 });
@@ -178,6 +253,9 @@ window.runTransactionBrowserTest = async () => {
     columns: { name: ["Grace", "Katherine"], score: [25, 40] },
   });
   const partialUpdate = await database.update("people", "Grace", { score: 26 });
+  // A partial update publishes a narrow immutable patch: an "update" segment carrying only the
+  // unique key and the columns that actually changed.
+  const patchSegment = await libraryStore.getSegment(partialUpdate.segmentId);
   const projected = await database.readTable("people", { columns: ["name"] });
   const deleted = await database.deleteBatch("people", { keys: ["Ada", "Missing"] });
   const rows = await database.readTable("people");
@@ -313,6 +391,81 @@ window.runTransactionBrowserTest = async () => {
   const ledgerMissingDelete = await database.deleteBatch("ledger", { keys: [2, 404] });
   const ledgerAuditAfterDelete = (await database.query("SELECT COUNT(*) AS n FROM ledger_audit"))
     .rows[0]?.n;
+
+  // Unique-key enforcement and two-connection contention. The key channel must reject bad keys
+  // before anything commits, and two connections to one database must resolve the same key
+  // between themselves instead of handing the conflict back to the caller.
+  await database.createTable({
+    name: "unique_probe",
+    uniqueKey: "record_id",
+    columns: [
+      { name: "record_id", type: "number" },
+      { name: "score", type: "number" },
+      { name: "label", type: "string" },
+      { name: "active", type: "boolean" },
+      { name: "changed_at", type: "datetime" },
+    ],
+  });
+  const probeDefinition = (await database.listTables()).find(
+    (table) => table.name === "unique_probe",
+  );
+  await database.insertBatch("unique_probe", { columns: probeColumns([1, 2, 3, 4], 0) });
+  let existingKeyRejected = false;
+  try {
+    await database.insertBatch("unique_probe", { columns: probeColumns([1], 20_000) });
+  } catch (error) {
+    existingKeyRejected = error instanceof UniqueConstraintError;
+  }
+  let duplicateKeyRejected = false;
+  try {
+    await database.insertBatch("unique_probe", { columns: probeColumns([90, 90], 30_000) });
+  } catch (error) {
+    duplicateKeyRejected = error instanceof UniqueConstraintError;
+  }
+  let nullKeyRejected = false;
+  try {
+    const nullKeyColumns = probeColumns([91], 40_000);
+    nullKeyColumns.record_id = [null];
+    await database.upsertBatch("unique_probe", { columns: nullKeyColumns });
+  } catch (error) {
+    nullKeyRejected = error instanceof TypeError;
+  }
+  const rowsAfterRejections = (await database.readTable("unique_probe")).length;
+
+  const secondLibraryStore = await IndexedDbBlockStore.open({ name: libraryName });
+  const secondDatabase = new MinnowDatabase(secondLibraryStore, { rowsPerBlock: 2 });
+  const versionBeforeConcurrentInserts = (await libraryStore.getCurrentManifest())?.version ?? -1;
+  const concurrentInserts = await Promise.all([
+    database.insertBatch("unique_probe", { columns: probeColumns([10, 11], 1_000) }),
+    secondDatabase.insertBatch("unique_probe", { columns: probeColumns([20, 21], 2_000) }),
+  ]);
+  const concurrentVersions = concurrentInserts
+    .map((result) => result.version)
+    .sort((left, right) => left - right);
+  const concurrentInsertVersionsConsecutive =
+    concurrentVersions[0] === versionBeforeConcurrentInserts + 1 &&
+    concurrentVersions[1] === versionBeforeConcurrentInserts + 2;
+  const rowsAfterConcurrentInserts = (await database.readTable("unique_probe")).length;
+
+  const competingKey = 50;
+  const competingUpserts = await Promise.all([
+    database.upsertBatch("unique_probe", { columns: probeColumns([competingKey], 50_000) }),
+    secondDatabase.upsertBatch("unique_probe", { columns: probeColumns([competingKey], 60_000) }),
+  ]);
+  // One writer inserts the key, the other rechecks after the conflict and updates it instead.
+  const competingUpsertCounts = competingUpserts
+    .map((result) => `${String(result.insertedRowCount)}/${String(result.updatedRowCount)}`)
+    .sort();
+  const lastCompetingUpsert = competingUpserts.reduce((latest, result) =>
+    result.version > latest.version ? result : latest,
+  );
+  const competingRows = (await database.readTable("unique_probe")).filter(
+    (row) => row.record_id === competingKey,
+  );
+  const competingUpsertKeptLatest =
+    competingRows[0]?.score ===
+    (lastCompetingUpsert === competingUpserts[0] ? 50_000 : 60_000) + competingKey;
+  secondLibraryStore.close();
   libraryStore.close();
 
   const reopenedLibraryStore = await IndexedDbBlockStore.open({ name: libraryName });
@@ -342,6 +495,28 @@ window.runTransactionBrowserTest = async () => {
     lostResponseRecovered,
     leases: { renewed: leaseRenewed, released: leaseReleased },
     rowIdsDisjoint,
+    staleRecovery: {
+      abortedTransactionIds: recoveryReport.abortedTransactionIds,
+      removedBlockIds: recoveryReport.removedBlockIds,
+      removedSegmentIds: recoveryReport.removedSegmentIds,
+      orphanBlockRemoved,
+      orphanSegmentRemoved,
+      livePendingRetained,
+      persistedStates,
+    },
+    uniqueKeys: {
+      persistedUniqueKey: probeDefinition?.uniqueKey ?? null,
+      persistedColumnTypes: (probeDefinition?.columns ?? []).map((column) => column.type),
+      existingKeyRejected,
+      duplicateKeyRejected,
+      nullKeyRejected,
+      rowsAfterRejections,
+      concurrentInsertVersionsConsecutive,
+      rowsAfterConcurrentInserts,
+      competingUpsertCounts,
+      competingUpsertRows: competingRows.length,
+      competingUpsertKeptLatest,
+    },
     writeScopes: {
       scopeTotal: typeof scopeCommit.result === "number" ? scopeCommit.result : null,
       scopeRolledBack,
@@ -364,10 +539,21 @@ window.runTransactionBrowserTest = async () => {
       finalRows: rows.length,
       updatedValue: typeof updatedScore === "number" ? updatedScore : null,
       partialUpdatedRows: partialUpdate.updatedRowCount,
+      updatePatch: {
+        changedColumns: partialUpdate.changedColumns,
+        segmentKind: patchSegment?.kind ?? null,
+        patchedColumnBlocks: Object.keys(patchSegment?.columnBlockIds ?? {}).length,
+      },
       projectedColumns: Object.keys(projected[0] ?? {}),
       deletedRows: deleted.deletedRowCount,
       writeMetricsValid: [batch, upsert, partialUpdate, deleted].every(
-        (result) => result.metrics.rowsPerSecond > 0 && result.metrics.storedBytes > 0,
+        (result) =>
+          result.metrics.storedBytes === result.storedBytes &&
+          result.metrics.storedBytes > 0 &&
+          Number.isFinite(result.metrics.rowsPerSecond) &&
+          result.metrics.rowsPerSecond > 0 &&
+          Number.isFinite(result.metrics.writeAmplification) &&
+          result.metrics.retries >= 0,
       ),
       bufferedRows,
       compaction: {
@@ -414,6 +600,17 @@ window.runTransactionBrowserTest = async () => {
     },
   };
 };
+
+/** Five public column types over an arbitrary set of unique keys, in one call. */
+function probeColumns(keys: readonly number[], offset: number): Record<string, BatchValue[]> {
+  return {
+    record_id: [...keys],
+    score: keys.map((key) => offset + key),
+    label: keys.map((key) => `row-${String(key)}`),
+    active: keys.map((key) => key % 2 === 0),
+    changed_at: keys.map((key) => new Date(Date.UTC(2026, 0, 1) + key * 1_000)),
+  };
+}
 
 function summarizeAggregate(result: QueryResult): { count: number; total: number } {
   const count = result.rows[0]?.count;

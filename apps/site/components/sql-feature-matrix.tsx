@@ -10,6 +10,8 @@ import matrix from "@minnowdb/core/sql-feature-matrix.json";
  */
 interface SqlFeature {
   id: string;
+  /** ISO/IEC 9075:2023 Annex F feature identifier, or "minnow" for an engine extension. */
+  feature: string;
   status: "supported" | "unsupported";
   example: string;
   params?: unknown[];
@@ -24,6 +26,9 @@ function Feature({ feature }: { feature: SqlFeature }) {
     <div className="rounded-lg border border-fd-border p-4">
       <div className="mb-2 flex items-center gap-2">
         <code className="text-xs text-fd-muted-foreground">{feature.id}</code>
+        <span className="rounded bg-fd-muted px-1.5 py-0.5 text-[11px] text-fd-muted-foreground">
+          {feature.feature === "minnow" ? "Minnow extension" : `SQL:2023 ${feature.feature}`}
+        </span>
       </div>
       <pre className="overflow-x-auto rounded-md bg-fd-muted p-3 text-[13px] leading-relaxed">
         <code>
@@ -49,7 +54,7 @@ export function SqlFeatureMatrix({ status }: { status: "supported" | "unsupporte
     <div className="not-prose my-6 flex flex-col gap-3">
       <p className="text-sm text-fd-muted-foreground">
         {status === "supported"
-          ? `${String(selected.length)} forms, each executed through both executors on every test run.`
+          ? `${String(selected.length)} forms, each executed through both executors on every test run, and diffed against SQLite and PostgreSQL wherever the three agree on what the answer should be.`
           : `${String(selected.length)} forms, each checked on every test run to still fail with the error below.`}
       </p>
       {selected.map((feature) => (

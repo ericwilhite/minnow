@@ -7,6 +7,27 @@ A snapshot is one committed version of a database, copied out as a single byte a
 into any block store. It is how you back a database up, seed a test fixture from real data, ship a
 prepared database as a static asset, or hand a colleague exactly what you were looking at.
 
+## From the database
+
+The database copies itself out as the finished file, and loads one back:
+
+```ts
+const bytes = await db.exportSnapshot();
+
+const restored = new MinnowDatabase(new MemoryBlockStore());
+await restored.importSnapshot(bytes);
+```
+
+Both take an `onProgress` callback, and both work the same way through the
+[worker client](/docs/client/workers) — there the file crosses the channel in slices, so the main
+thread copies a few megabytes at a time instead of stalling on one clone of the whole database.
+
+That is also what the devtools' **Download database** button does; see
+[the devtools](/docs/devtools#downloading-the-database).
+
+Everything below is the layer underneath, for when you want the records rather than the file, or
+a store that has no database in front of it.
+
 ```ts
 import { encodeSnapshot, decodeSnapshot } from "@minnowdb/core/storage";
 
@@ -35,7 +56,8 @@ await store.importSnapshot(await decodeSnapshot(bytes), {
 ```
 
 The target store must be empty. Loading into a database that already holds one throws rather than
-merging two histories.
+merging two histories. `MemoryBlockStore.fromSnapshot` builds a store around a snapshot instead,
+which is the same thing for a store that was never used.
 
 ## What it carries
 
@@ -83,6 +105,10 @@ consistent version.
 `IndexedDbBlockStore#exportSnapshot` reads across several transactions, so a concurrent commit
 could move the version underneath it. Hold a backup lease across the call when another writer is
 possible; a build script that is the only writer in its process does not need one.
+
+`MinnowDatabase#exportSnapshot` delegates to whichever of those the database was built on, so it
+inherits the same rule. A store that implements neither method says so rather than failing as a
+missing property.
 
 <Callout type="warn">
   The snapshot format is versioned and validated, but like the block format it carries no

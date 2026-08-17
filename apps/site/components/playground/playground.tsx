@@ -9,7 +9,7 @@ import dynamic from "next/dynamic";
 const Console = dynamic(async () => (await import("./console")).PlaygroundConsole, {
   ssr: false,
   loading: () => (
-    <div className="minnow-panel flex items-center justify-center" style={{ minHeight: 620 }}>
+    <div className="minnow-placeholder flex items-center justify-center" style={{ height: 620 }}>
       <p className="text-sm text-fd-muted-foreground">Loading the console…</p>
     </div>
   ),

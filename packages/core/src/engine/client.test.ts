@@ -269,6 +269,42 @@ describe("MinnowDatabaseClient", () => {
     ]);
   });
 
+  it("copies a snapshot out in slices and loads one back with progress", async () => {
+    const client = connect();
+    await createPeopleTable(client);
+    await client.insert("people", { id: 1, name: "Ada", joined: new Date("2024-01-02T03:04:05Z") });
+    await client.insert("people", { id: 2, name: "Grace", joined: new Date() });
+
+    const phases: string[] = [];
+    const bytes = await client.exportSnapshot({
+      onProgress: (progress) => phases.push(progress.phase),
+    });
+    // Read, then handed back a slice at a time; this database fits in one slice.
+    expect(phases).toEqual(["reading", "transfer", "done"]);
+    expect(bytes.byteLength).toBeGreaterThan(0);
+
+    const restored = connect();
+    const loads: number[] = [];
+    await restored.importSnapshot(bytes, {
+      onProgress: (progress) => {
+        if (progress.phase === "done") loads.push(progress.totalBytes);
+      },
+    });
+    expect(loads.length).toBe(1);
+    expect((await restored.query("SELECT id, name FROM people ORDER BY id")).rows).toEqual([
+      { id: 1, name: "Ada" },
+      { id: 2, name: "Grace" },
+    ]);
+    // A second load has nowhere to go, and the failure crosses the channel as itself.
+    await expect(restored.importSnapshot(bytes)).rejects.toThrow(/already holds/);
+    // The failed load released its handle rather than leaving the chunks in the worker.
+    await expect(
+      (
+        restored as unknown as { _invoke(h: string, m: string, a: unknown[]): Promise<unknown> }
+      )._invoke("missing-handle", "finish", []),
+    ).rejects.toThrow(/Unknown handle/);
+  });
+
   it("proxies buffered writers, including flush results and stats", async () => {
     const client = connect();
     await createPeopleTable(client);

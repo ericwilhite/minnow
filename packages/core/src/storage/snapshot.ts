@@ -66,6 +66,26 @@ export interface DatabaseSnapshot {
   blocks: Array<{ id: string; bytes: Uint8Array }>;
 }
 
+/** Where a snapshot load has got to, for a progress bar over a multi-megabyte file. */
+export interface SnapshotLoadProgress {
+  phase: "blocks" | "catalog" | "done";
+  writtenBytes: number;
+  totalBytes: number;
+}
+
+/**
+ * Where a snapshot export has got to. `reading` covers copying the version out of the store and
+ * encoding it, and reports no byte counts because the encoded length is not known until it is
+ * finished. `transfer` happens only when the database lives in a worker and the bytes are handed
+ * back a chunk at a time; an in-page database goes straight from `reading` to `done`.
+ */
+export interface SnapshotExportProgress {
+  phase: "reading" | "transfer" | "done";
+  transferredBytes: number;
+  /** Zero while reading; the encoded length once it is known. */
+  totalBytes: number;
+}
+
 /** What a header-only read reports, without touching a single block payload. */
 export interface SnapshotSummary {
   formatVersion: number;

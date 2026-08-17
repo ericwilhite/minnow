@@ -392,11 +392,17 @@ describe("public SQL queries", () => {
       columns: ["marker"],
       rows: [{ marker: "--;/*" }],
     });
-    expect(() => compileQuery("SELECT * FROM events -- comment")).toThrow(
-      "comments are not supported",
+    // The same markers outside a literal are comments (E161, T351), and skipping one leaves the
+    // statement exactly as it would read without it.
+    const commented = new Map([["events", [{ value: 1 }]]]);
+    expect(executeQuery(compileQuery("SELECT value FROM events -- comment"), commented)).toEqual(
+      executeQuery(compileQuery("SELECT value FROM events"), commented),
     );
-    expect(() => compileQuery("SELECT * FROM events /* comment */")).toThrow(
-      "comments are not supported",
+    expect(executeQuery(compileQuery("SELECT /* comment */ value FROM events"), commented)).toEqual(
+      executeQuery(compileQuery("SELECT value FROM events"), commented),
+    );
+    expect(() => compileQuery("SELECT value FROM events /* unterminated")).toThrow(
+      "Unterminated comment",
     );
   });
 
@@ -618,14 +624,44 @@ describe("public SQL queries", () => {
     expect(() => compileQuery("SELECT region FROM rows WHERE ROW_NUMBER() OVER () > 1")).toThrow(
       "Window functions are only allowed in the select list",
     );
-    expect(() => compileQuery("SELECT ROW_NUMBER() OVER () + 1 AS rn FROM rows")).toThrow(
-      "Window functions must be top-level select items",
+    // A window is an expression, so it composes like one: the arithmetic around it happens after
+    // the window has run, over the column it produced.
+    const composed = compileQuery(
+      `SELECT region,
+              amount,
+              ROW_NUMBER() OVER (ORDER BY amount, region) + 1 AS rn,
+              amount - LAG(amount) OVER (ORDER BY amount, region) AS change,
+              ROUND(100.0 * amount / SUM(amount) OVER (), 1) AS pct
+       FROM rows ORDER BY amount, region`,
     );
+    expect(executeQuery(composed, input).rows).toEqual([
+      { region: "east", amount: 5, rn: 2, change: null, pct: 4.9 },
+      { region: null, amount: 7, rn: 3, change: 2, pct: 6.9 },
+      { region: "west", amount: 10, rn: 4, change: 3, pct: 9.8 },
+      { region: "west", amount: 20, rn: 5, change: 10, pct: 19.6 },
+      { region: "west", amount: 20, rn: 6, change: 0, pct: 19.6 },
+      { region: "east", amount: 40, rn: 7, change: 20, pct: 39.2 },
+    ]);
+    expect(executeQuery(composed, input)).toEqual(executeRowQuery(composed, input));
+    // A window over a grouped block ranks the groups: SQL runs it after GROUP BY and HAVING, so
+    // its ORDER BY reads the aggregates.
+    const rankedGroups = compileQuery(
+      `SELECT region, COUNT(*) AS c, SUM(amount) AS total,
+              ROW_NUMBER() OVER (ORDER BY SUM(amount) DESC) AS rn,
+              SUM(SUM(amount)) OVER () AS everything
+       FROM rows GROUP BY region HAVING COUNT(*) > 1 ORDER BY rn`,
+    );
+    expect(executeQuery(rankedGroups, input).rows).toEqual([
+      { region: "west", c: 3, total: 50, rn: 1, everything: 95 },
+      { region: "east", c: 2, total: 45, rn: 2, everything: 95 },
+    ]);
+    expect(executeQuery(rankedGroups, input)).toEqual(executeRowQuery(rankedGroups, input));
+    // What is still refused is a window reading a column the grouping threw away.
     expect(() =>
       compileQuery(
-        "SELECT region, COUNT(*) AS c, ROW_NUMBER() OVER () AS rn FROM rows GROUP BY region",
+        "SELECT region, COUNT(*) AS c, ROW_NUMBER() OVER (ORDER BY amount) AS rn FROM rows GROUP BY region",
       ),
-    ).toThrow("Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING");
+    ).toThrow("OVER(...) must use aggregates or GROUP BY expressions");
     const windowTotal = executeQuery(
       compileQuery("SELECT region, SUM(amount) OVER () AS s FROM rows ORDER BY region"),
       input,
@@ -779,9 +815,20 @@ describe("public SQL queries", () => {
     expect(() => compileQuery("SELECT UPPER(DISTINCT region) AS r FROM rows")).toThrow(
       "DISTINCT is only supported inside aggregate functions",
     );
-    expect(() =>
-      compileQuery("SELECT COUNT(DISTINCT region) AS r, SUM(amount) AS total FROM rows"),
-    ).toThrow("A DISTINCT aggregate cannot be combined with other aggregates yet");
+    // A DISTINCT aggregate sits beside ordinary ones, several to a select, and inside arithmetic:
+    // each carries its own set of seen values rather than the select carrying one.
+    const mixed = compileQuery(
+      `SELECT COUNT(DISTINCT region) AS regions,
+              COUNT(DISTINCT amount) AS amounts,
+              SUM(amount) AS total,
+              COUNT(*) AS rows_seen,
+              SUM(amount) / COUNT(DISTINCT region) AS per_region
+       FROM rows`,
+    );
+    expect(executeQuery(mixed, input).rows).toEqual([
+      { regions: 2, amounts: 3, total: 75, rows_seen: 6, per_region: 37.5 },
+    ]);
+    expect(executeQuery(mixed, input)).toEqual(executeRowQuery(mixed, input));
     const notBetween = compileQuery("SELECT region FROM rows WHERE amount NOT BETWEEN 1 AND 5");
     expect(executeQuery(notBetween, input)).toEqual(executeRowQuery(notBetween, input));
     expect(executeQuery(notBetween, input).rows).toEqual([
@@ -1306,7 +1353,7 @@ describe("compile error positions", () => {
       at: "'oops",
       message: "Unterminated string literal",
     });
-    expect(queryFailure("SELECT * FROM events -- note").at).toBe("--");
+    expect(queryFailure("SELECT * FROM events /* note").at).toBe("/* note");
     expect(queryFailure("SELECT # FROM events").at).toBe("#");
     expect(queryFailure("SELECT * FROM a; SELECT * FROM b").at).toBe(";");
     expect(queryFailure("SELECT 1.2.3 FROM events").at).toBe("1.2.3");

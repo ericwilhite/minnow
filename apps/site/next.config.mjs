@@ -7,10 +7,40 @@ import { createMDX } from "fumadocs-mdx/next";
  * `trailingSlash` keeps every published URL shaped the way the previous site published them,
  * so existing links and the browser tests keep resolving.
  */
+/**
+ * The isolation `public/_headers` gives the published site, applied by the dev server too.
+ *
+ * A static export cannot carry headers, so this is development-only — but without it the two
+ * differ in a way that changes what the benchmarks page measures. An origin that is not
+ * cross-origin isolated has `performance.now()` clamped to 100µs instead of 5µs, which is coarser
+ * than most of what that page times, and SQLite falls back from its OPFS VFS to the
+ * synchronous-access-handle pool. Numbers read in development would be a different browser's.
+ */
+const developmentHeaders = [
+  {
+    source: "/benchmarks/:path*",
+    headers: [
+      { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+      { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
+    ],
+  },
+  {
+    // An isolated document may only load subresources that opt in — its own worker included.
+    source: "/:path*",
+    headers: [
+      { key: "Cross-Origin-Resource-Policy", value: "same-origin" },
+      { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
+    ],
+  },
+];
+
 const config = {
   output: "export",
   trailingSlash: true,
   reactStrictMode: true,
+  ...(process.env.NODE_ENV === "development"
+    ? { headers: () => Promise.resolve(developmentHeaders) }
+    : {}),
   // The engine and the devtools panel ship as ESM built from source in this repo, and both are
   // loaded only inside client components.
   transpilePackages: ["@minnowdb/core", "@minnowdb/devtools"],

@@ -4,11 +4,17 @@ import { toCatalog } from "./explorer/catalog.js";
 import { createExplorer } from "./explorer/explorer.js";
 import { createSchemaRail } from "./explorer/tree.js";
 import { matchesHotkey } from "./hotkey.js";
-import { resolveOptions, type DevtoolsOptions } from "./options.js";
+import { resolveOptions, type DevtoolsOptions, type DevtoolsTheme } from "./options.js";
 import { createLauncher } from "./panel/launcher.js";
 import { createPanel } from "./panel/panel.js";
+import { createSnapshotActions } from "./panel/snapshot.js";
 import { styles } from "./styles.js";
-import { resolveTarget, runsOffMainThread, type DevtoolsAttachable } from "./target.js";
+import {
+  isSnapshotTarget,
+  resolveTarget,
+  runsOffMainThread,
+  type DevtoolsAttachable,
+} from "./target.js";
 
 export interface DevtoolsHandle {
   open(): void;
@@ -20,6 +26,11 @@ export interface DevtoolsHandle {
    * application dropping the user into the query behind the screen they were looking at.
    */
   setQuery(sql: string): void;
+  /**
+   * Repaints in the given palette. A page with its own light/dark switch calls this when the
+   * switch is flipped, rather than remounting the panel and losing the query in it.
+   */
+  setTheme(theme: DevtoolsTheme): void;
   readonly isOpen: boolean;
   /** Removes every listener and empties the root. Safe to call twice. */
   destroy(): void;
@@ -56,6 +67,18 @@ export function createDevtools(
   const target = resolveTarget(attachable);
   adoptStyles(root);
 
+  // The two things the panel needs from its own host element: which layout it is in, so an inline
+  // host can be a block with a height, and which palette to paint in. Both are read by the
+  // stylesheet from the host rather than set on it in JavaScript, so the page can override them.
+  const host = root.host;
+  host.setAttribute("data-minnow-devtools", resolved.mode);
+
+  function applyTheme(theme: DevtoolsTheme): void {
+    if (theme === "system") host.removeAttribute("theme");
+    else host.setAttribute("theme", theme);
+  }
+  applyTheme(resolved.theme);
+
   const confirm = createConfirmLayer();
   const explorer = createExplorer({ target, confirm, write: resolved.write });
   const view = createConsole({
@@ -86,10 +109,28 @@ export function createDevtools(
     },
   });
 
+  /**
+   * Copying the database out and loading one back, when the target can. A target that cannot
+   * contributes no controls at all, so the title bar never carries a button that would only ever
+   * report that it is unavailable.
+   */
+  const snapshots = isSnapshotTarget(target)
+    ? createSnapshotActions({
+        target,
+        confirm,
+        write: resolved.write,
+        onRestored: () => {
+          // The panel is showing the catalog of the database that was here before the load.
+          void loadCatalog();
+        },
+      })
+    : undefined;
+
   const panel = createPanel({
     options: resolved,
     offMainThread: runsOffMainThread(target),
     rail: rail.node,
+    ...(snapshots === undefined ? {} : { actions: snapshots.nodes }),
     // The console leads: writing a query is what the panel is opened for most often.
     views: [
       {
@@ -197,6 +238,10 @@ export function createDevtools(
       panel.show("query");
       view.setQuery(sql);
     },
+    setTheme: (theme: DevtoolsTheme) => {
+      if (destroyed) return;
+      applyTheme(theme);
+    },
     get isOpen() {
       return open;
     },
@@ -207,6 +252,9 @@ export function createDevtools(
       confirm.dismiss();
       view.destroy();
       panel.destroy();
+      // The theme attribute stays: on the custom element it is the caller's own markup, and a
+      // remount reads its options back off the element.
+      host.removeAttribute("data-minnow-devtools");
       root.replaceChildren();
     },
   };

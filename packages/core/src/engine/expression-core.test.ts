@@ -161,11 +161,10 @@ describe("LAG/LEAD and frames", () => {
         "SELECT SUM(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) AS s FROM rows",
       ),
     ).toThrow("reversed");
+    // GROUPS frames count peer groups, which only an ordering defines.
     expect(() =>
-      compileQuery(
-        "SELECT SUM(amount) OVER (ORDER BY id GROUPS UNBOUNDED PRECEDING) AS s FROM rows",
-      ),
-    ).toThrow("GROUPS");
+      compileQuery("SELECT SUM(amount) OVER (GROUPS UNBOUNDED PRECEDING) AS s FROM rows"),
+    ).toThrow("GROUPS frames require ORDER BY");
   });
 });
 
@@ -236,12 +235,45 @@ describe("DISTINCT aggregates", () => {
     }
   });
 
-  it("keeps the existing DISTINCT aggregate restrictions", () => {
-    expect(() => compileQuery("SELECT SUM(DISTINCT amount) AS s, COUNT(*) AS c FROM rows")).toThrow(
-      "cannot be combined with other aggregates",
+  it("keeps its own set per aggregate, beside the plain ones", () => {
+    const duplicated = new Map<string, DatabaseRow[]>([
+      ["t", [{ v: 4 }, { v: 4 }, { v: 2 }, { v: null }]],
+    ]);
+    const plan = compileQuery(
+      "SELECT SUM(DISTINCT v) AS s, COUNT(*) AS c, COUNT(DISTINCT v) AS d, SUM(v) AS total FROM t",
     );
+    const expected = [{ s: 6, c: 4, d: 2, total: 10 }];
+    expect(executeRowQuery(plan, duplicated).rows).toEqual(expected);
+    expect(executeQuery(plan, duplicated).rows).toEqual(expected);
+  });
+
+  it("counts distinct values per group, not per select", () => {
+    const rows = new Map<string, DatabaseRow[]>([
+      [
+        "t",
+        [
+          { g: "a", v: 1, w: 9 },
+          { g: "a", v: 1, w: 8 },
+          { g: "a", v: 2, w: 9 },
+          { g: "b", v: 5, w: 1 },
+        ],
+      ],
+    ]);
+    const plan = compileQuery(
+      "SELECT g, COUNT(DISTINCT v) AS vs, COUNT(DISTINCT w) AS ws FROM t GROUP BY g ORDER BY g",
+    );
+    const expected = [
+      { g: "a", vs: 2, ws: 2 },
+      { g: "b", vs: 1, ws: 1 },
+    ];
+    expect(executeRowQuery(plan, rows).rows).toEqual(expected);
+    expect(executeQuery(plan, rows).rows).toEqual(expected);
+  });
+
+  it("still refuses DISTINCT where no aggregate is being taken", () => {
     expect(() => compileQuery("SELECT UPPER(DISTINCT region) AS u FROM rows")).toThrow(
       "only supported inside aggregate functions",
     );
+    expect(() => compileQuery("SELECT g FROM t WHERE COUNT(DISTINCT v) > 1")).toThrow();
   });
 });

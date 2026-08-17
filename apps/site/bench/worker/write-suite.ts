@@ -49,6 +49,16 @@ import {
 } from "./support";
 
 const SAMPLE_COUNT = 5;
+/**
+ * Same target window as the read suite, and the same reason: the browser's clock steps in 5µs or
+ * 100µs, so a write it cannot resolve has to be repeated inside one window and divided back down.
+ * The cap is far lower than the read suite's because every repeat here costs a table — created,
+ * seeded, and thrown away — rather than another call against one that already exists, and minnow
+ * has no DROP TABLE, so the ones it makes stay with the dataset. Sixteen repeats already put the
+ * clock's step three orders of magnitude below the window.
+ */
+const TARGET_WINDOW_MS = 5;
+const MAX_WRITE_BATCH = 16;
 
 /** Column names in table order; the read-back tuple is compared in exactly this order. */
 const COLUMNS = ["key_id", "payload_num", "payload_text", "updated_at"] as const;
@@ -269,25 +279,65 @@ async function measureCase(
   // JavaScript is the harness's cost, not the engine's, and it must not land in the number.
   const seed = definition.seedRows > 0 ? batchFor(1, definition.seedRows, 0) : undefined;
   const prepare = prepareStep(definition);
-  let target: WriteTarget | undefined;
+  let created = 0;
+  let batch: WriteTarget[] = [];
+  let previous: WriteTarget[] = [];
+
+  /**
+   * One table per write, each created empty, seeded, and with its payload already converted into
+   * the engine's argument form — all of it before anything is timed. A write cannot be repeated
+   * against the table it just changed, so amortizing one means preparing a table apiece.
+   */
+  const prepareBatch = async (size: number): Promise<Array<() => Promise<void>>> => {
+    const applies: Array<() => Promise<void>> = [];
+    batch = [];
+    for (let index = 0; index < size; index += 1) {
+      assertNotCancelled(requestId);
+      created += 1;
+      const target = await session.createTable(tableSchema(`${tableBase}_${String(created)}`));
+      batch.push(target);
+      if (seed !== undefined) await target.prepareInsert(seed)();
+      applies.push(prepare(target));
+    }
+    return applies;
+  };
+
+  const dropAll = async (targets: readonly WriteTarget[]): Promise<void> => {
+    for (const target of targets) await target.drop().catch(() => undefined);
+  };
+
   try {
+    // A calibration write, thrown away, sizes the window the way the read suite sizes its own:
+    // a write that costs milliseconds is timed one at a time, and one the clock cannot resolve
+    // is repeated until the window is long enough to divide.
+    const probeApplies = await prepareBatch(1);
+    const probeStarted = performance.now();
+    for (const apply of probeApplies) await apply();
+    const probeMs = performance.now() - probeStarted;
+    await dropAll(batch);
+    const batchSize =
+      probeMs >= TARGET_WINDOW_MS
+        ? 1
+        : Math.min(
+            MAX_WRITE_BATCH,
+            Math.max(1, Math.ceil(TARGET_WINDOW_MS / Math.max(probeMs, 0.005))),
+          );
+
     for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
       assertNotCancelled(requestId);
-      // The previous sample's table is dropped where the engine can, and always abandoned:
-      // every sample runs against a table it created empty.
-      if (target !== undefined) await target.drop().catch(() => undefined);
-      target = await session.createTable(tableSchema(`${tableBase}_${String(sample)}`));
-      if (seed !== undefined) await target.prepareInsert(seed)();
-      // The batch is converted into the engine's own argument form here, outside the timer;
-      // the returned call is the engine doing the write and nothing else.
-      const apply = prepare(target);
+      const applies = await prepareBatch(batchSize);
       const started = performance.now();
-      await apply();
-      samples.push(performance.now() - started);
+      for (const apply of applies) await apply();
+      samples.push((performance.now() - started) / applies.length);
+      // The previous sample's tables are dropped where the engine can, and always abandoned:
+      // every write in every window ran against a table prepared for it alone.
+      await dropAll(previous);
+      previous = batch;
     }
-    // Samples are identical by construction, so the last table's state is every sample's
-    // state; verifying it once keeps a 100k read-back out of the measured loop.
-    const rows = await (target?.readAll() ?? Promise.resolve([]));
+    // Every table in the batch took the identical write, so any of them is every sample's
+    // state; verifying one keeps a 100k read-back out of the measured loop.
+    const last = previous[previous.length - 1];
+    const rows = await (last?.readAll() ?? Promise.resolve([]));
     const tuples = canonicalTuples(rows, projectRow);
     const { medianMs, p95Ms } = summarizeSamples(samples);
     return {
@@ -295,6 +345,7 @@ async function measureCase(
       supported: true,
       medianMs,
       p95Ms,
+      batchSize,
       rowsPerSecond: medianMs > 0 ? (definition.rows / medianMs) * 1_000 : 0,
       tableRows: rows.length,
       checksum: referenceChecksum(tuples),
@@ -303,7 +354,8 @@ async function measureCase(
   } catch (error) {
     return unsupported(engine, error instanceof Error ? error.message : String(error));
   } finally {
-    if (target !== undefined) await target.drop().catch(() => undefined);
+    await dropAll(previous);
+    await dropAll(batch.filter((target) => !previous.includes(target)));
   }
 }
 

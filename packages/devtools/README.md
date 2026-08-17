@@ -24,6 +24,9 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
   so it works unchanged in React, Vue, Svelte, Solid, Astro, and plain HTML.
 - **A window, not a modal** — no backdrop, no focus trap; the page underneath stays interactive.
   Drag by the title bar, resize from the corner grip, and it reopens where you left it.
+- **Embeds anywhere** — `mode: "inline"` puts the panel in your layout, where it fills its
+  container. `theme` follows your page's light/dark switch, and the whole palette is `--mdt-*`
+  custom properties you can override from outside the shadow root.
 - **Edit records** — double-click a cell, select a row to delete it, or add one through a typed
   form. Values are validated against the column's type before anything is confirmed.
 - **Query with completion** — a CodeMirror console whose completion comes from your own catalog,
@@ -34,6 +37,9 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
   the statement.
 - **Changes are confirmed first** — the prompt names the table, the key, and the before and after
   values. An `UPDATE` or `DELETE` with no `WHERE` is called out as hitting every row.
+- **Download the database** — the whole thing as one snapshot file, and a matching restore that
+  describes the file it picked before loading it. Progress is reported throughout, and the bytes
+  leave a worker in slices so the page keeps painting.
 - **`permissions: { write: false }`** refuses statements that change data before they reach the
   database.
 

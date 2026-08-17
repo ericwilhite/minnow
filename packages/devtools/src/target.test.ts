@@ -1,9 +1,12 @@
+import type { MinnowDatabase, MinnowDatabaseClient } from "@minnowdb/core";
 import { describe, expect, it } from "vitest";
 import {
   isEditableTarget,
+  isSnapshotTarget,
   resolveTarget,
   runsOffMainThread,
   type DevtoolsTarget,
+  type SnapshotTarget,
 } from "./target.js";
 
 function stubTarget(): DevtoolsTarget {
@@ -55,6 +58,28 @@ describe("isEditableTarget", () => {
         Object.assign(stubTarget(), { insert: writes.insert, updateBatch: writes.updateBatch }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("isSnapshotTarget", () => {
+  it("requires both halves, since a download with no way back is half a feature", () => {
+    expect(isSnapshotTarget(stubTarget())).toBe(false);
+    const snapshots = {
+      exportSnapshot: async () => new Uint8Array(0),
+      importSnapshot: async () => undefined,
+    };
+    expect(isSnapshotTarget(Object.assign(stubTarget(), snapshots))).toBe(true);
+    expect(
+      isSnapshotTarget(Object.assign(stubTarget(), { exportSnapshot: snapshots.exportSnapshot })),
+    ).toBe(false);
+  });
+
+  it("is satisfied by the real database and the worker client", () => {
+    // Type-level only: the capability is declared structurally so both classes qualify as they
+    // are. If either signature drifts, this stops compiling.
+    const fromDatabase: (database: MinnowDatabase) => SnapshotTarget = (database) => database;
+    const fromClient: (client: MinnowDatabaseClient) => SnapshotTarget = (client) => client;
+    expect([fromDatabase, fromClient].every((narrow) => typeof narrow === "function")).toBe(true);
   });
 });
 

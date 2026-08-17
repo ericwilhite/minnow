@@ -8,13 +8,15 @@
  * reported unless it was verified: a timing for a wrong answer is not a timing.
  */
 import type {
+  DatasetRecord,
   EngineId,
   FeatureSuiteResult,
   ReferenceSuiteResult,
   WriteSuiteResult,
   WorkloadKind,
 } from "@/bench/protocol";
-import { ENGINES, formatMs } from "./config";
+import { formatBytes as formatStorage } from "@/bench/format";
+import { ENGINES, formatMs, type EngineChoice } from "./config";
 
 const WORKLOADS: ReadonlyArray<{ kind: WorkloadKind; label: string; note: string }> = [
   { kind: "oltp", label: "OLTP", note: "Selective lookups and small mutations." },
@@ -25,14 +27,14 @@ function engineLabel(engine: EngineId): string {
   return ENGINES.find((choice) => choice.id === engine)?.label ?? engine;
 }
 
-/** Fastest verified engine in a row, so the winner can be marked rather than eyeballed. */
-function fastest(entries: ReadonlyArray<{ engine: EngineId; ms: number | null }>): EngineId | null {
-  let best: { engine: EngineId; ms: number } | undefined;
+/** Fastest verified column in a row, so the winner can be marked rather than eyeballed. */
+function fastest(entries: ReadonlyArray<{ id: string; ms: number | null }>): string | null {
+  let best: { id: string; ms: number } | undefined;
   for (const entry of entries) {
     if (entry.ms === null) continue;
-    if (best === undefined || entry.ms < best.ms) best = { engine: entry.engine, ms: entry.ms };
+    if (best === undefined || entry.ms < best.ms) best = { id: entry.id, ms: entry.ms };
   }
-  return best?.engine ?? null;
+  return best?.id ?? null;
 }
 
 function Cell({ ms, best, note }: { ms: number | null; best: boolean; note?: string }) {
@@ -55,17 +57,17 @@ function Cell({ ms, best, note }: { ms: number | null; best: boolean; note?: str
 function Table({
   caption,
   note,
-  engines,
+  columns,
   rows,
 }: {
   caption: string;
   note: string;
-  engines: readonly EngineId[];
+  columns: readonly EngineChoice[];
   rows: ReadonlyArray<{
     id: string;
     name: string;
     detail: string;
-    cells: ReadonlyArray<{ engine: EngineId; ms: number | null; note?: string }>;
+    cells: ReadonlyArray<{ id: string; ms: number | null; note?: string }>;
   }>;
 }) {
   if (rows.length === 0) return null;
@@ -78,9 +80,13 @@ function Table({
           <thead>
             <tr className="border-b border-fd-border bg-fd-muted">
               <th className="px-3 py-2 text-left font-medium">Case</th>
-              {engines.map((engine) => (
-                <th key={engine} className="px-3 py-2 text-right font-medium">
-                  {engineLabel(engine)}
+              {columns.map((column) => (
+                <th
+                  key={column.id}
+                  className="px-3 py-2 text-right font-medium"
+                  title={column.note}
+                >
+                  {column.label}
                 </th>
               ))}
             </tr>
@@ -99,9 +105,9 @@ function Table({
                   </td>
                   {row.cells.map((cell) => (
                     <Cell
-                      key={cell.engine}
+                      key={cell.id}
                       ms={cell.ms}
-                      best={best === cell.engine}
+                      best={best === cell.id}
                       {...(cell.note === undefined ? {} : { note: cell.note })}
                     />
                   ))}
@@ -115,12 +121,26 @@ function Table({
   );
 }
 
-export function ReadResults({ result }: { result: ReferenceSuiteResult }) {
+export function ReadResults({
+  result,
+  columns,
+}: {
+  result: ReferenceSuiteResult;
+  columns: readonly EngineChoice[];
+}) {
+  const shown = columns.filter((column) => result.engines.includes(column.engine));
+  // The batch size the harness settled on, which is the honest answer to "how was 4µs measured".
+  const batched = result.queries
+    .flatMap((query) => query.engines.map((entry) => entry.batchSize ?? 1))
+    .reduce((highest, size) => Math.max(highest, size), 1);
   return (
     <section>
       <h3 className="text-xl font-semibold">Reads</h3>
       <p className="mt-1 text-sm text-fd-muted-foreground">
-        Median of {result.sampleCount} executions per query, after one untimed warm-up.{" "}
+        Median of {result.sampleCount} timed windows per query, after one untimed warm-up.{" "}
+        {batched > 1
+          ? `A query quicker than the clock is executed up to ${batched.toLocaleString("en-US")} times per window and divided back down, so a microsecond lookup reads as microseconds rather than as a clock tick. `
+          : ""}
         {result.passed
           ? "Every query every engine could run agreed with the independent oracle."
           : "Some results disagreed with the oracle — treat these timings as suspect."}
@@ -130,19 +150,78 @@ export function ReadResults({ result }: { result: ReferenceSuiteResult }) {
           key={workload.kind}
           caption={workload.label}
           note={workload.note}
-          engines={result.engines}
+          columns={shown}
           rows={result.queries
             .filter((query) => query.workload === workload.kind)
             .map((query) => ({
               id: query.id,
               name: query.name,
               detail: `${String(query.oracleRows)} rows`,
-              cells: result.engines.map((engine) => {
-                const measured = query.engines.find((entry) => entry.engine === engine);
+              cells: shown.map((column) => {
+                const measured = query.engines.find((entry) => entry.engine === column.engine);
+                // An unsupported query, or one whose answer did not match the oracle, has no
+                // number worth printing. Neither has a cached column for an engine with no cache.
+                const usable = measured?.supported === true && measured.verified;
+                const ms = !usable
+                  ? null
+                  : column.cached === true
+                    ? (measured.cachedMedianMs ?? null)
+                    : measured.medianMs;
                 return {
-                  engine,
-                  // An unsupported query, or one whose answer did not match the oracle, has no
-                  // number worth printing.
+                  id: column.id,
+                  ms,
+                  ...(measured?.error === undefined ? {} : { note: measured.error }),
+                };
+              }),
+            }))}
+        />
+      ))}
+    </section>
+  );
+}
+
+export function WriteResults({
+  result,
+  columns,
+}: {
+  result: WriteSuiteResult;
+  columns: readonly EngineChoice[];
+}) {
+  // Nothing caches a write, so the cached column would be a stripe of dashes.
+  const shown = columns.filter(
+    (column) => column.cached !== true && result.engines.includes(column.engine),
+  );
+  const batched = result.cases
+    .flatMap((entry) => entry.engines.map((measured) => measured.batchSize ?? 1))
+    .reduce((highest, size) => Math.max(highest, size), 1);
+  return (
+    <section>
+      <h3 className="text-xl font-semibold">Writes</h3>
+      <p className="mt-1 text-sm text-fd-muted-foreground">
+        Median of {result.sampleCount} timed windows, each against tables created and seeded for it
+        alone.{" "}
+        {batched > 1
+          ? `A write quicker than the clock is repeated across ${batched.toLocaleString("en-US")} of those tables inside one window and divided back down. `
+          : ""}
+        Only the engine&rsquo;s own call is timed — reshaping rows into the form each API wants is
+        the harness&rsquo;s cost, not the engine&rsquo;s.
+      </p>
+      {WORKLOADS.map((workload) => (
+        <Table
+          key={workload.kind}
+          caption={workload.label}
+          note={workload.note}
+          columns={shown}
+          rows={result.cases
+            .filter((entry) => entry.workload === workload.kind)
+            .map((entry) => ({
+              id: entry.id,
+              name: entry.name,
+              detail: `${entry.rows.toLocaleString("en-US")} rows`,
+              cells: shown.map((column) => {
+                const measured = entry.engines.find((item) => item.engine === column.engine);
+                return {
+                  id: column.id,
                   ms: measured?.supported === true && measured.verified ? measured.medianMs : null,
                   ...(measured?.error === undefined ? {} : { note: measured.error }),
                 };
@@ -154,38 +233,71 @@ export function ReadResults({ result }: { result: ReferenceSuiteResult }) {
   );
 }
 
-export function WriteResults({ result }: { result: WriteSuiteResult }) {
+/**
+ * What each engine's copy of the same dataset costs on disk, and the storage it went through.
+ * Every engine reports the size the way its own documentation does — Minnow sums its blocks,
+ * SQLite multiplies page count by page size, PostgreSQL sums its relation sizes — so these are
+ * each engine's own accounting of the same rows rather than one outsider's guess about all three.
+ */
+export function StorageResults({ record }: { record: DatasetRecord }) {
+  const ready = Object.values(record.engines).filter((entry) => entry.status === "ready");
+  if (ready.length === 0) return null;
+  const smallest = ready.reduce<number | null>(
+    (best, entry) =>
+      entry.storedBytes === null || (best !== null && best <= entry.storedBytes)
+        ? best
+        : entry.storedBytes,
+    null,
+  );
   return (
     <section>
-      <h3 className="text-xl font-semibold">Writes</h3>
+      <h3 className="text-xl font-semibold">Storage</h3>
       <p className="mt-1 text-sm text-fd-muted-foreground">
-        Median of {result.sampleCount} runs against a fresh table each time. Only the engine&rsquo;s
-        own call is timed — reshaping rows into the form each API wants is the harness&rsquo;s cost,
-        not the engine&rsquo;s.
+        The same {record.totalRows.toLocaleString("en-US")} rows, as each engine stored them just
+        now.
       </p>
-      {WORKLOADS.map((workload) => (
-        <Table
-          key={workload.kind}
-          caption={workload.label}
-          note={workload.note}
-          engines={result.engines}
-          rows={result.cases
-            .filter((entry) => entry.workload === workload.kind)
-            .map((entry) => ({
-              id: entry.id,
-              name: entry.name,
-              detail: `${entry.rows.toLocaleString("en-US")} rows`,
-              cells: result.engines.map((engine) => {
-                const measured = entry.engines.find((item) => item.engine === engine);
-                return {
-                  engine,
-                  ms: measured?.supported === true && measured.verified ? measured.medianMs : null,
-                  ...(measured?.error === undefined ? {} : { note: measured.error }),
-                };
-              }),
-            }))}
-        />
-      ))}
+      <div className="mt-3 overflow-x-auto rounded-lg border border-fd-border">
+        <table className="w-full min-w-[36rem] text-sm">
+          <thead>
+            <tr className="border-b border-fd-border bg-fd-muted">
+              <th className="px-3 py-2 text-left font-medium">Engine</th>
+              <th className="px-3 py-2 text-right font-medium">On disk</th>
+              <th className="px-3 py-2 text-right font-medium">Per row</th>
+              <th className="px-3 py-2 text-right font-medium">Relative</th>
+              <th className="px-3 py-2 text-left font-medium">Storage</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ready.map((entry) => (
+              <tr key={entry.engine} className="border-b border-fd-border last:border-0">
+                <td className="px-3 py-1.5">{engineLabel(entry.engine)}</td>
+                <td
+                  className={`px-3 py-1.5 text-right tabular-nums ${
+                    entry.storedBytes !== null && entry.storedBytes === smallest
+                      ? "font-semibold text-fd-primary"
+                      : ""
+                  }`}
+                >
+                  {entry.storedBytes === null ? "—" : formatStorage(entry.storedBytes)}
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums">
+                  {entry.storedBytes === null || record.totalRows === 0
+                    ? "—"
+                    : `${(entry.storedBytes / record.totalRows).toFixed(1)} B`}
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums">
+                  {entry.storedBytes === null || smallest === null || smallest === 0
+                    ? "—"
+                    : `${(entry.storedBytes / smallest).toFixed(2)}×`}
+                </td>
+                <td className="px-3 py-1.5 text-xs text-fd-muted-foreground">
+                  {entry.persistence}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
@@ -212,15 +324,12 @@ export function FeatureResults({ result }: { result: FeatureSuiteResult }) {
           </thead>
           <tbody>
             {result.engines.map((engine) => {
-              // "pass" on a supported form and "accepts" on a rejected one both mean the engine
-              // ran the example; the two spellings exist because they mean different things
-              // about Minnow, which is being checked for drift rather than surveyed.
-              const accepted = result.features.filter((feature) => {
-                const outcome = feature.engines.find((e) => e.engine === engine)?.outcome;
-                return feature.status === "supported"
-                  ? outcome === "pass"
-                  : outcome === "accepts" || (engine === "minnow" && outcome === "fail");
-              }).length;
+              // One question for every column: did the engine run the statement? The per-engine
+              // verdicts answer different questions — matrix drift for Minnow, surface survey for
+              // the others — so counting them together compared nothing.
+              const accepted = result.features.filter(
+                (feature) => feature.engines.find((e) => e.engine === engine)?.accepted === true,
+              ).length;
               return (
                 <tr key={engine} className="border-b border-fd-border last:border-0">
                   <td className="px-3 py-1.5">{engineLabel(engine)}</td>
@@ -235,8 +344,11 @@ export function FeatureResults({ result }: { result: FeatureSuiteResult }) {
         </table>
       </div>
       <p className="mt-2 text-xs text-fd-muted-foreground">
-        The other engines are informational: a form Minnow rejects and Postgres accepts is a
-        difference, not a defect on either side.
+        Accepted counts the forms an engine executed. Minnow&rsquo;s rejections are the forms the
+        matrix publishes as unsupported — refusing them is the matrix being accurate, and executing
+        one would be the drift reported above. For the other engines this is a survey of dialect,
+        not a score: a form Minnow rejects and Postgres accepts is a difference, not a defect on
+        either side.
       </p>
     </section>
   );

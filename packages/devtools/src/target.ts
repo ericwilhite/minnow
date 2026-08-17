@@ -10,6 +10,7 @@ import type {
   UpdateBatchInput,
   UpdateBatchResult,
 } from "@minnowdb/core";
+import type { SnapshotExportProgress, SnapshotLoadProgress } from "@minnowdb/core/storage";
 
 /**
  * The slice of the database the devtools drive. `MinnowDatabase` and `MinnowDatabaseClient`
@@ -32,6 +33,34 @@ export interface EditableTarget extends DevtoolsTarget {
   insert(tableName: string, row: BatchRow): Promise<InsertBatchResult>;
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<UpdateBatchResult>;
   deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult>;
+}
+
+/**
+ * The snapshot API the download and restore actions drive. Separate from `DevtoolsTarget` for the
+ * same reason the write API is: a target that cannot copy itself out is still a perfectly good one
+ * to browse, so the actions take themselves off the title bar rather than failing when clicked.
+ *
+ * Both methods are on `MinnowDatabase` and `MinnowDatabaseClient` whatever their block store can
+ * do, so their presence proves the API is reachable, not that this particular store implements it;
+ * a store that cannot says so when the action runs, and the panel shows what it said.
+ */
+export interface SnapshotTarget extends DevtoolsTarget {
+  exportSnapshot(options?: {
+    onProgress?: (progress: SnapshotExportProgress) => void;
+  }): Promise<Uint8Array>;
+  importSnapshot(
+    bytes: Uint8Array,
+    options?: { onProgress?: (progress: SnapshotLoadProgress) => void },
+  ): Promise<void>;
+}
+
+const snapshotMethods = ["exportSnapshot", "importSnapshot"] as const;
+
+/** Whether this target can copy a database out and load one back. */
+export function isSnapshotTarget(target: DevtoolsTarget): target is SnapshotTarget {
+  return snapshotMethods.every(
+    (method) => typeof (target as unknown as Record<string, unknown>)[method] === "function",
+  );
 }
 
 const writeMethods = ["insert", "updateBatch", "deleteBatch"] as const;

@@ -43,6 +43,7 @@ function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "create-table") return `created table ${result.table}`;
   if (result.kind === "create-trigger") return `created trigger ${result.name} on ${result.table}`;
   if (result.kind === "drop-trigger") return `dropped trigger ${result.name}`;
+  if (result.kind === "add-column") return `added column ${result.table}.${result.column}`;
   const rows = result.rowCount === 1 ? "1 row" : `${String(result.rowCount)} rows`;
   return `${result.kind}: ${rows} in ${result.table}`;
 }

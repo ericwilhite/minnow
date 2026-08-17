@@ -331,6 +331,8 @@ interface BoundSelectItem {
 interface AggregateSpec {
   readonly name: AggregateName;
   readonly argument: BoundExpression;
+  /** `COUNT(DISTINCT x)`: the accumulator sees each distinct value once per group. */
+  readonly distinct?: boolean;
   /** Set for MIN/MAX/COUNT over a bare datetime column: aggregate on raw epoch milliseconds. */
   readonly rawDatetime?: { source: number; vector: DateTimeVector };
   /** Set for any aggregate over a bare number column: read the typed vector directly. */
@@ -344,6 +346,13 @@ interface GroupState {
   readonly values: Array<QueryValue | undefined>;
   readonly valueReservations: Array<QueryMemoryReservation | undefined>;
   readonly valueReservationBytes: Float64Array;
+  /**
+   * The values a DISTINCT aggregate has already folded in, one set per aggregate slot and only
+   * for the slots that are DISTINCT. This is what makes several of them per select possible: each
+   * carries its own set, so they no longer compete for the single deduplicating GROUP BY that
+   * `COUNT(DISTINCT x)` used to be rewritten into.
+   */
+  readonly distincts: Array<Set<unknown> | undefined> | undefined;
 }
 
 interface BoundPlan {
@@ -1103,6 +1112,9 @@ function bindExpression(
     aggregateSpecs.push({
       name: expression.name,
       argument,
+      // The signature this slot was keyed by is the JSON of the compiled call, which carries the
+      // flag — so COUNT(x) and COUNT(DISTINCT x) in one select land in separate slots.
+      ...(expression.distinct === true ? { distinct: true } : {}),
       ...(rawDatetime === undefined ? {} : { rawDatetime }),
       ...(rawNumber === undefined ? {} : { rawNumber }),
     });
@@ -3658,6 +3670,8 @@ class GroupAccumulator {
   #fastAggregates(): Array<{ kind: "star" | "column"; sums: boolean }> | undefined {
     const specs: Array<{ kind: "star" | "column"; sums: boolean }> = [];
     for (const spec of this.#plan.aggregates) {
+      // The kernel counts every row it is given; deduplication needs the per-row path.
+      if (spec.distinct === true) return undefined;
       if (spec.argument.kind === "wildcard" && spec.name === "COUNT") {
         specs.push({ kind: "star", sums: false });
         continue;
@@ -4042,7 +4056,16 @@ function createGroupState(
       values: EMPTY_VALUES,
       valueReservations: EMPTY_RESERVATIONS,
       valueReservationBytes: EMPTY_ACCUMULATOR,
+      distincts: undefined,
     };
+  }
+  // Only DISTINCT slots get a set, and only when the plan has one at all — an ordinary grouped
+  // query allocates nothing extra for a feature it does not use.
+  let distincts: Array<Set<unknown> | undefined> | undefined;
+  for (let index = 0; index < plan.aggregates.length; index += 1) {
+    if (plan.aggregates[index]?.distinct !== true) continue;
+    distincts ??= new Array<Set<unknown> | undefined>(plan.aggregates.length);
+    distincts[index] = new Set<unknown>();
   }
   return {
     groupValues,
@@ -4051,7 +4074,46 @@ function createGroupState(
     values: new Array<QueryValue | undefined>(plan.aggregates.length),
     valueReservations: new Array<QueryMemoryReservation | undefined>(plan.aggregates.length),
     valueReservationBytes: new Float64Array(plan.aggregates.length),
+    distincts,
   };
+}
+
+/**
+ * A Set member standing for one aggregate input. Primitives are their own key — a Set separates
+ * `1` from `"1"` on its own — while a Date has to become its instant, since two Dates for the
+ * same moment are different objects. The NUL prefix keeps that instant from colliding with a
+ * string a row genuinely holds.
+ */
+function distinctKey(value: unknown): unknown {
+  return value instanceof Date ? ` d${String(value.getTime())}` : value;
+}
+
+/**
+ * Whether this value is the first of its kind for the slot, folding it into the set when it is.
+ * Growth is tallied rather than reserved for the same reason group state is: the set lives until
+ * the query's memory context closes, so a per-value reservation object would cost more than the
+ * value it tracks.
+ */
+function firstOfItsKind(
+  state: GroupState,
+  index: number,
+  value: unknown,
+  memory: QueryMemoryContext,
+): boolean {
+  const seen = state.distincts?.[index];
+  if (seen === undefined) return true;
+  const key = distinctKey(value);
+  if (seen.has(key)) return false;
+  seen.add(key);
+  memory.tally(
+    safeMemorySum(
+      QUERY_REFERENCE_BYTES,
+      queryValuePayloadBytes(asQueryValue(key)),
+      "Distinct aggregate value",
+    ),
+    "Distinct aggregate value",
+  );
+  return true;
 }
 
 function updateAggregates(
@@ -4081,7 +4143,9 @@ function updateAggregates(
     // the typed sums array, so the per-row value never crosses an interpreter dispatch and the
     // common accumulation path stays unboxed. MIN/MAX keep applyAggregateValue's comparison
     // semantics (including NaN ordering) through compareValues.
-    if (spec.rawNumber !== undefined) {
+    // A DISTINCT slot always takes the generic path below: the unboxed branch writes straight
+    // into the accumulators, with no place to ask whether this value has been seen before.
+    if (spec.rawNumber !== undefined && spec.distinct !== true) {
       const sourceRow = batch.rowsBySource[spec.rawNumber.source]?.[row] ?? -1;
       const value = rawFloat64Value(spec.rawNumber.vector, sourceRow);
       if (value !== null) {
@@ -4145,6 +4209,9 @@ function applyAggregateValue(
   memory: QueryMemoryContext,
 ): void {
   if (value === null || value === undefined) return;
+  // One gate for every path that accumulates: the generic per-row path, the raw datetime path,
+  // and the re-accumulation of spilled rows.
+  if (spec.distinct === true && !firstOfItsKind(state, index, value, memory)) return;
   state.counts[index] = (state.counts[index] ?? 0) + 1;
   if (spec.name === "SUM" || spec.name === "AVG") {
     state.sums[index] = (state.sums[index] ?? 0) + numeric(value);

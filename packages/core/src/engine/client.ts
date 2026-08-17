@@ -10,6 +10,7 @@ import {
   WriteConflictError,
   type CompactionJobRecord,
   type GarbageCollectionJobRecord,
+  type SnapshotLoadProgress,
 } from "../storage/index.js";
 import {
   parseRpcResponse,
@@ -43,6 +44,8 @@ import type {
   QuerySpillCleanupResult,
   ReadTableOptions,
   RunStatementOptions,
+  SnapshotExportOptions,
+  SnapshotImportOptions,
   TableDefinition,
   UpdateBatchInput,
   UpdateBatchResult,
@@ -113,7 +116,16 @@ interface EventRoute {
   onChange?: (result: QueryResult) => void;
   onError?: (error: unknown) => void;
   onComplete?: () => void;
+  /** Payload shape is the handle's own; only snapshot loads emit these today. */
+  onProgress?: (progress: unknown) => void;
 }
+
+/**
+ * Bytes per slice when a snapshot crosses the channel. Large enough that a hundred-megabyte
+ * database is tens of round trips, small enough that no single structured clone is long enough
+ * to be felt as a dropped frame.
+ */
+const SNAPSHOT_CHUNK_BYTES = 4 * 1024 * 1024;
 
 interface PendingCall {
   resolve: (value: unknown) => void;
@@ -371,6 +383,74 @@ export class MinnowDatabaseClient {
     }
   }
 
+  /**
+   * Copies the database out as a portable snapshot file, exactly like the in-worker
+   * `MinnowDatabase.exportSnapshot()`. The worker encodes it and hands it back in slices, so the
+   * main thread copies a few megabytes at a time instead of stalling on one clone of the whole
+   * database; `onProgress` reports each slice as it lands.
+   */
+  async exportSnapshot(options: SnapshotExportOptions = {}): Promise<Uint8Array> {
+    options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
+    const opened = (await this.#call("exportSnapshotOpen", [])) as {
+      handleId: string;
+      byteLength: number;
+    };
+    const totalBytes = opened.byteLength;
+    const bytes = new Uint8Array(totalBytes);
+    try {
+      let offset = 0;
+      while (offset < totalBytes) {
+        const chunk = (await this._invoke(opened.handleId, "read", [
+          offset,
+          Math.min(SNAPSHOT_CHUNK_BYTES, totalBytes - offset),
+        ])) as Uint8Array;
+        // A slice that came back empty would loop forever; the export is over either way.
+        if (chunk.byteLength === 0) throw new Error("Snapshot transfer returned no bytes");
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+        options.onProgress?.({ phase: "transfer", transferredBytes: offset, totalBytes });
+      }
+    } finally {
+      await this._invoke(opened.handleId, "close", []).catch(() => undefined);
+    }
+    options.onProgress?.({ phase: "done", transferredBytes: totalBytes, totalBytes });
+    return bytes;
+  }
+
+  /**
+   * Loads a snapshot file into the worker's store, which must be empty. The bytes go over in the
+   * same slices the export comes back in, and the worker's load progress arrives as events, so a
+   * multi-megabyte restore can be shown moving rather than as a frozen tab.
+   */
+  async importSnapshot(bytes: Uint8Array, options: SnapshotImportOptions = {}): Promise<void> {
+    const handleId = crypto.randomUUID();
+    const { onProgress } = options;
+    this.#events.set(handleId, {
+      ...(onProgress === undefined
+        ? {}
+        : {
+            onProgress: (progress: unknown) => {
+              onProgress(progress as SnapshotLoadProgress);
+            },
+          }),
+    });
+    try {
+      await this.#call("importSnapshotOpen", [handleId]);
+      for (let offset = 0; offset < bytes.byteLength; offset += SNAPSHOT_CHUNK_BYTES) {
+        // Copied, not viewed: structured clone copies the buffer behind a typed array, so a
+        // subarray would post the whole file on every write.
+        await this._invoke(handleId, "write", [bytes.slice(offset, offset + SNAPSHOT_CHUNK_BYTES)]);
+      }
+      await this._invoke(handleId, "finish", []);
+    } catch (error) {
+      // The handle survives a failed write; drop it rather than leaving the chunks in the worker.
+      await this._invoke(handleId, "close", []).catch(() => undefined);
+      throw error;
+    } finally {
+      this.#events.delete(handleId);
+    }
+  }
+
   /** The worker-side buffer pool's byte budget, residency, and lifetime counters. */
   async bufferPoolStats(): Promise<BufferPoolStats> {
     return (await this.#call("bufferPoolStats", [])) as BufferPoolStats;
@@ -532,7 +612,8 @@ export class MinnowDatabaseClient {
       if (response.event === "change") route.onChange?.(response.payload as QueryResult);
       else if (response.event === "error") {
         route.onError?.(rehydrateError(response.payload as SerializedError));
-      } else if (response.event === "complete") {
+      } else if (response.event === "progress") route.onProgress?.(response.payload);
+      else if (response.event === "complete") {
         this.#events.delete(response.handleId);
         route.onComplete?.();
       }

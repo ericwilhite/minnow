@@ -202,6 +202,26 @@ const stepTemplates: StepTemplate[] = [
     sql: `UPDATE items SET amount = amount + ? WHERE region = ?`,
     params: [quarter(state.rng) - 50, pick(state.rng, REGIONS)],
   }),
+  // SQL:2023 predicates on the write path: a row comparison chooses the rows to update, and
+  // the standard string functions build the new value. Both engines have to agree on which
+  // rows matched as well as on what they became.
+  (state) => ({
+    // RTRIM rather than TRIM(TRAILING …): SQLite has no side keyword, and the point here is
+    // the write path, which the read harness's TRIM cases already cover for the syntax.
+    kind: "sql",
+    sql: `UPDATE items SET label = RTRIM(label, '+') WHERE id >= ? AND id < ? RETURNING id, label`,
+    params: [1 + Math.floor(state.rng() * state.nextId), state.nextId + 5],
+  }),
+  (state) => ({
+    kind: "sql",
+    sql: `DELETE FROM items WHERE (region, active) IN ((?, TRUE), (?, FALSE)) AND amount < ? RETURNING id`,
+    params: [pick(state.rng, REGIONS), pick(state.rng, REGIONS), quarter(state.rng)],
+  }),
+  (state) => ({
+    kind: "sql",
+    sql: `UPDATE items SET amount = amount + ? WHERE (amount, id) > (?, ?) RETURNING id, amount`,
+    params: [quarter(state.rng) / 4, quarter(state.rng), Math.floor(state.rng() * state.nextId)],
+  }),
   // Update over a key range, RETURNING the affected rows.
   (state) => {
     const low = 1 + Math.floor(state.rng() * state.nextId);

@@ -16,7 +16,24 @@ describe("resolveOptions", () => {
       write: true,
       initialQuery: "",
       storageKey: "minnow-devtools",
+      theme: "system",
+      height: "",
     });
+  });
+
+  it("takes a height as pixels or as any CSS length", () => {
+    expect(resolveOptions({ height: 400 }).height).toBe("400px");
+    expect(resolveOptions({ height: "400" }).height).toBe("400px");
+    expect(resolveOptions({ height: "70vh" }).height).toBe("70vh");
+    expect(resolveOptions({ height: "100%" }).height).toBe("100%");
+    // Nothing usable leaves the container in charge rather than writing an invalid length.
+    expect(resolveOptions({ height: Number.NaN }).height).toBe("");
+    expect(resolveOptions({ height: "  " }).height).toBe("");
+  });
+
+  it("falls back to the system palette for an unknown theme", () => {
+    expect(resolveOptions({ theme: "dark" }).theme).toBe("dark");
+    expect(resolveOptions({ theme: "midnight" as never }).theme).toBe("system");
   });
 
   it("keeps inline panels open, since nothing else can open them", () => {
@@ -55,6 +72,8 @@ describe("optionsFromAttributes", () => {
           write: "false",
           "initial-query": "SELECT 1",
           "storage-key": "docs",
+          theme: "dark",
+          height: "70vh",
         }),
       ),
     ).toEqual({
@@ -65,6 +84,8 @@ describe("optionsFromAttributes", () => {
       permissions: { write: false },
       initialQuery: "SELECT 1",
       storageKey: "docs",
+      theme: "dark",
+      height: "70vh",
     });
   });
 

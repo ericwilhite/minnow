@@ -17,9 +17,22 @@ CREATE TABLE orders (
 )
 ```
 
-Columns are nullable unless marked `NOT NULL`. Exactly one column may be `PRIMARY KEY`, and it is
-the table's unique key: the column that `UPDATE`, `DELETE`, and `ON CONFLICT` address rows
-through, and the only uniqueness the engine enforces.
+Columns are nullable unless marked `NOT NULL`. Exactly one column may be `PRIMARY KEY` — written
+on the column or as a table-level `PRIMARY KEY (order_id)` — and it is the table's unique key: the
+column that `UPDATE`, `DELETE`, and `ON CONFLICT` address rows through, and the only uniqueness
+the engine enforces.
+
+`CREATE TABLE IF NOT EXISTS` leaves an existing table of that name alone, and `CREATE TABLE …
+AS SELECT` takes both its columns and its first rows from a query:
+
+```sql
+CREATE TABLE completed_orders AS
+SELECT order_id, customer_id, total FROM orders WHERE status = 'completed'
+```
+
+`CHECK` and `FOREIGN KEY` are rejected rather than accepted and ignored: the engine has no
+cross-table write hook to enforce a reference with, and a `CHECK` that never runs is worse than
+one it declines to promise. A `BEFORE` trigger can raise instead.
 
 A table without a `PRIMARY KEY` is append-only. That is a reasonable choice for an event log, and
 a mistake for anything a user edits, because it cannot be changed later without recreating the
@@ -47,8 +60,22 @@ stored as text.
 
 ## Defaults
 
-Column defaults are not part of the `CREATE TABLE` grammar — declare them through `createTable`,
-which is also the form the [schema DSL](/docs/schema) compiles to:
+A column can declare a default in SQL, either a constant or `CURRENT_TIMESTAMP`:
+
+```sql
+CREATE TABLE events (
+  event_id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  source TEXT DEFAULT 'app',
+  noted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+A column with a default is `NOT NULL` unless declared otherwise, because the default is what an
+absent value means — NULL and the default cannot both claim the slot.
+
+The same defaults, and the `autoincrement` kind that SQL has no spelling for, are available
+through `createTable`, which is also the form the [schema DSL](/docs/schema) compiles to:
 
 ```ts
 await db.createTable({
@@ -70,8 +97,17 @@ spec is stored in the catalog and crosses the worker boundary, so it has to be p
 
 ## Evolving a table
 
+```sql
+ALTER TABLE orders ADD COLUMN channel TEXT
+```
+
 Tables can gain nullable columns and widen a `NOT NULL` column to nullable. Both are catalog-only
-changes: no blocks are rewritten, so they are effectively instant however large the table is.
+changes: no blocks are rewritten, so they are effectively instant however large the table is. A
+column added to a table with rows in it is always nullable — the rows already stored have no value
+for it — though a `DEFAULT` fills the rows written afterwards.
+
+There is no `DROP TABLE`: the block store has no primitive that removes a table, so a dropped one
+would leave its segments and blocks behind.
 
 Narrowing a column, changing its type, dropping it, or adding a `NOT NULL` column to a table with
 rows in it are all refused — each would need a rewrite of every block, and doing that silently

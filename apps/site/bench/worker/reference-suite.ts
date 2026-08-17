@@ -20,7 +20,7 @@ import { getDataset } from "./registry";
 import {
   assertNotCancelled,
   progress,
-  summarizeSamples,
+  measureRepeated,
   validateDatasetSuitePayload,
 } from "./support";
 
@@ -218,26 +218,21 @@ async function measureOnSession(
     const prepareMs = performance.now() - prepareStarted;
     try {
       let rows = await prepared.execute();
-      const samples: number[] = [];
-      for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
-        const started = performance.now();
+      const { medianMs, p95Ms, batchSize } = await measureRepeated(async () => {
         rows = await prepared.execute();
-        samples.push(performance.now() - started);
-      }
-      const { medianMs, p95Ms } = summarizeSamples(samples);
+      }, SAMPLE_COUNT);
       // Engines with a result cache also report what a repeat costs an application that keeps
       // the default on. It is a different quantity from medianMs, so it gets its own field
-      // instead of replacing it.
+      // instead of replacing it — and it is microseconds, so it needs the batching most.
       let cachedMedianMs: number | undefined;
+      let cachedBatchSize: number | undefined;
       if (prepared.executeCached !== undefined) {
-        await prepared.executeCached();
-        const cachedSamples: number[] = [];
-        for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
-          const started = performance.now();
-          await prepared.executeCached();
-          cachedSamples.push(performance.now() - started);
-        }
-        cachedMedianMs = summarizeSamples(cachedSamples).medianMs;
+        // Bound to the statement: the harness only ever calls it back through the object.
+        const runCached = (): Promise<unknown> => prepared.executeCached?.() ?? Promise.resolve([]);
+        await runCached();
+        const cached = await measureRepeated(runCached, SAMPLE_COUNT);
+        cachedMedianMs = cached.medianMs;
+        cachedBatchSize = cached.batchSize;
       }
       const tuples = canonicalTuples(rows, (row) =>
         definition.columns.map((column) => row[column]),
@@ -248,7 +243,9 @@ async function measureOnSession(
         prepareMs,
         medianMs,
         p95Ms,
+        batchSize,
         ...(cachedMedianMs === undefined ? {} : { cachedMedianMs }),
+        ...(cachedBatchSize === undefined ? {} : { cachedBatchSize }),
         ...(prepared.peakMemoryBytes === undefined
           ? {}
           : { peakMemoryBytes: prepared.peakMemoryBytes }),

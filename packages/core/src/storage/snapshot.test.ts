@@ -207,3 +207,62 @@ describe("database snapshots", () => {
     await expect(new MemoryBlockStore().exportSnapshot()).rejects.toThrow(/no committed version/);
   });
 });
+
+describe("MinnowDatabase snapshots", () => {
+  it("exports the file the database can load back, into either store", async () => {
+    const { database: source } = await seededDatabase();
+    const before = await source.query(REPORT);
+
+    const phases: string[] = [];
+    const bytes = await source.exportSnapshot({
+      onProgress: (progress) => phases.push(progress.phase),
+    });
+    expect(phases).toEqual(["reading", "done"]);
+    expect((await readSnapshotSummary(bytes)).byteLength).toBe(bytes.byteLength);
+
+    const memory = new MinnowDatabase(new MemoryBlockStore());
+    await memory.importSnapshot(bytes);
+    expect((await memory.query(REPORT)).rows).toEqual(before.rows);
+
+    const written: number[] = [];
+    const indexed = new MinnowDatabase(
+      await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
+    );
+    await indexed.importSnapshot(bytes, {
+      onProgress: (progress) => {
+        if (progress.phase === "done") written.push(progress.writtenBytes);
+      },
+    });
+    expect(written[0]).toBeGreaterThan(0);
+    expect((await indexed.query(REPORT)).rows).toEqual(before.rows);
+  });
+
+  it("answers from the restored catalog rather than the empty one it cached", async () => {
+    const { database: source } = await seededDatabase();
+    const bytes = await source.exportSnapshot();
+    const restored = new MinnowDatabase(new MemoryBlockStore());
+    // Queried while empty, so anything cached from that read has to be dropped by the load.
+    await expect(restored.query("SELECT COUNT(*) AS n FROM authors")).rejects.toThrow();
+    await restored.importSnapshot(bytes);
+    expect((await restored.query("SELECT COUNT(*) AS n FROM authors")).rows).toEqual([{ n: 3 }]);
+  });
+
+  it("refuses to load into a database that already holds one", async () => {
+    const { database: source } = await seededDatabase();
+    const bytes = await source.exportSnapshot();
+    await expect(source.importSnapshot(bytes)).rejects.toThrow(/already holds/);
+  });
+
+  it("says plainly when the store cannot do it, rather than failing as a missing method", async () => {
+    // A store that is a complete backend but cannot copy itself out, which is what any block
+    // store outside this package is until it implements the two methods.
+    const bare = Object.create(new MemoryBlockStore()) as Record<string, unknown>;
+    bare.exportSnapshot = undefined;
+    bare.importSnapshot = undefined;
+    const database = new MinnowDatabase(bare as unknown as MemoryBlockStore);
+    await expect(database.exportSnapshot()).rejects.toThrow(/cannot export snapshots/);
+    await expect(database.importSnapshot(new Uint8Array(0))).rejects.toThrow(
+      /cannot load snapshots/,
+    );
+  });
+});

@@ -20,8 +20,19 @@ import type {
   WriteSuiteResult,
 } from "@/bench/protocol";
 import type { BenchWorker } from "@/bench/worker-client";
-import { ENGINES, SCALES, SUITES, estimateBytes, formatBytes, formatRows } from "./config";
-import { FeatureResults, ReadResults, WriteResults } from "./results";
+import {
+  ENGINES,
+  SCALES,
+  SUITES,
+  columnsFor,
+  enginesForColumns,
+  storageLabel,
+  estimateBytes,
+  formatBytes,
+  formatRows,
+  type ColumnId,
+} from "./config";
+import { FeatureResults, ReadResults, StorageResults, WriteResults } from "./results";
 
 type Phase =
   | { kind: "idle" }
@@ -30,6 +41,7 @@ type Phase =
   | { kind: "failed"; message: string };
 
 interface Results {
+  dataset?: DatasetRecord;
   reference?: ReferenceSuiteResult;
   write?: WriteSuiteResult;
   features?: FeatureSuiteResult;
@@ -38,15 +50,13 @@ interface Results {
 export function BenchRunner() {
   const worker = useRef<BenchWorker | undefined>(undefined);
   const running = useRef<string | undefined>(undefined);
-  const [engines, setEngines] = useState<EngineId[]>(["minnow", "sqlite"]);
-  const [suites, setSuites] = useState<string[]>(["reference"]);
+  const [columns, setColumns] = useState<ColumnId[]>(["minnow", "minnow-cached", "sqlite"]);
+  const [suites, setSuites] = useState<string[]>(["write", "reference"]);
   const [scale, setScale] = useState(0.5);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [results, setResults] = useState<Results>({});
-  const [isolated, setIsolated] = useState<boolean | undefined>(undefined);
 
   useEffect(() => {
-    setIsolated(window.crossOriginIsolated);
     return () => {
       worker.current?.terminate();
       worker.current = undefined;
@@ -84,6 +94,7 @@ export function BenchRunner() {
       };
 
       const wanted = SUITES.filter((suite) => suites.includes(suite.id));
+      const engines = enginesForColumns(columns);
       const next: Results = {};
 
       if (wanted.some((suite) => suite.needsDataset)) {
@@ -101,6 +112,8 @@ export function BenchRunner() {
         );
         running.current = started.requestId;
         const dataset = await started.result;
+        next.dataset = dataset;
+        setResults({ ...next });
         const failed = Object.entries(dataset.engines).filter(
           ([, entry]) => entry.status !== "ready",
         );
@@ -115,16 +128,9 @@ export function BenchRunner() {
           .filter(([, entry]) => entry.status === "ready")
           .map(([engine]) => engine as EngineId);
 
-        if (suites.includes("reference")) {
-          const task = client.start<ReferenceSuiteResult>(
-            "suiteReference",
-            { datasetId: dataset.id, engines: ready },
-            onProgress("Running reads"),
-          );
-          running.current = task.requestId;
-          next.reference = await task.result;
-          setResults({ ...next });
-        }
+        // Writes first: a database is written before it is read, and the read suite then runs
+        // against storage that has been through the write suite, which is the ordinary state of
+        // an application's database rather than a pristine bulk load.
         if (suites.includes("write")) {
           const task = client.start<WriteSuiteResult>(
             "suiteWrite",
@@ -133,6 +139,16 @@ export function BenchRunner() {
           );
           running.current = task.requestId;
           next.write = await task.result;
+          setResults({ ...next });
+        }
+        if (suites.includes("reference")) {
+          const task = client.start<ReferenceSuiteResult>(
+            "suiteReference",
+            { datasetId: dataset.id, engines: ready },
+            onProgress("Running reads"),
+          );
+          running.current = task.requestId;
+          next.reference = await task.result;
           setResults({ ...next });
         }
       }
@@ -155,7 +171,7 @@ export function BenchRunner() {
       const message = error instanceof Error ? error.message : String(error);
       setPhase(message.includes("cancelled") ? { kind: "idle" } : { kind: "failed", message });
     }
-  }, [engines, suites, scale]);
+  }, [columns, suites, scale]);
 
   const cancel = useCallback(() => {
     const id = running.current;
@@ -165,7 +181,8 @@ export function BenchRunner() {
   }, []);
 
   const needsDataset = SUITES.some((suite) => suites.includes(suite.id) && suite.needsDataset);
-  const bytes = estimateBytes(engines, scale);
+  const chosen = columnsFor(columns);
+  const bytes = estimateBytes(enginesForColumns(columns), scale);
   const busy = phase.kind === "running";
 
   return (
@@ -179,15 +196,22 @@ export function BenchRunner() {
                 <input
                   type="checkbox"
                   className="mt-1"
-                  checked={engines.includes(engine.id)}
+                  checked={columns.includes(engine.id)}
                   disabled={busy}
                   onChange={() => {
-                    toggle(engines, engine.id, setEngines);
+                    toggle(columns, engine.id, setColumns);
                   }}
                 />
                 <span>
                   {engine.label}
-                  <span className="ml-1.5 text-xs text-fd-muted-foreground">{engine.download}</span>
+                  {engine.download === undefined ? null : (
+                    <span className="ml-1.5 text-xs text-fd-muted-foreground">
+                      {engine.download}
+                    </span>
+                  )}
+                  <span className="block text-xs text-fd-muted-foreground">
+                    {storageLabel(engine, results.dataset?.engines[engine.engine]?.persistence)}
+                  </span>
                 </span>
               </label>
             ))}
@@ -277,16 +301,9 @@ export function BenchRunner() {
         </p>
       ) : null}
 
-      {isolated === false && engines.includes("sqlite") ? (
-        <p className="rounded-lg border border-fd-border bg-fd-muted p-3 text-sm text-fd-muted-foreground">
-          This page is not cross-origin isolated, so SQLite falls back from its OPFS VFS to the
-          synchronous-access-handle pool. Both persist; the timings are not directly comparable with
-          a run on an isolated origin.
-        </p>
-      ) : null}
-
-      {results.reference ? <ReadResults result={results.reference} /> : null}
-      {results.write ? <WriteResults result={results.write} /> : null}
+      {results.write ? <WriteResults result={results.write} columns={chosen} /> : null}
+      {results.reference ? <ReadResults result={results.reference} columns={chosen} /> : null}
+      {results.dataset ? <StorageResults record={results.dataset} /> : null}
       {results.features ? <FeatureResults result={results.features} /> : null}
 
       {phase.kind === "done" && Object.keys(results).length === 0 ? (

@@ -6,14 +6,12 @@ description: An embeddable SQL console for your database — a floating panel in
 A panel you drop into any app to browse, edit, and query the database it is already using. It
 floats over your page without blocking it, and every change asks first.
 
-## Try it on this page
+## Try it
 
-The launcher below is the real thing, in its production shape: a database running in a web worker
-(the same [worker client](/docs/client/workers) an app ships), loaded with a generated five-table
-commerce dataset — 165,808 rows of regions, customers, products, orders, and order items. The
-panel floats over these docs exactly as it would float over your app, and the title-bar badge
-reads **worker** because the queries genuinely leave the page. For the same panel rendered inline
-against a small in-memory database, see the [playground](/playground).
+The [playground](/playground) is this panel, in its production shape: a database running in a web
+worker (the same [worker client](/docs/client/workers) an app ships) over a seven-table retail
+dataset generated in your browser and kept in IndexedDB. The title-bar badge reads **worker**
+because the queries genuinely leave the page.
 
 ## Install
 
@@ -59,16 +57,18 @@ The database is a property rather than an attribute, because it is an object.
 
 ## Options
 
-| Option         | Attribute       | Default             | What it does                                                   |
-| -------------- | --------------- | ------------------- | -------------------------------------------------------------- |
-| `mode`         | `mode`          | `"launcher"`        | `"launcher"` floats over the page; `"inline"` renders in flow. |
-| `corner`       | `corner`        | `"bottom-right"`    | Which corner the launcher and the opening panel use.           |
-| `hotkey`       | `hotkey`        | `"mod+shift+d"`     | Toggle shortcut. `mod` is Cmd or Ctrl. Empty turns it off.     |
-| `defaultOpen`  | `open`          | `false`             | Open on mount. Inline panels are always open.                  |
-| `zIndex`       | `z-index`       | `2147483000`        | Stacking against your own overlays.                            |
-| `permissions`  | `write`         | `{ write: true }`   | `write: false` refuses every statement that changes data.      |
-| `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                   |
-| `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                   |
+| Option         | Attribute       | Default             | What it does                                                               |
+| -------------- | --------------- | ------------------- | -------------------------------------------------------------------------- |
+| `mode`         | `mode`          | `"launcher"`        | `"launcher"` floats over the page; `"inline"` renders in flow.             |
+| `corner`       | `corner`        | `"bottom-right"`    | Which corner the launcher and the opening panel use.                       |
+| `hotkey`       | `hotkey`        | `"mod+shift+d"`     | Toggle shortcut. `mod` is Cmd or Ctrl. Empty turns it off.                 |
+| `defaultOpen`  | `open`          | `false`             | Open on mount. Inline panels are always open.                              |
+| `zIndex`       | `z-index`       | `2147483000`        | Stacking against your own overlays.                                        |
+| `permissions`  | `write`         | `{ write: true }`   | `write: false` refuses every statement that changes data.                  |
+| `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                               |
+| `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                               |
+| `theme`        | `theme`         | `"system"`          | `"light"` or `"dark"` pins the palette; `"system"` follows the OS.         |
+| `height`       | `height`        | container           | Height of an inline panel. A number is pixels; a string is any CSS length. |
 
 ## The schema rail
 
@@ -172,6 +172,28 @@ Two badges in the title bar say what you are working with:
   a slow one will freeze it. The [worker client](/docs/client/workers) does not.
 - **write on** or **read-only** — whether `permissions.write` allows changes.
 
+## Downloading the database
+
+The ⭳ button beside the badges saves the whole database as a
+[snapshot](/docs/storage/snapshots) file — one committed version, blocks and catalog and counters,
+in a single `minnow-v42-2026-08-17.minnow`. It is how you keep a copy of what you are looking at,
+send it to someone, or carry it to another machine.
+
+The ⭱ button beside it loads one back. Pick a file and the panel reads its header — which costs
+nothing, whatever the file's size — and tells you the version, the table count, the date it was
+taken, and how big it is before anything is loaded. The tables reappear in the rail as soon as the
+load finishes.
+
+**The database has to be empty to restore into.** One that already holds data refuses the load
+rather than merging two histories, so the usual shape is a fresh page against a fresh store.
+
+A progress chip beside the badges reports what is happening throughout — reading, copying, writing
+— because a real database is not a quick file. The bytes come out of a worker in slices, so the
+page keeps painting while a large one is copied.
+
+Restoring is a write, so the button is absent with `permissions.write: false`. Both buttons are
+absent when the target cannot do snapshots at all.
+
 ## Running statements
 
 The **Query** tab is a SQL console over the same database, with syntax highlighting and completion
@@ -225,8 +247,8 @@ everything. History is namespaced by `storageKey`, so two panels on a page keep 
 ## Embedding a playground
 
 `mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
-panel, in flow, sized by its container. The [playground](/playground) is exactly this,
-pointed at an in-memory database:
+panel, in flow. The [playground](/playground) is exactly this, over a worker client with its
+blocks in IndexedDB:
 
 ```ts
 mountMinnowDevtools(db, {
@@ -235,6 +257,71 @@ mountMinnowDevtools(db, {
   initialQuery: "SELECT * FROM people",
 });
 ```
+
+### Sizing it
+
+An inline panel **fills its container**. Give the container a height and the panel takes all of
+it; give it none and the panel falls back to 520px, so dropping it into a page needs no CSS at all.
+
+```html
+<div id="playground" style="height: 70vh"></div>
+```
+
+Pass `height` instead when the container is not yours to style. It takes a number of pixels or any
+CSS length:
+
+```ts
+mountMinnowDevtools(db, { container, mode: "inline", height: "70vh" });
+```
+
+```html
+<minnow-devtools mode="inline" height="480"></minnow-devtools>
+```
+
+Two custom properties do the same from a stylesheet, which is what a responsive embed wants —
+they are read off the container, so a media query can change them without JavaScript:
+
+```css
+#playground {
+  --mdt-height: 60vh;
+  --mdt-min-height: 400px;
+}
+```
+
+### Matching your page
+
+The panel lives in a shadow root, so it follows the reader's OS colour scheme rather than your
+page's. A page with its own light/dark switch tells the panel which way it went:
+
+```ts
+const devtools = mountMinnowDevtools(db, { container, mode: "inline", theme: "dark" });
+devtools.setTheme("light"); // when your switch is flipped — no remount, the query survives
+```
+
+Its colours are custom properties, and properties set on the container reach inside the shadow
+root, so the whole palette is yours to override:
+
+```css
+#playground {
+  --mdt-accent: #7c3aed;
+  --mdt-bg: #ffffff;
+  --mdt-bg-secondary: #f7f7f5;
+  --mdt-text: #37352f;
+  --mdt-border: rgba(55, 53, 47, 0.12);
+  --mdt-sans: "Inter", sans-serif;
+  --mdt-mono: "JetBrains Mono", monospace;
+}
+```
+
+The full set is `--mdt-bg`, `--mdt-bg-secondary`, `--mdt-bg-hover`, `--mdt-bg-active`,
+`--mdt-bg-code`, `--mdt-text`, `--mdt-text-secondary`, `--mdt-text-faint`, `--mdt-border`,
+`--mdt-border-strong`, `--mdt-accent`, `--mdt-accent-bg`, `--mdt-selection`, `--mdt-danger`,
+`--mdt-danger-bg`, `--mdt-warn`, `--mdt-warn-bg`, `--mdt-ok`, `--mdt-ok-bg`, `--mdt-shadow`,
+`--mdt-sans`, and `--mdt-mono`. Set them in a dark-mode block too, or the ones you override will
+be the only colours that do not turn.
+
+Nothing else crosses the boundary in either direction: your stylesheet cannot restyle the panel's
+internals, and the panel cannot leak into your page.
 
 ## Cleaning up
 

@@ -73,6 +73,8 @@ export const icons = {
   minimize: "M6 12h12",
   play: "M6 4l14 8-14 8V4z",
   grip: "M21 9L9 21M21 15l-6 6",
+  download: "M12 4v10M8 11l4 4 4-4M5 19h14",
+  upload: "M12 15V5M8 9l4-4 4 4M5 19h14",
   fish: "M17 12l4-3v6l-4-3M3 12c0-2.8 3.1-5 7-5s7 2.2 7 5-3.1 5-7 5-7-2.2-7-5z",
   warning: "M12 3l9 17H3l9-17zM12 10v4M12 17.2v.1",
 } as const;

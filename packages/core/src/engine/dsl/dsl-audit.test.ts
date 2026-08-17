@@ -344,15 +344,25 @@ describe("builder semantics", () => {
     expect(notInBuyers.map((row) => row.name)).toEqual(["Edsger", "Katherine"]);
   });
 
-  it("rejects ordering by a non-selected column with the SQL path's error", async () => {
+  it("orders by a non-selected column on both paths, and rejects unknown ones alike", async () => {
     const { db, database } = await seeded();
-    const message = "ORDER BY requires a selected column or output alias";
-    await expect(
-      db.selectFrom("people as p").select(["p.name"]).orderBy("p.score").execute(),
-    ).rejects.toThrow(message);
-    await expect(
-      database.query("SELECT p.name AS name FROM people p ORDER BY p.score"),
-    ).rejects.toThrow(message);
+    // The standard lets a query sort by a source column it does not return; the value travels
+    // as a hidden select item and is projected away, so the output columns are unchanged.
+    const ordered = ["Edsger", "Ada", "Grace", "Barbara", "Katherine"];
+    const built = await db
+      .selectFrom("people as p")
+      .select(["p.name"])
+      .orderBy("p.score")
+      .execute();
+    expect(built.map((row) => row.name)).toEqual(ordered);
+    expect(built.every((row) => Object.keys(row).length === 1)).toBe(true);
+    const queried = await database.query("SELECT p.name AS name FROM people p ORDER BY p.score");
+    expect(queried.rows).toEqual(built);
+    expect(queried.columns).toEqual(["name"]);
+    // A column no source has still fails, on both paths, with the same message.
+    await expect(database.query("SELECT name FROM people ORDER BY missing")).rejects.toThrow(
+      "Ambiguous or missing column: missing",
+    );
   });
 
   it("null comparisons follow three-valued logic exactly as SQL", async () => {

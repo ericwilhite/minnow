@@ -169,6 +169,55 @@ describe("deterministic plan rewrites", () => {
     expectEquivalent(grouped);
   });
 
+  it("takes the hash key out of a conjunctive inner join and files the rest as predicates", () => {
+    const sql =
+      "SELECT r.region, r.amount, d.weight FROM rows r JOIN dims d ON d.region = r.region AND d.weight > 2 AND r.amount > 5 ORDER BY amount";
+    const rendered = renderPlan(optimizePlan(compileQuery(sql, { optimize: false })));
+    // Without this the join renders as `on null = null`: a cross product with a filter.
+    expect(rendered).toContain("inner join on d.region = r.region");
+    expect(rendered).toContain("where d.weight > 2");
+    expect(rendered).toContain("where r.amount > 5");
+    expectEquivalent(sql);
+  });
+
+  it("takes the first equality of a multi-key join and keeps the others as predicates", () => {
+    const sql =
+      "SELECT r.region, d.weight FROM rows r JOIN dims d ON d.region = r.region AND d.weight = r.amount";
+    const rendered = renderPlan(optimizePlan(compileQuery(sql, { optimize: false })));
+    expect(rendered).toContain("inner join on d.region = r.region");
+    expect(rendered).toContain("where d.weight = r.amount");
+    expectEquivalent(sql);
+  });
+
+  /**
+   * A self-join pairing rows of one table, which is the shape that made the difference visible:
+   * the equality is the only thing standing between this and every row against every row.
+   */
+  it("takes the hash key out of a self-join", () => {
+    const sql =
+      "SELECT a.region, COUNT(*) AS pairs FROM rows a JOIN rows b ON b.region = a.region AND b.amount > a.amount GROUP BY a.region";
+    const rendered = renderPlan(optimizePlan(compileQuery(sql, { optimize: false })));
+    expect(rendered).toContain("inner join on b.region = a.region");
+    expectEquivalent(sql);
+  });
+
+  it("leaves a left join's condition alone, since a predicate would delete its null rows", () => {
+    const sql =
+      "SELECT r.region, r.amount, d.weight FROM rows r LEFT JOIN dims d ON d.region = r.region AND d.weight > 2 ORDER BY amount";
+    const rendered = renderPlan(optimizePlan(compileQuery(sql, { optimize: false })));
+    expect(rendered).toContain("on null = null");
+    expect(rendered).not.toContain("where d.weight > 2");
+    expectEquivalent(sql);
+  });
+
+  it("leaves an ON clause that has no equality across the join", () => {
+    const sql = "SELECT r.region, d.weight FROM rows r JOIN dims d ON d.weight > r.amount";
+    expect(renderPlan(optimizePlan(compileQuery(sql, { optimize: false })))).toContain(
+      "on null = null",
+    );
+    expectEquivalent(sql);
+  });
+
   it("keeps predicates above left joins onto derived sources", () => {
     const sql =
       "SELECT r.region, d.total FROM rows r LEFT JOIN (SELECT region, SUM(amount) AS total FROM rows GROUP BY region) d ON d.region = r.region WHERE d.total > 10";

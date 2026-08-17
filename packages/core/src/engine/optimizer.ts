@@ -1,10 +1,12 @@
 import {
   childExpressions,
+  expressionAliases,
   forEachBlockExpression,
   forEachNestedBlock,
   isScalarFunctionName,
   scalarFunctionNames,
   scalarFunctionValue,
+  splitCondition,
   type BinaryOperator,
   type CompiledQuery,
   type Expression,
@@ -69,11 +71,73 @@ function optimizeBlock(block: CompiledQuery): void {
     }
   }
   foldBlockConstants(block);
+  extractJoinKeys(block);
   normalizeBooleanPredicates(block);
   coalesceOrEqualityLists(block);
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
+}
+
+// --- Join key extraction ---------------------------------------------------------------------
+
+/**
+ * Pulls a hash key out of a conjunctive ON clause.
+ *
+ * A join carries either an equality — which builds a hash index and probes it — or a general
+ * condition, which is a nested loop over every pair of rows. Only a bare `a.x = b.x` was ever
+ * recognized as the first kind, so `ON b.order_id = a.order_id AND b.product_id > a.product_id`
+ * became a cross product with a filter, as did the plain multi-key `ON a.x = b.x AND a.y = b.y`.
+ * The equality is right there in both.
+ *
+ * For an inner join the ON clause and WHERE are the same thing, so one equality becomes the key
+ * and every remaining conjunct becomes an ordinary predicate. A left join is left alone: its ON
+ * decides which rows are null-extended, and a predicate applied afterwards would delete them.
+ */
+function extractJoinKeys(block: CompiledQuery): void {
+  const available = new Set([block.base.alias]);
+  for (const join of block.joins) {
+    const condition = join.on;
+    if (condition === undefined || join.kind !== "inner") {
+      available.add(join.alias);
+      continue;
+    }
+    const conjuncts = splitCondition(condition);
+    const keyIndex = conjuncts.findIndex(
+      (conjunct) =>
+        conjunct.operator === "=" &&
+        joinsAcross(conjunct.left, conjunct.right, join.alias, available),
+    );
+    const key = conjuncts[keyIndex];
+    if (key === undefined) {
+      available.add(join.alias);
+      continue;
+    }
+    join.left = key.left;
+    join.right = key.right;
+    delete join.on;
+    block.predicates.push(...conjuncts.filter((_, index) => index !== keyIndex));
+    available.add(join.alias);
+  }
+}
+
+/**
+ * Whether an equality's two sides split cleanly along this join: one side reads only the table
+ * being joined, the other only tables already in hand. Anything else — a side spanning both, a
+ * side naming a table that has not been joined yet, a comparison of two columns of the same
+ * table — is a filter rather than a key, and stays in the residual.
+ */
+function joinsAcross(
+  left: Expression,
+  right: Expression,
+  alias: string,
+  available: ReadonlySet<string>,
+): boolean {
+  const sides = [expressionAliases(left), expressionAliases(right)];
+  const [joined, prior] = sides[0]?.has(alias) === true ? sides : [sides[1], sides[0]];
+  if (joined === undefined || prior === undefined) return false;
+  if (joined.size !== 1 || !joined.has(alias)) return false;
+  return prior.size > 0 && !prior.has(alias) && [...prior].every((name) => available.has(name));
 }
 
 // --- Boolean predicate normalization --------------------------------------------------------------

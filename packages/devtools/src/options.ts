@@ -7,6 +7,12 @@ export type DevtoolsCorner = "bottom-right" | "bottom-left" | "top-right" | "top
  */
 export type DevtoolsMode = "launcher" | "inline";
 
+/**
+ * Which palette the panel paints in. `"system"` follows the viewer's OS setting; a page with its
+ * own light/dark switch passes `"light"` or `"dark"` so the panel turns with the page.
+ */
+export type DevtoolsTheme = "system" | "light" | "dark";
+
 export interface DevtoolsPermissions {
   /** When false, statements that would change data are refused before they reach the database. */
   write?: boolean;
@@ -24,6 +30,13 @@ export interface DevtoolsOptions {
   initialQuery?: string;
   /** Namespace for persisted panel geometry, so two panels on a page keep their own. */
   storageKey?: string;
+  theme?: DevtoolsTheme;
+  /**
+   * How tall an inline panel is, as a CSS length; a number is pixels. Left out, the panel fills a
+   * container that has a height of its own and falls back to a readable default in one that does
+   * not. Ignored by a floating panel, which is sized by dragging.
+   */
+  height?: number | string;
 }
 
 export interface ResolvedDevtoolsOptions {
@@ -35,10 +48,22 @@ export interface ResolvedDevtoolsOptions {
   write: boolean;
   initialQuery: string;
   storageKey: string;
+  theme: DevtoolsTheme;
+  /** A CSS length, or empty when the caller said nothing and the container decides. */
+  height: string;
 }
 
 const corners: readonly DevtoolsCorner[] = ["bottom-right", "bottom-left", "top-right", "top-left"];
 const modes: readonly DevtoolsMode[] = ["launcher", "inline"];
+const themes: readonly DevtoolsTheme[] = ["system", "light", "dark"];
+
+/** A number is pixels, a string is whatever CSS length the caller wrote, anything else is unset. */
+function cssLength(value: number | string | undefined): string {
+  if (typeof value === "number") return Number.isFinite(value) ? `${String(value)}px` : "";
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return /^-?\d+(\.\d+)?$/.test(trimmed) ? `${trimmed}px` : trimmed;
+}
 
 function oneOf<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
   return typeof value === "string" && (allowed as readonly string[]).includes(value)
@@ -58,6 +83,8 @@ export function resolveOptions(options: DevtoolsOptions = {}): ResolvedDevtoolsO
     write: options.permissions?.write ?? true,
     initialQuery: options.initialQuery ?? "",
     storageKey: options.storageKey ?? "minnow-devtools",
+    theme: oneOf(themes, options.theme, "system"),
+    height: cssLength(options.height),
   };
 }
 
@@ -89,5 +116,9 @@ export function optionsFromAttributes(element: {
   if (initialQuery !== undefined) options.initialQuery = initialQuery;
   const storageKey = read("storage-key");
   if (storageKey !== undefined) options.storageKey = storageKey;
+  const theme = read("theme");
+  if (theme !== undefined) options.theme = theme as DevtoolsTheme;
+  const height = read("height");
+  if (height !== undefined) options.height = height;
   return options;
 }

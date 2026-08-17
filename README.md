@@ -13,10 +13,13 @@ npm install @minnowdb/core
 
 - **Our own engine** — parser, planner, optimizer, and vectorized executor implemented here. No
   SQLite or DuckDB underneath, and nothing to compile before the first query answers.
-- **SQL:2016 surface** — joins, CTEs including recursive, set operations, window functions,
-  grouping sets, quantified comparisons, upserts with `RETURNING`, triggers. The supported and
-  rejected forms ship as a checked-in feature matrix that is executed on every test run, and
-  deliberate omissions are documented with reasons.
+- **SQL:2023 surface** — joins (including `NATURAL` and `USING`), CTEs including recursive,
+  set operations, window functions with `GROUPS` frames and `EXCLUDE`, grouping sets with
+  `GROUPING`, row constructors, quantified comparisons, the standard string and datetime
+  functions, SQL/JSON (`JSON_VALUE`, `JSON_QUERY`, `IS JSON`), upserts with `RETURNING`, and
+  triggers. Every supported and rejected form ships as a checked-in feature matrix keyed to the
+  standard's own feature identifiers, executed on every test run and diffed against SQLite and
+  PostgreSQL; deliberate omissions are documented with reasons.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background once a table is large enough to want one.
 - **Columnar and durable** — immutable compressed column blocks on IndexedDB. Writes publish

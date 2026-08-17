@@ -1,4 +1,5 @@
 import type { DatabaseRow } from "./database.js";
+import type { ColumnDefault } from "../storage/types.js";
 import { SqlCompileError } from "./errors.js";
 import {
   cachedQueryTerms,
@@ -64,6 +65,7 @@ export type ScalarFunctionName =
   | "ROUND"
   | "COALESCE"
   | "DATE_TRUNC"
+  | "DATE_ADD"
   | "UPPER"
   | "LOWER"
   | "LENGTH"
@@ -83,12 +85,27 @@ export type ScalarFunctionName =
   | "POWER"
   | "SQRT"
   | "EXTRACT"
-  | "CAST";
+  | "CAST"
+  | "OCTET_LENGTH"
+  | "LPAD"
+  | "RPAD"
+  | "OVERLAY"
+  | "CURRENT_DATE"
+  | "CURRENT_TIMESTAMP"
+  | "LOCALTIME"
+  | "GROUPING"
+  | "JSON_VALUE"
+  | "JSON_QUERY"
+  | "JSON_EXISTS"
+  | "JSON_OBJECT"
+  | "JSON_ARRAY"
+  | "IS_JSON";
 
 export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "ROUND",
   "COALESCE",
   "DATE_TRUNC",
+  "DATE_ADD",
   "UPPER",
   "LOWER",
   "LENGTH",
@@ -109,7 +126,53 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "SQRT",
   "EXTRACT",
   "CAST",
+  "OCTET_LENGTH",
+  "LPAD",
+  "RPAD",
+  "OVERLAY",
+  "CURRENT_DATE",
+  "CURRENT_TIMESTAMP",
+  "LOCALTIME",
+  "GROUPING",
+  "JSON_VALUE",
+  "JSON_QUERY",
+  "JSON_EXISTS",
+  "JSON_OBJECT",
+  "JSON_ARRAY",
+  "IS_JSON",
 ] satisfies ScalarFunctionName[]);
+
+/**
+ * The niladic datetime functions (F051-06/07/08). Their value is the statement's own clock
+ * reading, so they are resolved once per execution rather than evaluated per row: every row of
+ * one statement sees one instant, both executors agree, and constant folding leaves them alone.
+ */
+export const statementDatetimeNames: ReadonlySet<string> = new Set([
+  "CURRENT_DATE",
+  "CURRENT_TIMESTAMP",
+  "LOCALTIME",
+]);
+
+/**
+ * The spellings that reach those three. Every datetime the engine stores is an instant in UTC
+ * and there is no session time zone, so LOCALTIMESTAMP and CURRENT_TIMESTAMP name one value,
+ * as do LOCALTIME and CURRENT_TIME.
+ */
+/** Standard function spellings that share one canonical plan name. */
+const functionSpellings: ReadonlyMap<string, string> = new Map([
+  ["SUBSTRING", "SUBSTR"],
+  ["CEILING", "CEIL"],
+  ["CHAR_LENGTH", "LENGTH"],
+  ["CHARACTER_LENGTH", "LENGTH"],
+]);
+
+const statementDatetimeAliases: ReadonlyMap<string, string> = new Map([
+  ["CURRENT_DATE", "CURRENT_DATE"],
+  ["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"],
+  ["LOCALTIMESTAMP", "CURRENT_TIMESTAMP"],
+  ["CURRENT_TIME", "LOCALTIME"],
+  ["LOCALTIME", "LOCALTIME"],
+]);
 
 export function isScalarFunctionName(
   name: AggregateName | ScalarFunctionName,
@@ -120,6 +183,163 @@ export function isScalarFunctionName(
 function stringArgument(name: string, value: unknown): string {
   if (typeof value !== "string") throw new TypeError(`${name} requires a string argument`);
   return value;
+}
+
+/**
+ * The SQL/JSON support the engine keeps (T801 family). Documents are UTF-8 text in ordinary
+ * string columns, exactly as SQLite stores them: no new logical type, no new storage format,
+ * and every function below is a scalar over that text. The path language is the subset with an
+ * unambiguous single result — `$`, member steps, and array subscripts — because the multi-value
+ * forms need a row-producing operator (JSON_TABLE) the executors do not have.
+ */
+interface JsonPathStep {
+  kind: "member" | "index";
+  name: string;
+  index: number;
+}
+
+function parseJsonPath(path: unknown, caller: string): JsonPathStep[] {
+  const text = stringArgument(caller, path).trim();
+  if (!text.startsWith("$")) throw new TypeError(`${caller} paths start at $`);
+  const steps: JsonPathStep[] = [];
+  let cursor = 1;
+  while (cursor < text.length) {
+    if (text[cursor] === ".") {
+      cursor += 1;
+      const start = cursor;
+      while (cursor < text.length && /[A-Za-z0-9_]/.test(text[cursor] ?? "")) cursor += 1;
+      if (cursor === start) throw new TypeError(`${caller} path expects a member name after .`);
+      steps.push({ kind: "member", name: text.slice(start, cursor), index: 0 });
+      continue;
+    }
+    if (text[cursor] === "[") {
+      const close = text.indexOf("]", cursor);
+      if (close === -1) throw new TypeError(`${caller} path has an unclosed subscript`);
+      const inner = text.slice(cursor + 1, close).trim();
+      cursor = close + 1;
+      if (/^\d+$/.test(inner)) {
+        steps.push({ kind: "index", name: "", index: Number(inner) });
+        continue;
+      }
+      const quoted = /^'(.*)'$/.exec(inner) ?? /^"(.*)"$/.exec(inner);
+      if (quoted?.[1] !== undefined) {
+        steps.push({ kind: "member", name: quoted[1], index: 0 });
+        continue;
+      }
+      throw new TypeError(`${caller} paths take array indexes and member names, not: ${inner}`);
+    }
+    throw new TypeError(`${caller} path is not understood: ${text}`);
+  }
+  return steps;
+}
+
+/** Walks one path over a document, reporting whether it selected anything. */
+function jsonAtPath(
+  document: unknown,
+  path: unknown,
+  caller: string,
+): { found: boolean; value?: unknown } {
+  const steps = parseJsonPath(path, caller);
+  let current: unknown;
+  try {
+    current = JSON.parse(stringArgument(caller, document));
+  } catch {
+    // A document that is not JSON selects nothing rather than failing the whole statement,
+    // matching the standard's default ON ERROR behaviour for these functions.
+    return { found: false };
+  }
+  for (const step of steps) {
+    if (current === null || current === undefined) return { found: false };
+    if (step.kind === "index") {
+      if (!Array.isArray(current)) return { found: false };
+      if (step.index >= current.length) return { found: false };
+      current = current[step.index];
+      continue;
+    }
+    if (typeof current !== "object" || Array.isArray(current)) return { found: false };
+    const members = current as Record<string, unknown>;
+    if (!Object.hasOwn(members, step.name)) return { found: false };
+    current = members[step.name];
+  }
+  return { found: true, value: current };
+}
+
+/** Whether a value is JSON text of the requested shape (T825). */
+function jsonIsValid(document: unknown, kind: string): boolean {
+  if (typeof document !== "string") return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(document);
+  } catch {
+    return false;
+  }
+  const isObject = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+  switch (kind) {
+    case "object":
+      return isObject;
+    case "array":
+      return Array.isArray(parsed);
+    case "scalar":
+      return !isObject && !Array.isArray(parsed);
+    default:
+      return true;
+  }
+}
+
+/** A SQL value as its JSON counterpart: datetimes serialize as ISO text, like every cast. */
+function jsonValueOf(value: unknown): unknown {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+/**
+ * JSON_ARRAY(v, ...) and JSON_OBJECT(k, v, ...) (T811/T812). Both skip NULL members, which is
+ * the standard's default (ABSENT ON NULL for objects, NULL ON NULL for arrays is the other
+ * spelling), and both return JSON text.
+ */
+function jsonConstructor(name: "JSON_ARRAY" | "JSON_OBJECT", values: readonly unknown[]): string {
+  if (name === "JSON_ARRAY") {
+    return JSON.stringify(
+      values.filter((value) => value !== null && value !== undefined).map(jsonValueOf),
+    );
+  }
+  const entries: Record<string, unknown> = {};
+  for (let index = 0; index + 1 < values.length; index += 2) {
+    const key = values[index];
+    if (typeof key !== "string") throw new TypeError("JSON_OBJECT keys must be strings");
+    const member = values[index + 1];
+    if (member === null || member === undefined) continue;
+    entries[key] = jsonValueOf(member);
+  }
+  return JSON.stringify(entries);
+}
+
+/**
+ * TRIM's shared body (E021-09, T056). The trim characters default to a single space and are
+ * removed as a whole repeated unit, not as a set: `TRIM(LEADING 'ab' FROM 'ababc')` is `'c'`.
+ * PostgreSQL reads a multi-character argument as a set instead, which is why the conformance
+ * harness diffs single-character trims against both oracles and this form against neither.
+ */
+function trimEnds(
+  name: string,
+  value: unknown,
+  characters: unknown,
+  side: "leading" | "trailing" | "both",
+): unknown {
+  if (characters === null) return null;
+  const text = stringArgument(name, value);
+  const unit = characters === undefined ? " " : stringArgument(name, characters);
+  if (unit.length === 0) return text;
+  let start = 0;
+  let end = text.length;
+  if (side !== "trailing") {
+    while (start + unit.length <= end && text.startsWith(unit, start)) start += unit.length;
+  }
+  if (side !== "leading") {
+    while (end - unit.length >= start && text.startsWith(unit, end - unit.length)) {
+      end -= unit.length;
+    }
+  }
+  return text.slice(start, end);
 }
 
 /**
@@ -185,7 +405,19 @@ export function scalarFunctionValue(
   name: Exclude<ScalarFunctionName, "COALESCE">,
   values: readonly unknown[],
 ): unknown {
+  if (name === "GROUPING") {
+    // T433. The grouping-sets desugar knows which columns each member aggregates away and
+    // replaces every GROUPING call with its constant; reaching here means there was no
+    // GROUP BY ROLLUP/CUBE/GROUPING SETS to answer it.
+    throw new TypeError("GROUPING requires GROUP BY ROLLUP, CUBE, or GROUPING SETS");
+  }
+  if (statementDatetimeNames.has(name)) {
+    // Resolution happens once per execution, before any executor sees the plan. Reaching here
+    // means a call survived that pass, which would silently give one statement two clocks.
+    throw new TypeError(`${name} must be resolved before execution`);
+  }
   if (name === "DATE_TRUNC") return dateTruncValue(values[0], values[1]);
+  if (name === "DATE_ADD") return dateAddValue(values[0], values[1], values[2]);
   if (name === "GREATEST" || name === "LEAST") {
     // NULL arguments are ignored, matching PostgreSQL; all-NULL yields NULL.
     let best: unknown;
@@ -199,6 +431,10 @@ export function scalarFunctionValue(
       }
     }
     return best ?? null;
+  }
+  if (name === "JSON_ARRAY" || name === "JSON_OBJECT") {
+    // These build from every argument, so a NULL first one is data, not an early exit.
+    return jsonConstructor(name, values);
   }
   const first = values[0];
   if (first === null || first === undefined) return null;
@@ -229,9 +465,9 @@ export function scalarFunctionValue(
       return Math.sqrt(operand);
     }
     case "LTRIM":
-      return stringArgument("LTRIM", first).replace(/^ +/, "");
+      return trimEnds("LTRIM", first, values[1], "leading");
     case "RTRIM":
-      return stringArgument("RTRIM", first).replace(/ +$/, "");
+      return trimEnds("RTRIM", first, values[1], "trailing");
     case "REPLACE": {
       if (values[1] === null || values[1] === undefined) return null;
       if (values[2] === null || values[2] === undefined) return null;
@@ -264,27 +500,102 @@ export function scalarFunctionValue(
       return stringArgument("LOWER", first).toLowerCase();
     case "TRIM":
       // SQL TRIM removes spaces, not general whitespace.
-      return stringArgument("TRIM", first).replace(/^ +/, "").replace(/ +$/, "");
+      return trimEnds("TRIM", first, values[1], "both");
     case "LENGTH":
       return Array.from(stringArgument("LENGTH", first)).length;
+    case "OCTET_LENGTH":
+      return new TextEncoder().encode(stringArgument("OCTET_LENGTH", first)).length;
+    case "IS_JSON": {
+      const kind = values[1];
+      return jsonIsValid(first, typeof kind === "string" ? kind : "value");
+    }
+    case "JSON_EXISTS":
+      return jsonAtPath(first, values[1], "JSON_EXISTS").found;
+    case "JSON_VALUE": {
+      const found = jsonAtPath(first, values[1], "JSON_VALUE");
+      if (!found.found) return null;
+      const value = found.value;
+      // A scalar comes back as itself; an object or array has no scalar value to give.
+      if (value === null) return null;
+      if (typeof value === "object") return null;
+      return typeof value === "string" ? value : JSON.stringify(value);
+    }
+    case "JSON_QUERY": {
+      const found = jsonAtPath(first, values[1], "JSON_QUERY");
+      if (!found.found || found.value === undefined) return null;
+      // JSON_QUERY returns JSON text, so a selected string keeps its quotes.
+      return JSON.stringify(found.value);
+    }
+
+    case "LPAD":
+    case "RPAD": {
+      if (values[1] === null || values[1] === undefined) return null;
+      const width = numeric(values[1]);
+      if (!Number.isInteger(width) || width < 0) {
+        throw new TypeError(`${name} length must be a non-negative integer`);
+      }
+      const text = Array.from(stringArgument(name, first));
+      if (text.length >= width) return text.slice(0, width).join("");
+      let fill = " ";
+      if (values.length > 2) {
+        if (values[2] === null || values[2] === undefined) return null;
+        fill = stringArgument(name, values[2]);
+      }
+      const filler = Array.from(fill);
+      // An empty fill cannot pad, so the value passes through, matching PostgreSQL.
+      if (filler.length === 0) return text.join("");
+      const padding: string[] = [];
+      while (padding.length < width - text.length) {
+        padding.push(filler[padding.length % filler.length] ?? "");
+      }
+      return name === "LPAD" ? padding.join("") + text.join("") : text.join("") + padding.join("");
+    }
+    case "OVERLAY": {
+      // OVERLAY(s PLACING r FROM start [FOR length]) replaces `length` characters of `s`
+      // starting at `start` with `r`; the default length is the replacement's own.
+      for (const index of [1, 2, 3]) {
+        if (index < values.length && (values[index] === null || values[index] === undefined)) {
+          return null;
+        }
+      }
+      const text = Array.from(stringArgument("OVERLAY", first));
+      const replacement = Array.from(stringArgument("OVERLAY", values[1]));
+      const start = numeric(values[2]);
+      if (!Number.isInteger(start) || start < 1) {
+        throw new TypeError("OVERLAY start must be a positive integer");
+      }
+      const span = values.length > 3 ? numeric(values[3]) : replacement.length;
+      if (!Number.isInteger(span) || span < 0) {
+        throw new TypeError("OVERLAY length must be a non-negative integer");
+      }
+      return [
+        ...text.slice(0, start - 1),
+        ...replacement,
+        ...text.slice(Math.min(start - 1 + span, text.length)),
+      ].join("");
+    }
     case "CAST":
       return castValue(first, typeof values[1] === "string" ? values[1] : "");
     case "SUBSTR": {
+      // SQL:2023 6.32: the result is the characters whose positions fall in both the requested
+      // window and the string, so a start before 1 shortens the result instead of shifting it,
+      // and a window entirely off the string is empty rather than an error.
       const text = Array.from(stringArgument("SUBSTR", first));
       if (values[1] === null || values[1] === undefined) return null;
       const start = numeric(values[1]);
-      if (!Number.isInteger(start) || start < 1) {
-        throw new TypeError("SUBSTR start must be a positive integer");
-      }
+      if (!Number.isInteger(start)) throw new TypeError("SUBSTR start must be an integer");
+      let until = text.length + 1;
       if (values.length > 2) {
         if (values[2] === null || values[2] === undefined) return null;
         const length = numeric(values[2]);
         if (!Number.isInteger(length) || length < 0) {
           throw new TypeError("SUBSTR length must be a non-negative integer");
         }
-        return text.slice(start - 1, start - 1 + length).join("");
+        until = start + length;
       }
-      return text.slice(start - 1).join("");
+      const from = Math.max(start, 1);
+      const to = Math.min(until, text.length + 1);
+      return to <= from ? "" : text.slice(from - 1, to - 1).join("");
     }
   }
 }
@@ -305,6 +616,64 @@ export const dateTruncUnits: ReadonlySet<string> = new Set([
  * compares datetimes by instant and has no session time zone. Weeks start on Monday,
  * matching Postgres.
  */
+const intervalUnits = new Map<string, { months: number; milliseconds: number }>([
+  ["year", { months: 12, milliseconds: 0 }],
+  ["quarter", { months: 3, milliseconds: 0 }],
+  ["month", { months: 1, milliseconds: 0 }],
+  ["week", { months: 0, milliseconds: 7 * 86_400_000 }],
+  ["day", { months: 0, milliseconds: 86_400_000 }],
+  ["hour", { months: 0, milliseconds: 3_600_000 }],
+  ["minute", { months: 0, milliseconds: 60_000 }],
+  ["second", { months: 0, milliseconds: 1_000 }],
+]);
+
+/**
+ * `INTERVAL '1 month'`, `INTERVAL '2 years 3 days'`. Months are kept apart from milliseconds
+ * rather than converted, because a month is not a fixed number of them: adding one to January 31
+ * has to land on the end of February, which only calendar arithmetic can do.
+ */
+export function intervalLiteral(text: string): { months: number; milliseconds: number } {
+  let months = 0;
+  let milliseconds = 0;
+  let matched = 0;
+  for (const [, amount, unit] of text.trim().matchAll(/(-?\d+(?:\.\d+)?)\s*([a-zA-Z]+)/g)) {
+    const singular = (unit ?? "").toLowerCase().replace(/s$/, "");
+    const scale = intervalUnits.get(singular);
+    if (scale === undefined) throw new TypeError(`Unknown INTERVAL unit: ${String(unit)}`);
+    const count = Number(amount);
+    if (scale.months !== 0 && !Number.isInteger(count * scale.months)) {
+      throw new TypeError(`INTERVAL ${String(unit)} must be a whole number`);
+    }
+    months += count * scale.months;
+    milliseconds += count * scale.milliseconds;
+    matched += 1;
+  }
+  if (matched === 0) throw new TypeError(`Invalid INTERVAL literal: ${text}`);
+  return { months, milliseconds };
+}
+
+/**
+ * A datetime shifted by a calendar interval: whole months first, then milliseconds. A day that
+ * does not exist in the target month clamps to that month's last day, which is what both SQLite
+ * and PostgreSQL do with 31 January plus a month.
+ */
+export function dateAddValue(value: unknown, months: unknown, milliseconds: unknown): Date | null {
+  if (value === null || value === undefined) return null;
+  if (!(value instanceof Date)) throw new TypeError("Date arithmetic requires a datetime value");
+  const monthCount = Number(months ?? 0);
+  const shifted = new Date(value.getTime());
+  if (monthCount !== 0) {
+    const day = shifted.getUTCDate();
+    shifted.setUTCDate(1);
+    shifted.setUTCMonth(shifted.getUTCMonth() + monthCount);
+    const lastDay = new Date(
+      Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, 0),
+    ).getUTCDate();
+    shifted.setUTCDate(Math.min(day, lastDay));
+  }
+  return new Date(shifted.getTime() + Number(milliseconds ?? 0));
+}
+
 export function dateTruncValue(unit: unknown, value: unknown): Date | null {
   if (typeof unit !== "string" || !dateTruncUnits.has(unit.toLowerCase())) {
     throw new TypeError(
@@ -354,7 +723,12 @@ export type Expression =
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }
   | { kind: "column"; reference: string }
-  | { kind: "wildcard" }
+  /**
+   * `*`, or `alias.*` when `table` is set (E051-07). A qualified wildcard names one source and
+   * may sit beside other select items; every executor entry expands it into that source's
+   * columns, so past the entry only a bare wildcard — the whole-row projection — survives.
+   */
+  | { kind: "wildcard"; table?: string }
   | { kind: "binary"; operator: BinaryOperator; left: Expression; right: Expression }
   | {
       kind: "call";
@@ -425,6 +799,7 @@ export type WindowFunctionName =
   | "LEAD"
   | "FIRST_VALUE"
   | "LAST_VALUE"
+  | "NTH_VALUE"
   | AggregateName;
 
 export interface WindowFrameBound {
@@ -433,11 +808,16 @@ export interface WindowFrameBound {
   offset?: number;
 }
 
+/** How a frame's rows are excluded around the current row (T612). */
+export type WindowFrameExclusion = "no-others" | "current-row" | "group" | "ties";
+
 /** An explicit frame clause; absent means the SQL default for the window's ordering. */
 export interface WindowFrame {
-  unit: "rows" | "range";
+  unit: "rows" | "range" | "groups";
   start: WindowFrameBound;
   end: WindowFrameBound;
+  /** Rows excluded around the current row; absent means EXCLUDE NO OTHERS. */
+  exclude?: WindowFrameExclusion;
 }
 
 export interface WindowSpec {
@@ -465,7 +845,8 @@ export function windowOutputType(
     window.name === "LAG" ||
     window.name === "LEAD" ||
     window.name === "FIRST_VALUE" ||
-    window.name === "LAST_VALUE";
+    window.name === "LAST_VALUE" ||
+    window.name === "NTH_VALUE";
   if (carries && window.argumentAlias !== undefined) {
     return innerSchema.find(({ name }) => name === window.argumentAlias)?.type ?? "number";
   }
@@ -487,6 +868,12 @@ export interface TableSource {
   recursive?: RecursiveCte;
   /** A window-function desugar: the inner block executes, then window columns append. */
   windowed?: { block: CompiledQuery; windows: WindowSpec[] };
+  /**
+   * `FROM t AS y(a, b)`: positional new names for a base table's columns (E051-09). Every
+   * executor entry turns the source into a derived projection, so past that point the rename
+   * is an ordinary select list and nothing else has to know about it.
+   */
+  columnAliases?: string[];
 }
 
 export interface JoinPlan extends TableSource {
@@ -497,6 +884,12 @@ export interface JoinPlan extends TableSource {
   on?: Expression;
   /** Parser marker: FULL OUTER JOIN. Assembly desugars it into a union of two left joins. */
   full?: boolean;
+  /**
+   * Parser marker: NATURAL JOIN. Every execution entry replaces it with the equality
+   * conjunction over the columns this source shares with the ones before it, so no executor
+   * ever sees the marker (F401-01).
+   */
+  natural?: boolean;
 }
 
 export type SetOperator =
@@ -570,10 +963,22 @@ export interface CompiledQuery {
   limitParameter?: number;
   offsetParameter?: number;
   /**
+   * FETCH FIRST n ROWS WITH TIES (F866): rows tying with the last retained row under the
+   * ORDER BY are kept too. The limit cannot be pushed into a scan then, so every execution
+   * entry runs the query unlimited and trims the ordered result.
+   */
+  limitWithTies?: boolean;
+  /**
    * Number of `?`/`$n` placeholders in the whole statement; set only on the top-level plan.
    * A plan with placeholders must pass through bindPlanParameters before it prepares.
    */
   parameterCount?: number;
+  /**
+   * CURRENT_DATE / CURRENT_TIMESTAMP / LOCALTIME appear somewhere in the statement. Every
+   * executor entry replaces them with one instant per execution, and results never memoize,
+   * because the answer depends on the clock rather than on the data.
+   */
+  usesStatementDatetime?: boolean;
 }
 
 /** ORDER BY / LIMIT / OFFSET tail of a select or set operation. */
@@ -583,6 +988,7 @@ export interface SelectTail {
   offset?: number;
   limitParameter?: number;
   offsetParameter?: number;
+  limitWithTies?: boolean;
 }
 
 type RowContext = Record<string, DatabaseRow | undefined>;
@@ -636,6 +1042,10 @@ const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
 
 const clauseKeywords = new Set([
   "WHERE",
+  "NATURAL",
+  "USING",
+  "OUTER",
+  "WINDOW",
   "GROUP",
   "HAVING",
   "ORDER",
@@ -654,6 +1064,15 @@ const clauseKeywords = new Set([
   "RETURNING",
 ]);
 const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
+/** Set functions the parser builds from COUNT/SUM rather than from their own accumulator. */
+const statisticalAggregates = new Set([
+  "VAR_POP",
+  "VAR_SAMP",
+  "VARIANCE",
+  "STDDEV_POP",
+  "STDDEV_SAMP",
+  "STDDEV",
+]);
 
 export interface CompileQueryOptions {
   /** Set false to skip deterministic plan rewrites, for example to snapshot the raw plan. */
@@ -719,7 +1138,29 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     throwLocated(error, offset, { start: 0, end: text.length });
   }
   if (parser.parameterCount > 0) compiled.parameterCount = parser.parameterCount;
+  if (parser.usesStatementDatetime) compiled.usesStatementDatetime = true;
   return compiled;
+}
+
+/**
+ * Reads a column DEFAULT into the catalog's own representation: a constant, or the
+ * CURRENT_TIMESTAMP family, which the catalog records as "now" and fills per inserted row.
+ */
+function columnDefaultFor(expression: Expression): ColumnDefault {
+  if (expression.kind === "literal") {
+    const value = expression.value;
+    if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+      return { kind: "literal", value };
+    }
+    if (value instanceof Date) return { kind: "literal", value: value.toISOString() };
+  }
+  if (
+    expression.kind === "call" &&
+    (expression.name === "CURRENT_TIMESTAMP" || expression.name === "CURRENT_DATE")
+  ) {
+    return { kind: "now" };
+  }
+  throw new TypeError("DEFAULT takes a constant or CURRENT_TIMESTAMP");
 }
 
 /** An INSERT value: a constant, or an unbound `?`/`$n` placeholder awaiting its parameter. */
@@ -766,8 +1207,15 @@ export type CompiledStatement =
   | {
       kind: "create-table";
       table: string;
-      columns: Array<{ name: string; type: SqlColumnType; nullable?: boolean }>;
+      columns: Array<{
+        name: string;
+        type: SqlColumnType;
+        nullable?: boolean;
+        defaultValue?: ColumnDefault;
+      }>;
       uniqueKey?: string;
+      /** CREATE TABLE IF NOT EXISTS: an existing table of that name is left alone. */
+      ifNotExists?: boolean;
       parameterCount?: number;
     }
   | {
@@ -785,7 +1233,25 @@ export type CompiledStatement =
       };
       parameterCount?: number;
     }
-  | { kind: "drop-trigger"; name: string; parameterCount?: number };
+  | { kind: "drop-trigger"; name: string; parameterCount?: number }
+  | {
+      kind: "create-table-as";
+      table: string;
+      query: CompiledQuery;
+      ifNotExists?: boolean;
+      parameterCount?: number;
+    }
+  | {
+      kind: "add-column";
+      table: string;
+      column: {
+        name: string;
+        type: SqlColumnType;
+        nullable?: boolean;
+        defaultValue?: ColumnDefault;
+      };
+      parameterCount?: number;
+    };
 
 /**
  * Parses CREATE TRIGGER name AFTER INSERT|UPDATE|DELETE ON table [FOR EACH ROW]
@@ -934,7 +1400,13 @@ export function compileStatement(sql: string): CompiledStatement {
     if (keyword === "CREATE") {
       if (isTriggerDdl) return parseCreateTrigger(text, tokens);
       parser = new Parser(tokens);
-      return parser.parseCreateTable();
+      const statement = parser.parseCreateTable();
+      if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
+      return statement;
+    }
+    if (keyword === "ALTER") {
+      parser = new Parser(tokens);
+      return parser.parseAlterTable();
     }
     if (keyword === "DROP") {
       const name = tokens[2];
@@ -1356,6 +1828,11 @@ export function bindStatementParameters(
     );
     return clone;
   }
+  if (clone.kind === "create-table-as") {
+    bindBlock(clone.query, values);
+    return clone;
+  }
+  if (clone.kind !== "update" && clone.kind !== "delete") return clone;
   if (clone.kind === "update") {
     for (const assignment of clone.assignments) {
       assignment.expression = bindExpression(assignment.expression, values);
@@ -1385,15 +1862,17 @@ export function inferBlockSchema(
   schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
 ): SqlColumnSchema[] {
   const sources = [plan.base, ...plan.joins];
-  if (plan.select[0]?.expression.kind === "wildcard") {
-    const multiple = sources.length > 1;
-    return sources.flatMap((source) =>
-      (schemas.get(source.table) ?? []).map((column) => ({
-        name: multiple ? `${source.alias}.${column.name}` : column.name,
-        type: column.type,
-      })),
-    );
-  }
+  const multipleSources = sources.length > 1;
+  const wildcardSchema = (source: TableSource): SqlColumnSchema[] =>
+    (schemas.get(source.table) ?? []).map((column) => ({
+      name: multipleSources ? `${source.alias}.${column.name}` : column.name,
+      type: column.type,
+    }));
+  if (
+    plan.select[0]?.expression.kind === "wildcard" &&
+    plan.select[0].expression.table === undefined
+  )
+    return sources.flatMap(wildcardSchema);
   const resolveColumnType = (reference: string): SqlColumnType | "null" => {
     const parts = reference.split(".");
     if (parts.length === 2) {
@@ -1501,11 +1980,28 @@ export function inferBlockSchema(
       expression.name === "POWER" ||
       expression.name === "SQRT" ||
       expression.name === "INSTR" ||
-      expression.name === "EXTRACT"
+      expression.name === "EXTRACT" ||
+      expression.name === "OCTET_LENGTH" ||
+      expression.name === "GROUPING"
     ) {
       return "number";
     }
+    if (
+      expression.name === "JSON_VALUE" ||
+      expression.name === "JSON_QUERY" ||
+      expression.name === "JSON_OBJECT" ||
+      expression.name === "JSON_ARRAY"
+    ) {
+      return "string";
+    }
+    if (expression.name === "JSON_EXISTS" || expression.name === "IS_JSON") return "boolean";
     if (expression.name === "DATE_TRUNC") return "datetime";
+    if (expression.name === "CURRENT_DATE" || expression.name === "CURRENT_TIMESTAMP") {
+      return "datetime";
+    }
+    // The engine has no TIME type, so LOCALTIME reads as an 'HH:MM:SS' string, like SQLite's
+    // CURRENT_TIME.
+    if (expression.name === "LOCALTIME") return "string";
     if (
       expression.name === "NULLIF" ||
       expression.name === "GREATEST" ||
@@ -1540,7 +2036,10 @@ export function inferBlockSchema(
       expression.name === "LTRIM" ||
       expression.name === "RTRIM" ||
       expression.name === "REPLACE" ||
-      expression.name === "SUBSTR"
+      expression.name === "SUBSTR" ||
+      expression.name === "LPAD" ||
+      expression.name === "RPAD" ||
+      expression.name === "OVERLAY"
     ) {
       const argument = expression.arguments[0];
       if (argument !== undefined) {
@@ -1566,12 +2065,18 @@ export function inferBlockSchema(
     const argument = expression.arguments[0];
     return argument === undefined ? "null" : infer(argument);
   };
-  return plan.select.map((item) => {
+  return plan.select.flatMap((item) => {
+    if (item.expression.kind === "wildcard" && item.expression.table !== undefined) {
+      const table = item.expression.table;
+      const source = sources.find((candidate) => candidate.alias === table);
+      if (source === undefined) throw new TypeError(`Unknown table for ${table}.*: ${table}`);
+      return wildcardSchema(source);
+    }
     const type = infer(item.expression);
     if (type === "null") {
       throw new TypeError(`Cannot infer a column type for output ${item.alias}`);
     }
-    return { name: item.alias, type };
+    return [{ name: item.alias, type }];
   });
 }
 
@@ -1622,7 +2127,10 @@ export function referencedColumns(
       }
     }
     if (expression.kind === "wildcard") {
+      // A qualified wildcard reads only its own source's columns.
+      const named = expression.table;
       for (const source of sources) {
+        if (named !== undefined && source.alias !== named) continue;
         for (const column of schemas.get(source.table) ?? [])
           requested.get(source.table)?.add(column);
       }
@@ -1687,6 +2195,25 @@ function assertTailParametersBound(plan: CompiledQuery): void {
   check(plan);
 }
 
+/** Wraps a prepared query so every result passes through one more projection or trim. */
+function trimPreparedResults(
+  prepared: PreparedQuery,
+  trim: (result: QueryResult) => QueryResult,
+): PreparedQuery {
+  return {
+    sql: prepared.sql,
+    tables: prepared.tables,
+    get memoryUsage() {
+      return prepared.memoryUsage;
+    },
+    execute: () => trim(prepared.execute()),
+    executeAsync: async (options) => trim(await prepared.executeAsync(options)),
+    close: () => {
+      prepared.close();
+    },
+  };
+}
+
 export function createPreparedQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
@@ -1694,6 +2221,15 @@ export function createPreparedQuery(
 ): PreparedQuery {
   assertTailParametersBound(plan);
   validateGrouping(plan);
+  plan = resolveStatementDatetimes(plan);
+  // The schema-dependent rewrites run before derived sources materialize, because both can
+  // turn a scanned table into one more derived block.
+  plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
+  plan = expandNaturalJoins(plan, wildcardRowColumns(tables));
+  plan = expandQualifiedWildcards(plan, wildcardRowColumns(tables));
+  const ties = withTiesPlan(plan);
+  if (ties.plan !== plan)
+    return trimPreparedResults(createPreparedQuery(ties.plan, tables, options), ties.trim);
   // Every engine entry expands MATCH(*) exactly once, here against the row tables' own
   // columns; past this point no executor sees the "*" sentinel.
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
@@ -1727,10 +2263,22 @@ export function createPreparedColumnarQuery(
   memory: QueryMemoryContext = new QueryMemoryContext(),
   options: { ftsStats?: ReadonlyMap<string, FtsStats> } = {},
 ): PreparedQuery {
-  plan = expandDistinctWildcard(plan, (tableName) => {
+  plan = resolveStatementDatetimes(plan);
+  const ties = withTiesPlan(plan);
+  if (ties.plan !== plan) {
+    return trimPreparedResults(
+      createPreparedColumnarQuery(ties.plan, tables, memory, options),
+      ties.trim,
+    );
+  }
+  const columnarColumns = (tableName: string): readonly string[] | undefined => {
     const table = tables.get(tableName);
     return table === undefined ? undefined : [...table.columns.keys()];
-  });
+  };
+  plan = expandSourceColumnAliases(plan, columnarColumns);
+  plan = expandNaturalJoins(plan, columnarColumns);
+  plan = expandQualifiedWildcards(plan, columnarColumns);
+  plan = expandDistinctWildcard(plan, columnarColumns);
   validateGrouping(plan);
   let closed = false;
   let prepared: PreparedVectorQuery | undefined;
@@ -2000,6 +2548,40 @@ export function childExpressions(expression: Expression): Expression[] {
 }
 
 /**
+ * `childExpressions` in reverse: the same node with each child replaced by `map(child)`. A node
+ * with no children — or one whose children are positions this cannot rebuild, like a window's
+ * own clauses — comes back untouched, so a caller that rewrites a subtree has to reach those
+ * itself. Kept beside `childExpressions` because the two have to agree about what a child is.
+ */
+export function mapChildExpressions(
+  expression: Expression,
+  map: (child: Expression) => Expression,
+): Expression {
+  if (expression.kind === "binary" || expression.kind === "condition") {
+    return { ...expression, left: map(expression.left), right: map(expression.right) };
+  }
+  if (expression.kind === "logical") {
+    return { ...expression, left: map(expression.left), right: map(expression.right) };
+  }
+  if (expression.kind === "not") return { ...expression, operand: map(expression.operand) };
+  if (expression.kind === "call") {
+    return { ...expression, arguments: expression.arguments.map(map) };
+  }
+  if (expression.kind === "list") return { ...expression, items: expression.items.map(map) };
+  if (expression.kind === "case") {
+    return {
+      ...expression,
+      branches: expression.branches.map((branch) => ({
+        when: map(branch.when),
+        then: map(branch.then),
+      })),
+      ...(expression.otherwise === undefined ? {} : { otherwise: map(expression.otherwise) }),
+    };
+  }
+  return expression;
+}
+
+/**
  * Visits every expression position of one block — select, predicates, HAVING, GROUP BY,
  * ORDER BY, and join conditions — without descending into nested blocks. Every plan feature
  * that scans "all expressions of a block" goes through here, so a future clause is added to
@@ -2037,6 +2619,73 @@ export function forEachNestedBlock(
       visit(source.recursive.step);
     }
   }
+}
+
+/**
+ * Rewrites every expression slot of one block in place, the writing counterpart to
+ * `forEachBlockExpression`. The mapper receives each root expression and returns its
+ * replacement; returning the same object leaves the slot untouched.
+ */
+export function mapBlockExpressions(
+  block: CompiledQuery,
+  map: (expression: Expression) => Expression,
+): void {
+  for (const item of block.select) item.expression = map(item.expression);
+  for (const predicate of [...block.predicates, ...block.having]) {
+    predicate.left = map(predicate.left);
+    predicate.right = map(predicate.right);
+  }
+  block.groupBy = block.groupBy.map(map);
+  for (const order of block.orderBy) order.expression = map(order.expression);
+  for (const join of block.joins) {
+    join.left = map(join.left);
+    join.right = map(join.right);
+    if (join.on !== undefined) join.on = map(join.on);
+  }
+}
+
+/**
+ * Replaces CURRENT_DATE / CURRENT_TIMESTAMP / LOCALTIME with one reading of the clock, so that
+ * every row of one execution — and both executors — see a single instant. Plans that never
+ * mention them are returned untouched, which is every plan the parser did not flag.
+ */
+export function resolveStatementDatetimes(
+  plan: CompiledQuery,
+  now: Date = new Date(),
+): CompiledQuery {
+  if (plan.usesStatementDatetime !== true) return plan;
+  const iso = now.toISOString();
+  const values = new Map<string, QueryValue>([
+    ["CURRENT_DATE", new Date(`${iso.slice(0, 10)}T00:00:00.000Z`)],
+    ["CURRENT_TIMESTAMP", new Date(now.getTime())],
+    ["LOCALTIME", iso.slice(11, 19)],
+  ]);
+  const resolved = structuredClone(plan);
+  const substitute = (expression: Expression): Expression => {
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      resolveBlock(expression.block);
+      return expression;
+    }
+    if (expression.kind === "call" && values.has(expression.name)) {
+      return { kind: "literal", value: values.get(expression.name) ?? null };
+    }
+    if (expression.kind === "window") {
+      // A window's own clauses are positions mapChildExpressions cannot rebuild; the plan is
+      // already a private clone, so they are rewritten in place.
+      expression.partitionBy = expression.partitionBy.map(substitute);
+      for (const order of expression.orderBy) order.expression = substitute(order.expression);
+      if (expression.argument !== undefined) expression.argument = substitute(expression.argument);
+      return expression;
+    }
+    return mapChildExpressions(expression, substitute);
+  };
+  const resolveBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, resolveBlock);
+    mapBlockExpressions(block, substitute);
+  };
+  resolveBlock(resolved);
+  delete resolved.usesStatementDatetime;
+  return resolved;
 }
 
 /** One top-level full-text MATCH conjunct of a plan, with its resolved column expressions. */
@@ -2160,6 +2809,46 @@ export function expandFtsColumns(
 }
 
 /**
+ * Aggregates the frame members named by position, for the frames whose rows are not contiguous.
+ * EXCLUDE puts a hole in the middle of a frame, which the prefix sums the common path uses
+ * cannot represent, so those positions walk their members instead.
+ */
+function aggregateWindowMembers(
+  window: WindowSpec,
+  values: readonly unknown[],
+  members: readonly number[],
+): unknown {
+  const present = members.filter((member) => {
+    const value = values[member];
+    return value !== null && value !== undefined;
+  });
+  if (window.name === "COUNT") {
+    return window.argumentAlias === undefined ? members.length : present.length;
+  }
+  if (window.name === "FIRST_VALUE") return values[members[0] ?? -1] ?? null;
+  if (window.name === "LAST_VALUE") return values[members[members.length - 1] ?? -1] ?? null;
+  if (window.name === "NTH_VALUE") return values[members[(window.offset ?? 1) - 1] ?? -1] ?? null;
+  if (present.length === 0) return null;
+  if (window.name === "SUM" || window.name === "AVG") {
+    const total = present.reduce<number>((sum, member) => sum + numeric(values[member]), 0);
+    return window.name === "SUM" ? total : total / present.length;
+  }
+  let best: unknown;
+  for (const member of present) {
+    const candidate = values[member];
+    if (
+      best === undefined ||
+      (window.name === "MIN"
+        ? compareValues(candidate, best) < 0
+        : compareValues(candidate, best) > 0)
+    ) {
+      best = candidate;
+    }
+  }
+  return best ?? null;
+}
+
+/**
  * Computes one aggregate window over partition-sorted row indexes. Without an explicit frame the
  * SQL default applies: no OVER ordering makes every partition row share the whole-partition
  * aggregate, and ordering gives each row the running aggregate through its ordering peers
@@ -2233,6 +2922,23 @@ function applyAggregateWindowPartition(
     prefixNonNull[position + 1] = (prefixNonNull[position] ?? 0) + (nonNull ? 1 : 0);
     prefixSum[position + 1] = (prefixSum[position] ?? 0) + (sums && nonNull ? numeric(value) : 0);
   }
+  // GROUPS frames count peer groups rather than rows, so each position needs its group's
+  // ordinal and the group boundaries to translate an offset back into row positions.
+  const groupOrdinal = new Array<number>(size).fill(0);
+  const groupStarts: number[] = [];
+  if (frame.unit === "groups") {
+    for (let position = 0; position < size; position += 1) {
+      if (position === 0 || peerStart[position] !== peerStart[position - 1]) {
+        groupStarts.push(peerStart[position] ?? position);
+      }
+      groupOrdinal[position] = groupStarts.length - 1;
+    }
+  }
+  const groupEdge = (ordinal: number, isStart: boolean): number => {
+    if (ordinal < 0) return isStart ? 0 : 0;
+    if (ordinal >= groupStarts.length) return size;
+    return isStart ? (groupStarts[ordinal] ?? 0) : (groupStarts[ordinal + 1] ?? size);
+  };
   const bound = (edge: WindowFrameBound, position: number, isStart: boolean): number => {
     switch (edge.kind) {
       case "unbounded-preceding":
@@ -2240,24 +2946,70 @@ function applyAggregateWindowPartition(
       case "unbounded-following":
         return size;
       case "preceding":
+        if (frame.unit === "groups") {
+          return groupEdge((groupOrdinal[position] ?? 0) - (edge.offset ?? 0), isStart);
+        }
         return position - (edge.offset ?? 0) + (isStart ? 0 : 1);
       case "following":
+        if (frame.unit === "groups") {
+          return groupEdge((groupOrdinal[position] ?? 0) + (edge.offset ?? 0), isStart);
+        }
         return position + (edge.offset ?? 0) + (isStart ? 0 : 1);
       case "current-row":
-        if (frame.unit === "range") {
+        if (frame.unit === "range" || frame.unit === "groups") {
           return (isStart ? peerStart[position] : peerEnd[position]) ?? position;
         }
         return position + (isStart ? 0 : 1);
+    }
+  };
+  /**
+   * The positions EXCLUDE removes from one frame: the current row, its whole peer group, or the
+   * peers other than the current row (T612).
+   */
+  const excluded = (position: number): { from: number; to: number; keepCurrent: boolean } => {
+    switch (frame.exclude) {
+      case "current-row":
+        return { from: position, to: position + 1, keepCurrent: false };
+      case "group":
+        return {
+          from: peerStart[position] ?? position,
+          to: peerEnd[position] ?? position + 1,
+          keepCurrent: false,
+        };
+      case "ties":
+        return {
+          from: peerStart[position] ?? position,
+          to: peerEnd[position] ?? position + 1,
+          keepCurrent: true,
+        };
+      default:
+        return { from: 0, to: 0, keepCurrent: true };
     }
   };
   for (let position = 0; position < size; position += 1) {
     const low = Math.max(0, Math.min(size, bound(frame.start, position, true)));
     const high = Math.max(0, Math.min(size, bound(frame.end, position, false)));
     let value: unknown;
+    if (frame.exclude !== undefined) {
+      const skip = excluded(position);
+      const members: number[] = [];
+      for (let member = low; member < high; member += 1) {
+        const dropped =
+          member >= skip.from && member < skip.to && !(skip.keepCurrent && member === position);
+        if (!dropped) members.push(member);
+      }
+      value = aggregateWindowMembers(window, values, members);
+      const row = rows[indexes[start + position] ?? -1];
+      if (row !== undefined) row[window.alias] = asQueryValue(value);
+      continue;
+    }
     if (high <= low) {
       value = window.name === "COUNT" ? 0 : null;
     } else if (window.name === "FIRST_VALUE") {
       value = values[low] ?? null;
+    } else if (window.name === "NTH_VALUE") {
+      const position = low + (window.offset ?? 1) - 1;
+      value = position < high ? (values[position] ?? null) : null;
     } else if (window.name === "LAST_VALUE") {
       value = values[high - 1] ?? null;
     } else if (window.name === "COUNT") {
@@ -2384,6 +3136,12 @@ function containsDistinctCount(expression: Expression): boolean {
 function containsWindow(expression: Expression): boolean {
   if (expression.kind === "window") return true;
   return childExpressions(expression).some(containsWindow);
+}
+
+/** Whether an expression still contains an unresolved GROUPING call (T433). */
+function containsGrouping(expression: Expression): boolean {
+  if (expression.kind === "call" && expression.name === "GROUPING") return true;
+  return childExpressions(expression).some(containsGrouping);
 }
 
 function containsFtsExpression(expression: Expression): boolean {
@@ -2565,6 +3323,12 @@ export function executeRowQuery(
 ): QueryResult {
   assertTailParametersBound(plan);
   validateGrouping(plan);
+  plan = resolveStatementDatetimes(plan);
+  plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
+  plan = expandNaturalJoins(plan, wildcardRowColumns(tables));
+  plan = expandQualifiedWildcards(plan, wildcardRowColumns(tables));
+  const ties = withTiesPlan(plan);
+  plan = ties.plan;
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
   for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
@@ -2652,7 +3416,7 @@ export function executeRowQuery(
     plan.select[0]?.expression.kind === "wildcard"
       ? Object.keys(rows[0] ?? {})
       : plan.select.map((item) => item.alias);
-  return { columns, rows };
+  return ties.trim({ columns, rows });
 }
 
 /** One ORDER BY resolution source: an alias and the columns a wildcard select exposes from it. */
@@ -2877,12 +3641,21 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (group === undefined)
           throw new TypeError(`${expression.name} requires grouped execution`);
         const argument = expression.arguments[0] ?? { kind: "wildcard" as const };
-        const values =
+        let values =
           argument.kind === "wildcard"
             ? group.map(() => 1)
             : group
                 .map((row) => evaluate(argument, row))
                 .filter((value) => value !== null && value !== undefined);
+        if (expression.distinct === true) {
+          const seen = new Set<unknown>();
+          values = values.filter((value) => {
+            const key = value instanceof Date ? ` d${String(value.getTime())}` : value;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        }
         if (expression.name === "COUNT") return values.length;
         if (expression.name === "SUM")
           return values.length === 0
@@ -3472,7 +4245,7 @@ function expressionColumns(expression: Expression): string[] {
   return childExpressions(expression).flatMap(expressionColumns);
 }
 
-function expressionAliases(expression: Expression): Set<string> {
+export function expressionAliases(expression: Expression): Set<string> {
   return new Set(
     expressionColumns(expression).flatMap((reference) =>
       reference.includes(".") ? [reference.split(".")[0] ?? ""] : [],
@@ -3529,6 +4302,9 @@ class Parser {
   #positionalParameters = 0;
   #highestNumberedParameter = 0;
 
+  /** Set when the statement names CURRENT_DATE, CURRENT_TIMESTAMP, or LOCALTIME. */
+  usesStatementDatetime = false;
+
   /** Total parameter slots the statement expects; 0 when it has no placeholders. */
   get parameterCount(): number {
     return Math.max(this.#positionalParameters, this.#highestNumberedParameter);
@@ -3539,6 +4315,8 @@ class Parser {
     return this.#derivedSequence;
   };
   readonly #ctes = new Map<string, CompiledQuery>();
+  /** Named windows of the block being parsed: `WINDOW w AS (...)`, referenced by `OVER w`. */
+  #namedWindows = new Map<string, { start: number; end: number }>();
   readonly #ctesInProgress = new Set<string>();
   readonly #recursiveCtes = new Map<string, RecursiveCte>();
   readonly #recursiveUses = new Set<string>();
@@ -3559,19 +4337,37 @@ class Parser {
       if (this.#ctes.has(name) || this.#ctesInProgress.has(name) || this.#recursiveCtes.has(name)) {
         throw new TypeError(`Duplicate CTE name: ${name}`);
       }
+      // `WITH months(month) AS (…)`: the CTE names its own output columns, whatever the block
+      // inside called them. A recursive CTE takes the names before its step member parses,
+      // because the step refers to the working set by these names and not by the base's.
+      const columns = this.#cteColumnList();
       this.#keyword("AS");
       this.#expectPunctuation("(");
       if (recursive) {
-        this.#recursiveCte(name);
+        this.#recursiveCte(name, columns);
       } else {
         this.#ctesInProgress.add(name);
-        const block = this.#selectBlock("(cte)");
+        const block = this.#queryExpression("(cte)");
         this.#ctesInProgress.delete(name);
         this.#expectPunctuation(")");
+        if (columns !== undefined) renameBlockOutputs(block, columns, name);
         this.#ctes.set(name, block);
       }
       if (!this.#punctuation(",")) break;
     }
+  }
+
+  /** The optional `(a, b, c)` between a CTE's name and its AS. */
+  #cteColumnList(): string[] | undefined {
+    if (!this.#punctuation("(")) return undefined;
+    const columns: string[] = [];
+    for (;;) {
+      columns.push(this.#identifier());
+      if (!this.#punctuation(",")) break;
+    }
+    this.#expectPunctuation(")");
+    if (columns.length === 0) throw new TypeError("A CTE column list cannot be empty");
+    return columns;
   }
 
   /**
@@ -3592,6 +4388,29 @@ class Parser {
 
   parse(sql: string): CompiledQuery {
     this.#withClause();
+    const plan = this.#queryExpression(sql);
+    this.#take("eof");
+    return plan;
+  }
+
+  /**
+   * A whole query expression: INTERSECT terms combined by UNION and EXCEPT. Every context that
+   * takes one — the statement itself, a derived table, a CTE body, a parenthesized member —
+   * parses through here, so set operations nest wherever the standard allows (E071-06).
+   */
+  #queryExpression(sql: string): CompiledQuery {
+    if (this.#isKeyword("WITH")) {
+      // T122: a nested WITH belongs to its own query expression only, so the outer names are
+      // restored afterwards and an inner CTE cannot leak out of the subquery that declared it.
+      const outer = new Map(this.#ctes);
+      try {
+        this.#withClause();
+        return this.#queryExpression(sql);
+      } finally {
+        this.#ctes.clear();
+        for (const [name, block] of outer) this.#ctes.set(name, block);
+      }
+    }
     // INTERSECT binds tighter than UNION and EXCEPT, per the SQL standard.
     const firstTerm = this.#setTerm(sql);
     let plan = firstTerm.block;
@@ -3616,7 +4435,6 @@ class Parser {
       }
       plan = this.#compoundBlock(sql, members, ops);
     }
-    this.#take("eof");
     return plan;
   }
 
@@ -3661,6 +4479,7 @@ class Parser {
         orderBy: last.block.orderBy,
         ...(last.block.limit === undefined ? {} : { limit: last.block.limit }),
         ...(last.block.offset === undefined ? {} : { offset: last.block.offset }),
+        ...(last.block.limitWithTies === true ? { limitWithTies: true } : {}),
         ...(last.block.limitParameter === undefined
           ? {}
           : { limitParameter: last.block.limitParameter }),
@@ -3693,15 +4512,76 @@ class Parser {
   parseCreateTable(): CompiledStatement {
     this.#keyword("CREATE");
     this.#keyword("TABLE");
+    let ifNotExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("NOT");
+      this.#keyword("EXISTS");
+      ifNotExists = true;
+    }
     const table = this.#identifier();
+    if (this.#isKeyword("AS")) {
+      // T172: CREATE TABLE name AS SELECT ... takes its columns from the query's own schema.
+      this.#keyword("AS");
+      const query = this.#queryExpression("(create table as)");
+      this.#take("eof");
+      return {
+        kind: "create-table-as",
+        table,
+        query,
+        ...(ifNotExists ? { ifNotExists: true } : {}),
+      };
+    }
     this.#expectPunctuation("(");
-    const columns: Array<{ name: string; type: SqlColumnType; nullable?: boolean }> = [];
+    const columns: Array<{
+      name: string;
+      type: SqlColumnType;
+      nullable?: boolean;
+      defaultValue?: ColumnDefault;
+    }> = [];
     let uniqueKey: string | undefined;
     for (;;) {
+      if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
+        // E141-08: the table-level spelling of the same single-column key.
+        if (this.#isKeyword("PRIMARY")) {
+          this.#keyword("PRIMARY");
+          this.#keyword("KEY");
+        } else this.#keyword("UNIQUE");
+        this.#expectPunctuation("(");
+        const keyColumn = this.#identifier();
+        if (this.#peek().text === ",") {
+          throw new TypeError("CREATE TABLE supports one unique key column");
+        }
+        this.#expectPunctuation(")");
+        if (uniqueKey !== undefined && uniqueKey !== keyColumn) {
+          throw new TypeError("CREATE TABLE supports one unique key column");
+        }
+        uniqueKey = keyColumn;
+        if (!this.#punctuation(",")) break;
+        continue;
+      }
       const name = this.#identifier();
       const type = this.#columnType();
       let nullable = true;
+      let explicitlyNullable = false;
+      let defaultValue: ColumnDefault | undefined;
       for (;;) {
+        if (this.#isKeyword("DEFAULT")) {
+          // E141-07. The catalog fills defaults at insert time, so they are constants: a
+          // literal, or the CURRENT_TIMESTAMP family, which it stores as "now".
+          this.#keyword("DEFAULT");
+          const expression = this.#expression();
+          defaultValue = columnDefaultFor(expression);
+          continue;
+        }
+        if (this.#isKeyword("CHECK")) {
+          throw new TypeError(
+            "CHECK constraints are not supported; validate before writing, or use a BEFORE trigger",
+          );
+        }
+        if (this.#isKeyword("REFERENCES")) {
+          throw new TypeError("FOREIGN KEY constraints are not supported");
+        }
         if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
           if (this.#isKeyword("PRIMARY")) {
             this.#keyword("PRIMARY");
@@ -3729,11 +4609,21 @@ class Parser {
         if (this.#isKeyword("NULL")) {
           this.#keyword("NULL");
           nullable = true;
+          explicitlyNullable = true;
           continue;
         }
         break;
       }
-      columns.push({ name, type, ...(nullable ? { nullable: true } : {}) });
+      // A default answers what an absent value means, so the column cannot also be nullable
+      // unless the author says so — and then the engine rejects the pair, since NULL and the
+      // default would both claim the same slot.
+      if (defaultValue !== undefined && !explicitlyNullable) nullable = false;
+      columns.push({
+        name,
+        type,
+        ...(nullable ? { nullable: true } : {}),
+        ...(defaultValue === undefined ? {} : { defaultValue }),
+      });
       if (!this.#punctuation(",")) break;
     }
     this.#expectPunctuation(")");
@@ -3741,11 +4631,60 @@ class Parser {
     if (new Set(columns.map((column) => column.name)).size !== columns.length) {
       throw new TypeError("CREATE TABLE column names must be unique");
     }
+    if (uniqueKey !== undefined && !columns.some((column) => column.name === uniqueKey)) {
+      throw new TypeError(`CREATE TABLE key column is not declared: ${uniqueKey}`);
+    }
     return {
       kind: "create-table",
       table,
-      columns,
+      columns: columns.map((column) =>
+        column.name === uniqueKey ? { ...column, nullable: false } : column,
+      ),
       ...(uniqueKey === undefined ? {} : { uniqueKey }),
+      ...(ifNotExists ? { ifNotExists: true } : {}),
+    };
+  }
+
+  /** ALTER TABLE name ADD [COLUMN] col TYPE [NOT NULL] [DEFAULT v] (F031-04). */
+  parseAlterTable(): CompiledStatement {
+    this.#keyword("ALTER");
+    this.#keyword("TABLE");
+    const table = this.#identifier();
+    this.#keyword("ADD");
+    if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
+    const name = this.#identifier();
+    const type = this.#columnType();
+    let nullable = true;
+    let defaultValue: ColumnDefault | undefined;
+    for (;;) {
+      if (this.#isKeyword("DEFAULT")) {
+        this.#keyword("DEFAULT");
+        defaultValue = columnDefaultFor(this.#expression());
+        continue;
+      }
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        this.#keyword("NULL");
+        nullable = false;
+        continue;
+      }
+      if (this.#isKeyword("NULL")) {
+        this.#keyword("NULL");
+        nullable = true;
+        continue;
+      }
+      break;
+    }
+    this.#take("eof");
+    return {
+      kind: "add-column",
+      table,
+      column: {
+        name,
+        type,
+        ...(nullable ? { nullable: true } : {}),
+        ...(defaultValue === undefined ? {} : { defaultValue }),
+      },
     };
   }
 
@@ -3991,7 +4930,7 @@ class Parser {
 
   #unionMember(sql: string): { block: CompiledQuery; parenthesized: boolean } {
     if (this.#punctuation("(")) {
-      const block = this.#isKeyword("VALUES") ? this.#valuesBlock() : this.#selectBlock(sql);
+      const block = this.#isKeyword("VALUES") ? this.#valuesBlock() : this.#queryExpression(sql);
       this.#expectPunctuation(")");
       return { block, parenthesized: true };
     }
@@ -4044,12 +4983,12 @@ class Parser {
   }
 
   /** The standard fetch clause: FETCH FIRST|NEXT [n] ROW|ROWS ONLY, a spelling of LIMIT. */
-  #fetchClause(): { limit?: number; limitParameter?: number } {
+  #fetchClause(): { limit?: number; limitParameter?: number; limitWithTies?: boolean } {
     if (!this.#isKeyword("FETCH")) return {};
     this.#keyword("FETCH");
     if (this.#isKeyword("FIRST")) this.#keyword("FIRST");
     else this.#keyword("NEXT");
-    let result: { limit?: number; limitParameter?: number } = { limit: 1 };
+    let result: { limit?: number; limitParameter?: number; limitWithTies?: boolean } = { limit: 1 };
     if (this.#peek().kind === "parameter") {
       const parameter = this.#parameterExpression();
       if (parameter.kind === "parameter") result = { limitParameter: parameter.index };
@@ -4058,6 +4997,12 @@ class Parser {
     }
     if (this.#isKeyword("ROWS")) this.#keyword("ROWS");
     else this.#keyword("ROW");
+    // F866: WITH TIES keeps every row that ties with the last one under the ORDER BY.
+    if (this.#isKeyword("WITH")) {
+      this.#keyword("WITH");
+      this.#keyword("TIES");
+      return { ...result, limitWithTies: true };
+    }
     this.#keyword("ONLY");
     return result;
   }
@@ -4082,6 +5027,7 @@ class Parser {
   #tailClauses(): {
     limit?: number;
     limitParameter?: number;
+    limitWithTies?: boolean;
     offset?: number;
     offsetParameter?: number;
   } {
@@ -4092,6 +5038,71 @@ class Parser {
   }
 
   #selectBlock(sql: string): CompiledQuery {
+    const enclosingWindows = this.#namedWindows;
+    this.#namedWindows = this.#scanNamedWindows();
+    try {
+      return this.#selectBlockBody(sql);
+    } finally {
+      this.#namedWindows = enclosingWindows;
+    }
+  }
+
+  /**
+   * Finds this block's `WINDOW name AS (...)` definitions before its select list parses, since
+   * `OVER name` in the select list refers forward to them (T620). Each name maps to the token
+   * span of its definition, which `#overClause` re-enters when it meets the reference.
+   */
+  #scanNamedWindows(): Map<string, { start: number; end: number }> {
+    const windows = new Map<string, { start: number; end: number }>();
+    let depth = 0;
+    for (let index = this.#index; index < this.tokens.length; index += 1) {
+      const token = this.tokens[index];
+      if (token === undefined || token.kind === "eof") break;
+      if (token.kind === "punctuation" && token.text === "(") depth += 1;
+      else if (token.kind === "punctuation" && token.text === ")") {
+        if (depth === 0) break;
+        depth -= 1;
+      }
+      if (depth !== 0 || token.kind !== "identifier" || token.quoted === true) continue;
+      const keyword = token.text.toUpperCase();
+      // A set operator ends this block; anything past it belongs to another one.
+      if (keyword === "UNION" || keyword === "INTERSECT" || keyword === "EXCEPT") break;
+      if (keyword !== "WINDOW") continue;
+      let cursor = index + 1;
+      for (;;) {
+        const name = this.tokens[cursor];
+        const as = this.tokens[cursor + 1];
+        const open = this.tokens[cursor + 2];
+        if (
+          name?.kind !== "identifier" ||
+          as?.kind !== "identifier" ||
+          as.text.toUpperCase() !== "AS" ||
+          open?.kind !== "punctuation" ||
+          open.text !== "("
+        ) {
+          throw new TypeError("WINDOW takes name AS (window specification)");
+        }
+        let inner = 1;
+        let end = cursor + 3;
+        while (end < this.tokens.length && inner > 0) {
+          const scan = this.tokens[end];
+          if (scan?.kind === "punctuation" && scan.text === "(") inner += 1;
+          if (scan?.kind === "punctuation" && scan.text === ")") inner -= 1;
+          end += 1;
+        }
+        if (inner !== 0) throw new TypeError("Unterminated WINDOW specification");
+        if (windows.has(name.text)) throw new TypeError(`Duplicate window name: ${name.text}`);
+        windows.set(name.text, { start: cursor + 2, end });
+        const next = this.tokens[end];
+        if (next?.kind !== "punctuation" || next.text !== ",") break;
+        cursor = end + 1;
+      }
+      break;
+    }
+    return windows;
+  }
+
+  #selectBlockBody(sql: string): CompiledQuery {
     this.#keyword("SELECT");
     let distinct = false;
     if (this.#isKeyword("DISTINCT")) {
@@ -4112,7 +5123,22 @@ class Parser {
     }
     const joins: JoinPlan[] = [];
     let rightJoins = 0;
+    /** A cross join: the nested-loop path with a condition every row pair satisfies. */
+    const crossJoin = (source: TableSource): JoinPlan => ({
+      ...source,
+      kind: "inner",
+      left: { kind: "literal", value: null },
+      right: { kind: "literal", value: null },
+      on: {
+        kind: "condition",
+        operator: "=",
+        left: { kind: "literal", value: 1 },
+        right: { kind: "literal", value: 1 },
+      },
+    });
     while (
+      this.#peek().text === "," ||
+      this.#isKeyword("NATURAL") ||
       this.#isKeyword("JOIN") ||
       this.#isKeyword("INNER") ||
       this.#isKeyword("LEFT") ||
@@ -4120,28 +5146,27 @@ class Parser {
       this.#isKeyword("FULL") ||
       this.#isKeyword("CROSS")
     ) {
+      if (this.#punctuation(",")) {
+        // F041-07: a comma between table references is a cross join.
+        joins.push(crossJoin(this.#source()));
+        continue;
+      }
       if (this.#isKeyword("CROSS")) {
-        // A cross join is the ON-less cartesian product: the nested-loop join path with a
-        // condition every row pair satisfies.
         this.#keyword("CROSS");
         this.#keyword("JOIN");
-        joins.push({
-          ...this.#source(),
-          kind: "inner",
-          left: { kind: "literal", value: null },
-          right: { kind: "literal", value: null },
-          on: {
-            kind: "condition",
-            operator: "=",
-            left: { kind: "literal", value: 1 },
-            right: { kind: "literal", value: 1 },
-          },
-        });
+        joins.push(crossJoin(this.#source()));
         continue;
       }
       let kind: JoinPlan["kind"] = "inner";
       let right = false;
       let full = false;
+      let natural = false;
+      if (this.#isKeyword("NATURAL")) {
+        // F401-01: the join columns are the names both sides share, which only the catalog
+        // knows; the join carries the marker until an execution entry resolves it.
+        this.#keyword("NATURAL");
+        natural = true;
+      }
       if (this.#isKeyword("INNER")) this.#keyword("INNER");
       else if (this.#isKeyword("LEFT")) {
         this.#keyword("LEFT");
@@ -4158,8 +5183,28 @@ class Parser {
       if (this.#isKeyword("OUTER")) this.#keyword("OUTER");
       this.#keyword("JOIN");
       const source = this.#source();
-      this.#keyword("ON");
-      const condition = this.#expression();
+      if (natural) {
+        if (this.#isKeyword("ON") || this.#isKeyword("USING")) {
+          throw new TypeError("A NATURAL join takes no ON or USING clause");
+        }
+        if (right) {
+          // The RIGHT mirror below rewrites the join's sources, which the shared-column search
+          // has to see; a natural right join would resolve against the wrong side.
+          throw new TypeError("NATURAL RIGHT JOIN is not supported; write it as a LEFT join");
+        }
+        joins.push({
+          ...source,
+          kind,
+          left: { kind: "literal", value: null },
+          right: { kind: "literal", value: null },
+          natural: true,
+          ...(full ? { full } : {}),
+        });
+        continue;
+      }
+      const condition = this.#isKeyword("USING")
+        ? this.#usingCondition(base.alias, source.alias)
+        : (this.#keyword("ON"), this.#expression());
       if (condition.kind === "condition" && condition.operator === "=") {
         joins.push({
           ...source,
@@ -4224,6 +5269,17 @@ class Parser {
       this.#keyword("HAVING");
       if (distinct) throw new TypeError("SELECT DISTINCT cannot be combined with HAVING");
       having.push(...splitCondition(this.#expression()));
+    }
+    if (this.#isKeyword("WINDOW")) {
+      // The definitions were read before the select list; here they only have to be stepped over.
+      this.#keyword("WINDOW");
+      for (;;) {
+        this.#identifier();
+        this.#keyword("AS");
+        const definition = this.#namedWindows.get(this.tokens[this.#index - 2]?.text ?? "");
+        this.#index = definition?.end ?? this.#index;
+        if (!this.#punctuation(",")) break;
+      }
     }
     const orderBy = this.#orderByClause();
     return assembleSelectBlock(
@@ -4299,10 +5355,21 @@ class Parser {
       items.push({ expression, alias });
       if (!this.#punctuation(",")) break;
     }
-    if (items.some((item) => item.expression.kind === "wildcard") && items.length > 1)
+    if (
+      items.some(
+        (item) => item.expression.kind === "wildcard" && item.expression.table === undefined,
+      ) &&
+      items.length > 1
+    ) {
       throw new TypeError("SELECT * cannot be mixed with other expressions");
+    }
     const aliases = new Set<string>();
     for (const item of items) {
+      if (item.expression.kind === "list") {
+        throw new TypeError("A row constructor is only allowed in a comparison or IN list");
+      }
+      // A qualified wildcard has no single output name until expansion resolves its columns.
+      if (item.expression.kind === "wildcard" && item.expression.table !== undefined) continue;
       if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
       aliases.add(item.alias);
     }
@@ -4313,11 +5380,13 @@ class Parser {
    * Parses one WITH RECURSIVE body: `base UNION [ALL] step`, where only the step may reference
    * the CTE's own name. A body without a self-reference or UNION registers as a plain CTE.
    */
-  #recursiveCte(name: string): void {
+  #recursiveCte(name: string, columns?: readonly string[]): void {
     const candidate = { name, reference: `(recursive ${name})` };
     this.#recursiveCandidate = candidate;
     try {
       const base = this.#selectBlock("(cte)");
+      // Before the step parses: it reads the working set by the declared names.
+      if (columns !== undefined) renameBlockOutputs(base, columns, name);
       if (this.#recursiveUses.has(name)) {
         throw new TypeError("A recursive CTE may only reference itself in its step member");
       }
@@ -4337,6 +5406,7 @@ class Parser {
         throw new TypeError("A recursive CTE takes exactly one UNION between base and step");
       }
       this.#expectPunctuation(")");
+      if (columns !== undefined) renameBlockOutputs(step, columns, name);
       if (!this.#recursiveUses.has(name)) {
         // No self-reference: the body is an ordinary two-member compound.
         this.#ctes.set(
@@ -4423,11 +5493,40 @@ class Parser {
     });
   }
 
+  /**
+   * `JOIN t USING (a, b)`: the named columns must exist on both sides, and the join condition
+   * is their conjunction (F401-04). Unlike the standard, the joined columns still appear once
+   * per side in a `SELECT *`, because this engine names wildcard outputs per source anyway.
+   */
+  #usingCondition(leftAlias: string, rightAlias: string): Expression {
+    this.#keyword("USING");
+    this.#expectPunctuation("(");
+    const names: string[] = [];
+    for (;;) {
+      names.push(this.#identifier());
+      if (!this.#punctuation(",")) break;
+    }
+    this.#expectPunctuation(")");
+    return names
+      .map<Expression>((name) => ({
+        kind: "condition",
+        operator: "=",
+        left: { kind: "column", reference: `${leftAlias}.${name}` },
+        right: { kind: "column", reference: `${rightAlias}.${name}` },
+      }))
+      .reduce((accumulated, condition) => ({
+        kind: "logical",
+        operator: "and",
+        left: accumulated,
+        right: condition,
+      }));
+  }
+
   #source(): TableSource {
     if (this.#punctuation("(")) {
       const derived = this.#isKeyword("VALUES")
         ? this.#valuesBlock()
-        : this.#selectBlock("(derived)");
+        : this.#queryExpression("(derived)");
       this.#expectPunctuation(")");
       const alias = this.#sourceAlias();
       if (alias === undefined) throw new TypeError("A derived table requires an alias");
@@ -4435,6 +5534,19 @@ class Parser {
       return this.#derivedSource(derived, alias);
     }
     const table = this.#identifier();
+    if (this.#peek().text === "(") {
+      // Two row-producing sources the executors have no operator for; both parse far enough to
+      // say so, rather than failing on the punctuation that follows.
+      const upper = table.toUpperCase();
+      if (upper === "LATERAL") {
+        throw new TypeError("LATERAL sources are not supported");
+      }
+      if (upper === "JSON_TABLE") {
+        throw new TypeError(
+          "JSON_TABLE is not supported; JSON_VALUE and JSON_QUERY read one value",
+        );
+      }
+    }
     const candidate = this.#recursiveCandidate;
     if (candidate?.name === table) {
       this.#recursiveUses.add(table);
@@ -4445,7 +5557,14 @@ class Parser {
     }
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
-    if (cte !== undefined) return this.#derivedSource(structuredClone(cte), alias);
+    if (cte !== undefined) {
+      const source = structuredClone(cte);
+      if (this.#peek().text === "(") {
+        this.#expectPunctuation("(");
+        this.#applyColumnAliases(source);
+      }
+      return this.#derivedSource(source, alias);
+    }
     const recursive = this.#recursiveCtes.get(table);
     if (recursive !== undefined) {
       return {
@@ -4453,6 +5572,18 @@ class Parser {
         alias,
         recursive: structuredClone(recursive),
       };
+    }
+    if (this.#peek().text === "(") {
+      // E051-09: `FROM t AS y(a, b)` renames the table's columns positionally. The names are
+      // kept on the source because the table's own column order is only known at execution.
+      this.#expectPunctuation("(");
+      const columnAliases: string[] = [];
+      for (;;) {
+        columnAliases.push(this.#identifier());
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+      return { table, alias, columnAliases };
     }
     return { table, alias };
   }
@@ -4511,8 +5642,141 @@ class Parser {
     return this.#comparisonExpression();
   }
 
+  /**
+   * Field-wise expansion of a row comparison (F641). Equality is the conjunction of the field
+   * equalities and inequality their disjunction; the ordering operators compare
+   * lexicographically, each field deciding only when every earlier field is equal.
+   */
+  #rowComparison(
+    operator: ComparisonOperator,
+    left: Expression[],
+    right: Expression[],
+  ): Expression {
+    if (left.length !== right.length) {
+      throw new TypeError("Compared rows must have the same number of fields");
+    }
+    for (const side of [left, right]) {
+      if (side.some((field) => field.kind === "list")) {
+        throw new TypeError("Row constructors cannot nest");
+      }
+    }
+    const pair = (index: number, op: ComparisonOperator): Expression => ({
+      kind: "condition",
+      operator: op,
+      left: structuredClone(left[index] ?? { kind: "literal", value: null }),
+      right: structuredClone(right[index] ?? { kind: "literal", value: null }),
+    });
+    if (operator === "=" || operator === "!=" || operator === "<>") {
+      const join = operator === "=" ? "and" : "or";
+      return left
+        .map((_, index) => pair(index, operator))
+        .reduce((accumulated, condition) => ({
+          kind: "logical",
+          operator: join,
+          left: accumulated,
+          right: condition,
+        }));
+    }
+    const strict: ComparisonOperator = operator === "<" || operator === "<=" ? "<" : ">";
+    const lexicographic = (index: number): Expression => {
+      // The final field decides with the original operator, so <= and >= stay inclusive.
+      if (index === left.length - 1) return pair(index, operator);
+      return {
+        kind: "logical",
+        operator: "or",
+        left: pair(index, strict),
+        right: {
+          kind: "logical",
+          operator: "and",
+          left: pair(index, "="),
+          right: lexicographic(index + 1),
+        },
+      };
+    };
+    return lexicographic(0);
+  }
+
+  /**
+   * The predicates a row constructor may head: `IS [NOT] NULL`, a comparison against another
+   * row, and `IN` over a list of rows. `R IS NOT NULL` is true when every field is non-null,
+   * which is why it is built directly rather than as the negation of `R IS NULL`.
+   */
+  #rowPredicate(row: Expression & { kind: "list" }): Expression {
+    const fields = row.items;
+    const conjunction = (operator: PredicateOperator): Expression =>
+      fields
+        .map<Expression>((field) => ({
+          kind: "condition",
+          operator,
+          left: field,
+          right: { kind: "literal", value: null },
+        }))
+        .reduce((accumulated, condition) => ({
+          kind: "logical",
+          operator: "and",
+          left: accumulated,
+          right: condition,
+        }));
+    if (this.#isKeyword("IS")) {
+      this.#keyword("IS");
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        this.#keyword("NULL");
+        return conjunction("IS NOT NULL");
+      }
+      this.#keyword("NULL");
+      return conjunction("IS NULL");
+    }
+    let negated = false;
+    if (this.#isKeyword("NOT")) {
+      this.#keyword("NOT");
+      negated = true;
+    }
+    if (this.#isKeyword("IN")) {
+      this.#keyword("IN");
+      this.#expectPunctuation("(");
+      const items = this.#expressionList();
+      this.#expectPunctuation(")");
+      const membership = items
+        .map((item) => {
+          if (item.kind !== "list") throw new TypeError("A row IN list takes row constructors");
+          return this.#rowComparison("=", fields, item.items);
+        })
+        .reduce((accumulated, condition) => ({
+          kind: "logical" as const,
+          operator: "or" as const,
+          left: accumulated,
+          right: condition,
+        }));
+      return negated ? { kind: "not", operand: membership } : membership;
+    }
+    if (negated) throw new TypeError("Expected IN after NOT");
+    const token = this.#peek();
+    if (
+      token.kind !== "operator" ||
+      !["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)
+    ) {
+      throw new TypeError("A row constructor takes a comparison, IN, or IS NULL");
+    }
+    const operator = this.#comparison();
+    const right = this.#additive();
+    if (right.kind !== "list") throw new TypeError("A row comparison takes a row on both sides");
+    return this.#rowComparison(operator, fields, right.items);
+  }
+
   #comparisonExpression(): Expression {
     const left = this.#additive();
+    if (left.kind === "list") {
+      // A row constructor either heads a predicate here, or is one member of an IN list and
+      // belongs to the enclosing comparison, which reads it as a row.
+      const token = this.#peek();
+      const heads =
+        this.#isKeyword("IS") ||
+        this.#isKeyword("IN") ||
+        this.#isKeyword("NOT") ||
+        (token.kind === "operator" && ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text));
+      return heads ? this.#rowPredicate(left) : left;
+    }
     if (this.#isKeyword("IS")) {
       this.#keyword("IS");
       let negatedIs = false;
@@ -4529,6 +5793,23 @@ class Parser {
           left,
           right: this.#additive(),
         };
+      }
+      if (this.#isKeyword("JSON")) {
+        // T825: IS JSON [VALUE|OBJECT|ARRAY|SCALAR], optionally negated.
+        this.#keyword("JSON");
+        let kind = "value";
+        for (const shape of ["VALUE", "OBJECT", "ARRAY", "SCALAR"] as const) {
+          if (!this.#isKeyword(shape)) continue;
+          this.#keyword(shape);
+          kind = shape.toLowerCase();
+          break;
+        }
+        const test: Expression = {
+          kind: "call",
+          name: "IS_JSON",
+          arguments: [left, { kind: "literal", value: kind }],
+        };
+        return negatedIs ? { kind: "not", operand: test } : test;
       }
       // IS [NOT] TRUE/FALSE never return UNKNOWN, which is exactly null-safe (in)equality.
       if (this.#isKeyword("TRUE") || this.#isKeyword("FALSE")) {
@@ -4689,6 +5970,24 @@ class Parser {
               : -1;
       if (precedence < minimumPrecedence) break;
       this.#index += 1;
+      // `placed_at + INTERVAL '1 month'`. An interval is not a value any column can hold, so it
+      // never becomes an expression of its own: it is read here, where the thing it applies to is
+      // already in hand, and folds into the date arithmetic DATE_ADD performs.
+      if ((operator === "+" || operator === "-") && this.#isKeyword("INTERVAL")) {
+        this.#keyword("INTERVAL");
+        const { months, milliseconds } = intervalLiteral(this.#take("string").text);
+        const sign = operator === "-" ? -1 : 1;
+        left = {
+          kind: "call",
+          name: "DATE_ADD",
+          arguments: [
+            left,
+            { kind: "literal", value: sign * months },
+            { kind: "literal", value: sign * milliseconds },
+          ],
+        };
+        continue;
+      }
       left = {
         kind: "binary",
         operator: operator as BinaryOperator,
@@ -4739,6 +6038,11 @@ class Parser {
         right: this.#primary(),
       };
     }
+    if (token.kind === "operator" && token.text === "+") {
+      // Unary plus is the identity the standard allows in front of any numeric operand.
+      this.#index += 1;
+      return this.#primary();
+    }
     if (token.kind === "operator" && token.text === "*") {
       this.#index += 1;
       return { kind: "wildcard" };
@@ -4750,6 +6054,14 @@ class Parser {
         return { kind: "subquery", block };
       }
       const expression = this.#expression();
+      if (this.#peek().text === ",") {
+        // F641: a parenthesized list of values is a row constructor. Comparisons against it
+        // desugar into field-wise conditions, so no executor ever sees a row value.
+        const items = [expression];
+        while (this.#punctuation(",")) items.push(this.#expression());
+        this.#expectPunctuation(")");
+        return { kind: "list", items };
+      }
       this.#expectPunctuation(")");
       return expression;
     }
@@ -4827,6 +6139,96 @@ class Parser {
         arguments: [{ kind: "literal", value: field.toLowerCase() }, operand],
       };
     }
+    if (statementDatetimeAliases.has(upper)) {
+      // F051-06/07/08. The optional empty parentheses are the CURRENT_TIMESTAMP() spelling;
+      // an explicit precision is not accepted, since the engine keeps milliseconds either way.
+      if (this.#peek().text === "(") {
+        this.#expectPunctuation("(");
+        this.#expectPunctuation(")");
+      }
+      this.usesStatementDatetime = true;
+      return {
+        kind: "call",
+        name: statementDatetimeAliases.get(upper) as ScalarFunctionName,
+        arguments: [],
+      };
+    }
+    if (upper === "POSITION" && this.#peek().text === "(") {
+      // E021-11. POSITION(sub IN str) is INSTR's argument order reversed. The needle parses
+      // below the comparison level, so its IN belongs to POSITION rather than to an IN list.
+      this.#expectPunctuation("(");
+      const needle = this.#additive();
+      this.#keyword("IN");
+      const haystack = this.#expression();
+      this.#expectPunctuation(")");
+      return { kind: "call", name: "INSTR", arguments: [haystack, needle] };
+    }
+    if (upper === "SUBSTRING" && this.#peek().text === "(") {
+      // E021-06. Both the standard SUBSTRING(s FROM a FOR b) and the comma spelling parse into
+      // one SUBSTR call; the comma form falls through to the ordinary call path below.
+      const restore = this.#index;
+      this.#expectPunctuation("(");
+      const operand = this.#expression();
+      if (this.#isKeyword("FROM")) {
+        this.#keyword("FROM");
+        const args = [operand, this.#expression()];
+        if (this.#isKeyword("FOR")) {
+          this.#keyword("FOR");
+          args.push(this.#expression());
+        }
+        this.#expectPunctuation(")");
+        return { kind: "call", name: "SUBSTR", arguments: args };
+      }
+      this.#index = restore;
+    }
+    if (upper === "OVERLAY" && this.#peek().text === "(") {
+      // OVERLAY(s PLACING r FROM start [FOR length]).
+      this.#expectPunctuation("(");
+      const args = [this.#expression()];
+      this.#keyword("PLACING");
+      args.push(this.#expression());
+      this.#keyword("FROM");
+      args.push(this.#expression());
+      if (this.#isKeyword("FOR")) {
+        this.#keyword("FOR");
+        args.push(this.#expression());
+      }
+      this.#expectPunctuation(")");
+      return { kind: "call", name: "OVERLAY", arguments: args };
+    }
+    if (upper === "TRIM" && this.#peek().text === "(") {
+      // E021-09 and T056: TRIM([[LEADING|TRAILING|BOTH] [characters] FROM] source). The plain
+      // TRIM(x) and TRIM(x, chars) spellings fall through to the ordinary call path.
+      const restore = this.#index;
+      this.#expectPunctuation("(");
+      let side: "LEADING" | "TRAILING" | "BOTH" | undefined;
+      for (const candidate of ["LEADING", "TRAILING", "BOTH"] as const) {
+        if (this.#isKeyword(candidate)) {
+          this.#keyword(candidate);
+          side = candidate;
+          break;
+        }
+      }
+      if (side !== undefined || !this.#isKeyword("FROM")) {
+        // Without a side keyword this is only the standard form if a FROM follows the
+        // characters, so parse one expression and check.
+        let characters: Expression | undefined;
+        if (!this.#isKeyword("FROM")) characters = this.#expression();
+        if (this.#isKeyword("FROM")) {
+          this.#keyword("FROM");
+          const source = this.#expression();
+          this.#expectPunctuation(")");
+          const name = side === "LEADING" ? "LTRIM" : side === "TRAILING" ? "RTRIM" : "TRIM";
+          return {
+            kind: "call",
+            name,
+            arguments: characters === undefined ? [source] : [source, characters],
+          };
+        }
+        if (side !== undefined) throw new TypeError(`TRIM ${side} requires FROM`);
+      }
+      this.#index = restore;
+    }
     if (upper === "CAST" && this.#peek().text === "(") {
       this.#expectPunctuation("(");
       const operand = this.#expression();
@@ -4844,6 +6246,9 @@ class Parser {
       const date = new Date(`${this.#take("string").text}T00:00:00.000Z`);
       if (!Number.isFinite(date.getTime())) throw new TypeError("Invalid DATE literal");
       return { kind: "literal", value: date };
+    }
+    if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
+      return { kind: "literal", value: timestampLiteral(this.#take("string").text) };
     }
     if (this.#punctuation("(")) {
       if (
@@ -4886,8 +6291,23 @@ class Parser {
           offset: bucketExpression.value,
         };
       }
-      if (upper === "FIRST_VALUE" || upper === "LAST_VALUE") {
+      if (upper === "FIRST_VALUE" || upper === "LAST_VALUE" || upper === "NTH_VALUE") {
         const argument = this.#expression();
+        // T618: NTH_VALUE takes the position as a second, constant argument.
+        let position = 1;
+        if (upper === "NTH_VALUE") {
+          this.#expectPunctuation(",");
+          const nth = this.#expression();
+          if (
+            nth.kind !== "literal" ||
+            typeof nth.value !== "number" ||
+            !Number.isInteger(nth.value) ||
+            nth.value < 1
+          ) {
+            throw new TypeError("NTH_VALUE requires a positive integer position");
+          }
+          position = nth.value;
+        }
         this.#expectPunctuation(")");
         if (argument.kind === "wildcard") {
           throw new TypeError(`${upper} requires a value argument`);
@@ -4903,6 +6323,7 @@ class Parser {
           partitionBy,
           orderBy,
           argument,
+          ...(upper === "NTH_VALUE" ? { offset: position } : {}),
           ...(frame === undefined ? {} : { frame }),
         };
       }
@@ -4959,8 +6380,15 @@ class Parser {
           ...(fallback === null ? {} : { fallback }),
         };
       }
-      // SUBSTRING/CEILING are the standard spellings; SUBSTR/CEIL are the canonical plan names.
-      const name = (upper === "SUBSTRING" ? "SUBSTR" : upper === "CEILING" ? "CEIL" : upper) as
+      if (upper === "JSON_OBJECT") return this.#jsonObject();
+      if (statisticalAggregates.has(upper)) return this.#statisticalAggregate(upper);
+      if (upper === "EVERY" || upper === "BOOL_AND" || upper === "BOOL_OR") {
+        return this.#booleanAggregate(upper);
+      }
+      // SUBSTRING/CEILING/CHAR_LENGTH are standard spellings; SUBSTR/CEIL/LENGTH are the
+      // canonical plan names. ANY_VALUE picks an implementation-dependent row of the group
+      // (T626); MIN is one such choice and reuses its accumulator exactly.
+      const name = (upper === "ANY_VALUE" ? "MIN" : (functionSpellings.get(upper) ?? upper)) as
         AggregateName | ScalarFunctionName;
       if (!aggregateNames.has(name as AggregateName) && !scalarFunctionNames.has(name))
         throw new TypeError(`Unsupported function: ${identifier}`);
@@ -4971,6 +6399,9 @@ class Parser {
         }
         this.#keyword("DISTINCT");
         distinct = true;
+      } else if (this.#isKeyword("ALL") && aggregateNames.has(name as AggregateName)) {
+        // E091-06: ALL is the default set quantifier, so it only has to parse.
+        this.#keyword("ALL");
       }
       const args: Expression[] = [];
       if (!this.#punctuation(")")) {
@@ -4989,10 +6420,8 @@ class Parser {
       if (
         (name === "UPPER" ||
           name === "LOWER" ||
-          name === "TRIM" ||
-          name === "LTRIM" ||
-          name === "RTRIM" ||
           name === "LENGTH" ||
+          name === "OCTET_LENGTH" ||
           name === "ABS" ||
           name === "FLOOR" ||
           name === "CEIL" ||
@@ -5000,6 +6429,40 @@ class Parser {
         args.length !== 1
       ) {
         throw new TypeError(`${name} requires exactly one argument`);
+      }
+      if (
+        (name === "TRIM" || name === "LTRIM" || name === "RTRIM") &&
+        (args.length < 1 || args.length > 2)
+      ) {
+        throw new TypeError(`${name} takes a string and optional trim characters`);
+      }
+      if ((name === "LPAD" || name === "RPAD") && (args.length < 2 || args.length > 3)) {
+        throw new TypeError(`${name} requires a string, a length, and an optional fill`);
+      }
+      if (name === "OVERLAY" && (args.length < 3 || args.length > 4)) {
+        throw new TypeError("OVERLAY requires a string, a replacement, a start, and a length");
+      }
+      if (statementDatetimeNames.has(name) && args.length !== 0) {
+        throw new TypeError(`${name} takes no arguments`);
+      }
+      if (
+        (name === "JSON_VALUE" || name === "JSON_QUERY" || name === "JSON_EXISTS") &&
+        args.length !== 2
+      ) {
+        throw new TypeError(`${name} requires a JSON document and a path`);
+      }
+      if (name === "JSON_OBJECT" && args.length % 2 !== 0) {
+        throw new TypeError("JSON_OBJECT takes key and value pairs");
+      }
+      if (name === "IS_JSON") {
+        throw new TypeError("Use the IS JSON predicate rather than calling IS_JSON");
+      }
+      // The path is fixed at compile time, so a malformed one fails here rather than per row.
+      if (name === "JSON_VALUE" || name === "JSON_QUERY" || name === "JSON_EXISTS") {
+        const path = args[1];
+        if (path?.kind === "literal" && typeof path.value === "string") {
+          parseJsonPath(path.value, name);
+        }
       }
       if (
         (name === "NULLIF" || name === "MOD" || name === "POWER" || name === "INSTR") &&
@@ -5053,9 +6516,9 @@ class Parser {
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
         const argument = args[0];
-        if (argument !== undefined && hasAggregate(argument)) {
-          throw new TypeError("Window aggregate arguments cannot contain aggregates");
-        }
+        // An aggregate inside a window argument — SUM(SUM(total)) OVER (PARTITION BY region) —
+        // is the running total of a grouped result, and legal wherever the block is grouped.
+        // The parser cannot see the GROUP BY yet, so the block assembler decides.
         return {
           kind: "window",
           name: name as AggregateName,
@@ -5068,7 +6531,14 @@ class Parser {
       return { kind: "call", name, arguments: args, ...(distinct ? { distinct: true } : {}) };
     }
     let reference = identifier;
-    if (this.#punctuation(".")) reference += `.${this.#identifier()}`;
+    if (this.#punctuation(".")) {
+      // E051-07: `alias.*` selects one source's columns.
+      if (this.#peek().kind === "operator" && this.#peek().text === "*") {
+        this.#index += 1;
+        return { kind: "wildcard", table: identifier };
+      }
+      reference += `.${this.#identifier()}`;
+    }
     return { kind: "column", reference };
   }
 
@@ -5091,11 +6561,135 @@ class Parser {
     return columns;
   }
 
+  /**
+   * VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP, built from the aggregates the executors already
+   * have: the variance is E(x²) − E(x)², so one pass over SUM(x), SUM(x·x) and COUNT(x) gives
+   * every form. Both executors and the vectorized group state stay untouched, and the NULL
+   * rules fall out — COUNT skips NULLs, and a sample variance of one row divides by zero,
+   * which this engine reads as NULL.
+   */
+  #statisticalAggregate(name: string): Expression {
+    // The opening parenthesis is already consumed by the call dispatch.
+    const argument = this.#expression();
+    this.#expectPunctuation(")");
+    if (hasAggregate(argument)) {
+      throw new TypeError(`${name} cannot take another aggregate as its argument`);
+    }
+    const aggregate = (fn: AggregateName, operand: Expression): Expression => ({
+      kind: "call",
+      name: fn,
+      arguments: [structuredClone(operand)],
+    });
+    const squares = aggregate("SUM", {
+      kind: "binary",
+      operator: "*",
+      left: structuredClone(argument),
+      right: structuredClone(argument),
+    });
+    const total = aggregate("SUM", argument);
+    const count = aggregate("COUNT", argument);
+    // sum(x²) − sum(x)² / n
+    const spread: Expression = {
+      kind: "binary",
+      operator: "-",
+      left: squares,
+      right: {
+        kind: "binary",
+        operator: "/",
+        left: {
+          kind: "binary",
+          operator: "*",
+          left: total,
+          right: structuredClone(total),
+        },
+        right: structuredClone(count),
+      },
+    };
+    // Bare VARIANCE and STDDEV are the sample forms, as in PostgreSQL.
+    const sample = name !== "VAR_POP" && name !== "STDDEV_POP";
+    const divisor: Expression = sample
+      ? {
+          kind: "binary",
+          operator: "-",
+          left: structuredClone(count),
+          right: { kind: "literal", value: 1 },
+        }
+      : structuredClone(count);
+    const variance: Expression = { kind: "binary", operator: "/", left: spread, right: divisor };
+    if (name.startsWith("VAR")) return variance;
+    return { kind: "call", name: "SQRT", arguments: [variance] };
+  }
+
+  /**
+   * EVERY/BOOL_AND and BOOL_OR over a boolean argument: the extremes of the argument read as
+   * 0 or 1 answer both, so they reuse MIN and MAX rather than adding an accumulator.
+   */
+  #booleanAggregate(name: string): Expression {
+    const argument = this.#expression();
+    this.#expectPunctuation(")");
+    if (hasAggregate(argument)) {
+      throw new TypeError(`${name} cannot take another aggregate as its argument`);
+    }
+    const indicator: Expression = {
+      kind: "case",
+      branches: [{ when: argument, then: { kind: "literal", value: 1 } }],
+      otherwise: { kind: "literal", value: 0 },
+    };
+    return {
+      kind: "condition",
+      operator: "=",
+      left: {
+        kind: "call",
+        name: name === "BOOL_OR" ? "MAX" : "MIN",
+        arguments: [indicator],
+      },
+      right: { kind: "literal", value: 1 },
+    };
+  }
+
+  /**
+   * JSON_OBJECT (T811) in both spellings: the standard's `KEY 'k' VALUE v` (with KEY optional)
+   * and the flat `'k', v` pair list. Both become one call whose arguments alternate key and
+   * value, so the evaluator has a single shape to read.
+   */
+  #jsonObject(): Expression {
+    const args: Expression[] = [];
+    if (!this.#punctuation(")")) {
+      for (;;) {
+        if (this.#isKeyword("KEY")) this.#keyword("KEY");
+        args.push(this.#expression());
+        if (this.#isKeyword("VALUE")) {
+          this.#keyword("VALUE");
+          args.push(this.#expression());
+        } else {
+          this.#expectPunctuation(",");
+          args.push(this.#expression());
+        }
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+    }
+    return { kind: "call", name: "JSON_OBJECT", arguments: args };
+  }
+
   #overClause(): {
     partitionBy: Expression[];
     orderBy: Array<{ expression: Expression; direction: "asc" | "desc"; nulls?: "first" | "last" }>;
     frame?: WindowFrame;
   } {
+    if (this.#peek().kind === "identifier") {
+      // T620: OVER w re-enters the definition the WINDOW clause gave that name.
+      const name = this.#identifier();
+      const definition = this.#namedWindows.get(name);
+      if (definition === undefined) throw new TypeError(`Unknown window name: ${name}`);
+      const resume = this.#index;
+      this.#index = definition.start;
+      try {
+        return this.#overClause();
+      } finally {
+        this.#index = resume;
+      }
+    }
     this.#expectPunctuation("(");
     const partitionBy: Expression[] = [];
     if (this.#isKeyword("PARTITION")) {
@@ -5105,9 +6699,9 @@ class Parser {
     }
     const orderBy = this.#orderByClause();
     let frame: WindowFrame | undefined;
-    if (this.#isKeyword("ROWS") || this.#isKeyword("RANGE")) {
-      const unit = this.#isKeyword("ROWS") ? "rows" : "range";
-      this.#keyword(unit === "rows" ? "ROWS" : "RANGE");
+    if (this.#isKeyword("ROWS") || this.#isKeyword("RANGE") || this.#isKeyword("GROUPS")) {
+      const unit = this.#isKeyword("ROWS") ? "rows" : this.#isKeyword("RANGE") ? "range" : "groups";
+      this.#keyword(unit.toUpperCase());
       let start: WindowFrameBound;
       let end: WindowFrameBound;
       if (this.#isKeyword("BETWEEN")) {
@@ -5123,16 +6717,40 @@ class Parser {
       if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
         throw new TypeError("Window frame bounds are reversed");
       }
-      frame = { unit, start, end };
-    }
-    if (this.#isKeyword("GROUPS")) {
-      throw new TypeError("GROUPS window frames are not supported");
+      if (unit === "groups" && orderBy.length === 0) {
+        throw new TypeError("GROUPS frames require ORDER BY inside OVER (...)");
+      }
+      let exclude: WindowFrameExclusion | undefined;
+      if (this.#isKeyword("EXCLUDE")) {
+        this.#keyword("EXCLUDE");
+        if (this.#isKeyword("CURRENT")) {
+          this.#keyword("CURRENT");
+          this.#keyword("ROW");
+          exclude = "current-row";
+        } else if (this.#isKeyword("GROUP")) {
+          this.#keyword("GROUP");
+          exclude = "group";
+        } else if (this.#isKeyword("TIES")) {
+          this.#keyword("TIES");
+          exclude = "ties";
+        } else {
+          this.#keyword("NO");
+          this.#keyword("OTHERS");
+          exclude = "no-others";
+        }
+      }
+      frame = {
+        unit,
+        start,
+        end,
+        ...(exclude === undefined || exclude === "no-others" ? {} : { exclude }),
+      };
     }
     this.#expectPunctuation(")");
     return { partitionBy, orderBy, ...(frame === undefined ? {} : { frame }) };
   }
 
-  #frameBound(unit: "rows" | "range"): WindowFrameBound {
+  #frameBound(unit: "rows" | "range" | "groups"): WindowFrameBound {
     if (this.#isKeyword("UNBOUNDED")) {
       this.#keyword("UNBOUNDED");
       if (this.#isKeyword("PRECEDING")) {
@@ -5249,6 +6867,7 @@ export interface SelectBlockParts {
   offset?: number;
   limitParameter?: number;
   offsetParameter?: number;
+  limitWithTies?: boolean;
   /** GROUP BY GROUPING SETS/ROLLUP/CUBE: the grouping lists to union; groupBy is then unused. */
   groupingSets?: Expression[][];
 }
@@ -5278,27 +6897,61 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
   const universe = new Set(sets.flat().map(signatureOf));
   const members = sets.map((set) => {
     const setSignatures = new Set(set.map(signatureOf));
-    const select = blockParts.select.map((item) => {
-      if (hasAggregate(item.expression)) return item;
-      const signature = signatureOf(item.expression);
-      if (setSignatures.has(signature) || !universe.has(signature)) return item;
-      // MIN over an always-NULL argument: legal in a grouped select, NULL in every group, and
-      // typed like the original expression through MIN's carry and NULLIF's first argument.
-      return {
-        alias: item.alias,
-        expression: {
+    /**
+     * T433: GROUPING(a, b, ...) is a bitmask saying which of its arguments this grouping set
+     * aggregated away — constant per member block, so it folds to a literal here rather than
+     * needing an executor of its own. The most significant bit is the first argument.
+     */
+    const resolveGrouping = (expression: Expression): Expression => {
+      if (expression.kind === "call" && expression.name === "GROUPING") {
+        if (expression.arguments.length === 0) {
+          throw new TypeError("GROUPING requires at least one grouping column");
+        }
+        let mask = 0;
+        for (const argument of expression.arguments) {
+          const signature = signatureOf(argument);
+          if (!universe.has(signature)) {
+            throw new TypeError("GROUPING arguments must appear in the GROUP BY clause");
+          }
+          mask = mask * 2 + (setSignatures.has(signature) ? 0 : 1);
+        }
+        // MIN over the constant, not the bare constant: the mask is the same either way, and
+        // being an aggregate keeps the member block grouped. A literal-only select list over
+        // the empty grouping set would otherwise degenerate into one row per input row.
+        return {
           kind: "call",
           name: "MIN",
-          arguments: [
-            {
-              kind: "call",
-              name: "NULLIF",
-              arguments: [structuredClone(item.expression), structuredClone(item.expression)],
-            },
-          ],
-        } satisfies Expression,
-      };
-    });
+          arguments: [{ kind: "literal", value: mask }],
+        };
+      }
+      return mapChildExpressions(expression, resolveGrouping);
+    };
+    const select = blockParts.select
+      .map((item) => ({
+        alias: item.alias,
+        expression: resolveGrouping(item.expression),
+      }))
+      .map((item) => {
+        if (hasAggregate(item.expression)) return item;
+        const signature = signatureOf(item.expression);
+        if (setSignatures.has(signature) || !universe.has(signature)) return item;
+        // MIN over an always-NULL argument: legal in a grouped select, NULL in every group, and
+        // typed like the original expression through MIN's carry and NULLIF's first argument.
+        return {
+          alias: item.alias,
+          expression: {
+            kind: "call",
+            name: "MIN",
+            arguments: [
+              {
+                kind: "call",
+                name: "NULLIF",
+                arguments: [structuredClone(item.expression), structuredClone(item.expression)],
+              },
+            ],
+          } satisfies Expression,
+        };
+      });
     return assembleSelectBlock(
       {
         ...blockParts,
@@ -5431,7 +7084,11 @@ export function assembleSelectBlock(
   if (parts.groupingSets !== undefined && parts.groupingSets.length > 0) {
     return desugarGroupingSets(parts, nextSequence);
   }
-  if (parts.orderBy.some((order) => order.expression.kind !== "column")) {
+  if (parts.select.some((item) => containsGrouping(item.expression))) {
+    // Only the grouping-sets desugar can answer GROUPING, and it has already run above.
+    throw new TypeError("GROUPING requires GROUP BY ROLLUP, CUBE, or GROUPING SETS");
+  }
+  if (parts.orderBy.some((order) => orderNeedsHiddenColumn(order.expression, parts))) {
     return assembleOrderByExpressionBlock(parts, nextSequence);
   }
   const { sql, base, joins, select, distinct, predicates, having, orderBy, limit, offset } = parts;
@@ -5478,15 +7135,15 @@ export function assembleSelectBlock(
   if (clauseExpressions.some(containsWindow)) {
     throw new TypeError("Window functions are only allowed in the select list");
   }
+  // A DISTINCT aggregate is an aggregate: it belongs where any other one does — anywhere in the
+  // select list, including inside arithmetic — and nowhere an aggregate cannot go.
   if (
-    clauseExpressions.some(containsDistinctCount) ||
-    select.some(
-      (item) =>
-        containsDistinctCount(item.expression) &&
-        !(item.expression.kind === "call" && item.expression.distinct === true),
-    )
+    predicates.some((predicate) => [predicate.left, predicate.right].some(containsDistinctCount))
   ) {
-    throw new TypeError("DISTINCT aggregates must be top-level select items");
+    throw new TypeError("DISTINCT aggregates are not allowed in WHERE");
+  }
+  if (groupBy.some(containsDistinctCount)) {
+    throw new TypeError("DISTINCT aggregates are not allowed in GROUP BY");
   }
   const tail = {
     orderBy,
@@ -5494,32 +7151,8 @@ export function assembleSelectBlock(
     ...(offset === undefined ? {} : { offset }),
     ...(limitParameter === undefined ? {} : { limitParameter }),
     ...(offsetParameter === undefined ? {} : { offsetParameter }),
+    ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
   };
-  const distinctCounts = select.filter(
-    (item) => item.expression.kind === "call" && item.expression.distinct === true,
-  );
-  if (distinctCounts.length > 0) {
-    if (distinctCounts.length > 1) {
-      throw new TypeError("Only one DISTINCT aggregate is supported per select");
-    }
-    if (
-      select.some(
-        (item) =>
-          item.expression.kind !== "window" &&
-          !(item.expression.kind === "call" && item.expression.distinct === true) &&
-          hasAggregate(item.expression),
-      )
-    ) {
-      throw new TypeError("A DISTINCT aggregate cannot be combined with other aggregates yet");
-    }
-    if (select.some((item) => containsWindow(item.expression))) {
-      throw new TypeError("A DISTINCT aggregate cannot be combined with window functions");
-    }
-    if (having.length > 0) {
-      throw new TypeError("A DISTINCT aggregate cannot be combined with HAVING yet");
-    }
-    return desugarDistinctCount(sql, base, joins, select, predicates, groupBy, tail, nextSequence);
-  }
   if (select.some((item) => containsWindow(item.expression))) {
     return desugarWindows(
       sql,
@@ -5574,6 +7207,252 @@ export function expandDistinctWildcard(
   return { ...rest, select, groupBy: select.map((item) => item.expression) };
 }
 
+/**
+ * The output columns one source contributes to a wildcard, in declaration order: a derived
+ * table's own aliases, a set operation's first member's, and otherwise the input table's.
+ */
+function sourceWildcardColumns(
+  source: TableSource,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (source.derived !== undefined) return source.derived.select.map((item) => item.alias);
+  if (source.union !== undefined) {
+    return source.union.blocks[0]?.select.map((item) => item.alias);
+  }
+  return columnsOf(source.table);
+}
+
+/**
+ * Turns every source carrying a column alias list into a derived projection that renames the
+ * table's columns positionally (E051-09). The table's own column order is only known here, so
+ * the parser records the names and this pass — one per execution entry — applies them.
+ */
+export function planHasSourceColumnAliases(plan: CompiledQuery): boolean {
+  if ([plan.base, ...plan.joins].some((source) => source.columnAliases !== undefined)) return true;
+  let nested = false;
+  forEachNestedBlock(plan, (inner) => {
+    nested ||= planHasSourceColumnAliases(inner);
+  });
+  return nested;
+}
+
+/**
+ * FETCH FIRST n ROWS WITH TIES (F866). The plan runs without its limit — a limit pushed into a
+ * scan cannot know whether the next row ties — and the ordered result is trimmed here: rows up
+ * to the limit, plus every following row equal to the last one on all ORDER BY columns.
+ */
+export function withTiesPlan(plan: CompiledQuery): {
+  plan: CompiledQuery;
+  trim: (result: QueryResult) => QueryResult;
+} {
+  // Ordering by an expression or an unselected column wraps the real block in a projection that
+  // hides the sort column. The tie test needs that column, so the inner block runs and the
+  // projection is applied after trimming instead of before.
+  const wrapper = transparentProjectionSource(plan);
+  if (wrapper?.inner.limitWithTies === true) {
+    const inner = withTiesPlan(wrapper.inner);
+    return {
+      plan: inner.plan,
+      trim: (result) => projectResultColumns(inner.trim(result), wrapper.aliases),
+    };
+  }
+  const limit = plan.limit;
+  if (plan.limitWithTies !== true || limit === undefined) return { plan, trim: (result) => result };
+  if (plan.orderBy.length === 0) throw new TypeError("FETCH ... WITH TIES requires ORDER BY");
+  const sources = [plan.base, ...plan.joins].map((source) => ({
+    alias: source.alias,
+    columns: source.derived?.select.map((item) => item.alias) ?? [],
+  }));
+  // orderOutputName throws when a sort key has no output column, which is the same failure the
+  // executors report; nothing here has to re-check it.
+  const keys = plan.orderBy.map(({ expression }) =>
+    orderOutputName(expression, plan.select, sources),
+  );
+  const unlimited = { ...plan };
+  delete unlimited.limit;
+  delete unlimited.limitWithTies;
+  return {
+    plan: unlimited,
+    trim: (result) => {
+      if (result.rows.length <= limit) return result;
+      const last = result.rows[limit - 1];
+      let end = limit;
+      while (
+        end < result.rows.length &&
+        keys.every((key) => comparable(result.rows[end]?.[key]) === comparable(last?.[key]))
+      ) {
+        end += 1;
+      }
+      return { ...result, rows: result.rows.slice(0, end) };
+    },
+  };
+}
+
+/** Whether any block of the plan still carries an unresolved NATURAL join marker. */
+export function planHasNaturalJoins(plan: CompiledQuery): boolean {
+  if (plan.joins.some((join) => join.natural === true)) return true;
+  let nested = false;
+  forEachNestedBlock(plan, (inner) => {
+    nested ||= planHasNaturalJoins(inner);
+  });
+  return nested;
+}
+
+/**
+ * Resolves NATURAL joins into ordinary equality conditions (F401-01): the join columns are the
+ * names the new source shares with the sources already joined, compared in the order they are
+ * declared. A pair with no shared column is a cross join, which is what the standard says.
+ */
+export function expandNaturalJoins(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (!planHasNaturalJoins(plan)) return plan;
+  const expandBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, expandBlock);
+    const sources = [block.base, ...block.joins];
+    block.joins.forEach((join, index) => {
+      if (join.natural !== true) return;
+      const columnsFor = (source: TableSource): readonly string[] => {
+        const own = sourceWildcardColumns(source, columnsOf);
+        if (own === undefined)
+          throw new TypeError(`A NATURAL join needs known columns for: ${source.table}`);
+        return own;
+      };
+      const preceding = sources.slice(0, index + 1);
+      const shared: Array<{ left: string; name: string }> = [];
+      for (const name of columnsFor(join)) {
+        const owner = preceding.find((source) => columnsFor(source).includes(name));
+        if (owner !== undefined) shared.push({ left: owner.alias, name });
+      }
+      delete join.natural;
+      if (shared.length === 0) {
+        // No shared column: the standard's degenerate natural join is a cross join.
+        join.left = { kind: "literal", value: 1 };
+        join.right = { kind: "literal", value: 1 };
+        return;
+      }
+      const conditions = shared.map<Expression>(({ left, name }) => ({
+        kind: "condition",
+        operator: "=",
+        left: { kind: "column", reference: `${left}.${name}` },
+        right: { kind: "column", reference: `${join.alias}.${name}` },
+      }));
+      const [first] = conditions;
+      if (conditions.length === 1 && first?.kind === "condition") {
+        join.left = first.left;
+        join.right = first.right;
+        return;
+      }
+      join.on = conditions.reduce((accumulated, condition) => ({
+        kind: "logical",
+        operator: "and",
+        left: accumulated,
+        right: condition,
+      }));
+    });
+  };
+  const expanded = structuredClone(plan);
+  expandBlock(expanded);
+  return expanded;
+}
+
+export function expandSourceColumnAliases(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (!planHasSourceColumnAliases(plan)) return plan;
+  let sequence = 0;
+  const nextSequence = (): number => {
+    sequence += 1;
+    return sequence;
+  };
+  const rename = (source: TableSource): void => {
+    const names = source.columnAliases;
+    if (names === undefined) return;
+    const columns = columnsOf(source.table);
+    if (columns === undefined || columns.length === 0) {
+      throw new TypeError(`A column alias list requires known columns for: ${source.table}`);
+    }
+    if (columns.length !== names.length) {
+      throw new TypeError(
+        `Column alias list must match the table's column count: ${source.table} has ${String(columns.length)}`,
+      );
+    }
+    const projection: CompiledQuery = {
+      sql: "(column aliases)",
+      base: { table: source.table, alias: source.alias },
+      joins: [],
+      select: names.map((name, index) => ({
+        expression: { kind: "column" as const, reference: columns[index] ?? name },
+        alias: name,
+      })),
+      predicates: [],
+      groupBy: [],
+      having: [],
+      orderBy: [],
+    };
+    delete source.columnAliases;
+    Object.assign(source, derivedTableSource(projection, source.alias, nextSequence));
+  };
+  const renameBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, renameBlock);
+    for (const source of [block.base, ...block.joins]) rename(source);
+  };
+  const expanded = structuredClone(plan);
+  renameBlock(expanded);
+  return expanded;
+}
+
+/**
+ * Expands `alias.*` select items into that source's columns (E051-07), at every nesting depth.
+ * Output names follow the same rule as a bare `*`: the column's own name when the block reads
+ * one source, and `alias.column` when it reads several, so two sources cannot collide.
+ * Runs once per execution entry, like MATCH(*) and DISTINCT * expansion.
+ */
+export function expandQualifiedWildcards(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  const qualified = (block: CompiledQuery): boolean => {
+    if (block.select.some((item) => item.expression.kind === "wildcard" && item.expression.table))
+      return true;
+    let nested = false;
+    forEachNestedBlock(block, (inner) => {
+      nested ||= qualified(inner);
+    });
+    return nested;
+  };
+  if (!qualified(plan)) return plan;
+  const expandBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, expandBlock);
+    const sources = [block.base, ...block.joins];
+    const multiple = sources.length > 1;
+    block.select = block.select.flatMap((item) => {
+      if (item.expression.kind !== "wildcard" || item.expression.table === undefined) return [item];
+      const table = item.expression.table;
+      const source = sources.find((candidate) => candidate.alias === table);
+      if (source === undefined) throw new TypeError(`Unknown table for ${table}.*: ${table}`);
+      const columns = sourceWildcardColumns(source, columnsOf);
+      if (columns === undefined || columns.length === 0) {
+        throw new TypeError(`${table}.* requires known columns for: ${source.table}`);
+      }
+      return columns.map((name) => {
+        const output = multiple ? `${source.alias}.${name}` : name;
+        return { expression: { kind: "column" as const, reference: output }, alias: output };
+      });
+    });
+    const aliases = new Set<string>();
+    for (const item of block.select) {
+      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
+      aliases.add(item.alias);
+    }
+  };
+  const expanded = structuredClone(plan);
+  expandBlock(expanded);
+  return expanded;
+}
+
 /** Wraps compound members into the set-operation source the executor folds left to right. */
 export function compoundSelectBlock(
   sql: string,
@@ -5599,6 +7478,7 @@ export function compoundSelectBlock(
     orderBy: tail.orderBy,
     ...(tail.limit === undefined ? {} : { limit: tail.limit }),
     ...(tail.offset === undefined ? {} : { offset: tail.offset }),
+    ...(tail.limitWithTies === true ? { limitWithTies: true } : {}),
   };
 }
 
@@ -5611,6 +7491,25 @@ export function compoundSelectBlock(
  * output list to hide items behind, and DISTINCT's output would change if hidden expressions
  * joined its grouping, so both keep the named-column restriction.
  */
+/**
+ * Whether an ORDER BY item has to travel as a hidden select item: any expression, and also a
+ * column the select list does not already carry. The standard lets a query sort by a column of
+ * its source that it does not return, and hiding it is how this engine keeps the value
+ * available to the sort without returning it.
+ */
+function orderNeedsHiddenColumn(expression: Expression, parts: SelectBlockParts): boolean {
+  if (expression.kind !== "column") return true;
+  if (parts.select.some((item) => item.expression.kind === "wildcard")) return false;
+  const reference = expression.reference;
+  const bare = reference.split(".").at(-1) ?? reference;
+  return !parts.select.some(
+    (item) =>
+      item.alias === reference ||
+      item.alias === bare ||
+      (item.expression.kind === "column" && item.expression.reference === reference),
+  );
+}
+
 function assembleOrderByExpressionBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
@@ -5624,7 +7523,7 @@ function assembleOrderByExpressionBlock(
     throw new TypeError("SELECT DISTINCT orders by selected columns or output aliases only");
   }
   for (const order of parts.orderBy) {
-    if (order.expression.kind === "column") continue;
+    if (!orderNeedsHiddenColumn(order.expression, parts)) continue;
     if (containsWindow(order.expression)) {
       throw new TypeError("Window functions are only allowed in the select list");
     }
@@ -5639,7 +7538,7 @@ function assembleOrderByExpressionBlock(
   );
   const hiddenItems: SelectItem[] = [];
   const rewrittenOrder = parts.orderBy.map((order) => {
-    if (order.expression.kind === "column") return order;
+    if (!orderNeedsHiddenColumn(order.expression, parts)) return order;
     const existingAlias = selectSignatures.get(JSON.stringify(order.expression));
     if (existingAlias !== undefined) {
       return {
@@ -5752,6 +7651,45 @@ export function validateLimit(limit: number): number {
   return limit;
 }
 
+/**
+ * Applies a CTE's declared column names to the block that fills it. The names are positional, so
+ * the count has to match; a wildcard has no names to replace until its input schema is known,
+ * which is later than this.
+ */
+function renameBlockOutputs(block: CompiledQuery, columns: readonly string[], name: string): void {
+  if (block.select.some((item) => item.expression.kind === "wildcard")) {
+    throw new TypeError(`A column list needs named columns in the CTE body: ${name}`);
+  }
+  if (block.select.length !== columns.length) {
+    throw new TypeError(
+      `CTE ${name} declares ${String(columns.length)} columns but selects ${String(block.select.length)}`,
+    );
+  }
+  block.select = block.select.map((item, index) => ({
+    ...item,
+    alias: columns[index] ?? item.alias,
+  }));
+}
+
+/**
+ * `TIMESTAMP '2026-01-02 03:04:05'` — the standard's spelling, which writes a space where ISO
+ * writes a T and leaves the time off entirely for midnight. A literal without a zone is UTC, the
+ * same reading `DATE` already takes and the same one every datetime in a Minnow database has.
+ */
+export function timestampLiteral(text: string): Date {
+  const trimmed = text.trim();
+  const match =
+    /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      trimmed,
+    );
+  if (match === null) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
+  const [, day, time = "00:00:00", zone = "Z"] = match;
+  const seconds = time.length === 5 ? `${time}:00` : time;
+  const date = new Date(`${String(day)}T${seconds}${zone === "Z" ? "Z" : zone}`);
+  if (!Number.isFinite(date.getTime())) throw new TypeError(`Invalid TIMESTAMP literal: ${text}`);
+  return date;
+}
+
 /** The parser's OFFSET range contract, shared with the typed builder. */
 export function validateOffset(offset: number): number {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)
@@ -5760,80 +7698,15 @@ export function validateOffset(offset: number): number {
 }
 
 /**
- * Rewrites `COUNT(DISTINCT e)` as counting the deduplicated inner block: the inner block groups
- * by every outer group key plus `e` (deduplication through the ordinary grouped machinery,
- * including its spill), and the wrapper counts the non-null deduplicated values per group. The
- * output column names and order are preserved exactly.
- */
-function desugarDistinctCount(
-  sql: string,
-  base: TableSource,
-  joins: JoinPlan[],
-  select: SelectItem[],
-  predicates: Predicate[],
-  groupBy: Expression[],
-  tail: SelectTail,
-  nextSequence: () => number,
-): CompiledQuery {
-  const distinctAlias = "(distinct 1)";
-  const innerSelect: SelectItem[] = [];
-  const outerSelect: SelectItem[] = [];
-  for (const item of select) {
-    if (item.expression.kind === "call" && item.expression.distinct === true) {
-      const argument = item.expression.arguments[0];
-      if (argument === undefined) throw new TypeError("DISTINCT aggregate argument is missing");
-      innerSelect.push({ expression: argument, alias: distinctAlias });
-      // The inner block groups the argument to distinct values; the original aggregate then
-      // runs over them — COUNT counts them, SUM/AVG sum them, MIN/MAX pass through.
-      outerSelect.push({
-        expression: {
-          kind: "call",
-          name: item.expression.name,
-          arguments: [{ kind: "column", reference: distinctAlias }],
-        },
-        alias: item.alias,
-      });
-      continue;
-    }
-    innerSelect.push(item);
-    outerSelect.push({
-      expression: { kind: "column", reference: item.alias },
-      alias: item.alias,
-    });
-  }
-  const distinctArgument = innerSelect.find(({ alias }) => alias === distinctAlias);
-  if (distinctArgument === undefined) {
-    throw new TypeError("DISTINCT aggregate argument is missing");
-  }
-  const inner: CompiledQuery = {
-    sql: "(count distinct input)",
-    base,
-    joins,
-    select: innerSelect,
-    predicates,
-    groupBy: [...groupBy, distinctArgument.expression],
-    having: [],
-    orderBy: [],
-  };
-  return {
-    sql,
-    base: derivedTableSource(inner, "distinct", nextSequence),
-    joins: [],
-    select: outerSelect,
-    predicates: [],
-    groupBy: outerSelect
-      .filter(({ expression }) => expression.kind === "column")
-      .map(({ expression }) => expression),
-    having: [],
-    ...tail,
-  };
-}
-
-/**
  * Rewrites a block with window select items into a wrapper over a windowed source: the inner
  * block computes every non-window item plus hidden partition and ordering columns, the window
  * columns append after execution, and the wrapper projects the visible aliases and applies the
  * block's ORDER BY and LIMIT after window computation, as SQL requires.
+ *
+ * The inner block carries the grouping when there is one. SQL evaluates windows after GROUP BY
+ * and HAVING, so a window over a grouped block ranks the groups — `ROW_NUMBER() OVER (PARTITION
+ * BY category ORDER BY SUM(total) DESC)` — and its partition and ordering expressions are read
+ * from the grouped output, aggregates included.
  */
 function desugarWindows(
   sql: string,
@@ -5846,26 +7719,33 @@ function desugarWindows(
   tail: SelectTail,
   nextSequence: () => number,
 ): CompiledQuery {
-  if (
-    groupBy.length > 0 ||
-    having.length > 0 ||
-    select.some((item) => hasAggregate(item.expression))
-  ) {
-    throw new TypeError(
-      "Window functions cannot be combined with GROUP BY, DISTINCT, aggregates, or HAVING",
-    );
-  }
-  for (const item of select) {
-    if (item.expression.kind !== "window" && containsWindow(item.expression)) {
-      throw new TypeError("Window functions must be top-level select items");
-    }
-  }
-  const innerSelect: SelectItem[] = select.filter((item) => item.expression.kind !== "window");
+  const grouped = groupBy.length > 0 || select.some((item) => hasAggregate(item.expression));
+  const groupExpressions = new Set(groupBy.map((expression) => JSON.stringify(expression)));
+  /**
+   * What a window may read once the rows it sees are groups: an aggregate over the group, a
+   * GROUP BY expression, or a constant — the same rule the select list itself follows.
+   */
+  const readableWhenGrouped = (expression: Expression): boolean =>
+    hasAggregate(expression) ||
+    expressionColumns(expression).length === 0 ||
+    groupExpressions.has(JSON.stringify(expression));
+  const innerSelect: SelectItem[] = select.filter((item) => !containsWindow(item.expression));
   const windows: WindowSpec[] = [];
   let hidden = 0;
-  for (const item of select) {
-    const expression = item.expression;
-    if (expression.kind !== "window") continue;
+
+  /** A name for one more column the inner block computes for the wrapper to read back. */
+  const hide = (expression: Expression): string => {
+    hidden += 1;
+    const alias = `(window ${String(hidden)})`;
+    innerSelect.push({ expression, alias });
+    return alias;
+  };
+
+  /** Registers one window under the output name the wrapper will read it by. */
+  const registerWindow = (
+    expression: Extract<Expression, { kind: "window" }>,
+    alias: string,
+  ): void => {
     // Full-text nodes evaluate against a scanned base table; a window's hidden columns
     // compute over the windowed wrapper where no such scan exists.
     const windowInputs = [
@@ -5876,39 +7756,62 @@ function desugarWindows(
     if (windowInputs.some(containsFtsExpression)) {
       throw new TypeError("Full-text MATCH and BM25 are not supported inside OVER(...)");
     }
-    const partitionAliases = expression.partitionBy.map((partition) => {
-      hidden += 1;
-      const alias = `(window ${String(hidden)})`;
-      innerSelect.push({ expression: partition, alias });
-      return alias;
-    });
-    const orderAliases = expression.orderBy.map((order) => {
-      hidden += 1;
-      const alias = `(window ${String(hidden)})`;
-      innerSelect.push({ expression: order.expression, alias });
-      return {
-        alias,
-        direction: order.direction,
-        ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
-      };
-    });
-    let argumentAlias: string | undefined;
-    if (expression.argument !== undefined) {
-      hidden += 1;
-      argumentAlias = `(window ${String(hidden)})`;
-      innerSelect.push({ expression: expression.argument, alias: argumentAlias });
+    if (grouped && !windowInputs.every(readableWhenGrouped)) {
+      throw new TypeError(
+        `OVER(...) must use aggregates or GROUP BY expressions in a grouped query: ${alias}`,
+      );
+    }
+    if (windowInputs.some(containsWindow)) {
+      throw new TypeError("Window functions cannot be nested inside OVER(...)");
     }
     windows.push({
-      alias: item.alias,
+      alias,
       name: expression.name,
-      partitionAliases,
-      orderAliases,
-      ...(argumentAlias === undefined ? {} : { argumentAlias }),
+      partitionAliases: expression.partitionBy.map(hide),
+      orderAliases: expression.orderBy.map((order) => ({
+        alias: hide(order.expression),
+        direction: order.direction,
+        ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
+      })),
+      ...(expression.argument === undefined ? {} : { argumentAlias: hide(expression.argument) }),
       ...(expression.offset === undefined ? {} : { offset: expression.offset }),
       ...(expression.fallback === undefined ? {} : { fallback: expression.fallback }),
       ...(expression.frame === undefined ? {} : { frame: expression.frame }),
     });
-  }
+  };
+
+  /**
+   * Splits an expression across the two sides of the rewrite. A window becomes a windowed
+   * column; a subtree with no window in it becomes an inner column, computed before the windows
+   * run; anything holding a window somewhere below keeps its shape and has its children split
+   * the same way. The wrapper then evaluates what comes back — which is how
+   * `revenue - LAG(revenue) OVER (ORDER BY month)` works: the subtraction happens after the
+   * window, over two columns the windowed source hands it.
+   */
+  const split = (expression: Expression): Expression => {
+    if (expression.kind === "window") {
+      const alias = `(window column ${String(windows.length)})`;
+      registerWindow(expression, alias);
+      return { kind: "column", reference: alias };
+    }
+    if (!containsWindow(expression)) {
+      return { kind: "column", reference: hide(expression) };
+    }
+    return mapChildExpressions(expression, split);
+  };
+
+  const projections = select.map((item) => {
+    if (!containsWindow(item.expression)) {
+      return { expression: { kind: "column" as const, reference: item.alias }, alias: item.alias };
+    }
+    // A window that is the whole select item keeps carrying that item's own name, which is what
+    // the executor's windowed source and every existing plan already expect.
+    if (item.expression.kind === "window") {
+      registerWindow(item.expression, item.alias);
+      return { expression: { kind: "column" as const, reference: item.alias }, alias: item.alias };
+    }
+    return { expression: split(item.expression), alias: item.alias };
+  });
   if (innerSelect.length === 0) {
     innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });
   }
@@ -5918,8 +7821,8 @@ function desugarWindows(
     joins,
     select: innerSelect,
     predicates,
-    groupBy: [],
-    having: [],
+    groupBy,
+    having,
     orderBy: [],
   };
   return {
@@ -5930,10 +7833,7 @@ function desugarWindows(
       windowed: { block: inner, windows },
     },
     joins: [],
-    select: select.map((item) => ({
-      expression: { kind: "column", reference: item.alias },
-      alias: item.alias,
-    })),
+    select: projections,
     predicates: [],
     groupBy: [],
     having: [],
@@ -5968,8 +7868,20 @@ function defaultAlias(expression: Expression): string {
   if (expression.kind === "column")
     return expression.reference.split(".").at(-1) ?? expression.reference;
   if (expression.kind === "call") return expression.name.toLowerCase();
-  if (expression.kind === "wildcard") return "*";
+  if (expression.kind === "wildcard")
+    return expression.table === undefined ? "*" : `${expression.table}.*`;
   return "expression";
+}
+
+/**
+ * Whether a numeric literal's digits are well formed: at most one decimal point (radix 10 only)
+ * and underscores only between digits, never leading, trailing, or doubled (T662).
+ */
+function validNumericLiteral(text: string, radix: number): boolean {
+  const digits = radix === 16 ? "0-9a-fA-F" : radix === 8 ? "0-7" : radix === 2 ? "01" : "0-9";
+  const group = `[${digits}]+(?:_[${digits}]+)*`;
+  const pattern = radix === 10 ? `^${group}(?:\\.${group})?$` : `^${group}$`;
+  return new RegExp(pattern).test(text);
 }
 
 function tokenize(sql: string): Token[] {
@@ -5988,12 +7900,32 @@ function tokenize(sql: string): Token[] {
       continue;
     }
     if (/\d/.test(character)) {
-      const start = index++;
-      while (index < sql.length && /[\d.]/.test(sql[index] ?? "")) index += 1;
+      const start = index;
+      // T661: 0x/0o/0b integers. The radix prefix is checked before the decimal scan, which
+      // would otherwise stop at the letter and leave `x1F` looking like an identifier.
+      const radix = { x: 16, o: 8, b: 2 }[(sql[index + 1] ?? "").toLowerCase()];
+      if (character === "0" && radix !== undefined) {
+        index += 2;
+        while (index < sql.length && /[0-9a-fA-F_]/.test(sql[index] ?? "")) index += 1;
+        const digits = sql.slice(start + 2, index);
+        const value = Number.parseInt(digits.replaceAll("_", ""), radix);
+        if (!validNumericLiteral(digits, radix) || !Number.isSafeInteger(value)) {
+          throw new SqlCompileError(
+            `Invalid number: ${sql.slice(start, index)}`,
+            start,
+            index - start,
+          );
+        }
+        tokens.push({ kind: "number", text: String(value), start, end: index });
+        continue;
+      }
+      index += 1;
+      // T662: underscores may separate digits.
+      while (index < sql.length && /[\d._]/.test(sql[index] ?? "")) index += 1;
       const text = sql.slice(start, index);
-      if (!/^\d+(?:\.\d+)?$/.test(text))
+      if (!validNumericLiteral(text, 10))
         throw new SqlCompileError(`Invalid number: ${text}`, start, index - start);
-      tokens.push({ kind: "number", text, start, end: index });
+      tokens.push({ kind: "number", text: text.replaceAll("_", ""), start, end: index });
       continue;
     }
     if (character === "'") {
@@ -6054,8 +7986,20 @@ function tokenize(sql: string): Token[] {
       continue;
     }
     const pair = sql.slice(index, index + 2);
-    if (pair === "--" || pair === "/*") {
-      throw new SqlCompileError("SQL comments are not supported", index, pair.length);
+    if (pair === "--") {
+      // E161: a simple comment runs to the end of the line.
+      const newline = sql.indexOf("\n", index);
+      index = newline === -1 ? sql.length : newline + 1;
+      continue;
+    }
+    if (pair === "/*") {
+      // T351: bracketed comments, which the standard does not nest.
+      const close = sql.indexOf("*/", index + 2);
+      if (close === -1) {
+        throw new SqlCompileError("Unterminated comment", index, sql.length - index);
+      }
+      index = close + 2;
+      continue;
     }
     if (character === ";") {
       // Statement separators lex normally; the routers reject them everywhere except inside

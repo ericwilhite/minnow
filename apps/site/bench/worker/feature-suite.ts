@@ -144,11 +144,18 @@ async function measureFeature(
     error = caught instanceof Error ? caught.message : String(caught);
   }
   const ms = performance.now() - started;
+  const accepted = error === undefined;
   if (engine === "minnow") {
     if (feature.status === "supported") {
-      return error === undefined
-        ? { engine, outcome: "pass", ms }
-        : { engine, outcome: "fail", ms, detail: error };
+      return accepted
+        ? { engine, outcome: "pass", accepted, ms }
+        : {
+            engine,
+            outcome: "fail",
+            accepted,
+            ms,
+            ...(error === undefined ? {} : { detail: error }),
+          };
     }
     // An unsupported example must still fail with the recorded error; executing
     // successfully or failing differently both mean the matrix has drifted.
@@ -156,17 +163,24 @@ async function measureFeature(
       return {
         engine,
         outcome: "fail",
+        accepted,
         ms,
         detail: "example executed but is cataloged as unsupported",
       };
     }
     return error.includes(feature.error ?? "")
-      ? { engine, outcome: "pass", ms }
-      : { engine, outcome: "fail", ms, detail: `unexpected error: ${error}` };
+      ? { engine, outcome: "pass", accepted, ms }
+      : { engine, outcome: "fail", accepted, ms, detail: `unexpected error: ${error}` };
   }
-  return error === undefined
-    ? { engine, outcome: "accepts", ms }
-    : { engine, outcome: "rejects", ms, detail: error };
+  return accepted
+    ? { engine, outcome: "accepts", accepted, ms }
+    : {
+        engine,
+        outcome: "rejects",
+        accepted,
+        ms,
+        ...(error === undefined ? {} : { detail: error }),
+      };
 }
 
 interface FeatureRunner {

@@ -8,6 +8,14 @@ description. On every test run, each supported example below is executed through
 engine's executors, and each rejected example is checked to still fail with the recorded error. A
 page built from it cannot drift from what the engine does.
 
+Every entry is keyed to the feature identifier ISO/IEC 9075:2023 (SQL:2023) gives it in Annex F,
+so what the engine claims can be checked against the standard rather than against its own
+vocabulary. Forms the standard does not define — `MATCH` and BM25 relevance, `ILIKE`,
+`DATE_TRUNC` — are marked as extensions instead. Supported forms are also diffed against SQLite
+and PostgreSQL on every run, and where the three genuinely disagree the difference is recorded
+with the reason rather than hidden: multi-character `TRIM` removes the whole string here, as the
+standard says, while PostgreSQL removes any of its characters.
+
 ## Deliberate omissions
 
 Some of what is missing is missing on purpose. The reasons fall into three groups.
@@ -19,9 +27,21 @@ open is one that a lost reference, a closed tab, or a thrown error can leave ope
 storage a background sweep then cannot reclaim. Transactions are a scope instead —
 `db.write(async (tx) => { … })` — which ends when its callback does, however it ends.
 
-There are no `JSON`, array, `UUID`, or `INTERVAL` column types. Each would need an encoding, a
-comparison order, and a set of operators that the columnar format would carry forever, for a gain
-an application can get today by storing text and parsing it.
+There are no array, `UUID`, or `INTERVAL` column types. Each would need an encoding, a comparison
+order, and a set of operators that the columnar format would carry forever, for a gain an
+application can get today by storing text and parsing it. There is no `JSON` column type either,
+for the same reason — but the SQL/JSON functions read documents out of ordinary text columns, the
+way SQLite does: `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON_ARRAY`, and the
+`IS JSON` predicate. `JSON_TABLE` is missing because it produces rows rather than a value, which
+the executors have no operator for.
+
+There is no `DROP TABLE` or `CREATE VIEW`. The block store has no primitive that removes a table,
+so a dropped one would leave its segments and blocks behind, and the catalog has no registry for
+named queries — a CTE or the typed builder covers the same reuse.
+
+`CHECK` and `FOREIGN KEY` are rejected at `CREATE TABLE` rather than accepted and ignored. A
+constraint that never runs is worse than one the engine declines to promise; a `BEFORE` trigger
+can raise instead.
 
 ### Because of how mutations work
 

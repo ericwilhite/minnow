@@ -62,13 +62,12 @@
 }
 
 /*
- * The devtools panel mounts into a shadow root, so Tailwind's preflight cannot reach inside it.
- * The host element still needs a size and a frame from this side.
+ * The devtools panel draws its own frame inside its shadow root, so all this page supplies is a
+ * box with a height for it to fill. This is what stands in that box while the console loads.
  */
-.minnow-panel {
+.minnow-placeholder {
   border: 1px solid var(--color-fd-border);
-  border-radius: 12px;
-  overflow: hidden;
+  border-radius: 10px;
   background: var(--color-fd-muted);
 }
 
@@ -85,10 +84,6 @@
   animation: minnow-flick 1.6s ease-in-out infinite;
 }
 
-.minnow-water path {
-  animation: minnow-drift 7s ease-in-out infinite;
-}
-
 @keyframes minnow-flick {
   0%,
   100% {
@@ -99,19 +94,62 @@
   }
 }
 
-@keyframes minnow-drift {
-  0%,
-  100% {
-    transform: translateX(0);
-  }
-  50% {
-    transform: translateX(-6px);
-  }
+/*
+ * The hero's pond. Every colour the canvas draws with is a variable here, so the scene follows the
+ * theme, and the gradient stands in for the water until the canvas has painted its first frame.
+ */
+.minnow-pond {
+  --pond-surface: #e8f3fd;
+  --pond-deep: #cfe4f7;
+  --pond-floor: #b6d3ee;
+  --pond-fish: #2383e2;
+  --pond-school: #2383e2;
+  --pond-weed: #5e9c7a;
+  --pond-weed-back: #8fb9a4;
+  --pond-glow: rgba(255, 255, 255, 0.5);
+  --pond-glow-fade: rgba(255, 255, 255, 0);
+  --pond-net: rgba(55, 53, 47, 0.55);
+  --pond-foam: rgba(255, 255, 255, 0.8);
+  --pond-eye: #ffffff;
+  background: linear-gradient(var(--pond-surface), var(--pond-floor));
+}
+
+.dark .minnow-pond {
+  --pond-surface: #16252f;
+  --pond-deep: #101c24;
+  --pond-floor: #0a1319;
+  --pond-fish: #6bb2e6;
+  --pond-school: #7fc0ef;
+  --pond-weed: #2f6b52;
+  --pond-weed-back: #24513f;
+  --pond-glow: rgba(190, 226, 255, 0.16);
+  --pond-glow-fade: rgba(190, 226, 255, 0);
+  --pond-net: rgba(255, 255, 255, 0.5);
+  --pond-foam: rgba(190, 226, 255, 0.28);
+  --pond-eye: #0f1a22;
+}
+
+/* Inside the water the pointer is the net that is drawn, not the one the system draws. */
+.minnow-pond[data-net="in"] canvas {
+  cursor: none;
+}
+
+.minnow-pond-hint {
+  color: var(--color-fd-muted-foreground);
+  opacity: 0.75;
+  transition: opacity 0.5s ease;
+}
+
+.minnow-pond[data-net="in"] .minnow-pond-hint {
+  opacity: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .minnow-swim .minnow-tail,
-  .minnow-water path {
+  .minnow-swim .minnow-tail {
     animation: none;
+  }
+
+  .minnow-pond[data-net="in"] canvas {
+    cursor: default;
   }
 }

@@ -42,6 +42,10 @@ ORDER BY revenue DESC
 `ON`. The optimizer reorders joins by estimated cardinality and builds hash tables on the smaller
 side; equality joins take an index-nested-loop path when one side is a unique key.
 
+An `ON` clause that carries more than its equality still hashes on that equality — `ON b.order_id
+= a.order_id AND b.product_id > a.product_id` builds on the order and applies the rest to the
+pairs it finds, rather than comparing every row with every row.
+
 ## Aggregation
 
 ```sql
@@ -61,6 +65,10 @@ ORDER BY revenue DESC
 
 `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, and `COUNT(DISTINCT …)` are available, with `FILTER (WHERE …)`
 for conditional aggregates. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`, and `CUBE`.
+
+`DISTINCT` is per aggregate, not per query: each one keeps its own set of values, so a select can
+carry several of them beside ordinary aggregates, inside expressions, and in `HAVING` —
+`COUNT(DISTINCT r.return_id) / COUNT(DISTINCT i.order_item_id)` counts two different things.
 
 An aggregate over a whole column reads only that column. This is the shape columnar storage is
 for: summing one column of a fourteen-column table touches a fourteenth of the bytes.
@@ -111,6 +119,12 @@ WITH RECURSIVE months(month) AS (
 SELECT month FROM months
 ```
 
+A CTE can name its own output columns, as `months(month)` does above; a recursive one takes those
+names before its step runs, which is how the step reads `month` back. `DATE '2025-01-01'` and
+`TIMESTAMP '2025-01-01 09:30:00'` are both literals, read as UTC — the way every datetime in a
+Minnow database is stored — and `INTERVAL '1 month'` added to or subtracted from a datetime does
+calendar arithmetic, so 31 January plus a month is the end of February.
+
 ## Window functions
 
 ```sql
@@ -126,6 +140,29 @@ FROM orders
 `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and the
 aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and explicit `ROWS` / `RANGE`
 frames.
+
+A window runs after `GROUP BY` and `HAVING`, as the standard orders them, so it ranks the groups
+rather than the rows behind them and its `OVER` clause reads the group's own aggregates — that is
+what makes the `ROW_NUMBER() OVER (PARTITION BY p.category ORDER BY SUM(i.line_total) DESC)` above
+the best sellers per category. `SUM(SUM(total)) OVER (PARTITION BY region)` is the same idea: the
+inner aggregate makes the group, the outer one totals across groups.
+
+A window is an expression, so it composes like one. The arithmetic around it runs afterwards, over
+the column the window produced:
+
+```sql
+WITH monthly AS (
+  SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total) AS revenue
+  FROM orders WHERE status = 'completed'
+  GROUP BY DATE_TRUNC('month', placed_at)
+)
+SELECT month,
+       revenue,
+       revenue - LAG(revenue) OVER (ORDER BY month) AS change,
+       100.0 * revenue / SUM(revenue) OVER () AS pct_of_total
+FROM monthly
+ORDER BY month
+```
 
 ## Set operations
 

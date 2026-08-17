@@ -37,9 +37,18 @@ export default function BenchmarksPage() {
         </p>
         <p className="mb-2">
           Every engine runs its shipped defaults — no pragmas, no tuning. Each database persists to
-          the storage its own documentation recommends: IndexedDB for Minnow and PGlite, an OPFS VFS
-          for SQLite. Only the engine&rsquo;s own call is timed; reshaping rows into the form each
-          API wants is the harness&rsquo;s cost and is excluded.
+          the storage its own documentation recommends, named per engine above and reported exactly
+          as the engine installed it once a run has finished. Only the engine&rsquo;s own call is
+          timed; reshaping rows into the form each API wants is the harness&rsquo;s cost and is
+          excluded.
+        </p>
+        <p className="mb-2">
+          Timings are taken by the batch. The browser&rsquo;s clock ticks every 5µs on this page and
+          every 100µs on an origin that is not cross-origin isolated, which is coarser than most of
+          what is measured here — so anything quicker than the clock is executed many times inside
+          one timed window and divided back down. A lookup that costs 150µs is reported as 150µs
+          rather than rounded to the nearest tick, which is what made every fast case look
+          identical.
         </p>
         <p>
           Running a suite writes real data to your browser&rsquo;s storage for this origin. Use one

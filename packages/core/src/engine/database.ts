@@ -89,6 +89,11 @@ import {
   type SegmentKind,
   type SegmentRecord,
   type SimpleDataType,
+  decodeSnapshot,
+  encodeSnapshot,
+  type DatabaseSnapshot,
+  type SnapshotExportProgress,
+  type SnapshotLoadProgress,
   type TableColumnRecord,
   type TableRecord,
   type TransactionRecord,
@@ -123,8 +128,12 @@ import {
   referencedColumns,
   childExpressions,
   expandFtsColumns,
+  expandNaturalJoins,
+  expandSourceColumnAliases,
   forEachBlockExpression,
   planContainsFts,
+  planHasNaturalJoins,
+  planHasSourceColumnAliases,
   planReadsBeyondSingleScan,
   projectResultColumns,
   subqueryResolutionSteps,
@@ -683,6 +692,7 @@ export interface QuerySpillCleanupResult {
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
   | { kind: "create-table"; table: string }
+  | { kind: "add-column"; table: string; column: string }
   | { kind: "create-trigger"; table: string; name: string }
   | { kind: "drop-trigger"; name: string }
   | {
@@ -727,6 +737,46 @@ export interface VisibleSegment {
   id: string;
   rowCount: number;
   columnBlockIds: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * The snapshot methods a block store may have. Neither belongs to `BlockStore`: a store can be a
+ * complete database backend without being able to copy itself out, so the database checks for
+ * them at the call and says plainly when they are absent rather than failing as a missing
+ * property.
+ */
+interface SnapshotCapableStore {
+  exportSnapshot(): Promise<DatabaseSnapshot>;
+  importSnapshot(
+    snapshot: DatabaseSnapshot,
+    options?: { onProgress?: (progress: SnapshotLoadProgress) => void },
+  ): Promise<void>;
+}
+
+function exportingStore(store: BlockStore): Pick<SnapshotCapableStore, "exportSnapshot"> {
+  const candidate = store as Partial<SnapshotCapableStore>;
+  if (typeof candidate.exportSnapshot !== "function") {
+    throw new Error("This database's block store cannot export snapshots");
+  }
+  return candidate as SnapshotCapableStore;
+}
+
+function importingStore(store: BlockStore): Pick<SnapshotCapableStore, "importSnapshot"> {
+  const candidate = store as Partial<SnapshotCapableStore>;
+  if (typeof candidate.importSnapshot !== "function") {
+    throw new Error("This database's block store cannot load snapshots");
+  }
+  return candidate as SnapshotCapableStore;
+}
+
+export interface SnapshotExportOptions {
+  /** Called as the export moves through its phases; see SnapshotExportProgress. */
+  onProgress?: (progress: SnapshotExportProgress) => void;
+}
+
+export interface SnapshotImportOptions {
+  /** Called as blocks land, for a progress bar over a multi-megabyte file. */
+  onProgress?: (progress: SnapshotLoadProgress) => void;
 }
 
 export class MinnowDatabase {
@@ -2146,6 +2196,9 @@ export class MinnowDatabase {
     const probe = this.store.getCatalogProbe?.bind(this.store);
     const memoizable =
       options.memoize !== false &&
+      // A statement that reads the clock is not a function of the data, so the catalog epoch
+      // cannot tell a fresh answer from a stale one.
+      plan.usesStatementDatetime !== true &&
       options.version === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
       options.spillToStorage === undefined &&
@@ -2175,11 +2228,30 @@ export class MinnowDatabase {
   }
 
   /**
+   * Applies the rewrites that need the catalog's columns: `FROM t AS y(a, b)` renames (E051-09)
+   * and NATURAL join conditions (F401-01). The catalog read only happens for the statements
+   * that ask for one.
+   */
+  async #renameAliasedSourceColumns(plan: CompiledQuery): Promise<CompiledQuery> {
+    const aliased = planHasSourceColumnAliases(plan);
+    const natural = planHasNaturalJoins(plan);
+    if (!aliased && !natural) return plan;
+    const tables = await this.store.listTables();
+    const columns = new Map(
+      tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
+    );
+    const columnsOf = (name: string): readonly string[] | undefined => columns.get(name);
+    if (aliased) plan = expandSourceColumnAliases(plan, columnsOf);
+    return natural ? expandNaturalJoins(plan, columnsOf) : plan;
+  }
+
+  /**
    * The one read pipeline: every compiled plan — SQL text, the typed builder, and live-query
    * re-runs — routes through the same streaming-first execution, so builder/SQL parity holds
    * for the execution path as well as the plan.
    */
   async #queryCompiled(plan: CompiledQuery, options: QueryOptions = {}): Promise<QueryResult> {
+    plan = await this.#renameAliasedSourceColumns(plan);
     const spillPageRows =
       options.spillPageRows === undefined
         ? undefined
@@ -4111,12 +4183,72 @@ export class MinnowDatabase {
       return { kind: "rows", result: await this.query(statement.sql) };
     }
     if (statement.kind === "create-table") {
+      if (statement.ifNotExists === true) {
+        const existing = await this.store.getTableByName(statement.table);
+        if (existing !== undefined) return { kind: "create-table", table: statement.table };
+      }
       await this.createTable({
         name: statement.table,
         columns: statement.columns,
         ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
       });
       return { kind: "create-table", table: statement.table };
+    }
+    if (statement.kind === "create-table-as") {
+      // T172: the query runs first, its output schema becomes the table's, and its rows are the
+      // table's first insert — one statement, but the same createTable and insertBatch paths.
+      const existing = await this.store.getTableByName(statement.table);
+      if (existing !== undefined) {
+        if (statement.ifNotExists === true) {
+          return { kind: "create-table", table: statement.table };
+        }
+        throw new TypeError(`Table already exists: ${statement.table}`);
+      }
+      const records = await this.store.listTables();
+      const schemas = new Map(
+        records.map((record) => [
+          record.name,
+          record.columns.map(({ name, type }) => ({ name, type })),
+        ]),
+      );
+      const columns = inferBlockSchema(statement.query, schemas).map(({ name, type }) => ({
+        name,
+        type,
+        nullable: true,
+      }));
+      const result = await this.#queryCompiled(statement.query);
+      await this.createTable({ name: statement.table, columns });
+      if (result.rows.length > 0) {
+        await this.insertBatch(statement.table, result.rows);
+      }
+      return { kind: "create-table", table: statement.table };
+    }
+    if (statement.kind === "add-column") {
+      // F031-04. Existing rows have no value for the new column, so it is always nullable;
+      // a DEFAULT fills the rows written afterwards.
+      const added = statement.column;
+      const record = await this.store.getTableByName(statement.table);
+      if (record === undefined) throw new TypeError(`Unknown table: ${statement.table}`);
+      if (added.nullable !== true) {
+        throw new TypeError(
+          "ALTER TABLE ADD COLUMN adds a nullable column; existing rows have no value for it",
+        );
+      }
+      if (record.columns.some(({ name }) => name === added.name)) {
+        throw new TypeError(`Column already exists: ${statement.table}.${added.name}`);
+      }
+      const columns = [
+        ...structuredClone(record.columns),
+        {
+          id: this.#createId(),
+          name: added.name,
+          type: added.type,
+          nullable: true,
+          ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
+        },
+      ];
+      await this.store.updateTable(record.id, record.revision ?? 0, { columns });
+      return { kind: "add-column", table: statement.table, column: added.name };
     }
     if (statement.kind === "create-trigger") {
       await this.#createTrigger(statement.table, statement.trigger);
@@ -4336,6 +4468,9 @@ export class MinnowDatabase {
   #canStreamPlanShape(plan: CompiledQuery, options: QueryOptions): boolean {
     return (
       (options.executionMemoryBudgetBytes === undefined || options.spillToStorage !== false) &&
+      // WITH TIES cannot stop at the limit: whether the next row belongs is only known after
+      // reading it, so those plans take the materialized path that trims the ordered result.
+      plan.limitWithTies !== true &&
       plan.base.table !== DUAL_TABLE &&
       plan.base.derived === undefined &&
       plan.base.union === undefined &&
@@ -5654,6 +5789,54 @@ export class MinnowDatabase {
         columnBlockIds: structuredClone(segment.columnBlockIds),
       })),
     );
+  }
+
+  /**
+   * Copies the current committed version out as a portable snapshot file — the byte array
+   * `../storage/snapshot.ts` describes, which `importSnapshot()` loads back into any store.
+   *
+   * The bytes are the unit here rather than the structured `DatabaseSnapshot` the store returns,
+   * because that is what a caller does with a snapshot: write it to disk, hand it to a colleague,
+   * ship it as an asset. Reach for `store.exportSnapshot()` directly when you want the records
+   * instead. Either way the whole snapshot is materialized in memory, so a database of hundreds
+   * of megabytes needs the headroom for a copy of itself.
+   *
+   * Stores differ in how they hold still while this runs: see the note on exporting safely in the
+   * snapshots guide.
+   */
+  async exportSnapshot(options: SnapshotExportOptions = {}): Promise<Uint8Array> {
+    // Announced before the work starts, because reading and encoding report nothing in between:
+    // the encoded length is not known until the last block has been copied.
+    options.onProgress?.({ phase: "reading", transferredBytes: 0, totalBytes: 0 });
+    const bytes = await encodeSnapshot(await exportingStore(this.store).exportSnapshot());
+    options.onProgress?.({
+      phase: "done",
+      transferredBytes: bytes.byteLength,
+      totalBytes: bytes.byteLength,
+    });
+    return bytes;
+  }
+
+  /**
+   * Loads a snapshot file into this database's store, which must be empty. Every block is
+   * authenticated while decoding, so a corrupt file fails here rather than mid-query, and a store
+   * that already holds a database throws rather than merging two histories.
+   */
+  async importSnapshot(bytes: Uint8Array, options: SnapshotImportOptions = {}): Promise<void> {
+    // Asked before the file is decoded, so a store that could never load it fails immediately
+    // rather than after parsing and authenticating hundreds of megabytes.
+    const store = importingStore(this.store);
+    const snapshot = await decodeSnapshot(bytes);
+    await store.importSnapshot(snapshot, {
+      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    });
+    // This database is now looking at a catalog it has never seen. Both stores bump their catalog
+    // epoch as they load, which is what expires the cached catalog state, but the compiled-plan
+    // cache is keyed by statement text alone; clearing both is cheap and leaves nothing behind
+    // from the database this one replaced.
+    this.#planCache.clear();
+    this.#catalogStateCache.clear();
+    this.#catalogStateEpoch = undefined;
   }
 
   async compactTable(

@@ -16,6 +16,28 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
         lostResponseRecovered: boolean;
         leases: { renewed: boolean; released: boolean };
         rowIdsDisjoint: boolean;
+        staleRecovery: {
+          abortedTransactionIds: string[];
+          removedBlockIds: string[];
+          removedSegmentIds: string[];
+          orphanBlockRemoved: boolean;
+          orphanSegmentRemoved: boolean;
+          livePendingRetained: boolean;
+          persistedStates: { active: number; committed: number; aborted: number };
+        };
+        uniqueKeys: {
+          persistedUniqueKey: string | null;
+          persistedColumnTypes: string[];
+          existingKeyRejected: boolean;
+          duplicateKeyRejected: boolean;
+          nullKeyRejected: boolean;
+          rowsAfterRejections: number;
+          concurrentInsertVersionsConsecutive: boolean;
+          rowsAfterConcurrentInserts: number;
+          competingUpsertCounts: string[];
+          competingUpsertRows: number;
+          competingUpsertKeptLatest: boolean;
+        };
         writeScopes: {
           scopeTotal: number | null;
           scopeRolledBack: boolean;
@@ -37,6 +59,11 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
           finalRows: number;
           updatedValue: number | null;
           partialUpdatedRows: number;
+          updatePatch: {
+            changedColumns: string[];
+            segmentKind: string | null;
+            patchedColumnBlocks: number;
+          };
           projectedColumns: string[];
           deletedRows: number;
           writeMetricsValid: boolean;
@@ -97,6 +124,33 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
     lostResponseRecovered: true,
     leases: { renewed: true, released: true },
     rowIdsDisjoint: true,
+    staleRecovery: {
+      // Only the transaction older than the cutoff is aborted, and only its staged work is
+      // reclaimed — the younger transaction keeps its pending block.
+      abortedTransactionIds: ["stale"],
+      removedBlockIds: ["orphan"],
+      removedSegmentIds: ["orphan-segment"],
+      orphanBlockRemoved: true,
+      orphanSegmentRemoved: true,
+      livePendingRetained: true,
+      persistedStates: { active: 1, committed: 1, aborted: 1 },
+    },
+    uniqueKeys: {
+      persistedUniqueKey: "record_id",
+      persistedColumnTypes: ["number", "number", "string", "boolean", "datetime"],
+      existingKeyRejected: true,
+      duplicateKeyRejected: true,
+      nullKeyRejected: true,
+      // Every rejection failed before commit, so the seeded four rows are untouched.
+      rowsAfterRejections: 4,
+      // Two connections committed back-to-back versions with no caller-side retry.
+      concurrentInsertVersionsConsecutive: true,
+      rowsAfterConcurrentInserts: 8,
+      // The loser of the key race rechecked and updated instead of inserting a duplicate.
+      competingUpsertCounts: ["0/1", "1/0"],
+      competingUpsertRows: 1,
+      competingUpsertKeptLatest: true,
+    },
     writeScopes: {
       // The in-scope read saw the staged update (60) plus the staged insert (40).
       scopeTotal: 100,
@@ -122,6 +176,12 @@ test("coordinates and recovers transactions in real IndexedDB", async ({ page })
       finalRows: 3,
       updatedValue: 26,
       partialUpdatedRows: 1,
+      // The patch carries the unique key plus the one changed column, nothing else.
+      updatePatch: {
+        changedColumns: ["score"],
+        segmentKind: "update",
+        patchedColumnBlocks: 2,
+      },
       projectedColumns: ["name"],
       deletedRows: 1,
       writeMetricsValid: true,

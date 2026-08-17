@@ -134,7 +134,27 @@ button { font: inherit; color: inherit; }
 .panel.maximized { border-radius: 0; }
 .panel.maximized .grip, .panel.maximized .resize-edge { display: none; }
 .panel.maximized .titlebar { cursor: default; }
-.panel.inline { position: relative; width: 100%; height: 520px; }
+/*
+ * Inline panels are laid out by the page, so the host has to be a block that can take a height.
+ * These are :host rules, which the embedding page's own stylesheet outranks whatever its
+ * specificity — a container styled from outside keeps the size and display it was given.
+ */
+:host([data-minnow-devtools="inline"]) { display: block; height: 100%; }
+
+/*
+ * The panel fills a container that has a height of its own, and falls back to a readable default
+ * in one that does not, so dropping it into a docs page needs no CSS at all. Both are variables:
+ * the host page can set --mdt-height (and --mdt-min-height) on the container instead of passing
+ * the height option, which is what a responsive embed wants.
+ */
+.panel.inline {
+  position: relative;
+  width: 100%;
+  height: var(--mdt-height, 100%);
+  min-height: var(--mdt-min-height, 520px);
+  /* In flow the panel is framed by the page around it; the drop shadow is for a floating one. */
+  box-shadow: none;
+}
 
 .titlebar {
   flex: none;
@@ -145,6 +165,9 @@ button { font: inherit; color: inherit; }
   padding: 0 8px 0 12px;
   background: var(--mdt-bg-secondary);
   border-bottom: 1px solid var(--mdt-border);
+  /* Sized against itself, so the snapshot chip can step aside on a narrow panel the way the
+     sidebars do — the panel's own container is the body below, which the title bar is not in. */
+  container: mdt-titlebar / inline-size;
 }
 .panel.floating .titlebar { cursor: grab; user-select: none; }
 .panel.floating .titlebar.dragging { cursor: grabbing; }
@@ -168,6 +191,28 @@ button { font: inherit; color: inherit; }
 .badge.ok { background: var(--mdt-ok-bg); color: var(--mdt-ok); }
 .badge.warn { background: var(--mdt-warn-bg); color: var(--mdt-warn); }
 .badge .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+
+/* Progress and outcome for the snapshot actions. It is capped on purpose — the title bar belongs
+   to the tabs and the badges — so the full text, an error message especially, is in the tooltip.
+   It never shrinks past a few words: a chip squeezed to one letter says less than no chip. */
+.snap-status {
+  display: block;
+  flex: 0 1 auto;
+  min-width: 84px;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.5;
+}
+.snap-status[hidden] { display: none; }
+.snap-status.ok { background: var(--mdt-ok-bg); color: var(--mdt-ok); }
+.snap-status.warn { background: var(--mdt-danger-bg); color: var(--mdt-danger); }
+/* The picker is driven by the restore button; it is in the title bar only so it stays alive. */
+.snap-file { display: none; }
+/* Below this there is no room for it beside the tabs, and the buttons are what matter. */
+@container mdt-titlebar (max-width: 520px) {
+  .snap-status { display: none; }
+}
 
 .winbtn {
   width: 24px;

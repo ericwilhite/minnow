@@ -80,6 +80,8 @@ export interface AttachDatabaseWorkerOptions {
 
 type Handle =
   | { type: "snapshot"; release: () => void }
+  | { type: "snapshot-export"; bytes: Uint8Array }
+  | { type: "snapshot-import"; chunks: Uint8Array[]; byteLength: number }
   | {
       type: "write";
       session: WriteSession;
@@ -203,6 +205,22 @@ class DatabaseRpcServer {
         this.#handles.set(handleId, { type: "snapshot", release });
         return { handleId, version };
       }
+      case "exportSnapshotOpen": {
+        // The snapshot is encoded here and held by the handle so the client can pull it across
+        // in slices. One result frame carrying the whole thing would be a structured clone the
+        // size of the database, and the main thread would sit still for all of it.
+        const handleId = crypto.randomUUID();
+        const bytes = await this.database.exportSnapshot();
+        this.#handles.set(handleId, { type: "snapshot-export", bytes });
+        return { handleId, byteLength: bytes.byteLength };
+      }
+      case "importSnapshotOpen": {
+        // Named by the client, like the other event-producing handles, so its progress route
+        // exists before the first frame the load can emit.
+        const handleId = this.#claimHandleId(args[0]);
+        this.#handles.set(handleId, { type: "snapshot-import", chunks: [], byteLength: 0 });
+        return { handleId };
+      }
       case "bufferedWriter": {
         // Event-producing handles are named by the client so its event routes exist before the
         // first frame the handle can emit.
@@ -276,6 +294,10 @@ class DatabaseRpcServer {
         }
         throw new Error(`Unsupported write method: ${method}`);
       }
+      case "snapshot-export":
+        return this.#callSnapshotExport(handleId, handle, method, args);
+      case "snapshot-import":
+        return this.#callSnapshotImport(handleId, handle, method, args);
       case "writer":
         return this.#callWriter(handleId, handle.writer, method, args);
       case "live-set":
@@ -288,6 +310,85 @@ class DatabaseRpcServer {
         if (parent?.type === "live-set") parent.subscriptionIds.delete(handleId);
         return undefined;
       }
+    }
+  }
+
+  /**
+   * Hands one slice of an encoded snapshot back. The slice is copied rather than viewed: a
+   * subarray shares the whole buffer, and structured clone copies the buffer behind a view, not
+   * the window into it — so every read would post the entire snapshot again.
+   */
+  #callSnapshotExport(
+    handleId: string,
+    handle: Extract<Handle, { type: "snapshot-export" }>,
+    method: string,
+    args: unknown[],
+  ): unknown {
+    switch (method) {
+      case "read": {
+        const [offset, length] = args as [unknown, unknown];
+        if (!Number.isSafeInteger(offset) || (offset as number) < 0) {
+          throw new RangeError("Snapshot read offset must be a non-negative whole number");
+        }
+        if (!Number.isSafeInteger(length) || (length as number) <= 0) {
+          throw new RangeError("Snapshot read length must be a positive whole number");
+        }
+        const start = offset as number;
+        return handle.bytes.slice(start, start + (length as number));
+      }
+      case "close": {
+        this.#handles.delete(handleId);
+        return undefined;
+      }
+      default:
+        throw new Error(`Unsupported snapshot export method: ${method}`);
+    }
+  }
+
+  /** Collects an uploaded snapshot chunk by chunk, then loads it, reporting progress as events. */
+  async #callSnapshotImport(
+    handleId: string,
+    handle: Extract<Handle, { type: "snapshot-import" }>,
+    method: string,
+    args: unknown[],
+  ): Promise<unknown> {
+    switch (method) {
+      case "write": {
+        const chunk = args[0];
+        if (!(chunk instanceof Uint8Array)) {
+          throw new TypeError("Snapshot chunk must be a Uint8Array");
+        }
+        handle.chunks.push(chunk);
+        handle.byteLength += chunk.byteLength;
+        return undefined;
+      }
+      case "finish": {
+        const bytes = new Uint8Array(handle.byteLength);
+        let offset = 0;
+        for (const chunk of handle.chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        // Dropped before the load starts: the decoded snapshot is another copy of these bytes,
+        // and holding the chunks too would make three of them.
+        handle.chunks.length = 0;
+        try {
+          await this.database.importSnapshot(bytes, {
+            onProgress: (progress) => {
+              this.scope.postMessage(rpcEvent(handleId, "progress", progress));
+            },
+          });
+        } finally {
+          this.#handles.delete(handleId);
+        }
+        return undefined;
+      }
+      case "close": {
+        this.#handles.delete(handleId);
+        return undefined;
+      }
+      default:
+        throw new Error(`Unsupported snapshot import method: ${method}`);
     }
   }
 

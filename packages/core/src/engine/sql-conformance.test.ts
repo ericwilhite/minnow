@@ -1,18 +1,30 @@
 /**
- * Differential SQL conformance harness. A seeded generator produces a corpus of queries over
- * the supported SQL surface; every query executes through the full MinnowDatabase pipeline,
- * through the row executor, and through SQLite and PGlite. The two Minnow paths must agree
- * exactly; Minnow and the independent engines must agree after normalizing representation
- * differences (booleans, dates, float rounding).
+ * Differential SQL conformance harness. Every query here executes through the full
+ * MinnowDatabase pipeline, through the row executor, and through SQLite and PGlite. The two
+ * Minnow paths must agree exactly; Minnow and the independent engines must agree after
+ * normalizing representation differences (booleans, dates, float rounding).
  *
- * The corpus deliberately avoids forms where the engines' documented semantics differ:
- * `/` (SQLite does integer division on integers), ROUND (half-away-from-zero vs half-even),
+ * Three layers, because each catches what the others cannot:
+ *
+ * 1. Seeded templates — hand-written shapes with randomized parameters, run over many rounds.
+ * 2. Combination cases — generated from the axes a feature varies along (every aggregate ×
+ *    DISTINCT × grouping × position; every window × grouped input × nesting; every join kind ×
+ *    ON shape). Layer 1 tests what someone thought to write down, and every gap found so far was
+ *    a *combination* nobody wrote down, which is what this layer exists to stop.
+ * 3. The shipped feature matrix — every read-only feature the engine publicly claims, executed
+ *    against both oracles. A claim nothing checks is how a wrong answer ships, so the
+ *    classification test makes coverage mandatory: a supported feature is diffed here, owned by
+ *    the mutation harness, or named in `matrixSkips` with the reason an oracle cannot judge it.
+ *
+ * Forms where the engines' documented semantics differ are skipped per oracle rather than
+ * dropped: `/` (SQLite divides integers as integers), ROUND (half-away-from-zero vs half-even),
  * LIKE case-insensitivity (disabled via PRAGMA case_sensitive_like), and Minnow extensions
- * (MATCH/BM25, DATE_TRUNC, DATE literals). Everything else that both engines parse is fair
- * game, and a mismatch fails the suite with the offending statement.
+ * (MATCH/BM25). Both PostgreSQL sessions run in UTC, since Minnow reads every datetime as an
+ * instant in UTC and a zone difference would be a difference in the question.
  */
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import {
@@ -277,6 +289,34 @@ const templates: Template[] = [
     sql: `SELECT d.id AS id FROM data d LEFT JOIN dims m ON d.region = m.region WHERE m.label IS NULL ORDER BY d.id`,
     ordered: true,
   }),
+  // Conjunctive ON clauses. The equality in each becomes the hash key and the rest is a filter,
+  // which is only sound for an inner join — so the same shapes run as LEFT JOINs too, where the
+  // extra conjunct decides null-extension instead and the answers must still match.
+  (rng) => ({
+    sql: `SELECT d.id AS id, m.label AS place FROM data d JOIN dims m ON d.region = m.region AND m.rank > ? AND d.amount > 4 ORDER BY d.id`,
+    params: [Math.floor(rng() * 3)],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id, m.label AS place FROM data d JOIN dims m ON m.region = d.region AND m.rank = d.id % 4 ORDER BY d.id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    sql: `SELECT d.id AS id, m.label AS place FROM data d LEFT JOIN dims m ON d.region = m.region AND m.rank > ? ORDER BY d.id, place`,
+    params: [Math.floor(rng() * 3)],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id, m.label AS place FROM data d LEFT JOIN dims m ON d.region = m.region AND d.amount > 4 ORDER BY d.id, place`,
+    ordered: true,
+  }),
+  // A self-join whose ON pairs rows of one table: the market-basket shape, where losing the
+  // equality means every row against every row.
+  (rng) => ({
+    sql: `SELECT a.region AS region, COUNT(*) AS pairs FROM data a JOIN data b ON b.region = a.region AND b.id > a.id AND b.amount >= ? GROUP BY a.region`,
+    params: [Math.floor(rng() * 200) / 4],
+    ordered: false,
+  }),
   (rng) => {
     const op = pick(rng, ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] as const);
     return {
@@ -432,11 +472,58 @@ const templates: Template[] = [
     sql: `SELECT id, COUNT(*) OVER (PARTITION BY region ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS peers FROM data`,
     ordered: false,
   }),
+  // Windows over a grouped block: SQL runs them after GROUP BY and HAVING, so they rank groups
+  // and read aggregates. Every ORDER BY inside OVER(...) carries a unique tiebreak, or the rank
+  // an engine hands to tied rows is its own business and the diff would be meaningless.
+  () => ({
+    sql: `SELECT region, label, SUM(amount) AS total, ROW_NUMBER() OVER (PARTITION BY region ORDER BY SUM(amount) DESC, label) AS rank, RANK() OVER (PARTITION BY region ORDER BY COUNT(*) DESC, label) AS by_rows FROM data GROUP BY region, label`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT region, label, COUNT(*) AS n, SUM(SUM(amount)) OVER (PARTITION BY region) AS region_total FROM data GROUP BY region, label HAVING COUNT(*) > 1`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT SUM(amount) AS total, ROW_NUMBER() OVER (ORDER BY SUM(amount)) AS only_row FROM data`,
+    ordered: false,
+  }),
+  // Grouped by label rather than region: the tiebreak inside OVER(...) has to be non-nullable,
+  // or the engines' opposite NULL ordering shifts every rank below it and the diff is noise.
+  () => ({
+    sql: `SELECT label, COUNT(DISTINCT region) AS regions, DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT region) DESC, label) AS variety FROM data GROUP BY label`,
+    ordered: false,
+  }),
   () => ({
     sql: `SELECT region, SUM(DISTINCT amount) AS s FROM data GROUP BY region`,
     ordered: false,
   }),
   () => ({ sql: `SELECT AVG(DISTINCT amount) AS a FROM data`, ordered: false }),
+  // Several DISTINCT aggregates in one select, beside plain ones: each keeps its own set of
+  // values, so nothing here may fold into a shared deduplication.
+  () => ({
+    sql: `SELECT region, COUNT(DISTINCT amount) AS amounts, COUNT(DISTINCT label) AS labels, COUNT(DISTINCT active) AS flags, COUNT(*) AS rows_seen, SUM(amount) AS total, MIN(DISTINCT amount) AS lowest FROM data GROUP BY region`,
+    ordered: false,
+  }),
+  // Nested inside arithmetic, which the top-level-only rule used to refuse outright.
+  () => ({
+    sql: `SELECT region, SUM(amount) / COUNT(DISTINCT label) AS per_label, COUNT(DISTINCT amount) + COUNT(DISTINCT label) AS spread FROM data GROUP BY region`,
+    ordered: false,
+    // Integer division: SQLite would floor SUM/COUNT where Minnow and PostgreSQL do not.
+    skip: ["sqlite"],
+  }),
+  (rng) => ({
+    sql: `SELECT region, COUNT(DISTINCT amount) AS amounts FROM data GROUP BY region HAVING COUNT(DISTINCT amount) > ? AND COUNT(*) > 1`,
+    params: [Math.floor(rng() * 3)],
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT COUNT(DISTINCT joined) AS days, COUNT(DISTINCT region) AS regions, MAX(DISTINCT amount) AS highest FROM data WHERE active`,
+    ordered: false,
+  }),
+  () => ({
+    sql: `SELECT COUNT(DISTINCT CASE WHEN amount > 5 THEN region END) AS busy_regions, COUNT(DISTINCT CASE WHEN active THEN label END) AS active_labels FROM data`,
+    ordered: false,
+  }),
   () => ({
     sql: `SELECT 1 + 1 AS two, UPPER('minnow') AS name, NULLIF(2, 2) AS n`,
     ordered: false,
@@ -541,7 +628,269 @@ const templates: Template[] = [
     ordered: false,
     skip: ["sqlite"],
   }),
+  // --- SQL:2023 surface, over the same seeded fixture ------------------------------------------
+  (rng) => ({
+    // E021-06/09/11 and T055 against PostgreSQL, whose spellings are the standard's.
+    sql: `SELECT id, SUBSTRING(label FROM ${String(1 + Math.floor(rng() * 4))} FOR 3) AS part, POSITION('a' IN label) AS at, LPAD(label, 9, '.') AS padded, RPAD(label, 9, '.') AS tail, OVERLAY(label PLACING 'ZZ' FROM 2 FOR 2) AS masked, CHAR_LENGTH(label) AS width, OCTET_LENGTH(label) AS bytes FROM data ORDER BY id`,
+    ordered: true,
+    skip: ["sqlite"],
+  }),
+  (rng) => ({
+    // A start below 1 and a window past the end are where the position-window rule shows. The
+    // bounds are written into the text because PostgreSQL cannot infer a placeholder's type in
+    // this position.
+    sql: `SELECT id, SUBSTRING(label FROM ${String(Math.floor(rng() * 4))} FOR ${String(Math.floor(rng() * 12))}) AS part FROM data ORDER BY id`,
+    ordered: true,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    sql: `SELECT id, TRIM(LEADING 'a' FROM label) AS lead, TRIM(TRAILING 'o' FROM label) AS trail, TRIM(BOTH 'a' FROM label) AS both FROM data ORDER BY id`,
+    ordered: true,
+    skip: ["sqlite"],
+  }),
+  (rng) => ({
+    // E051-07: over one source, where the wildcard's output names are the columns' own. With
+    // several sources this engine prefixes them by alias, which no oracle does.
+    sql: `SELECT d.* FROM data d WHERE d.amount >= ? ORDER BY id`,
+    params: [Math.floor(rng() * 300) / 4],
+    ordered: true,
+  }),
+  (rng) => ({
+    // F041-07: the comma join.
+    sql: `SELECT d.id AS id, m.rank AS r FROM data d, dims m WHERE m.region = d.region AND d.amount >= ? ORDER BY id, r`,
+    params: [Math.floor(rng() * 300) / 4],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id, m.rank AS r FROM data d JOIN dims m USING (region) ORDER BY id`,
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT d.id AS id FROM data d NATURAL JOIN dims m ORDER BY id`,
+    ordered: true,
+  }),
+  (rng) => ({
+    // F641: row comparisons and row IN, including the NULL region.
+    sql: `SELECT id FROM data WHERE (region, amount) > (?, ?) ORDER BY id`,
+    params: ["east", Math.floor(rng() * 300) / 4],
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT id FROM data WHERE (region, active) IN (('west', TRUE), ('east', FALSE)) ORDER BY id`,
+    ordered: true,
+  }),
+  () => ({
+    sql: `SELECT id FROM data WHERE (region, label) IS NOT NULL ORDER BY id`,
+    ordered: true,
+    // SQLite rejects a row value in a null predicate.
+    skip: ["sqlite"],
+  }),
+  (rng) => ({
+    // T618 and T620: a named window reused by several functions.
+    sql: `SELECT id, NTH_VALUE(amount, ${String(1 + Math.floor(rng() * 3))}) OVER w AS nth, FIRST_VALUE(amount) OVER w AS first, SUM(amount) OVER w AS running FROM data WINDOW w AS (PARTITION BY region ORDER BY id)`,
+    ordered: false,
+  }),
+  (rng) => ({
+    // T612: GROUPS frames and the exclusions, both of which SQLite and PostgreSQL implement.
+    sql: `SELECT id, COUNT(*) OVER (ORDER BY region GROUPS BETWEEN ${String(1 + Math.floor(rng() * 2))} PRECEDING AND CURRENT ROW) AS peers, SUM(amount) OVER (ORDER BY region RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS others, COUNT(*) OVER (ORDER BY region RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS untied FROM data WHERE region IS NOT NULL`,
+    ordered: false,
+  }),
+  () => ({
+    // T433 with several sets, the shape that caught a real bug: a literal-only select list.
+    sql: `SELECT region, GROUPING(region) AS aggregated, COUNT(*) AS n FROM data WHERE region IS NOT NULL GROUP BY ROLLUP(region)`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    sql: `SELECT VAR_POP(amount) AS vp, VAR_SAMP(amount) AS vs, STDDEV_POP(amount) AS sp, EVERY(amount >= 0) AS all_positive, BOOL_OR(amount > 70) AS any_large FROM data`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    sql: `SELECT region, STDDEV_SAMP(amount) AS spread FROM data WHERE region IS NOT NULL GROUP BY region`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
+  (rng) => ({
+    // F866 over a column with ties, ordered so the tie set is unambiguous.
+    sql: `SELECT region FROM data WHERE region IS NOT NULL ORDER BY region DESC FETCH FIRST ${String(1 + Math.floor(rng() * 3))} ROWS WITH TIES`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    // E071-06 and T122: a set operation inside a derived table, under a nested WITH.
+    sql: `SELECT s.id AS id FROM (WITH pool AS (SELECT id FROM data WHERE amount > 50 UNION SELECT id FROM data WHERE region = 'west') SELECT id FROM pool) s ORDER BY id`,
+    ordered: true,
+  }),
 ];
+
+// --- Combination coverage -----------------------------------------------------------------------
+//
+// The templates above are written one at a time, which means they cover what somebody thought to
+// write down. Everything that has gone wrong here was a *combination* nobody wrote down: a second
+// DISTINCT aggregate in the same select, a window over a grouped block, a window inside an
+// expression, an ON clause carrying more than its equality. So these are generated from the axes
+// each feature varies along instead, and every crossing becomes a case. They are built once
+// rather than per round, since the SQL does not vary with the seed.
+
+const aggregates = ["COUNT", "SUM", "AVG", "MIN", "MAX"] as const;
+const groupings = [
+  { keys: "", select: "", by: "" },
+  { keys: "region", select: "region, ", by: " GROUP BY region" },
+  { keys: "region, label", select: "region, label, ", by: " GROUP BY region, label" },
+];
+
+/** Every aggregate, DISTINCT and not, in every position a select list can put one. */
+function distinctCases(): Case[] {
+  const cases: Case[] = [];
+  for (const aggregate of aggregates) {
+    for (const grouping of groupings) {
+      const plain = `${aggregate}(amount)`;
+      const distinct = `${aggregate}(DISTINCT amount)`;
+      // Beside its own plain form, beside a second DISTINCT over another column, and beside
+      // COUNT(*) — the shapes the old one-DISTINCT-per-select rule made impossible.
+      cases.push({
+        sql: `SELECT ${grouping.select}${distinct} AS d, ${plain} AS p, COUNT(DISTINCT label) AS labels, COUNT(*) AS n FROM data${grouping.by}`,
+        ordered: false,
+      });
+      // Inside an expression rather than as the whole select item.
+      cases.push({
+        sql: `SELECT ${grouping.select}${distinct} + COUNT(DISTINCT label) AS combined, ${plain} - ${distinct} AS gap FROM data${grouping.by}`,
+        ordered: false,
+      });
+      if (grouping.by !== "") {
+        cases.push({
+          sql: `SELECT ${grouping.select}${distinct} AS d FROM data${grouping.by} HAVING ${distinct} > 1 AND COUNT(*) > 2`,
+          ordered: false,
+        });
+      }
+    }
+  }
+  return cases;
+}
+
+/**
+ * Every window function over grouped and ungrouped input, as the whole select item and inside an
+ * expression. Each ORDER BY inside OVER(...) ends in a unique, non-null tiebreak: without one the
+ * rank handed to tied rows is the engine's own business and a diff would mean nothing.
+ */
+function windowCases(): Case[] {
+  const ranks = ["ROW_NUMBER()", "RANK()", "DENSE_RANK()", "PERCENT_RANK()", "CUME_DIST()"];
+  const cases: Case[] = [];
+  for (const rank of ranks) {
+    cases.push({
+      sql: `SELECT id, ${rank} OVER (ORDER BY amount, id) AS r FROM data`,
+      ordered: false,
+    });
+    cases.push({
+      sql: `SELECT region, SUM(amount) AS total, ${rank} OVER (ORDER BY SUM(amount), region) AS r FROM data WHERE region IS NOT NULL GROUP BY region`,
+      ordered: false,
+    });
+  }
+  for (const aggregate of aggregates) {
+    cases.push({
+      sql: `SELECT id, ${aggregate}(amount) OVER (PARTITION BY region ORDER BY amount, id) AS w FROM data`,
+      ordered: false,
+    });
+    cases.push({
+      sql: `SELECT region, ${aggregate}(amount) AS agg, ${aggregate}(${aggregate}(amount)) OVER (PARTITION BY region) AS nested FROM data WHERE region IS NOT NULL GROUP BY region, label`,
+      ordered: false,
+    });
+  }
+  // Windows inside expressions: arithmetic around one, two of them combined, one inside a CASE.
+  cases.push(
+    {
+      sql: `SELECT id, amount - LAG(amount) OVER (ORDER BY amount, id) AS change FROM data`,
+      ordered: false,
+    },
+    {
+      sql: `SELECT id, ROW_NUMBER() OVER (ORDER BY amount, id) + LEAD(id, 1, 0) OVER (ORDER BY amount, id) AS mixed FROM data`,
+      ordered: false,
+    },
+    {
+      sql: `SELECT id, CASE WHEN ROW_NUMBER() OVER (ORDER BY amount, id) > 75 THEN 'late' ELSE 'early' END AS half FROM data`,
+      ordered: false,
+    },
+    {
+      sql: `SELECT id, 100.0 * amount / SUM(amount) OVER () AS share FROM data`,
+      ordered: false,
+    },
+    {
+      sql: `SELECT region, SUM(amount) AS total, 100.0 * SUM(amount) / SUM(SUM(amount)) OVER () AS pct FROM data WHERE region IS NOT NULL GROUP BY region`,
+      ordered: false,
+    },
+  );
+  return cases;
+}
+
+/** Both join kinds against every shape an ON clause takes, since only one of them keeps a key. */
+function joinCases(): Case[] {
+  const conditions = [
+    "d.region = m.region",
+    "d.region = m.region AND m.rank > 1",
+    "d.region = m.region AND d.amount > 4",
+    "d.region = m.region AND m.rank > 1 AND d.amount > 4",
+    "d.region = m.region AND m.label > d.label",
+    "m.region = d.region AND m.rank = d.id % 4",
+    "d.amount > m.rank",
+  ];
+  return ["JOIN", "LEFT JOIN"].flatMap((kind) =>
+    conditions.map((on) => ({
+      sql: `SELECT d.id AS id, m.label AS place FROM data d ${kind} dims m ON ${on} WHERE d.id <= 60 ORDER BY d.id, place`,
+      ordered: true,
+    })),
+  );
+}
+
+/** Datetime literals and calendar arithmetic, which only PostgreSQL spells the same way. */
+function datetimeCases(): Case[] {
+  const cases: Case[] = [
+    { sql: `SELECT id FROM data WHERE joined >= DATE '2026-01-01' ORDER BY id`, ordered: true },
+    {
+      sql: `SELECT id FROM data WHERE joined >= TIMESTAMP '2026-01-02 03:04:05' ORDER BY id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT id FROM data WHERE joined BETWEEN TIMESTAMP '2025-12-01' AND TIMESTAMP '2026-02-01 12:00:00' ORDER BY id`,
+      ordered: true,
+    },
+  ];
+  for (const interval of ["1 month", "3 months", "1 year", "2 days", "36 hours", "90 minutes"]) {
+    cases.push({
+      sql: `SELECT id, joined + INTERVAL '${interval}' AS later, joined - INTERVAL '${interval}' AS earlier FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ordered: true,
+    });
+  }
+  // Month arithmetic has to clamp: 31 January plus a month is the end of February, not March 3.
+  cases.push({
+    sql: `SELECT TIMESTAMP '2026-01-31' + INTERVAL '1 month' AS clamped, TIMESTAMP '2024-02-29' + INTERVAL '1 year' AS leap FROM data LIMIT 1`,
+    ordered: false,
+  });
+  // SQLite has neither the literals nor INTERVAL; PostgreSQL checks every one of these.
+  return cases.map((testCase) => ({ ...testCase, skip: ["sqlite"] as const }));
+}
+
+/** A CTE naming its own columns, including the recursive form where the step reads them back. */
+function cteCases(): Case[] {
+  return [
+    {
+      sql: `WITH totals(place, total) AS (SELECT region, SUM(amount) FROM data GROUP BY region) SELECT place, total FROM totals`,
+      ordered: false,
+    },
+    {
+      sql: `WITH RECURSIVE counter(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM counter WHERE n < 10) SELECT n FROM counter ORDER BY n`,
+      ordered: true,
+    },
+    {
+      sql: `WITH ranked(id, place, position) AS (SELECT id, region, ROW_NUMBER() OVER (ORDER BY amount, id) FROM data) SELECT position, place FROM ranked WHERE position <= 10 ORDER BY position`,
+      ordered: true,
+    },
+  ];
+}
+
+function combinationCases(): Case[] {
+  return [...distinctCases(), ...windowCases(), ...joinCases(), ...datetimeCases(), ...cteCases()];
+}
 
 function buildCorpus(): Case[] {
   const rng = mulberry32(0xc0ffee);
@@ -549,6 +898,7 @@ function buildCorpus(): Case[] {
   for (let round = 0; round < 12; round += 1) {
     for (const template of templates) corpus.push(template(rng));
   }
+  corpus.push(...combinationCases());
   return corpus;
 }
 
@@ -633,6 +983,10 @@ function positionalToNumbered(sql: string): string {
 async function pgliteOracle(): Promise<Oracle> {
   const { PGlite } = await import("@electric-sql/pglite");
   const database = await PGlite.create();
+  // Minnow reads every datetime as an instant in UTC, including a TIMESTAMP literal written
+  // without a zone. Left on the host's zone, PostgreSQL reads those literals locally and the
+  // two disagree by the offset — a difference in the question, not in the answer.
+  await database.exec(`SET TIME ZONE 'UTC'`);
   await database.exec(
     `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
   );
@@ -650,8 +1004,14 @@ async function pgliteOracle(): Promise<Oracle> {
   for (const dim of dims) {
     await database.query(`INSERT INTO dims VALUES ($1, $2, $3)`, [dim.region, dim.label, dim.rank]);
   }
-  // int8 and numeric arrive as numbers, so counts and numeric-typed math compare directly.
-  const parsers = { 20: (value: string) => Number(value), 1700: (value: string) => Number(value) };
+  // int8 and numeric arrive as numbers, so counts and numeric-typed math compare directly, and a
+  // timestamp without a zone (what `TIMESTAMP '…' + INTERVAL` returns) is read as UTC rather than
+  // in whatever zone the machine running the tests happens to be in.
+  const parsers = {
+    20: (value: string) => Number(value),
+    1700: (value: string) => Number(value),
+    1114: (value: string) => new Date(`${value.replace(" ", "T")}Z`),
+  };
   return {
     name: "pglite",
     execute: async (testCase) => {
@@ -665,6 +1025,278 @@ async function pgliteOracle(): Promise<Oracle> {
     close: () => database.close(),
   };
 }
+
+// --- Feature matrix coverage --------------------------------------------------------------------
+//
+// The corpus above is written by hand, so it only tests what somebody thought to write down. The
+// shipped feature matrix is the other half: it is the list of SQL this engine claims to support,
+// one example apiece, and until now nothing checked those claims against another database — a
+// feature could be listed, execute, return the wrong answer, and pass. Every read-only claim now
+// runs through both oracles, and the classification test below makes that non-optional: a new
+// feature is either differentially checked here, checked by the mutation harness, or named in
+// `matrixExemptions` with the reason it cannot be.
+
+interface MatrixFeature {
+  id: string;
+  status: "supported" | "unsupported";
+  example: string;
+  setup?: string[];
+  params?: QueryValue[];
+}
+
+const matrixFeatures = (rawMatrix as { features: MatrixFeature[] }).features;
+
+/** The fixture the matrix's examples are written against, mirrored from feature-matrix.test.ts. */
+const matrixRows = [
+  { region: "west", amount: 10, active: true, joined: new Date("2026-01-02T00:00:00.000Z") },
+  { region: "west", amount: 6, active: false, joined: new Date("2025-12-30T00:00:00.000Z") },
+  { region: "east", amount: 3, active: true, joined: new Date("2026-02-01T00:00:00.000Z") },
+  { region: null, amount: 8, active: true, joined: null },
+];
+const matrixDims = [
+  { region: "west", label: "West Coast", amount: 1 },
+  { region: "north", label: "North", amount: 2 },
+];
+
+async function matrixMinnow(): Promise<MinnowDatabase> {
+  const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 8 });
+  await database.createTable({
+    name: "rows",
+    columns: [
+      { name: "region", type: "string", nullable: true },
+      { name: "amount", type: "number" },
+      { name: "active", type: "boolean" },
+      { name: "joined", type: "datetime", nullable: true },
+    ],
+  });
+  await database.insertBatch("rows", matrixRows);
+  await database.createTable({
+    name: "dims",
+    columns: [
+      { name: "region", type: "string" },
+      { name: "label", type: "string" },
+      { name: "amount", type: "number" },
+    ],
+  });
+  await database.insertBatch("dims", matrixDims);
+  return database;
+}
+
+function matrixSqlite(): Oracle {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA case_sensitive_like = ON");
+  database.exec(
+    `CREATE TABLE "rows" ("region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT)`,
+  );
+  database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "amount" REAL)`);
+  const insert = database.prepare(`INSERT INTO "rows" VALUES (?, ?, ?, ?)`);
+  for (const row of matrixRows) {
+    insert.run(row.region, row.amount, row.active ? 1 : 0, row.joined?.toISOString() ?? null);
+  }
+  const insertDim = database.prepare(`INSERT INTO dims VALUES (?, ?, ?)`);
+  for (const dim of matrixDims) insertDim.run(dim.region, dim.label, dim.amount);
+  return {
+    name: "sqlite",
+    execute: (testCase) =>
+      Promise.resolve(
+        database
+          .prepare(numberedToPositional(testCase.sql))
+          .all(...sqliteParams(testCase.params)) as Array<Record<string, unknown>>,
+      ),
+    close: () => {
+      database.close();
+    },
+  };
+}
+
+/** SQLite reads $1 as a named parameter; the matrix means it positionally, as PostgreSQL does. */
+function numberedToPositional(sql: string): string {
+  return sql.replace(/\$\d+/g, "?");
+}
+
+async function matrixPglite(): Promise<Oracle> {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const database = await PGlite.create();
+  // Every datetime in a Minnow database is an instant read as UTC. Left on the host's zone,
+  // PostgreSQL truncates and extracts in local time and the two disagree by the offset.
+  await database.exec(`SET TIME ZONE 'UTC'`);
+  await database.exec(
+    `CREATE TABLE "rows" ("region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ)`,
+  );
+  await database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "amount" DOUBLE PRECISION)`);
+  for (const row of matrixRows) {
+    await database.query(`INSERT INTO "rows" VALUES ($1, $2, $3, $4)`, [
+      row.region,
+      row.amount,
+      row.active,
+      row.joined,
+    ]);
+  }
+  for (const dim of matrixDims) {
+    await database.query(`INSERT INTO dims VALUES ($1, $2, $3)`, [
+      dim.region,
+      dim.label,
+      dim.amount,
+    ]);
+  }
+  const parsers = {
+    20: (value: string) => Number(value),
+    1700: (value: string) => Number(value),
+    1114: (value: string) => new Date(`${value.replace(" ", "T")}Z`),
+  };
+  return {
+    name: "pglite",
+    execute: async (testCase) => {
+      const result = await database.query(
+        positionalToNumbered(testCase.sql),
+        (testCase.params ?? []) as unknown[],
+        { parsers },
+      );
+      return result.rows as Array<Record<string, unknown>>;
+    },
+    close: () => database.close(),
+  };
+}
+
+/** Features the mutation harness owns: they change data rather than answer a question. */
+function writesData(id: string): boolean {
+  return (
+    id.startsWith("mutation.") ||
+    id.startsWith("ddl.") ||
+    id.startsWith("trigger.") ||
+    id.startsWith("transaction.")
+  );
+}
+
+/**
+ * Oracles that cannot be asked about a given feature, with the reason. Skipping one oracle still
+ * leaves the other checking the claim, so most entries here cost nothing in coverage — SQLite has
+ * no ILIKE, PostgreSQL has no two-argument ROUND on a float, and neither has Minnow's full-text
+ * extensions. Every entry is a decision someone made and wrote down; the classification test below
+ * fails for any supported feature that is neither executed nor listed.
+ */
+const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: string }>([
+  // --- SQL:2023 forms SQLite does not spell ------------------------------------------------
+  ["function.char-length", { oracles: ["sqlite"], reason: "SQLite spells it LENGTH" }],
+  [
+    "function.substring-from-for",
+    { oracles: ["sqlite"], reason: "SQLite has no SUBSTRING(x FROM a FOR b) syntax" },
+  ],
+  [
+    "function.trim-specification",
+    { oracles: ["sqlite"], reason: "SQLite's TRIM takes no LEADING/TRAILING/BOTH" },
+  ],
+  [
+    "function.trim-multi-character",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "The standard removes the trim string as a repeated unit; PostgreSQL removes any of its characters, and SQLite has no side keyword",
+    },
+  ],
+  [
+    "function.position",
+    { oracles: ["sqlite"], reason: "SQLite spells it INSTR, arguments swapped" },
+  ],
+  ["function.pad", { oracles: ["sqlite"], reason: "SQLite has no LPAD/RPAD" }],
+  ["function.overlay", { oracles: ["sqlite"], reason: "SQLite has no OVERLAY" }],
+  [
+    "from.column-alias-list",
+    { oracles: ["sqlite"], reason: "SQLite has no column alias list on a table reference" },
+  ],
+  [
+    "datetime.current-date",
+    { oracles: ["sqlite"], reason: "SQLite has no DATE '…' literal to compare against" },
+  ],
+  [
+    "datetime.current-timestamp",
+    { oracles: ["sqlite"], reason: "SQLite has no TIMESTAMP '…' literal to compare against" },
+  ],
+  ["datetime.localtime", { oracles: ["sqlite"], reason: "SQLite spells it CURRENT_TIME" }],
+  ["predicate.row-null", { oracles: ["sqlite"], reason: "SQLite rejects a row value in IS NULL" }],
+  ["limit.with-ties", { oracles: ["sqlite"], reason: "SQLite has no FETCH FIRST clause" }],
+  ["aggregate.grouping", { oracles: ["sqlite"], reason: "SQLite has neither ROLLUP nor GROUPING" }],
+  [
+    "aggregate.any-value",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "Which row of the group answers is implementation-dependent, so no two engines have to agree; SQLite has no ANY_VALUE either",
+    },
+  ],
+  ["aggregate.variance", { oracles: ["sqlite"], reason: "SQLite has no VAR_POP" }],
+  ["aggregate.stddev", { oracles: ["sqlite"], reason: "SQLite has no STDDEV_POP" }],
+  ["aggregate.boolean", { oracles: ["sqlite"], reason: "SQLite has no EVERY" }],
+  // --- SQL/JSON --------------------------------------------------------------------------
+  ["json.value", { oracles: ["sqlite"], reason: "SQLite spells it json_extract" }],
+  [
+    "json.query",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite spells it json_extract; PostgreSQL renders JSON text with spaces after separators, which is a formatting difference rather than a value one",
+    },
+  ],
+  ["json.exists", { oracles: ["sqlite"], reason: "SQLite spells it json_type IS NOT NULL" }],
+  ["json.is-json", { oracles: ["sqlite"], reason: "SQLite spells it json_valid" }],
+  [
+    "json.object",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite has no KEY … VALUE spelling; PostgreSQL renders JSON text with spaces after separators",
+    },
+  ],
+  [
+    "json.array",
+    { oracles: ["pglite"], reason: "PostgreSQL renders JSON text with spaces after separators" },
+  ],
+
+  ["predicate.match", { oracles: ["sqlite", "pglite"], reason: "MATCH is a Minnow extension" }],
+  [
+    "predicate.match-star",
+    { oracles: ["sqlite", "pglite"], reason: "MATCH(*) is a Minnow extension" },
+  ],
+  ["function.bm25", { oracles: ["sqlite", "pglite"], reason: "BM25 is a Minnow extension" }],
+  [
+    "expression.date-trunc",
+    { oracles: ["sqlite"], reason: "SQLite has no DATE_TRUNC; PostgreSQL still checks it" },
+  ],
+  [
+    "expression.date-add",
+    { oracles: ["sqlite"], reason: "SQLite spells interval arithmetic datetime(x, '+1 month')" },
+  ],
+  ["literal.date", { oracles: ["sqlite"], reason: "SQLite has no DATE '…' literal" }],
+  ["literal.timestamp", { oracles: ["sqlite"], reason: "SQLite has no TIMESTAMP '…' literal" }],
+  [
+    "expression.round",
+    { oracles: ["pglite"], reason: "PostgreSQL's two-argument ROUND takes numeric, not float8" },
+  ],
+  ["expression.modulo", { oracles: ["pglite"], reason: "PostgreSQL has no % operator on float8" }],
+  [
+    "expression.cast",
+    { oracles: ["sqlite"], reason: "SQLite renders a REAL cast to text as 10.0, PostgreSQL as 10" },
+  ],
+  [
+    "function.numeric-core",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason: "one statement covering functions each oracle is missing a different one of",
+    },
+  ],
+  ["function.string-extended", { oracles: ["pglite"], reason: "PostgreSQL spells INSTR strpos" }],
+  ["function.extract", { oracles: ["sqlite"], reason: "SQLite has no EXTRACT(field FROM …)" }],
+  ["limit.fetch-first", { oracles: ["sqlite"], reason: "SQLite has no FETCH FIRST" }],
+  ["offset.standalone", { oracles: ["sqlite"], reason: "SQLite requires LIMIT before OFFSET" }],
+  ["group-by.rollup", { oracles: ["sqlite"], reason: "SQLite has no ROLLUP" }],
+  ["group-by.grouping-sets", { oracles: ["sqlite"], reason: "SQLite has no GROUPING SETS" }],
+  ["predicate.boolean-test", { oracles: ["sqlite"], reason: "SQLite has no IS UNKNOWN" }],
+  ["predicate.quantified", { oracles: ["sqlite"], reason: "SQLite has no ALL/ANY quantifiers" }],
+  ["predicate.ilike", { oracles: ["sqlite"], reason: "SQLite has no ILIKE" }],
+  ["where.between-symmetric", { oracles: ["sqlite"], reason: "SQLite has no BETWEEN SYMMETRIC" }],
+  ["set.intersect-all", { oracles: ["sqlite"], reason: "SQLite has no INTERSECT ALL" }],
+  ["set.except-all", { oracles: ["sqlite"], reason: "SQLite has no EXCEPT ALL" }],
+]);
 
 // --- The harness --------------------------------------------------------------------------------
 
@@ -733,7 +1365,9 @@ describe("SQL conformance against SQLite and PGlite", () => {
     } finally {
       for (const oracle of oracles) await oracle.close();
     }
-    expect(corpus.length).toBeGreaterThan(300);
+    // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
+    expect(corpus.length).toBeGreaterThan(1_000);
+    expect(combinationCases().length).toBeGreaterThan(80);
     if (failures.length > 0) {
       expect.fail(
         `${String(failures.length)} of ${String(corpus.length)} conformance cases diverged:\n\n` +
@@ -741,4 +1375,84 @@ describe("SQL conformance against SQLite and PGlite", () => {
       );
     }
   }, 240_000);
+
+  it("agrees with the oracles on every read-only feature the matrix claims", async () => {
+    const covered = matrixFeatures.filter(
+      (feature) =>
+        feature.status === "supported" &&
+        !writesData(feature.id) &&
+        matrixSkips.get(feature.id)?.oracles.length !== 2,
+    );
+    const database = await matrixMinnow();
+    const oracles: Oracle[] = [matrixSqlite(), await matrixPglite()];
+    const failures: string[] = [];
+    try {
+      for (const feature of covered) {
+        const testCase: Case = {
+          sql: feature.example,
+          ordered: false,
+          ...(feature.params === undefined ? {} : { params: feature.params }),
+        };
+        let minnowRows: Array<Record<string, unknown>>;
+        try {
+          minnowRows = (
+            await database.query(
+              testCase.sql,
+              testCase.params === undefined ? {} : { params: testCase.params },
+            )
+          ).rows;
+        } catch (error) {
+          failures.push(`${feature.id} :: ${feature.example}\n  minnow threw: ${String(error)}`);
+          continue;
+        }
+        const minnowKeys = resultKeys(minnowRows, false);
+        const skipped = matrixSkips.get(feature.id)?.oracles ?? [];
+        for (const oracle of oracles) {
+          if (skipped.includes(oracle.name)) continue;
+          let oracleRows: Array<Record<string, unknown>>;
+          try {
+            oracleRows = await oracle.execute(testCase);
+          } catch (error) {
+            failures.push(
+              `${feature.id} :: ${feature.example}\n  ${oracle.name} threw: ${String(error)}`,
+            );
+            continue;
+          }
+          const oracleKeys = resultKeys(oracleRows, false);
+          if (minnowKeys.join("\n") !== oracleKeys.join("\n")) {
+            failures.push(
+              `${feature.id} :: ${feature.example}\n${diffSummary(`minnow vs ${oracle.name}`, minnowKeys, oracleKeys)}`,
+            );
+          }
+        }
+      }
+    } finally {
+      for (const oracle of oracles) await oracle.close();
+    }
+    expect(covered.length).toBeGreaterThan(80);
+    if (failures.length > 0) {
+      expect.fail(
+        `${String(failures.length)} of ${String(covered.length)} matrix features diverged:\n\n` +
+          failures.slice(0, 10).join("\n\n"),
+      );
+    }
+  }, 240_000);
+
+  it("leaves no supported feature unaccounted for", () => {
+    const unclassified = matrixFeatures
+      .filter((feature) => feature.status === "supported")
+      .filter(
+        (feature) =>
+          !writesData(feature.id) &&
+          matrixSkips.get(feature.id)?.oracles.length !== 2 &&
+          !/^\s*(SELECT|WITH|VALUES|TABLE)\b/i.test(feature.example),
+      )
+      .map((feature) => feature.id);
+    // A supported feature is checked against the oracles above, or owned by the mutation
+    // harness, or exempted by name with a reason. Nothing else.
+    expect(unclassified).toEqual([]);
+    // And nothing may be exempted that does not exist, so the list cannot rot.
+    const ids = new Set(matrixFeatures.map((feature) => feature.id));
+    expect([...matrixSkips.keys()].filter((id) => !ids.has(id))).toEqual([]);
+  });
 });
