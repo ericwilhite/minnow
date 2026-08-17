@@ -2,56 +2,60 @@
   "rows": 200000,
   "thresholds": {
     "bulk-ingest": {
-      "sqlite": 3.22,
-      "pglite": 0.436
+      "sqlite": 3.28,
+      "pglite": 0.458
     },
     "count-star": {
-      "sqlite": 1.92,
-      "pglite": 0.0169
+      "sqlite": 2.13,
+      "pglite": 0.0176
     },
     "filter-scan": {
-      "sqlite": 0.466,
-      "pglite": 0.188
+      "sqlite": 0.472,
+      "pglite": 0.189
     },
     "group-aggregate": {
       "sqlite": 0.128,
-      "pglite": 0.191
+      "pglite": 0.197
     },
     "top-n": {
-      "sqlite": 0.436,
-      "pglite": 0.136
+      "sqlite": 0.421,
+      "pglite": 0.131
     },
     "join-aggregate": {
-      "sqlite": 0.328,
-      "pglite": 0.291
+      "sqlite": 0.351,
+      "pglite": 0.308
     },
     "like-scan": {
-      "sqlite": 0.349,
-      "pglite": 0.18
+      "sqlite": 0.335,
+      "pglite": 0.155
     },
     "window-running": {
-      "sqlite": 1.59,
-      "pglite": 0.494
+      "sqlite": 1.6,
+      "pglite": 0.487
     },
     "distinct-aggregate": {
-      "sqlite": 0.279,
-      "pglite": 0.17
+      "sqlite": 0.25,
+      "pglite": 0.151
     },
     "point-lookup": {
-      "sqlite": 0.0322,
-      "pglite": 0.0132
+      "sqlite": 0.0321,
+      "pglite": 0.013
     },
     "range-scan": {
-      "sqlite": 0.0851,
+      "sqlite": 0.0951,
       "pglite": 0.0369
     },
+    "deep-page": {
+      "sqlite": 4.57,
+      "pglite": 1.51
+    },
     "catalog-point-lookup": {
-      "sqlite": 0.0276,
-      "pglite": 0.0109
+      "sqlite": 0.0295,
+      "pglite": 0.012
     },
     "memo-hit-aggregate": {
-      "sqlite": 0.00025,
-      "pglite": 0.000387
+      "sqlite": 0.000271,
+      "pglite": 0.000408
     }
   }
 }

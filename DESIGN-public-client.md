@@ -28,10 +28,10 @@ The drift this predicts has already happened: `dropTable`, `createView`, and `dr
 
 Three defects block the adapter goal specifically:
 
-| Defect                             | Evidence                                                                                                                                                                                                 |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The driver seam speaks Minnow internals | `DslDriver.run()` takes `CompiledQuery` (`dsl/db.ts:61`). Kysely and Drizzle emit SQL strings; they can neither satisfy nor consume this contract.                                                     |
-| Two transaction models, neither adapter-shaped | `write()` scopes stage batches and expose no SQL DML from the main thread (`ClientWriteSession`, `client.ts:642`); SQL `BEGIN`/`COMMIT` runs through `execute()`. Adapters model a transaction as *a connection you run the same queries against*. Neither gives them one. |
+| Defect                                                 | Evidence                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The driver seam speaks Minnow internals                | `DslDriver.run()` takes `CompiledQuery` (`dsl/db.ts:61`). Kysely and Drizzle emit SQL strings; they can neither satisfy nor consume this contract.                                                                                                                                                                                          |
+| Two transaction models, neither adapter-shaped         | `write()` scopes stage batches and expose no SQL DML from the main thread (`ClientWriteSession`, `client.ts:642`); SQL `BEGIN`/`COMMIT` runs through `execute()`. Adapters model a transaction as _a connection you run the same queries against_. Neither gives them one.                                                                  |
 | Introspection is thinner than migration planning needs | `listTables()` returns `TableDefinition` — name, type, nullable, default, enum (`database.ts:630`). `planMigration` takes storage's `TableRecord`, which also carries the stable column `id` and `uniqueKeyColumnId` (`schema.ts:433`). Renames key off those IDs, so migration planning is reachable only through Minnow's own schema DSL. |
 
 ## Principles
@@ -71,9 +71,7 @@ itself. The worker RPC surface collapses from 36 methods to roughly seven frames
 ## The contract
 
 ```ts
-type Statement =
-  | { sql: string; params?: readonly QueryValue[] }
-  | { bulk: BulkWrite };
+type Statement = { sql: string; params?: readonly QueryValue[] } | { bulk: BulkWrite };
 
 interface BulkWrite {
   table: string;
@@ -159,12 +157,12 @@ highest-leverage item in this document.
 
 ## What each adapter needs
 
-| Adapter                | Needs from L1                                                             | Remaining work                                                                  |
-| ---------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Drizzle driver         | `execute`, `transaction`                                                  | Thin session shim. Nearly free.                                                 |
-| Kysely dialect         | `execute`, `transaction`, `introspect`                                    | A Minnow-flavored SQL query compiler. The real work; verified by the conformance harness. |
-| Migration tooling      | `introspect`, `transaction`, pure `planMigration`                          | None beyond the catalog change.                                                 |
-| `Minnow<DB>` builder   | `execute`, `transaction`, `subscribe`                                     | Re-target from `DslDriver`; render SQL unless `{ plan }` is admitted.           |
+| Adapter              | Needs from L1                                     | Remaining work                                                                            |
+| -------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Drizzle driver       | `execute`, `transaction`                          | Thin session shim. Nearly free.                                                           |
+| Kysely dialect       | `execute`, `transaction`, `introspect`            | A Minnow-flavored SQL query compiler. The real work; verified by the conformance harness. |
+| Migration tooling    | `introspect`, `transaction`, pure `planMigration` | None beyond the catalog change.                                                           |
+| `Minnow<DB>` builder | `execute`, `transaction`, `subscribe`             | Re-target from `DslDriver`; render SQL unless `{ plan }` is admitted.                     |
 
 ## Sequencing
 

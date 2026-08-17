@@ -149,6 +149,14 @@ const QUERIES: readonly PerfQuery[] = [
     params: [150_000, 154_000],
   },
   {
+    // A page deep enough that the bounded top-K sink retains most of what it scans. The bound
+    // buys a memory guarantee — retention stays proportional to the limit rather than the table
+    // — and past roughly a quarter of the rows it costs more time than sorting everything once.
+    // Gated so that trade stays where it was measured instead of drifting.
+    name: "deep-page",
+    sql: "SELECT id, amount FROM data ORDER BY region, id LIMIT 100000",
+  },
+  {
     // The same point lookup, run while the catalog holds many more tables than the query
     // touches. Per-query work that scales with the schema rather than the data shows up here
     // and nowhere else: a catalog scan per query once made this five times slower than the
