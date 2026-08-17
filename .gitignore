@@ -10,3 +10,4 @@ apps/site/.astro/
 apps/site/.next/
 apps/site/out/
 apps/site/.source/
+apps/site/public/vendor/

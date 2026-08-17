@@ -1,9 +1,14 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/core" },
-    { "path": "packages/devtools" },
-    { "path": "packages/devtools/demo" },
-    { "path": "apps/bench" }
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/devtools"
+    },
+    {
+      "path": "packages/devtools/demo"
+    }
   ]
 }

@@ -11,3 +11,15 @@
 /benchmarks/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
+
+# The build's own assets need the policy as well. A module worker spawned from an isolated
+# document is a new execution context that must opt into isolation, and Chrome blocks its script
+# outright when the response carries neither CORP nor COEP. Same-origin resource policy is what
+# these are anyway, so stating it costs nothing on the pages that are not isolated.
+/_next/*
+  Cross-Origin-Resource-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/vendor/*
+  Cross-Origin-Resource-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

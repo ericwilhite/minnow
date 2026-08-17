@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(path.join(repoRoot, "package.json"));
-const OUTPUT = path.join(repoRoot, "apps/site/src/data/library-sizes.json");
+const OUTPUT = path.join(repoRoot, "apps/site/components/bench/library-sizes.json");
 
 interface EngineSpec {
   id: string;

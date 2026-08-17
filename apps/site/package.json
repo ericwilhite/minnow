@@ -7,6 +7,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "predev": "node scripts/vendor-engines.mjs",
+    "prebuild": "node scripts/vendor-engines.mjs",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
@@ -25,6 +27,8 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "postcss": "^8.5.26",
-    "tailwindcss": "^4.3.3"
+    "tailwindcss": "^4.3.3",
+    "@electric-sql/pglite": "^0.5.5",
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
   }
 }

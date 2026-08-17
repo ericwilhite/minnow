@@ -1,11 +1,7 @@
 # Minnow `><(((('>`
 
-**A columnar SQL engine that runs entirely in the browser.** Typed queries, real SQL, full-text
-search, live results, and durable storage on IndexedDB — no server, no WASM file, no build step.
-
-Minnow is the engine. Use its typed builder directly, or treat it as the layer a framework
-binding or ORM-style adapter is written against — the driver contract, the storage contract, and
-the worker RPC are all public seams.
+**A columnar SQL engine that runs entirely in the browser.** Real SQL over immutable snapshots,
+durable on IndexedDB — no server, no WebAssembly to download, no build step.
 
 ```bash
 npm install @minnowdb/core
@@ -15,51 +11,55 @@ npm install @minnowdb/core
 
 ## Features
 
-- **One schema, everything typed** — a single declaration drives migrations, autocomplete, row
-  types, insert validation, and live subscriptions.
-- **SQL and a Kysely-style typed builder** — both compile to the same plans and run identically;
-  parameters bind per execution against a cached plan.
-- **SQL:2016 surface** — joins, CTEs, set operations, window functions, grouping sets, quantified
-  comparisons, upserts with `RETURNING`; the supported and rejected forms ship as a checked-in
-  feature matrix, and deliberate omissions are documented with reasons.
+- **Our own engine** — parser, planner, optimizer, and vectorized executor implemented here. No
+  SQLite or DuckDB underneath, and nothing to compile before the first query answers.
+- **SQL:2016 surface** — joins, CTEs including recursive, set operations, window functions,
+  grouping sets, quantified comparisons, upserts with `RETURNING`, triggers. The supported and
+  rejected forms ship as a checked-in feature matrix that is executed on every test run, and
+  deliberate omissions are documented with reasons.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
-  that builds itself in the background on large tables.
-- **Fast** — columnar blocks, vectorized execution, and a checked-in perf gate that pins every
-  query class against native SQLite and PGlite so a regression can't land unnoticed. In-browser
-  it leads on analytical reads and on bulk writes at every published scale; SQLite Wasm still
-  wins single-key lookups and small writes. The
-  [benchmarks](https://minnowdb.dev/benchmarks/) publish the raw captures, including the shapes
-  where it loses.
-- **Small** — 143 KB gzipped, and no WebAssembly to fetch: about a third of SQLite Wasm and a
-  fortieth of PGlite, both of which download a Wasm build before answering anything.
-- **Safe across tabs** — writes publish atomically; readers see the old version or the new one,
-  never half a write. Reads never block writes.
-- **Always fresh** — every query observes the latest committed state, even commits from another
-  tab; stale reads are unrepresentable. Multi-statement consistency is an explicit `snapshot()`
-  scope that releases itself.
-- **Built for real data** — compression, a memory budget you set, spill to storage, and durable,
-  resumable compaction and GC that fit in idle time.
-- **Workers first** — a shipped worker entry and main-thread client; the API is identical on
-  either side of the boundary.
-- **Live queries** — subscriptions re-run when their tables change, across tabs, and stay quiet
-  when results are unchanged.
-- **Devtools** — an embeddable SQL console and data browser for the database your app is already
-  using, shipped as a separate package.
-- **Our own engine** — parser, planner, optimizer, and executor implemented here; no SQLite or
-  DuckDB underneath.
-- **Differentially tested** — a seeded query corpus runs through the engine's two executors and
-  two independent oracles (native SQLite and PGlite) on every test run; results must agree.
+  that builds itself in the background once a table is large enough to want one.
+- **Columnar and durable** — immutable compressed column blocks on IndexedDB. Writes publish
+  atomically; another tab sees the old version or the new one, never half of one.
+- **Snapshot reads** — every query executes against one version, reads never block writes, and
+  stale reads are unrepresentable. Multi-statement consistency is an explicit scope that releases
+  itself.
+- **Bounded memory** — execution works in batches under a budget you set and spills to storage
+  rather than failing. A whole table is never required to be resident.
+- **Small** — about 143 KB gzipped, and no Wasm blob: roughly a third of SQLite's WebAssembly
+  build and a fortieth of PGlite's, both of which download and compile a module before answering
+  anything.
+- **Workers first** — a shipped worker entry and a main-thread client with an identical API.
+- **Snapshots** — copy one committed version out as a portable file and load it into any store.
+- **Devtools** — an embeddable SQL console and data browser, shipped as a separate package.
+- **Differentially tested** — a seeded query corpus runs through both executors and two
+  independent oracles (native SQLite and PGlite) on every test run; results must agree.
 
 ## Documentation
 
-Everything else — quick start, the schema DSL, queries, writes, live queries, workers, devtools,
-the full SQL feature matrix, benchmark results, contributor test runners, and the API reference —
-lives in the [docs site](https://minnowdb.dev/docs/), the single source of truth.
+Everything else — installation, running SQL, the language surface, the client API, transactions,
+workers, storage adapters, and the API reference — lives on the
+[docs site](https://minnowdb.dev/docs/).
+
+Two pages there are worth knowing about specifically:
+
+- **[Playground](https://minnowdb.dev/playground/)** — a real database of around 590,000 rows,
+  generated in your browser and stored in IndexedDB. Write whatever SQL you like against it.
+- **[Benchmarks](https://minnowdb.dev/benchmarks/)** — Minnow against SQLite Wasm and PGlite,
+  run live on your machine at a dataset size you choose. There are no published numbers to take
+  on trust; every result is checked against an independent oracle before its timing counts.
 
 [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) are internal engineering
 records of the design and milestone gates.
 
 ## Development
 
-See [Testing & benchmarks](https://minnowdb.dev/docs/testing/) for the contributor workflow,
-runner map, release gate, and benchmark capture process.
+```bash
+npm install
+npm run check          # format, typecheck, lint, build, unit tests
+npm run site:dev       # the docs site, playground and benchmarks
+npm run test:browser   # library and site tests in real browsers
+```
+
+See [Testing](https://minnowdb.dev/docs/reference/testing/) for the full runner map and the
+release gate.

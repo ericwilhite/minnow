@@ -8,24 +8,22 @@
     "apps/*"
   ],
   "scripts": {
-    "build": "tsc -b && npm run build --workspace @minnowdb/bench",
+    "build": "tsc -b && npm run build --workspace @minnowdb/site",
     "site:dev": "npm run dev --workspace @minnowdb/site",
-    "site:build": "tsc -b packages/core && npm run build --workspace @minnowdb/site",
-    "typecheck": "tsc -b --pretty false",
+    "site:build": "tsc -b packages/core packages/devtools && npm run build --workspace @minnowdb/site",
+    "typecheck": "tsc -b --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit",
     "test": "npm run test:unit",
     "test:unit": "vitest run",
-    "test:browser": "npm run test:browser:library && npm run test:browser:site && npm run test:browser:bench",
+    "test:browser": "npm run test:browser:library && npm run test:browser:site",
     "test:browser:library": "tsc -b packages/core && playwright test --config playwright.library.config.ts",
     "test:browser:site": "tsc -b packages/core && playwright test --config playwright.site.config.ts",
-    "test:browser:bench": "npm run build && playwright test --config playwright.bench.config.ts",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "check": "npm run format && npm run typecheck && npm run lint && npm run build && npm run test:unit",
     "check:release": "npm run check && npm run benchmark:gate && npm run test:browser",
     "benchmark:gate": "vite-node scripts/perf-gate.mts",
-    "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts",
-    "benchmark:capture": "tsc -b && playwright test --config apps/bench/capture/playwright.config.mjs"
+    "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
