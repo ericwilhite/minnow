@@ -148,6 +148,7 @@ import {
   type PredicateOperator,
   type CompiledQuery,
   type CompiledStatement,
+  type ForeignKeyDefinition,
   type Expression,
   type InsertValue,
   type PreparedQuery,
@@ -318,6 +319,8 @@ export interface CreateTableInput {
   columns: readonly ColumnDefinition[];
   /** Row conditions every written row must satisfy (E141-06); each is a boolean SQL expression. */
   checks?: ReadonlyArray<{ name: string; sql: string }>;
+  /** Single-column references to another table's unique key (E141-04). */
+  foreignKeys?: readonly ForeignKeyDefinition[];
   uniqueKey?: string;
 }
 
@@ -701,6 +704,26 @@ export interface QuerySpillCleanupResult {
   ownersRetained: number;
 }
 
+/**
+ * How deep a delete's referential actions may cascade. A chain of CASCADE keys can reach further
+ * tables; the bound stops a cycle from recursing, the same way the trigger chain is bounded.
+ */
+const REFERENTIAL_CASCADES = 8;
+
+/** One foreign key and the table that declares it, indexed by the parent it points at. */
+interface ChildForeignKey {
+  table: TableRecord;
+  key: NonNullable<TableRecord["foreignKeys"]>[number];
+}
+
+/** What one catalog epoch says beyond the tables themselves; see `#catalogFacts`. */
+interface CatalogFacts {
+  /** View name to its query text. */
+  views: ReadonlyMap<string, string>;
+  /** Parent table name to the foreign keys referencing it. */
+  childKeys: ReadonlyMap<string, readonly ChildForeignKey[]>;
+}
+
 /** Thrown into a held write scope to make it abort; never surfaces to a caller. */
 class TransactionRollback extends Error {
   constructor() {
@@ -841,8 +864,8 @@ export class MinnowDatabase {
    * staged blocks and a transaction record the collector cannot reclaim while it is open.
    */
   readonly #transactionIdleTimeoutMs: number;
-  /** The catalog's views by name at one epoch; see `#catalogViews`. */
-  #viewCache: { epoch: number; views: ReadonlyMap<string, string> } | undefined;
+  /** What the catalog says, derived once per epoch; see `#catalogFacts`. */
+  #catalogCache: { epoch: number; facts: CatalogFacts } | undefined;
   /** The scope a statement-level BEGIN opened, held until COMMIT, ROLLBACK, or the idle sweep. */
   #openTransaction:
     | {
@@ -979,6 +1002,54 @@ export class MinnowDatabase {
         );
       }
     }
+    const foreignKeys = await Promise.all(
+      (input.foreignKeys ?? []).map(async (key) => {
+        const child = columns.find((column) => column.name === key.column);
+        if (child === undefined) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} names a column this table has no: ${key.column}`,
+          );
+        }
+        // Self-references are allowed, and then the parent is this very table, which does not
+        // exist yet — its own declaration is the authority on the key.
+        const parent =
+          key.parentTable === name ? undefined : await this.store.getTableByName(key.parentTable);
+        if (key.parentTable !== name && parent === undefined) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} references a table that does not exist: ${key.parentTable}`,
+          );
+        }
+        const parentKey =
+          parent === undefined
+            ? columns.find((column) => column.name === input.uniqueKey)
+            : getUniqueKeyColumn(parent);
+        if (parentKey === undefined) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} references a table with no unique key: ${key.parentTable}`,
+          );
+        }
+        if (key.parentColumn !== undefined && key.parentColumn !== parentKey.name) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} must reference ${key.parentTable}'s unique key ${parentKey.name}`,
+          );
+        }
+        if (child.type !== parentKey.type) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} compares ${child.type} with ${parentKey.type}`,
+          );
+        }
+        if (key.onDelete === "set null" && !child.nullable) {
+          throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
+        }
+        return {
+          name: validateName(key.name, "Constraint"),
+          column: key.column,
+          parentTable: key.parentTable,
+          parentColumn: parentKey.name,
+          onDelete: key.onDelete,
+        };
+      }),
+    );
     const checks = (input.checks ?? []).map((check) => {
       // Compiling here means a constraint the engine could never evaluate is refused at
       // definition rather than on the first write.
@@ -989,6 +1060,7 @@ export class MinnowDatabase {
       id: this.#createId(),
       name,
       columns,
+      ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
       ...(checks.length === 0 ? {} : { checks }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
@@ -1114,6 +1186,13 @@ export class MinnowDatabase {
       if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
         throw new TypeError(`Cannot drop ${table.name}: view ${owner.name} reads it`);
       }
+      for (const key of owner.foreignKeys ?? []) {
+        if (key.parentTable === table.name) {
+          throw new TypeError(
+            `Cannot drop ${table.name}: foreign key ${key.name} on ${owner.name} references it`,
+          );
+        }
+      }
       for (const trigger of owner.triggers ?? []) {
         const writesHere = trigger.statements.some((statement) => {
           const compiled = compileStatement(statement.sql);
@@ -1131,18 +1210,31 @@ export class MinnowDatabase {
         }
       }
     }
-    const segments = await this.store.listSegments(table.id);
-    const blockIds = [
-      ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
-    ];
-    const transaction = await this.#transactions.begin();
-    try {
-      transaction.markTableChanged(table.id);
-      if (blockIds.length > 0) transaction.supersedeBlocks(blockIds);
-      await transaction.commit();
-    } catch (error) {
-      await transaction.abort();
-      throw error;
+    // Retiring the blocks is a commit like any other, and background compaction publishes
+    // underneath it: a block this table owned a moment ago can already have been rewritten. The
+    // list is therefore taken from the transaction's own snapshot — the manifest its commit will
+    // be validated against — and a scope that loses the race simply runs again.
+    for (let attempt = 0; ; attempt += 1) {
+      const transaction = await this.#transactions.begin();
+      try {
+        const segments = await this.store.listSegments(table.id);
+        const snapshot =
+          transaction.snapshotVersion === null
+            ? undefined
+            : await this.store.getManifest(transaction.snapshotVersion);
+        const live = new Set(snapshot?.blockIds ?? []);
+        const blockIds = [
+          ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+        ].filter((id) => live.has(id));
+        transaction.markTableChanged(table.id);
+        if (blockIds.length > 0) transaction.supersedeBlocks(blockIds);
+        await transaction.commit();
+        break;
+      } catch (error) {
+        await transaction.abort();
+        if (!(error instanceof WriteConflictError) || attempt >= this.#maxCommitRetries)
+          throw error;
+      }
     }
     // The catalog goes last: until it does, the table is merely empty of live blocks, and a
     // crash in between leaves a table whose rows are gone rather than a segment pointing at a
@@ -1155,6 +1247,11 @@ export class MinnowDatabase {
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
     const table = await this.#findTable(tableName);
     const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    await this.#assertForeignKeysPresent(
+      table,
+      (column) => batch.columns[column] ?? [],
+      (sql, params) => this.query(sql, { params, memoize: false }),
+    );
     const keys =
       autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
         ? batchKeys(table, batch)
@@ -1196,6 +1293,11 @@ export class MinnowDatabase {
       throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
     }
     const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    await this.#assertForeignKeysPresent(
+      table,
+      (column) => batch.columns[column] ?? [],
+      (sql, params) => this.query(sql, { params, memoize: false }),
+    );
     const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
     const keys = deferred ? undefined : batchKeys(table, batch);
     const result = await this.#withTriggerRestarts(() =>
@@ -1220,6 +1322,11 @@ export class MinnowDatabase {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
     }
     const keys = validateUpdateBatch(table, keyColumn, input);
+    await this.#assertForeignKeysPresent(
+      table,
+      (column) => input.changes[column] ?? [],
+      (sql, params) => this.query(sql, { params, memoize: false }),
+    );
     return this.#withTriggerRestarts(() => this.#writeUpdateBatch(table, keyColumn, input, keys));
   }
 
@@ -1235,7 +1342,38 @@ export class MinnowDatabase {
   }
 
   async deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
-    return this.#withTriggerRestarts(() => this.#deleteBatchOnce(tableName, input));
+    const dependents = await this.#childForeignKeys(tableName);
+    if (dependents.length === 0) {
+      return this.#withTriggerRestarts(() => this.#deleteBatchOnce(tableName, input));
+    }
+    // E141-04: the referential actions and the delete itself publish as one commit, so no tab
+    // can observe a parent gone while its children still point at it.
+    const table = await this.#findTable(tableName);
+    const started = performance.now();
+    const { result, version } = await this.write(async (session) => {
+      await this.#applyReferentialActions(table, [...input.keys], session, REFERENTIAL_CASCADES);
+      return session.deleteBatch(tableName, input);
+    });
+    return {
+      tableName,
+      segmentId: result.segmentId,
+      requestedKeyCount: input.keys.length,
+      deletedRowCount: result.rowCount,
+      blockCount: 0,
+      storedBytes: 0,
+      version,
+      metrics: {
+        logicalBytes: 0,
+        storedBytes: 0,
+        writeAmplification: 0,
+        encodeMs: 0,
+        stageMs: 0,
+        commitMs: 0,
+        totalMs: performance.now() - started,
+        retries: 0,
+        rowsPerSecond: 0,
+      },
+    };
   }
 
   async #deleteBatchOnce(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
@@ -2468,7 +2606,7 @@ export class MinnowDatabase {
     // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
     // result memoization — and only re-reads the view set when the catalog has actually moved.
     // A database with no views therefore pays one probe, not a catalog scan per query.
-    const views = await this.#catalogViews();
+    const { views } = await this.#catalogFacts();
     let rewritten = plan;
     if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
@@ -2497,22 +2635,34 @@ export class MinnowDatabase {
   }
 
   /**
-   * The catalog's views by name, cached against the catalog epoch. Every read consults this, so
-   * the steady state has to be one probe and no allocation; the list is rebuilt only when a
-   * catalog mutation — anywhere, including another tab — moves the epoch.
+   * The two things the catalog knows that statements cannot: which names are views, and which
+   * tables reference which. Both are consulted by every read or write of the relevant kind, so
+   * the steady state has to be one epoch probe and no allocation; the facts are rebuilt only
+   * when a catalog mutation — anywhere, including another tab — moves the epoch.
    */
-  async #catalogViews(): Promise<ReadonlyMap<string, string>> {
+  async #catalogFacts(): Promise<CatalogFacts> {
     const probe = await this.store.getCatalogProbe?.();
     const epoch = probe?.catalogEpoch;
-    const cached = this.#viewCache;
-    if (cached !== undefined && epoch !== undefined && cached.epoch === epoch) return cached.views;
-    const views = new Map(
-      (await this.store.listTables()).flatMap((table) =>
-        table.view === undefined ? [] : [[table.name, table.view.sql] as const],
-      ),
-    );
-    if (epoch !== undefined) this.#viewCache = { epoch, views };
-    return views;
+    const cached = this.#catalogCache;
+    if (cached !== undefined && epoch !== undefined && cached.epoch === epoch) return cached.facts;
+    const views = new Map<string, string>();
+    const childKeys = new Map<string, ChildForeignKey[]>();
+    for (const table of await this.store.listTables()) {
+      if (table.view !== undefined) views.set(table.name, table.view.sql);
+      for (const key of table.foreignKeys ?? []) {
+        const existing = childKeys.get(key.parentTable);
+        if (existing === undefined) childKeys.set(key.parentTable, [{ table, key }]);
+        else existing.push({ table, key });
+      }
+    }
+    const facts: CatalogFacts = { views, childKeys };
+    if (epoch !== undefined) this.#catalogCache = { epoch, facts };
+    return facts;
+  }
+
+  /** Every foreign key pointing at one table, with the table that declares it. */
+  async #childForeignKeys(parentName: string): Promise<readonly ChildForeignKey[]> {
+    return (await this.#catalogFacts()).childKeys.get(parentName) ?? [];
   }
 
   /**
@@ -3727,6 +3877,11 @@ export class MinnowDatabase {
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
     const { batch, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    await this.#assertForeignKeysPresent(
+      table,
+      (column) => batch.columns[column] ?? [],
+      (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+    );
     if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
         table.id,
@@ -3846,6 +4001,11 @@ export class MinnowDatabase {
     if (committedKeys.size > 0) {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
     }
+    await this.#assertForeignKeysPresent(
+      table,
+      (column) => input.changes[column] ?? [],
+      (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+    );
     const sessionChecks = table.checks ?? [];
     const preImages = await this.#triggerPreImages(
       table,
@@ -3949,12 +4109,26 @@ export class MinnowDatabase {
     tableName: string,
     input: DeleteBatchInput,
     cascadeBudget = 1,
+    referentialBudget = REFERENTIAL_CASCADES,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
     }
+    // The dependents go first and in this same scope, so a cascade publishes with its cause.
+    await this.#applyReferentialActions(
+      table,
+      [...input.keys],
+      {
+        query: (sql, options) => this.#sessionQuery(transaction, sql, options ?? {}),
+        updateBatch: (name, update) =>
+          this.#sessionUpdate(transaction, name, update, cascadeBudget),
+        deleteBatch: (name, remove) =>
+          this.#sessionDelete(transaction, name, remove, cascadeBudget, referentialBudget - 1),
+      },
+      referentialBudget,
+    );
     if (input.keys.length === 0) throw new TypeError("A delete batch needs at least one key");
     const keys = new Map<string, Exclude<BatchValue, null>>();
     input.keys.forEach((value, index) => {
@@ -4285,6 +4459,112 @@ export class MinnowDatabase {
       );
     }
     return this.runStatement(bindStatementParameters(statement, params));
+  }
+
+  /**
+   * E141-04 on the child side: every non-null value written into a referencing column must name
+   * a row that exists in the parent. The probe is the parent's own unique-key membership — the
+   * same index the keyed write paths address rows by — read through the writing transaction, so
+   * a child inserted next to its parent in one scope sees it.
+   */
+  async #assertForeignKeysPresent(
+    table: TableRecord,
+    rowsByColumn: (column: string) => readonly BatchValue[],
+    read: (sql: string, params: QueryValue[]) => Promise<QueryResult>,
+  ): Promise<void> {
+    for (const key of table.foreignKeys ?? []) {
+      const values = rowsByColumn(key.column);
+      const wanted = [...new Set(values.filter((value): value is QueryValue => value !== null))];
+      if (wanted.length === 0) continue;
+      // A NULL reference names no parent, which the standard leaves satisfied.
+      const parent = await this.store.getTableByName(key.parentTable);
+      if (parent === undefined) {
+        throw new TypeError(
+          `FOREIGN KEY ${key.name} references a missing table: ${key.parentTable}`,
+        );
+      }
+      const found = await read(
+        `SELECT ${quoteSqlIdentifier(key.parentColumn)} AS parent_key FROM ${quoteSqlIdentifier(
+          key.parentTable,
+        )} WHERE ${quoteSqlIdentifier(key.parentColumn)} IN (${wanted.map(() => "?").join(", ")})`,
+        wanted,
+      );
+      // Compared by the same token the keyed paths use, so 1 and '1' cannot pass for each other.
+      const token = (value: QueryValue): string =>
+        value instanceof Date ? `d${value.toISOString()}` : `${typeof value}:${String(value)}`;
+      const present = new Set(
+        found.rows.flatMap((row) => {
+          const value = row.parent_key ?? null;
+          return value === null ? [] : [token(value)];
+        }),
+      );
+      const missing = wanted.find((value) => !present.has(token(value)));
+      if (missing !== undefined) {
+        throw new TypeError(
+          `FOREIGN KEY ${key.name} has no ${key.parentTable} row with ${key.parentColumn} ${String(missing)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * E141-04 on the parent side: what a delete does to the rows referencing the parent it
+   * removes. RESTRICT refuses, CASCADE deletes them, SET NULL clears the reference — each
+   * applied inside the deleting transaction, so the parent and its dependents publish together.
+   * A cascade that reaches another parent cascades again, bounded like a trigger chain.
+   */
+  async #applyReferentialActions(
+    parent: TableRecord,
+    keys: readonly QueryValue[],
+    session: {
+      query: (sql: string, options?: { params?: QueryOptions["params"] }) => Promise<QueryResult>;
+      updateBatch: (table: string, input: UpdateBatchInput) => Promise<unknown>;
+      deleteBatch: (table: string, input: DeleteBatchInput) => Promise<unknown>;
+    },
+    cascadeBudget: number,
+  ): Promise<void> {
+    if (keys.length === 0) return;
+    const children = await this.#childForeignKeys(parent.name);
+    if (children.length === 0) return;
+    if (cascadeBudget < 0) {
+      throw new Error(`Referential cascade depth exceeded at table: ${parent.name}`);
+    }
+    const placeholders = keys.map(() => "?").join(", ");
+    for (const { table: child, key } of children) {
+      const childKeyColumn = getUniqueKeyColumn(child);
+      const selected =
+        childKeyColumn === undefined
+          ? quoteSqlIdentifier(key.column)
+          : `${quoteSqlIdentifier(childKeyColumn.name)} AS child_key`;
+      const affected = await session.query(
+        `SELECT ${selected} FROM ${quoteSqlIdentifier(child.name)} WHERE ${quoteSqlIdentifier(
+          key.column,
+        )} IN (${placeholders})`,
+        { params: [...keys] },
+      );
+      if (affected.rows.length === 0) continue;
+      if (key.onDelete === "restrict") {
+        throw new TypeError(
+          `FOREIGN KEY ${key.name} still has ${String(affected.rows.length)} ${child.name} row(s) referencing ${parent.name}`,
+        );
+      }
+      if (childKeyColumn === undefined) {
+        throw new TypeError(
+          `FOREIGN KEY ${key.name} needs a unique key on ${child.name} to ${key.onDelete}`,
+        );
+      }
+      const childKeys = affected.rows
+        .map((row) => row.child_key ?? null)
+        .filter((value): value is Exclude<BatchValue, null> => value !== null);
+      if (key.onDelete === "cascade") {
+        await session.deleteBatch(child.name, { keys: childKeys });
+        continue;
+      }
+      await session.updateBatch(child.name, {
+        keys: childKeys,
+        changes: { [key.column]: childKeys.map(() => null) },
+      });
+    }
   }
 
   /** Runs one statement inside an open transaction, holding off the idle sweep while it does. */
@@ -4689,6 +4969,7 @@ export class MinnowDatabase {
         name: statement.table,
         columns: statement.columns,
         ...(statement.checks === undefined ? {} : { checks: statement.checks }),
+        ...(statement.foreignKeys === undefined ? {} : { foreignKeys: statement.foreignKeys }),
         ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
       });
       return { kind: "create-table", table: statement.table };

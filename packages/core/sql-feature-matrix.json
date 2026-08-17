@@ -1155,14 +1155,6 @@
       "example": "CREATE TABLE copied AS SELECT region FROM rows"
     },
     {
-      "id": "ddl.foreign-key",
-      "feature": "E141-04",
-      "status": "unsupported",
-      "example": "CREATE TABLE child (a INTEGER, b INTEGER REFERENCES rows(amount))",
-      "error": "FOREIGN KEY constraints are not supported",
-      "notes": "Referential actions would have to run on every write path of every table; the engine has no cross-table write hook."
-    },
-    {
       "id": "privileges.grant",
       "feature": "E081",
       "status": "unsupported",
@@ -1270,6 +1262,14 @@
       "status": "supported",
       "example": "CREATE TABLE checked (a INTEGER NOT NULL CHECK (a > 0), CONSTRAINT small CHECK (a < 100))",
       "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row — insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
+    },
+    {
+      "id": "ddl.foreign-key",
+      "feature": "E141-04",
+      "status": "supported",
+      "setup": ["CREATE TABLE parents (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"],
+      "example": "CREATE TABLE children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
+      "notes": "Single-column references to the parent's unique key, which is the column the engine can probe for existence and the one its keyed writes address rows by. Every write of a referencing column checks the parent exists, reading through the writing transaction so a child inserted beside its parent in one scope sees it; a NULL reference names no parent and is satisfied. ON DELETE takes RESTRICT (the default), CASCADE, and SET NULL, applied inside the deleting transaction. ON UPDATE has nothing to act on, because a unique key cannot change."
     }
   ]
 }

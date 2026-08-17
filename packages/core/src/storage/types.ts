@@ -208,6 +208,18 @@ export interface TableRecord {
   /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
   triggers?: TriggerRecord[];
   /**
+   * Single-column FOREIGN KEY constraints (E141-04). The referenced column is the parent's
+   * unique key, which is what the engine can probe for existence and what its keyed write paths
+   * address rows by; a parent key never changes, so only ON DELETE has an action to take.
+   */
+  foreignKeys?: Array<{
+    name: string;
+    column: string;
+    parentTable: string;
+    parentColumn: string;
+    onDelete: "restrict" | "cascade" | "set null";
+  }>;
+  /**
    * Row-level CHECK constraints (E141-06), each the text of a boolean expression over this
    * table's own columns. Text rather than a compiled form because the record crosses the worker
    * boundary and IndexedDB; the writer compiles it and evaluates it against every row it writes.

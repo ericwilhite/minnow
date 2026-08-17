@@ -1111,10 +1111,91 @@ describe("E141/F031 schema statements", () => {
     await expect(database.execute("CREATE TABLE c (a INTEGER CHECK (SUM(a) > 0))")).rejects.toThrow(
       "takes a row condition, not an aggregate",
     );
-    // FOREIGN KEY still has no enforcement path, and says so rather than being ignored.
+    // A reference to a table that is not there is refused where it is written.
     await expect(
       database.execute("CREATE TABLE c (a INTEGER, b INTEGER REFERENCES other(id))"),
-    ).rejects.toThrow("FOREIGN KEY constraints are not supported");
+    ).rejects.toThrow("references a table that does not exist: other");
+  });
+
+  it("enforces foreign keys on both sides (E141-04)", async () => {
+    const database = await fresh();
+    await database.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    await database.execute(
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer INTEGER NOT NULL REFERENCES customers(id), total INTEGER NOT NULL)",
+    );
+    await database.execute(
+      "CREATE TABLE notes (id INTEGER PRIMARY KEY, customer INTEGER REFERENCES customers(id) ON DELETE SET NULL, body TEXT NOT NULL)",
+    );
+    await database.execute(
+      "CREATE TABLE logs (id INTEGER PRIMARY KEY, customer INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE)",
+    );
+    await database.execute("INSERT INTO customers (id, name) VALUES (1, 'ada'), (2, 'grace')");
+
+    // Child side: a value must name a row that exists, on insert and on update alike.
+    await database.execute("INSERT INTO orders (id, customer, total) VALUES (10, 1, 5)");
+    await expect(
+      database.execute("INSERT INTO orders (id, customer, total) VALUES (11, 99, 5)"),
+    ).rejects.toThrow("has no customers row with id 99");
+    await expect(database.execute("UPDATE orders SET customer = 98 WHERE id = 10")).rejects.toThrow(
+      "has no customers row with id 98",
+    );
+    // A NULL reference names no parent, which the standard leaves satisfied.
+    await database.execute("INSERT INTO notes (id, customer, body) VALUES (20, NULL, 'none')");
+
+    // Parent side: the default refuses while a child still points at the row.
+    await expect(database.execute("DELETE FROM customers WHERE id = 1")).rejects.toThrow(
+      "still has 1 orders row(s) referencing customers",
+    );
+    // With the referencing order gone, the other two actions run: SET NULL clears, CASCADE deletes.
+    await database.execute("INSERT INTO notes (id, customer, body) VALUES (21, 1, 'about ada')");
+    await database.execute("INSERT INTO logs (id, customer) VALUES (30, 1)");
+    await database.execute("DELETE FROM orders WHERE id = 10");
+    await database.execute("DELETE FROM customers WHERE id = 1");
+    expect((await database.query("SELECT id, customer FROM notes ORDER BY id")).rows).toEqual([
+      { id: 20, customer: null },
+      { id: 21, customer: null },
+    ]);
+    expect((await database.query("SELECT COUNT(*) AS n FROM logs")).rows).toEqual([{ n: 0 }]);
+    // And the table cannot be dropped while something references it.
+    // Whichever key the catalog reports first, the drop names it and refuses.
+    await expect(database.execute("DROP TABLE customers")).rejects.toThrow(
+      /Cannot drop customers: foreign key \w+ on \w+ references it/,
+    );
+  });
+
+  it("refuses references it could not keep", async () => {
+    const database = await fresh();
+    await database.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    // The reference has to be to the parent's unique key: that is the only column the engine can
+    // probe for existence and the only one its keyed writes address rows by.
+    await expect(
+      database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(name))"),
+    ).rejects.toThrow("must reference customers's unique key id");
+    await expect(
+      database.execute("CREATE TABLE c (a TEXT REFERENCES customers(id))"),
+    ).rejects.toThrow("compares string with number");
+    await expect(
+      database.execute(
+        "CREATE TABLE c (a INTEGER NOT NULL REFERENCES customers(id) ON DELETE SET NULL)",
+      ),
+    ).rejects.toThrow("cannot SET NULL a NOT NULL column");
+    // A unique key never changes here, so an ON UPDATE action would have nothing to act on.
+    await expect(
+      database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(id) ON UPDATE CASCADE)"),
+    ).rejects.toThrow("has nothing to act on");
+  });
+
+  it("keeps a cascade atomic with the delete that caused it", async () => {
+    const database = await fresh();
+    await database.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute(
+      "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE, note TEXT NOT NULL CHECK (LENGTH(note) < 4))",
+    );
+    await database.execute("INSERT INTO parent (id, n) VALUES (1, 1)");
+    await database.execute("INSERT INTO child (id, p, note) VALUES (10, 1, 'ok')");
+    await database.execute("DELETE FROM parent WHERE id = 1");
+    expect((await database.query("SELECT COUNT(*) AS n FROM child")).rows).toEqual([{ n: 0 }]);
+    expect((await database.query("SELECT COUNT(*) AS n FROM parent")).rows).toEqual([{ n: 0 }]);
   });
 });
 

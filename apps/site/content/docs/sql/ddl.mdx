@@ -46,9 +46,24 @@ CREATE TABLE orders (
 A constraint fails only when it evaluates to false, so SQL's unknown passes: a NULL column
 satisfies `CHECK (total >= 0)` unless the column is also `NOT NULL`.
 
-`FOREIGN KEY` is rejected rather than accepted and ignored: referential actions would have to run
-on every write path of every table, and the engine has no cross-table write hook to hang them on.
-A `BEFORE` trigger can raise instead.
+A `FOREIGN KEY` references another table's unique key — the column the engine can probe for
+existence, and the one its keyed writes address rows by:
+
+```sql
+CREATE TABLE orders (
+  order_id INTEGER PRIMARY KEY,
+  customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+  note_id INTEGER REFERENCES notes(note_id) ON DELETE SET NULL
+)
+```
+
+Every write of a referencing column checks that the parent row exists, reading through the writing
+transaction, so a child inserted beside its parent in one scope sees it. A NULL reference names no
+parent and is satisfied.
+
+`ON DELETE` takes `RESTRICT` (the default), `CASCADE`, and `SET NULL`, and the action runs inside
+the deleting transaction — a parent and its dependents publish together or not at all. `ON UPDATE`
+has nothing to act on, because a unique key cannot change.
 
 A table without a `PRIMARY KEY` is append-only. That is a reasonable choice for an event log, and
 a mistake for anything a user edits, because it cannot be changed later without recreating the

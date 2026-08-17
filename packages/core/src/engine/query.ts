@@ -1050,6 +1050,18 @@ export type MergeBranch =
       action: { kind: "insert"; columns: string[]; values: Expression[] };
     };
 
+/**
+ * One FOREIGN KEY as written (E141-04). The parent column is optional in the text and defaults
+ * to the parent's unique key, which is the only column this engine can reference.
+ */
+export interface ForeignKeyDefinition {
+  name: string;
+  column: string;
+  parentTable: string;
+  parentColumn?: string;
+  onDelete: "restrict" | "cascade" | "set null";
+}
+
 /** An INSERT value: a constant, or an unbound `?`/`$n` placeholder awaiting its parameter. */
 export type InsertValue = QueryValue | { parameter: number };
 
@@ -1101,6 +1113,7 @@ export type CompiledStatement =
         defaultValue?: ColumnDefault;
       }>;
       checks?: Array<{ name: string; sql: string }>;
+      foreignKeys?: ForeignKeyDefinition[];
       uniqueKey?: string;
       /** CREATE TABLE IF NOT EXISTS: an existing table of that name is left alone. */
       ifNotExists?: boolean;
@@ -4592,18 +4605,31 @@ class Parser {
       defaultValue?: ColumnDefault;
     }> = [];
     const checks: Array<{ name: string; sql: string }> = [];
+    const foreignKeys: ForeignKeyDefinition[] = [];
     let uniqueKey: string | undefined;
     for (;;) {
-      if (this.#isKeyword("CONSTRAINT") || this.#isKeyword("CHECK")) {
-        // A table-level constraint, named or not. Only CHECK reaches here; the key clauses
-        // below take the same optional name.
+      if (this.#isKeyword("CONSTRAINT") || this.#isKeyword("CHECK") || this.#isKeyword("FOREIGN")) {
+        // A table-level constraint, named or not.
         let constraintName: string | undefined;
         if (this.#isKeyword("CONSTRAINT")) {
           this.#keyword("CONSTRAINT");
           constraintName = this.#identifier();
         }
+        if (this.#isKeyword("FOREIGN")) {
+          this.#keyword("FOREIGN");
+          this.#keyword("KEY");
+          this.#expectPunctuation("(");
+          const column = this.#identifier();
+          if (this.#peek().text === ",") {
+            throw new TypeError("FOREIGN KEY supports one column, the parent's unique key");
+          }
+          this.#expectPunctuation(")");
+          foreignKeys.push(this.#references(constraintName ?? `${table}_${column}_fkey`, column));
+          if (!this.#punctuation(",")) break;
+          continue;
+        }
         if (!this.#isKeyword("CHECK")) {
-          throw new TypeError("Only CHECK constraints take a CONSTRAINT name");
+          throw new TypeError("Table constraints are CHECK and FOREIGN KEY");
         }
         checks.push(
           this.#checkConstraint(constraintName ?? `${table}_check_${String(checks.length + 1)}`),
@@ -4649,7 +4675,8 @@ class Parser {
           continue;
         }
         if (this.#isKeyword("REFERENCES")) {
-          throw new TypeError("FOREIGN KEY constraints are not supported");
+          foreignKeys.push(this.#references(`${table}_${name}_fkey`, name));
+          continue;
         }
         if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
           if (this.#isKeyword("PRIMARY")) {
@@ -4724,8 +4751,69 @@ class Parser {
       ),
       ...(uniqueKey === undefined ? {} : { uniqueKey }),
       ...(checks.length === 0 ? {} : { checks }),
+      ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
       ...(ifNotExists ? { ifNotExists: true } : {}),
     };
+  }
+
+  /**
+   * `REFERENCES parent(column) [ON DELETE action] [ON UPDATE action]` (E141-04, T191). A parent
+   * key cannot change in this engine, so ON UPDATE has nothing to act on and only the
+   * no-op actions parse; ON DELETE takes the three the engine can carry out.
+   */
+  #references(name: string, column: string): ForeignKeyDefinition {
+    this.#keyword("REFERENCES");
+    const parentTable = this.#identifier();
+    let parentColumn: string | undefined;
+    if (this.#punctuation("(")) {
+      parentColumn = this.#identifier();
+      this.#expectPunctuation(")");
+    }
+    let onDelete: ForeignKeyDefinition["onDelete"] = "restrict";
+    while (this.#isKeyword("ON")) {
+      this.#keyword("ON");
+      const event = this.#isKeyword("DELETE") ? "delete" : "update";
+      this.#keyword(event === "delete" ? "DELETE" : "UPDATE");
+      const action = this.#referentialAction();
+      if (event === "update") {
+        if (action !== "restrict") {
+          throw new TypeError(
+            `ON UPDATE ${action.toUpperCase()} has nothing to act on: a unique key cannot change`,
+          );
+        }
+        continue;
+      }
+      onDelete = action;
+    }
+    return {
+      name,
+      column,
+      parentTable,
+      ...(parentColumn === undefined ? {} : { parentColumn }),
+      onDelete,
+    };
+  }
+
+  #referentialAction(): ForeignKeyDefinition["onDelete"] {
+    if (this.#isKeyword("CASCADE")) {
+      this.#keyword("CASCADE");
+      return "cascade";
+    }
+    if (this.#isKeyword("SET")) {
+      this.#keyword("SET");
+      if (this.#isKeyword("DEFAULT")) {
+        throw new TypeError("SET DEFAULT is not supported; use SET NULL or CASCADE");
+      }
+      this.#keyword("NULL");
+      return "set null";
+    }
+    if (this.#isKeyword("NO")) {
+      this.#keyword("NO");
+      this.#keyword("ACTION");
+      return "restrict";
+    }
+    this.#keyword("RESTRICT");
+    return "restrict";
   }
 
   /**
