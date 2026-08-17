@@ -105,3 +105,13 @@ export function defineSqlResultProperty(
     writable: true,
   });
 }
+
+/**
+ * A scalar function's string operand, or a type error naming the function. Shared because both
+ * the scalar evaluator and the SQL/JSON functions insist on real strings rather than coercing:
+ * a silent coercion here would make `LENGTH(42)` answer instead of failing.
+ */
+export function stringArgument(name: string, value: unknown): string {
+  if (typeof value !== "string") throw new TypeError(`${name} requires a string argument`);
+  return value;
+}

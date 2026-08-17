@@ -841,6 +841,8 @@ export class MinnowDatabase {
    * staged blocks and a transaction record the collector cannot reclaim while it is open.
    */
   readonly #transactionIdleTimeoutMs: number;
+  /** The catalog's views by name at one epoch; see `#catalogViews`. */
+  #viewCache: { epoch: number; views: ReadonlyMap<string, string> } | undefined;
   /** The scope a statement-level BEGIN opened, held until COMMIT, ROLLBACK, or the idle sweep. */
   #openTransaction:
     | {
@@ -848,7 +850,10 @@ export class MinnowDatabase {
         settle: (outcome: "commit" | "rollback") => void;
         finished: Promise<{ version: number | null | undefined }>;
         timer: ReturnType<typeof setInterval>;
-        touched: boolean;
+        /** Statements running right now: a transaction working is never idle, however slow. */
+        busy: number;
+        /** When the last statement started or finished, by the injected clock. */
+        activeAt: number;
       }
     | undefined;
   readonly #compression: Compression;
@@ -1100,10 +1105,15 @@ export class MinnowDatabase {
       throw new Error(`Table not found: ${tableName}`);
     }
     if (table.view !== undefined) throw new TypeError(`${tableName} is a view; use DROP VIEW`);
-    // A trigger elsewhere whose body writes to this table would fail at every firing, which is
-    // a worse outcome than refusing the drop — the same rule a column rename follows.
+    // Anything that would be left pointing at a table that is no longer there refuses the drop:
+    // a view over it would fail on its next read, and a trigger body writing to it at every
+    // firing. Both are worse outcomes than an error here, which is the rule a column rename
+    // already follows.
     for (const owner of await this.store.listTables()) {
       if (owner.id === table.id) continue;
+      if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
+        throw new TypeError(`Cannot drop ${table.name}: view ${owner.name} reads it`);
+      }
       for (const trigger of owner.triggers ?? []) {
         const writesHere = trigger.statements.some((statement) => {
           const compiled = compileStatement(statement.sql);
@@ -2402,10 +2412,8 @@ export class MinnowDatabase {
     if (open !== undefined) {
       // Read-your-writes: inside BEGIN … COMMIT a read sees the pre-scope snapshot plus what
       // this transaction has staged, and nothing another writer published in between.
-      open.touched = true;
-      return open.session.query(
-        sql,
-        options.params === undefined ? {} : { params: options.params },
+      return this.#duringTransaction(open, () =>
+        open.session.query(sql, options.params === undefined ? {} : { params: options.params }),
       );
     }
     const plan = bindPlanParameters(this.#compileCached(sql), options.params);
@@ -2456,13 +2464,11 @@ export class MinnowDatabase {
   async #applyCatalogRewrites(plan: CompiledQuery): Promise<CompiledQuery> {
     const aliased = planHasSourceColumnAliases(plan);
     const natural = planHasNaturalJoins(plan);
-    // A view reference is indistinguishable from a table reference without the catalog, so the
-    // cheap pre-check is whether the statement names anything at all beyond its own derived
-    // sources — which every statement does. The catalog read is one cached list.
-    const tables = await this.store.listTables();
-    const views = new Map(
-      tables.flatMap((table) => (table.view === undefined ? [] : [[table.name, table.view.sql]])),
-    );
+    // Whether a name is a view cannot be read off the statement, so this is the one thing every
+    // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
+    // result memoization — and only re-reads the view set when the catalog has actually moved.
+    // A database with no views therefore pays one probe, not a catalog scan per query.
+    const views = await this.#catalogViews();
     let rewritten = plan;
     if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
@@ -2477,12 +2483,36 @@ export class MinnowDatabase {
       });
     }
     if (!aliased && !natural) return rewritten;
+    // These two need column *order*, which only the records carry; both are rare enough that
+    // reading the catalog for them is fine.
     const columns = new Map(
-      tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
+      (await this.store.listTables()).map((table) => [
+        table.name,
+        table.columns.map(({ name }) => name),
+      ]),
     );
     const columnsOf = (name: string): readonly string[] | undefined => columns.get(name);
     if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
     return natural ? expandNaturalJoins(rewritten, columnsOf) : rewritten;
+  }
+
+  /**
+   * The catalog's views by name, cached against the catalog epoch. Every read consults this, so
+   * the steady state has to be one probe and no allocation; the list is rebuilt only when a
+   * catalog mutation — anywhere, including another tab — moves the epoch.
+   */
+  async #catalogViews(): Promise<ReadonlyMap<string, string>> {
+    const probe = await this.store.getCatalogProbe?.();
+    const epoch = probe?.catalogEpoch;
+    const cached = this.#viewCache;
+    if (cached !== undefined && epoch !== undefined && cached.epoch === epoch) return cached.views;
+    const views = new Map(
+      (await this.store.listTables()).flatMap((table) =>
+        table.view === undefined ? [] : [[table.name, table.view.sql] as const],
+      ),
+    );
+    if (epoch !== undefined) this.#viewCache = { epoch, views };
+    return views;
   }
 
   /**
@@ -3538,7 +3568,10 @@ export class MinnowDatabase {
     sql: string,
     options: { params?: QueryOptions["params"] } = {},
   ): Promise<QueryResult> {
-    const plan = bindPlanParameters(this.#compileCached(sql), options.params);
+    const bound = bindPlanParameters(this.#compileCached(sql), options.params);
+    // The same catalog rewrites a read outside a scope gets: a scope that could not see a view
+    // would make the scope's reads a different language from everyone else's.
+    const plan = await this.#applyCatalogRewrites(bound);
     return this.#sessionQueryPlan(transaction, plan);
   }
 
@@ -4247,12 +4280,26 @@ export class MinnowDatabase {
           `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a transaction`,
         );
       }
-      open.touched = true;
-      return this.runStatement(bindStatementParameters(statement, params), {
-        writer: open.session,
-      });
+      return this.#duringTransaction(open, () =>
+        this.runStatement(bindStatementParameters(statement, params), { writer: open.session }),
+      );
     }
     return this.runStatement(bindStatementParameters(statement, params));
+  }
+
+  /** Runs one statement inside an open transaction, holding off the idle sweep while it does. */
+  async #duringTransaction<T>(
+    state: { busy: number; activeAt: number },
+    run: () => Promise<T>,
+  ): Promise<T> {
+    state.busy += 1;
+    state.activeAt = this.#now().getTime();
+    try {
+      return await run();
+    } finally {
+      state.busy -= 1;
+      state.activeAt = this.#now().getTime();
+    }
   }
 
   /**
@@ -4290,7 +4337,8 @@ export class MinnowDatabase {
       const state = {
         session,
         settle,
-        touched: false,
+        busy: 0,
+        activeAt: this.#now().getTime(),
         finished: finished.then(
           ({ version }) => ({ version }),
           (error: unknown) => {
@@ -4299,13 +4347,11 @@ export class MinnowDatabase {
           },
         ),
         timer: setInterval(() => {
-          // One whole interval with no statement is what counts as abandoned: a transaction
-          // still being written to keeps clearing the flag before the next sweep reads it.
-          if (this.#openTransaction !== state) return;
-          if (state.touched) {
-            state.touched = false;
-            return;
-          }
+          // Abandoned means nothing has run for the whole timeout — not that the timeout
+          // elapsed. A statement in flight, however slow, and one that finished a moment ago
+          // both count as activity; only a caller that walked away trips this.
+          if (this.#openTransaction !== state || state.busy > 0) return;
+          if (this.#now().getTime() - state.activeAt < this.#transactionIdleTimeoutMs) return;
           this.#openTransaction = undefined;
           clearInterval(state.timer);
           state.settle("rollback");
@@ -4551,67 +4597,13 @@ export class MinnowDatabase {
           if (key !== null && key !== undefined) present.set(keyToken(keyColumn.type, key), row);
         }
       }
-      const updates = new Map<
-        string,
-        { key: Exclude<BatchValue, null>; changes: Record<string, BatchValue> }
-      >();
-      const deletes = new Map<string, QueryValue>();
-      const inserts: Array<Record<string, BatchValue>> = [];
-      sourceRows.forEach((sourceRow, index) => {
-        const key = keys[index] ?? null;
-        const token = key === null ? undefined : keyToken(keyColumn.type, key);
-        const matched = token === undefined ? undefined : present.get(token);
-        const context = {
-          [statement.source.alias]: sourceRow,
-          [statement.alias]: matched,
-        };
-        for (const branch of statement.branches) {
-          if ((branch.when === "matched") !== (matched !== undefined)) continue;
-          if (
-            branch.condition !== undefined &&
-            evaluateJoinedRowExpression(branch.condition, context) !== true
-          ) {
-            continue;
-          }
-          if (branch.action.kind === "delete") {
-            if (key !== null && token !== undefined) {
-              deletes.set(token, key);
-              updates.delete(token);
-            }
-            return;
-          }
-          if (branch.action.kind === "update") {
-            if (key === null || token === undefined) return;
-            const changes: Record<string, BatchValue> = {};
-            for (const assignment of branch.action.assignments) {
-              if (assignment.column === keyColumn.name) {
-                throw new TypeError(`MERGE cannot update the unique key: ${keyColumn.name}`);
-              }
-              changes[assignment.column] = evaluateJoinedRowExpression(
-                assignment.expression,
-                context,
-              );
-            }
-            updates.set(token, { key, changes });
-            return;
-          }
-          const columns =
-            branch.action.columns.length > 0
-              ? branch.action.columns
-              : target.columns.map(({ name }) => name);
-          if (columns.length !== branch.action.values.length) {
-            throw new TypeError("MERGE INSERT values must match the table's columns");
-          }
-          const row: Record<string, BatchValue> = {};
-          columns.forEach((column, position) => {
-            const value =
-              branch.action.kind === "insert" ? branch.action.values[position] : undefined;
-            if (value === undefined) return;
-            row[column] = evaluateJoinedRowExpression(value, context);
-          });
-          inserts.push(row);
-          return;
-        }
+      const { updates, deletes, inserts } = classifyMergeRows({
+        statement,
+        target,
+        keyColumn,
+        sourceRows,
+        keys,
+        present,
       });
       // Applied in one order per kind, so a row can only be touched by the branch that claimed
       // it: updates, then deletes, then the fresh rows.
@@ -4834,7 +4826,10 @@ export class MinnowDatabase {
         }
       }
       const writer = options.writer;
-      const staged: StagedWriteResult & {
+      // A scope stages and reports rows; a standalone write also publishes a version and any
+      // values the engine generated. Both shapes answer here, and the narrow one has less to
+      // report rather than something different.
+      const result: StagedWriteResult & {
         version?: number;
         generatedColumns?: Record<string, BatchValue[]>;
       } = await (viaUpsert
@@ -4842,7 +4837,6 @@ export class MinnowDatabase {
           this.upsertBatch(statement.table, { columns }))
         : (writer?.insertBatch(statement.table, { columns }) ??
           this.insertBatch(statement.table, { columns })));
-      const result = staged;
       let returningColumns: readonly string[] | undefined;
       if (options.returning !== undefined) {
         returningColumns =
@@ -9909,6 +9903,104 @@ export class MinnowDatabase {
   }
 }
 
+/** What a MERGE decided for one source's rows, ready to apply as three batched writes. */
+interface MergeWork {
+  updates: Map<string, { key: Exclude<BatchValue, null>; changes: Record<string, BatchValue> }>;
+  deletes: Map<string, QueryValue>;
+  inserts: Array<Record<string, BatchValue>>;
+}
+
+/**
+ * Chooses each source row's branch and evaluates what that branch would write (F312). Pure: it
+ * reads the source rows and the target rows they matched and returns the work, so every decision
+ * is made before any of it is applied — which is what lets the caller apply the result as three
+ * batches instead of row by row.
+ */
+function classifyMergeRows(input: {
+  statement: Extract<CompiledStatement, { kind: "merge" }>;
+  target: TableRecord;
+  keyColumn: TableColumnRecord;
+  sourceRows: QueryResult["rows"];
+  keys: readonly QueryValue[];
+  present: ReadonlyMap<string, DatabaseRow>;
+}): MergeWork {
+  const { statement, target, keyColumn, sourceRows, keys, present } = input;
+  const work: MergeWork = { updates: new Map(), deletes: new Map(), inserts: [] };
+  const claimed = new Set<string>();
+  sourceRows.forEach((sourceRow, index) => {
+    const key = keys[index] ?? null;
+    const token = key === null ? undefined : keyToken(keyColumn.type, key);
+    const matched = token === undefined ? undefined : present.get(token);
+    if (key !== null && token !== undefined && matched !== undefined) {
+      // SQL:2023 15.8: two source rows may not both act on one target row. Applying the last one
+      // silently would make the result depend on the order the source happened to produce.
+      if (claimed.has(token)) {
+        throw new TypeError(
+          `MERGE matched ${target.name} row ${formatValue(key)} from more than one source row`,
+        );
+      }
+      claimed.add(token);
+    }
+    const context = { [statement.source.alias]: sourceRow, [statement.alias]: matched };
+    for (const branch of statement.branches) {
+      // The first branch whose match state and condition both hold decides this row.
+      if ((branch.when === "matched") !== (matched !== undefined)) continue;
+      if (
+        branch.condition !== undefined &&
+        evaluateJoinedRowExpression(branch.condition, context) !== true
+      ) {
+        continue;
+      }
+      if (branch.action.kind === "delete") {
+        if (key !== null && token !== undefined) {
+          work.deletes.set(token, key);
+          work.updates.delete(token);
+        }
+        return;
+      }
+      if (branch.action.kind === "update") {
+        if (key === null || token === undefined) return;
+        const changes: Record<string, BatchValue> = {};
+        for (const assignment of branch.action.assignments) {
+          if (assignment.column === keyColumn.name) {
+            throw new TypeError(`MERGE cannot update the unique key: ${keyColumn.name}`);
+          }
+          changes[assignment.column] = evaluateJoinedRowExpression(assignment.expression, context);
+        }
+        work.updates.set(token, { key, changes });
+        return;
+      }
+      const values = branch.action.values;
+      const columns =
+        branch.action.columns.length > 0
+          ? branch.action.columns
+          : target.columns.map(({ name }) => name);
+      if (columns.length !== values.length) {
+        throw new TypeError("MERGE INSERT values must match the table's columns");
+      }
+      const row: Record<string, BatchValue> = {};
+      columns.forEach((column, position) => {
+        const value = values[position];
+        if (value !== undefined) row[column] = evaluateJoinedRowExpression(value, context);
+      });
+      work.inserts.push(row);
+      return;
+    }
+  });
+  return work;
+}
+
+/** Whether a view's body reads one table by name, at any depth of its query. */
+function viewReadsTable(sql: string, table: string): boolean {
+  try {
+    return collectRealTableNames(compileQuery(sql)).includes(table);
+  } catch {
+    // A view whose body no longer compiles cannot be shown to depend on this table, and its own
+    // next read will say so far more clearly than a refused drop would.
+    return false;
+  }
+}
+
 /**
  * The source-side expression a MERGE matches on. The condition has to be an equality naming the
  * target's unique key on one side, because that is the address the keyed write paths use; the
@@ -9955,23 +10047,29 @@ function validateName(name: string, kind: string): string {
 }
 
 /**
- * Compiled CHECK expressions per table record. Keyed by the record's identity and revision, so a
- * table whose constraints change compiles again and one whose rows are being written does not
- * recompile per batch.
+ * Compiled CHECK expressions, keyed by table id and catalog revision rather than by the record
+ * object: the store hands out a fresh clone on every read, so an identity-keyed cache would miss
+ * every time and recompile the constraints once per written batch. A changed revision compiles
+ * again, which is what makes an altered constraint take effect.
  */
-const compiledChecks = new WeakMap<
-  TableRecord,
-  ReadonlyArray<{ name: string; expression: Expression }>
->();
+const compiledChecks = new Map<string, ReadonlyArray<{ name: string; expression: Expression }>>();
+const COMPILED_CHECK_CACHE_LIMIT = 64;
 
 function tableChecks(table: TableRecord): ReadonlyArray<{ name: string; expression: Expression }> {
-  const cached = compiledChecks.get(table);
+  const key = `${table.id}/${String(table.revision ?? 0)}`;
+  const cached = compiledChecks.get(key);
   if (cached !== undefined) return cached;
   const compiled = (table.checks ?? []).map((check) => ({
     name: check.name,
     expression: compileCheckExpression(check.sql, check.name),
   }));
-  compiledChecks.set(table, compiled);
+  // Bounded and insertion-ordered: the oldest entry leaves, which is the table written least
+  // recently. Constraint expressions are small, so the cap bounds the map, not the memory.
+  if (compiledChecks.size >= COMPILED_CHECK_CACHE_LIMIT) {
+    const oldest = compiledChecks.keys().next().value;
+    if (oldest !== undefined) compiledChecks.delete(oldest);
+  }
+  compiledChecks.set(key, compiled);
   return compiled;
 }
 

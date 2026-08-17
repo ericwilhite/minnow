@@ -826,7 +826,7 @@
       "status": "supported",
       "setup": ["INSERT INTO keyed (name, score, bonus) VALUES ('z', 5, NULL)"],
       "example": "MERGE INTO keyed k USING (SELECT 'z' AS name, 9 AS score) s ON k.name = s.name WHEN MATCHED THEN UPDATE SET score = s.score WHEN NOT MATCHED THEN INSERT (name, score) VALUES (s.name, s.score)",
-      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope — atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed and why a source row can match at most one target row. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
+      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope — atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed. Two source rows matching one target row is a cardinality violation, as the standard says, rather than a last-one-wins race. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
     },
     {
       "id": "transaction.begin",
@@ -1248,14 +1248,14 @@
       "status": "supported",
       "setup": ["CREATE TABLE doomed (a INTEGER)"],
       "example": "DROP TABLE doomed",
-      "notes": "Takes the table's rows, catalog record, full-text index, and triggers. The blocks are retired through the commit rather than deleted, so a reader pinned to an older version keeps resolving them and the lease-aware collector reclaims them later. DROP TABLE CASCADE is refused: nothing cascades, because there are no dependent objects to reach."
+      "notes": "Takes the table's rows, catalog record, full-text index, and triggers. The blocks are retired through the commit rather than deleted, so a reader pinned to an older version keeps resolving them and the lease-aware collector reclaims them later. Refused while a view reads the table or another table's trigger writes to it — both would be left pointing at something that is not there. DROP TABLE CASCADE is refused too: nothing cascades, because there are no dependent objects to reach."
     },
     {
       "id": "ddl.create-view",
       "feature": "F031-02",
       "status": "supported",
       "example": "CREATE VIEW west AS SELECT region, amount FROM rows WHERE region = 'west'",
-      "notes": "The catalog stores the query text and the schema inferred from it, so a view answers the same questions a table does and reads expand it into the query it stands for. A view is never a write target, and CREATE OR REPLACE redefines one — a view stacked on it follows the new definition, and fails on the next read if the columns it named are gone."
+      "notes": "The catalog stores the query text and the schema inferred from it, so a view answers the same questions a table does and reads expand it into the query it stands for — anywhere a read runs, including inside a write scope. A view is never a write target. CREATE OR REPLACE redefines one; a view stacked on it follows the new definition, and a cycle two redefinitions close is caught on the next read rather than recursed."
     },
     {
       "id": "ddl.drop-view",

@@ -564,6 +564,27 @@ describe("E151 statement transactions", () => {
     await database.execute("ROLLBACK");
   });
 
+  it("stays open while its statements are slow, however long they take", async () => {
+    /** A store whose reads are slow, so one statement outlives several idle sweeps. */
+    class SlowStore extends MemoryBlockStore {
+      override async getBlocks(ids: readonly string[]): ReturnType<MemoryBlockStore["getBlocks"]> {
+        await new Promise((resolve) => setTimeout(resolve, 12));
+        return super.getBlocks(ids);
+      }
+    }
+    const database = new MinnowDatabase(new SlowStore(), { transactionIdleTimeoutMs: 5 });
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute("INSERT INTO t (id, n) VALUES (1, 1)");
+    await database.execute("BEGIN");
+    // Every statement here runs longer than the whole idle bound. Idle means nothing running,
+    // not time passing, so the scope has to survive all of them.
+    for (let index = 0; index < 5; index += 1) {
+      await database.execute(`UPDATE t SET n = ${String(index)} WHERE id = 1`);
+    }
+    await expect(database.execute("COMMIT")).resolves.toMatchObject({ action: "commit" });
+    expect((await database.query("SELECT n FROM t")).rows).toEqual([{ n: 4 }]);
+  });
+
   it("refuses what it cannot take back, and the spellings it has no meaning for", async () => {
     const database = await counted();
     await expect(database.execute("COMMIT")).rejects.toThrow("COMMIT without an open transaction");
@@ -660,6 +681,22 @@ describe("F312 MERGE", () => {
     ).toEqual([
       { action: "ins", sku: 3 },
       { action: "upd", sku: 1 },
+    ]);
+  });
+
+  it("refuses two source rows for one target row", async () => {
+    const database = await stocked();
+    // SQL:2023 15.8 makes this a cardinality violation. Applying the last one silently would
+    // make the result depend on the order the source happened to produce.
+    await expect(
+      database.execute(
+        `MERGE INTO stock s USING (SELECT 1 AS sku, 5 AS qty UNION ALL SELECT 1 AS sku, 7 AS qty) d
+         ON s.sku = d.sku WHEN MATCHED THEN UPDATE SET qty = d.qty`,
+      ),
+    ).rejects.toThrow("matched stock row 1 from more than one source row");
+    // And nothing was written: the statement is one scope.
+    expect((await database.query("SELECT qty FROM stock WHERE sku = 1")).rows).toEqual([
+      { qty: 10 },
     ]);
   });
 
@@ -771,6 +808,32 @@ describe("F031 views", () => {
     );
   });
 
+  it("refuses to drop a table a view reads", async () => {
+    const database = await seeded();
+    await database.execute("CREATE VIEW big AS SELECT id, total FROM orders WHERE total >= 10");
+    // A view left pointing at a table that is gone would fail on its next read, which is the
+    // same reason a trigger writing to the table blocks the drop.
+    await expect(database.execute("DROP TABLE orders")).rejects.toThrow(
+      "Cannot drop orders: view big reads it",
+    );
+    await database.execute("DROP VIEW big");
+    await expect(database.execute("DROP TABLE orders")).resolves.toMatchObject({ dropped: true });
+  });
+
+  it("catches a cycle between views rather than recursing", async () => {
+    const database = await seeded();
+    await database.execute("CREATE VIEW a AS SELECT id, total FROM orders");
+    await database.execute("CREATE VIEW b AS SELECT id, total FROM a");
+    // Neither definition is recursive on its own; redefining one over the other closes a loop.
+    await database.execute("CREATE OR REPLACE VIEW a AS SELECT id, total FROM b");
+    await expect(database.query("SELECT * FROM a")).rejects.toThrow(
+      "A view cannot be defined in terms of itself",
+    );
+    // And the loop is recoverable: redefining either side makes both readable again.
+    await database.execute("CREATE OR REPLACE VIEW a AS SELECT id, total FROM orders");
+    expect((await database.query("SELECT COUNT(*) AS n FROM b")).rows).toEqual([{ n: 3 }]);
+  });
+
   it("drops, freeing the name", async () => {
     const database = await seeded();
     await database.execute("CREATE VIEW big AS SELECT id, total FROM orders WHERE total >= 10");
@@ -787,6 +850,68 @@ describe("F031 views", () => {
     // The name is free for a table now.
     await database.execute("CREATE TABLE big (a INTEGER)");
     expect((await database.query("SELECT COUNT(*) AS n FROM big")).rows).toEqual([{ n: 0 }]);
+  });
+});
+
+describe("catalog-dependent rewrites", () => {
+  /** A store that counts how often the read path asks for the whole catalog. */
+  class CountingStore extends MemoryBlockStore {
+    listings = 0;
+    override async listTables(): ReturnType<MemoryBlockStore["listTables"]> {
+      this.listings += 1;
+      return super.listTables();
+    }
+  }
+
+  it("does not read the catalog per query", async () => {
+    // Resolving a view name is the one thing a read cannot do from the statement alone, and it
+    // used to cost a full catalog listing on every query — which made an unrelated point lookup
+    // slower as the schema grew. The view set is cached against the catalog epoch instead.
+    const store = new CountingStore();
+    const database = new MinnowDatabase(store);
+    for (let index = 0; index < 8; index += 1) {
+      await database.execute(
+        `CREATE TABLE t${String(index)} (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)`,
+      );
+    }
+    await database.execute("INSERT INTO t0 (id, n) VALUES (1, 1)");
+    await database.query("SELECT n FROM t0 WHERE id = 1", { memoize: false });
+    const before = store.listings;
+    for (let index = 0; index < 20; index += 1) {
+      await database.query("SELECT n FROM t0 WHERE id = 1", { memoize: false });
+    }
+    expect(store.listings - before).toBe(0);
+    // A catalog change invalidates the cache, so a view created now is still found.
+    await database.execute("CREATE VIEW v AS SELECT n FROM t0");
+    expect((await database.query("SELECT n FROM v")).rows).toEqual([{ n: 1 }]);
+  });
+
+  it("resolves views wherever a read runs, including inside a write scope", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute("INSERT INTO t (id, n) VALUES (1, 10), (2, 20)");
+    await database.execute("CREATE VIEW v AS SELECT id, n FROM t WHERE n >= 20");
+    await database.write(async (session) => {
+      expect((await session.query("SELECT id FROM v")).rows).toEqual([{ id: 2 }]);
+      // And it sees what the scope has staged, like any other read in one.
+      await session.insertBatch("t", { columns: { id: [3], n: [30] } });
+      expect((await session.query("SELECT COUNT(*) AS n FROM v")).rows).toEqual([{ n: 2 }]);
+    });
+    await database.execute("BEGIN");
+    expect((await database.query("SELECT COUNT(*) AS n FROM v")).rows).toEqual([{ n: 2 }]);
+    await database.execute("ROLLBACK");
+  });
+
+  it("renames the columns of a view through an alias list", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
+    await database.execute("CREATE VIEW v AS SELECT id, n FROM t");
+    // The view is a derived source by the time the alias list applies, so the rename has to wrap
+    // it rather than look its columns up by name.
+    expect((await database.query("SELECT x.a AS a, x.b AS b FROM v AS x(a, b)")).rows).toEqual([
+      { a: 1, b: 10 },
+    ]);
   });
 });
 
