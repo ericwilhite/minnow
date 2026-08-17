@@ -513,6 +513,283 @@ describe("F641 row constructors", () => {
   });
 });
 
+describe("E151 statement transactions", () => {
+  async function counted(): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
+    return database;
+  }
+  const rows = async (database: MinnowDatabase): Promise<DatabaseRow[]> =>
+    (await database.query("SELECT id, n FROM t ORDER BY id")).rows;
+
+  it("publishes everything between BEGIN and COMMIT at once", async () => {
+    const database = await counted();
+    await database.execute("BEGIN");
+    await database.execute("INSERT INTO t (id, n) VALUES (2, 20)");
+    await database.execute("UPDATE t SET n = 99 WHERE id = 1");
+    // Read-your-writes: inside the transaction the statements see each other.
+    expect(await rows(database)).toEqual([
+      { id: 1, n: 99 },
+      { id: 2, n: 20 },
+    ]);
+    const committed = await database.execute("COMMIT");
+    expect(committed).toMatchObject({ kind: "transaction", action: "commit" });
+    expect(await rows(database)).toEqual([
+      { id: 1, n: 99 },
+      { id: 2, n: 20 },
+    ]);
+  });
+
+  it("discards everything on ROLLBACK", async () => {
+    const database = await counted();
+    await database.execute("START TRANSACTION");
+    await database.execute("INSERT INTO t (id, n) VALUES (3, 30)");
+    await database.execute("DELETE FROM t WHERE id = 1");
+    expect(await rows(database)).toEqual([{ id: 3, n: 30 }]);
+    await database.execute("ROLLBACK");
+    expect(await rows(database)).toEqual([{ id: 1, n: 10 }]);
+  });
+
+  it("rolls back a transaction left open, rather than holding the scope forever", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { transactionIdleTimeoutMs: 5 });
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute("BEGIN");
+    await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
+    // Nothing touches it for longer than the idle bound: the scope ends itself.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect((await database.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 0 }]);
+    // And the next BEGIN is allowed, because the abandoned one is no longer open.
+    await database.execute("BEGIN");
+    await database.execute("ROLLBACK");
+  });
+
+  it("refuses what it cannot take back, and the spellings it has no meaning for", async () => {
+    const database = await counted();
+    await expect(database.execute("COMMIT")).rejects.toThrow("COMMIT without an open transaction");
+    await expect(database.execute("ROLLBACK")).rejects.toThrow(
+      "ROLLBACK without an open transaction",
+    );
+    await database.execute("BEGIN");
+    await expect(database.execute("BEGIN")).rejects.toThrow("A transaction is already open");
+    // The catalog commits outside the scope, so a rollback could not take a DDL statement back.
+    await expect(database.execute("CREATE TABLE other (a INTEGER)")).rejects.toThrow(
+      "CREATE TABLE is not allowed inside a transaction",
+    );
+    await database.execute("ROLLBACK");
+    // The standard's optional noise parses; an isolation level does not, since there is one.
+    await database.execute("BEGIN WORK");
+    await database.execute("COMMIT TRANSACTION");
+    await expect(
+      database.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+    ).rejects.toThrow();
+  });
+});
+
+describe("F312 MERGE", () => {
+  async function stocked(): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE stock (sku INTEGER PRIMARY KEY, qty INTEGER NOT NULL, note TEXT)",
+    );
+    await database.execute("CREATE TABLE delivery (sku INTEGER PRIMARY KEY, qty INTEGER NOT NULL)");
+    await database.execute("INSERT INTO stock (sku, qty, note) VALUES (1, 10, 'a'), (2, 5, 'b')");
+    await database.execute("INSERT INTO delivery (sku, qty) VALUES (1, 3), (3, 7)");
+    return database;
+  }
+
+  it("updates what matched and inserts what did not", async () => {
+    const database = await stocked();
+    const result = await database.execute(
+      `MERGE INTO stock s USING delivery d ON s.sku = d.sku
+       WHEN MATCHED THEN UPDATE SET qty = s.qty + d.qty
+       WHEN NOT MATCHED THEN INSERT (sku, qty, note) VALUES (d.sku, d.qty, 'new')`,
+    );
+    expect(result).toMatchObject({ kind: "merge", table: "stock", rowCount: 2 });
+    expect((await database.query("SELECT * FROM stock ORDER BY sku")).rows).toEqual([
+      { sku: 1, qty: 13, note: "a" },
+      { sku: 2, qty: 5, note: "b" },
+      { sku: 3, qty: 7, note: "new" },
+    ]);
+  });
+
+  it("tries the branches in order, with their own conditions", async () => {
+    const database = await stocked();
+    await database.execute(
+      `MERGE INTO stock s USING delivery d ON s.sku = d.sku
+       WHEN MATCHED AND s.qty >= 10 THEN DELETE
+       WHEN MATCHED THEN UPDATE SET note = 'kept'
+       WHEN NOT MATCHED AND d.qty > 5 THEN INSERT (sku, qty, note) VALUES (d.sku, d.qty, 'big')`,
+    );
+    // sku 1 matched and had qty 10, so the first branch claimed it; sku 3 was not matched and
+    // its quantity passed the branch condition; sku 2 was in neither source row.
+    expect((await database.query("SELECT * FROM stock ORDER BY sku")).rows).toEqual([
+      { sku: 2, qty: 5, note: "b" },
+      { sku: 3, qty: 7, note: "big" },
+    ]);
+  });
+
+  it("takes a query as its source", async () => {
+    const database = await stocked();
+    await database.execute(
+      `MERGE INTO stock s USING (SELECT sku, qty * 2 AS doubled FROM delivery WHERE qty > 5) d
+       ON s.sku = d.sku
+       WHEN NOT MATCHED THEN INSERT (sku, qty, note) VALUES (d.sku, d.doubled, 'sub')`,
+    );
+    expect((await database.query("SELECT * FROM stock WHERE sku = 3")).rows).toEqual([
+      { sku: 3, qty: 14, note: "sub" },
+    ]);
+  });
+
+  it("fires the triggers the equivalent statements would", async () => {
+    const database = await stocked();
+    await database.execute("CREATE TABLE audit (action TEXT, sku INTEGER)");
+    await database.execute(
+      "CREATE TRIGGER stock_ins AFTER INSERT ON stock BEGIN INSERT INTO audit (action, sku) VALUES ('ins', NEW.sku); END",
+    );
+    await database.execute(
+      "CREATE TRIGGER stock_upd AFTER UPDATE ON stock BEGIN INSERT INTO audit (action, sku) VALUES ('upd', NEW.sku); END",
+    );
+    await database.execute(
+      `MERGE INTO stock s USING delivery d ON s.sku = d.sku
+       WHEN MATCHED THEN UPDATE SET qty = 1
+       WHEN NOT MATCHED THEN INSERT (sku, qty, note) VALUES (d.sku, d.qty, 'new')`,
+    );
+    expect(
+      (await database.query("SELECT action, sku FROM audit ORDER BY action, sku")).rows,
+    ).toEqual([
+      { action: "ins", sku: 3 },
+      { action: "upd", sku: 1 },
+    ]);
+  });
+
+  it("says what it cannot address", async () => {
+    const database = await stocked();
+    // The unique key is how the keyed write paths address rows, so the match has to name it.
+    await expect(
+      database.execute(
+        "MERGE INTO stock s USING delivery d ON s.qty = d.qty WHEN MATCHED THEN DELETE",
+      ),
+    ).rejects.toThrow("MERGE ON must equate s.sku with a source value");
+    await expect(
+      database.execute(
+        "MERGE INTO stock s USING delivery d ON s.sku = d.sku WHEN MATCHED THEN UPDATE SET sku = 5",
+      ),
+    ).rejects.toThrow("MERGE cannot update the unique key: sku");
+    await expect(
+      database.execute("MERGE INTO stock s USING delivery d ON s.sku = d.sku"),
+    ).rejects.toThrow("MERGE needs at least one WHEN clause");
+    await expect(
+      database.execute(
+        "MERGE INTO stock s USING delivery d ON s.sku = d.sku WHEN NOT MATCHED BY SOURCE THEN DELETE",
+      ),
+    ).rejects.toThrow("MATCHED BY SOURCE and BY TARGET are not supported");
+  });
+});
+
+describe("F031 views", () => {
+  async function seeded(): Promise<MinnowDatabase> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT NOT NULL, total INTEGER NOT NULL)",
+    );
+    await database.execute(
+      "INSERT INTO orders (id, region, total) VALUES (1, 'west', 10), (2, 'east', 5), (3, 'west', 20)",
+    );
+    return database;
+  }
+
+  it("answers by name, and reads through to the tables behind it (F031-02)", async () => {
+    const database = await seeded();
+    await database.execute(
+      "CREATE VIEW big AS SELECT id, region, total FROM orders WHERE total >= 10",
+    );
+    expect((await database.query("SELECT * FROM big ORDER BY id")).rows).toEqual([
+      { id: 1, region: "west", total: 10 },
+      { id: 3, region: "west", total: 20 },
+    ]);
+    // A view is a source like any other: aliased, grouped, joined, counted.
+    expect(
+      (await database.query("SELECT b.region AS r, SUM(b.total) AS s FROM big b GROUP BY b.region"))
+        .rows,
+    ).toEqual([{ r: "west", s: 30 }]);
+    expect(
+      (
+        await database.query(
+          "SELECT o.id AS id FROM orders o JOIN big b ON b.id = o.id ORDER BY id",
+        )
+      ).rows,
+    ).toEqual([{ id: 1 }, { id: 3 }]);
+    // It reflects the table underneath rather than a copy taken at definition time.
+    await database.execute("INSERT INTO orders (id, region, total) VALUES (4, 'east', 40)");
+    expect((await database.query("SELECT COUNT(*) AS n FROM big")).rows).toEqual([{ n: 3 }]);
+    // And the catalog lists it with the columns a reader can select.
+    const listed = (await database.listTables()).find((table) => table.name === "big");
+    expect(listed?.columns.map((column) => column.name)).toEqual(["id", "region", "total"]);
+  });
+
+  it("stacks on another view and can be replaced", async () => {
+    const database = await seeded();
+    await database.execute(
+      "CREATE VIEW big AS SELECT id, region, total FROM orders WHERE total >= 10",
+    );
+    await database.execute(
+      "CREATE VIEW west_big AS SELECT id, total FROM big WHERE region = 'west'",
+    );
+    expect((await database.query("SELECT * FROM west_big ORDER BY id")).rows).toEqual([
+      { id: 1, total: 10 },
+      { id: 3, total: 20 },
+    ]);
+    await expect(database.execute("CREATE VIEW big AS SELECT id FROM orders")).rejects.toThrow(
+      "View already exists: big",
+    );
+    await database.execute(
+      "CREATE OR REPLACE VIEW big AS SELECT id, region, total FROM orders WHERE total >= 20",
+    );
+    // The stacked view follows the redefinition, because it stores the query rather than a plan.
+    expect((await database.query("SELECT * FROM west_big")).rows).toEqual([{ id: 3, total: 20 }]);
+  });
+
+  it("is not a table, and says so", async () => {
+    const database = await seeded();
+    await database.execute(
+      "CREATE VIEW big AS SELECT id, region, total FROM orders WHERE total >= 10",
+    );
+    await expect(database.execute("INSERT INTO big (id) VALUES (9)")).rejects.toThrow(
+      "big is a view, not a table",
+    );
+    await expect(database.execute("DELETE FROM big WHERE id = 1")).rejects.toThrow(
+      "big is a view, not a table",
+    );
+    await expect(database.execute("DROP TABLE big")).rejects.toThrow(
+      "big is a view; use DROP VIEW",
+    );
+    await expect(database.execute("DROP VIEW orders")).rejects.toThrow("Not a view: orders");
+    // A body that cannot be typed fails where it is written.
+    await expect(database.execute("CREATE VIEW bad AS SELECT nope FROM orders")).rejects.toThrow(
+      "Ambiguous or missing column: nope",
+    );
+  });
+
+  it("drops, freeing the name", async () => {
+    const database = await seeded();
+    await database.execute("CREATE VIEW big AS SELECT id, total FROM orders WHERE total >= 10");
+    await expect(database.execute("DROP VIEW big")).resolves.toEqual({
+      kind: "drop-view",
+      view: "big",
+      dropped: true,
+    });
+    await expect(database.query("SELECT * FROM big")).rejects.toThrow("Table not found: big");
+    await expect(database.execute("DROP VIEW big")).rejects.toThrow("View not found: big");
+    await expect(database.execute("DROP VIEW IF EXISTS big")).resolves.toMatchObject({
+      dropped: false,
+    });
+    // The name is free for a table now.
+    await database.execute("CREATE TABLE big (a INTEGER)");
+    expect((await database.query("SELECT COUNT(*) AS n FROM big")).rows).toEqual([{ n: 0 }]);
+  });
+});
+
 describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
   const documents = new Map<string, DatabaseRow[]>([
     [
@@ -668,13 +945,48 @@ describe("E141/F031 schema statements", () => {
     );
   });
 
-  it("rejects the constraints it does not enforce, by name", async () => {
+  it("enforces CHECK constraints on every write path (E141-06)", async () => {
     const database = await fresh();
-    // Recording these as errors rather than accepting and ignoring them: a CHECK that never
-    // runs is worse than one the engine refuses to promise.
-    await expect(database.execute("CREATE TABLE c (a INTEGER CHECK (a > 0))")).rejects.toThrow(
-      "CHECK constraints are not supported",
+    await database.execute(
+      "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL CHECK (qty > 0), note TEXT, CONSTRAINT short_note CHECK (LENGTH(note) < 5))",
     );
+    await database.execute("INSERT INTO items (id, qty, note) VALUES (1, 5, 'abc')");
+    // A column constraint and a named table constraint both refuse the row.
+    await expect(
+      database.execute("INSERT INTO items (id, qty, note) VALUES (2, 0, 'abc')"),
+    ).rejects.toThrow("CHECK items_qty_check failed for row 0 of items");
+    await expect(
+      database.execute("INSERT INTO items (id, qty, note) VALUES (3, 5, 'toolong')"),
+    ).rejects.toThrow("CHECK short_note failed");
+    // Three-valued logic: an unknown passes, which is why NULL satisfies LENGTH(note) < 5.
+    await database.execute("INSERT INTO items (id, qty, note) VALUES (4, 5, NULL)");
+    expect((await database.query("SELECT id FROM items ORDER BY id")).rows).toEqual([
+      { id: 1 },
+      { id: 4 },
+    ]);
+    // An update is checked against the post-image, so an untouched column still counts.
+    await expect(database.execute("UPDATE items SET qty = -1 WHERE id = 1")).rejects.toThrow(
+      "CHECK items_qty_check failed",
+    );
+    await database.execute("UPDATE items SET qty = 9 WHERE id = 1");
+    // And so is the update half of an upsert, which runs inside a write scope.
+    await expect(
+      database.execute(
+        "INSERT INTO items (id, qty, note) VALUES (1, -7, 'x') ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty",
+      ),
+    ).rejects.toThrow("CHECK items_qty_check failed");
+    expect((await database.query("SELECT qty FROM items WHERE id = 1")).rows).toEqual([{ qty: 9 }]);
+  });
+
+  it("refuses a constraint it could never evaluate", async () => {
+    const database = await fresh();
+    await expect(database.execute("CREATE TABLE c (a INTEGER CHECK (b > 0))")).rejects.toThrow(
+      "refers to a column this table has no: b",
+    );
+    await expect(database.execute("CREATE TABLE c (a INTEGER CHECK (SUM(a) > 0))")).rejects.toThrow(
+      "takes a row condition, not an aggregate",
+    );
+    // FOREIGN KEY still has no enforcement path, and says so rather than being ignored.
     await expect(
       database.execute("CREATE TABLE c (a INTEGER, b INTEGER REFERENCES other(id))"),
     ).rejects.toThrow("FOREIGN KEY constraints are not supported");

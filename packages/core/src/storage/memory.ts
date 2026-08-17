@@ -275,6 +275,34 @@ export class MemoryBlockStore implements BlockStore {
     });
   }
 
+  async removeTable(id: string, expectedRevision: number): Promise<void> {
+    return this.#runAtomic(() => {
+      const record = this.#tables.get(id);
+      const actualRevision = record === undefined ? null : (record.revision ?? 0);
+      if (record === undefined || actualRevision !== expectedRevision) {
+        throw new TableRecordConflictError(id, expectedRevision, actualRevision);
+      }
+      for (const [segmentId, segment] of this.#segments) {
+        if (segment.tableId === id) this.#segments.delete(segmentId);
+      }
+      const owned = `${id}/`;
+      for (const key of [...this.#ftsBases.keys()]) {
+        if (key.startsWith(owned)) this.#ftsBases.delete(key);
+      }
+      for (const key of [...this.#ftsDeltas.keys()]) {
+        if (key.startsWith(owned)) this.#ftsDeltas.delete(key);
+      }
+      for (const key of [...this.#nextAutoIncrement.keys()]) {
+        if (key.startsWith(owned)) this.#nextAutoIncrement.delete(key);
+      }
+      this.#uniqueKeys.delete(id);
+      this.#nextRowIds.delete(id);
+      this.#tableIdsByName.delete(record.name);
+      this.#tables.delete(id);
+      this.#catalogEpoch += 1;
+    });
+  }
+
   async writeFtsBase(
     tableId: string,
     columnId: string,

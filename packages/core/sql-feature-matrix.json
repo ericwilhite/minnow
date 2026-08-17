@@ -672,14 +672,6 @@
       ]
     },
     {
-      "id": "transaction.begin",
-      "feature": "E151-01",
-      "status": "unsupported",
-      "example": "BEGIN",
-      "error": "Expected SELECT, found BEGIN",
-      "notes": "Transactions are a programmatic API: database.write(async tx => { ... }) stages any number of mutations across tables and publishes them as one atomic commit."
-    },
-    {
       "id": "where.parenthesized",
       "feature": "E061-14",
       "status": "supported",
@@ -827,6 +819,43 @@
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) SELECT name || '2' AS name, score + 1 AS score FROM keyed",
       "notes": "The SELECT runs at one snapshot and materializes before the batch write."
+    },
+    {
+      "id": "mutation.merge",
+      "feature": "F312",
+      "status": "supported",
+      "setup": ["INSERT INTO keyed (name, score, bonus) VALUES ('z', 5, NULL)"],
+      "example": "MERGE INTO keyed k USING (SELECT 'z' AS name, 9 AS score) s ON k.name = s.name WHEN MATCHED THEN UPDATE SET score = s.score WHEN NOT MATCHED THEN INSERT (name, score) VALUES (s.name, s.score)",
+      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope — atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed and why a source row can match at most one target row. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
+    },
+    {
+      "id": "transaction.begin",
+      "feature": "E151-01",
+      "status": "supported",
+      "example": "BEGIN",
+      "notes": "Holds the same scope `write()` opens between statements instead of around a callback: writes stage into it, reads see what it staged, and COMMIT publishes them together. Schema changes are refused inside one, because the catalog commits outside the scope and a rollback could not take them back. A transaction left untouched past the idle bound rolls itself back, so an abandoned BEGIN cannot hold storage forever."
+    },
+    {
+      "id": "transaction.commit",
+      "feature": "E151-01",
+      "status": "supported",
+      "setup": ["BEGIN"],
+      "example": "COMMIT"
+    },
+    {
+      "id": "transaction.rollback",
+      "feature": "E151-02",
+      "status": "supported",
+      "setup": ["BEGIN"],
+      "example": "ROLLBACK"
+    },
+    {
+      "id": "transaction.isolation-level",
+      "feature": "E152-01",
+      "status": "unsupported",
+      "example": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+      "error": "Expected SELECT, found SET",
+      "notes": "The engine has one isolation level. Every read runs against a single version and every write scope commits atomically, so there is no weaker mode to relax into and no stronger one to ask for."
     },
     {
       "id": "function.char-length",
@@ -1126,14 +1155,6 @@
       "example": "CREATE TABLE copied AS SELECT region FROM rows"
     },
     {
-      "id": "ddl.check-constraint",
-      "feature": "E141-06",
-      "status": "unsupported",
-      "example": "CREATE TABLE checked (a INTEGER CHECK (a > 0))",
-      "error": "CHECK constraints are not supported",
-      "notes": "Refused rather than accepted and ignored: a constraint that never runs is worse than one the engine declines to promise. A BEFORE trigger can raise instead."
-    },
-    {
       "id": "ddl.foreign-key",
       "feature": "E141-04",
       "status": "unsupported",
@@ -1142,44 +1163,12 @@
       "notes": "Referential actions would have to run on every write path of every table; the engine has no cross-table write hook."
     },
     {
-      "id": "ddl.drop-table",
-      "feature": "F031-13",
-      "status": "unsupported",
-      "example": "DROP TABLE rows",
-      "error": "DROP supports: DROP TRIGGER name",
-      "notes": "The block store has no table-removal primitive: a table's segments and blocks would outlive it. Recreate the store instead."
-    },
-    {
-      "id": "ddl.create-view",
-      "feature": "F031-02",
-      "status": "unsupported",
-      "example": "CREATE VIEW v AS SELECT amount FROM rows",
-      "error": "Expected TABLE, found VIEW",
-      "notes": "The catalog stores tables and triggers only, with no registry for named queries. A CTE or the typed builder covers the same reuse."
-    },
-    {
-      "id": "transaction.commit",
-      "feature": "E151-01",
-      "status": "unsupported",
-      "example": "COMMIT",
-      "error": "Expected SELECT, found COMMIT",
-      "notes": "Transactions are an API, not statements: database.transaction() scopes them, so a statement-level COMMIT has nothing to commit."
-    },
-    {
       "id": "privileges.grant",
       "feature": "E081",
       "status": "unsupported",
       "example": "GRANT SELECT ON rows TO reader",
       "error": "Expected SELECT, found GRANT",
       "notes": "An embedded, single-user database in the page has no principals to grant to."
-    },
-    {
-      "id": "mutation.merge",
-      "feature": "F312",
-      "status": "unsupported",
-      "example": "MERGE INTO rows USING dims ON rows.region = dims.region WHEN MATCHED THEN UPDATE SET amount = 1",
-      "error": "Expected SELECT, found MERGE",
-      "notes": "INSERT ... ON CONFLICT covers the upsert shape MERGE is usually written for; the general form needs multi-action write planning."
     },
     {
       "id": "from.lateral",
@@ -1252,6 +1241,35 @@
       "example": "CREATE SEQUENCE order_ids",
       "error": "Expected TABLE, found SEQUENCE",
       "notes": "A sequence is a second kind of catalog object with its own durability and contention story; the key column's autoincrement default covers the common use."
+    },
+    {
+      "id": "ddl.drop-table",
+      "feature": "F031-13",
+      "status": "supported",
+      "setup": ["CREATE TABLE doomed (a INTEGER)"],
+      "example": "DROP TABLE doomed",
+      "notes": "Takes the table's rows, catalog record, full-text index, and triggers. The blocks are retired through the commit rather than deleted, so a reader pinned to an older version keeps resolving them and the lease-aware collector reclaims them later. DROP TABLE CASCADE is refused: nothing cascades, because there are no dependent objects to reach."
+    },
+    {
+      "id": "ddl.create-view",
+      "feature": "F031-02",
+      "status": "supported",
+      "example": "CREATE VIEW west AS SELECT region, amount FROM rows WHERE region = 'west'",
+      "notes": "The catalog stores the query text and the schema inferred from it, so a view answers the same questions a table does and reads expand it into the query it stands for. A view is never a write target, and CREATE OR REPLACE redefines one — a view stacked on it follows the new definition, and fails on the next read if the columns it named are gone."
+    },
+    {
+      "id": "ddl.drop-view",
+      "feature": "F031-16",
+      "status": "supported",
+      "setup": ["CREATE VIEW doomed_view AS SELECT amount FROM rows"],
+      "example": "DROP VIEW doomed_view"
+    },
+    {
+      "id": "ddl.check-constraint",
+      "feature": "E141-06",
+      "status": "supported",
+      "example": "CREATE TABLE checked (a INTEGER NOT NULL CHECK (a > 0), CONSTRAINT small CHECK (a < 100))",
+      "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row — insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
     }
   ]
 }

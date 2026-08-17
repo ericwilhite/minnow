@@ -308,6 +308,16 @@ export class DatabaseTransaction {
   }
 
   /**
+   * Records that this commit changes a table's logical content without staging a segment for
+   * it — dropping the table, for instance, whose only publish is the retirement of its blocks.
+   * Change-driven readers such as live queries need to see it move.
+   */
+  markTableChanged(tableId: string): void {
+    this.#assertActive();
+    this.#changedTableIds.add(tableId);
+  }
+
+  /**
    * Marks this commit as logically content-preserving (for example a compaction rewrite), so
    * change-driven readers such as live queries skip it even though it stages segments.
    */

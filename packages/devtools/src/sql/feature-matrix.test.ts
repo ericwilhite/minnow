@@ -63,7 +63,8 @@ describe("the shipped matrix", () => {
     for (const message of [
       "Correlated NOT IN subqueries are not supported; use NOT EXISTS",
       "UPDATE requires a table with a unique key",
-      "Expected SELECT, found BEGIN",
+      // BEGIN is a statement now; the isolation level is what a user still cannot ask for.
+      "Expected SELECT, found SET",
     ]) {
       expect(lookupFailure(index, message)?.notes).toBeDefined();
     }

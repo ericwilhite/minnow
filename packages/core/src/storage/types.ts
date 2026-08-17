@@ -207,6 +207,18 @@ export interface TableRecord {
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
   /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
   triggers?: TriggerRecord[];
+  /**
+   * Row-level CHECK constraints (E141-06), each the text of a boolean expression over this
+   * table's own columns. Text rather than a compiled form because the record crosses the worker
+   * boundary and IndexedDB; the writer compiles it and evaluates it against every row it writes.
+   */
+  checks?: Array<{ name: string; sql: string }>;
+  /**
+   * A view rather than a table: the query text it stands for, and no segments of its own. The
+   * `columns` are the query's inferred output schema, so a view answers the same catalog
+   * questions a table does — what a reader can select, and of what type.
+   */
+  view?: { sql: string };
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
   revision?: number;
@@ -943,6 +955,18 @@ export interface BlockStore {
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord>;
+  /**
+   * Removes a table's catalog record together with everything else keyed to it: its segments,
+   * its full-text base chunks and commit deltas, its unique-key membership, and its row-id and
+   * autoincrement counters. One step, so a crash cannot leave a segment pointing at a table
+   * that no longer exists. Advances the catalog epoch, and fails with a
+   * `TableRecordConflictError` on a revision mismatch, like `updateTable`.
+   *
+   * The table's blocks are the caller's business: they are retired by superseding them in a
+   * commit, which leaves the bytes for the lease-aware collector rather than deleting data a
+   * pinned reader may still be reading.
+   */
+  removeTable(id: string, expectedRevision: number): Promise<void>;
   /**
    * Replaces one column's full-text base chunks (term-range partitioned, term-sorted within
    * each chunk) and deletes commit deltas the new base covers. The caller flips the catalog

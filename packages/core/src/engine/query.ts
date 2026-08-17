@@ -1163,6 +1163,24 @@ function columnDefaultFor(expression: Expression): ColumnDefault {
   throw new TypeError("DEFAULT takes a constant or CURRENT_TIMESTAMP");
 }
 
+/**
+ * One WHEN clause of a MERGE (F312). Branches are tried in order for each source row, and the
+ * first whose match state and optional condition hold decides what happens to that row.
+ */
+export type MergeBranch =
+  | {
+      when: "matched";
+      condition?: Expression;
+      action:
+        | { kind: "update"; assignments: Array<{ column: string; expression: Expression }> }
+        | { kind: "delete" };
+    }
+  | {
+      when: "not-matched";
+      condition?: Expression;
+      action: { kind: "insert"; columns: string[]; values: Expression[] };
+    };
+
 /** An INSERT value: a constant, or an unbound `?`/`$n` placeholder awaiting its parameter. */
 export type InsertValue = QueryValue | { parameter: number };
 
@@ -1213,6 +1231,7 @@ export type CompiledStatement =
         nullable?: boolean;
         defaultValue?: ColumnDefault;
       }>;
+      checks?: Array<{ name: string; sql: string }>;
       uniqueKey?: string;
       /** CREATE TABLE IF NOT EXISTS: an existing table of that name is left alone. */
       ifNotExists?: boolean;
@@ -1241,6 +1260,36 @@ export type CompiledStatement =
       ifNotExists?: boolean;
       parameterCount?: number;
     }
+  | { kind: "drop-table"; table: string; ifExists?: boolean; parameterCount?: number }
+  | {
+      kind: "create-view";
+      view: string;
+      sql: string;
+      orReplace?: boolean;
+      parameterCount?: number;
+    }
+  | { kind: "drop-view"; view: string; ifExists?: boolean; parameterCount?: number }
+  | { kind: "transaction"; action: "begin" | "commit" | "rollback"; parameterCount?: number }
+  | {
+      kind: "merge";
+      /** The target table, and the correlation name its columns are read under. */
+      table: string;
+      alias: string;
+      /**
+       * The source: a table or view by name, or a parenthesized query kept as its own text —
+       * the statement re-reads it through the ordinary query pipeline, so a source query sees
+       * views, CTEs, and joins exactly as it would on its own.
+       */
+      source: { alias: string; table?: string; sql?: string };
+      /**
+       * The match condition. The engine requires it to equate the target's unique key with a
+       * source expression, which is also what makes each source row match at most one target
+       * row — the standard's cardinality violation cannot arise.
+       */
+      on: Expression;
+      branches: MergeBranch[];
+      parameterCount?: number;
+    }
   | {
       kind: "add-column";
       table: string;
@@ -1261,6 +1310,73 @@ export type CompiledStatement =
  * already exists. Bodies cannot carry their own parameters — placeholder order is the
  * binding order.
  */
+/**
+ * BEGIN / START TRANSACTION, COMMIT, and ROLLBACK (E151). The optional noise the standard and
+ * the dialects allow around them — WORK, TRANSACTION, and the read-write access mode — parses
+ * and carries no meaning here: this engine has one isolation level, snapshot, and no read-only
+ * mode a transaction could relax into.
+ */
+function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledStatement {
+  const words = tokens
+    .filter((token) => token.kind === "identifier")
+    .map((token) => token.text.toUpperCase());
+  const action = keyword === "START" || keyword === "BEGIN" ? "begin" : keyword.toLowerCase();
+  const allowed = new Set(["BEGIN", "START", "COMMIT", "ROLLBACK", "WORK", "TRANSACTION"]);
+  for (const word of words) {
+    if (!allowed.has(word)) {
+      throw new TypeError(`${keyword} takes no ${word}: this engine has one isolation level`);
+    }
+  }
+  if (keyword === "START" && words[1] !== "TRANSACTION") {
+    throw new TypeError("Expected START TRANSACTION");
+  }
+  return { kind: "transaction", action: action as "begin" | "commit" | "rollback" };
+}
+
+/**
+ * Compiles one CHECK constraint's stored text into the expression the writer evaluates per row.
+ * Kept beside the parser because the same restrictions apply wherever a constraint is read: a
+ * row condition over this table's columns, with no aggregate, window, subquery, or parameter.
+ */
+export function compileCheckExpression(sql: string, name: string): Expression {
+  const parser = new Parser(tokenize(sql), sql);
+  const expression = parser.parseExpression();
+  if (hasAggregate(expression) || containsWindow(expression) || containsParameter(expression)) {
+    throw new TypeError(`CHECK ${name} takes a row condition over this table's own columns`);
+  }
+  return expression;
+}
+
+/**
+ * CREATE [OR REPLACE] VIEW name AS <query>. The body is kept as the author's own text rather
+ * than a re-rendered plan: the catalog stores what was written, and every read compiles it
+ * through the same route any other statement takes.
+ */
+function parseCreateView(sql: string, tokens: Token[], orReplace: boolean): CompiledStatement {
+  const cursor = orReplace ? 3 : 1;
+  const keywordAt = (index: number, word: string): boolean => {
+    const token = tokens[index];
+    return (
+      token?.kind === "identifier" && token.quoted !== true && token.text.toUpperCase() === word
+    );
+  };
+  if (orReplace && !keywordAt(1, "OR")) throw new TypeError("Expected OR REPLACE");
+  if (orReplace && !keywordAt(2, "REPLACE")) throw new TypeError("Expected OR REPLACE");
+  const name = tokens[cursor + 1];
+  if (name?.kind !== "identifier") throw new TypeError("Expected a view name");
+  if (!keywordAt(cursor + 2, "AS")) {
+    throw new TypeError("CREATE VIEW takes a name and AS <query>; column lists are not supported");
+  }
+  const body = tokens[cursor + 3];
+  if (body === undefined || body.kind === "eof")
+    throw new TypeError("CREATE VIEW requires a query");
+  const view = name.text;
+  const text = sql.slice(body.start).trim();
+  // Compiling now means a broken view fails where it is written, not on the first read.
+  compileQuery(text);
+  return { kind: "create-view", view, sql: text, ...(orReplace ? { orReplace: true } : {}) };
+}
+
 function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
   let cursor = 2;
   const keywordAt = (index: number, keyword: string): boolean => {
@@ -1391,6 +1507,20 @@ export function compileStatement(sql: string): CompiledStatement {
       second?.kind === "identifier" &&
       second.text.toUpperCase() === "TRIGGER";
     if (!isTriggerDdl) rejectSemicolons(tokens);
+    if (
+      keyword === "BEGIN" ||
+      keyword === "START" ||
+      keyword === "COMMIT" ||
+      keyword === "ROLLBACK"
+    ) {
+      return parseTransactionStatement(keyword, tokens);
+    }
+    if (keyword === "MERGE") {
+      parser = new Parser(tokens, text);
+      const statement = parser.parseMerge();
+      if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
+      return statement;
+    }
     if (keyword === "INSERT" || keyword === "UPDATE" || keyword === "DELETE") {
       parser = new Parser(tokens);
       const statement = parser.parseMutation(keyword);
@@ -1399,7 +1529,11 @@ export function compileStatement(sql: string): CompiledStatement {
     }
     if (keyword === "CREATE") {
       if (isTriggerDdl) return parseCreateTrigger(text, tokens);
-      parser = new Parser(tokens);
+      const viewAt = second?.text.toUpperCase() === "OR" ? 3 : 1;
+      if (tokens[viewAt]?.kind === "identifier" && tokens[viewAt].text.toUpperCase() === "VIEW") {
+        return parseCreateView(text, tokens, viewAt === 3);
+      }
+      parser = new Parser(tokens, text);
       const statement = parser.parseCreateTable();
       if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
       return statement;
@@ -1409,11 +1543,19 @@ export function compileStatement(sql: string): CompiledStatement {
       return parser.parseAlterTable();
     }
     if (keyword === "DROP") {
+      if (second?.kind === "identifier" && second.text.toUpperCase() === "VIEW") {
+        parser = new Parser(tokens);
+        return parser.parseDropView();
+      }
       const name = tokens[2];
       if (isTriggerDdl && name?.kind === "identifier" && tokens[3]?.kind === "eof") {
         return { kind: "drop-trigger", name: name.text };
       }
-      throw new TypeError("DROP supports: DROP TRIGGER name");
+      if (second?.kind === "identifier" && second.text.toUpperCase() === "TABLE") {
+        parser = new Parser(tokens);
+        return parser.parseDropTable();
+      }
+      throw new TypeError("DROP supports: DROP TABLE name, DROP TRIGGER name");
     }
     if (keyword === "WITH") {
       parser = new Parser(tokens);
@@ -1432,6 +1574,17 @@ export function compileStatement(sql: string): CompiledStatement {
   } catch (error) {
     throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
   }
+}
+
+/**
+ * Evaluates an expression against several named rows — the shape MERGE works in, where one
+ * condition or assignment reads the target and the source at once.
+ */
+export function evaluateJoinedRowExpression(
+  expression: Expression,
+  rows: Readonly<Record<string, DatabaseRow | undefined>>,
+): QueryValue {
+  return asQueryValue(evaluate(expression, { ...rows }));
 }
 
 /** Evaluates an expression against one row, for UPDATE SET assignment computation. */
@@ -1826,6 +1979,29 @@ export function bindStatementParameters(
     clone.rows = clone.rows.map((row) =>
       row.map((value) => (isParameterSlot(value) ? (values[value.parameter] ?? null) : value)),
     );
+    return clone;
+  }
+  if (
+    clone.kind === "drop-table" ||
+    clone.kind === "create-view" ||
+    clone.kind === "drop-view" ||
+    clone.kind === "transaction"
+  ) {
+    return clone;
+  }
+  if (clone.kind === "merge") {
+    clone.on = bindExpression(clone.on, values);
+    for (const branch of clone.branches) {
+      if (branch.condition !== undefined)
+        branch.condition = bindExpression(branch.condition, values);
+      if (branch.action.kind === "update") {
+        for (const assignment of branch.action.assignments) {
+          assignment.expression = bindExpression(assignment.expression, values);
+        }
+      } else if (branch.action.kind === "insert") {
+        branch.action.values = branch.action.values.map((value) => bindExpression(value, values));
+      }
+    }
     return clone;
   }
   if (clone.kind === "create-table-as") {
@@ -4296,6 +4472,8 @@ function asQueryValue(value: unknown): QueryValue {
 }
 
 class Parser {
+  /** The statement text the tokens came from, for the clauses stored verbatim (CHECK bodies). */
+  readonly text: string;
   #index = 0;
   #derivedSequence = 0;
   /** Placeholders seen so far: positional `?` count, and the highest `$n` number. */
@@ -4322,7 +4500,12 @@ class Parser {
   readonly #recursiveUses = new Set<string>();
   #recursiveCandidate: { name: string; reference: string } | undefined;
 
-  constructor(private readonly tokens: Token[]) {}
+  constructor(
+    private readonly tokens: Token[],
+    text = "",
+  ) {
+    this.text = text;
+  }
 
   #withClause(): void {
     if (!this.#isKeyword("WITH")) return;
@@ -4539,8 +4722,26 @@ class Parser {
       nullable?: boolean;
       defaultValue?: ColumnDefault;
     }> = [];
+    const checks: Array<{ name: string; sql: string }> = [];
     let uniqueKey: string | undefined;
     for (;;) {
+      if (this.#isKeyword("CONSTRAINT") || this.#isKeyword("CHECK")) {
+        // A table-level constraint, named or not. Only CHECK reaches here; the key clauses
+        // below take the same optional name.
+        let constraintName: string | undefined;
+        if (this.#isKeyword("CONSTRAINT")) {
+          this.#keyword("CONSTRAINT");
+          constraintName = this.#identifier();
+        }
+        if (!this.#isKeyword("CHECK")) {
+          throw new TypeError("Only CHECK constraints take a CONSTRAINT name");
+        }
+        checks.push(
+          this.#checkConstraint(constraintName ?? `${table}_check_${String(checks.length + 1)}`),
+        );
+        if (!this.#punctuation(",")) break;
+        continue;
+      }
       if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
         // E141-08: the table-level spelling of the same single-column key.
         if (this.#isKeyword("PRIMARY")) {
@@ -4575,9 +4776,8 @@ class Parser {
           continue;
         }
         if (this.#isKeyword("CHECK")) {
-          throw new TypeError(
-            "CHECK constraints are not supported; validate before writing, or use a BEFORE trigger",
-          );
+          checks.push(this.#checkConstraint(`${table}_${name}_check`));
+          continue;
         }
         if (this.#isKeyword("REFERENCES")) {
           throw new TypeError("FOREIGN KEY constraints are not supported");
@@ -4634,6 +4834,19 @@ class Parser {
     if (uniqueKey !== undefined && !columns.some((column) => column.name === uniqueKey)) {
       throw new TypeError(`CREATE TABLE key column is not declared: ${uniqueKey}`);
     }
+    const declared = new Set(columns.map((column) => column.name));
+    for (const check of checks) {
+      for (const reference of expressionColumnNames(
+        compileCheckExpression(check.sql, check.name),
+      )) {
+        const column = reference.split(".").at(-1) ?? reference;
+        if (!declared.has(column)) {
+          throw new TypeError(
+            `CHECK ${check.name} refers to a column this table has no: ${column}`,
+          );
+        }
+      }
+    }
     return {
       kind: "create-table",
       table,
@@ -4641,8 +4854,73 @@ class Parser {
         column.name === uniqueKey ? { ...column, nullable: false } : column,
       ),
       ...(uniqueKey === undefined ? {} : { uniqueKey }),
+      ...(checks.length === 0 ? {} : { checks }),
       ...(ifNotExists ? { ifNotExists: true } : {}),
     };
+  }
+
+  /**
+   * `CHECK (expression)`: the text is kept as written so the catalog stores what the author
+   * declared, and compiled once here to reject a constraint the engine could never evaluate.
+   */
+  #checkConstraint(fallbackName: string): { name: string; sql: string } {
+    this.#keyword("CHECK");
+    const open = this.#peek();
+    this.#expectPunctuation("(");
+    const expression = this.#expression();
+    const close = this.#peek();
+    this.#expectPunctuation(")");
+    if (hasAggregate(expression) || containsWindow(expression)) {
+      throw new TypeError(`CHECK ${fallbackName} takes a row condition, not an aggregate`);
+    }
+    if (containsParameter(expression)) {
+      throw new TypeError(`CHECK ${fallbackName} cannot take a parameter`);
+    }
+    return { name: fallbackName, sql: this.text.slice(open.start + 1, close.start).trim() };
+  }
+
+  /** Parses one whole expression and nothing else — the form a CHECK constraint stores. */
+  parseExpression(): Expression {
+    const expression = this.#expression();
+    this.#take("eof");
+    return expression;
+  }
+
+  /** DROP VIEW [IF EXISTS] name (F031-16). */
+  parseDropView(): CompiledStatement {
+    this.#keyword("DROP");
+    this.#keyword("VIEW");
+    let ifExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("EXISTS");
+      ifExists = true;
+    }
+    const view = this.#identifier();
+    if (this.#isKeyword("RESTRICT")) this.#keyword("RESTRICT");
+    this.#take("eof");
+    return { kind: "drop-view", view, ...(ifExists ? { ifExists: true } : {}) };
+  }
+
+  /** DROP TABLE [IF EXISTS] name (F031-13). */
+  parseDropTable(): CompiledStatement {
+    this.#keyword("DROP");
+    this.#keyword("TABLE");
+    let ifExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("EXISTS");
+      ifExists = true;
+    }
+    const table = this.#identifier();
+    // RESTRICT is the standard's default and the only behaviour here: nothing cascades, because
+    // the engine has no dependent objects a drop could reach.
+    if (this.#isKeyword("RESTRICT")) this.#keyword("RESTRICT");
+    else if (this.#isKeyword("CASCADE")) {
+      throw new TypeError("DROP TABLE CASCADE is not supported; drop dependents explicitly");
+    }
+    this.#take("eof");
+    return { kind: "drop-table", table, ...(ifExists ? { ifExists: true } : {}) };
   }
 
   /** ALTER TABLE name ADD [COLUMN] col TYPE [NOT NULL] [DEFAULT v] (F031-04). */
@@ -4860,6 +5138,127 @@ class Parser {
       if (!this.#punctuation(",")) break;
     }
     return { returning: columns };
+  }
+
+  /**
+   * MERGE INTO target USING source ON condition WHEN [NOT] MATCHED [AND …] THEN … (F312).
+   * The source may be a table, a view, or a query; each WHEN clause carries its own optional
+   * condition, and the branches are kept in the order written, which is the order they are tried.
+   */
+  parseMerge(): CompiledStatement {
+    this.#keyword("MERGE");
+    this.#keyword("INTO");
+    const table = this.#identifier();
+    const alias = this.#sourceAlias() ?? table;
+    this.#keyword("USING");
+    let source: { alias: string; table?: string; sql?: string };
+    if (this.#peek().text === "(") {
+      const open = this.#peek();
+      this.#expectPunctuation("(");
+      const before = this.parameterCount;
+      this.#queryExpression("(merge source)");
+      if (this.parameterCount !== before) {
+        throw new TypeError(
+          "A MERGE source query cannot take parameters; bind them in the branches",
+        );
+      }
+      const close = this.#peek();
+      this.#expectPunctuation(")");
+      const sourceAlias = this.#sourceAlias();
+      if (sourceAlias === undefined) throw new TypeError("A MERGE source query requires an alias");
+      source = { alias: sourceAlias, sql: this.text.slice(open.start + 1, close.start).trim() };
+    } else {
+      const name = this.#identifier();
+      source = { alias: this.#sourceAlias() ?? name, table: name };
+    }
+    if (source.alias === alias) throw new TypeError("MERGE source and target need distinct names");
+    this.#keyword("ON");
+    const on = this.#expression();
+    const branches: MergeBranch[] = [];
+    while (this.#isKeyword("WHEN")) {
+      this.#keyword("WHEN");
+      let matched = true;
+      if (this.#isKeyword("NOT")) {
+        this.#keyword("NOT");
+        matched = false;
+      }
+      this.#keyword("MATCHED");
+      if (this.#isKeyword("BY")) {
+        // WHEN NOT MATCHED BY SOURCE/TARGET walks the target rather than the source, which this
+        // implementation does not do.
+        throw new TypeError("MERGE ... MATCHED BY SOURCE and BY TARGET are not supported");
+      }
+      let condition: Expression | undefined;
+      if (this.#isKeyword("AND")) {
+        this.#keyword("AND");
+        condition = this.#expression();
+      }
+      this.#keyword("THEN");
+      if (matched) {
+        if (this.#isKeyword("DELETE")) {
+          this.#keyword("DELETE");
+          branches.push({
+            when: "matched",
+            ...(condition === undefined ? {} : { condition }),
+            action: { kind: "delete" },
+          });
+          continue;
+        }
+        this.#keyword("UPDATE");
+        this.#keyword("SET");
+        const assignments: Array<{ column: string; expression: Expression }> = [];
+        for (;;) {
+          const column = this.#identifier();
+          this.#operator("=");
+          const expression = this.#expression();
+          if (hasAggregate(expression)) {
+            throw new TypeError("Aggregate functions are not allowed in MERGE assignments");
+          }
+          assignments.push({ column, expression });
+          if (!this.#punctuation(",")) break;
+        }
+        if (new Set(assignments.map((entry) => entry.column)).size !== assignments.length) {
+          throw new TypeError("MERGE assignments must set each column once");
+        }
+        branches.push({
+          when: "matched",
+          ...(condition === undefined ? {} : { condition }),
+          action: { kind: "update", assignments },
+        });
+        continue;
+      }
+      this.#keyword("INSERT");
+      const columns: string[] = [];
+      if (this.#punctuation("(")) {
+        for (;;) {
+          columns.push(this.#identifier());
+          if (!this.#punctuation(",")) break;
+        }
+        this.#expectPunctuation(")");
+      }
+      this.#keyword("VALUES");
+      this.#expectPunctuation("(");
+      const values: Expression[] = [];
+      for (;;) {
+        values.push(this.#expression());
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+      if (columns.length > 0 && columns.length !== values.length) {
+        throw new TypeError("MERGE INSERT values must match its column list");
+      }
+      branches.push({
+        when: "not-matched",
+        ...(condition === undefined ? {} : { condition }),
+        action: { kind: "insert", columns, values },
+      });
+    }
+    if (branches.length === 0) throw new TypeError("MERGE needs at least one WHEN clause");
+    if (this.#isKeyword("RETURNING")) {
+      throw new TypeError("MERGE does not support RETURNING; read the rows back with a SELECT");
+    }
+    this.#take("eof");
+    return { kind: "merge", table, alias, source, on, branches };
   }
 
   #updateStatement(): CompiledStatement {
@@ -7227,6 +7626,60 @@ function sourceWildcardColumns(
  * table's columns positionally (E051-09). The table's own column order is only known here, so
  * the parser records the names and this pass — one per execution entry — applies them.
  */
+/** Whether any block of the plan reads a table name the catalog answers with a view. */
+export function planReadsViews(plan: CompiledQuery, isView: (name: string) => boolean): boolean {
+  if (
+    [plan.base, ...plan.joins].some(
+      (source) => source.derived === undefined && isView(source.table),
+    )
+  )
+    return true;
+  let nested = false;
+  forEachNestedBlock(plan, (inner) => {
+    nested ||= planReadsViews(inner, isView);
+  });
+  return nested;
+}
+
+/**
+ * Replaces every reference to a view with the query it stands for, as a derived table under the
+ * reference's own alias (F031-02). A view whose body reads another view expands too, up to a
+ * depth that stops a cycle from recursing forever — a view cannot be defined in terms of itself,
+ * but two views can be redefined into a loop after the fact.
+ */
+export function expandViewSources(
+  plan: CompiledQuery,
+  viewFor: (tableName: string) => CompiledQuery | undefined,
+  maxDepth = 16,
+): CompiledQuery {
+  const isView = (name: string): boolean => viewFor(name) !== undefined;
+  if (!planReadsViews(plan, isView)) return plan;
+  let sequence = 0;
+  const nextSequence = (): number => {
+    sequence += 1;
+    return sequence;
+  };
+  const expandBlock = (block: CompiledQuery, depth: number): void => {
+    if (depth > maxDepth) {
+      throw new TypeError("A view cannot be defined in terms of itself");
+    }
+    for (const source of [block.base, ...block.joins]) {
+      if (source.derived !== undefined || source.union !== undefined) continue;
+      const body = viewFor(source.table);
+      if (body === undefined) continue;
+      const expanded = structuredClone(body);
+      expandBlock(expanded, depth + 1);
+      Object.assign(source, derivedTableSource(expanded, source.alias, nextSequence));
+    }
+    forEachNestedBlock(block, (inner) => {
+      expandBlock(inner, depth);
+    });
+  };
+  const resolved = structuredClone(plan);
+  expandBlock(resolved, 0);
+  return resolved;
+}
+
 export function planHasSourceColumnAliases(plan: CompiledQuery): boolean {
   if ([plan.base, ...plan.joins].some((source) => source.columnAliases !== undefined)) return true;
   let nested = false;

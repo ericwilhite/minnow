@@ -22,10 +22,15 @@ Some of what is missing is missing on purpose. The reasons fall into three group
 
 ### Because the browser is the runtime
 
-`BEGIN` / `COMMIT` as statement text are not supported. A transaction that a statement string can
-open is one that a lost reference, a closed tab, or a thrown error can leave open forever, holding
-storage a background sweep then cannot reclaim. Transactions are a scope instead —
-`db.write(async (tx) => { … })` — which ends when its callback does, however it ends.
+`BEGIN` … `COMMIT` works, but with a bound on it. A transaction a statement string can open is one
+a lost reference, a closed tab, or a thrown error could leave open forever, holding storage a
+background sweep cannot reclaim — so one left untouched rolls itself back, and schema changes are
+refused inside it, because the catalog commits outside the scope and a rollback could not take
+them back. `db.write(async (tx) => { … })` remains the form with no bound to hit: it ends when its
+callback does, however it ends.
+
+There is one isolation level, so `SET TRANSACTION ISOLATION LEVEL` has nothing to set: every read
+runs against a single version and every write scope commits atomically.
 
 There are no array, `UUID`, or `INTERVAL` column types. Each would need an encoding, a comparison
 order, and a set of operators that the columnar format would carry forever, for a gain an
@@ -35,13 +40,11 @@ way SQLite does: `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON
 `IS JSON` predicate. `JSON_TABLE` is missing because it produces rows rather than a value, which
 the executors have no operator for.
 
-There is no `DROP TABLE` or `CREATE VIEW`. The block store has no primitive that removes a table,
-so a dropped one would leave its segments and blocks behind, and the catalog has no registry for
-named queries — a CTE or the typed builder covers the same reuse.
-
-`CHECK` and `FOREIGN KEY` are rejected at `CREATE TABLE` rather than accepted and ignored. A
-constraint that never runs is worse than one the engine declines to promise; a `BEFORE` trigger
-can raise instead.
+`FOREIGN KEY` is rejected at `CREATE TABLE` rather than accepted and ignored: referential actions
+would have to run on every write path of every table, and the engine has no cross-table write hook
+to hang them on. A constraint that never runs is worse than one the engine declines to promise, so
+it fails by name — and a `BEFORE` trigger can raise instead. `CHECK` is enforced, on every path
+that writes a row.
 
 ### Because of how mutations work
 

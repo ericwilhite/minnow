@@ -658,6 +658,85 @@ async function commitLowLevelNumberSegment(
 
 for (const implementation of implementations()) {
   describe(implementation.name, () => {
+    it("drops a table and everything keyed to it, leaving the bytes for the collector", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2 });
+      await database.createTable({
+        name: "notes",
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "body", type: "string" },
+        ],
+      });
+      await database.createTable({
+        name: "kept",
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "body", type: "string" },
+        ],
+      });
+      await database.insertBatch("notes", { columns: { id: [1, 2, 3], body: ["a", "b", "c"] } });
+      await database.insertBatch("kept", { columns: { id: [1], body: ["stays"] } });
+      const before = await store.listBlockIds();
+      const notesId = (await store.getTableByName("notes"))?.id ?? "";
+      expect((await store.listSegments(notesId)).length).toBeGreaterThan(0);
+
+      expect(await database.dropTable("notes")).toBe(true);
+
+      // The catalog no longer knows the table, and neither does a query.
+      expect((await store.listTables()).map((table) => table.name)).toEqual(["kept"]);
+      await expect(database.query("SELECT COUNT(*) AS n FROM notes")).rejects.toThrow(
+        "Table not found: notes",
+      );
+      // Its segments go with it, so nothing points at a table that is not there.
+      expect(await store.listSegments(notesId)).toEqual([]);
+      const remainingTables = await store.listTables();
+      const liveIds = new Set(remainingTables.map((table) => table.id));
+      expect((await store.listSegments()).every((segment) => liveIds.has(segment.tableId))).toBe(
+        true,
+      );
+      // The bytes are retired rather than deleted: still stored until the lease-aware collector
+      // reclaims them, which is what keeps a pinned reader's blocks resolvable.
+      expect((await store.listBlockIds()).length).toBe(before.length);
+      await database.collectGarbage();
+      expect((await store.listBlockIds()).length).toBeLessThan(before.length);
+      // The surviving table is untouched, and the name is free again.
+      expect((await database.query("SELECT body FROM kept")).rows).toEqual([{ body: "stays" }]);
+      await database.createTable({
+        name: "notes",
+        columns: [{ name: "different", type: "number" }],
+      });
+      expect((await database.query("SELECT COUNT(*) AS n FROM notes")).rows).toEqual([{ n: 0 }]);
+
+      expect(await database.dropTable("missing", { ifExists: true })).toBe(false);
+      await expect(database.dropTable("missing")).rejects.toThrow("Table not found: missing");
+    });
+
+    it("refuses to drop a table another table's trigger writes to", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "audit",
+        columns: [{ name: "note", type: "string" }],
+      });
+      await database.createTable({
+        name: "items",
+        uniqueKey: "id",
+        columns: [{ name: "id", type: "number" }],
+      });
+      await database.execute(
+        "CREATE TRIGGER items_ins AFTER INSERT ON items BEGIN INSERT INTO audit (note) VALUES ('ins'); END",
+      );
+      await expect(database.dropTable("audit")).rejects.toThrow(
+        "Cannot drop audit: trigger items_ins on items writes to it",
+      );
+      // The table the trigger belongs to can still go: its triggers leave with it.
+      expect(await database.dropTable("items")).toBe(true);
+      expect(await database.dropTable("audit")).toBe(true);
+    });
+
     it("creates tables with only simple data types and inserts a column batch", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { rowsPerBlock: 2 });
@@ -6766,8 +6845,11 @@ for (const implementation of implementations()) {
     await expect(database.execute("DELETE FROM sql_events")).rejects.toThrow(
       "DELETE requires a table with a unique key",
     );
-    await expect(database.execute("DROP TABLE sql_people")).rejects.toThrow(
-      "DROP supports: DROP TRIGGER name",
+    await expect(database.execute("DROP TABLE sql_people CASCADE")).rejects.toThrow(
+      "DROP TABLE CASCADE is not supported",
+    );
+    await expect(database.execute("DROP INDEX whatever")).rejects.toThrow(
+      "DROP supports: DROP TABLE name, DROP TRIGGER name",
     );
     await expect(database.query("DELETE FROM sql_people")).rejects.toThrow("Expected SELECT");
     await expect(

@@ -116,6 +116,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.updateTable(id, expectedRevision, update);
   }
 
+  removeTable(id: string, expectedRevision: number): Promise<void> {
+    return this.inner.removeTable(id, expectedRevision);
+  }
+
   addSegment(record: SegmentRecord): Promise<void> {
     return this.inner.addSegment(record);
   }

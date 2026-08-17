@@ -30,9 +30,25 @@ CREATE TABLE completed_orders AS
 SELECT order_id, customer_id, total FROM orders WHERE status = 'completed'
 ```
 
-`CHECK` and `FOREIGN KEY` are rejected rather than accepted and ignored: the engine has no
-cross-table write hook to enforce a reference with, and a `CHECK` that never runs is worse than
-one it declines to promise. A `BEFORE` trigger can raise instead.
+A `CHECK` constraint is a row condition over the table's own columns, and it runs on every path
+that writes a row — insert, upsert, and update, which is checked against the row as it will be
+once the update lands:
+
+```sql
+CREATE TABLE orders (
+  order_id INTEGER PRIMARY KEY,
+  total DOUBLE PRECISION NOT NULL CHECK (total >= 0),
+  status VARCHAR(20) NOT NULL,
+  CONSTRAINT settled_orders_have_a_total CHECK (status <> 'completed' OR total > 0)
+)
+```
+
+A constraint fails only when it evaluates to false, so SQL's unknown passes: a NULL column
+satisfies `CHECK (total >= 0)` unless the column is also `NOT NULL`.
+
+`FOREIGN KEY` is rejected rather than accepted and ignored: referential actions would have to run
+on every write path of every table, and the engine has no cross-table write hook to hang them on.
+A `BEFORE` trigger can raise instead.
 
 A table without a `PRIMARY KEY` is append-only. That is a reasonable choice for an event log, and
 a mistake for anything a user edits, because it cannot be changed later without recreating the
@@ -106,8 +122,18 @@ changes: no blocks are rewritten, so they are effectively instant however large 
 column added to a table with rows in it is always nullable — the rows already stored have no value
 for it — though a `DEFAULT` fills the rows written afterwards.
 
-There is no `DROP TABLE`: the block store has no primitive that removes a table, so a dropped one
-would leave its segments and blocks behind.
+`DROP TABLE` takes the table's rows, its catalog record, its full-text index, and its triggers.
+The blocks are retired through the commit rather than deleted, so a reader pinned to an older
+version keeps resolving the bytes it already holds and the collector reclaims them once nobody
+can reach them:
+
+```sql
+DROP TABLE IF EXISTS old_orders
+```
+
+What a pinned reader does lose is the table itself — the catalog has one present tense, so a
+snapshot open across a drop sees the table disappear rather than a frozen copy of it. A table
+another table's trigger writes to cannot be dropped; the trigger would fail at every firing.
 
 Narrowing a column, changing its type, dropping it, or adding a `NOT NULL` column to a table with
 rows in it are all refused — each would need a rewrite of every block, and doing that silently

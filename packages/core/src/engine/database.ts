@@ -117,11 +117,13 @@ import {
   dualTableRows,
   blockHasSubqueries,
   combineUnionResults,
+  compileCheckExpression,
   compileQuery,
   hasAggregate,
   createRecursiveCteState,
   compileStatement,
   createPreparedColumnarQuery,
+  evaluateJoinedRowExpression,
   evaluateRowExpression,
   expressionColumnNames,
   inferBlockSchema,
@@ -130,10 +132,12 @@ import {
   expandFtsColumns,
   expandNaturalJoins,
   expandSourceColumnAliases,
+  expandViewSources,
   forEachBlockExpression,
   planContainsFts,
   planHasNaturalJoins,
   planHasSourceColumnAliases,
+  planReadsViews,
   planReadsBeyondSingleScan,
   projectResultColumns,
   subqueryResolutionSteps,
@@ -312,6 +316,8 @@ export interface ColumnDefinition {
 export interface CreateTableInput {
   name: string;
   columns: readonly ColumnDefinition[];
+  /** Row conditions every written row must satisfy (E141-06); each is a boolean SQL expression. */
+  checks?: ReadonlyArray<{ name: string; sql: string }>;
   uniqueKey?: string;
 }
 
@@ -655,6 +661,12 @@ export interface MinnowDatabaseOptions {
   /** Durable spill-owner lease lifetime; renewed while a spilling query runs. */
   spillOwnerLeaseMs?: number;
   /**
+   * How long a statement-level transaction (`BEGIN` … `COMMIT`) may sit untouched before it
+   * rolls itself back; 30 seconds by default. A scope nobody ever closes would otherwise hold
+   * its staged blocks and transaction record against the collector forever.
+   */
+  transactionIdleTimeoutMs?: number;
+  /**
    * Retained bytes for the block buffer pool: decoded physical blocks, their vectorized
    * per-block column forms, zone-map block descriptions, and derived/subquery block
    * results. Every entry is keyed by an immutable identity (a block id, or an exact
@@ -689,10 +701,37 @@ export interface QuerySpillCleanupResult {
   ownersRetained: number;
 }
 
+/** Thrown into a held write scope to make it abort; never surfaces to a caller. */
+class TransactionRollback extends Error {
+  constructor() {
+    super("Transaction rolled back");
+    this.name = "TransactionRollback";
+  }
+}
+
+/**
+ * Whether a statement may run inside a statement-level transaction. Reads and row writes stage
+ * into the scope; schema changes do not, because the catalog commits outside it and a rollback
+ * could not take them back.
+ */
+function isTransactionalStatement(statement: CompiledStatement): boolean {
+  return (
+    statement.kind === "insert" ||
+    statement.kind === "update" ||
+    statement.kind === "delete" ||
+    statement.kind === "select"
+  );
+}
+
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
   | { kind: "create-table"; table: string }
   | { kind: "add-column"; table: string; column: string }
+  | { kind: "drop-table"; table: string; dropped: boolean }
+  | { kind: "merge"; table: string; rowCount: number; version?: number }
+  | { kind: "transaction"; action: "begin" | "commit" | "rollback"; version?: number }
+  | { kind: "create-view"; view: string }
+  | { kind: "drop-view"; view: string; dropped: boolean }
   | { kind: "create-trigger"; table: string; name: string }
   | { kind: "drop-trigger"; name: string }
   | {
@@ -731,6 +770,21 @@ export interface RunStatementOptions {
    * the written values; updates return post-update values; deletes return the rows as read.
    */
   readonly returning?: readonly string[] | "*";
+  /**
+   * Where the statement's writes go. Absent means the database itself — one commit per
+   * statement. A write scope routes them into that scope instead, which is how a statement-level
+   * transaction makes several statements publish together.
+   */
+  readonly writer?: StatementWriter;
+}
+
+/**
+ * A write scope seen as somewhere statements can run: the batch operations, plus the reads the
+ * keyed mutation paths need — by SQL for subqueries, by plan for the rows an UPDATE or DELETE
+ * is about to touch. Both reads observe the scope's own staged writes.
+ */
+export interface StatementWriter extends WriteSession {
+  queryPlan(plan: CompiledQuery): Promise<QueryResult>;
 }
 
 export interface VisibleSegment {
@@ -781,6 +835,22 @@ export interface SnapshotImportOptions {
 
 export class MinnowDatabase {
   readonly #transactions: TransactionManager;
+  /**
+   * How long a statement-level transaction may sit untouched before it rolls itself back. The
+   * bound is what makes a BEGIN a caller can walk away from safe: an abandoned scope holds
+   * staged blocks and a transaction record the collector cannot reclaim while it is open.
+   */
+  readonly #transactionIdleTimeoutMs: number;
+  /** The scope a statement-level BEGIN opened, held until COMMIT, ROLLBACK, or the idle sweep. */
+  #openTransaction:
+    | {
+        session: StatementWriter;
+        settle: (outcome: "commit" | "rollback") => void;
+        finished: Promise<{ version: number | null | undefined }>;
+        timer: ReturnType<typeof setInterval>;
+        touched: boolean;
+      }
+    | undefined;
   readonly #compression: Compression;
   /** Per-column record of whether gzip repaid itself, and how many blocks ago that was seen. */
   readonly #gzipVerdicts = new Map<string, { worthwhile: boolean; blocksSince: number }>();
@@ -854,6 +924,7 @@ export class MinnowDatabase {
         "Full-text auto-index row threshold must be a non-negative whole number",
       );
     }
+    this.#transactionIdleTimeoutMs = options.transactionIdleTimeoutMs ?? 30_000;
     this.#transactions = new TransactionManager(store, {
       now: this.#now,
       createId: this.#createId,
@@ -903,10 +974,17 @@ export class MinnowDatabase {
         );
       }
     }
+    const checks = (input.checks ?? []).map((check) => {
+      // Compiling here means a constraint the engine could never evaluate is refused at
+      // definition rather than on the first write.
+      compileCheckExpression(check.sql, check.name);
+      return { name: validateName(check.name, "Constraint"), sql: check.sql };
+    });
     await this.store.addTable({
       id: this.#createId(),
       name,
       columns,
+      ...(checks.length === 0 ? {} : { checks }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyStorage: "chunks-v2" as const }),
@@ -945,6 +1023,123 @@ export class MinnowDatabase {
         if (attempt >= this.#maxCommitRetries) throw error.conflict;
       }
     }
+  }
+
+  /**
+   * Defines a view: a query the catalog answers to by name (F031-02). The stored record carries
+   * the query's inferred output schema, so a view answers the same questions a table does —
+   * what a reader can select, and of what type — and the devtools rail lists it beside them.
+   * Reads expand it into the query it stands for; writes to it are refused.
+   */
+  async createView(
+    name: string,
+    sql: string,
+    options: { orReplace?: boolean } = {},
+  ): Promise<void> {
+    const viewName = validateName(name, "View");
+    const plan = compileQuery(sql);
+    const existing = await this.store.getTableByName(viewName);
+    if (existing !== undefined) {
+      if (existing.view === undefined) throw new TypeError(`Table already exists: ${viewName}`);
+      if (options.orReplace !== true) throw new TypeError(`View already exists: ${viewName}`);
+    }
+    // The schema is inferred against the catalog as it stands, where a view answers with its own
+    // stored columns — so a view over a view types without expanding anything, and a body that
+    // cannot be typed fails where it is written rather than on the first read.
+    const schemas = new Map(
+      (await this.store.listTables()).map((table) => [
+        table.name,
+        table.columns.map(({ name: column, type }) => ({ name: column, type })),
+      ]),
+    );
+    const inferred = inferBlockSchema(plan, schemas);
+    if (inferred.length === 0) throw new TypeError(`A view needs at least one column: ${viewName}`);
+    if (existing !== undefined) await this.store.removeTable(existing.id, existing.revision ?? 0);
+    await this.store.addTable({
+      id: this.#createId(),
+      name: viewName,
+      columns: inferred.map((column) => ({
+        id: this.#createId(),
+        name: column.name,
+        type: column.type,
+        nullable: true,
+      })),
+      view: { sql },
+      createdAt: this.#now().toISOString(),
+    });
+    this.#planCache.clear();
+  }
+
+  /** Removes a view. Returns whether one was dropped; `ifExists` makes a missing one no error. */
+  async dropView(name: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    const record = await this.store.getTableByName(name);
+    if (record?.view === undefined) {
+      if (record !== undefined) throw new TypeError(`Not a view: ${name}`);
+      if (options.ifExists === true) return false;
+      throw new Error(`View not found: ${name}`);
+    }
+    await this.store.removeTable(record.id, record.revision ?? 0);
+    this.#planCache.clear();
+    return true;
+  }
+
+  /**
+   * Drops a table: its rows, its catalog record, its full-text index, and its triggers. The
+   * blocks are retired through an ordinary commit rather than deleted, so a reader pinned to an
+   * older version keeps resolving the bytes it already holds and the lease-aware collector
+   * reclaims them when nobody can reach them. What a pinned reader does lose is the table
+   * itself — the catalog has one present tense, so a snapshot open across a drop sees the table
+   * disappear rather than a frozen copy of it.
+   *
+   * Returns whether a table was dropped; with `ifExists`, a missing table is not an error.
+   */
+  async dropTable(tableName: string, options: { ifExists?: boolean } = {}): Promise<boolean> {
+    const table = await this.store.getTableByName(tableName);
+    if (table === undefined) {
+      if (options.ifExists === true) return false;
+      throw new Error(`Table not found: ${tableName}`);
+    }
+    if (table.view !== undefined) throw new TypeError(`${tableName} is a view; use DROP VIEW`);
+    // A trigger elsewhere whose body writes to this table would fail at every firing, which is
+    // a worse outcome than refusing the drop — the same rule a column rename follows.
+    for (const owner of await this.store.listTables()) {
+      if (owner.id === table.id) continue;
+      for (const trigger of owner.triggers ?? []) {
+        const writesHere = trigger.statements.some((statement) => {
+          const compiled = compileStatement(statement.sql);
+          return (
+            (compiled.kind === "insert" ||
+              compiled.kind === "update" ||
+              compiled.kind === "delete") &&
+            compiled.table === table.name
+          );
+        });
+        if (writesHere) {
+          throw new TypeError(
+            `Cannot drop ${table.name}: trigger ${trigger.name} on ${owner.name} writes to it`,
+          );
+        }
+      }
+    }
+    const segments = await this.store.listSegments(table.id);
+    const blockIds = [
+      ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+    ];
+    const transaction = await this.#transactions.begin();
+    try {
+      transaction.markTableChanged(table.id);
+      if (blockIds.length > 0) transaction.supersedeBlocks(blockIds);
+      await transaction.commit();
+    } catch (error) {
+      await transaction.abort();
+      throw error;
+    }
+    // The catalog goes last: until it does, the table is merely empty of live blocks, and a
+    // crash in between leaves a table whose rows are gone rather than a segment pointing at a
+    // table that is not there.
+    await this.store.removeTable(table.id, table.revision ?? 0);
+    this.#planCache.clear();
+    return true;
   }
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
@@ -1277,11 +1472,14 @@ export class MinnowDatabase {
         blockCount += blockWrites.length;
         batchBlockWrites.push(...blockWrites);
       }
+      const checks = table.checks ?? [];
       const preImages = await this.#triggerPreImages(
         table,
         keyColumn,
         input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
         "update",
+        undefined,
+        checks.length > 0,
       );
       const updateValueAt = (
         source: "new" | "old",
@@ -1294,6 +1492,18 @@ export class MinnowDatabase {
           ? (preImages[rowIndex]?.[column] ?? null)
           : (changed[rowIndex] ?? null);
       };
+      // E141-06 on the write that changes a row rather than writes a whole one: the constraint
+      // sees the post-image, the row as it will be once this update lands.
+      if (checks.length > 0) {
+        for (let rowIndex = 0; rowIndex < input.keys.length; rowIndex += 1) {
+          if (preImages[rowIndex] === undefined) continue;
+          const row: Record<string, BatchValue> = {};
+          for (const column of table.columns) {
+            row[column.name] = updateValueAt("new", column.name, rowIndex);
+          }
+          assertRowChecks(table, row, rowIndex);
+        }
+      }
       await this.#stageTriggerDerivedInserts(
         transaction,
         table,
@@ -2188,6 +2398,16 @@ export class MinnowDatabase {
 
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    const open = this.#openTransaction;
+    if (open !== undefined) {
+      // Read-your-writes: inside BEGIN … COMMIT a read sees the pre-scope snapshot plus what
+      // this transaction has staged, and nothing another writer published in between.
+      open.touched = true;
+      return open.session.query(
+        sql,
+        options.params === undefined ? {} : { params: options.params },
+      );
+    }
     const plan = bindPlanParameters(this.#compileCached(sql), options.params);
     // Result memoization is a pure cache over the freshness probe: the catalog epoch is part
     // of the key, so any commit or DDL changes the key and a hit can never be stale. Only
@@ -2228,21 +2448,41 @@ export class MinnowDatabase {
   }
 
   /**
-   * Applies the rewrites that need the catalog's columns: `FROM t AS y(a, b)` renames (E051-09)
-   * and NATURAL join conditions (F401-01). The catalog read only happens for the statements
-   * that ask for one.
+   * Applies the rewrites that need the catalog rather than the statement alone: a view becomes
+   * the query it stands for (F031-02), `FROM t AS y(a, b)` renames the table's columns
+   * (E051-09), and a NATURAL join becomes the equality over the columns its sides share
+   * (F401-01). Reads the catalog only for the statements that ask for one of them.
    */
-  async #renameAliasedSourceColumns(plan: CompiledQuery): Promise<CompiledQuery> {
+  async #applyCatalogRewrites(plan: CompiledQuery): Promise<CompiledQuery> {
     const aliased = planHasSourceColumnAliases(plan);
     const natural = planHasNaturalJoins(plan);
-    if (!aliased && !natural) return plan;
+    // A view reference is indistinguishable from a table reference without the catalog, so the
+    // cheap pre-check is whether the statement names anything at all beyond its own derived
+    // sources — which every statement does. The catalog read is one cached list.
     const tables = await this.store.listTables();
+    const views = new Map(
+      tables.flatMap((table) => (table.view === undefined ? [] : [[table.name, table.view.sql]])),
+    );
+    let rewritten = plan;
+    if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
+      const bodies = new Map<string, CompiledQuery>();
+      rewritten = expandViewSources(rewritten, (name) => {
+        const sql = views.get(name);
+        if (sql === undefined) return undefined;
+        const cached = bodies.get(name);
+        if (cached !== undefined) return cached;
+        const compiled = this.#compileCached(sql);
+        bodies.set(name, compiled);
+        return compiled;
+      });
+    }
+    if (!aliased && !natural) return rewritten;
     const columns = new Map(
       tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
     );
     const columnsOf = (name: string): readonly string[] | undefined => columns.get(name);
-    if (aliased) plan = expandSourceColumnAliases(plan, columnsOf);
-    return natural ? expandNaturalJoins(plan, columnsOf) : plan;
+    if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
+    return natural ? expandNaturalJoins(rewritten, columnsOf) : rewritten;
   }
 
   /**
@@ -2251,7 +2491,7 @@ export class MinnowDatabase {
    * for the execution path as well as the plan.
    */
   async #queryCompiled(plan: CompiledQuery, options: QueryOptions = {}): Promise<QueryResult> {
-    plan = await this.#renameAliasedSourceColumns(plan);
+    plan = await this.#applyCatalogRewrites(plan);
     const spillPageRows =
       options.spillPageRows === undefined
         ? undefined
@@ -2392,7 +2632,9 @@ export class MinnowDatabase {
         currentVersion: () => this.store.getCurrentManifestVersion(),
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
         dependencyTableIds: async (query) => {
-          const plan = typeof query === "string" ? this.#compileCached(query) : query.plan;
+          const compiled = typeof query === "string" ? this.#compileCached(query) : query.plan;
+          // A live query over a view depends on the tables behind it, not on the view's name.
+          const plan = await this.#applyCatalogRewrites(compiled);
           const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
@@ -2857,8 +3099,10 @@ export class MinnowDatabase {
     keys: ReadonlyArray<Exclude<BatchValue, null>>,
     event: "update" | "delete",
     readRows?: (sql: string, params: QueryValue[]) => Promise<QueryResult>,
+    /** Reads the rows even with no trigger to feed — CHECK constraints need the post-image. */
+    force = false,
   ): Promise<Array<Record<string, BatchValue> | undefined>> {
-    if (!(table.triggers ?? []).some((trigger) => trigger.event === event)) return [];
+    if (!force && !(table.triggers ?? []).some((trigger) => trigger.event === event)) return [];
     const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
     const placeholders = keys.map(() => "?").join(", ");
     const preImageSql = `SELECT * FROM ${quote(table.name)} WHERE ${quote(keyColumn.name)} IN (${placeholders})`;
@@ -3175,6 +3419,17 @@ export class MinnowDatabase {
   async write<T>(
     action: (session: WriteSession) => Promise<T>,
   ): Promise<{ result: T; version: number | null }> {
+    return this.#openWriteScope((session) => action(session));
+  }
+
+  /**
+   * `write()` with the scope's transaction handed to the callback as well, for the internal
+   * callers that need to read through it by plan rather than by SQL text — the keyed mutation
+   * paths a statement-level transaction routes through.
+   */
+  async #openWriteScope<T>(
+    action: (session: WriteSession, transaction: DatabaseTransaction) => Promise<T>,
+  ): Promise<{ result: T; version: number | null }> {
     const transaction = await this.#transactions.begin();
     let closed = false;
     let staged = 0;
@@ -3230,7 +3485,7 @@ export class MinnowDatabase {
       },
     };
     try {
-      const result = await action(session);
+      const result = await action(session, transaction);
       closed = true;
       if (poisoned !== undefined) {
         // The outer catch aborts the transaction.
@@ -3558,12 +3813,14 @@ export class MinnowDatabase {
     if (committedKeys.size > 0) {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
     }
+    const sessionChecks = table.checks ?? [];
     const preImages = await this.#triggerPreImages(
       table,
       keyColumn,
       input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
       "update",
       (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
+      sessionChecks.length > 0,
     );
     const sessionUpdateValueAt = (
       source: "new" | "old",
@@ -3576,6 +3833,18 @@ export class MinnowDatabase {
         ? (preImages[rowIndex]?.[column] ?? null)
         : (changed[rowIndex] ?? null);
     };
+    // The same post-image rule as a standalone update, so a scope — and the partial upsert that
+    // runs inside one — cannot write a row a direct UPDATE would refuse.
+    if (sessionChecks.length > 0) {
+      for (let rowIndex = 0; rowIndex < input.keys.length; rowIndex += 1) {
+        if (preImages[rowIndex] === undefined) continue;
+        const row: Record<string, BatchValue> = {};
+        for (const column of table.columns) {
+          row[column.name] = sessionUpdateValueAt("new", column.name, rowIndex);
+        }
+        assertRowChecks(table, row, rowIndex);
+      }
+    }
     await this.#stageTriggerDerivedInserts(
       transaction,
       table,
@@ -3960,13 +4229,106 @@ export class MinnowDatabase {
    */
   async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
     const statement = compileStatement(sql);
+    if (statement.kind === "transaction") return this.#runTransactionStatement(statement.action);
     if (statement.kind === "select") {
       return {
         kind: "rows",
         result: await this.query(statement.sql, params === undefined ? {} : { params }),
       };
     }
+    const open = this.#openTransaction;
+    if (open !== undefined) {
+      // Inside BEGIN … COMMIT every write stages into that one scope, so the statements publish
+      // together or not at all. Schema changes are refused rather than silently auto-committed:
+      // the catalog is not part of the scope, so a DDL statement inside one would land even if
+      // the transaction rolled back.
+      if (!isTransactionalStatement(statement)) {
+        throw new TypeError(
+          `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a transaction`,
+        );
+      }
+      open.touched = true;
+      return this.runStatement(bindStatementParameters(statement, params), {
+        writer: open.session,
+      });
+    }
     return this.runStatement(bindStatementParameters(statement, params));
+  }
+
+  /**
+   * BEGIN / COMMIT / ROLLBACK (E151). The scope is the same one `write()` opens, held between
+   * statements instead of around a callback: every write stages into it, reads see what it has
+   * staged, COMMIT publishes, and ROLLBACK discards.
+   *
+   * An abandoned transaction is the hazard a statement-level BEGIN introduces — a lost reference
+   * or a closed tab would otherwise hold a scope open forever — so one that goes untouched for
+   * `transactionIdleTimeoutMs` rolls itself back, and closing the database rolls back whatever
+   * is open.
+   */
+  async #runTransactionStatement(action: "begin" | "commit" | "rollback"): Promise<ExecuteResult> {
+    if (action === "begin") {
+      if (this.#openTransaction !== undefined) {
+        throw new TypeError("A transaction is already open; COMMIT or ROLLBACK it first");
+      }
+      let start!: (writer: StatementWriter) => void;
+      const opened = new Promise<StatementWriter>((resolve) => {
+        start = resolve;
+      });
+      let settle!: (outcome: "commit" | "rollback") => void;
+      const decided = new Promise<"commit" | "rollback">((resolve) => {
+        settle = resolve;
+      });
+      const finished = this.#openWriteScope<null>(async (session, transaction) => {
+        start({
+          ...session,
+          queryPlan: (plan) => this.#sessionQueryPlan(transaction, plan),
+        });
+        if ((await decided) === "rollback") throw new TransactionRollback();
+        return null;
+      });
+      const session = await opened;
+      const state = {
+        session,
+        settle,
+        touched: false,
+        finished: finished.then(
+          ({ version }) => ({ version }),
+          (error: unknown) => {
+            if (error instanceof TransactionRollback) return { version: null };
+            throw error;
+          },
+        ),
+        timer: setInterval(() => {
+          // One whole interval with no statement is what counts as abandoned: a transaction
+          // still being written to keeps clearing the flag before the next sweep reads it.
+          if (this.#openTransaction !== state) return;
+          if (state.touched) {
+            state.touched = false;
+            return;
+          }
+          this.#openTransaction = undefined;
+          clearInterval(state.timer);
+          state.settle("rollback");
+        }, this.#transactionIdleTimeoutMs),
+      };
+      // An idle sweep must never keep a process alive on its own; browsers have no unref.
+      if (typeof state.timer === "object" && "unref" in state.timer) state.timer.unref();
+      this.#openTransaction = state;
+      return { kind: "transaction", action: "begin" };
+    }
+    const open = this.#openTransaction;
+    if (open === undefined) {
+      throw new TypeError(`${action.toUpperCase()} without an open transaction`);
+    }
+    this.#openTransaction = undefined;
+    clearInterval(open.timer);
+    open.settle(action === "commit" ? "commit" : "rollback");
+    const { version } = await open.finished;
+    return {
+      kind: "transaction",
+      action,
+      ...(version === null || version === undefined ? {} : { version }),
+    };
   }
 
   /**
@@ -4149,6 +4511,150 @@ export class MinnowDatabase {
   }
 
   /** Runs an INSERT ... SELECT source at one snapshot and materializes it as literal rows. */
+  /**
+   * MERGE (F312). One pass over the source, joined to the target on the match condition, decides
+   * each row's branch; the branches then apply as ordinary batched writes inside a single write
+   * scope, so the whole statement publishes atomically and fires the same triggers the
+   * equivalent INSERT, UPDATE, and DELETE would.
+   *
+   * The match condition has to equate the target's unique key with something from the source:
+   * that is what the keyed write paths address rows by, and it is also why a source row can
+   * match at most one target row — the standard's cardinality violation cannot arise here.
+   */
+  async #runMerge(
+    statement: Extract<CompiledStatement, { kind: "merge" }>,
+  ): Promise<ExecuteResult> {
+    const target = await this.#findTable(statement.table);
+    const keyColumn = getUniqueKeyColumn(target);
+    if (keyColumn === undefined) {
+      throw new TypeError(`MERGE requires a table with a unique key: ${target.name}`);
+    }
+    const sourceKey = mergeSourceKeyExpression(statement, keyColumn.name);
+    // The source's key value per row, and the target row it matches (or none).
+    const sourceSql = mergeSourceSql(statement);
+    const { result: applied, version } = await this.write(async (session) => {
+      const sourceRows = (await session.query(sourceSql)).rows;
+      const keys = sourceRows.map((row) =>
+        evaluateJoinedRowExpression(sourceKey, { [statement.source.alias]: row }),
+      );
+      const present = new Map<string, DatabaseRow>();
+      const wanted = keys.filter((key): key is QueryValue => key !== null);
+      if (wanted.length > 0) {
+        const existing = await session.query(
+          `SELECT * FROM ${quoteSqlIdentifier(target.name)} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${wanted
+            .map(() => "?")
+            .join(", ")})`,
+          { params: wanted },
+        );
+        for (const row of existing.rows) {
+          const key = row[keyColumn.name];
+          if (key !== null && key !== undefined) present.set(keyToken(keyColumn.type, key), row);
+        }
+      }
+      const updates = new Map<
+        string,
+        { key: Exclude<BatchValue, null>; changes: Record<string, BatchValue> }
+      >();
+      const deletes = new Map<string, QueryValue>();
+      const inserts: Array<Record<string, BatchValue>> = [];
+      sourceRows.forEach((sourceRow, index) => {
+        const key = keys[index] ?? null;
+        const token = key === null ? undefined : keyToken(keyColumn.type, key);
+        const matched = token === undefined ? undefined : present.get(token);
+        const context = {
+          [statement.source.alias]: sourceRow,
+          [statement.alias]: matched,
+        };
+        for (const branch of statement.branches) {
+          if ((branch.when === "matched") !== (matched !== undefined)) continue;
+          if (
+            branch.condition !== undefined &&
+            evaluateJoinedRowExpression(branch.condition, context) !== true
+          ) {
+            continue;
+          }
+          if (branch.action.kind === "delete") {
+            if (key !== null && token !== undefined) {
+              deletes.set(token, key);
+              updates.delete(token);
+            }
+            return;
+          }
+          if (branch.action.kind === "update") {
+            if (key === null || token === undefined) return;
+            const changes: Record<string, BatchValue> = {};
+            for (const assignment of branch.action.assignments) {
+              if (assignment.column === keyColumn.name) {
+                throw new TypeError(`MERGE cannot update the unique key: ${keyColumn.name}`);
+              }
+              changes[assignment.column] = evaluateJoinedRowExpression(
+                assignment.expression,
+                context,
+              );
+            }
+            updates.set(token, { key, changes });
+            return;
+          }
+          const columns =
+            branch.action.columns.length > 0
+              ? branch.action.columns
+              : target.columns.map(({ name }) => name);
+          if (columns.length !== branch.action.values.length) {
+            throw new TypeError("MERGE INSERT values must match the table's columns");
+          }
+          const row: Record<string, BatchValue> = {};
+          columns.forEach((column, position) => {
+            const value =
+              branch.action.kind === "insert" ? branch.action.values[position] : undefined;
+            if (value === undefined) return;
+            row[column] = evaluateJoinedRowExpression(value, context);
+          });
+          inserts.push(row);
+          return;
+        }
+      });
+      // Applied in one order per kind, so a row can only be touched by the branch that claimed
+      // it: updates, then deletes, then the fresh rows.
+      let changedRows = 0;
+      const assignedColumns = [
+        ...new Set([...updates.values()].flatMap((entry) => Object.keys(entry.changes))),
+      ];
+      if (updates.size > 0) {
+        const entries = [...updates.values()];
+        const changes: Record<string, BatchValue[]> = {};
+        for (const column of assignedColumns) {
+          changes[column] = entries.map((entry) => entry.changes[column] ?? null);
+        }
+        const result = await session.updateBatch(target.name, {
+          keys: entries.map((entry) => entry.key),
+          changes,
+        });
+        changedRows += result.rowCount;
+      }
+      if (deletes.size > 0) {
+        const result = await session.deleteBatch(target.name, {
+          keys: [...deletes.values()] as Array<Exclude<BatchValue, null>>,
+        });
+        changedRows += result.rowCount;
+      }
+      if (inserts.length > 0) {
+        const columns: Record<string, BatchValue[]> = {};
+        for (const column of target.columns) {
+          columns[column.name] = inserts.map((row) => row[column.name] ?? null);
+        }
+        const result = await session.insertBatch(target.name, { columns });
+        changedRows += result.rowCount;
+      }
+      return changedRows;
+    });
+    return {
+      kind: "merge",
+      table: target.name,
+      rowCount: applied,
+      ...(version === null ? {} : { version }),
+    };
+  }
+
   async #materializeInsertSelect(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
@@ -4190,6 +4696,7 @@ export class MinnowDatabase {
       await this.createTable({
         name: statement.table,
         columns: statement.columns,
+        ...(statement.checks === undefined ? {} : { checks: statement.checks }),
         ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
       });
       return { kind: "create-table", table: statement.table };
@@ -4250,6 +4757,25 @@ export class MinnowDatabase {
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
       return { kind: "add-column", table: statement.table, column: added.name };
     }
+    if (statement.kind === "merge") return this.#runMerge(statement);
+    if (statement.kind === "create-view") {
+      await this.createView(statement.view, statement.sql, {
+        ...(statement.orReplace === true ? { orReplace: true } : {}),
+      });
+      return { kind: "create-view", view: statement.view };
+    }
+    if (statement.kind === "drop-view") {
+      const dropped = await this.dropView(statement.view, {
+        ...(statement.ifExists === true ? { ifExists: true } : {}),
+      });
+      return { kind: "drop-view", view: statement.view, dropped };
+    }
+    if (statement.kind === "drop-table") {
+      const dropped = await this.dropTable(statement.table, {
+        ...(statement.ifExists === true ? { ifExists: true } : {}),
+      });
+      return { kind: "drop-table", table: statement.table, dropped };
+    }
     if (statement.kind === "create-trigger") {
       await this.#createTrigger(statement.table, statement.trigger);
       return { kind: "create-trigger", table: statement.table, name: statement.trigger.name };
@@ -4258,6 +4784,7 @@ export class MinnowDatabase {
       await this.#dropTrigger(statement.name);
       return { kind: "drop-trigger", name: statement.name };
     }
+    if (statement.kind === "transaction") return this.#runTransactionStatement(statement.action);
     // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
     if (statement.returning !== undefined && options.returning === undefined) {
       options = { ...options, returning: statement.returning };
@@ -4306,9 +4833,16 @@ export class MinnowDatabase {
           columns[column.name] = statement.rows.map(() => null);
         }
       }
-      const result = viaUpsert
-        ? await this.upsertBatch(statement.table, { columns })
-        : await this.insertBatch(statement.table, { columns });
+      const writer = options.writer;
+      const staged: StagedWriteResult & {
+        version?: number;
+        generatedColumns?: Record<string, BatchValue[]>;
+      } = await (viaUpsert
+        ? (writer?.upsertBatch(statement.table, { columns }) ??
+          this.upsertBatch(statement.table, { columns }))
+        : (writer?.insertBatch(statement.table, { columns }) ??
+          this.insertBatch(statement.table, { columns })));
+      const result = staged;
       let returningColumns: readonly string[] | undefined;
       if (options.returning !== undefined) {
         returningColumns =
@@ -4321,12 +4855,13 @@ export class MinnowDatabase {
           }
         }
       }
-      const generated = result.generatedColumns ?? {};
+      const generated = "generatedColumns" in result ? (result.generatedColumns ?? {}) : {};
       return {
         kind: "insert",
         table: statement.table,
         rowCount: result.rowCount,
-        version: result.version,
+        // A staged write has no version yet: the scope it belongs to has not published.
+        ...(result.version === undefined ? {} : { version: result.version }),
         ...(returningColumns === undefined
           ? {}
           : {
@@ -4376,12 +4911,18 @@ export class MinnowDatabase {
       having: [],
       orderBy: [],
     };
-    const prepared = await this.#prepareCompiledPlan(plan);
     let rows: QueryResult["rows"];
-    try {
-      rows = prepared.execute().rows;
-    } finally {
-      prepared.close();
+    if (options.writer !== undefined) {
+      // Inside a scope the rows to touch are the ones the scope can see, which includes what it
+      // has already staged — an UPDATE after an INSERT in the same transaction finds that row.
+      rows = (await options.writer.queryPlan(plan)).rows;
+    } else {
+      const prepared = await this.#prepareCompiledPlan(plan);
+      try {
+        rows = prepared.execute().rows;
+      } finally {
+        prepared.close();
+      }
     }
     const keys = rows.map((row) => row[keyColumn.name]);
     if (keys.some((key) => key === null || key === undefined)) {
@@ -4402,12 +4943,17 @@ export class MinnowDatabase {
           ...(returnedRows === undefined ? {} : { returnedRows }),
         };
       }
-      const result = await this.deleteBatch(table.name, { keys: keys as BatchValue[] });
+      const deleted: { deletedRowCount?: number; rowCount?: number; version?: number | null } =
+        options.writer === undefined
+          ? await this.deleteBatch(table.name, { keys: keys as BatchValue[] })
+          : await options.writer.deleteBatch(table.name, { keys: keys as BatchValue[] });
       return {
         kind: "delete",
         table: table.name,
-        rowCount: result.deletedRowCount,
-        version: result.version,
+        rowCount: deleted.deletedRowCount ?? deleted.rowCount ?? 0,
+        ...(deleted.version === undefined || deleted.version === null
+          ? {}
+          : { version: deleted.version }),
         ...(returnedRows === undefined ? {} : { returnedRows }),
       };
     }
@@ -4431,10 +4977,10 @@ export class MinnowDatabase {
         return value;
       });
     }
-    const result = await this.updateBatch(table.name, {
-      keys: keys as BatchValue[],
-      changes,
-    });
+    const updated: { updatedRowCount?: number; rowCount?: number; version?: number | null } =
+      options.writer === undefined
+        ? await this.updateBatch(table.name, { keys: keys as BatchValue[], changes })
+        : await options.writer.updateBatch(table.name, { keys: keys as BatchValue[], changes });
     const returnedRows =
       returningColumns === undefined
         ? undefined
@@ -4449,8 +4995,10 @@ export class MinnowDatabase {
     return {
       kind: "update",
       table: table.name,
-      rowCount: result.updatedRowCount,
-      version: result.version,
+      rowCount: updated.updatedRowCount ?? updated.rowCount ?? 0,
+      ...(updated.version === undefined || updated.version === null
+        ? {}
+        : { version: updated.version }),
       ...(returnedRows === undefined ? {} : { returnedRows }),
     };
   }
@@ -9354,8 +9902,45 @@ export class MinnowDatabase {
   async #findTable(name: string): Promise<TableRecord> {
     const table = await this.store.getTableByName(name);
     if (table === undefined) throw new Error(`Table not found: ${name}`);
+    // Reads resolve a view into its query before reaching here, so a view arriving at this
+    // point is a write, a DDL statement, or a path that forgot to rewrite: all of them errors.
+    if (table.view !== undefined) throw new TypeError(`${name} is a view, not a table`);
     return table;
   }
+}
+
+/**
+ * The source-side expression a MERGE matches on. The condition has to be an equality naming the
+ * target's unique key on one side, because that is the address the keyed write paths use; the
+ * other side is what each source row contributes.
+ */
+function mergeSourceKeyExpression(
+  statement: Extract<CompiledStatement, { kind: "merge" }>,
+  keyColumn: string,
+): Expression {
+  const namesKey = (expression: Expression): boolean =>
+    expression.kind === "column" &&
+    (expression.reference === `${statement.alias}.${keyColumn}` ||
+      expression.reference === keyColumn);
+  const condition = statement.on;
+  if (condition.kind === "condition" && condition.operator === "=") {
+    if (namesKey(condition.left)) return condition.right;
+    if (namesKey(condition.right)) return condition.left;
+  }
+  throw new TypeError(
+    `MERGE ON must equate ${statement.alias}.${keyColumn} with a source value: the unique key is how rows are addressed`,
+  );
+}
+
+/** The SELECT that materializes a MERGE's source rows under its correlation name. */
+function mergeSourceSql(statement: Extract<CompiledStatement, { kind: "merge" }>): string {
+  const alias = quoteSqlIdentifier(statement.source.alias);
+  if (statement.source.table !== undefined) {
+    return `SELECT * FROM ${quoteSqlIdentifier(statement.source.table)} AS ${alias}`;
+  }
+  const query = statement.source.sql;
+  if (query === undefined) throw new TypeError("A MERGE source needs a table or a query");
+  return `SELECT * FROM (${query}) AS ${alias}`;
 }
 
 /** True when a compiled block groups rows, either explicitly or through select aggregates. */
@@ -9367,6 +9952,65 @@ function validateName(name: string, kind: string): string {
   const trimmed = name.trim();
   if (trimmed.length === 0) throw new TypeError(`${kind} name cannot be empty`);
   return trimmed;
+}
+
+/**
+ * Compiled CHECK expressions per table record. Keyed by the record's identity and revision, so a
+ * table whose constraints change compiles again and one whose rows are being written does not
+ * recompile per batch.
+ */
+const compiledChecks = new WeakMap<
+  TableRecord,
+  ReadonlyArray<{ name: string; expression: Expression }>
+>();
+
+function tableChecks(table: TableRecord): ReadonlyArray<{ name: string; expression: Expression }> {
+  const cached = compiledChecks.get(table);
+  if (cached !== undefined) return cached;
+  const compiled = (table.checks ?? []).map((check) => ({
+    name: check.name,
+    expression: compileCheckExpression(check.sql, check.name),
+  }));
+  compiledChecks.set(table, compiled);
+  return compiled;
+}
+
+/**
+ * Applies a table's CHECK constraints to one row (E141-06). A constraint fails only when it
+ * evaluates to false: SQL's three-valued logic lets an unknown pass, which is why a NULL column
+ * satisfies `CHECK (amount > 0)` unless the column is also NOT NULL.
+ */
+function assertRowChecks(table: TableRecord, row: Record<string, BatchValue>, index: number): void {
+  for (const check of tableChecks(table)) {
+    let value: unknown;
+    try {
+      // The row binds under the table's own name, so `CHECK (t.a > 0)` and `CHECK (a > 0)`
+      // both resolve.
+      value = evaluateRowExpression(check.expression, table.name, row);
+    } catch (error) {
+      throw new TypeError(
+        `CHECK ${check.name} could not be evaluated for row ${String(index)}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { cause: error },
+      );
+    }
+    if (value === false) {
+      throw new TypeError(`CHECK ${check.name} failed for row ${String(index)} of ${table.name}`);
+    }
+  }
+}
+
+/** Reads one row out of a columnar batch, for the row-shaped checks. */
+function batchRowAt(
+  table: TableRecord,
+  input: ColumnarBatch,
+  index: number,
+): Record<string, BatchValue> {
+  const row: Record<string, BatchValue> = {};
+  for (const column of table.columns)
+    row[column.name] = input.columns[column.name]?.[index] ?? null;
+  return row;
 }
 
 function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?: string): number {
@@ -9394,6 +10038,12 @@ function validateBatch(table: TableRecord, input: ColumnarBatch, pendingColumn?:
       const value = values[index] as BatchValue;
       if (allowNull && value === null) continue;
       validateValue(column, value, index);
+    }
+  }
+  // The constraints run last, over whole rows, once every column has been type-checked.
+  if ((table.checks ?? []).length > 0) {
+    for (let index = 0; index < rowCount; index += 1) {
+      assertRowChecks(table, batchRowAt(table, input, index), index);
     }
   }
   return rowCount;

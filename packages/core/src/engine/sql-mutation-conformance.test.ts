@@ -115,7 +115,18 @@ interface ScopeStep {
   absentDeletes?: number[];
 }
 
-type Step = SqlStep | ScopeStep;
+/**
+ * One logical change spelled differently for each engine — MERGE against the statements SQLite
+ * has. Only the resulting state and audit trail are compared, since the two spellings report
+ * their affected rows differently.
+ */
+interface PairStep {
+  kind: "pair";
+  minnow: SqlStep | { sql: string; params?: QueryValue[] };
+  sqlite: Array<{ sql: string; params?: QueryValue[] }>;
+}
+
+type Step = SqlStep | ScopeStep | PairStep;
 
 interface ScriptState {
   nextId: number;
@@ -222,6 +233,39 @@ const stepTemplates: StepTemplate[] = [
     sql: `UPDATE items SET amount = amount + ? WHERE (amount, id) > (?, ?) RETURNING id, amount`,
     params: [quarter(state.rng) / 4, quarter(state.rng), Math.floor(state.rng() * state.nextId)],
   }),
+  // F312: the same rows a MERGE touches, written as the statements SQLite has. The two engines
+  // have to agree on which rows matched, what they became, and which triggers fired — MERGE is
+  // only worth having if it is exactly the sum of those parts.
+  (state) => {
+    const existing = 1 + Math.floor(state.rng() * Math.max(1, state.nextId - 1));
+    const fresh = state.nextId + 50_000 + Math.floor(state.rng() * 1_000);
+    const amount = quarter(state.rng);
+    const label = pick(state.rng, LABELS);
+    const source =
+      `SELECT ${String(existing)} AS id, ${String(amount)} AS amount ` +
+      `UNION ALL SELECT ${String(fresh)} AS id, ${String(amount)} AS amount`;
+    return {
+      kind: "pair",
+      minnow: {
+        sql:
+          `MERGE INTO items t USING (${source}) s ON t.id = s.id ` +
+          `WHEN MATCHED THEN UPDATE SET amount = s.amount, label = '${label}' ` +
+          `WHEN NOT MATCHED THEN INSERT (id, region, amount, active, label) ` +
+          `VALUES (s.id, 'west', s.amount, TRUE, '${label}')`,
+      },
+      sqlite: [
+        {
+          sql: `UPDATE items SET amount = ${String(amount)}, label = '${label}' WHERE id IN (${String(existing)}, ${String(fresh)})`,
+        },
+        {
+          sql:
+            `INSERT INTO items (id, region, amount, active, label) ` +
+            `SELECT s.id, 'west', s.amount, 1, '${label}' FROM (${source}) s ` +
+            `WHERE s.id NOT IN (SELECT id FROM items)`,
+        },
+      ],
+    };
+  },
   // Update over a key range, RETURNING the affected rows.
   (state) => {
     const low = 1 + Math.floor(state.rng() * state.nextId);
@@ -430,6 +474,35 @@ describe("DML conformance against SQLite", () => {
       }
     };
 
+    const runPair = async (step: PairStep, label: string): Promise<void> => {
+      let minnowError: unknown;
+      try {
+        await minnow.execute(step.minnow.sql, step.minnow.params);
+      } catch (error) {
+        minnowError = error;
+      }
+      let sqliteError: unknown;
+      try {
+        sqlite.exec("BEGIN");
+        for (const statement of step.sqlite) {
+          sqlite.prepare(statement.sql).run(...sqliteParams(statement.params));
+        }
+        sqlite.exec("COMMIT");
+      } catch (error) {
+        sqlite.exec("ROLLBACK");
+        sqliteError = error;
+      }
+      if ((minnowError === undefined) !== (sqliteError === undefined)) {
+        failures.push(
+          `${label}\n  outcome diverged: minnow ${
+            minnowError === undefined ? "succeeded" : `threw: ${describeError(minnowError)}`
+          }; sqlite ${
+            sqliteError === undefined ? "succeeded" : `threw: ${describeError(sqliteError)}`
+          }`,
+        );
+      }
+    };
+
     const runScope = async (step: ScopeStep, label: string): Promise<void> => {
       // Resolve staged updates/deletes against current state so both engines see identical ops:
       // Minnow's updateBatch requires existing keys, so filter to rows that exist right now.
@@ -503,13 +576,16 @@ describe("DML conformance against SQLite", () => {
         const label =
           step.kind === "sql"
             ? `#${String(index)} ${step.sql} :: ${JSON.stringify(step.params ?? [])}`
-            : `#${String(index)} write-scope ${JSON.stringify({
-                updates: step.updates,
-                inserts: step.inserts.map((row) => row.id),
-                deletes: step.deletes,
-                poisonKey: step.poisonKey,
-              })}`;
+            : step.kind === "pair"
+              ? `#${String(index)} ${step.minnow.sql}`
+              : `#${String(index)} write-scope ${JSON.stringify({
+                  updates: step.updates,
+                  inserts: step.inserts.map((row) => row.id),
+                  deletes: step.deletes,
+                  poisonKey: step.poisonKey,
+                })}`;
         if (step.kind === "sql") await runSql(step, label);
+        else if (step.kind === "pair") await runPair(step, label);
         else await runScope(step, label);
         await compareState(label);
         if (failures.length >= 10) break; // Divergence cascades; stop at a useful sample.

@@ -438,6 +438,57 @@ export class IndexedDbBlockStore implements BlockStore {
     return updated;
   }
 
+  async removeTable(id: string, expectedRevision: number): Promise<void> {
+    const transaction = this.#transaction(["catalog", "segments"], "readwrite");
+    const catalog = transaction.objectStore("catalog");
+    const value: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${id}`));
+    const record = value === undefined ? undefined : (structuredClone(value) as TableRecord);
+    const actualRevision = record === undefined ? null : (record.revision ?? 0);
+    if (record === undefined || actualRevision !== expectedRevision) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new TableRecordConflictError(id, expectedRevision, actualRevision);
+    }
+    catalog.delete(`${TABLE_ID_PREFIX}${id}`);
+    catalog.delete(`${TABLE_NAME_PREFIX}${record.name}`);
+    catalog.delete(`${ROW_ID_PREFIX}${id}`);
+    // Everything else this table owns is keyed by its id under one of a handful of prefixes,
+    // string-keyed or array-keyed. One sequential pass collects them all: a dropped table is
+    // rare and the alternative is a range read per prefix, several of which the injected test
+    // factory cannot express.
+    const ownedStringPrefixes = [
+      `${AUTO_INCREMENT_PREFIX}${id}/`,
+      `${FTS_BASE_INDEX_PREFIX}${id}/`,
+      `${FTS_BASE_PREFIX}${id}/`,
+      `${FTS_CHUNK_PREFIX}${id}/`,
+    ];
+    const ownedArrayKinds = new Set([
+      "unique-key",
+      UNIQUE_KEY_CHUNK_INDEX,
+      UNIQUE_KEY_CHUNK,
+      UNIQUE_KEY_BASE,
+      UNIQUE_KEY_BASE_PART,
+    ]);
+    const doomed: IDBValidKey[] = [];
+    await visitObjectStoreSequentially(catalog, (_value, key) => {
+      if (typeof key === "string") {
+        if (ownedStringPrefixes.some((prefix) => key.startsWith(prefix))) doomed.push(key);
+        return;
+      }
+      if (!Array.isArray(key)) return;
+      const [kind, owner] = key as unknown[];
+      if (typeof kind === "string" && ownedArrayKinds.has(kind) && owner === id) doomed.push(key);
+    });
+    for (const key of doomed) catalog.delete(key);
+    const segments = transaction.objectStore("segments");
+    const segmentKeys = await requestResult<IDBValidKey[]>(
+      segments.index(SEGMENT_TABLE_INDEX).getAllKeys(id),
+    );
+    for (const key of segmentKeys) segments.delete(key);
+    await bumpCatalogEpoch(catalog);
+    await transactionDone(transaction);
+  }
+
   async writeFtsBase(
     tableId: string,
     columnId: string,

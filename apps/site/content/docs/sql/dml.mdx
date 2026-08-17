@@ -131,6 +131,38 @@ const { version } = await db.write(async (tx) => {
 Either both are visible or neither is — including to another tab, which never sees the stock
 decremented without the shipment.
 
+The same scope is reachable from SQL, for a console or a client that only speaks statements:
+
+```sql
+BEGIN;
+UPDATE stock SET on_hand = on_hand - 1 WHERE sku = 'A-1';
+INSERT INTO shipments (sku, qty, at) VALUES ('A-1', 1, CURRENT_TIMESTAMP);
+COMMIT;
+```
+
+Statements inside see each other — a `SELECT` after the `UPDATE` reads the new value — and
+`ROLLBACK` discards the lot. Two rules keep an open transaction from becoming a leak: schema
+changes are refused inside one, because the catalog commits outside the scope and a rollback could
+not take them back, and a transaction left untouched for 30 seconds rolls itself back. A callback
+scope has no such bound, which is why it stays the better form when you have one.
+
+## Merging
+
+`MERGE` writes one source's rows into a table, deciding per row what to do:
+
+```sql
+MERGE INTO stock s
+USING (SELECT sku, qty FROM delivery) d ON s.sku = d.sku
+WHEN MATCHED AND d.qty = 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET on_hand = s.on_hand + d.qty
+WHEN NOT MATCHED THEN INSERT (sku, on_hand) VALUES (d.sku, d.qty)
+```
+
+The branches are tried in order for each source row, the whole statement is one commit, and it
+fires the same triggers the equivalent `INSERT`, `UPDATE`, and `DELETE` would. The `ON` condition
+has to equate the target's unique key with a source value: that is how rows are addressed, and it
+is also why one source row can never match two target rows.
+
 ## Bulk loading
 
 Parsing a statement per row is the wrong shape for loading a lot of data. The batch APIs take

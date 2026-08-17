@@ -98,13 +98,18 @@ describe("SQL feature matrix conformance", () => {
     if (
       feature.id.startsWith("mutation.") ||
       feature.id.startsWith("ddl.") ||
-      feature.id.startsWith("trigger.")
+      feature.id.startsWith("trigger.") ||
+      feature.id.startsWith("transaction.")
     ) {
       it(`executes supported ${feature.id}`, async () => {
         const database = await keyedDatabase();
         for (const statement of feature.setup ?? []) await database.execute(statement);
         const result = await database.execute(feature.example, feature.params);
         expect(result.kind).not.toBe("rows");
+        // A statement that opened a transaction must not leave it open for the next example.
+        if (result.kind === "transaction" && result.action === "begin") {
+          await database.execute("ROLLBACK");
+        }
       });
       continue;
     }
