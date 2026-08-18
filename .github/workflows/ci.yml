@@ -1,0 +1,102 @@
+# The merge gate. Everything here must pass before a change lands on main.
+#
+# Split into three jobs because they fail for different reasons and at different speeds: `check`
+# is the fast one that catches most mistakes, `browser` proves the storage and site behavior a
+# Node substitute cannot, and `engines-floor` proves the oldest Node the package claims to
+# support still runs the suite. The performance gate deliberately lives in its own scheduled
+# workflow — it measures a machine as much as the code, so it must never block a merge.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, types, lint, build, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run format
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      # Coverage rather than a bare run: the thresholds in vitest.config.ts are a ratchet, and a
+      # ratchet nothing turns is just a number in a file.
+      - run: npm run test:coverage
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+
+  browser:
+    name: Real browsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # The browser binaries are the slow part of this job, so they are cached against the
+      # Playwright version that asks for them.
+      - name: Resolve Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: browsers
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+      - name: Install browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+        if: steps.browsers.outputs.cache-hit != 'true'
+      - name: Install system dependencies for cached browsers
+        run: npx playwright install-deps chromium firefox webkit
+        if: steps.browsers.outputs.cache-hit == 'true'
+      - run: npm run test:browser
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+  engines-floor:
+    name: Unit tests on the oldest supported Node
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          # package.json declares ">=22". This job is what makes that claim true rather than
+          # aspirational — node:sqlite in particular moved between 22 and 24.
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:unit

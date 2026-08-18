@@ -82,6 +82,12 @@ export interface World {
   ripples: Ripple[];
   bubbles: Bubble[];
   nextBubble: number;
+  /**
+   * The pond's source of randomness. Every unpredictable choice below draws from here rather
+   * than `Math.random` directly, so a test can seed it and get the same fish twice. The default
+   * is `Math.random`, which is what the page wants.
+   */
+  random: () => number;
 }
 
 export const TAU = Math.PI * 2;
@@ -99,21 +105,21 @@ export function turnToward(angle: number, want: number, step: number) {
   return angle + clamp(delta, -step, step);
 }
 
-function makeFish(w: number, h: number, distance: number): Fish {
+function makeFish(w: number, h: number, distance: number, random: () => number): Fish {
   return {
-    x: w * (0.2 + Math.random() * 0.6),
-    y: h * (0.25 + Math.random() * 0.55),
+    x: w * (0.2 + random() * 0.6),
+    y: h * (0.25 + random() * 0.55),
     vx: 0,
     vy: 0,
     angle: 0,
-    facing: Math.random() < 0.5 ? 1 : -1,
+    facing: random() < 0.5 ? 1 : -1,
     length: h * 0.3 * (1 - distance * 0.62),
     cruise: h * (0.3 - distance * 0.13),
     dash: h * (2.4 - distance * 1.2),
     fear: h * (1.1 - distance * 0.45),
     distance,
-    tail: Math.random() * TAU,
-    pulse: Math.random() * TAU,
+    tail: random() * TAU,
+    pulse: random() * TAU,
     startle: 0,
     targetX: w * 0.5,
     targetY: h * 0.5,
@@ -122,8 +128,8 @@ function makeFish(w: number, h: number, distance: number): Fish {
   };
 }
 
-export function createWorld(w: number, h: number): World {
-  const hero = makeFish(w, h, 0);
+export function createWorld(w: number, h: number, random: () => number = Math.random): World {
+  const hero = makeFish(w, h, 0, random);
   // The hero starts mid-pond on a lazy crossing, so the first thing seen is a fish swimming.
   hero.x = w * 0.62;
   hero.y = h * 0.5;
@@ -151,10 +157,11 @@ export function createWorld(w: number, h: number): World {
     hero,
     // A narrow pond gets fewer of them, so a phone shows a pond rather than a shoal.
     school: SCHOOL.slice(0, w < 520 ? 3 : SCHOOL.length).map((distance) =>
-      makeFish(w, h, distance),
+      makeFish(w, h, distance, random),
     ),
     ripples: [],
     bubbles: [],
+    random,
     nextBubble: 0.8,
   };
 }
@@ -197,9 +204,9 @@ function retarget(fish: Fish, world: World) {
   // somewhere else along the water rather than somewhere else in the depth of it.
   const rise = world.h * 0.3;
   for (let i = 0; i < 5; i += 1) {
-    const x = margin + Math.random() * (world.w - margin * 2);
+    const x = margin + world.random() * (world.w - margin * 2);
     const y = clamp(
-      fish.y + (Math.random() - 0.5) * 2 * rise,
+      fish.y + (world.random() - 0.5) * 2 * rise,
       margin,
       Math.max(margin, world.h - margin),
     );
@@ -214,7 +221,7 @@ function retarget(fish: Fish, world: World) {
   }
   fish.targetX = bestX;
   fish.targetY = bestY;
-  fish.targetFor = 4 + Math.random() * 5;
+  fish.targetFor = 4 + world.random() * 5;
 }
 
 /**
@@ -385,14 +392,14 @@ export function swim(fish: Fish, world: World, dt: number) {
       life: 1,
       span: 0.9,
     });
-    if (Math.random() < 0.35 * fish.startle)
+    if (world.random() < 0.35 * fish.startle)
       world.bubbles.push({
         x: fish.x,
         y: fish.y,
-        r: 1 + Math.random() * 2,
-        rise: 22 + Math.random() * 26,
-        sway: 4 + Math.random() * 8,
-        phase: Math.random() * TAU,
+        r: 1 + world.random() * 2,
+        rise: 22 + world.random() * 26,
+        sway: 4 + world.random() * 8,
+        phase: world.random() * TAU,
       });
   }
 }
@@ -420,7 +427,7 @@ export function step(world: World, dt: number) {
   if (net.depth > 0.2 && net.trail > 48) {
     net.trail = 0;
     world.ripples.push({
-      x: net.x + (Math.random() - 0.5) * net.radius,
+      x: net.x + (world.random() - 0.5) * net.radius,
       y: net.y + net.radius * 0.5,
       r: net.radius * 0.15,
       grow: net.radius * 1.1,
@@ -442,14 +449,14 @@ export function step(world: World, dt: number) {
 
   world.nextBubble -= dt;
   if (world.nextBubble <= 0) {
-    world.nextBubble = 1.2 + Math.random() * 2.6;
+    world.nextBubble = 1.2 + world.random() * 2.6;
     world.bubbles.push({
-      x: world.w * (0.1 + Math.random() * 0.8),
-      y: world.h * (0.85 + Math.random() * 0.15),
-      r: 1.2 + Math.random() * 2.6,
-      rise: 16 + Math.random() * 22,
-      sway: 5 + Math.random() * 9,
-      phase: Math.random() * TAU,
+      x: world.w * (0.1 + world.random() * 0.8),
+      y: world.h * (0.85 + world.random() * 0.15),
+      r: 1.2 + world.random() * 2.6,
+      rise: 16 + world.random() * 22,
+      sway: 5 + world.random() * 9,
+      phase: world.random() * TAU,
     });
   }
   for (let i = world.bubbles.length - 1; i >= 0; i -= 1) {

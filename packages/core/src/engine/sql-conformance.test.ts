@@ -26,6 +26,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
+import { seedFor } from "../testing/seeds.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import {
   bindPlanParameters,
@@ -69,7 +70,7 @@ interface FixtureRow {
 }
 
 function buildFixture(): FixtureRow[] {
-  const rng = mulberry32(0x5eed);
+  const rng = mulberry32(seedFor("sql-conformance", 0x5eed));
   const rows: FixtureRow[] = [];
   for (let id = 1; id <= 150; id += 1) {
     const region = REGIONS[Math.floor(rng() * REGIONS.length)] ?? null;
@@ -893,7 +894,7 @@ function combinationCases(): Case[] {
 }
 
 function buildCorpus(): Case[] {
-  const rng = mulberry32(0xc0ffee);
+  const rng = mulberry32(seedFor("sql-conformance-corpus", 0xc0ffee));
   const corpus: Case[] = [];
   for (let round = 0; round < 12; round += 1) {
     for (const template of templates) corpus.push(template(rng));
@@ -1298,6 +1299,15 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ["set.except-all", { oracles: ["sqlite"], reason: "SQLite has no EXCEPT ALL" }],
 ]);
 
+/**
+ * The one failure an unoptimized plan is allowed to produce. `optimizePlan` does two jobs: it
+ * rewrites plans for speed, and it decorrelates subqueries -- and decorrelation is lowering, not
+ * optimization, so a correlated subquery has no form the executor can run until it happens. Those
+ * plans reference an outer alias the inner block cannot resolve on its own, which is exactly this
+ * message. Anything else means an optimization changed an answer, which is the bug being hunted.
+ */
+const REQUIRES_LOWERING = "Unknown table alias";
+
 // --- The harness --------------------------------------------------------------------------------
 
 describe("SQL conformance against SQLite and PGlite", () => {
@@ -1306,6 +1316,8 @@ describe("SQL conformance against SQLite and PGlite", () => {
     const database = await minnowFixture();
     const oracles: Oracle[] = [sqliteOracle(), await pgliteOracle()];
     const failures: string[] = [];
+    let unoptimizedCompared = 0;
+    let unoptimizedLowered = 0;
     try {
       for (const [index, testCase] of corpus.entries()) {
         const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
@@ -1330,6 +1342,34 @@ describe("SQL conformance against SQLite and PGlite", () => {
           failures.push(
             `${caseLabel}\n${diffSummary("vectorized vs row executor", vectorKeys, rowKeys)}`,
           );
+        }
+        // The optimizer is otherwise inside the trusted base: both paths above compile through
+        // it, so a rewrite that changes an answer consistently is invisible to their diff and
+        // visible only to an oracle. Features no oracle can judge -- MATCH, BM25, and the rest of
+        // matrixSkips -- would have nothing left to contradict them. Comparing against the
+        // unoptimized plan is SQLite's disabled-optimization run: same question, no rewrites.
+        //
+        // Decorrelation is the exception, because it is lowering rather than optimization: a
+        // correlated subquery has no executable form until it runs, so those plans legitimately
+        // fail to execute unoptimized. That is allowed and counted, and any *other* failure is a
+        // real one -- see the assertions below, which pin both the count and the reason.
+        try {
+          const unoptimized = executeRowQuery(
+            bindPlanParameters(compileQuery(testCase.sql, { optimize: false }), testCase.params),
+            rowTables,
+          );
+          unoptimizedCompared += 1;
+          const unoptimizedKeys = resultKeys(unoptimized.rows, testCase.ordered);
+          if (rowKeys.join("\n") !== unoptimizedKeys.join("\n")) {
+            failures.push(
+              `${caseLabel}\n${diffSummary("optimized vs unoptimized plan", rowKeys, unoptimizedKeys)}`,
+            );
+          }
+        } catch (error) {
+          if (!String(error).includes(REQUIRES_LOWERING)) {
+            failures.push(`${caseLabel}\n  unoptimized plan threw: ${String(error)}`);
+          }
+          unoptimizedLowered += 1;
         }
         for (const oracle of oracles) {
           if (testCase.skip?.includes(oracle.name)) continue;
@@ -1365,15 +1405,24 @@ describe("SQL conformance against SQLite and PGlite", () => {
     } finally {
       for (const oracle of oracles) await oracle.close();
     }
-    // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
-    expect(corpus.length).toBeGreaterThan(1_000);
-    expect(combinationCases().length).toBeGreaterThan(80);
+    // Divergences are reported before the structural floors below, because a real disagreement
+    // is the thing worth reading: a failing case also skips the rest of its own checks, which
+    // would otherwise trip a floor and bury the diff that explains it.
     if (failures.length > 0) {
       expect.fail(
         `${String(failures.length)} of ${String(corpus.length)} conformance cases diverged:\n\n` +
           failures.slice(0, 10).join("\n\n"),
       );
     }
+    // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
+    expect(corpus.length).toBeGreaterThan(1_000);
+    expect(combinationCases().length).toBeGreaterThan(80);
+    // The unoptimized comparison is only worth something while it actually runs. Every case that
+    // got this far reached it, so pin both the total and the share that ran rather than lowered:
+    // a change that routes cases into the lowering branch -- or one that makes the corpus
+    // unrunnable without the optimizer -- fails here instead of quietly becoming a no-op.
+    expect(unoptimizedCompared + unoptimizedLowered).toBe(corpus.length);
+    expect(unoptimizedCompared / corpus.length).toBeGreaterThan(0.9);
   }, 240_000);
 
   it("agrees with the oracles on every read-only feature the matrix claims", async () => {

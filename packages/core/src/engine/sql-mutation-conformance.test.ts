@@ -13,6 +13,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
+import { seedFor } from "../testing/seeds.js";
 import { MinnowDatabase } from "./database.js";
 import { type QueryValue } from "./query.js";
 
@@ -331,7 +332,10 @@ const stepTemplates: StepTemplate[] = [
 ];
 
 function buildScript(): Step[] {
-  const state: ScriptState = { nextId: 1, rng: mulberry32(0xd1ffe4) };
+  const state: ScriptState = {
+    nextId: 1,
+    rng: mulberry32(seedFor("sql-mutation-conformance", 0xd1ffe4)),
+  };
   const script: Step[] = [];
   // Seed rows so the first predicates have something to chew on.
   for (let index = 0; index < 8; index += 1) {

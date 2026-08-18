@@ -17,9 +17,7 @@ import { MinnowDatabase } from "../packages/core/src/engine/database.js";
 const BASELINE_PATH = new URL("../packages/core/perf-baseline.json", import.meta.url);
 const ROWS = 200_000;
 const WARMUP = 2;
-const RUNS = 7;
-/** Headroom multiplier applied to a measured ratio when writing a new baseline. */
-const MARGIN = 1.5;
+const RUNS = 9;
 /**
  * Sub-millisecond queries are timed in batches rather than floored. Flooring both sides of the
  * ratio — the old approach — made every fast query gate as 0.5ms against 0.5ms, so a point
@@ -29,7 +27,7 @@ const MARGIN = 1.5;
  * the count, which makes a 0.07ms query as measurable as a 7ms one and keeps the gate's
  * cross-engine ratio — the part that survives a change of machine — meaningful at every scale.
  */
-const TARGET_SAMPLE_MS = 5;
+const TARGET_SAMPLE_MS = 25;
 const MAX_ITERATIONS = 2_000;
 /** A tiny floor remains, against a divide-by-zero on an engine that answers instantly. */
 const ratioOf = (minnowMs: number, engineMs: number): number =>
@@ -206,19 +204,122 @@ function median(samples: number[]): number {
   return sorted[Math.floor(sorted.length / 2)] ?? 0;
 }
 
+/**
+ * A shape's timing: the middle of the samples, and the ends.
+ *
+ * The threshold is sized from the spread rather than from a fixed multiplier, because how noisy a
+ * shape is varies enormously between shapes. A 90ms sort is steady to a percent or two; a memo
+ * hit answered in 0.01ms is at the edge of what the clock resolves and swings much further. One
+ * global margin either has to be wide enough for the worst of those -- which is the blind spot
+ * this gate is trying to close -- or it fails on noise, which is how a gate gets ignored.
+ */
+interface Timing {
+  /** What the table reports: the typical cost. */
+  readonly median: number;
+  /** The slowest and fastest samples, which is what the threshold is built from. */
+  readonly worst: number;
+  readonly best: number;
+  /** False for a shape that can only be measured once, and so has no spread to read. */
+  readonly repeated: boolean;
+}
+
 /** Median per-iteration time over RUNS samples, each sample running the query `iterations` times. */
 async function timeRepeated(
   run: () => Promise<unknown> | unknown,
   iterations: number,
-): Promise<number> {
+): Promise<Timing> {
   const samples: number[] = [];
   for (let index = 0; index < RUNS; index += 1) {
     const started = performance.now();
     for (let repeat = 0; repeat < iterations; repeat += 1) await run();
     samples.push((performance.now() - started) / iterations);
   }
-  return median(samples);
+  return {
+    median: median(samples),
+    worst: Math.max(...samples),
+    best: Math.min(...samples),
+    repeated: true,
+  };
 }
+
+/** Wraps a measurement that can only be taken once, so it flows through the same reporting. */
+function onceOnly(ms: number): Timing {
+  return { median: ms, worst: ms, best: ms, repeated: false };
+}
+
+/**
+ * The threshold to record for a shape, from what its samples actually did.
+ *
+ * A repeated shape is pinned just past its own worst case: Minnow's slowest sample against the
+ * comparison engine's fastest, which is the least favourable reading the run produced, plus a
+ * little. A shape measured once has no spread to read, so it falls back to a fixed multiplier --
+ * a real blind spot, kept explicit and kept to the two shapes that cannot be repeated.
+ */
+/**
+ * How much headroom a recorded threshold gets, in the units of the ratio it pins.
+ *
+ * The old gate gave every shape 1.5x, which meant a 49% regression could re-baseline unnoticed on
+ * a 90ms sort that never varies by more than a percent. Sizing purely from the observed spread
+ * fixes that but overcorrects the other way: a memo hit measured at 0.01ms swings far enough
+ * between samples that its own spread argues for *more* than 1.5x, which would make the gate
+ * weaker than it was.
+ *
+ * So the spread chooses the margin and the bounds keep it honest. A steady shape is pinned at
+ * FLOOR, well inside the old blanket figure. A noisy one gets more room, but never more than
+ * CEILING -- which is the old figure, so no shape ends up gated more loosely than before.
+ */
+const MARGIN_FLOOR = 1.15;
+const MARGIN_CEILING = 1.5;
+/** A measurement taken once has no spread to read, so it gets the ceiling and an explicit name. */
+const ONCE_ONLY_MARGIN = MARGIN_CEILING;
+
+function thresholdFor(minnow: Timing, engine: Timing): number {
+  const ratio = ratioOf(minnow.median, engine.median);
+  if (!minnow.repeated || !engine.repeated) return ratio * ONCE_ONLY_MARGIN;
+  // Both sides contribute uncertainty to the ratio, so their spreads compound. The extra 5%
+  // covers what nine samples in one run cannot see: the drift between one run and the next.
+  const spread = (minnow.worst / minnow.best) * (engine.worst / engine.best) * 1.05;
+  return ratio * Math.min(MARGIN_CEILING, Math.max(MARGIN_FLOOR, spread));
+}
+
+/**
+ * Write shapes.
+ *
+ * The gate measured exactly one write -- bulk ingest -- which left the whole small-write path
+ * ungated: a regression in point updates or keyed deletes could not move any number here. These
+ * run against `data_mut`, whose rows all three engines already hold, and cycle the key so each
+ * iteration does equivalent work on a different row rather than re-touching one hot row.
+ */
+interface PerfMutation {
+  readonly name: string;
+  readonly sql: string;
+  /** Bound parameters for iteration `n`, so repeated samples stay equivalent but not identical. */
+  readonly params: (n: number) => ReadonlyArray<number | string>;
+}
+
+/** Rows the cycling keys stay inside, well under the ingested range. */
+const MUTATION_KEYS = 100_000;
+
+const MUTATIONS: readonly PerfMutation[] = [
+  {
+    name: "point-update",
+    sql: "UPDATE data_mut SET amount = amount + 1 WHERE id = ?",
+    params: (n) => [(n % MUTATION_KEYS) + 1],
+  },
+  {
+    name: "range-update",
+    sql: "UPDATE data_mut SET amount = amount + 1 WHERE id BETWEEN ? AND ?",
+    params: (n) => {
+      const start = ((n * 100) % MUTATION_KEYS) + 1;
+      return [start, start + 99];
+    },
+  },
+  {
+    name: "filtered-update",
+    sql: "UPDATE data_mut SET label = ? WHERE region = ? AND id < ?",
+    params: (n) => ["alpha", "west", (n % 1_000) + 1],
+  },
+];
 
 function minnowRunner(database: MinnowDatabase, query: PerfQuery): () => Promise<unknown> {
   // By default the gate measures execution, not the probe-validated result memo (which would
@@ -427,15 +528,15 @@ const baseline: Baseline | undefined = existsSync(BASELINE_PATH)
 
 interface Result {
   name: string;
-  minnowMs: number;
-  engineMs: Record<EngineName, number>;
+  minnow: Timing;
+  engine: Record<EngineName, Timing>;
 }
 
 const results: Result[] = [
   {
     name: "bulk-ingest",
-    minnowMs: ingestMs.minnow,
-    engineMs: { sqlite: ingestMs.sqlite, pglite: ingestMs.pglite },
+    minnow: onceOnly(ingestMs.minnow),
+    engine: { sqlite: onceOnly(ingestMs.sqlite), pglite: onceOnly(ingestMs.pglite) },
   },
 ];
 for (const query of QUERIES) {
@@ -457,13 +558,72 @@ for (const query of QUERIES) {
   const iterations = iterationsFor(Math.max(...singleRuns));
   results.push({
     name: query.name,
-    minnowMs: await timeRepeated(runners.minnow, iterations),
-    engineMs: {
+    minnow: await timeRepeated(runners.minnow, iterations),
+    engine: {
       sqlite: await timeRepeated(runners.sqlite, iterations),
       pglite: await timeRepeated(runners.pglite, iterations),
     },
   });
 }
+
+/**
+ * Write shapes, timed the same way as the reads: one iteration count shared by all three engines
+ * so the ratio compares like with like, and a cycling key so a repeated sample is equivalent work
+ * rather than the same row over and over.
+ */
+for (const mutation of MUTATIONS) {
+  const statement = sqlite.prepare(mutation.sql);
+  const pgliteSql = positionalToNumbered(mutation.sql);
+  let counter = 0;
+  const runners = {
+    minnow: () => minnow.execute(mutation.sql, mutation.params(counter++) as never),
+    sqlite: () => statement.run(...(mutation.params(counter++) as Array<number | string>)),
+    pglite: () => pglite.query(pgliteSql, [...mutation.params(counter++)]),
+  };
+  const singleRuns = [
+    await warmUp(runners.minnow),
+    await warmUp(runners.sqlite),
+    await warmUp(runners.pglite),
+  ];
+  const iterations = iterationsFor(Math.max(...singleRuns));
+  results.push({
+    name: mutation.name,
+    minnow: await timeRepeated(runners.minnow, iterations),
+    engine: {
+      sqlite: await timeRepeated(runners.sqlite, iterations),
+      pglite: await timeRepeated(runners.pglite, iterations),
+    },
+  });
+}
+
+/**
+ * Bulk delete, measured once rather than repeated: a row can only be deleted the first time, so
+ * there is no way to run this shape twice on the same data and have it mean the same thing. It
+ * runs last, after every other measurement has taken its samples from the full table.
+ */
+{
+  const first = MUTATION_KEYS + 1;
+  const last = MUTATION_KEYS + 50_000;
+  const deleteMs = { minnow: 0, sqlite: 0, pglite: 0 };
+  let started = performance.now();
+  await minnow.execute("DELETE FROM data_mut WHERE id BETWEEN ? AND ?", [first, last]);
+  deleteMs.minnow = performance.now() - started;
+
+  started = performance.now();
+  sqlite.prepare("DELETE FROM data_mut WHERE id BETWEEN ? AND ?").run(first, last);
+  deleteMs.sqlite = performance.now() - started;
+
+  started = performance.now();
+  await pglite.query("DELETE FROM data_mut WHERE id BETWEEN $1 AND $2", [first, last]);
+  deleteMs.pglite = performance.now() - started;
+
+  results.push({
+    name: "bulk-delete",
+    minnow: onceOnly(deleteMs.minnow),
+    engine: { sqlite: onceOnly(deleteMs.sqlite), pglite: onceOnly(deleteMs.pglite) },
+  });
+}
+
 sqlite.close();
 await pglite.close();
 
@@ -476,19 +636,25 @@ const versus = (minnowMs: number, engineMs: number): string => {
 const failures: string[] = [];
 const newThresholds: Baseline["thresholds"] = {};
 for (const result of results) {
-  const line: string[] = [result.name.padEnd(20), result.minnowMs.toFixed(2).padStart(11)];
+  const minnowMs = result.minnow.median;
+  const line: string[] = [result.name.padEnd(20), minnowMs.toFixed(2).padStart(11)];
   newThresholds[result.name] = {};
   for (const engine of ENGINES) {
-    const engineMs = result.engineMs[engine];
-    const ratio = ratioOf(result.minnowMs, engineMs);
+    const engineMs = result.engine[engine].median;
+    // The reported comparison is median against median -- the typical cost, which is what a
+    // reader wants. The recorded threshold comes from the spread instead, so a shape is judged
+    // against its own noise rather than against a number picked for the noisiest shape.
+    const ratio = ratioOf(minnowMs, engineMs);
     // Significant digits rather than fixed decimals: a memo hit against a re-executing engine
     // is a ratio of 0.00015, which two decimals would round to a threshold of zero that nothing
     // can satisfy.
-    newThresholds[result.name][engine] = Number((ratio * MARGIN).toPrecision(3));
+    newThresholds[result.name][engine] = Number(
+      thresholdFor(result.minnow, result.engine[engine]).toPrecision(3),
+    );
     const threshold = baseline?.thresholds[result.name]?.[engine];
     const flag = threshold !== undefined && ratio > threshold ? "!" : " ";
     line.push(
-      `${engineMs.toFixed(2).padStart(10)} ${versus(result.minnowMs, engineMs).padStart(11)}${flag}`,
+      `${engineMs.toFixed(2).padStart(10)} ${versus(minnowMs, engineMs).padStart(11)}${flag}`,
     );
     if (threshold !== undefined && ratio > threshold) {
       failures.push(

@@ -116,6 +116,22 @@ describe("SQL feature matrix conformance", () => {
     it(`executes supported ${feature.id} identically in both executors`, () => {
       const plan = bindPlanParameters(compileQuery(feature.example), feature.params);
       expect(executeQuery(plan, tables)).toEqual(executeRowQuery(plan, tables));
+      // Both executors above share one optimized plan, so they agree on whatever the optimizer
+      // handed them. Several features here -- MATCH, BM25, and the rest of the extensions -- have
+      // no external oracle at all, which leaves an optimizer rewrite nothing to contradict it.
+      // The unoptimized plan is that missing reference.
+      //
+      // Correlated subqueries are the documented exception: decorrelation is lowering rather
+      // than optimization, so those plans have no runnable unoptimized form. They are named
+      // here rather than caught by a bare try, so a feature that stops running unoptimized for
+      // any other reason fails instead of quietly opting itself out.
+      if (!feature.id.startsWith("subquery.correlated")) {
+        const raw = bindPlanParameters(
+          compileQuery(feature.example, { optimize: false }),
+          feature.params,
+        );
+        expect(executeRowQuery(raw, tables)).toEqual(executeRowQuery(plan, tables));
+      }
     });
   }
 

@@ -12,5 +12,8 @@ export default defineConfig({
     reuseExistingServer: false,
   },
   use: { baseURL: localUrl(port) },
-  projects: browserProjects.filter(({ name }) => name !== "webkit"),
+  // All three, including WebKit: this runner is the only place real IndexedDB is exercised, and
+  // Safari's is the implementation most likely to differ. It was excluded until the harness
+  // stopped treating a transient `blocked` on deleteDatabase as a failure -- see run.ts.
+  projects: browserProjects,
 });

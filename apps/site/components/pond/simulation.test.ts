@@ -11,8 +11,25 @@ const W = 900;
 const H = 280;
 const FRAME = 1 / 60;
 
-function pond(): World {
-  const world = createWorld(W, H);
+/**
+ * The pond is driven by `Math.random`, and these tests assert statistical properties of where a
+ * fish ends up. Left unseeded, the spread check below failed about one run in a hundred -- often
+ * enough to go off in CI, rarely enough to look like an unrelated blip. Seeding turns the same
+ * assertions into a fixed question with a fixed answer.
+ */
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let mixed = state;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pond(seed = 0x9011d): World {
+  const world = createWorld(W, H, mulberry32(seed));
   world.net.wanted = 1;
   return world;
 }
@@ -71,24 +88,28 @@ describe("the pond", () => {
     }
   });
 
-  it("swims on its own, and covers the water rather than circling one spot", () => {
-    const world = createWorld(W, H);
-    let low = Infinity;
-    let high = -Infinity;
-    let distance = 0;
-    let { x, y } = world.hero;
-    for (let t = 0; t < 60; t += FRAME) {
-      step(world, FRAME);
-      distance += Math.hypot(world.hero.x - x, world.hero.y - y);
-      ({ x, y } = world.hero);
-      low = Math.min(low, x);
-      high = Math.max(high, x);
-      expect(inWater(world)).toBe(true);
-    }
-    // A minute of cruising is a long way, over most of the width of the pond.
-    expect(distance).toBeGreaterThan(W * 3);
-    expect(high - low).toBeGreaterThan(W * 0.5);
-  });
+  // One seed proves one pond. These are fixed so the run is repeatable, and there are several so
+  // the claim is about the way the fish swims rather than about a lucky start.
+  for (const seed of [0x9011d, 0x2f31, 0x7ac9, 0x51b0, 0xbeef]) {
+    it(`swims on its own, and covers the water rather than circling one spot (seed ${String(seed)})`, () => {
+      const world = createWorld(W, H, mulberry32(seed));
+      let low = Infinity;
+      let high = -Infinity;
+      let distance = 0;
+      let { x, y } = world.hero;
+      for (let t = 0; t < 60; t += FRAME) {
+        step(world, FRAME);
+        distance += Math.hypot(world.hero.x - x, world.hero.y - y);
+        ({ x, y } = world.hero);
+        low = Math.min(low, x);
+        high = Math.max(high, x);
+        expect(inWater(world)).toBe(true);
+      }
+      // A minute of cruising is a long way, over most of the width of the pond.
+      expect(distance).toBeGreaterThan(W * 3);
+      expect(high - low).toBeGreaterThan(W * 0.5);
+    });
+  }
 
   it("bolts when the net comes at it, and settles again once it leaves", () => {
     const world = pond();

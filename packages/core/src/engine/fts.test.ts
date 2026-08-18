@@ -114,6 +114,28 @@ describe("BM25", () => {
     expect(bm25Score(2, 4, 0, 1, 4)).toBe(0);
   });
 
+  it("normalizes by document length against the corpus average", () => {
+    // The case above cannot see B at all: it scores a document whose length equals the corpus
+    // average, and at that point `1 - B + B * (len / avg)` collapses to 1 for *any* B. Setting
+    // B to zero -- disabling length normalization outright -- left the whole suite green.
+    //
+    // These three share a corpus (docCount 10, totalTokens 100, so an average length of 10) and
+    // a term (tf 2, df 4), and differ only in document length. The expected values are computed
+    // by hand from the standard formula with K1 = 1.2 and B = 0.75, written as literals so the
+    // test cannot drift along with the constants it is pinning.
+    const short = bm25Score(2, 5, 4, 10, 100);
+    const average = bm25Score(2, 10, 4, 10, 100);
+    const long = bm25Score(2, 20, 4, 10, 100);
+    expect(short).toBeCloseTo(1.4301086016353546, 12);
+    expect(average).toBeCloseTo(1.2289995795303827, 12);
+    expect(long).toBeCloseTo(0.9592191840237135, 12);
+    // The property those numbers encode: among equally relevant documents, the shorter one wins,
+    // because the same term count says more about a short document than a long one. With B = 0
+    // all three collapse to the middle value, so this ordering is what length normalization is.
+    expect(short).toBeGreaterThan(average);
+    expect(average).toBeGreaterThan(long);
+  });
+
   it("is identical regardless of accumulation order", () => {
     const terms = tokenizeQuery("alpha beta");
     const stats = { docCount: 10, totalTokens: 100, dfByTerm: [4, 7] };

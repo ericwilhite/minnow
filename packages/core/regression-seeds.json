@@ -1,0 +1,14 @@
+{
+  "comment": [
+    "Seeds that once produced a failure. The soak runner (npm run soak) varies the seed to find",
+    "new ground; when it finds a break, the seed goes here and the deterministic suite replays it",
+    "forever after. Never remove one: a seed listed here is a bug that used to exist, and the",
+    "entry is what stops it coming back. Keys match the suite names passed to seedsFor()."
+  ],
+  "suites": {
+    "sql-conformance": [],
+    "sql-conformance-corpus": [],
+    "sql-mutation-conformance": [],
+    "differential": []
+  }
+}

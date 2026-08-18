@@ -624,19 +624,38 @@ function summarizeAggregate(result: QueryResult): { count: number; total: number
 const ready = document.querySelector("#ready");
 if (ready !== null) ready.textContent = "Transaction tests ready";
 
+/**
+ * Deletes a database, tolerating a transient `blocked`.
+ *
+ * `close()` returns before the connection is actually gone, and how long that takes is the
+ * browser's business: WebKit releases it a beat later than Chromium and Firefox do, so a delete
+ * issued right after a close fires `blocked` and then succeeds on its own. Treating `blocked` as
+ * a failure is what kept WebKit out of this runner. It is a "not yet", not an error — so wait,
+ * and only fail if the connection never actually goes away, which is the case worth reporting.
+ */
 async function deleteDatabase(name: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const request = indexedDB.deleteDatabase(name);
-    request.addEventListener("success", () => resolve(), { once: true });
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (finish: () => void) => {
+      if (blockedTimer !== undefined) clearTimeout(blockedTimer);
+      finish();
+    };
+    request.addEventListener("success", () => settle(resolve), { once: true });
     request.addEventListener(
       "error",
-      () => reject(request.error ?? new Error("Database deletion failed")),
-      {
-        once: true,
-      },
+      () => settle(() => reject(request.error ?? new Error("Database deletion failed"))),
+      { once: true },
     );
-    request.addEventListener("blocked", () => reject(new Error("Database deletion was blocked")), {
-      once: true,
-    });
+    request.addEventListener(
+      "blocked",
+      () => {
+        blockedTimer = setTimeout(
+          () => reject(new Error(`Database deletion stayed blocked: ${name}`)),
+          10_000,
+        );
+      },
+      { once: true },
+    );
   });
 }

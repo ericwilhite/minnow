@@ -1,0 +1,43 @@
+# The performance gate, kept off the merge path on purpose.
+#
+# It compares Minnow against SQLite and PGlite as a ratio, which survives a change of machine far
+# better than a wall-clock budget would — but a shared CI runner is still noisy enough that
+# blocking a merge on it would train everyone to re-run until green. Nightly instead: a
+# regression shows up within a day, and the failure is a real signal rather than a coin flip.
+name: Performance
+
+on:
+  schedule:
+    # 07:00 UTC daily, so a regression is waiting at the start of the day rather than mid-review.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  # Changes to the gate itself, or to the executor it measures, are worth an immediate run.
+  pull_request:
+    paths:
+      - "scripts/perf-gate.mts"
+      - "packages/core/perf-baseline.json"
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: SQL performance gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Run the gate
+        run: npm run benchmark:gate | tee gate.txt
+      - name: Upload the timing table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate
+          path: gate.txt
+          retention-days: 90

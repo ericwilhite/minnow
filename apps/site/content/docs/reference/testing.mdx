@@ -13,12 +13,14 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 | Command                        | What it runs                                                          | Use it for                         |
 | ------------------------------ | --------------------------------------------------------------------- | ---------------------------------- |
 | `npm test`                     | Vitest unit, conformance, differential, and harness tests             | Normal implementation work         |
-| `npm run test:browser:library` | Core IndexedDB and transaction tests in Chromium and Firefox          | Storage or browser-runtime changes |
+| `npm run test:coverage`        | The same suite, with the coverage floors enforced                     | Before pushing                     |
+| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures     | Hunting bugs rather than pinning   |
+| `npm run test:browser:library` | Core IndexedDB and transaction tests in Chromium, Firefox, and WebKit | Storage or browser-runtime changes |
 | `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                 | Docs, examples, and site changes   |
 | `npm run test:browser`         | Both browser runners, in sequence                                     | Cross-browser regression checks    |
 | `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline        | Query-executor performance changes |
 | `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages | Dependency or public-entry changes |
-| `npm run check`                | Formatting, types, lint, build, and unit tests                        | The local merge gate               |
+| `npm run check`                | Formatting, types, lint, build, and unit tests with coverage floors   | The local merge gate               |
 | `npm run check:release`        | The local gate, performance gate, and all browser runners             | Release candidates                 |
 
 Install the browser binaries once before using a browser runner:
@@ -26,6 +28,11 @@ Install the browser binaries once before using a browser runner:
 ```bash
 npx playwright install chromium firefox webkit
 ```
+
+Everything above also runs in CI: `.github/workflows/ci.yml` on every push and pull request, and
+`.github/workflows/performance.yml` nightly. The performance gate is deliberately kept off the
+merge path — it measures a machine as much as it measures the code, and a merge gate that fails
+on a noisy runner is one people learn to re-run rather than read.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
@@ -45,12 +52,54 @@ application it starts.
   case runs a suite end to end in each browser and asserts it verified against the oracles,
   another asserts the `/benchmarks` route is cross-origin isolated. Documentation cannot drift
   into non-running sample code, and the harness cannot drift from the page that runs it.
-- **The performance gate** detects regressions on stable seeded query shapes. It is a guardrail,
-  not a published cross-engine benchmark.
+- **The performance gate** detects regressions on stable seeded query shapes, reads and writes
+  alike. It is a guardrail, not a published cross-engine benchmark: the comparison engines run
+  without indexes, which is fine for noticing that Minnow got slower and useless as a fair
+  cross-engine claim.
 
 When adding a runner, give it one responsibility and make it independently runnable. When adding a
 suite case, derive smoke-test counts from the suite itself instead of copying totals into tests or
 HTML.
+
+## Seeds, and how a soak failure becomes a permanent test
+
+The generative suites — SQL conformance, DML conformance, and the columnar-versus-row differential
+— build their corpora from a seeded generator. A committed run is deterministic: it uses the
+checked-in seeds plus every seed that has ever failed, listed in
+`packages/core/regression-seeds.json`. That makes the suite a reliable regression net, and on its
+own it would be nothing else, because the questions it asks never change.
+
+`npm run soak` is the other half. It runs the same suites on seeds nobody has tried and stops at
+the first failure, printing the seed:
+
+```bash
+npm run soak -- --rounds 200
+```
+
+A failing seed is the whole artifact. Replay it directly:
+
+```bash
+MINNOW_SEED=1476318588 npx vitest run packages/core/src/engine/sql-conformance.test.ts
+```
+
+Then add it to `regression-seeds.json` under the suite that failed, where every future run picks
+it up. Never remove one: a seed in that file is a bug that used to exist, and the entry is what
+stops it coming back. The explored space only grows, and it grows by exactly what the soak found.
+
+## The fault sweep
+
+`packages/core/src/testing/fault-sweep.test.ts` runs one fixed write workload many times, failing
+a different storage operation each time — the first block write, then the second, then the first
+block read, and so on through every operation a clean run performs. After each interruption it
+reopens the store and asks whether what survived is coherent.
+
+The invariant is atomicity, not durability. A write interrupted mid-flight may be present or
+absent; both are correct. What is never correct is a torn state — a row nobody wrote, a duplicated
+key, a database that will not reopen. Every assertion is phrased as "the surviving state is one a
+caller could have observed", never "the write landed".
+
+The set of fault points the workload reaches is pinned in the test. If a change starts or stops
+routing writes through one, the sweep fails and someone decides whether it should follow.
 
 ## Benchmark workload model
 

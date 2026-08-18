@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { type DatabaseRow } from "./database.js";
 import { compileQuery, executeQuery, executeRowQuery, type QueryRow } from "./query.js";
+import { seedsFor } from "../testing/seeds.js";
 
 /**
  * Seeded differential fuzzing: the columnar executor must agree with the row reference on a
@@ -217,7 +218,7 @@ function canonicalRows(rows: readonly QueryRow[], columns: readonly string[]): s
 }
 
 describe("differential executor fuzzing", () => {
-  for (const seed of [11, 47, 101, 211, 401]) {
+  for (const seed of seedsFor("differential", [11, 47, 101, 211, 401])) {
     it(`agrees across 120 randomized queries for seed ${String(seed)}`, () => {
       const fuzzer = createFuzzer(seed);
       const tables = new Map([
