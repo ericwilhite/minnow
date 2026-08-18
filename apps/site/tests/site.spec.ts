@@ -237,3 +237,18 @@ test("a path that misses lands in the pond", async ({ page }) => {
   // And the pond is really the pond, canvas and all.
   await expect(page.locator("canvas")).toBeVisible();
 });
+
+test("a link to a file the site serves opens the file", async ({ page }) => {
+  await page.goto("/docs/reference/agents/");
+  await page.getByRole("link", { name: "/llms.txt", exact: true }).first().click();
+
+  // Handed to the router instead, this resolves as an app route: the extension is dropped and
+  // the reader lands on the 404 for a URL they never clicked.
+  await expect(page).toHaveURL(/\/llms\.txt$/);
+  await expect(page.locator("body")).toContainText("# Minnow");
+
+  // A link to a page still navigates on the client.
+  await page.goBack();
+  await page.getByRole("link", { name: "Feature matrix" }).first().click();
+  await expect(page).toHaveURL(/\/docs\/sql\/feature-matrix\/$/);
+});
