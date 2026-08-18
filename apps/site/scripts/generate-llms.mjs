@@ -272,7 +272,7 @@ write(
     "",
     `- [Playground](${url("/playground/")}): a live database of ~590,000 rows, generated in the browser, that any SQL can be run against.`,
     `- [Benchmarks](${url("/benchmarks/")}): Minnow against SQLite Wasm and PGlite, run in the visitor's browser.`,
-    `- [Source](https://github.com/minnowdb/minnow): the repository, MIT licensed.`,
+    `- [Source](https://github.com/ericwilhite/minnow): the repository, MIT licensed.`,
     "",
   ].join("\n"),
 );

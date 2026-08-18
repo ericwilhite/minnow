@@ -5,7 +5,7 @@
   "author": "Eric Wilhite",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/minnowdb/minnow.git"
+    "url": "git+https://github.com/ericwilhite/minnow.git"
   },
   "private": true,
   "type": "module",
@@ -32,6 +32,7 @@
     "check:release": "npm run check && npm run benchmark:gate && npm run test:browser",
     "version:check": "vite-node scripts/version.mts check",
     "version:set": "vite-node scripts/version.mts set",
+    "release:publish": "vite-node scripts/publish-packages.mts",
     "benchmark:gate": "vite-node scripts/perf-gate.mts",
     "soak": "vite-node scripts/soak.mts",
     "fixture:format": "vite-node scripts/write-format-fixture.mts",

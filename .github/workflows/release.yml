@@ -1,0 +1,51 @@
+# Publishing, driven by the versions in the manifests.
+#
+# There is no release ritual beyond a version bump: `npm run version:set` writes a new version,
+# and once that commit's CI run is green this publishes every package whose version npm does not
+# already have, then tags each one. A push that changes no version publishes nothing, and a rerun
+# after a failure is safe, because the registry is what decides — not this workflow's history.
+#
+# It waits for CI rather than repeating it: `workflow_run` fires when the whole gate finishes, and
+# the `conclusion` check means a red build never reaches the registry.
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # For a release that needs a nudge — a publish that failed on an expired token, say.
+  workflow_dispatch:
+
+# Tags are pushed by this job; the id token is what npm signs provenance with once the manifests
+# and the repository agree on where this lives.
+permissions:
+  contents: write
+  id-token: write
+
+# Two runs publishing at once would race for the same version.
+concurrency: release
+
+jobs:
+  publish:
+    name: Publish new versions to npm
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The commit CI actually tested, which is not necessarily the tip of main by now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      # The tarballs are built from source here rather than trusted from CI's artifacts.
+      - run: npm run build
+      - name: Publish
+        run: npm run release:publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

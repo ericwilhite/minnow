@@ -83,6 +83,7 @@ npm run site:dev       # the docs site, playground and benchmarks
 npm run test:browser   # library and site tests in real browsers
 npm run soak           # generative suites on fresh random seeds, to find new failures
 npm run version:set -- minor @minnowdb/core   # one package; `major` moves them all together
+npm run release:publish -- --dry-run          # what a release would send to npm
 ```
 
 `npm install` points git at `.githooks`, where a pre-push hook runs `npm run check` — the same

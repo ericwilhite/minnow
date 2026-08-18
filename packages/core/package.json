@@ -7,10 +7,10 @@
   "homepage": "https://minnowdb.com/docs/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/minnowdb/minnow.git",
+    "url": "git+https://github.com/ericwilhite/minnow.git",
     "directory": "packages/core"
   },
-  "bugs": "https://github.com/minnowdb/minnow/issues",
+  "bugs": "https://github.com/ericwilhite/minnow/issues",
   "keywords": [
     "sql",
     "database",
@@ -66,6 +66,9 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.test.*",
+    "!dist/**/*.spec.*",
+    "!dist/*.tsbuildinfo",
     "sql-feature-matrix.json"
   ]
 }

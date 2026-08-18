@@ -7,10 +7,10 @@
   "homepage": "https://minnowdb.com/docs/client/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/minnowdb/minnow.git",
+    "url": "git+https://github.com/ericwilhite/minnow.git",
     "directory": "packages/client"
   },
-  "bugs": "https://github.com/minnowdb/minnow/issues",
+  "bugs": "https://github.com/ericwilhite/minnow/issues",
   "keywords": [
     "sql",
     "database",
@@ -27,7 +27,10 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/*.test.*",
+    "!dist/**/*.spec.*",
+    "!dist/*.tsbuildinfo"
   ],
   "dependencies": {
     "@minnowdb/core": ">=0.1.0 <1.0.0"

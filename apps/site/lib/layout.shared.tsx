@@ -25,6 +25,6 @@ export function baseOptions(): BaseLayoutProps {
       { text: "Benchmarks", url: "/benchmarks" },
       { text: "AI & LLMs", url: "/docs/reference/agents" },
     ],
-    githubUrl: "https://github.com/minnowdb/minnow",
+    githubUrl: "https://github.com/ericwilhite/minnow",
   };
 }
