@@ -1,14 +1,21 @@
 import { createMDX } from "fumadocs-mdx/next";
 
 /**
- * The docs site is a static export: Cloudflare Pages serves `out/` as plain files, with the
- * cross-origin isolation headers the benchmarks page needs coming from `public/_headers`.
+ * The docs site is a static export: Vercel serves `out/` as plain files, with the cross-origin
+ * isolation headers the benchmarks page needs coming from `vercel.json` at the repository root.
+ *
+ * Isolation is scoped to the benchmarks route on purpose: `require-corp` blocks every
+ * cross-origin subresource on any page it covers, and applying it site-wide would be a standing
+ * constraint on pages that gain nothing from it. The build's own assets under `/_next/` and the
+ * vendored engines under `/vendor/` still need CORP and COEP, because a module worker spawned
+ * from an isolated document is a new execution context that must opt in, and Chrome blocks its
+ * script outright when the response carries neither.
  *
  * `trailingSlash` keeps every published URL shaped the way the previous site published them,
  * so existing links and the browser tests keep resolving.
  */
 /**
- * The isolation `public/_headers` gives the published site, applied by the dev server too.
+ * The isolation `vercel.json` gives the published site, applied by the dev server too.
  *
  * A static export cannot carry headers, so this is development-only — but without it the two
  * differ in a way that changes what the benchmarks page measures. An origin that is not

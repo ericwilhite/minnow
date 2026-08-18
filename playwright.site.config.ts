@@ -12,7 +12,7 @@ export default defineConfig({
   timeout: 300_000,
   webServer: {
     // Build, then serve the static export with a plain foreground server that also applies the
-    // cross-origin isolation headers Cloudflare Pages serves from public/_headers, so the
+    // cross-origin isolation headers Vercel serves from vercel.json, so the
     // benchmarks page is tested on the code path it ships on.
     command: `npm run build --workspace @minnowdb/site && node apps/site/tests/serve-dist.mjs ${String(port)}`,
     url: localUrl(port),

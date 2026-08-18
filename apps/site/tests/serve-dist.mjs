@@ -2,7 +2,7 @@
 //
 // It exists for two reasons. It stays in the foreground, where a framework preview command may
 // daemonize itself and make Playwright's webServer watchdog think the process died. And it sets
-// the cross-origin isolation headers that Cloudflare Pages applies from public/_headers, so the
+// the cross-origin isolation headers that Vercel applies from vercel.json, so the
 // benchmarks page is tested on the same isolated code path it ships on — SQLite reaches its OPFS
 // VFS rather than silently falling back to the handle pool.
 import { createServer } from "node:http";
@@ -28,7 +28,7 @@ const contentTypes = new Map([
 ]);
 
 /**
- * Mirrors public/_headers.
+ * Mirrors the `headers` block in vercel.json.
  *
  * Isolation is scoped to the benchmarks document, not the whole site. The build's own assets
  * need CORP and COEP too, though: a module worker spawned from an isolated document is a new

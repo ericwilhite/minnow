@@ -7,8 +7,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "predev": "node scripts/vendor-engines.mjs",
-    "prebuild": "node scripts/vendor-engines.mjs",
+    "predev": "npm run build:packages && node scripts/vendor-engines.mjs",
+    "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs",
+    "build:packages": "tsc -b ../../packages/core ../../packages/client ../../packages/devtools",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {

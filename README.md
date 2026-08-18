@@ -65,10 +65,19 @@ records of the design and milestone gates.
 
 ```bash
 npm install
-npm run check          # format, typecheck, lint, build, unit tests
+npm run check          # format, typecheck, lint, build, unit tests with coverage floors
 npm run site:dev       # the docs site, playground and benchmarks
 npm run test:browser   # library and site tests in real browsers
+npm run soak           # generative suites on fresh random seeds, to find new failures
 ```
 
 See [Testing](https://minnowdb.dev/docs/reference/testing/) for the full runner map and the
 release gate.
+
+## Deployment
+
+The docs site is a static export deployed to Vercel from the repository root. [`vercel.json`](vercel.json)
+holds the whole configuration: it builds the workspace packages before `next build`, publishes
+`apps/site/out`, and serves the cross-origin isolation headers the benchmarks page needs to reach
+SQLite's OPFS backend. The Vercel project's root directory must stay at the repository root so
+that file is read.
