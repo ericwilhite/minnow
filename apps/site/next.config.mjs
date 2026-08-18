@@ -2,7 +2,7 @@ import { createMDX } from "fumadocs-mdx/next";
 
 /**
  * The docs site is a static export: Vercel serves `out/` as plain files, with the cross-origin
- * isolation headers the benchmarks page needs coming from `vercel.json` at the repository root.
+ * isolation headers the benchmarks page needs coming from the `vercel.json` beside this file.
  *
  * Isolation is scoped to the benchmarks route on purpose: `require-corp` blocks every
  * cross-origin subresource on any page it covers, and applying it site-wide would be a standing

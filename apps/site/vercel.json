@@ -1,10 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": null,
-  "installCommand": "npm ci",
-  "buildCommand": "npm run site:build",
-  "outputDirectory": "apps/site/out",
-  "trailingSlash": true,
   "headers": [
     {
       "source": "/benchmarks",

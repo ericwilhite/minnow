@@ -76,8 +76,10 @@ release gate.
 
 ## Deployment
 
-The docs site is a static export deployed to Vercel from the repository root. [`vercel.json`](vercel.json)
-holds the whole configuration: it builds the workspace packages before `next build`, publishes
-`apps/site/out`, and serves the cross-origin isolation headers the benchmarks page needs to reach
-SQLite's OPFS backend. The Vercel project's root directory must stay at the repository root so
-that file is read.
+The docs site is a static export deployed to Vercel, whose project root directory is `apps/site`
+with "Include source files outside of the Root Directory" enabled — the build compiles the
+workspace packages the site imports, so it needs the rest of the repository present.
+
+[`apps/site/vercel.json`](apps/site/vercel.json) carries the cross-origin isolation headers the
+benchmarks page needs to reach SQLite's OPFS backend. They cannot live in `next.config.mjs`,
+because a static export serves plain files and Next.js drops its `headers()` config there.
