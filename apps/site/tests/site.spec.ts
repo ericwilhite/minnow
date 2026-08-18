@@ -65,7 +65,7 @@ test("the SQL docs render and the feature matrix comes from the checked-in fixtu
 test("the docs navigation covers every section", async ({ page }) => {
   await page.goto("/docs/");
   const sidebar = page.locator("#nd-sidebar");
-  for (const section of ["SQL", "Client", "Storage", "Reference"]) {
+  for (const section of ["SQL", "Schema", "Typed client", "Engine", "Storage", "Reference"]) {
     await expect(sidebar.getByText(section, { exact: true }).first()).toBeVisible();
   }
 });
