@@ -106,6 +106,9 @@ interface DB {
 }
 ```
 
+Declaration order does not matter: `migrate()` creates a table after the tables it references, so a
+child may be listed before its parent.
+
 ### Relations and row conditions
 
 A declared relation is enforced, not decorative. The same is true of `checks`, the third argument
@@ -175,7 +178,12 @@ await db.insertInto("active_customers"); // compile error: not a writable table
 ```
 
 Because nothing is stored under a view, replacing one is always safe: change the `sql` and the next
-`migrate()` redefines it in place. Dropping a view from your schema drops it from the database.
+`migrate()` redefines it in place.
+
+Removing a view from your schema does **not** drop it. Nothing distinguishes a view the schema used
+to declare from one someone created with `CREATE VIEW`, so dropping the undeclared ones would
+destroy the second kind — and "the schema stopped mentioning it" is not proof that it should go.
+Drop a view explicitly with `database.dropView(name)`.
 
 ## What migrate() does
 

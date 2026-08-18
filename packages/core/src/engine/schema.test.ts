@@ -1121,7 +1121,7 @@ describe("views in the schema", () => {
     store.close();
   });
 
-  it("drops a view the schema stops declaring", async () => {
+  it("leaves a view the schema stops declaring, and every undeclared view, in place", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store);
     await database.migrate(withView(ACTIVE_SQL));
@@ -1135,8 +1135,25 @@ describe("views in the schema", () => {
         ],
       }),
     );
-    await expect(database.query("SELECT id FROM active_customers")).rejects.toThrow();
+    // Undeclared views survive: nothing distinguishes a view this schema used to own from one
+    // created with CREATE VIEW, so removal is explicit through dropView().
+    expect((await database.query("SELECT id FROM active_customers")).rows).toEqual([]);
     expect((await database.query("SELECT id FROM recent_customers")).rows).toEqual([]);
+    expect(await database.dropView("active_customers")).toBe(true);
+    await expect(database.query("SELECT id FROM active_customers")).rejects.toThrow();
+    store.close();
+  });
+
+  it("never drops a view created outside the schema", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(withView(ACTIVE_SQL));
+    await database.execute(`CREATE VIEW handmade AS SELECT id FROM customers`);
+    await database.migrate(withView(`SELECT id, status FROM customers`));
+    expect((await database.introspect()).views.map(({ name }) => name).sort()).toEqual([
+      "active_customers",
+      "handmade",
+    ]);
     store.close();
   });
 
@@ -1424,7 +1441,6 @@ describe("planning a migration without engine access", () => {
     const other = view("other", { sql: "SELECT id FROM notes", columns: { id: column.number() } });
     expect(planMigration(withView, schema([notesTable()], { views: [other] })).steps).toEqual([
       { kind: "replace-view", view: other },
-      { kind: "drop-view", viewName: "recent" },
     ]);
   });
 
@@ -1435,5 +1451,61 @@ describe("planning a migration without engine access", () => {
         schema([table("notes", { id: column.number().unique().autoIncrement() })]),
       ),
     ).toThrow("Dropping columns is not supported: notes.body");
+  });
+});
+
+describe("creation order follows declared relations", () => {
+  it("creates a parent before the child that references it, whatever the declaration order", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema([
+        table("child", {
+          id: column.number().unique(),
+          parent_id: column.number().references("parent", "id"),
+        }),
+        table("parent", { id: column.number().unique(), label: column.string() }),
+      ]),
+    );
+    const catalog = await database.introspect();
+    expect(catalog.tables.map(({ name }) => name)).toEqual(["child", "parent"]);
+    // The constraint really exists, so the ordering did not quietly skip it.
+    await expect(database.insertBatch("child", [{ id: 1, parent_id: 9 }])).rejects.toThrow(
+      /FOREIGN KEY/,
+    );
+    store.close();
+  });
+
+  it("plans creation parents-first while keeping unrelated tables in declaration order", () => {
+    const plan = planMigration(
+      { tables: [], views: [] },
+      schema([
+        table("z", { id: column.number().unique() }),
+        table("child", {
+          id: column.number().unique(),
+          parent_id: column.number().references("parent", "id"),
+        }),
+        table("parent", { id: column.number().unique() }),
+        table("a", { id: column.number().unique() }),
+      ]),
+    );
+    expect(
+      plan.steps.map((step) => (step.kind === "create-table" ? step.table.name : step.kind)),
+    ).toEqual(["z", "parent", "child", "a"]);
+  });
+
+  it("still creates a self-referencing table", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema([
+        table("node", {
+          id: column.number().unique(),
+          parent: column.number().nullable().references("node", "id"),
+        }),
+      ]),
+    );
+    expect((await database.introspect()).tables[0]?.foreignKeys).toHaveLength(1);
+    store.close();
   });
 });

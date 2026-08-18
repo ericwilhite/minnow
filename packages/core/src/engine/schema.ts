@@ -608,9 +608,12 @@ export interface MigrationPlan {
 
 /**
  * Views are derived: nothing is stored under one, so a body change is a replace rather than a
- * rewrite, and a view the schema stops declaring is simply dropped. The one thing refused is a
- * name collision — a schema that declares a view over an existing real table would otherwise
- * destroy it.
+ * rewrite and needs none of the proofs a table alteration needs.
+ *
+ * A view the schema does not declare is left alone. There is no way to tell a view this schema
+ * used to own from one someone created with `CREATE VIEW`, so dropping the undeclared ones would
+ * silently destroy the second kind — and "the schema stopped mentioning it" is not proof that it
+ * should go. Removing a view is therefore explicit, through `dropView()`.
  */
 function planViewSteps(
   catalog: Catalog,
@@ -619,7 +622,6 @@ function planViewSteps(
 ): void {
   const tableNames = new Set(catalog.tables.map(({ name }) => name));
   const existing = new Map(catalog.views.map((record) => [record.name, record]));
-  const declared = new Set(definition.views.map(({ name }) => name));
   for (const viewDefinition of definition.views) {
     if (tableNames.has(viewDefinition.name)) {
       throw new TypeError(`A table already exists with this name: ${viewDefinition.name}`);
@@ -627,12 +629,32 @@ function planViewSteps(
     if (existing.get(viewDefinition.name)?.sql === viewDefinition.sql) continue;
     steps.push({ kind: "replace-view", view: viewDefinition });
   }
-  for (const record of catalog.views) {
-    // Only views this schema is responsible for: a view created outside it is left alone.
-    if (declared.has(record.name)) continue;
-    if (definition.views.length === 0) continue;
-    steps.push({ kind: "drop-view", viewName: record.name });
-  }
+}
+
+/**
+ * Creation order, so a table is created after the tables it references. A FOREIGN KEY names a
+ * parent that must already exist, which would otherwise make a schema fail purely because its
+ * tables were listed child-first. Declaration order is preserved among tables that do not
+ * constrain each other, and a reference cycle (or a self-reference, which the engine allows)
+ * falls back to declaration order rather than failing here — the engine still has the final say.
+ */
+function orderedForCreation(tables: readonly AnyTable[]): readonly AnyTable[] {
+  const byName = new Map(tables.map((definition) => [definition.name, definition]));
+  const ordered: AnyTable[] = [];
+  const state = new Map<string, "visiting" | "done">();
+  const visit = (definition: AnyTable): void => {
+    const status = state.get(definition.name);
+    if (status !== undefined) return; // done, or a cycle we decline to reorder
+    state.set(definition.name, "visiting");
+    for (const key of declaredForeignKeys(definition)) {
+      const parent = byName.get(key.parentTable);
+      if (parent !== undefined && parent !== definition) visit(parent);
+    }
+    state.set(definition.name, "done");
+    ordered.push(definition);
+  };
+  for (const definition of tables) visit(definition);
+  return ordered;
 }
 
 /**
@@ -714,7 +736,7 @@ export function planMigration(
 ): MigrationPlan {
   const steps: MigrationStep[] = [];
   const currentByName = new Map(catalog.tables.map((record) => [record.name, record]));
-  for (const tableDefinition of definition.tables) {
+  for (const tableDefinition of orderedForCreation(definition.tables)) {
     const record = currentByName.get(tableDefinition.name);
     if (record === undefined) {
       steps.push({ kind: "create-table", table: tableDefinition });
