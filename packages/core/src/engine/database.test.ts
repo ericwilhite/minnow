@@ -6667,7 +6667,7 @@ for (const implementation of implementations()) {
 
     expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
     store.close();
-  }, 30_000);
+  });
 }
 
 for (const implementation of implementations()) {
@@ -6744,7 +6744,7 @@ for (const implementation of implementations()) {
 
     expect(await store.listTempOwnerIdsPage(null, 4)).toEqual({ records: [], nextCursor: null });
     store.close();
-  }, 30_000);
+  });
 }
 
 for (const implementation of implementations()) {
