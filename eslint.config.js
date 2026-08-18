@@ -70,6 +70,9 @@ export default tseslint.config(
       "packages/core/src/engine/sql-mutation-conformance.test.ts",
       "packages/core/src/engine/delta-scan.test.ts",
       "packages/core/src/engine/scan-kernels.test.ts",
+      // Reads the checked-in format fixtures off disk; they are the databases earlier builds
+      // wrote, and there is nowhere else to keep them.
+      "packages/core/src/storage/format-compatibility.test.ts",
       "scripts/*.mts",
     ],
     rules: { "no-restricted-imports": "off" },

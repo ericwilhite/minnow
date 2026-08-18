@@ -1,5 +1,8 @@
 {
   "extends": "../../../tsconfig.base.json",
-  "compilerOptions": { "noEmit": true, "composite": false },
-  "include": ["transactions.spec.ts"]
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false
+  },
+  "include": ["transactions.spec.ts", "worker.spec.ts"]
 }

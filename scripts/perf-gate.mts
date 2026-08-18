@@ -267,8 +267,12 @@ function onceOnly(ms: number): Timing {
  * So the spread chooses the margin and the bounds keep it honest. A steady shape is pinned at
  * FLOOR, well inside the old blanket figure. A noisy one gets more room, but never more than
  * CEILING -- which is the old figure, so no shape ends up gated more loosely than before.
+ *
+ * FLOOR is 1.25 rather than 1.15 because nine samples in one run understate what the fastest
+ * shapes do between runs: a point lookup measured at 0.07ms against a 10ms engine puts all the
+ * ratio's jitter on the small side of the division, and 1.15 tripped it about one run in three.
  */
-const MARGIN_FLOOR = 1.15;
+const MARGIN_FLOOR = 1.25;
 const MARGIN_CEILING = 1.5;
 /** A measurement taken once has no spread to read, so it gets the ceiling and an explicit name. */
 const ONCE_ONLY_MARGIN = MARGIN_CEILING;

@@ -15,6 +15,7 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 | `npm test`                     | Vitest unit, conformance, differential, and harness tests             | Normal implementation work         |
 | `npm run test:coverage`        | The same suite, with the coverage floors enforced                     | Before pushing                     |
 | `npm run soak`                 | The generative suites on fresh random seeds, to find new failures     | Hunting bugs rather than pinning   |
+| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture       | Before changing a format version   |
 | `npm run test:browser:library` | Core IndexedDB and transaction tests in Chromium, Firefox, and WebKit | Storage or browser-runtime changes |
 | `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                 | Docs, examples, and site changes   |
 | `npm run test:browser`         | Both browser runners, in sequence                                     | Cross-browser regression checks    |
@@ -47,7 +48,8 @@ application it starts.
   `packages/**`, so the dataset generator, the oracles, and the suite definitions are checked on
   every unit run.
 - **Library browser tests** exercise IndexedDB and transaction behavior that a Node substitute
-  cannot prove.
+  cannot prove, and drive a database through a real module worker: the published entry booting,
+  transferred buffers arriving intact, and a second worker reopening what the first one wrote.
 - **Site browser tests** execute the public examples and drive the benchmarks page itself: one
   case runs a suite end to end in each browser and asserts it verified against the oracles,
   another asserts the `/benchmarks` route is cross-origin isolated. Documentation cannot drift
@@ -85,6 +87,72 @@ MINNOW_SEED=1476318588 npx vitest run packages/core/src/engine/sql-conformance.t
 Then add it to `regression-seeds.json` under the suite that failed, where every future run picks
 it up. Never remove one: a seed in that file is a bug that used to exist, and the entry is what
 stops it coming back. The explored space only grows, and it grows by exactly what the soak found.
+
+## Format compatibility
+
+A browser database's data lives in the user's browser, so it outlives every deploy. There is no
+migration window and no way to reach back and rewrite it: if a format change makes yesterday's
+blocks unreadable, the first anyone hears is a user whose application will not open.
+
+`packages/core/format-fixtures/` holds one frozen database per released format version — a
+snapshot, which carries the raw block bytes verbatim, plus the answers that build gave to a fixed
+set of queries. `format-compatibility.test.ts` opens all of them on every run, checks the answers
+still hold, and checks that writes into a restored database still work.
+
+It also fails when the current `BLOCK_FORMAT_VERSION` or `SNAPSHOT_FORMAT_VERSION` has no fixture
+behind it. That failure is the useful one, because it fires _before_ the damage:
+
+```bash
+npm run fixture:format
+```
+
+Run it on the build that still writes the old format, commit the fixture, and only then change the
+version. A fixture can only be produced by the build that writes it — once that code is gone, the
+format it wrote cannot be regenerated. For the same reason, never delete one.
+
+## Running out of quota
+
+`quota.test.ts` covers what happens when the browser refuses a write because the origin is out of
+space — the characteristic way a browser database fails, and the one an application most needs to
+handle deliberately. It pins four things: the write fails rather than half-landing, the error
+keeps its `QuotaExceededError` identity so an application can branch on it, everything committed
+earlier stays readable, and the same write succeeds once there is room, with no repair step.
+
+## Property-based tests
+
+`block-format/properties.test.ts` states the format's contract as properties and checks them
+against generated inputs rather than chosen ones: a value written and read back is the same value,
+both codecs agree, a zone map contains everything it summarizes, and a flipped byte is detected
+rather than decoded into plausible rows. The generators reach for what breaks encoders — negative
+zero, the extremes of the double range, subnormals, empty and astral-plane strings, all-null and
+empty columns. A failure shrinks to a minimal case and prints the seed.
+
+## Soaks
+
+Two suites cover accumulation rather than a single operation, which is where a fold that loses a
+row or a compactor that stops folding actually shows up:
+
+- `compaction-soak.test.ts` runs 1,500 interleaved mutations against a reference `Map`, compacting
+  at checkpoints, and compares the whole table to the reference each time. Compaction is bounded
+  and incremental — one call folds a limited number of blocks — so the contract asserted is
+  monotone progress, not a fixed point reached in one call.
+- `concurrency-simulation.test.ts` runs twelve independent databases over one shared store, the
+  shape of twelve browser tabs on one origin, issuing a seeded random schedule. It checks that the
+  outcome is explicable: every visible row was written by some tab, acknowledged writes are
+  present, no key appears twice, the write the store acknowledged _last_ is the one visible, and
+  every tab sees the same database afterwards.
+
+## Concurrent writes
+
+`write-contention.test.ts` documents a sharp edge. Writes commit optimistically and rebase on
+conflict, up to `maxCommitRetries` attempts. Issued sequentially, they all land. Issued
+concurrently against IndexedDB, at most `maxCommitRetries + 1` land — and that ceiling does not
+move with the number of writers, because each commit that wins costs every other in-flight writer
+one retry. Sixty-four parallel writes leave the same nine winners as sixteen do.
+
+The tests guarantee the losses are clean: a rejected write leaves nothing behind, an accepted one
+is fully present, and which is which is deterministic. An application issuing parallel writes to
+one table should await them, or retry the rejections.
 
 ## The fault sweep
 

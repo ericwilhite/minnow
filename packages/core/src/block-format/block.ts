@@ -34,7 +34,17 @@ const MAGIC = Uint8Array.of(0x42, 0x52, 0x44, 0x42);
  * reads (zone-map pruning, block inventories) can trust derived statistics without paying the
  * decompress-and-revalidate cost of the payload.
  */
-const VERSION = 1;
+/**
+ * The block envelope version. Every persisted block carries it, and `readBlock` refuses any
+ * value it does not recognize -- so this number is a compatibility contract with every database
+ * already sitting in a user's browser, not an internal detail.
+ *
+ * Changing it means older blocks stop being readable unless a read path for them is kept. Before
+ * changing it, run `npm run fixture:format` on the *current* build to freeze what this version
+ * writes; format-compatibility.test.ts then holds the new build to still reading it.
+ */
+export const BLOCK_FORMAT_VERSION = 1;
+const VERSION = BLOCK_FORMAT_VERSION;
 const HEADER_LENGTH = 40;
 const ENVELOPE_CHECKSUM_START = 8;
 const MAX_BLOCK_LENGTH = MAX_PHYSICAL_COLUMN_BYTE_LENGTH;

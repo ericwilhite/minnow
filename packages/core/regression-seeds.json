@@ -9,6 +9,9 @@
     "sql-conformance": [],
     "sql-conformance-corpus": [],
     "sql-mutation-conformance": [],
-    "differential": []
+    "differential": [],
+    "concurrency-simulation": [],
+    "compaction-soak": [],
+    "compaction-soak-snapshots": []
   }
 }
