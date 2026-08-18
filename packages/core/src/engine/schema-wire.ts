@@ -57,6 +57,8 @@ export type WireMigrationStep =
   | { kind: "add-column"; tableName: string; columnName: string; definition: WireColumn }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
   | { kind: "widen-nullable"; tableName: string; columnName: string }
+  | { kind: "tighten-nullable"; tableName: string; columnName: string }
+  | { kind: "set-auto-increment"; tableName: string; columnName: string; enabled: boolean }
   | { kind: "widen-enum"; tableName: string; columnName: string; enumValues: string[] | null }
   | {
       kind: "alter-default";

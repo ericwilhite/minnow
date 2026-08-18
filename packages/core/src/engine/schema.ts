@@ -635,6 +635,13 @@ export type MigrationStep =
     }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
   | { kind: "widen-nullable"; tableName: string; columnName: string }
+  /**
+   * NULL -> NOT NULL. Only provable, never assumed: `migrate()` verifies from block headers that
+   * no visible row holds NULL before applying it, and refuses the migration when one does.
+   */
+  | { kind: "tighten-nullable"; tableName: string; columnName: string }
+  /** Adopting or dropping the persistent counter; neither touches a stored row. */
+  | { kind: "set-auto-increment"; tableName: string; columnName: string; enabled: boolean }
   /** Grows an enum's value set, or drops the restriction entirely (`enumValues: null`). */
   | { kind: "widen-enum"; tableName: string; columnName: string; enumValues: string[] | null }
   | {
@@ -897,9 +904,11 @@ export function planMigration(
         throw new TypeError(`Unique keys cannot change: ${tableDefinition.name}.${columnName}`);
       }
       if (existing.nullable && !columnDefinition.isNullable) {
-        throw new TypeError(
-          `Nullable columns cannot tighten to non-null: ${tableDefinition.name}.${columnName}`,
-        );
+        steps.push({
+          kind: "tighten-nullable",
+          tableName: tableDefinition.name,
+          columnName,
+        });
       }
       if (!existing.nullable && columnDefinition.isNullable) {
         steps.push({
@@ -909,13 +918,18 @@ export function planMigration(
         });
       }
       if (!columnDefaultsEqual(existing.defaultValue, columnDefinition.defaultSpec)) {
-        if (
-          existing.defaultValue?.kind === "autoincrement" ||
-          columnDefinition.defaultSpec?.kind === "autoincrement"
-        ) {
-          throw new TypeError(
-            `Auto-increment cannot be added or removed after creation: ${tableDefinition.name}.${columnName}. Existing rows cannot be backfilled; recreate the table to change key generation.`,
-          );
+        const wasAuto = existing.defaultValue?.kind === "autoincrement";
+        const isAuto = columnDefinition.defaultSpec?.kind === "autoincrement";
+        if (wasAuto !== isAuto) {
+          // Adopting one seeds the counter past the largest key already stored; dropping one
+          // simply stops generating. Neither rewrites a row.
+          steps.push({
+            kind: "set-auto-increment",
+            tableName: tableDefinition.name,
+            columnName,
+            enabled: isAuto,
+          });
+          continue;
         }
         steps.push({
           kind: "alter-default",
@@ -1053,6 +1067,20 @@ export function applyColumnSteps(
     if (step.kind === "widen-nullable") {
       const target = columns.find(({ name }) => name === step.columnName);
       if (target !== undefined) target.nullable = true;
+      continue;
+    }
+    if (step.kind === "tighten-nullable") {
+      // The proof happens before this runs; see MinnowDatabase#columnHoldsNull.
+      const target = columns.find(({ name }) => name === step.columnName);
+      if (target !== undefined) target.nullable = false;
+      continue;
+    }
+    if (step.kind === "set-auto-increment") {
+      const target = columns.find(({ name }) => name === step.columnName);
+      if (target !== undefined) {
+        if (step.enabled) target.defaultValue = { kind: "autoincrement" };
+        else delete target.defaultValue;
+      }
       continue;
     }
     if (step.kind === "alter-default") {

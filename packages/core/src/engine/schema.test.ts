@@ -239,12 +239,16 @@ describe("column defaults", () => {
     expect(removed.steps).toEqual([
       { kind: "alter-default", tableName: "notes", columnName: "status", defaultValue: null },
     ]);
-    expect(() =>
+    // Dropping the generator is a catalog edit: nothing stored changes, writes just stop
+    // being filled.
+    expect(
       planMigration(
         toCatalog(current),
         schema([table("notes", { id: column.number().unique(), status: column.string() })]),
-      ),
-    ).toThrow("Auto-increment cannot be added or removed after creation");
+      ).steps,
+    ).toEqual([
+      { kind: "set-auto-increment", tableName: "notes", columnName: "id", enabled: false },
+    ]);
   });
 
   it("fills function defaults through typedTable before the batch reaches the engine", async () => {
@@ -695,7 +699,9 @@ describe("migration planning rejections", () => {
         ]),
       ),
     ).toThrow("Unique keys cannot change");
-    expect(() =>
+    // Tightening is planned, then earned: migrate() proves it from block headers before
+    // applying, and refuses when a stored row holds NULL.
+    expect(
       planMigration(
         toCatalog(current),
         schema([
@@ -705,8 +711,8 @@ describe("migration planning rejections", () => {
             joined: column.datetime(),
           }),
         ]),
-      ),
-    ).toThrow("Nullable columns cannot tighten");
+      ).steps,
+    ).toEqual([{ kind: "tighten-nullable", tableName: "people", columnName: "joined" }]);
     store.close();
   });
 
@@ -1691,6 +1697,99 @@ describe("adding a column with a backfill", () => {
     );
     expect(status?.backfill).toBe("archived");
     expect(status?.nullable).toBe(false);
+    store.close();
+  });
+});
+
+// --- Provable evolution ----------------------------------------------------------------------
+
+describe("tightening a column to NOT NULL", () => {
+  const loose = schema([
+    table("people", { id: column.number().unique(), city: column.string().nullable() }),
+  ]);
+  const tight = schema([table("people", { id: column.number().unique(), city: column.string() })]);
+
+  it("applies when no stored row holds NULL", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(loose);
+    await database.insertBatch("people", [
+      { id: 1, city: "London" },
+      { id: 2, city: "Paris" },
+    ]);
+    await database.migrate(tight);
+    const city = (await database.introspect()).tables[0]?.columns.find(
+      ({ name }) => name === "city",
+    );
+    expect(city?.nullable).toBe(false);
+    // And it is enforced from then on.
+    await expect(database.insertBatch("people", [{ id: 3, city: null }])).rejects.toThrow();
+    store.close();
+  });
+
+  it("refuses when a stored row holds NULL, naming the fix", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(loose);
+    await database.insertBatch("people", [
+      { id: 1, city: "London" },
+      { id: 2, city: null },
+    ]);
+    await expect(database.migrate(tight)).rejects.toThrow(/people\.city holds NULL in stored rows/);
+    // The catalog is unchanged: a refused migration applies nothing.
+    const city = (await database.introspect()).tables[0]?.columns.find(
+      ({ name }) => name === "city",
+    );
+    expect(city?.nullable).toBe(true);
+    store.close();
+  });
+
+  it("counts rows written before the column existed as NULL unless it is backfilled", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(schema([table("t", { id: column.number().unique() })]));
+    await database.insertBatch("t", [{ id: 1 }]);
+    await database.migrate(
+      schema([table("t", { id: column.number().unique(), note: column.string().nullable() })]),
+    );
+    // Those rows have no block for `note`, so tightening cannot be proven.
+    await expect(
+      database.migrate(
+        schema([table("t", { id: column.number().unique(), note: column.string() })]),
+      ),
+    ).rejects.toThrow(/t\.note holds NULL in stored rows/);
+    store.close();
+  });
+});
+
+describe("adopting and dropping auto-increment", () => {
+  it("adopts on a populated table, seeding past the largest stored key", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(schema([table("t", { id: column.number().unique() })]));
+    await database.insertBatch("t", [{ id: 5 }, { id: 41 }]);
+    await database.migrate(schema([table("t", { id: column.number().unique().autoIncrement() })]));
+    const id = (await database.introspect()).tables[0]?.columns[0];
+    expect(id?.isAutoIncrementing).toBe(true);
+    // A generated key must not collide with one already stored.
+    const written = await database.insert("t", {});
+    expect(written.rowCount).toBe(1);
+    const ids = (await database.readTable("t"))
+      .map((row) => row.id)
+      .sort((a, b) => Number(a) - Number(b));
+    expect(ids).toEqual([5, 41, 42]);
+    store.close();
+  });
+
+  it("drops the generator without touching stored rows", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(schema([table("t", { id: column.number().unique().autoIncrement() })]));
+    await database.insertBatch("t", [{}, {}]);
+    const before = await database.readTable("t");
+    await database.migrate(schema([table("t", { id: column.number().unique() })]));
+    expect((await database.introspect()).tables[0]?.columns[0]?.isAutoIncrementing).toBe(false);
+    expect(await database.readTable("t")).toEqual(before);
     store.close();
   });
 });

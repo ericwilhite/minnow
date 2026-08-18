@@ -4321,6 +4321,90 @@ export class MinnowDatabase {
     }
   }
 
+  /**
+   * Whether any visible row holds NULL in this column, proven from block headers alone.
+   *
+   * Every block records its own null count, and that field is covered by the envelope checksum
+   * the format authenticates independently of the payload — the same guarantee zone-map pruning
+   * already relies on. So tightening a column to NOT NULL costs one header read per block of that
+   * column, not a scan of its values: bytes are fetched, but nothing is decompressed or decoded.
+   *
+   * A segment written before the column existed contributes NULLs for all its rows unless the
+   * column carries a backfill, which is exactly what makes those rows non-null.
+   */
+  async #columnHoldsNull(table: TableRecord, columnId: string): Promise<boolean> {
+    const record = table.columns.find((candidate) => candidate.id === columnId);
+    if (record === undefined) return true;
+    const snapshot = await this.#transactions.openSnapshot();
+    const segments = await this.#visibleSegmentRecords(table, snapshot);
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const kind = segment.kind ?? "insert";
+      // Only append-shaped histories are provable this way: a delete or update segment means a
+      // row's live value is decided by replay, which headers cannot settle.
+      if (kind !== "insert" && kind !== "base") return true;
+      const blockIds = segment.columnBlockIds[columnId];
+      if (blockIds === undefined || blockIds.length === 0) {
+        if (record.backfill === undefined) return true;
+        continue;
+      }
+      for (let start = 0; start < blockIds.length; start += 16) {
+        const window = blockIds.slice(start, start + 16);
+        const fetched = await this.store.getBlocks(window);
+        for (const bytes of fetched) {
+          if (bytes === undefined) return true;
+          if (inspectBlock(bytes).nullCount > 0) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Bumps a column's auto-increment counter past every key already stored, so adopting the
+   * generator on a populated table cannot mint an id that collides with one already written.
+   *
+   * The largest key comes from the numeric zone map each block carries in its header, so this
+   * costs one header read per block of the key column — no decode, no scan. A block without a
+   * zone map (or a non-numeric column) makes the maximum unknowable this way, and the migration
+   * is refused rather than seeded from an incomplete picture.
+   */
+  async #seedAutoIncrement(table: TableRecord, columnName: string): Promise<void> {
+    const column = table.columns.find(({ name }) => name === columnName);
+    if (column === undefined) return;
+    if (column.type !== "number") {
+      throw new TypeError(`Auto-increment requires a number column: ${table.name}.${columnName}`);
+    }
+    const snapshot = await this.#transactions.openSnapshot();
+    const segments = await this.#visibleSegmentRecords(table, snapshot);
+    let largest = 0;
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const blockIds = segment.columnBlockIds[column.id] ?? [];
+      if (blockIds.length === 0) continue;
+      for (let start = 0; start < blockIds.length; start += 16) {
+        const fetched = await this.store.getBlocks(blockIds.slice(start, start + 16));
+        for (const bytes of fetched) {
+          if (bytes === undefined) {
+            throw new TypeError(
+              `Auto-increment cannot be adopted for ${table.name}.${columnName}: a block is missing`,
+            );
+          }
+          const zoneMap = inspectBlock(bytes).metadata.zoneMap;
+          if (zoneMap === undefined) {
+            throw new TypeError(
+              `Auto-increment cannot be adopted for ${table.name}.${columnName}: a block carries ` +
+                `no zone map, so the largest existing key is unknown without a scan`,
+            );
+          }
+          if (zoneMap.max > largest) largest = zoneMap.max;
+        }
+      }
+    }
+    if (largest <= 0) return;
+    await this.store.reserveAutoIncrement(table.id, column.id, 0, BigInt(Math.trunc(largest)) + 1n);
+  }
+
   async #migrateOnce(definition: SchemaDefinition<readonly AnyTable[]>): Promise<{
     createdTables: string[];
     alteredTables: string[];
@@ -4401,6 +4485,26 @@ export class MinnowDatabase {
       const record = recordsByName.get(tableName);
       if (record === undefined) {
         throw new Error(`Migration target table is missing: ${tableName}`);
+      }
+      // Tightening to NOT NULL is the one step that has to be earned rather than declared: the
+      // catalog cannot promise what the stored rows contain, so prove it from block headers
+      // before the batched compare-and-swap makes it durable.
+      for (const step of steps) {
+        if (step.kind !== "tighten-nullable") continue;
+        const target = record.columns.find(({ name }) => name === step.columnName);
+        if (target === undefined) continue;
+        if (await this.#columnHoldsNull(record, target.id)) {
+          throw new TypeError(
+            `Column cannot tighten to non-null: ${tableName}.${step.columnName} holds NULL in ` +
+              `stored rows. Give it a value everywhere, or declare it nullable.`,
+          );
+        }
+      }
+      // Adopting auto-increment seeds the counter past the largest key already stored, so a
+      // generated id can never collide with one already written.
+      for (const step of steps) {
+        if (step.kind !== "set-auto-increment" || !step.enabled) continue;
+        await this.#seedAutoIncrement(record, step.columnName);
       }
       // A renamed column that a trigger references would silently bind NULL forever (NEW/OLD
       // bindings) or fail every firing (body target columns), so reject the rename instead.

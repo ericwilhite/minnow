@@ -235,15 +235,28 @@ widen an enum's value set (or drop it to a plain string), and add/change/remove 
 - **Nothing is rewritten.** A column added later reads as NULL in old data without touching it;
   physical rewrites are [compaction](/docs/sql/dml)'s job.
 
+Two changes are **proven rather than assumed**. Both read block headers only — the same
+checksum-authenticated statistics that drive data skipping — so they cost one header read per
+block, with nothing decompressed or decoded:
+
+- **Tightening a column to NOT NULL.** Every block records its own null count. If any visible row
+  holds NULL the migration is refused and nothing is applied; otherwise the column tightens with no
+  scan and no rewrite. Rows written before the column existed count as NULL unless it carries a
+  backfill.
+- **Adopting `.autoIncrement()`.** The counter is seeded past the largest key already stored, taken
+  from each block's numeric zone map, so a generated id can never collide with one already written.
+  Dropping the generator is free — writes simply stop being filled.
+
 Rejected outright, rather than attempted:
 
 - type changes
 - column or table drops
 - unique-key changes
-- non-null tightening
 - non-nullable column additions **without a backfill**
 - removing enum values, or tightening a string column into an enum
-- adding or removing `.autoIncrement()` (existing rows can't be backfilled into the counter)
+
+Those first three need the stored bytes rewritten, which is compaction's job, not a migration's.
+
 - adding, changing, or dropping a FOREIGN KEY or CHECK on an existing table
 
 That last one is the same rule as the rest: existing rows are not known to satisfy a constraint
