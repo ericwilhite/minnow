@@ -1527,3 +1527,170 @@ describe("creation order follows declared relations", () => {
     store.close();
   });
 });
+
+// --- Backfilled columns ---------------------------------------------------------------------
+
+describe("adding a column with a backfill", () => {
+  const before = schema([table("notes", { id: column.number().unique(), body: column.string() })]);
+  const after = (backfill: string) =>
+    schema([
+      table("notes", {
+        id: column.number().unique(),
+        body: column.string(),
+        status: column.string().backfill(backfill),
+      }),
+    ]);
+
+  async function seeded(): Promise<{ database: MinnowDatabase; store: MemoryBlockStore }> {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(before);
+    await database.insertBatch("notes", [
+      { id: 1, body: "old one" },
+      { id: 2, body: "old two" },
+    ]);
+    return { database, store };
+  }
+
+  it("adds a non-nullable column and reads the value for rows written before it", async () => {
+    const { database, store } = await seeded();
+    await database.migrate(after("archived"));
+    // The boxed read path.
+    expect(await database.readTable("notes")).toEqual([
+      { id: 1, body: "old one", status: "archived" },
+      { id: 2, body: "old two", status: "archived" },
+    ]);
+    // The vectorized read path.
+    expect((await database.query("SELECT id, status FROM notes ORDER BY id")).rows).toEqual([
+      { id: 1, status: "archived" },
+      { id: 2, status: "archived" },
+    ]);
+    // And it is filterable, so the value is real to the executor, not patched into output rows.
+    expect(
+      (await database.query("SELECT COUNT(*) AS n FROM notes WHERE status = 'archived'")).rows,
+    ).toEqual([{ n: 2 }]);
+    store.close();
+  });
+
+  it("does not rewrite the stored segments", async () => {
+    const { database, store } = await seeded();
+    const before = await database.listVisibleSegments("notes");
+    await database.migrate(after("archived"));
+    const after2 = await database.listVisibleSegments("notes");
+    expect(after2.map(({ id }) => id)).toEqual(before.map(({ id }) => id));
+    // The new column owns no blocks in the old segment: the value is substituted, not stored.
+    expect(Object.keys(after2[0]?.columnBlockIds ?? {})).toHaveLength(2);
+    store.close();
+  });
+
+  it("lets rows written afterwards carry their own value, including through mutations", async () => {
+    const { database, store } = await seeded();
+    await database.migrate(after("archived"));
+    await database.insertBatch("notes", [{ id: 3, body: "new", status: "live" }]);
+    await database.updateBatch("notes", { keys: [1], changes: { status: ["revived"] } });
+    // The keyed-mutation read path: seeded slots, overwritten where a segment carried the column.
+    expect(await database.readTable("notes")).toEqual([
+      { id: 1, body: "old one", status: "revived" },
+      { id: 2, body: "old two", status: "archived" },
+      { id: 3, body: "new", status: "live" },
+    ]);
+    store.close();
+  });
+
+  it("freezes a generated backfill so every reader agrees", async () => {
+    const { database, store } = await seeded();
+    let calls = 0;
+    await database.migrate(
+      schema([
+        table("notes", {
+          id: column.number().unique(),
+          body: column.string(),
+          stamp: column.number().backfill(() => {
+            calls += 1;
+            return 100 + calls;
+          }),
+        }),
+      ]),
+    );
+    expect(calls).toBe(1);
+    const rows = await database.readTable("notes");
+    expect(rows.map((row) => row.stamp)).toEqual([101, 101]);
+    // Re-reading does not re-run the generator.
+    expect(calls).toBe(1);
+    expect((await database.readTable("notes")).map((row) => row.stamp)).toEqual([101, 101]);
+    store.close();
+  });
+
+  it("backfills every column type", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(schema([table("t", { id: column.number().unique() })]));
+    await database.insertBatch("t", [{ id: 1 }]);
+    const stamp = new Date("2024-05-06T07:08:09.000Z");
+    await database.migrate(
+      schema([
+        table("t", {
+          id: column.number().unique(),
+          flag: column.boolean().backfill(true),
+          count: column.number().backfill(7),
+          label: column.string().backfill("x"),
+          at: column.datetime().backfill(stamp),
+          tier: column.enum(["free", "paid"]).backfill("paid"),
+        }),
+      ]),
+    );
+    expect(await database.readTable("t")).toEqual([
+      { id: 1, flag: true, count: 7, label: "x", at: stamp, tier: "paid" },
+    ]);
+    store.close();
+  });
+
+  it("still refuses a non-nullable column with no backfill", async () => {
+    const { database, store } = await seeded();
+    await expect(
+      database.migrate(
+        schema([
+          table("notes", {
+            id: column.number().unique(),
+            body: column.string(),
+            status: column.string(),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("Added columns must be nullable, or carry a backfill: notes.status");
+    store.close();
+  });
+
+  it("rejects a backfill that does not fit the column", () => {
+    expect(() =>
+      table("t", { id: column.number().unique(), n: column.number().backfill("x" as never) }),
+    ).toThrow("Backfill value must be a number: t.n");
+    expect(() =>
+      table("t", {
+        id: column.number().unique(),
+        tier: column.enum(["free", "paid"]).backfill("gold" as never),
+      }),
+    ).toThrow("Backfill value must be one of: free, paid");
+    expect(() =>
+      table("t", { id: column.number().unique(), s: column.string().nullable().backfill("x") }),
+    ).toThrow("A nullable column needs no backfill: t.s");
+  });
+
+  it("survives the wire round trip with the value frozen", () => {
+    const restored = deserializeSchema(serializeSchema(after("archived")));
+    const status = restored.tables[0]?.columns.status;
+    expect(status?.backfillValue).toBe("archived");
+    expect(status?.isNullable).toBe(false);
+  });
+
+  it("reports the value in the catalog", async () => {
+    const { database, store } = await seeded();
+    await database.migrate(after("archived"));
+    const status = (await database.introspect()).tables[0]?.columns.find(
+      ({ name }) => name === "status",
+    );
+    expect(status?.backfill).toBe("archived");
+    expect(status?.nullable).toBe(false);
+    store.close();
+  });
+});

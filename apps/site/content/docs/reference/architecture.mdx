@@ -58,6 +58,12 @@ Writes append small **delta segments**: an update stores just the key and the ch
 delete stores a key marker. Background compaction folds deltas into larger read-friendly segments
 later. Nothing is ever edited in place.
 
+A query reads a table with deltas by scanning the appended data and applying the deltas over it:
+deleted keys mask rows out, updated keys patch the cells they changed, and the row groups a
+delta cannot reach are skipped from their statistics alone. The cost is the size of the deltas,
+not the size of the table — deleting one row of a million does not make the next query re-read
+the million.
+
 ## How a write commits
 
 Readers see the database through a **manifest** — the list of exactly which blocks make up

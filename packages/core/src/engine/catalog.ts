@@ -23,6 +23,8 @@ export interface CatalogColumn {
   readonly enumValues?: readonly string[];
   /** Derived from the default spec, because a planner should not have to decode one. */
   readonly isAutoIncrementing: boolean;
+  /** What rows written before this column existed read as, instead of NULL. */
+  readonly backfill?: boolean | number | string | Date;
 }
 
 export interface CatalogForeignKey {
@@ -86,6 +88,7 @@ function toCatalogColumn(column: TableRecord["columns"][number]): CatalogColumn 
     nullable: column.nullable,
     ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
     ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
+    ...(column.backfill === undefined ? {} : { backfill: column.backfill }),
     isAutoIncrementing: column.defaultValue?.kind === "autoincrement",
   };
 }

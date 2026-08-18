@@ -88,6 +88,20 @@ export interface TableColumnRecord {
   /** Fills null-or-absent slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
   /**
+   * What rows written before this column existed read as, instead of NULL.
+   *
+   * A column added by a migration has no blocks in older segments. Those rows would otherwise
+   * read NULL forever, which is why adding a non-nullable column was impossible. Substituting
+   * this value at read time makes the addition meaningful without rewriting a single stored
+   * byte — the segments are untouched, and compaction folds the value in whenever it next
+   * rewrites them. It is frozen when the column is added: a generator runs once, at migration
+   * time, so every reader of a given row agrees.
+   *
+   * Spelled out rather than imported: storage sits below the engine, and NULL is the absence
+   * this replaces, so it is not one of the options.
+   */
+  backfill?: boolean | number | string | Date;
+  /**
    * String columns only: the closed set of values writes must draw from. Physically the column
    * stays a plain string column; the set is write-time validation metadata, so widening it (or
    * dropping it) is catalog-only while narrowing it is rejected by migration planning.

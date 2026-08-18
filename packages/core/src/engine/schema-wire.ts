@@ -29,6 +29,8 @@ export interface WireColumn {
   readonly renamedFromName?: string;
   readonly reference?: { table: string; column: string; onDelete: ReferentialAction };
   readonly enumValues?: readonly string[];
+  /** Already frozen by planning, so the wire carries a value and never a generator. */
+  readonly backfillValue?: boolean | number | string | Date;
 }
 
 export interface WireTable {
@@ -78,6 +80,14 @@ function serializeColumn(definition: AnyColumn): WireColumn {
       : { renamedFromName: definition.renamedFromName }),
     ...(definition.reference === undefined ? {} : { reference: { ...definition.reference } }),
     ...(definition.enumValues === undefined ? {} : { enumValues: [...definition.enumValues] }),
+    ...(definition.backfillValue === undefined
+      ? {}
+      : {
+          backfillValue:
+            typeof definition.backfillValue === "function"
+              ? definition.backfillValue()
+              : definition.backfillValue,
+        }),
   };
 }
 
@@ -159,6 +169,7 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
   if (wire.isNullable) builder = builder.nullable();
   if (wire.isUnique) builder = builder.unique();
   if (wire.renamedFromName !== undefined) builder = builder.renamedFrom(wire.renamedFromName);
+  if (wire.backfillValue !== undefined) builder = builder.backfill(wire.backfillValue);
   if (wire.reference !== undefined) {
     builder = builder.references(wire.reference.table, wire.reference.column, {
       onDelete: wire.reference.onDelete,

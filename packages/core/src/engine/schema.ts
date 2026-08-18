@@ -89,6 +89,8 @@ export interface ColumnBuilder<
   readonly defaultFn?: () => TValue;
   /** Present on `column.enum()` builders: the closed set of values writes must draw from. */
   readonly enumValues?: readonly string[];
+  /** What rows written before this column existed read as; see `.backfill()`. */
+  readonly backfillValue?: TValue | (() => TValue);
   readonly renamedFromName?: string;
   readonly reference?: ColumnReferenceSpec;
   /** Marks the column nullable; inserts may omit it and reads may return null. */
@@ -97,6 +99,16 @@ export interface ColumnBuilder<
   unique(): ColumnBuilder<TValue, TNullable, true, THasDefault>;
   /** Declares this column as the rename target of an existing catalog column. */
   renamedFrom(name: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
+  /**
+   * What rows written before this column existed read as, instead of NULL. Giving one is what
+   * makes adding a non-nullable column possible: no stored byte is rewritten, and reads
+   * substitute the value wherever the column has no data.
+   *
+   * A function runs once, when the migration adds the column, and its result is frozen into the
+   * catalog — so it can derive a value (a timestamp, a version stamp) without readers ever
+   * disagreeing. It cannot derive from other columns; that would need a value per row.
+   */
+  backfill(value: TValue | (() => TValue)): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /**
    * Declares a FOREIGN KEY onto another table's unique key. `migrate()` creates it as a real
    * constraint, so a write naming a parent row that does not exist is rejected — the same
@@ -166,6 +178,7 @@ function createColumn<TType extends SchemaColumnType>(
       | "defaultSpec"
       | "defaultFn"
       | "enumValues"
+      | "backfillValue"
     >
   > = {},
 ): ColumnBuilder<ValueOf<TType>, false> {
@@ -182,6 +195,9 @@ function createColumn<TType extends SchemaColumnType>(
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
     ...(state.reference === undefined ? {} : { reference: state.reference }),
     ...(state.enumValues === undefined ? {} : { enumValues: state.enumValues }),
+    ...(state.backfillValue === undefined
+      ? {}
+      : { backfillValue: state.backfillValue as ValueOf<TType> | (() => ValueOf<TType>) }),
   };
   return {
     ...base,
@@ -197,6 +213,8 @@ function createColumn<TType extends SchemaColumnType>(
         true
       >,
     renamedFrom: (name: string) => createColumn(type, { ...state, renamedFromName: name }),
+    backfill: (value: unknown) =>
+      createColumn(type, { ...state, backfillValue: value as ValueOf<TType> }),
     references: (
       table: string,
       referencedColumn: string,
@@ -325,6 +343,30 @@ export function table<const TName extends string, TColumns extends Record<string
   for (const [columnName, definition] of entries) {
     if (definition.defaultFn !== undefined && definition.isNullable) {
       throw new TypeError(`Defaults require a non-nullable column: ${columnName}`);
+    }
+    const backfill = definition.backfillValue;
+    if (backfill !== undefined && typeof backfill !== "function") {
+      const matches =
+        definition.type === "datetime"
+          ? backfill instanceof Date
+          : typeof backfill === definition.type;
+      if (!matches) {
+        throw new TypeError(`Backfill value must be a ${definition.type}: ${name}.${columnName}`);
+      }
+      if (
+        definition.enumValues !== undefined &&
+        typeof backfill === "string" &&
+        !definition.enumValues.includes(backfill)
+      ) {
+        throw new TypeError(
+          `Backfill value must be one of: ${definition.enumValues.join(", ")} (${name}.${columnName})`,
+        );
+      }
+    }
+    if (backfill !== undefined && definition.isNullable) {
+      throw new TypeError(
+        `A nullable column needs no backfill: ${name}.${columnName}. Rows without it already read NULL.`,
+      );
     }
     if (definition.reference?.onDelete === "set null" && !definition.isNullable) {
       throw new TypeError(`ON DELETE SET NULL requires a nullable column: ${name}.${columnName}`);
@@ -583,7 +625,14 @@ export type InferUpdateChanges<TTable extends AnyTable> = {
 
 export type MigrationStep =
   | { kind: "create-table"; table: AnyTable }
-  | { kind: "add-column"; tableName: string; columnName: string; definition: AnyColumn }
+  | {
+      kind: "add-column";
+      tableName: string;
+      columnName: string;
+      definition: AnyColumn;
+      /** Frozen here: a generator runs once, so every reader of a given row agrees. */
+      backfill?: boolean | number | string | Date;
+    }
   | { kind: "rename-column"; tableName: string; from: string; to: string }
   | { kind: "widen-nullable"; tableName: string; columnName: string }
   /** Grows an enum's value set, or drops the restriction entirely (`enumValues: null`). */
@@ -664,6 +713,16 @@ function orderedForCreation(tables: readonly AnyTable[]): readonly AnyTable[] {
   };
   for (const definition of tables) visit(definition);
   return ordered;
+}
+
+/**
+ * Freezes a column's backfill. A generator runs exactly once — here, while the migration is being
+ * planned — so the catalog stores a value rather than a function and no two readers can disagree.
+ */
+function resolveBackfill(definition: AnyColumn): boolean | number | string | Date | undefined {
+  const declared = definition.backfillValue;
+  if (declared === undefined) return undefined;
+  return typeof declared === "function" ? declared() : declared;
 }
 
 /**
@@ -776,9 +835,10 @@ export function planMigration(
         }
       }
       if (existing === undefined) {
-        if (!columnDefinition.isNullable) {
+        const backfill = resolveBackfill(columnDefinition);
+        if (!columnDefinition.isNullable && backfill === undefined) {
           throw new TypeError(
-            `Added columns must be nullable: ${tableDefinition.name}.${columnName}`,
+            `Added columns must be nullable, or carry a backfill: ${tableDefinition.name}.${columnName}`,
           );
         }
         if (columnDefinition.isUnique) {
@@ -791,6 +851,7 @@ export function planMigration(
           tableName: tableDefinition.name,
           columnName,
           definition: columnDefinition,
+          ...(backfill === undefined ? {} : { backfill }),
         });
         continue;
       }
@@ -970,7 +1031,10 @@ export function applyColumnSteps(
           id: createId(),
           name: step.columnName,
           type: step.definition.type,
-          nullable: true,
+          // A backfill is what lets the column be non-nullable: every row has a value, either
+          // written or substituted at read time.
+          nullable: step.backfill === undefined ? true : step.definition.isNullable,
+          ...(step.backfill === undefined ? {} : { backfill: step.backfill }),
           ...(step.definition.enumValues === undefined
             ? {}
             : { enumValues: [...step.definition.enumValues] }),

@@ -211,6 +211,8 @@ const CATALOG_STATE_CACHE_LIMIT = 64;
 const STREAMED_SCAN_LOOKAHEAD_BLOCKS = 8;
 /** Visible segments per table at which a streamed scan schedules a compaction step. */
 const AUTO_COMPACT_SCAN_SEGMENTS = 48;
+/** Visible delete/update segments at which a streamed scan schedules a compaction step. */
+const AUTO_COMPACT_DELTA_SEGMENTS = 8;
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
 const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 
@@ -315,6 +317,8 @@ export interface ColumnDefinition {
   defaultValue?: ColumnDefault;
   /** String columns only: the closed set of values writes must draw from. */
   enumValues?: readonly string[];
+  /** What rows written before this column existed read as, instead of NULL. */
+  backfill?: boolean | number | string | Date;
 }
 
 export interface CreateTableInput {
@@ -900,6 +904,8 @@ export class MinnowDatabase {
   readonly #ftsBuildsInFlight = new Set<string>();
   /** Tables with a fire-and-forget compaction step already running. */
   readonly #autoCompactionsInFlight = new Set<string>();
+  /** Per table: the visible segment count a failed auto-compaction must see before retrying. */
+  readonly #autoCompactionBackoff = new Map<string, number>();
   /**
    * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
    * optimization — subquery resolution and CTE expansion clone before rewriting and join
@@ -985,6 +991,7 @@ export class MinnowDatabase {
         ...(column.enumValues === undefined
           ? {}
           : { enumValues: validateEnumValues(column.enumValues, columnName) }),
+        ...(column.backfill === undefined ? {} : { backfill: column.backfill }),
       };
     });
     const uniqueKeyColumn =
@@ -3007,14 +3014,32 @@ export class MinnowDatabase {
    * Read-triggered self-maintenance: a streamed scan that observes heavy fragmentation
    * schedules one incremental compaction step in the background, exactly like the full-text
    * auto index — fire-and-forget, never awaited by the read, one per table at a time.
+   *
+   * Deltas count separately from fragmentation. Folding them is what returns a table to the
+   * plain append scan, and a table can carry enough of them to matter long before it has
+   * forty-eight segments. A failed attempt (a merge plan that does not fit the compaction
+   * memory budget is the usual one) doubles the count the table must reach before the next
+   * one, so a table that cannot be compacted today costs one attempt, not one per query.
    */
-  #maybeScheduleAutoCompaction(table: TableRecord, visibleSegmentCount: number): void {
+  #maybeScheduleAutoCompaction(table: TableRecord, segments: readonly SegmentRecord[]): void {
     if (!this.#autoCompact) return;
-    if (visibleSegmentCount < AUTO_COMPACT_SCAN_SEGMENTS) return;
+    const deltas = segments.filter((segment) => {
+      const kind = segment.kind ?? "insert";
+      return kind !== "insert" && kind !== "base";
+    }).length;
+    if (segments.length < AUTO_COMPACT_SCAN_SEGMENTS && deltas < AUTO_COMPACT_DELTA_SEGMENTS) {
+      return;
+    }
+    if (segments.length < (this.#autoCompactionBackoff.get(table.id) ?? 0)) return;
     if (this.#autoCompactionsInFlight.has(table.id)) return;
     this.#autoCompactionsInFlight.add(table.id);
     void this.compactTableStep(table.name, { maxBlocks: 4 })
-      .catch(() => undefined)
+      .then(() => {
+        this.#autoCompactionBackoff.delete(table.id);
+      })
+      .catch(() => {
+        this.#autoCompactionBackoff.set(table.id, Math.max(2, segments.length * 2));
+      })
       .finally(() => {
         this.#autoCompactionsInFlight.delete(table.id);
       });
@@ -4336,6 +4361,14 @@ export class MinnowDatabase {
             ...(columnDefinition.enumValues === undefined
               ? {}
               : { enumValues: columnDefinition.enumValues }),
+            ...(columnDefinition.backfillValue === undefined
+              ? {}
+              : {
+                  backfill:
+                    typeof columnDefinition.backfillValue === "function"
+                      ? columnDefinition.backfillValue()
+                      : columnDefinition.backfillValue,
+                }),
           })),
           ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
           ...(step.table.checks.length === 0 ? {} : { checks: [...step.table.checks] }),
@@ -5548,7 +5581,7 @@ export class MinnowDatabase {
       const visibleBaseSegments =
         visibleByTable.get(freshBaseTable.name) ??
         (await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility));
-      this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments.length);
+      this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments);
       const baseSegments = await this.#ftsPrunedSegments(
         freshBaseTable,
         visibleBaseSegments,
@@ -5570,6 +5603,7 @@ export class MinnowDatabase {
         zonePruned?.segments ?? baseSegments,
         snapshot,
         zonePruned?.storedBlocks,
+        zonePruned !== undefined,
       );
       if (baseView === undefined) return undefined;
 
@@ -5710,14 +5744,14 @@ export class MinnowDatabase {
     segments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
   ): Promise<{ segments: SegmentRecord[]; storedBlocks: Map<string, Uint8Array> } | undefined> {
-    if (
-      segments.some((segment) => {
-        const kind = segment.kind ?? "insert";
-        return kind !== "insert" && kind !== "base";
-      })
-    ) {
-      return undefined;
-    }
+    const mutations = segments.filter(
+      (segment) => segment.kind === "delete" || segment.kind === "update",
+    );
+    const appends = segments.filter((segment) => {
+      const kind = segment.kind ?? "insert";
+      return kind === "insert" || kind === "base";
+    });
+    if (appends.length + mutations.length !== segments.length) return undefined;
     const predicates = zonePredicates(plan, table);
     if (predicates.length === 0) return undefined;
     if (planContainsFts(plan, "bm25") && !this.#ftsIndexServesScoring(plan, table, segments)) {
@@ -5726,14 +5760,36 @@ export class MinnowDatabase {
     const predicateColumns = [
       ...new Map(predicates.map((predicate) => [predicate.column.id, predicate.column])).values(),
     ];
+    const keyColumn = getUniqueKeyColumn(table);
+    if (mutations.length > 0) {
+      // The replay addresses base rows by their slot in the streamed scan, so the key column
+      // has to be pruned in lockstep with everything else the scan reads.
+      if (keyColumn === undefined) return undefined;
+      // An update can move a row's value into a predicate's range, which the base block's zone
+      // map cannot know: eliminating that row group would drop a row the update makes match.
+      // A delete only ever removes rows, so it composes with elimination unchanged.
+      if (
+        mutations.some(
+          (segment) =>
+            segment.kind === "update" &&
+            predicateColumns.some((column) => (segment.columnBlockIds[column.id]?.length ?? 0) > 0),
+        )
+      ) {
+        return undefined;
+      }
+    }
     const involvedColumns = [
       ...new Map(
-        [...projectedColumns, ...predicateColumns].map((column) => [column.id, column]),
+        [
+          ...projectedColumns,
+          ...predicateColumns,
+          ...(mutations.length > 0 && keyColumn !== undefined ? [keyColumn] : []),
+        ].map((column) => [column.id, column]),
       ).values(),
     ];
     if (
       involvedColumns.some((column) =>
-        segments.some((segment) => segment.columnBlockIds[column.id] === undefined),
+        appends.some((segment) => segment.columnBlockIds[column.id] === undefined),
       )
     ) {
       return undefined;
@@ -5742,7 +5798,7 @@ export class MinnowDatabase {
     const descriptions = new Map<string, ReturnType<typeof inspectBlock>>();
     const predicateBlockIds = [
       ...new Set(
-        segments.flatMap((segment) =>
+        appends.flatMap((segment) =>
           predicateColumns.flatMap((column) => segment.columnBlockIds[column.id] ?? []),
         ),
       ),
@@ -5773,6 +5829,12 @@ export class MinnowDatabase {
     }
     const prunedSegments: SegmentRecord[] = [];
     for (const segment of segments) {
+      // Deltas ride through in place: they carry the replay's key markers and patches, they are
+      // small, and their position among the appends is what makes the replay order meaningful.
+      if (segment.kind === "delete" || segment.kind === "update") {
+        prunedSegments.push(segment);
+        continue;
+      }
       const firstIds = segment.columnBlockIds[predicateColumns[0]?.id ?? ""] ?? [];
       if (
         involvedColumns.some(
@@ -5835,6 +5897,7 @@ export class MinnowDatabase {
     segments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
     storedBlocks?: Map<string, Uint8Array>,
+    zonePruned = false,
   ):
     | {
         create: (memory: QueryMemoryContext) => Promise<{
@@ -5879,6 +5942,8 @@ export class MinnowDatabase {
               segments,
               snapshot,
               memory,
+              zonePruned,
+              storedBlocks,
             )
           : this.#createStreamedTable(
               table,
@@ -6196,6 +6261,38 @@ export class MinnowDatabase {
    * mutation size, not the table; the duplicate-key corruption guard consequently only fires
    * for touched keys on this path.
    */
+  /**
+   * Block header/metadata descriptions, cached and fetched in one round trip: no decompress and
+   * no payload validation. Descriptions are immutable per block id, so a repeated query pays
+   * nothing — including the await, which is why the misses are batched rather than looped.
+   */
+  async #zoneDescriptions(
+    blockIds: readonly string[],
+    snapshot: LeasedSnapshot,
+  ): Promise<Map<string, ReturnType<typeof inspectBlock>>> {
+    const descriptions = new Map<string, ReturnType<typeof inspectBlock>>();
+    const missing: string[] = [];
+    for (const blockId of blockIds) {
+      const cached = this.#cacheGet(`zi ${blockId}`) as ReturnType<typeof inspectBlock> | undefined;
+      if (cached === undefined) missing.push(blockId);
+      else descriptions.set(blockId, cached);
+    }
+    for (let start = 0; start < missing.length; start += 16) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      const ids = missing.slice(start, start + 16);
+      const blocks = await this.store.getBlocks(ids);
+      for (let index = 0; index < ids.length; index += 1) {
+        const id = ids[index] ?? "";
+        const bytes = blocks[index];
+        if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
+        const description = inspectBlock(bytes);
+        descriptions.set(id, description);
+        this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+      }
+    }
+    return descriptions;
+  }
+
   async #createStreamedMutationTable(
     table: TableRecord,
     keyColumn: TableColumnRecord,
@@ -6203,6 +6300,8 @@ export class MinnowDatabase {
     baseSegments: readonly SegmentRecord[],
     snapshot: LeasedSnapshot,
     memory: QueryMemoryContext,
+    zonePruned = false,
+    storedBlocks?: Map<string, Uint8Array>,
   ): Promise<{
     table: ColumnarTable;
     load: (start: number, length: number) => number | Promise<number>;
@@ -6216,7 +6315,10 @@ export class MinnowDatabase {
     // projected columns) — resident and reserved, bounded by the mutation history's size.
     const mutationKeyVectors = new Map<string, ColumnVector>();
     const mutationChangedVectors = new Map<string, Map<string, ColumnVector>>();
-    const touched = new Set<string>();
+    // Keys as the primitives the vectors already hold. The replay used to build one string
+    // token per row on both sides, which made a single deleted row cost an allocation and a
+    // hash of every key in the table.
+    const touched = new Set<OverlayKey>();
     for (const segment of baseSegments) {
       const kind = segment.kind ?? "insert";
       if (kind !== "update" && kind !== "delete") continue;
@@ -6228,8 +6330,9 @@ export class MinnowDatabase {
       );
       memory.reserve(columnVectorRetainedBytes(keyVector), "Streamed mutation replay");
       mutationKeyVectors.set(segment.id, keyVector);
+      const readMutationKey = requiredColumnVectorKeyReader(keyVector);
       for (let row = 0; row < segment.rowCount; row += 1) {
-        touched.add(columnVectorKeyToken(keyColumn.type, keyVector, row));
+        touched.add(readMutationKey(row));
       }
       if (kind === "update") {
         const changed = new Map<string, ColumnVector>();
@@ -6251,13 +6354,34 @@ export class MinnowDatabase {
 
     // Phase B: one bounded pass over the scan segments' key blocks — a single block resident
     // at a time — recording, per scan segment, the touched tokens and their absolute slots.
-    const touchedByScanSegment = new Map<string, Array<{ token: string; slot: number }>>();
+    const touchedByScanSegment = new Map<string, Array<{ key: OverlayKey; slot: number }>>();
+    // A mutation history is small, and a unique key is usually written in order, so most key
+    // blocks cannot hold any touched key at all. Their zone maps say so from the header alone,
+    // which is what keeps one deleted row from costing a decode of every key block in the table.
+    const touchedPredicate = touchedKeyPredicate(keyColumn, touched);
+    const keyDescriptions =
+      touchedPredicate === undefined
+        ? new Map<string, ReturnType<typeof inspectBlock>>()
+        : await this.#zoneDescriptions(
+            scanSegments.flatMap((segment) => segment.columnBlockIds[keyColumn.id] ?? []),
+            snapshot,
+          );
     let baseRows = 0;
     for (const segment of scanSegments) {
-      const entries: Array<{ token: string; slot: number }> = [];
+      const entries: Array<{ key: OverlayKey; slot: number }> = [];
       touchedByScanSegment.set(segment.id, entries);
       let segmentRows = 0;
       for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
+        const description = keyDescriptions.get(blockId);
+        if (touchedPredicate !== undefined && description !== undefined) {
+          if (description.type !== keyColumn.type) {
+            throw new Error(`Column type mismatch: ${keyColumn.name}`);
+          }
+          if (!zoneMapCanMatch(description, touchedPredicate)) {
+            segmentRows += description.rowCount;
+            continue;
+          }
+        }
         const [decoded] = await this.#decodedBlocksThroughCache([blockId], snapshot);
         if (decoded === undefined) throw new Error(`Visible block is missing: ${blockId}`);
         if (decoded.column.type !== keyColumn.type) {
@@ -6286,9 +6410,10 @@ export class MinnowDatabase {
               }
             : { kind: keyColumn.type, length: rows, validity, values }
         ) as ColumnVector;
+        const readBlockKey = requiredColumnVectorKeyReader(blockVector);
         for (let row = 0; row < rows; row += 1) {
-          const token = columnVectorKeyToken(keyColumn.type, blockVector, row);
-          if (touched.has(token)) entries.push({ token, slot: baseRows + segmentRows + row });
+          const key = readBlockKey(row);
+          if (touched.has(key)) entries.push({ key, slot: baseRows + segmentRows + row });
         }
         segmentRows += rows;
       }
@@ -6304,17 +6429,17 @@ export class MinnowDatabase {
     // patches per changed column with last-writer-wins.
     const dead = new Uint8Array(Math.ceil(baseRows / 8));
     memory.reserve(dead.byteLength, "Streamed mutation replay");
-    const tokenSlot = new Map<string, number>();
+    const slotByKey = new Map<OverlayKey, number>();
     const patches = new Map<number, Map<string, { vector: ColumnVector; row: number }>>();
     let deadCount = 0;
     for (const segment of baseSegments) {
       const kind = segment.kind ?? "insert";
       if (kind === "insert" || kind === "base") {
         for (const entry of touchedByScanSegment.get(segment.id) ?? []) {
-          if (tokenSlot.has(entry.token)) {
+          if (slotByKey.has(entry.key)) {
             throw new Error(`Stored table contains a duplicate unique key: ${table.name}`);
           }
-          tokenSlot.set(entry.token, entry.slot);
+          slotByKey.set(entry.key, entry.slot);
         }
         continue;
       }
@@ -6322,24 +6447,28 @@ export class MinnowDatabase {
       if (keyVector === undefined) {
         throw new Error(`Mutation segment key vector is missing: ${segment.id}`);
       }
+      const readKey = requiredColumnVectorKeyReader(keyVector);
       if (kind === "delete") {
         for (let row = 0; row < segment.rowCount; row += 1) {
-          const token = columnVectorKeyToken(keyColumn.type, keyVector, row);
-          const slot = tokenSlot.get(token);
+          const key = readKey(row);
+          const slot = slotByKey.get(key);
           if (slot !== undefined && !bitmapHasValue(dead, slot)) {
             setBitmapValue(dead, slot);
             deadCount += 1;
             patches.delete(slot);
           }
-          tokenSlot.delete(token);
+          slotByKey.delete(key);
         }
         continue;
       }
       const changed = mutationChangedVectors.get(segment.id) ?? new Map<string, ColumnVector>();
       for (let row = 0; row < segment.rowCount; row += 1) {
-        const token = columnVectorKeyToken(keyColumn.type, keyVector, row);
-        const slot = tokenSlot.get(token);
+        const slot = slotByKey.get(readKey(row));
         if (slot === undefined) {
+          // Zone-map elimination only drops row groups this plan's predicates reject, and it
+          // refuses to run at all when an update touches one of those predicate columns — so
+          // an eliminated row's patch cannot change what the query returns.
+          if (zonePruned) continue;
           throw new Error(`Update segment references a missing key: ${segment.id}`);
         }
         let slotPatches = patches.get(slot);
@@ -6350,8 +6479,9 @@ export class MinnowDatabase {
         for (const [columnId, vector] of changed) slotPatches.set(columnId, { vector, row });
       }
     }
-    memory.tally(patches.size * 96 + tokenSlot.size * 64, "Streamed mutation replay");
+    memory.tally(patches.size * 96 + slotByKey.size * 64, "Streamed mutation replay");
 
+    const hasPatches = patches.size > 0;
     const outputRows = baseRows - deadCount;
     const inner = this.#createStreamedTable(
       table,
@@ -6360,7 +6490,13 @@ export class MinnowDatabase {
       snapshot,
       baseRows,
       memory,
+      storedBlocks,
     );
+    // Deltas that touch no row this scan reads — every one of them eliminated with its row
+    // group, or aimed at keys this table no longer holds — leave the scan exactly as it was.
+    // The plain streamed scan hands decoded blocks straight through, so skipping the overlay
+    // here is the difference between a copy per window and none.
+    if (deadCount === 0 && !hasPatches) return inner;
     interface OuterColumnState {
       column: TableColumnRecord;
       vector: ColumnVector;
@@ -6376,6 +6512,9 @@ export class MinnowDatabase {
     let cursorBase = 0;
     const load = async (start: number, length: number): Promise<number> => {
       const end = Math.min(start + length, outputRows);
+      // COUNT(*) and friends project nothing: the replay already knows how many rows survive,
+      // so there is no window to build and no reason to walk the base rows to build it.
+      if (states.length === 0) return end;
       const window = states[0]?.vector.window;
       if (window !== undefined && start >= window.start && end <= window.start + window.length) {
         return window.start + window.length;
@@ -6485,9 +6624,22 @@ export class MinnowDatabase {
             if (innerWindow === undefined) {
               throw new Error(`Streamed column is missing: ${entry.state.column.name}`);
             }
-            for (let live = index; live < chunkEndIndex; live += 1) {
+            // Live rows are consecutive except where a delete cut them, so the copy walks runs:
+            // one typed-array slice each, with patched slots taken out individually. Copying
+            // cell by cell here is what made a table with one deleted row scan like a replay.
+            const columnId = entry.state.column.id;
+            const remap =
+              entry.innerVector.kind === "string"
+                ? remapDictionary(
+                    entry.innerVector.dictionary,
+                    entry.dictionary,
+                    entry.dictionaryIndex,
+                  )
+                : undefined;
+            let live = index;
+            while (live < chunkEndIndex) {
               const baseRow = liveBaseRows[live] ?? 0;
-              const patch = patches.get(baseRow)?.get(entry.state.column.id);
+              const patch = hasPatches ? patches.get(baseRow)?.get(columnId) : undefined;
               if (patch !== undefined) {
                 copyColumnVectorValue(
                   patch.vector,
@@ -6496,15 +6648,26 @@ export class MinnowDatabase {
                   live,
                   entry.dictionaryIndex,
                 );
-              } else {
-                copyColumnVectorValue(
-                  entry.innerVector,
-                  baseRow - innerWindow.start,
-                  entry.target,
-                  live,
-                  entry.dictionaryIndex,
-                );
+                live += 1;
+                continue;
               }
+              let runEnd = live + 1;
+              while (
+                runEnd < chunkEndIndex &&
+                (liveBaseRows[runEnd] ?? 0) === baseRow + (runEnd - live) &&
+                (!hasPatches || patches.get(liveBaseRows[runEnd] ?? 0)?.get(columnId) === undefined)
+              ) {
+                runEnd += 1;
+              }
+              copyVectorSpan(
+                entry.innerVector,
+                baseRow - innerWindow.start,
+                runEnd - live,
+                entry.target,
+                live,
+                remap,
+              );
+              live = runEnd;
             }
           }
           index = chunkEndIndex;
@@ -9584,6 +9747,23 @@ export class MinnowDatabase {
         ...(projectedKey ? { uniqueKey: projectedKey } : {}),
       };
     }
+    if (
+      keyColumn !== undefined &&
+      segments.every((segment) => {
+        const kind = segment.kind ?? "insert";
+        return kind === "insert" || kind === "base" || kind === "delete" || kind === "update";
+      })
+    ) {
+      const overlay = await this.#materializeOverlayTable(
+        table,
+        snapshot,
+        projectedColumns,
+        segments,
+        keyColumn,
+        plan,
+      );
+      if (overlay !== undefined) return overlay;
+    }
     const neededColumns = [
       ...projectedColumns,
       ...(keyColumn === undefined || projectedColumns.some((column) => column.id === keyColumn.id)
@@ -9597,9 +9777,15 @@ export class MinnowDatabase {
       );
     }, 0);
     const vectorsByColumn = new Map(
-      neededColumns.map(
-        (column) => [column.id, createEmptyColumnVector(column.type, maximumRows)] as const,
-      ),
+      neededColumns.map((column) => {
+        const vector = createEmptyColumnVector(column.type, maximumRows);
+        // Seeded, not filled per segment: replay overwrites a slot whenever a segment carries
+        // the column, so what survives is exactly the rows no segment ever wrote it for.
+        if (column.backfill !== undefined) {
+          fillColumnVectorRange(vector, 0, maximumRows, column.backfill);
+        }
+        return [column.id, vector] as const;
+      }),
     );
     const dictionaryIndexes = new Map(
       neededColumns
@@ -9736,6 +9922,178 @@ export class MinnowDatabase {
       rowCount: visibleRowCount,
       columns,
       ...(projectedKey ? { uniqueKey: projectedKey } : {}),
+    };
+  }
+
+  /**
+   * An append scan of the base segments with the table's delete and update deltas applied on
+   * top. The replay path below rebuilds every row of every segment through a keyed map because
+   * one segment is not an append, so a single deleted row used to cost a full-table replay —
+   * and cost it on every later query, since only compaction folds the delta away. This path
+   * pays for the deltas instead: base columns are copied in runs, deleted keys mask rows out,
+   * and updated keys patch the cells they changed.
+   *
+   * Returns undefined for any history it does not cover (a windowed vector, a null key, an
+   * update whose key no live row carries), which falls through to the replay unchanged.
+   */
+  async #materializeOverlayTable(
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    projectedColumns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    keyColumn: TableColumnRecord,
+    plan: CompiledQuery | undefined,
+  ): Promise<ColumnarTable | undefined> {
+    const appends: SegmentRecord[] = [];
+    const appendOrders: number[] = [];
+    const deltas: Array<{ segment: SegmentRecord; order: number }> = [];
+    segments.forEach((segment, order) => {
+      const kind = segment.kind ?? "insert";
+      if (kind === "insert" || kind === "base") {
+        appends.push(segment);
+        appendOrders.push(order);
+        return;
+      }
+      deltas.push({ segment, order });
+    });
+    if (deltas.length === 0) return undefined;
+
+    // The deltas are the small side: key markers, and for an update the columns it changed.
+    const deletedAt = new Map<OverlayKey, number>();
+    const updatesByKey = new Map<OverlayKey, OverlayUpdate[]>();
+    const patchedColumnIds = new Set<string>();
+    const allUpdates: OverlayUpdate[] = [];
+    for (const { segment, order } of deltas) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      const keyVector = await this.#materializeAppendColumnVector(
+        keyColumn,
+        [segment],
+        snapshot,
+        segment.rowCount,
+      );
+      const readKey = columnVectorKeyReader(keyVector);
+      if (readKey === undefined) return undefined;
+      if (segment.kind === "delete") {
+        for (let row = 0; row < segment.rowCount; row += 1) {
+          const key = readKey(row);
+          if (key === undefined) return undefined;
+          deletedAt.set(key, order);
+        }
+        continue;
+      }
+      const changed = projectedColumns.filter(
+        (column) =>
+          column.id !== keyColumn.id && (segment.columnBlockIds[column.id]?.length ?? 0) > 0,
+      );
+      const vectors = new Map<string, ColumnVector>();
+      for (const column of changed) {
+        vectors.set(
+          column.id,
+          await this.#materializeAppendColumnVector(column, [segment], snapshot, segment.rowCount),
+        );
+        patchedColumnIds.add(column.id);
+      }
+      for (let row = 0; row < segment.rowCount; row += 1) {
+        const key = readKey(row);
+        if (key === undefined) return undefined;
+        const update: OverlayUpdate = { order, row, vectors, applied: false };
+        allUpdates.push(update);
+        const existing = updatesByKey.get(key);
+        if (existing === undefined) updatesByKey.set(key, [update]);
+        else existing.push(update);
+      }
+    }
+
+    const projectsKey = projectedColumns.some((column) => column.id === keyColumn.id);
+    const neededColumns = projectsKey ? projectedColumns : [...projectedColumns, keyColumn];
+    // Zone-map elimination drops whole row groups, so it can only compose with deltas that
+    // cannot bring a pruned row back: deletes, and only when every one of them is newer than
+    // every base segment (otherwise a row's fate depends on which segment it came from, which
+    // a pruned scan no longer reports).
+    const lastAppendOrder = appendOrders.at(-1) ?? -1;
+    const orderFree =
+      updatesByKey.size === 0 && deltas.every(({ order }) => order > lastAppendOrder);
+    const predicates = plan === undefined || !orderFree ? [] : zonePredicates(plan, table);
+    let base: ColumnarTable | undefined;
+    if (predicates.length > 0) {
+      base = await this.#materializePrunedAppendTable(
+        table,
+        snapshot,
+        neededColumns,
+        appends,
+        predicates,
+      );
+    }
+    // Runs map an output row back to the segment that wrote it; a pruned scan reports no runs,
+    // and orderFree is what makes that safe.
+    const runs: Array<{ end: number; order: number }> = [];
+    if (base === undefined) {
+      const appendRowCount = appends.reduce((total, segment) => total + segment.rowCount, 0);
+      const columns = new Map<string, ColumnVector>();
+      for (const column of neededColumns) {
+        columns.set(
+          column.name,
+          await this.#materializeAppendColumnVector(column, appends, snapshot, appendRowCount),
+        );
+      }
+      base = { name: table.name, rowCount: appendRowCount, columns };
+      let end = 0;
+      appends.forEach((segment, index) => {
+        end += segment.rowCount;
+        runs.push({ end, order: appendOrders[index] ?? 0 });
+      });
+    }
+
+    const rowCount = base.rowCount;
+    const baseKeyVector = base.columns.get(keyColumn.name);
+    if (baseKeyVector === undefined) return undefined;
+    const readBaseKey = columnVectorKeyReader(baseKeyVector);
+    if (readBaseKey === undefined) return undefined;
+    const alive = new Uint8Array(rowCount).fill(1);
+    const patches = new Map<number, OverlayUpdate[]>();
+    let aliveCount = rowCount;
+    let runIndex = 0;
+    for (let row = 0; row < rowCount; row += 1) {
+      while (runIndex < runs.length && row >= (runs[runIndex]?.end ?? 0)) runIndex += 1;
+      const order = runs.length === 0 ? -1 : (runs[runIndex]?.order ?? -1);
+      const key = readBaseKey(row);
+      if (key === undefined) return undefined;
+      const updates = updatesByKey.get(key);
+      if (updates !== undefined) {
+        const applicable = updates.filter((update) => update.order > order);
+        for (const update of applicable) update.applied = true;
+        if (applicable.length > 0) patches.set(row, applicable);
+      }
+      const deleted = deletedAt.get(key);
+      if (deleted !== undefined && deleted > order) {
+        alive[row] = 0;
+        aliveCount -= 1;
+      }
+    }
+    // An update whose key no base row carries means the replay's corruption check would fire,
+    // or that a shape this path does not model let the row escape it. Either way, defer.
+    if (allUpdates.some((update) => !update.applied)) return undefined;
+
+    const columns = new Map<string, ColumnVector>();
+    for (const column of projectedColumns) {
+      const source = base.columns.get(column.name);
+      if (source === undefined) return undefined;
+      if (aliveCount === rowCount && !patchedColumnIds.has(column.id)) {
+        columns.set(column.name, source);
+        continue;
+      }
+      columns.set(
+        column.name,
+        patchedColumnIds.has(column.id)
+          ? patchColumnVector(source, column, alive, aliveCount, patches)
+          : compactColumnVector(source, alive, aliveCount),
+      );
+    }
+    return {
+      name: table.name,
+      rowCount: aliveCount,
+      columns,
+      ...(projectsKey ? { uniqueKey: keyColumn.name } : {}),
     };
   }
 
@@ -10004,9 +10362,25 @@ export class MinnowDatabase {
     for (const segment of segments) {
       const blockIds = segment.columnBlockIds[column.id];
       if (blockIds === undefined) {
-        // The column joined the catalog after this segment was written; its rows read as NULL
-        // through the preallocated validity default. A present-but-empty block list still fails
-        // the row-count check below, preserving the corruption guard.
+        // The column joined the catalog after this segment was written. Its rows read as the
+        // column's backfill, or as NULL through the preallocated validity default when it has
+        // none. A present-but-empty block list still fails the row-count check below, preserving
+        // the corruption guard.
+        if (column.backfill !== undefined) {
+          const backfill = column.backfill;
+          const stringCode =
+            stringCodes === undefined
+              ? 0
+              : dictionaryCodeForText(stringDictionary, String(backfill));
+          const numeric = backfill instanceof Date ? backfill.getTime() : Number(backfill);
+          for (let offset = 0; offset < segment.rowCount; offset += 1) {
+            const index = outputRow + offset;
+            setBitmapValue(validity, index);
+            if (stringCodes !== undefined) stringCodes[index] = stringCode;
+            else if (values instanceof Uint8Array) values[index] = backfill === true ? 1 : 0;
+            else if (values !== undefined) values[index] = numeric;
+          }
+        }
         outputRow += segment.rowCount;
         continue;
       }
@@ -10097,8 +10471,10 @@ export class MinnowDatabase {
   ): BatchValue[] {
     const blockIds = segment.columnBlockIds[column.id];
     if (blockIds === undefined) {
-      // The column joined the catalog after this segment was written; its rows read as NULL.
-      return Array.from({ length: segment.rowCount }, () => null);
+      // The column joined the catalog after this segment was written; its rows read as the
+      // column's backfill, or NULL when it has none.
+      const absent = column.backfill ?? null;
+      return Array.from({ length: segment.rowCount }, () => absent);
     }
     const values: BatchValue[] = [];
     for (const blockId of blockIds) {
@@ -11189,6 +11565,45 @@ function derivedColumnarTable(
   return createColumnarTable(name, columns);
 }
 
+/**
+ * Writes a column's backfill across a run of slots, for rows whose segment predates the column.
+ * Doing it here rather than at write time is what keeps adding a column metadata-only: the stored
+ * segments never change, and compaction folds the value in the next time it rewrites them.
+ */
+function fillColumnVectorRange(
+  vector: ColumnVector,
+  start: number,
+  count: number,
+  value: boolean | number | string | Date,
+): void {
+  for (let offset = 0; offset < count; offset += 1) {
+    setBitmapValue(vector.validity, start + offset);
+  }
+  if (vector.kind === "boolean") {
+    vector.values.fill(value === true ? 1 : 0, start, start + count);
+    return;
+  }
+  if (vector.kind === "number" || vector.kind === "datetime") {
+    vector.values.fill(
+      value instanceof Date ? value.getTime() : Number(value),
+      start,
+      start + count,
+    );
+    return;
+  }
+  const text = String(value);
+  const dictionary = vector.dictionary as string[];
+  let code = dictionary.indexOf(text);
+  if (code === -1) code = dictionary.push(text) - 1;
+  vector.codes.fill(code, start, start + count);
+}
+
+/** Interns one string in a builder-backed dictionary, for the append path's own arrays. */
+function dictionaryCodeForText(builder: StringDictionaryBuilder, text: string): number {
+  const bytes = new TextEncoder().encode(text);
+  return builder.codeForBytes(bytes, 0, bytes.length);
+}
+
 function createEmptyColumnVector(type: SimpleDataType, length: number): ColumnVector {
   const validity = new Uint8Array(Math.ceil(length / 8));
   if (type === "boolean") {
@@ -11368,6 +11783,201 @@ function estimatedColumnarBytes(
   let rowWidth = 0;
   for (const column of columns) rowWidth += column.type === "string" ? 32 : 8;
   return rows * Math.max(rowWidth, 1);
+}
+
+/** A unique key read straight out of a vector: no per-row string token, no allocation. */
+type OverlayKey = string | number | boolean;
+
+/** One update segment row: which columns it changed, and whether a base row took it. */
+interface OverlayUpdate {
+  readonly order: number;
+  readonly row: number;
+  readonly vectors: ReadonlyMap<string, ColumnVector>;
+  applied: boolean;
+}
+
+/**
+ * Reads a key column's values as primitives. Dictionary-coded strings resolve through the
+ * dictionary the vector already holds, so a string key costs one array index and no encoding.
+ * Undefined for a windowed vector or a null key — shapes the overlay refuses rather than guesses.
+ */
+function columnVectorKeyReader(
+  vector: ColumnVector,
+): ((row: number) => OverlayKey | undefined) | undefined {
+  if (vector.window !== undefined) return undefined;
+  const validity = vector.validity;
+  if (vector.kind === "string") {
+    const { codes, dictionary } = vector;
+    return (row) =>
+      bitmapHasValue(validity, row) ? dictionary[codes[row] ?? NULL_STRING_VECTOR_CODE] : undefined;
+  }
+  if (vector.kind === "boolean") {
+    const values = vector.values;
+    return (row) => (bitmapHasValue(validity, row) ? values[row] === 1 : undefined);
+  }
+  const values = vector.values;
+  return (row) => (bitmapHasValue(validity, row) ? values[row] : undefined);
+}
+
+/** `columnVectorKeyReader` for a key column that must be readable: a null key is corruption. */
+function requiredColumnVectorKeyReader(vector: ColumnVector): (row: number) => OverlayKey {
+  const read = columnVectorKeyReader(vector);
+  if (read === undefined) throw new Error("Unique key vector cannot be read as keys");
+  return (row) => {
+    const key = read(row);
+    if (key === undefined) throw new TypeError("Unique key cannot be null");
+    return key;
+  };
+}
+
+/**
+ * The touched keys as one IN zone predicate, or undefined when zone maps cannot judge them
+ * (a string key has no numeric zone map, and an empty set has nothing to prune against).
+ */
+function touchedKeyPredicate(
+  keyColumn: TableColumnRecord,
+  touched: ReadonlySet<OverlayKey>,
+): ZonePredicate | undefined {
+  if (keyColumn.type !== "number" && keyColumn.type !== "datetime") return undefined;
+  if (touched.size === 0) return undefined;
+  const members = new Float64Array(touched.size);
+  let index = 0;
+  for (const key of touched) {
+    if (typeof key !== "number") return undefined;
+    members[index] = key;
+    index += 1;
+  }
+  members.sort();
+  return { column: keyColumn, operator: "IN", value: members[0] ?? 0, members };
+}
+
+/**
+ * Copies a run of rows between vectors: values as one typed-array slice, validity bit by bit.
+ * A string run needs `remap` unless both sides share a dictionary — the codes mean nothing on
+ * their own. This is what keeps a copy proportional to bytes rather than to cells.
+ */
+function copyVectorSpan(
+  source: ColumnVector,
+  sourceStart: number,
+  length: number,
+  target: ColumnVector,
+  targetStart: number,
+  remap?: Uint32Array,
+): void {
+  if (source.kind === "string") {
+    if (target.kind !== "string") throw new Error("Column vector type mismatch");
+    if (remap === undefined) {
+      target.codes.set(source.codes.subarray(sourceStart, sourceStart + length), targetStart);
+    } else {
+      for (let index = 0; index < length; index += 1) {
+        if (!bitmapHasValue(source.validity, sourceStart + index)) continue;
+        target.codes[targetStart + index] =
+          remap[source.codes[sourceStart + index] ?? NULL_STRING_VECTOR_CODE] ??
+          NULL_STRING_VECTOR_CODE;
+      }
+    }
+  } else if (source.kind === "boolean") {
+    if (target.kind !== "boolean") throw new Error("Column vector type mismatch");
+    target.values.set(source.values.subarray(sourceStart, sourceStart + length), targetStart);
+  } else {
+    if (target.kind === "string" || target.kind === "boolean") {
+      throw new Error("Column vector type mismatch");
+    }
+    target.values.set(source.values.subarray(sourceStart, sourceStart + length), targetStart);
+  }
+  for (let index = 0; index < length; index += 1) {
+    if (bitmapHasValue(source.validity, sourceStart + index)) {
+      setBitmapValue(target.validity, targetStart + index);
+    }
+  }
+}
+
+/** Source dictionary code -> target dictionary code, built once per source window. */
+function remapDictionary(
+  source: readonly string[],
+  targetDictionary: string[],
+  targetIndex: Map<string, number>,
+): Uint32Array {
+  const remap = new Uint32Array(source.length);
+  for (let code = 0; code < source.length; code += 1) {
+    const value = source[code] ?? "";
+    let mapped = targetIndex.get(value);
+    if (mapped === undefined) {
+      mapped = targetDictionary.length;
+      targetDictionary.push(value);
+      targetIndex.set(value, mapped);
+    }
+    remap[code] = mapped;
+  }
+  return remap;
+}
+
+/**
+ * The live rows of a vector, in order. Runs between deletions copy as typed-array slices and
+ * the dictionary is shared, so dropping one row of a million does not rebuild the column.
+ */
+function compactColumnVector(
+  source: ColumnVector,
+  alive: Uint8Array,
+  aliveCount: number,
+): ColumnVector {
+  const validity = new Uint8Array(Math.ceil(aliveCount / 8));
+  const target: ColumnVector =
+    source.kind === "string"
+      ? {
+          kind: "string",
+          length: aliveCount,
+          validity,
+          codes: new Uint32Array(aliveCount).fill(NULL_STRING_VECTOR_CODE),
+          dictionary: source.dictionary,
+        }
+      : source.kind === "boolean"
+        ? { kind: "boolean", length: aliveCount, validity, values: new Uint8Array(aliveCount) }
+        : { kind: source.kind, length: aliveCount, validity, values: new Float64Array(aliveCount) };
+  let output = 0;
+  let runStart = -1;
+  for (let row = 0; row <= source.length; row += 1) {
+    const live = row < source.length && alive[row] === 1;
+    if (live) {
+      if (runStart < 0) runStart = row;
+      continue;
+    }
+    if (runStart < 0) continue;
+    copyVectorSpan(source, runStart, row - runStart, target, output);
+    output += row - runStart;
+    runStart = -1;
+  }
+  return target;
+}
+
+/**
+ * The live rows of a column an update changed: cell by cell, because a patched string value can
+ * be one the source dictionary never held. Later updates win, in segment order.
+ */
+function patchColumnVector(
+  source: ColumnVector,
+  column: TableColumnRecord,
+  alive: Uint8Array,
+  aliveCount: number,
+  patches: ReadonlyMap<number, readonly OverlayUpdate[]>,
+): ColumnVector {
+  const target = createEmptyColumnVector(column.type, aliveCount);
+  const dictionaryIndex = column.type === "string" ? new Map<string, number>() : undefined;
+  let output = 0;
+  for (let row = 0; row < source.length; row += 1) {
+    if (alive[row] !== 1) continue;
+    let from = source;
+    let fromRow = row;
+    for (const update of patches.get(row) ?? []) {
+      const vector = update.vectors.get(column.id);
+      if (vector === undefined) continue;
+      from = vector;
+      fromRow = update.row;
+    }
+    copyColumnVectorValue(from, fromRow, target, output, dictionaryIndex);
+    output += 1;
+  }
+  return target;
 }
 
 function columnVectorKeyToken(type: SimpleDataType, vector: ColumnVector, row: number): string {

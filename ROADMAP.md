@@ -772,9 +772,34 @@ tiers remain outstanding.
       scoring node's compiled signature and injected at bind — restoring index pruning for
       scoring plans and lifting their streaming restriction; a limited ORDER BY retains only
       the top rows, so ranked search is bounded by candidate segments plus k.
+- [x] Make a mutation history cost its deltas rather than its table (2026-08-17). One delete
+      segment used to move a table onto a full replay: the materialized path rebuilt every row
+      of every segment through a string-token key map, and the streamed path tokenized every
+      base key to find the touched ones. Measured on 200k rows with exactly one row deleted:
+      COUNT(*) 0.06 ms -> 14.6 ms, a key point lookup 0.09 ms -> 21.2 ms, a filter scan 2.1 ms
+      -> 23.2 ms. Four changes bring those to 1.1 ms, 0.08 ms, and 5.0 ms. (a) The materialized
+      path gained a delta overlay: an append scan of the base segments with deleted keys masked
+      out and updated keys patched, keys read as the primitives the vectors already hold, live
+      rows copied as typed-array runs with a shared dictionary. (b) The streamed replay reads
+      the same primitives, and prunes its key-block pass by the touched keys' zone maps. (c)
+      Zone-map elimination now composes with delete-bearing histories — refused when an update
+      touches a predicate column, and, for the overlay, when a delta is older than any base
+      segment, since either makes a row's fate depend on which segment it came from. (d) A
+      replay that finds nothing dead or patched in what the scan reads hands the plain scan
+      through untouched. Upsert histories keep the replay. Pinned by a differential harness
+      against SQLite over seeded delete/update/re-insert/upsert scripts at sixteen rows per
+      block, and by three `delta-*` queries in the performance gate.
+- [x] Probe FOREIGN KEY parents through the persistent unique-key lookup (2026-08-17) instead
+      of a SELECT over the parent table; only values the lookup cannot settle (staged in the
+      open scope, or absent) read rows. A 1,000-row child insert against a 5,000-row parent
+      drops from 8.4 ms to 4.0 ms, against 3.7 ms for the same insert with no foreign key.
 - [ ] Extend full-text indexing to keyed-mutation histories via key-range partition rewrites,
       and serve per-document scores directly from postings (row fetch-by-id) to skip candidate
       segments entirely.
+- [ ] Fold deltas without a full in-memory merge plan. Keyed compaction bounds its planner at
+      256 bytes per row plus 256 per cell, so a 200k-row table needs ~211 MB and fails under the
+      32 MiB default; auto-compaction now backs a failing table off instead of retrying it on
+      every query, but a large keyed table still cannot be folded without a spillable planner.
 
 ## Phase 20 — Public surface
 

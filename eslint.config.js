@@ -68,6 +68,7 @@ export default tseslint.config(
       "apps/site/scripts/*.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",
       "packages/core/src/engine/sql-mutation-conformance.test.ts",
+      "packages/core/src/engine/delta-scan.test.ts",
       "packages/core/src/engine/scan-kernels.test.ts",
       "scripts/*.mts",
     ],

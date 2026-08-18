@@ -173,6 +173,26 @@ const QUERIES: readonly PerfQuery[] = [
     params: [123_456],
   },
   {
+    // The same point lookup against a table one row has been deleted from. A mutation history
+    // cannot be read as a plain append, and the replay that reads it used to cost the whole
+    // table on every query — 236x this, for one deleted row out of 200,000.
+    name: "delta-point-lookup",
+    sql: "SELECT id, amount, label FROM data_mut WHERE id = ?",
+    params: [123_456],
+  },
+  {
+    // Cardinality over the same history: the delete's effect on the row count is known without
+    // materializing a single column.
+    name: "delta-count-star",
+    sql: "SELECT COUNT(*) AS n FROM data_mut",
+  },
+  {
+    // A full scan of that history, where every surviving row is copied past the deleted one.
+    name: "delta-filter-scan",
+    sql: "SELECT id, amount FROM data_mut WHERE amount > ? AND region = ?",
+    params: [9000, "west"],
+  },
+  {
     // Same statement repeated unchanged: Minnow answers from the probe-validated memo while
     // the other engines re-execute. Gates the memo probe's own latency.
     name: "memo-hit-aggregate",
@@ -266,6 +286,29 @@ await minnow.createTable({
   ],
 });
 await minnow.insertBatch("dims", DIMS);
+// The same rows, minus one deleted row: every delta-* query reads this mutation history.
+await minnow.createTable({
+  name: "data_mut",
+  uniqueKey: "id",
+  columns: [
+    { name: "id", type: "number" },
+    { name: "region", type: "string", nullable: true },
+    { name: "amount", type: "number" },
+    { name: "active", type: "boolean" },
+    { name: "joined", type: "datetime", nullable: true },
+    { name: "label", type: "string" },
+  ],
+});
+for (let start = 0; start < rows.length; start += 50_000) {
+  await minnow.insertBatch(
+    "data_mut",
+    rows.slice(start, start + 50_000).map((row) => ({
+      ...row,
+      joined: row.joined === null ? null : new Date(row.joined),
+    })),
+  );
+}
+await minnow.deleteBatch("data_mut", { keys: [7] });
 for (let index = 0; index < CATALOG_TABLES; index += 1) {
   await minnow.createTable({
     name: `spare_${String(index)}`,
@@ -293,6 +336,16 @@ sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
   ingestMs.sqlite = performance.now() - started;
   const dim = sqlite.prepare("INSERT INTO dims VALUES (?, ?, ?)");
   for (const entry of DIMS) dim.run(entry.region, entry.label, entry.rank);
+  sqlite.exec(
+    `CREATE TABLE data_mut ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+  );
+  const mut = sqlite.prepare("INSERT INTO data_mut VALUES (?, ?, ?, ?, ?, ?)");
+  sqlite.exec("BEGIN");
+  for (const row of rows) {
+    mut.run(row.id, row.region, row.amount, row.active ? 1 : 0, row.joined, row.label);
+  }
+  sqlite.exec("COMMIT");
+  sqlite.exec("DELETE FROM data_mut WHERE id = 7");
 }
 
 function sqlLiteral(value: unknown): string {
@@ -336,6 +389,22 @@ for (let index = 0; index < CATALOG_TABLES; index += 1) {
 await pglite.exec(
   `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
 );
+await pglite.exec(
+  `CREATE TABLE data_mut ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+);
+for (let start = 0; start < rows.length; start += 2000) {
+  const batch = rows
+    .slice(start, start + 2000)
+    .map(
+      (row) =>
+        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
+          .map(sqlLiteral)
+          .join(", ")})`,
+    )
+    .join(", ");
+  await pglite.exec(`INSERT INTO data_mut VALUES ${batch}`);
+}
+await pglite.exec("DELETE FROM data_mut WHERE id = 7");
 
 function pgliteRunner(query: PerfQuery): () => Promise<unknown> {
   const sql = positionalToNumbered(query.sql);

@@ -54,6 +54,8 @@ There's a builder per column type — `column.boolean()`, `column.number()`, `co
   echoes the written values either way.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
   rather than a drop-and-add.
+- **`.backfill(value)`** — what rows written before this column existed read as, instead of NULL.
+  Giving one is what makes adding a **non-nullable** column possible.
 - **`.references(table, column, { onDelete })`** — declares a FOREIGN KEY onto another table's
   unique key. `migrate()` creates it as a real constraint, so a write naming a parent row that
   does not exist is rejected. `onDelete` is `"restrict"` (the default), `"cascade"`, or
@@ -186,6 +188,40 @@ written before Minnow recorded ownership, belongs to no schema and no migration 
 "the schema never mentioned it" is not proof that it should go. `introspect()` reports which is
 which as `managed`, and `database.dropView(name)` removes either.
 
+### Backfilling an added column
+
+A column added by a migration has no data in older segments, so its rows would read NULL forever —
+which is why an added column had to be nullable. A backfill says what those rows read instead:
+
+```ts
+const notes = table("notes", {
+  id: column.number().unique(),
+  body: column.string(),
+  status: column.string().backfill("archived"), // added later; old rows read "archived"
+});
+```
+
+Nothing is rewritten. The stored segments are untouched, and the value is substituted at read
+time — so adding a backfilled column to a table of ten million rows costs a catalog write, not a
+scan. Compaction folds the value into the blocks whenever it next rewrites them.
+
+The value is real to the engine, not patched onto output rows: you can filter, group, and join on
+it exactly as if it had always been stored.
+
+A function runs **once**, when the migration adds the column, and its result is frozen into the
+catalog:
+
+```ts
+column.datetime().backfill(() => new Date()); // one timestamp, shared by every pre-existing row
+```
+
+That is what "derived" means here — derived at migration time, not per row. A value that depends on
+_other columns_ would need one value per row, which is a rewrite rather than a metadata step, and is
+not supported.
+
+Backfills apply to non-nullable columns only. A nullable column already has an answer for rows that
+never had a value, and the declaration is rejected rather than quietly ignored.
+
 ## What migrate() does
 
 `migrate()` compares the live catalog with your declaration and applies the difference as
@@ -205,7 +241,7 @@ Rejected outright, rather than attempted:
 - column or table drops
 - unique-key changes
 - non-null tightening
-- non-nullable column additions
+- non-nullable column additions **without a backfill**
 - removing enum values, or tightening a string column into an enum
 - adding or removing `.autoIncrement()` (existing rows can't be backfilled into the counter)
 - adding, changing, or dropping a FOREIGN KEY or CHECK on an existing table

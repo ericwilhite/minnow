@@ -57,6 +57,18 @@
       "sqlite": 0.0328,
       "pglite": 0.0137
     },
+    "delta-point-lookup": {
+      "sqlite": 0.0565,
+      "pglite": 0.0218
+    },
+    "delta-count-star": {
+      "sqlite": 39.8,
+      "pglite": 0.311
+    },
+    "delta-filter-scan": {
+      "sqlite": 1.83,
+      "pglite": 0.753
+    },
     "memo-hit-aggregate": {
       "sqlite": 0.000226,
       "pglite": 0.000337
