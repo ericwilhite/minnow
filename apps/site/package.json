@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "node scripts/build.mjs",
     "start": "next start",
     "predev": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-llms.mjs",
     "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-llms.mjs",
