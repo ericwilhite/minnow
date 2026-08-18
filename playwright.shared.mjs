@@ -5,8 +5,6 @@ export const browserProjects = [
   { name: "webkit", use: { browserName: "webkit" } },
 ];
 
-export const captureProjects = browserProjects.filter(({ name }) => name !== "webkit");
-
 export const runnerDefaults = {
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 2 : 0,

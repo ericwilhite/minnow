@@ -3893,6 +3893,7 @@ export class MinnowDatabase {
       table,
       (column) => batch.columns[column] ?? [],
       (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+      transaction,
     );
     if (autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
@@ -4017,6 +4018,7 @@ export class MinnowDatabase {
       table,
       (column) => input.changes[column] ?? [],
       (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+      transaction,
     );
     const sessionChecks = table.checks ?? [];
     const preImages = await this.#triggerPreImages(
@@ -4346,10 +4348,6 @@ export class MinnowDatabase {
         replacedViews.push(step.view.name);
         continue;
       }
-      if (step.kind === "drop-view") {
-        await this.dropView(step.viewName, { ifExists: true });
-        continue;
-      }
       const steps = alterationsByTable.get(step.tableName) ?? [];
       steps.push(step);
       alterationsByTable.set(step.tableName, steps);
@@ -4523,18 +4521,20 @@ export class MinnowDatabase {
   /**
    * E141-04 on the child side: every non-null value written into a referencing column must name
    * a row that exists in the parent. The probe is the parent's own unique-key membership — the
-   * same index the keyed write paths address rows by — read through the writing transaction, so
-   * a child inserted next to its parent in one scope sees it.
+   * same index the keyed write paths address rows by — and only what that index cannot settle
+   * is read through the writing transaction, so a child inserted next to its parent in one
+   * scope still sees it.
    */
   async #assertForeignKeysPresent(
     table: TableRecord,
     rowsByColumn: (column: string) => readonly BatchValue[],
     read: (sql: string, params: QueryValue[]) => Promise<QueryResult>,
+    transaction?: DatabaseTransaction,
   ): Promise<void> {
     for (const key of table.foreignKeys ?? []) {
       const values = rowsByColumn(key.column);
-      const wanted = [...new Set(values.filter((value): value is QueryValue => value !== null))];
-      if (wanted.length === 0) continue;
+      const distinct = [...new Set(values.filter((value): value is QueryValue => value !== null))];
+      if (distinct.length === 0) continue;
       // A NULL reference names no parent, which the standard leaves satisfied.
       const parent = await this.store.getTableByName(key.parentTable);
       if (parent === undefined) {
@@ -4542,6 +4542,10 @@ export class MinnowDatabase {
           `FOREIGN KEY ${key.name} references a missing table: ${key.parentTable}`,
         );
       }
+      const wanted = [
+        ...(await this.#foreignKeyValuesNeedingRead(parent, key, distinct, transaction)),
+      ];
+      if (wanted.length === 0) continue;
       const found = await read(
         `SELECT ${quoteSqlIdentifier(key.parentColumn)} AS parent_key FROM ${quoteSqlIdentifier(
           key.parentTable,
@@ -4564,6 +4568,48 @@ export class MinnowDatabase {
         );
       }
     }
+  }
+
+  /**
+   * Which referenced values a FOREIGN KEY probe still has to read rows for. A parent whose
+   * persistent unique-key lookup is ready answers membership with point reads instead of a
+   * scan, so the ordinary case — every referenced parent already committed — costs no table
+   * read at all. Keys an open scope staged count as present, keys it removed stay unproven,
+   * and anything the lookup cannot decide falls through to the caller's transactional read,
+   * which is also what reports the violation.
+   */
+  async #foreignKeyValuesNeedingRead(
+    parent: TableRecord,
+    key: NonNullable<TableRecord["foreignKeys"]>[number],
+    wanted: readonly QueryValue[],
+    transaction: DatabaseTransaction | undefined,
+  ): Promise<readonly QueryValue[]> {
+    if (parent.uniqueKeyLookupReady !== true) return wanted;
+    const parentKey = getUniqueKeyColumn(parent);
+    if (parentKey?.name !== key.parentColumn) return wanted;
+    const tokens = new Map<QueryValue, string>();
+    for (const value of wanted) {
+      // A value the key encoding rejects (wrong type for the parent key, a non-finite number)
+      // is a violation the read reports with its own message rather than a thrown encoding error.
+      const token = tryKeyToken(parentKey.type, value);
+      if (token === undefined) return wanted;
+      tokens.set(value, token);
+    }
+    const overlay =
+      transaction === undefined ? undefined : this.#stagedKeyOverlay(transaction, parent.id);
+    const probed = [...new Set(tokens.values())].filter(
+      (token) => overlay?.added.has(token) !== true,
+    );
+    const present =
+      probed.length === 0
+        ? new Set<string>()
+        : new Set(await this.store.getExistingUniqueKeys(parent.id, probed));
+    return wanted.filter((value) => {
+      const token = tokens.get(value) ?? "";
+      if (overlay?.removed.has(token) === true) return true;
+      if (overlay?.added.has(token) === true) return false;
+      return !present.has(token);
+    });
   }
 
   /**
@@ -10735,6 +10781,15 @@ function batchKeys(
     keys.set(token, value);
   }
   return keys;
+}
+
+/** `keyToken` for values that may not encode: undefined instead of a thrown encoding error. */
+function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefined {
+  try {
+    return keyToken(type, value);
+  } catch {
+    return undefined;
+  }
 }
 
 function keyToken(type: SimpleDataType, value: BatchValue): string {

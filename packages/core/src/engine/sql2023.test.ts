@@ -1185,6 +1185,64 @@ describe("E141/F031 schema statements", () => {
     ).rejects.toThrow("has nothing to act on");
   });
 
+  it("checks a foreign key against the parent's key index, not its rows", async () => {
+    // The child-side probe asks the parent's persistent unique-key lookup, so its cost does not
+    // grow with the parent. Counting block reads is what makes that observable: a probe that
+    // scans the parent has to read the parent's blocks, and this insert reads none.
+    class CountingStore extends MemoryBlockStore {
+      blockReads = 0;
+
+      override async getBlock(id: string): Promise<Uint8Array | undefined> {
+        this.blockReads += 1;
+        return super.getBlock(id);
+      }
+
+      override async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+        this.blockReads += ids.length;
+        return super.getBlocks(ids);
+      }
+    }
+    const store = new CountingStore();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+    await database.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    await database.execute(
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer INTEGER NOT NULL REFERENCES customers(id))",
+    );
+    await database.insertBatch("customers", {
+      columns: {
+        id: Array.from({ length: 200 }, (_, index) => index + 1),
+        name: Array.from({ length: 200 }, (_, index) => `c${String(index + 1)}`),
+      },
+    });
+
+    store.blockReads = 0;
+    await database.execute("INSERT INTO orders (id, customer) VALUES (1, 137)");
+    expect(store.blockReads).toBe(0);
+
+    // The rejection still names the missing parent, and still costs no parent scan to find.
+    store.blockReads = 0;
+    await expect(
+      database.execute("INSERT INTO orders (id, customer) VALUES (2, 999)"),
+    ).rejects.toThrow("has no customers row with id 999");
+
+    // Read-your-writes inside a scope is unchanged: a parent staged in the same scope satisfies
+    // the reference, and one the scope deleted stops satisfying it.
+    await database.write(async (tx) => {
+      await tx.insertBatch("customers", { columns: { id: [201], name: ["fresh"] } });
+      await tx.insertBatch("orders", { columns: { id: [3], customer: [201] } });
+    });
+    expect((await database.query("SELECT COUNT(*) AS n FROM orders")).rows).toEqual([{ n: 2 }]);
+    await expect(
+      database.write(async (tx) => {
+        await tx.deleteBatch("customers", { keys: [201] });
+        await tx.insertBatch("orders", { columns: { id: [4], customer: [201] } });
+      }),
+    ).rejects.toThrow(/FOREIGN KEY/);
+    expect(
+      (await database.query("SELECT COUNT(*) AS n FROM customers WHERE id = 201")).rows,
+    ).toEqual([{ n: 1 }]);
+  });
+
   it("keeps a cascade atomic with the delete that caused it", async () => {
     const database = await fresh();
     await database.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");

@@ -598,9 +598,11 @@ export type MigrationStep =
    * A view is derived and disposable: nothing is stored under it, so replacing its body loses no
    * data and needs none of the proofs a table alteration needs. `replace` covers both creating a
    * missing view and redefining an existing one.
+   *
+   * There is deliberately no drop step. A migration never removes a view — see `planViewSteps` —
+   * so a step describing one would advertise something the planner refuses to do.
    */
-  | { kind: "replace-view"; view: AnyView }
-  | { kind: "drop-view"; viewName: string };
+  | { kind: "replace-view"; view: AnyView };
 
 export interface MigrationPlan {
   steps: MigrationStep[];
