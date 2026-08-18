@@ -34,3 +34,47 @@
   them straight into the console.
 - The README is a feature list plus install and development pointers. It links to the docs site
   rather than repeating anything from it. Package READMEs are short summaries with the same rule.
+- Documentation is part of the change, not a follow-up. A change that alters behaviour and leaves
+  the docs describing the old behaviour is unfinished, however green the tests are.
+- The machine-readable set — `/llms.txt`, `/llms-full.txt`, the `.md` twin of every page,
+  `/agent-rules.md` — is generated from the MDX by `apps/site/scripts/generate-llms.mjs`. Update
+  the page and those follow. Never edit the generated files.
+
+## Claims go stale silently
+
+Most of this documentation describes what Minnow _is_: what it requires, what it supports, what it
+refuses. Prose is not tested, so when a change moves one of those lines, the sentence that said
+otherwise stays perfectly convincing and wrong.
+
+So when a change alters a capability or a requirement, find every sentence that claimed the old
+one and update all of them — not the nearest page. Grep for the claim itself, across the docs, both
+README layers, and the agents page:
+
+```bash
+rg -i "indexeddb" apps/site/content README.md packages/*/README.md
+```
+
+The places that make claims of this kind:
+
+- **`apps/site/content/docs/reference/agents.mdx`** — its rules block is published as
+  `/agent-rules.md` and pasted into other people's repositories, where it long outlives this
+  release. It states the environment ("needs IndexedDB and `CompressionStream`", "no Node build"),
+  the API shape, and the SQL forms to avoid.
+- **`apps/site/content/docs/installation.mdx`** — the entry-point table and "Where it runs".
+- **`apps/site/content/docs/storage/`** — what each block store costs and guarantees.
+- **`README.md`** — the feature list, including sizes and the comparisons around them.
+- **Package `README.md` files** — the one-paragraph summary of what each package is.
+
+Adding an OPFS block store, for one example, is never one file: the agent rules say the engine
+needs IndexedDB, installation says "Anything with IndexedDB and `CompressionStream`", the storage
+guide lists the adapters, the README says blocks live on IndexedDB, and the rules tell a model to
+reach for `MemoryBlockStore` in tests. Every one of them is then wrong, and no test says so.
+
+What the suites do and do not cover:
+
+- **Covered.** The SELECT guide's SQL runs against the playground dataset (`docs-sql.test.ts`).
+  The SQL feature matrix is a fixture the engine is tested against, so that page cannot drift.
+  `generate-llms.mjs` fails the build on a component it cannot render as markdown, and
+  `npm run version:check` fails on a version claim that no longer matches the manifests.
+- **Not covered.** Every sentence of prose, every capability claim, every number in the README,
+  and the rules block. Those are yours to keep true.
