@@ -149,7 +149,11 @@ for (const entry of pending) {
     console.log(`Tagged ${tag}. Push it with \`git push origin ${tag}\`.`);
     continue;
   }
-  const pushed = run("git", ["push", "origin", tag]);
+  // --no-verify because this repository's pre-push hook runs the whole gate, which is what you
+  // want from a person's machine and absurd from here: CI has just run it, and the hook ran a
+  // second copy of the site build inside npm's publish environment, failed, and took the tag with
+  // it. The tags for 0.1.1 were lost to exactly that.
+  const pushed = run("git", ["push", "--no-verify", "origin", tag]);
   if (pushed.status !== 0) console.error(`Could not push ${tag}: ${pushed.stderr.trim()}`);
 }
 
