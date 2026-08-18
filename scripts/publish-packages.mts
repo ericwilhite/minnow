@@ -133,18 +133,24 @@ for (const entry of pending) {
   }
 
   // The tag records what was published, after the fact, so a failed publish leaves no tag behind
-  // claiming otherwise.
+  // claiming otherwise. Run locally it is written but not pushed, because pushing is the kind of
+  // thing to decide for yourself.
   const tag = `${entry.name}@${entry.version}`;
-  if (dryRun || !inCI) {
+  if (dryRun) {
     console.log(`Would tag ${tag}.`);
     continue;
   }
   const tagged = run("git", ["tag", tag]);
-  if (tagged.status !== 0) console.error(`Could not tag ${tag}: ${tagged.stderr.trim()}`);
-  else {
-    const pushed = run("git", ["push", "origin", tag]);
-    if (pushed.status !== 0) console.error(`Could not push ${tag}: ${pushed.stderr.trim()}`);
+  if (tagged.status !== 0) {
+    console.error(`Could not tag ${tag}: ${tagged.stderr.trim()}`);
+    continue;
   }
+  if (!inCI) {
+    console.log(`Tagged ${tag}. Push it with \`git push origin ${tag}\`.`);
+    continue;
+  }
+  const pushed = run("git", ["push", "origin", tag]);
+  if (pushed.status !== 0) console.error(`Could not push ${tag}: ${pushed.stderr.trim()}`);
 }
 
 console.log(`Published ${String(pending.length)} package${pending.length === 1 ? "" : "s"}.`);
