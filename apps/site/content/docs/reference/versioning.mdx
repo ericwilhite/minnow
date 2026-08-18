@@ -73,6 +73,13 @@ npm does not already have and tags each one `@minnowdb/core@0.2.0`. A push that 
 publishes nothing, and a rerun after a failure is safe, because the registry decides what has
 already shipped.
 
+There is no npm token in the repository. npm is configured to trust that workflow in this
+repository, and hands it a credential that lives for the length of one publish — which is also
+what signs the provenance attestation you can see on each version's npm page. Nothing expires and
+there is nothing to rotate. It is configured once per package, in the package's settings on npm,
+and a package has to exist before it can be configured: the first release of a new package is
+published from a machine with `npm run release:publish`, and every release after it from CI.
+
 Two things are checked before anything leaves the machine. `npm run version:check` proves the
 workspace agrees with itself — matching majors, ranges that span them, and a docs version that
 matches the engine — as the first step of both `npm run check` and CI. And the publish refuses a

@@ -7,9 +7,13 @@
  * because the registry is the record of what has shipped — so a rerun after a failure is safe,
  * and a push that changes no version is a no-op.
  *
- * Provenance is attached when the repository this is building in is the one the manifests name.
- * npm rejects a provenance statement that points somewhere else, and the manifests currently name
- * an organisation the repository has not moved to yet, so this turns itself on the day it does.
+ * In CI there is no token: npm is configured to trust the release workflow and hands it a
+ * short-lived credential when it asks, which is also what signs the provenance attestation.
+ * Provenance is only attached when the repository being built is the one the manifests name,
+ * because npm rejects a statement that points anywhere else.
+ *
+ * Run locally it publishes with whatever `npm whoami` says, which is how a package is created in
+ * the first place — a trusted publisher can only be configured for a package that exists.
  */
 import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
@@ -107,15 +111,6 @@ const pending = publishable().filter((entry) => !alreadyPublished(entry));
 
 if (pending.length === 0) {
   console.log("Every package's version is already on npm. Nothing to publish.");
-  process.exit(0);
-}
-
-// A repository without the token configured yet should say so rather than fail a build over it.
-if (inCI && !dryRun && (process.env.NODE_AUTH_TOKEN ?? "").length === 0) {
-  console.log(
-    `No NPM_TOKEN is configured, so ${pending.map((entry) => `${entry.name}@${entry.version}`).join(", ")} ` +
-      "was not published. Add the secret and run this workflow again.",
-  );
   process.exit(0);
 }
 

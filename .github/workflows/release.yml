@@ -17,8 +17,9 @@ on:
   # For a release that needs a nudge — a publish that failed on an expired token, say.
   workflow_dispatch:
 
-# Tags are pushed by this job; the id token is what npm signs provenance with once the manifests
-# and the repository agree on where this lives.
+# There is no npm token here, and there is no secret to rotate: npm is configured to trust this
+# workflow, and `id-token: write` is what lets it prove it is this workflow. The same token signs
+# the provenance attestation on each published version. `contents: write` is for the tags.
 permissions:
   contents: write
   id-token: write
@@ -42,10 +43,11 @@ jobs:
           node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer, which is newer than some Node 24 images
+      # ship. Pinning the major keeps that from being a surprise on a runner-image update.
+      - run: npm install --global npm@^11
       - run: npm ci
       # The tarballs are built from source here rather than trusted from CI's artifacts.
       - run: npm run build
       - name: Publish
         run: npm run release:publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
