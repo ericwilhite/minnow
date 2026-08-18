@@ -10175,13 +10175,31 @@ export class MinnowDatabase {
     const projectsKey = projectedColumns.some((column) => column.id === keyColumn.id);
     const neededColumns = projectsKey ? projectedColumns : [...projectedColumns, keyColumn];
     // Zone-map elimination drops whole row groups, so it can only compose with deltas that
-    // cannot bring a pruned row back: deletes, and only when every one of them is newer than
-    // every base segment (otherwise a row's fate depends on which segment it came from, which
-    // a pruned scan no longer reports).
+    // cannot bring a pruned row back. Two conditions decide that, and they are independent.
+    //
+    // The first is ordering. A pruned scan reports no runs, so an update's position cannot be
+    // compared against the segment a row came from -- but it does not need to be, as long as
+    // every delta is newer than every base segment, because then every delta wins outright.
+    //
+    // The second is which columns the predicate reads. Zone maps are built from the base
+    // blocks, so a predicate on a column an update rewrites is unsafe: the update could move a
+    // value into the predicate's range, and the row group holding it would already have been
+    // eliminated. A predicate on a column no update touches has no such hazard -- the unique
+    // key most of all, which updates address rows *by* and never change.
+    //
+    // Requiring no updates at all, which is what this used to do, conflated the two. It meant a
+    // single updated row anywhere in a table demoted every later keyed lookup to a full scan of
+    // every row, permanently, until compaction folded the delta away: at 200k rows that was a
+    // point lookup going from 0.06ms to 7.6ms, and scaling with the table from there.
     const lastAppendOrder = appendOrders.at(-1) ?? -1;
-    const orderFree =
-      updatesByKey.size === 0 && deltas.every(({ order }) => order > lastAppendOrder);
-    const predicates = plan === undefined || !orderFree ? [] : zonePredicates(plan, table);
+    const deltasFollowAppends = deltas.every(({ order }) => order > lastAppendOrder);
+    const candidates =
+      plan === undefined || !deltasFollowAppends ? [] : zonePredicates(plan, table);
+    // Dropping an unsafe predicate only prunes less, never more, so keeping the safe ones is
+    // both correct and worth doing even when the two kinds are mixed.
+    const predicates = candidates.filter(
+      (predicate) => !patchedColumnIds.has(predicate.column.id),
+    );
     let base: ColumnarTable | undefined;
     if (predicates.length > 0) {
       base = await this.#materializePrunedAppendTable(
@@ -10192,6 +10210,8 @@ export class MinnowDatabase {
         predicates,
       );
     }
+    /** Whether the rows below are a pruned subset rather than every base row. */
+    const prunedScan = base !== undefined;
     // Runs map an output row back to the segment that wrote it; a pruned scan reports no runs,
     // and orderFree is what makes that safe.
     const runs: Array<{ end: number; order: number }> = [];
@@ -10240,7 +10260,13 @@ export class MinnowDatabase {
     }
     // An update whose key no base row carries means the replay's corruption check would fire,
     // or that a shape this path does not model let the row escape it. Either way, defer.
-    if (allUpdates.some((update) => !update.applied)) return undefined;
+    //
+    // A pruned scan is the one case where an unapplied update is expected rather than alarming:
+    // its row was eliminated by a predicate on a column no update touches, so the row cannot
+    // satisfy this query whatever the update did to it, and the patch is simply irrelevant here.
+    // The check still applies in full to every unpruned scan, which is where a genuinely
+    // dangling update would surface.
+    if (!prunedScan && allUpdates.some((update) => !update.applied)) return undefined;
 
     const columns = new Map<string, ColumnVector>();
     for (const column of projectedColumns) {

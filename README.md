@@ -83,3 +83,10 @@ workspace packages the site imports, so it needs the rest of the repository pres
 [`apps/site/vercel.json`](apps/site/vercel.json) carries the cross-origin isolation headers the
 benchmarks page needs to reach SQLite's OPFS backend. They cannot live in `next.config.mjs`,
 because a static export serves plain files and Next.js drops its `headers()` config there.
+
+The benchmarks rule is written twice, and the trailing slash is the reason. A `source` matches a
+request path ending in `/` neither as `/benchmarks` nor as `/benchmarks/:path*`, and
+`trailingSlash` means the document is only ever served at `/benchmarks/` -- so the literal form is
+what covers the page itself, and the pattern covers anything below it. Check a change to these by
+reading `crossOriginIsolated` in the console on the deployed page; when it is false, SQLite has
+silently fallen back to the handle pool and the benchmarks measure a different browser.
