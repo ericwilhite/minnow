@@ -5,6 +5,7 @@ import {
   type TableColumnRecord,
   type TableRecord,
 } from "../storage/index.js";
+import { type Catalog, type CatalogTable } from "./catalog.js";
 import { type BatchRow } from "./batch.js";
 
 /**
@@ -16,6 +17,30 @@ import { type BatchRow } from "./batch.js";
  */
 
 export type SchemaColumnType = "boolean" | "number" | "string" | "datetime";
+
+/** What a FOREIGN KEY does to child rows when the parent row is deleted (E141-04). */
+export type ReferentialAction = "restrict" | "cascade" | "set null";
+
+/** A declared relation. `onDelete` defaults to "restrict", matching SQL's own default. */
+export interface ColumnReferenceSpec {
+  readonly table: string;
+  readonly column: string;
+  readonly onDelete: ReferentialAction;
+}
+
+/** A row condition every write must satisfy (E141-06); `sql` is a boolean expression. */
+export interface TableCheck {
+  readonly name: string;
+  readonly sql: string;
+}
+
+/**
+ * The constraint name `migrate()` gives a declared relation. It matches the name the SQL parser
+ * derives for an unnamed inline REFERENCES, so a table built either way has the same catalog.
+ */
+export function foreignKeyName(tableName: string, columnName: string): string {
+  return `${tableName}_${columnName}_fkey`;
+}
 
 type ValueOf<TType extends SchemaColumnType> = TType extends "boolean"
   ? boolean
@@ -65,15 +90,25 @@ export interface ColumnBuilder<
   /** Present on `column.enum()` builders: the closed set of values writes must draw from. */
   readonly enumValues?: readonly string[];
   readonly renamedFromName?: string;
-  readonly reference?: { table: string; column: string };
+  readonly reference?: ColumnReferenceSpec;
   /** Marks the column nullable; inserts may omit it and reads may return null. */
   nullable(): ColumnBuilder<TValue, true, TUnique, THasDefault>;
   /** Marks the table's unique key; exactly one non-nullable column may carry it. */
   unique(): ColumnBuilder<TValue, TNullable, true, THasDefault>;
   /** Declares this column as the rename target of an existing catalog column. */
   renamedFrom(name: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
-  /** Declares a relation for catalog metadata and validation; not enforced at write time. */
-  references(table: string, column: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
+  /**
+   * Declares a FOREIGN KEY onto another table's unique key. `migrate()` creates it as a real
+   * constraint, so a write naming a parent row that does not exist is rejected — the same
+   * behaviour as declaring `REFERENCES` in SQL DDL.
+   *
+   * `onDelete` defaults to `"restrict"`. `"set null"` requires a nullable column.
+   */
+  references(
+    table: string,
+    column: string,
+    options?: { onDelete?: ReferentialAction },
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /**
    * Fills null-or-absent slots at insert time. Requires a non-nullable column.
    *
@@ -162,8 +197,19 @@ function createColumn<TType extends SchemaColumnType>(
         true
       >,
     renamedFrom: (name: string) => createColumn(type, { ...state, renamedFromName: name }),
-    references: (table: string, referencedColumn: string) =>
-      createColumn(type, { ...state, reference: { table, column: referencedColumn } }),
+    references: (
+      table: string,
+      referencedColumn: string,
+      options: { onDelete?: ReferentialAction } = {},
+    ) =>
+      createColumn(type, {
+        ...state,
+        reference: {
+          table,
+          column: referencedColumn,
+          onDelete: options.onDelete ?? "restrict",
+        },
+      }),
     default: ((value: unknown) => {
       // A declared default is one thing: a function replaces any spec and vice versa.
       const cleared = { ...state };
@@ -235,6 +281,8 @@ export interface TableSchema<
   readonly kind: "table";
   readonly name: TName;
   readonly columns: TColumns;
+  /** Row conditions every write must satisfy; empty when none were declared. */
+  readonly checks: readonly TableCheck[];
   /** Standard Schema-compatible runtime validator for one insert row. */
   readonly "~standard": {
     readonly version: 1;
@@ -249,9 +297,20 @@ export interface TableSchema<
 
 export type AnyTable = TableSchema<Record<string, AnyColumn>>;
 
+export interface TableOptions {
+  /**
+   * Row conditions every write must satisfy (E141-06), each a boolean SQL expression over this
+   * table's own columns — the declarative form of `CONSTRAINT name CHECK (sql)`. The engine
+   * compiles each one when the table is created, so an expression it cannot evaluate is refused
+   * at migration time rather than on the first write.
+   */
+  readonly checks?: readonly TableCheck[];
+}
+
 export function table<const TName extends string, TColumns extends Record<string, AnyColumn>>(
   name: TName,
   columns: TColumns,
+  options: TableOptions = {},
 ): TableSchema<TColumns, TName> {
   const entries = Object.entries(columns);
   if (entries.length === 0) throw new TypeError(`Table ${name} needs at least one column`);
@@ -267,6 +326,9 @@ export function table<const TName extends string, TColumns extends Record<string
     if (definition.defaultFn !== undefined && definition.isNullable) {
       throw new TypeError(`Defaults require a non-nullable column: ${columnName}`);
     }
+    if (definition.reference?.onDelete === "set null" && !definition.isNullable) {
+      throw new TypeError(`ON DELETE SET NULL requires a nullable column: ${name}.${columnName}`);
+    }
     const spec = definition.defaultSpec;
     if (spec === undefined) continue;
     validateColumnDefault(
@@ -280,10 +342,23 @@ export function table<const TName extends string, TColumns extends Record<string
       spec,
     );
   }
+  const checks = options.checks ?? [];
+  const checkNames = new Set<string>();
+  for (const check of checks) {
+    if (check.name.length === 0) throw new TypeError(`Table ${name} has an unnamed CHECK`);
+    if (checkNames.has(check.name)) {
+      throw new TypeError(`Duplicate CHECK in table ${name}: ${check.name}`);
+    }
+    checkNames.add(check.name);
+    if (check.sql.trim().length === 0) {
+      throw new TypeError(`CHECK ${check.name} in table ${name} has no expression`);
+    }
+  }
   return {
     kind: "table",
     name,
     columns,
+    checks,
     "~standard": {
       version: 1,
       vendor: "minnow",
@@ -333,18 +408,107 @@ export function table<const TName extends string, TColumns extends Record<string
   };
 }
 
-export interface SchemaDefinition<TTables extends readonly AnyTable[]> {
-  readonly kind: "schema";
-  readonly tables: TTables;
+/**
+ * The FOREIGN KEY constraints a table declares, in column order. This is the single derivation
+ * of "what relations does this table have" — `planMigration` diffs against it and `migrate()`
+ * creates from it, so the two can never disagree.
+ */
+export function declaredForeignKeys(definition: AnyTable): Array<{
+  name: string;
+  column: string;
+  parentTable: string;
+  parentColumn: string;
+  onDelete: ReferentialAction;
+}> {
+  const keys = [];
+  for (const [columnName, columnDefinition] of Object.entries(definition.columns)) {
+    const reference = columnDefinition.reference;
+    if (reference === undefined) continue;
+    keys.push({
+      name: foreignKeyName(definition.name, columnName),
+      column: columnName,
+      parentTable: reference.table,
+      parentColumn: reference.column,
+      onDelete: reference.onDelete,
+    });
+  }
+  return keys;
 }
 
-export function schema<TTables extends readonly AnyTable[]>(
+/**
+ * A view declared in the schema: the query it stands for, plus the column shape the author
+ * expects it to produce.
+ *
+ * The shape is declared rather than inferred from a builder because the query builder compiles to
+ * a plan, not to SQL text, and `CREATE VIEW` needs text. Declaring it is not a downgrade: the
+ * engine infers the real output schema when it creates the view and `migrate()` compares the two,
+ * so a body that drifts from its declaration fails at migration time rather than at read time.
+ */
+export interface ViewSchema<
+  TColumns extends Record<string, AnyColumn>,
+  TName extends string = string,
+> {
+  readonly kind: "view";
+  readonly name: TName;
+  readonly sql: string;
+  readonly columns: TColumns;
+}
+
+export type AnyView = ViewSchema<Record<string, AnyColumn>>;
+
+/**
+ * Declares a view. Its columns use the same builders tables use, so a view row types exactly like
+ * a table row — but a view is read-only, and the typed facade will not let a write name one.
+ *
+ * ```ts
+ * const activeCustomers = view("active_customers", {
+ *   sql: `SELECT customer_id, name FROM customers WHERE status = 'active'`,
+ *   columns: { customer_id: column.number(), name: column.string() },
+ * });
+ * ```
+ */
+export function view<const TName extends string, TColumns extends Record<string, AnyColumn>>(
+  name: TName,
+  definition: { sql: string; columns: TColumns },
+): ViewSchema<TColumns, TName> {
+  const entries = Object.entries(definition.columns);
+  if (entries.length === 0) throw new TypeError(`View ${name} needs at least one column`);
+  if (definition.sql.trim().length === 0) throw new TypeError(`View ${name} has no query`);
+  for (const [columnName, columnDefinition] of entries) {
+    if (columnDefinition.isUnique) {
+      throw new TypeError(`A view column cannot be a unique key: ${name}.${columnName}`);
+    }
+    if (columnDefinition.defaultSpec !== undefined || columnDefinition.defaultFn !== undefined) {
+      throw new TypeError(`A view column cannot have a default: ${name}.${columnName}`);
+    }
+  }
+  return { kind: "view", name, sql: definition.sql, columns: definition.columns };
+}
+
+export interface SchemaDefinition<
+  TTables extends readonly AnyTable[],
+  TViews extends readonly AnyView[] = readonly AnyView[],
+> {
+  readonly kind: "schema";
+  readonly tables: TTables;
+  readonly views: TViews;
+}
+
+export function schema<TTables extends readonly AnyTable[], TViews extends readonly AnyView[] = []>(
   tables: TTables,
-): SchemaDefinition<TTables> {
+  options: { views?: TViews } = {},
+): SchemaDefinition<TTables, TViews> {
+  const views = (options.views ?? []) as TViews;
   const names = new Set<string>();
   for (const definition of tables) {
     if (names.has(definition.name)) {
       throw new TypeError(`Duplicate table in schema: ${definition.name}`);
+    }
+    names.add(definition.name);
+  }
+  for (const definition of views) {
+    if (names.has(definition.name)) {
+      throw new TypeError(`Duplicate name in schema: ${definition.name}`);
     }
     names.add(definition.name);
   }
@@ -360,7 +524,7 @@ export function schema<TTables extends readonly AnyTable[]>(
       }
     }
   }
-  return { kind: "schema", tables };
+  return { kind: "schema", tables, views };
 }
 
 // --- Compile-time row types ---------------------------------------------------------------------
@@ -377,6 +541,14 @@ type ColumnValue<TColumn> =
 /** The complete row shape a read returns. */
 export type InferRow<TTable extends AnyTable> = {
   [K in keyof TTable["columns"]]: ColumnValue<TTable["columns"][K]>;
+};
+
+/**
+ * A view's row shape. Views are read-only and their columns carry no keys or defaults, so this is
+ * the only row type a view has — there is no insert or update counterpart.
+ */
+export type InferViewRow<TView extends AnyView> = {
+  [K in keyof TView["columns"]]: ColumnValue<TView["columns"][K]>;
 };
 
 type NullableKeys<TTable extends AnyTable> = {
@@ -397,12 +569,15 @@ export type InferInsertRow<TTable extends AnyTable> = Omit<
   [K in OptionalInsertKeys<TTable>]?: ColumnValue<TTable["columns"][K]>;
 };
 
-/** Update changes may cover any column except the unique key. */
-export type InferUpdateChanges<TTable extends AnyTable> = Partial<{
-  [
-    K in keyof TTable["columns"] as TTable["columns"][K]["isUnique"] extends true ? never : K
-  ]: ColumnValue<TTable["columns"][K]>;
-}>;
+/**
+ * Update changes may cover any column except the unique key. An explicit `undefined` entry is
+ * allowed and means "leave this column untouched", so a spread-patch built from optional fields
+ * stays assignable under `exactOptionalPropertyTypes`.
+ */
+export type InferUpdateChanges<TTable extends AnyTable> = {
+  [K in keyof TTable["columns"] as TTable["columns"][K]["isUnique"] extends true ? never : K]?:
+    ColumnValue<TTable["columns"][K]> | undefined;
+};
 
 // --- Migration planning -------------------------------------------------------------------------
 
@@ -418,10 +593,113 @@ export type MigrationStep =
       tableName: string;
       columnName: string;
       defaultValue: ColumnDefault | null;
-    };
+    }
+  /**
+   * A view is derived and disposable: nothing is stored under it, so replacing its body loses no
+   * data and needs none of the proofs a table alteration needs. `replace` covers both creating a
+   * missing view and redefining an existing one.
+   */
+  | { kind: "replace-view"; view: AnyView }
+  | { kind: "drop-view"; viewName: string };
 
 export interface MigrationPlan {
   steps: MigrationStep[];
+}
+
+/**
+ * Views are derived: nothing is stored under one, so a body change is a replace rather than a
+ * rewrite, and a view the schema stops declaring is simply dropped. The one thing refused is a
+ * name collision — a schema that declares a view over an existing real table would otherwise
+ * destroy it.
+ */
+function planViewSteps(
+  catalog: Catalog,
+  definition: SchemaDefinition<readonly AnyTable[]>,
+  steps: MigrationStep[],
+): void {
+  const tableNames = new Set(catalog.tables.map(({ name }) => name));
+  const existing = new Map(catalog.views.map((record) => [record.name, record]));
+  const declared = new Set(definition.views.map(({ name }) => name));
+  for (const viewDefinition of definition.views) {
+    if (tableNames.has(viewDefinition.name)) {
+      throw new TypeError(`A table already exists with this name: ${viewDefinition.name}`);
+    }
+    if (existing.get(viewDefinition.name)?.sql === viewDefinition.sql) continue;
+    steps.push({ kind: "replace-view", view: viewDefinition });
+  }
+  for (const record of catalog.views) {
+    // Only views this schema is responsible for: a view created outside it is left alone.
+    if (declared.has(record.name)) continue;
+    if (definition.views.length === 0) continue;
+    steps.push({ kind: "drop-view", viewName: record.name });
+  }
+}
+
+/**
+ * Constraints on an existing table cannot change through a metadata-only step. Attaching a
+ * FOREIGN KEY or CHECK to a table that already holds rows would claim something about those rows
+ * that nobody has verified, and no validation scan exists; dropping one is refused for the mirror
+ * reason, so that a constraint never disappears because a schema file drifted. Both get the same
+ * discipline every other unprovable change gets: an explicit error naming the fix.
+ */
+function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable): void {
+  const describeKey = (key: {
+    column: string;
+    parentTable: string;
+    parentColumn: string;
+    onDelete: string;
+  }): string => `${key.column} -> ${key.parentTable}.${key.parentColumn} ON DELETE ${key.onDelete}`;
+
+  const existingKeys = new Map(record.foreignKeys.map((key) => [key.name, key]));
+  const declaredKeys = new Map(declaredForeignKeys(definition).map((key) => [key.name, key]));
+  for (const [name, declared] of declaredKeys) {
+    const existing = existingKeys.get(name);
+    if (existing === undefined) {
+      throw new TypeError(
+        `FOREIGN KEY cannot be added after creation: ${definition.name}.${declared.column}. ` +
+          `Existing rows are not known to satisfy it; recreate the table to add a relation.`,
+      );
+    }
+    if (describeKey(existing) !== describeKey(declared)) {
+      throw new TypeError(
+        `FOREIGN KEY cannot change: ${definition.name}.${declared.column} is ` +
+          `${describeKey(existing)}, schema says ${describeKey(declared)}`,
+      );
+    }
+  }
+  for (const name of existingKeys.keys()) {
+    if (!declaredKeys.has(name)) {
+      throw new TypeError(
+        `FOREIGN KEY cannot be dropped: ${definition.name} still has ${name}. ` +
+          `Declare the relation, or recreate the table without it.`,
+      );
+    }
+  }
+
+  const existingChecks = new Map(record.checks.map((check) => [check.name, check.sql]));
+  const declaredChecks = new Map(definition.checks.map((check) => [check.name, check.sql]));
+  for (const [name, sql] of declaredChecks) {
+    const existing = existingChecks.get(name);
+    if (existing === undefined) {
+      throw new TypeError(
+        `CHECK cannot be added after creation: ${definition.name}.${name}. ` +
+          `Existing rows are not known to satisfy it; recreate the table to add a constraint.`,
+      );
+    }
+    if (existing !== sql) {
+      throw new TypeError(
+        `CHECK cannot change: ${definition.name}.${name} is (${existing}), schema says (${sql})`,
+      );
+    }
+  }
+  for (const name of existingChecks.keys()) {
+    if (!declaredChecks.has(name)) {
+      throw new TypeError(
+        `CHECK cannot be dropped: ${definition.name} still has ${name}. ` +
+          `Declare the constraint, or recreate the table without it.`,
+      );
+    }
+  }
 }
 
 /**
@@ -431,11 +709,11 @@ export interface MigrationPlan {
  * or still defined.
  */
 export function planMigration(
-  current: readonly TableRecord[],
+  catalog: Catalog,
   definition: SchemaDefinition<readonly AnyTable[]>,
 ): MigrationPlan {
   const steps: MigrationStep[] = [];
-  const currentByName = new Map(current.map((record) => [record.name, record]));
+  const currentByName = new Map(catalog.tables.map((record) => [record.name, record]));
   for (const tableDefinition of definition.tables) {
     const record = currentByName.get(tableDefinition.name);
     if (record === undefined) {
@@ -562,7 +840,9 @@ export function planMigration(
         );
       }
     }
+    assertConstraintsUnchanged(record, tableDefinition);
   }
+  planViewSteps(catalog, definition, steps);
   return { steps };
 }
 

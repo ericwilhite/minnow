@@ -9,7 +9,7 @@ floats over your page without blocking it, and every change asks first.
 ## Try it
 
 The [playground](/playground) is this panel, in its production shape: a database running in a web
-worker (the same [worker client](/docs/client/workers) an app ships) over a seven-table retail
+worker (the same [worker client](/docs/engine/workers) an app ships) over a seven-table retail
 dataset generated in your browser and kept in IndexedDB. The title-bar badge reads **worker**
 because the queries genuinely leave the page.
 
@@ -169,7 +169,7 @@ table picker, so choosing a table never depends on the rail being there.
 Two badges in the title bar say what you are working with:
 
 - **worker** or **main thread** — a database built in the page runs queries on the main thread, so
-  a slow one will freeze it. The [worker client](/docs/client/workers) does not.
+  a slow one will freeze it. The [worker client](/docs/engine/workers) does not.
 - **write on** or **read-only** — whether `permissions.write` allows changes.
 
 ## Downloading the database
@@ -214,7 +214,7 @@ What a statement does is read off the compiled plan, not its text, so a `SELECT`
 mentions `DELETE` in a string literal is still a query.
 
 SQL that fails to compile is reported with the offending token selected in the editor — the
-position comes from [`SqlCompileError`](/docs/queries/#locating-a-compile-error).
+position comes from [`SqlCompileError`](/docs/engine/index#errors).
 
 ## Diagnostics
 

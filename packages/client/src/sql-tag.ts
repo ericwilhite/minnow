@@ -1,4 +1,4 @@
-import { type QueryRow, type QueryValue } from "../query.js";
+import { type QueryRow, type QueryValue } from "@minnowdb/core/plan";
 
 /**
  * Raw-SQL escape hatch: sql<Row>`SELECT ... WHERE x = ${value}`. Interpolated values become

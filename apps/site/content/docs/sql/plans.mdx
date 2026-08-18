@@ -43,7 +43,7 @@ rejected rather than run row-by-row — see the
 
 The executor is vectorized: it works on batches of column values rather than a row at a time, and
 scans stream block by block so a table is never required to be resident. When a hash table,
-sort, or grouping payload would exceed the [memory budget](/docs/client/memory), the operator
+sort, or grouping payload would exceed the [memory budget](/docs/engine/memory), the operator
 spills to storage and continues rather than failing.
 
 ## Measuring a query honestly

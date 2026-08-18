@@ -1,0 +1,174 @@
+---
+title: Extending Minnow
+description: The primitives for building a typed layer, schema tool, or adapter on top of the engine.
+---
+
+SQL is Minnow's contract. The engine runs statements on its own, and every typed layer — including
+the official [`@minnowdb/client`](/docs/engine) — is a consumer of the primitives on this page.
+
+That is not an accident of packaging. `@minnowdb/client` ships as a separate package built only
+from what is documented here, so if these primitives were not enough to build a query builder, the
+first thing to break would be ours.
+
+## The primitives
+
+| Primitive                 | Import                | What it gives you                                                                      |
+| ------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
+| `execute(sql, params)`    | `@minnowdb/core`      | The query channel. One entry point, one discriminated result.                          |
+| `introspect()`            | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                           |
+| Statement transactions    | `@minnowdb/core`      | `BEGIN` / `COMMIT` / `ROLLBACK`, drivable from a layer that owns its own control flow. |
+| Plan construction         | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.          |
+| `sql-feature-matrix.json` | `@minnowdb/core`      | Machine-readable capability discovery.                                                 |
+
+## Running statements
+
+Everything the engine can do is reachable through one call. The result is a discriminated union, so
+a caller learns what happened without a second query:
+
+```ts
+const result = await database.execute(
+  `INSERT INTO orders (order_id, total) VALUES (?, ?)`,
+  [1, 25],
+);
+// { kind: "insert", table: "orders", rowCount: 1, version: 4 }
+```
+
+Bind values with `?` rather than building SQL strings. The compiled plan is cached on the statement
+text and re-bound per execution, so parameters are faster as well as safer — and a layer that
+inlines literals instead defeats that cache, since every distinct value becomes a distinct key.
+
+Identifiers quote with double quotes, doubling an embedded quote: `"order id"`, `"say ""hi"""`.
+
+## Introspecting the catalog
+
+`introspect()` returns what a schema tool needs to diff a live database against a desired state.
+It is deliberately richer than `listTables()`, which answers what a _reader_ needs:
+
+```ts
+const catalog = await database.introspect();
+
+for (const table of catalog.tables) {
+  table.name;
+  table.uniqueKeyColumnId; // identity, not a name
+  table.columns; // { id, name, type, nullable, defaultValue?, enumValues?, isAutoIncrementing }
+  table.foreignKeys; // { name, column, parentTable, parentColumn, onDelete }
+  table.checks; // { name, sql }
+  table.triggers; // { name, event, timing }
+}
+
+for (const declared of catalog.views) {
+  declared.name;
+  declared.sql; // the query text it stands for
+  declared.columns; // the query's inferred output schema
+}
+```
+
+Two things make it plannable rather than merely descriptive:
+
+- **Column IDs are stable across renames.** A rename is only expressible as a diff because the
+  column keeps its ID; matching on names alone cannot tell a rename from a drop plus an add.
+- **Derived facts are resolved for you.** `isAutoIncrementing` is reported directly rather than
+  leaving a planner to decode a default spec.
+
+Tables and views are sorted by name, so a diff over two catalogs is stable.
+
+## Planning a migration
+
+`planMigration` diffs a `Catalog` against a schema declaration. It takes the published catalog and
+nothing else — no database, no store, no engine — so a tool can plan against a catalog it fetched,
+cached, or built by hand:
+
+```ts
+import { planMigration, schema, table, column } from "@minnowdb/core";
+
+const catalog = await database.introspect(); // or any Catalog value you have
+const plan = planMigration(catalog, schema([table("notes", {/* ... */})]));
+
+for (const step of plan.steps) {
+  step.kind; // "create-table" | "add-column" | "rename-column" | "widen-nullable" |
+  // "widen-enum" | "alter-default" | "replace-view" | "drop-view"
+}
+```
+
+Planning is a pure function, so it is also how you preview: run it, show the steps, and decide
+whether to apply. Anything it cannot prove safe throws with a message naming the fix rather than
+appearing as a step — see [the rejected list](/docs/schema#what-migrate-does).
+
+**Applying still goes through the engine.** `database.migrate(schema)` plans and applies in one
+call. Some steps have no SQL spelling — a rename happens through the column's stable ID, which
+`ALTER TABLE` cannot express — so there is no statement list you could run yourself today. If you
+need the split, plan with `planMigration` to decide and inspect, then hand the same schema to
+`migrate()` to apply.
+
+## Transactions
+
+The primitive is imperative, because a layer that owns its own control flow cannot always express
+its work as a callback:
+
+```ts
+await database.execute("BEGIN");
+try {
+  await database.execute(`UPDATE accounts SET balance = balance - ? WHERE id = ?`, [10, 1]);
+  await database.execute(`UPDATE accounts SET balance = balance + ? WHERE id = ?`, [10, 2]);
+  await database.execute("COMMIT");
+} catch (error) {
+  await database.execute("ROLLBACK");
+  throw error;
+}
+```
+
+A scoped API can always be built on top of this. The reverse — recovering imperative control from a
+callback-only API — requires suspending the callback on deferred promises, which is why the
+imperative form is what gets published.
+
+Savepoints are not implemented, so transactions do not nest.
+
+## Building plans directly
+
+`@minnowdb/core/plan` exposes the block-assembly functions the SQL parser itself ends in, plus the
+plan types and the validators that keep a hand-built plan as strict as a parsed one. A builder that
+uses them produces plans the engine cannot distinguish from parsed SQL — same validation errors,
+same desugaring, same execution strategy.
+
+```ts
+import { assembleSelectBlock, optimizePlan, type CompiledQuery } from "@minnowdb/core/plan";
+```
+
+This is the lowest-level primitive here, and the one most likely to change shape as the plan types
+move into a module of their own. Most layers should emit SQL and let the engine parse it: parsing
+costs 11–28 µs, which is under 1% of any query that touches real data.
+
+## Discovering what the engine accepts
+
+A layer that generates SQL will eventually emit something the engine does not support. The answer
+is not a handful of capability flags but the feature matrix, shipped as data:
+
+```ts
+import matrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
+
+const unsupported = matrix.features.filter((entry) => entry.status === "unsupported");
+// each carries: id, the SQL:2023 Annex F feature, an example, and the error it raises
+```
+
+190 entries, 176 supported. It is the input to the conformance suite, so it cannot drift from the
+engine without failing tests.
+
+The gaps most likely to matter to a SQL generator:
+
+| Gap                           | Note                                                                        |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| correlated non-equi `EXISTS`  | correlation must be a plain equality between one inner and one outer column |
+| correlated `NOT IN`           | use `NOT EXISTS`                                                            |
+| `LATERAL` sources             | no operator re-executes a source per row of its left side                   |
+| `ON CONFLICT DO UPDATE SET`   | supported only as `column = EXCLUDED.column`                                |
+| `COLLATE`, sequences, `ARRAY` | absent; the matrix records each with its error                              |
+
+Every one of these raises an explicit error naming the constraint, so a generator can surface a
+useful message rather than a failure deep in execution.
+
+## Row types
+
+If your layer is typed, [`InferDatabase`](/docs/schema#inferred-shapes) gives you a `DB` where each
+table names its `select`, `insert`, and `update` shapes and each view names only `select`. Reading
+those three names is all that is required — there is no marker to decode, and the absence of
+`insert` on a view is what makes writing to one a compile error.

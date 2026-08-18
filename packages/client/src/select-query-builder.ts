@@ -1,11 +1,9 @@
-import { optimizePlan } from "../optimizer.js";
+import { optimizePlan } from "@minnowdb/core/plan";
 import {
   assembleSelectBlock,
   compoundSelectBlock,
   derivedTableSource,
   splitCondition,
-  validateLimit,
-  validateOffset,
   type CompiledQuery,
   type Expression,
   type JoinPlan,
@@ -13,7 +11,9 @@ import {
   type SelectItem,
   type SetOperator,
   type TableSource,
-} from "../query.js";
+  validateLimit,
+  validateOffset,
+} from "@minnowdb/core/plan";
 import {
   buildBinaryCondition,
   buildFtsExpression,

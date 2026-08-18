@@ -119,7 +119,7 @@ END
 ## Atomicity
 
 One statement is one commit. Several statements that must land together belong in a
-[write scope](/docs/client/transactions):
+[write scope](/docs/engine/transactions):
 
 ```ts
 const { version } = await db.write(async (tx) => {
@@ -172,4 +172,4 @@ rows or columns directly:
 await db.insertBatch("orders", rows); // an array of plain objects
 ```
 
-See [bulk writes](/docs/client#bulk-writes) for the columnar form and the buffered writer.
+See [bulk writes](/docs/engine#bulk-writes) for the columnar form and the buffered writer.

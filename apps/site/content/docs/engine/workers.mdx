@@ -11,7 +11,8 @@ and a main-thread client (`@minnowdb/core/client`). Your app contributes one lin
 
 ```ts
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
-import { createMinnow, column, schema, table, type InferDatabase } from "@minnowdb/core";
+import { column, schema, table } from "@minnowdb/core";
+import { createMinnow, type InferDatabase } from "@minnowdb/client";
 
 const people = table("people", {
   name: column.string().unique(),

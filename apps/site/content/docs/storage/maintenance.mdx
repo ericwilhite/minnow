@@ -44,7 +44,7 @@ await db.collectGarbage();
 
 A block is only collectable when no manifest, no open reader lease, and no non-terminal job still
 roots it. That is what makes it safe to run while a report is being read: an open
-[snapshot scope](/docs/client/transactions#stable-reads) pins its version, and collection skips
+[snapshot scope](/docs/engine/transactions#stable-reads) pins its version, and collection skips
 everything that version needs.
 
 The same stepped shape applies:
@@ -60,7 +60,7 @@ Neither job needs to run on a timer. Reasonable triggers:
 - After a bulk load, compact the tables it touched.
 - On an idle callback, take one step of whatever is outstanding.
 - At startup, resume jobs a previous session left and call
-  [`cleanupQuerySpill()`](/docs/client/memory#spill-cleanup).
+  [`cleanupQuerySpill()`](/docs/engine/memory#spill-cleanup).
 
 Leaving them undone costs storage and scan speed. It never costs correctness — a database that
 is never compacted or collected still answers every query correctly, just over more blocks and

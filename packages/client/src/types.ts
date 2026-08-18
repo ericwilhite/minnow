@@ -1,5 +1,12 @@
-import { type CompiledQuery, type Expression } from "../query.js";
-import { type AnyTable, type InferRow, type SchemaDefinition } from "../schema.js";
+import { type CompiledQuery, type Expression } from "@minnowdb/core/plan";
+import {
+  type AnyTable,
+  type InferInsertRow,
+  type InferRow,
+  type InferUpdateChanges,
+  type InferViewRow,
+  type SchemaDefinition,
+} from "@minnowdb/core";
 
 /**
  * Type foundation for the Kysely-style query builder. A database type `DB` maps table names to
@@ -12,10 +19,69 @@ import { type AnyTable, type InferRow, type SchemaDefinition } from "../schema.j
 /** Flattens intersections so inferred row types read as one object. */
 export type Simplify<T> = { [K in keyof T]: T[K] } & {};
 
-/** Maps a schema's table names to their inferred row shapes. */
-export type InferDatabase<TSchema extends SchemaDefinition<readonly AnyTable[]>> = Simplify<{
-  [TTable in TSchema["tables"][number] as TTable["name"]]: InferRow<TTable>;
-}>;
+/**
+ * What one table contributes to `DB`: the three shapes reads and writes need, named rather than
+ * derived. The schema already computes all three, so nothing downstream has to decode a marker to
+ * recover them — which is also what lets code that did not build `DB` read it.
+ */
+export interface TableShape<TSelect, TInsert, TUpdate> {
+  readonly select: TSelect;
+  readonly insert: TInsert;
+  readonly update: TUpdate;
+}
+
+/**
+ * What a view contributes: a readable shape and nothing else. Having no `insert` is precisely what
+ * makes `insertInto("some_view")` a compile error rather than a runtime one.
+ */
+export interface ViewShape<TSelect> {
+  readonly select: TSelect;
+}
+
+/**
+ * The readable row of a `DB` entry. Exported for consumers; the context types below inline the
+ * same conditional rather than calling it, because routing every table brought into scope through
+ * a named alias costs an extra instantiation layer per reference — measured at roughly 29% of all
+ * instantiations on a 16-query, 25-table fixture.
+ */
+export type SelectRowOf<TShape> = TShape extends { select: infer TSelect } ? TSelect : never;
+export type InsertRowOf<TShape> = TShape extends { insert: infer TInsert } ? TInsert : never;
+export type UpdateRowOf<TShape> = TShape extends { update: infer TUpdate } ? TUpdate : never;
+
+/** The entries of `DB` that accept writes; views are excluded structurally, not by a flag. */
+export type WritableTable<DB> = {
+  [K in keyof DB]: DB[K] extends { insert: unknown } ? K : never;
+}[keyof DB] &
+  string;
+
+/**
+ * Builds a table's three shapes from one row type, for a hand-declared `DB`. This is where the
+ * `Generated<T>` marker is read — once, at your declaration — so nothing deeper in the stack has
+ * to look for it:
+ *
+ * ```ts
+ * interface DB {
+ *   notes: FromRow<{ id: Generated<number>; body: string }>;
+ * }
+ * ```
+ */
+export type FromRow<TRow> = TableShape<TRow, InsertRowFor<TRow>, UpdateChangesFor<TRow>>;
+
+/**
+ * Maps a schema to `DB`: every table contributes its select, insert, and update shapes, and every
+ * view contributes a readable shape only.
+ */
+export type InferDatabase<TSchema extends SchemaDefinition<readonly AnyTable[]>> = Simplify<
+  {
+    [TTable in TSchema["tables"][number] as TTable["name"]]: TableShape<
+      InferRow<TTable>,
+      InferInsertRow<TTable>,
+      InferUpdateChanges<TTable>
+    >;
+  } & {
+    [TView in TSchema["views"][number] as TView["name"]]: ViewShape<InferViewRow<TView>>;
+  }
+>;
 
 export type AnyRow = Record<string, unknown>;
 export type AnyContext = Record<string, AnyRow>;
@@ -35,11 +101,19 @@ export type NullableRow<TRow> = { [K in keyof TRow]: TRow[K] | null };
 
 /** The context after bringing a table (or aliased table) into scope. */
 export type ContextWithTable<DB, TCtx, TE extends string> = TCtx &
-  Record<ExtractTableAlias<TE>, DB[ExtractTableName<TE> & keyof DB]>;
+  Record<
+    ExtractTableAlias<TE>,
+    DB[ExtractTableName<TE> & keyof DB] extends { select: infer TSelect } ? TSelect : never
+  >;
 
 /** The context after a LEFT JOIN: the joined table's columns widen with null. */
 export type ContextWithLeftTable<DB, TCtx, TE extends string> = TCtx &
-  Record<ExtractTableAlias<TE>, NullableRow<DB[ExtractTableName<TE> & keyof DB]>>;
+  Record<
+    ExtractTableAlias<TE>,
+    NullableRow<
+      DB[ExtractTableName<TE> & keyof DB] extends { select: infer TSelect } ? TSelect : never
+    >
+  >;
 
 /** Every column in scope, as a bare name or an alias-qualified `"a.column"`. */
 export type ColumnReference<TCtx> = {

@@ -87,7 +87,7 @@ for (const event of batch) {
 }
 ```
 
-For bulk loading, prefer [`insertBatch`](/docs/client#bulk-writes), which takes rows or columns
+For bulk loading, prefer [`insertBatch`](/docs/engine#bulk-writes), which takes rows or columns
 directly and never touches the parser.
 
 ## Result caching, and turning it off
@@ -106,7 +106,7 @@ await db.query(sql, { memoize: false });
 ## Multiple statements
 
 One call runs one statement. To make several writes land together — or fail together — use a
-[write scope](/docs/client/transactions):
+[write scope](/docs/engine/transactions):
 
 ```ts
 await db.write(async (tx) => {

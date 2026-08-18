@@ -5,10 +5,11 @@
     "installation",
     "first-query",
     "sql",
+    "schema",
     "client",
+    "engine",
     "storage",
     "---Also---",
-    "schema",
     "devtools",
     "reference"
   ]

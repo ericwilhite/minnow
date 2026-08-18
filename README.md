@@ -29,11 +29,17 @@ npm install @minnowdb/core
   itself.
 - **Bounded memory** — execution works in batches under a budget you set and spills to storage
   rather than failing. A whole table is never required to be resident.
-- **Small** — about 143 KB gzipped, and no Wasm blob: roughly a third of SQLite's WebAssembly
-  build and a fortieth of PGlite's, both of which download and compile a module before answering
+- **Small** — about 159 KB gzipped, and no Wasm blob: roughly a third of SQLite's WebAssembly
+  build and a thirty-fifth of PGlite's, both of which download and compile a module before answering
   anything.
 - **Workers first** — a shipped worker entry and a main-thread client with an identical API.
 - **Snapshots** — copy one committed version out as a portable file and load it into any store.
+- **[Typed client](https://minnowdb.dev/docs/client/), optional** — `@minnowdb/client` adds a schema-aware query builder with inferred
+  row types, declared foreign keys and CHECK constraints, views, and live queries. It ships
+  separately and is built only from the engine's published primitives, so anyone can build their
+  own layer the same way.
+- **Extensible** — a published catalog with stable column IDs, plan-construction primitives, and a
+  machine-readable SQL feature matrix. See [Extending Minnow](https://minnowdb.dev/docs/reference/extending/).
 - **Devtools** — an embeddable SQL console and data browser, shipped as a separate package.
 - **Differentially tested** — a seeded query corpus runs through both executors and two
   independent oracles (native SQLite and PGlite) on every test run; results must agree.

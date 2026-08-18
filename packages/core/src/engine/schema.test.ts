@@ -6,13 +6,16 @@ import {
   type BlockStore,
 } from "../storage/index.js";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import { toCatalog, type Catalog } from "./catalog.js";
 import { MinnowDatabase } from "./database.js";
 import {
   column,
+  declaredForeignKeys,
   planMigration,
   schema,
   table,
   typedTable,
+  view,
   type InferInsertRow,
   type InferRow,
   type InferUpdateChanges,
@@ -204,7 +207,7 @@ describe("column defaults", () => {
     const current = [notesRecord];
     const idColumn = column.number().unique().autoIncrement();
     const added = planMigration(
-      current,
+      toCatalog(current),
       schema([table("notes", { id: idColumn, status: column.string().default("draft") })]),
     );
     expect(added.steps).toEqual([
@@ -216,7 +219,7 @@ describe("column defaults", () => {
       },
     ]);
     const unchanged = planMigration(
-      current,
+      toCatalog(current),
       schema([table("notes", { id: idColumn, status: column.string() })]),
     );
     expect(unchanged.steps).toEqual([]);
@@ -230,7 +233,7 @@ describe("column defaults", () => {
       },
     ];
     const removed = planMigration(
-      currentWithLiteral,
+      toCatalog(currentWithLiteral),
       schema([table("notes", { id: idColumn, status: column.string() })]),
     );
     expect(removed.steps).toEqual([
@@ -238,7 +241,7 @@ describe("column defaults", () => {
     ]);
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([table("notes", { id: column.number().unique(), status: column.string() })]),
       ),
     ).toThrow("Auto-increment cannot be added or removed after creation");
@@ -376,12 +379,12 @@ describe("enum columns", () => {
     ];
     const key = column.string().unique();
     const unchanged = planMigration(
-      current,
+      toCatalog(current),
       schema([table("machines", { name: key, state: column.enum(["off", "idle"]) })]),
     );
     expect(unchanged.steps).toEqual([]);
     const widened = planMigration(
-      current,
+      toCatalog(current),
       schema([table("machines", { name: key, state: column.enum(["off", "idle", "running"]) })]),
     );
     expect(widened.steps).toEqual([
@@ -393,7 +396,7 @@ describe("enum columns", () => {
       },
     ]);
     const relaxed = planMigration(
-      current,
+      toCatalog(current),
       schema([table("machines", { name: key, state: column.string() })]),
     );
     expect(relaxed.steps).toEqual([
@@ -401,13 +404,13 @@ describe("enum columns", () => {
     ]);
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([table("machines", { name: key, state: column.enum(["off"]) })]),
       ),
     ).toThrow("Enum values cannot be removed: machines.state drops idle");
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([table("machines", { name: column.enum(["a"]).unique(), state: column.string() })]),
       ),
     ).toThrow("Plain string columns cannot tighten to an enum: machines.name");
@@ -651,7 +654,7 @@ describe("migration planning rejections", () => {
 
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([
           table("people", {
             name: column.string().unique(),
@@ -663,13 +666,13 @@ describe("migration planning rejections", () => {
     ).toThrow("Column types cannot change");
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([table("people", { name: column.string().unique(), score: column.number() })]),
       ),
     ).toThrow("Dropping columns is not supported");
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([
           table("people", {
             name: column.string().unique(),
@@ -682,7 +685,7 @@ describe("migration planning rejections", () => {
     ).toThrow("Added columns must be nullable");
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([
           table("people", {
             name: column.string(),
@@ -694,7 +697,7 @@ describe("migration planning rejections", () => {
     ).toThrow("Unique keys cannot change");
     expect(() =>
       planMigration(
-        current,
+        toCatalog(current),
         schema([
           table("people", {
             name: column.string().unique(),
@@ -718,5 +721,719 @@ describe("migration planning rejections", () => {
       store.updateTable(record.id, record.revision ?? 0, { columns: record.columns }),
     ).rejects.toThrow(TableRecordConflictError);
     store.close();
+  });
+});
+
+// --- Declared constraints -------------------------------------------------------------------------
+
+/**
+ * The same intent expressed two ways. A table the schema DSL creates and a table SQL DDL creates
+ * must be the same table: same catalog, same rejections. `migrate()` used to drop both constraint
+ * kinds on the floor, so this pair is the regression that proves it does not.
+ */
+const relational = schema([
+  table("parents", { id: column.number().unique(), label: column.string() }),
+  table(
+    "children",
+    {
+      id: column.number().unique(),
+      parent_id: column.number().references("parents", "id"),
+      qty: column.number(),
+    },
+    { checks: [{ name: "positive_qty", sql: "qty > 0" }] },
+  ),
+]);
+
+const EQUIVALENT_DDL = [
+  `CREATE TABLE parents (id INTEGER PRIMARY KEY, label VARCHAR(40) NOT NULL)`,
+  `CREATE TABLE children (
+     id INTEGER PRIMARY KEY,
+     parent_id INTEGER NOT NULL REFERENCES parents(id),
+     qty INTEGER NOT NULL,
+     CONSTRAINT positive_qty CHECK (qty > 0)
+   )`,
+];
+
+async function viaMigrate(): Promise<{ database: MinnowDatabase; store: MemoryBlockStore }> {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  await database.migrate(relational);
+  return { database, store };
+}
+
+async function viaSql(): Promise<{ database: MinnowDatabase; store: MemoryBlockStore }> {
+  const store = new MemoryBlockStore();
+  const database = new MinnowDatabase(store);
+  for (const statement of EQUIVALENT_DDL) await database.execute(statement);
+  return { database, store };
+}
+
+const paths = [
+  { name: "schema DSL migrate()", open: viaMigrate },
+  { name: "SQL DDL", open: viaSql },
+];
+
+describe.each(paths)("declared constraints via $name", ({ open }) => {
+  it("stores the same foreign keys and checks in the catalog", async () => {
+    const { store } = await open();
+    const record = await store.getTableByName("children");
+    expect(record?.foreignKeys).toEqual([
+      {
+        name: "children_parent_id_fkey",
+        column: "parent_id",
+        parentTable: "parents",
+        parentColumn: "id",
+        onDelete: "restrict",
+      },
+    ]);
+    expect(record?.checks).toEqual([{ name: "positive_qty", sql: "qty > 0" }]);
+    store.close();
+  });
+
+  it("rejects a child row whose parent does not exist", async () => {
+    const { database, store } = await open();
+    await expect(
+      database.insertBatch("children", [{ id: 1, parent_id: 999, qty: 1 }]),
+    ).rejects.toThrow(/FOREIGN KEY children_parent_id_fkey/);
+    store.close();
+  });
+
+  it("rejects a row failing the check", async () => {
+    const { database, store } = await open();
+    await database.insertBatch("parents", [{ id: 1, label: "a" }]);
+    await expect(
+      database.insertBatch("children", [{ id: 1, parent_id: 1, qty: 0 }]),
+    ).rejects.toThrow(/CHECK positive_qty/);
+    store.close();
+  });
+
+  it("restricts deleting a referenced parent, and allows an unreferenced one", async () => {
+    const { database, store } = await open();
+    await database.insertBatch("parents", [
+      { id: 1, label: "referenced" },
+      { id: 2, label: "free" },
+    ]);
+    await database.insertBatch("children", [{ id: 1, parent_id: 1, qty: 5 }]);
+    await expect(database.deleteBatch("parents", { keys: [1] })).rejects.toThrow(/FOREIGN KEY/);
+    await expect(database.deleteBatch("parents", { keys: [2] })).resolves.toBeDefined();
+    store.close();
+  });
+
+  it("accepts a row satisfying both constraints", async () => {
+    const { database, store } = await open();
+    await database.insertBatch("parents", [{ id: 1, label: "a" }]);
+    await database.insertBatch("children", [{ id: 1, parent_id: 1, qty: 3 }]);
+    expect(await database.readTable("children")).toEqual([{ id: 1, parent_id: 1, qty: 3 }]);
+    store.close();
+  });
+});
+
+describe("referential actions", () => {
+  it("cascades child deletes when the relation declares it", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema([
+        table("parents", { id: column.number().unique(), label: column.string() }),
+        table("children", {
+          id: column.number().unique(),
+          parent_id: column.number().references("parents", "id", { onDelete: "cascade" }),
+        }),
+      ]),
+    );
+    await database.insertBatch("parents", [{ id: 1, label: "a" }]);
+    await database.insertBatch("children", [
+      { id: 1, parent_id: 1 },
+      { id: 2, parent_id: 1 },
+    ]);
+    await database.deleteBatch("parents", { keys: [1] });
+    expect(await database.readTable("children")).toEqual([]);
+    store.close();
+  });
+
+  it("nulls the child column when the relation declares set null", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema([
+        table("parents", { id: column.number().unique(), label: column.string() }),
+        table("children", {
+          id: column.number().unique(),
+          parent_id: column
+            .number()
+            .nullable()
+            .references("parents", "id", { onDelete: "set null" }),
+        }),
+      ]),
+    );
+    await database.insertBatch("parents", [{ id: 1, label: "a" }]);
+    await database.insertBatch("children", [{ id: 1, parent_id: 1 }]);
+    await database.deleteBatch("parents", { keys: [1] });
+    expect(await database.readTable("children")).toEqual([{ id: 1, parent_id: null }]);
+    store.close();
+  });
+
+  it("refuses set null on a non-nullable column at declaration time", () => {
+    expect(() =>
+      table("children", {
+        id: column.number().unique(),
+        parent_id: column.number().references("parents", "id", { onDelete: "set null" }),
+      }),
+    ).toThrow("ON DELETE SET NULL requires a nullable column: children.parent_id");
+  });
+
+  it("derives the same constraint name the SQL parser derives", () => {
+    const children = relational.tables[1];
+    if (children === undefined) expect.unreachable("children table missing");
+    expect(declaredForeignKeys(children).map((key) => key.name)).toEqual([
+      "children_parent_id_fkey",
+    ]);
+  });
+});
+
+describe("constraint migration safety", () => {
+  async function migrated(): Promise<{ database: MinnowDatabase; store: MemoryBlockStore }> {
+    return viaMigrate();
+  }
+
+  it("is idempotent when the constraints are unchanged", async () => {
+    const { database, store } = await migrated();
+    const again = await database.migrate(relational);
+    expect(again.createdTables).toEqual([]);
+    expect(again.steps).toEqual([]);
+    store.close();
+  });
+
+  it("refuses to add a relation to an existing table", async () => {
+    const { database, store } = await migrated();
+    await expect(
+      database.migrate(
+        schema([
+          table("parents", { id: column.number().unique(), label: column.string() }),
+          table(
+            "children",
+            {
+              id: column.number().unique(),
+              parent_id: column.number().references("parents", "id"),
+              qty: column.number().references("parents", "id"),
+            },
+            { checks: [{ name: "positive_qty", sql: "qty > 0" }] },
+          ),
+        ]),
+      ),
+    ).rejects.toThrow("FOREIGN KEY cannot be added after creation: children.qty");
+    store.close();
+  });
+
+  it("refuses to drop a relation still in the catalog", async () => {
+    const { database, store } = await migrated();
+    await expect(
+      database.migrate(
+        schema([
+          table("parents", { id: column.number().unique(), label: column.string() }),
+          table(
+            "children",
+            {
+              id: column.number().unique(),
+              parent_id: column.number(),
+              qty: column.number(),
+            },
+            { checks: [{ name: "positive_qty", sql: "qty > 0" }] },
+          ),
+        ]),
+      ),
+    ).rejects.toThrow("FOREIGN KEY cannot be dropped: children still has children_parent_id_fkey");
+    store.close();
+  });
+
+  it("refuses to change a referential action", async () => {
+    const { database, store } = await migrated();
+    await expect(
+      database.migrate(
+        schema([
+          table("parents", { id: column.number().unique(), label: column.string() }),
+          table(
+            "children",
+            {
+              id: column.number().unique(),
+              parent_id: column.number().references("parents", "id", { onDelete: "cascade" }),
+              qty: column.number(),
+            },
+            { checks: [{ name: "positive_qty", sql: "qty > 0" }] },
+          ),
+        ]),
+      ),
+    ).rejects.toThrow("FOREIGN KEY cannot change: children.parent_id");
+    store.close();
+  });
+
+  it("refuses to add, change, or drop a check on an existing table", async () => {
+    const children = (checks: Array<{ name: string; sql: string }>) =>
+      schema([
+        table("parents", { id: column.number().unique(), label: column.string() }),
+        table(
+          "children",
+          {
+            id: column.number().unique(),
+            parent_id: column.number().references("parents", "id"),
+            qty: column.number(),
+          },
+          { checks },
+        ),
+      ]);
+    const { database, store } = await migrated();
+    await expect(
+      database.migrate(
+        children([
+          { name: "positive_qty", sql: "qty > 0" },
+          { name: "small_qty", sql: "qty < 100" },
+        ]),
+      ),
+    ).rejects.toThrow("CHECK cannot be added after creation: children.small_qty");
+    await expect(
+      database.migrate(children([{ name: "positive_qty", sql: "qty >= 0" }])),
+    ).rejects.toThrow("CHECK cannot change: children.positive_qty");
+    await expect(database.migrate(children([]))).rejects.toThrow(
+      "CHECK cannot be dropped: children still has positive_qty",
+    );
+    store.close();
+  });
+
+  it("rejects a check the engine cannot compile, at migration time", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await expect(
+      database.migrate(
+        schema([
+          table("t", { id: column.number().unique() }, { checks: [{ name: "bad", sql: "nope(" }] }),
+        ]),
+      ),
+    ).rejects.toThrow();
+    store.close();
+  });
+
+  it("rejects malformed check declarations at table definition", () => {
+    expect(() =>
+      table("t", { id: column.number().unique() }, { checks: [{ name: "a", sql: "  " }] }),
+    ).toThrow("CHECK a in table t has no expression");
+    expect(() =>
+      table(
+        "t",
+        { id: column.number().unique() },
+        {
+          checks: [
+            { name: "a", sql: "id > 0" },
+            { name: "a", sql: "id < 9" },
+          ],
+        },
+      ),
+    ).toThrow("Duplicate CHECK in table t: a");
+  });
+});
+
+describe("constraint wire round trip", () => {
+  it("preserves referential actions and checks across serialization", () => {
+    const original = schema([
+      table("parents", { id: column.number().unique(), label: column.string() }),
+      table(
+        "children",
+        {
+          id: column.number().unique(),
+          parent_id: column
+            .number()
+            .nullable()
+            .references("parents", "id", { onDelete: "set null" }),
+        },
+        { checks: [{ name: "positive_id", sql: "id > 0" }] },
+      ),
+    ]);
+    const restored = deserializeSchema(serializeSchema(original));
+    const children = restored.tables[1];
+    const declared = original.tables[1];
+    if (children === undefined || declared === undefined) {
+      expect.unreachable("children table missing");
+    }
+    expect(children.checks).toEqual([{ name: "positive_id", sql: "id > 0" }]);
+    expect(children.columns.parent_id?.reference).toEqual({
+      table: "parents",
+      column: "id",
+      onDelete: "set null",
+    });
+    expect(declaredForeignKeys(children)).toEqual(declaredForeignKeys(declared));
+  });
+});
+
+// --- Views ----------------------------------------------------------------------------------------
+
+const withView = (sql: string) =>
+  schema([table("customers", { id: column.number().unique(), status: column.string() })], {
+    views: [
+      view("active_customers", {
+        sql,
+        columns: { id: column.number(), status: column.string() },
+      }),
+    ],
+  });
+
+const ACTIVE_SQL = `SELECT id, status FROM customers WHERE status = 'active'`;
+
+describe("views in the schema", () => {
+  it("creates the view and reads through it", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    const result = await database.migrate(withView(ACTIVE_SQL));
+    expect(result.replacedViews).toEqual(["active_customers"]);
+    await database.insertBatch("customers", [
+      { id: 1, status: "active" },
+      { id: 2, status: "churned" },
+    ]);
+    const rows = await database.query("SELECT id FROM active_customers ORDER BY id");
+    expect(rows.rows).toEqual([{ id: 1 }]);
+    store.close();
+  });
+
+  it("is idempotent when the body is unchanged", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(withView(ACTIVE_SQL));
+    const again = await database.migrate(withView(ACTIVE_SQL));
+    expect(again.steps).toEqual([]);
+    expect(again.replacedViews).toEqual([]);
+    store.close();
+  });
+
+  it("replaces the body when the query changes, without touching table data", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(withView(ACTIVE_SQL));
+    await database.insertBatch("customers", [
+      { id: 1, status: "active" },
+      { id: 2, status: "churned" },
+    ]);
+    const changed = await database.migrate(withView(`SELECT id, status FROM customers`));
+    expect(changed.replacedViews).toEqual(["active_customers"]);
+    expect((await database.query("SELECT id FROM active_customers ORDER BY id")).rows).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    // The underlying table is untouched by a view replacement.
+    expect((await database.readTable("customers")).length).toBe(2);
+    store.close();
+  });
+
+  it("drops a view the schema stops declaring", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(withView(ACTIVE_SQL));
+    await database.migrate(
+      schema([table("customers", { id: column.number().unique(), status: column.string() })], {
+        views: [
+          view("recent_customers", {
+            sql: `SELECT id, status FROM customers WHERE id > 0`,
+            columns: { id: column.number(), status: column.string() },
+          }),
+        ],
+      }),
+    );
+    await expect(database.query("SELECT id FROM active_customers")).rejects.toThrow();
+    expect((await database.query("SELECT id FROM recent_customers")).rows).toEqual([]);
+    store.close();
+  });
+
+  it("fails when the declared columns disagree with what the query produces", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await expect(
+      database.migrate(
+        schema([table("customers", { id: column.number().unique(), status: column.string() })], {
+          views: [
+            view("wrong", {
+              sql: `SELECT id FROM customers`,
+              columns: { id: column.number(), status: column.string() },
+            }),
+          ],
+        }),
+      ),
+    ).rejects.toThrow(/View wrong declares .* but its query produces/);
+    store.close();
+  });
+
+  it("refuses to shadow a table in the same schema, at declaration time", () => {
+    // schema() catches the collision before a database is ever involved, so the mistake cannot
+    // reach a migration that would have to decide what to do with the real table's rows.
+    expect(() =>
+      schema([table("customers", { id: column.number().unique(), status: column.string() })], {
+        views: [
+          view("customers", { sql: `SELECT id FROM customers`, columns: { id: column.number() } }),
+        ],
+      }),
+    ).toThrow("Duplicate name in schema: customers");
+  });
+
+  it("refuses to replace a table created outside the schema", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.execute(`CREATE TABLE legacy (id INTEGER PRIMARY KEY)`);
+    await expect(
+      database.migrate(
+        schema([table("customers", { id: column.number().unique(), status: column.string() })], {
+          views: [
+            view("legacy", { sql: `SELECT id FROM customers`, columns: { id: column.number() } }),
+          ],
+        }),
+      ),
+    ).rejects.toThrow("A table already exists with this name: legacy");
+    store.close();
+  });
+
+  it("rejects malformed view declarations", () => {
+    expect(() => view("v", { sql: "  ", columns: { a: column.number() } })).toThrow(
+      "View v has no query",
+    );
+    expect(() => view("v", { sql: "SELECT 1", columns: {} })).toThrow(
+      "View v needs at least one column",
+    );
+    expect(() =>
+      view("v", { sql: "SELECT 1 AS a", columns: { a: column.number().unique() } }),
+    ).toThrow("A view column cannot be a unique key: v.a");
+    expect(() =>
+      view("v", { sql: "SELECT 1 AS a", columns: { a: column.number().default(1) } }),
+    ).toThrow("A view column cannot have a default: v.a");
+    expect(() =>
+      schema([table("t", { a: column.number().unique() })], {
+        views: [view("t", { sql: "SELECT a FROM t", columns: { a: column.number() } })],
+      }),
+    ).toThrow("Duplicate name in schema: t");
+  });
+
+  it("survives the wire round trip with its body and columns", () => {
+    const restored = deserializeSchema(serializeSchema(withView(ACTIVE_SQL)));
+    const restoredView = restored.views[0];
+    if (restoredView === undefined) expect.unreachable("view missing");
+    expect(restoredView.name).toBe("active_customers");
+    expect(restoredView.sql).toBe(ACTIVE_SQL);
+    expect(Object.keys(restoredView.columns)).toEqual(["id", "status"]);
+  });
+});
+
+// --- Published catalog ------------------------------------------------------------------------
+
+describe("catalog introspection", () => {
+  it("reports identity, constraints, triggers, and views", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema(
+        [
+          table("parents", {
+            id: column.number().unique().autoIncrement(),
+            label: column.string(),
+          }),
+          table(
+            "children",
+            {
+              id: column.number().unique(),
+              parent_id: column.number().references("parents", "id", { onDelete: "cascade" }),
+              tier: column.enum(["free", "paid"]).default("free"),
+            },
+            { checks: [{ name: "positive_id", sql: "id > 0" }] },
+          ),
+        ],
+        {
+          views: [
+            view("paid_children", {
+              sql: `SELECT id, tier FROM children WHERE tier = 'paid'`,
+              columns: { id: column.number(), tier: column.string() },
+            }),
+          ],
+        },
+      ),
+    );
+    // A trigger body may only insert into a keyless table, so the audit sink has no unique key.
+    await database.execute(`CREATE TABLE child_audit (note VARCHAR(20) NOT NULL)`);
+    await database.execute(
+      `CREATE TRIGGER audit AFTER INSERT ON children BEGIN INSERT INTO child_audit (note) VALUES ('added'); END`,
+    );
+
+    const catalog = await database.introspect();
+    expect(catalog.tables.map(({ name }) => name)).toEqual(["child_audit", "children", "parents"]);
+    expect(catalog.views.map(({ name }) => name)).toEqual(["paid_children"]);
+
+    const children = catalog.tables.find(({ name }) => name === "children");
+    const parents = catalog.tables.find(({ name }) => name === "parents");
+    if (children === undefined || parents === undefined) expect.unreachable("missing table");
+
+    // Identity: every column has a stable id, and the key is named by id rather than by name.
+    expect(children.columns.every(({ id }) => id.length > 0)).toBe(true);
+    const keyColumn = children.columns.find(({ id }) => id === children.uniqueKeyColumnId);
+    expect(keyColumn?.name).toBe("id");
+
+    expect(children.foreignKeys).toEqual([
+      {
+        name: "children_parent_id_fkey",
+        column: "parent_id",
+        parentTable: "parents",
+        parentColumn: "id",
+        onDelete: "cascade",
+      },
+    ]);
+    expect(children.checks).toEqual([{ name: "positive_id", sql: "id > 0" }]);
+    expect(children.triggers).toEqual([{ name: "audit", event: "insert", timing: "after" }]);
+
+    // Derived facts a planner would otherwise have to decode from a default spec.
+    expect(parents.columns.find(({ name }) => name === "id")?.isAutoIncrementing).toBe(true);
+    expect(children.columns.find(({ name }) => name === "id")?.isAutoIncrementing).toBe(false);
+    expect(children.columns.find(({ name }) => name === "tier")?.enumValues).toEqual([
+      "free",
+      "paid",
+    ]);
+
+    const paidChildren = catalog.views[0];
+    if (paidChildren === undefined) expect.unreachable("missing view");
+    expect(paidChildren.sql).toContain("WHERE tier = 'paid'");
+    expect(paidChildren.columns.map(({ name }) => name)).toEqual(["id", "tier"]);
+    store.close();
+  });
+
+  it("keeps a rename planable by holding column ids stable across it", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema([table("t", { id: column.number().unique(), before: column.string().nullable() })]),
+    );
+    const idBefore = (await database.introspect()).tables[0]?.columns.find(
+      ({ name }) => name === "before",
+    )?.id;
+    await database.migrate(
+      schema([
+        table("t", {
+          id: column.number().unique(),
+          after: column.string().nullable().renamedFrom("before"),
+        }),
+      ]),
+    );
+    const renamed = (await database.introspect()).tables[0]?.columns.find(
+      ({ name }) => name === "after",
+    );
+    expect(renamed?.id).toBe(idBefore);
+    store.close();
+  });
+});
+
+describe("planning a migration without engine access", () => {
+  /**
+   * The whole point of publishing the catalog: a schema tool can hold a `Catalog` value it got
+   * from `introspect()` — or built itself — and plan against it with no database, no store, and
+   * no engine import. This test constructs one by hand for exactly that reason.
+   */
+  const handBuilt: Catalog = {
+    tables: [
+      {
+        name: "notes",
+        uniqueKeyColumnId: "col-id",
+        columns: [
+          {
+            id: "col-id",
+            name: "id",
+            type: "number",
+            nullable: false,
+            defaultValue: { kind: "autoincrement" },
+            isAutoIncrementing: true,
+          },
+          {
+            id: "col-body",
+            name: "body",
+            type: "string",
+            nullable: false,
+            isAutoIncrementing: false,
+          },
+        ],
+        foreignKeys: [],
+        checks: [],
+        triggers: [],
+      },
+    ],
+    views: [],
+  };
+
+  const notesTable = () =>
+    table("notes", { id: column.number().unique().autoIncrement(), body: column.string() });
+
+  it("plans an add-column from a hand-built catalog", () => {
+    const plan = planMigration(
+      handBuilt,
+      schema([
+        table("notes", {
+          id: column.number().unique().autoIncrement(),
+          body: column.string(),
+          note: column.string().nullable(),
+        }),
+      ]),
+    );
+    expect(plan.steps.length).toBe(1);
+    const [step] = plan.steps;
+    if (step?.kind !== "add-column") expect.unreachable("expected an add-column step");
+    expect(step.tableName).toBe("notes");
+    expect(step.columnName).toBe("note");
+    expect(step.definition.type).toBe("string");
+    expect(step.definition.isNullable).toBe(true);
+  });
+
+  it("plans a rename through the stable column id, not the name", () => {
+    const plan = planMigration(
+      handBuilt,
+      schema([
+        table("notes", {
+          id: column.number().unique().autoIncrement(),
+          content: column.string().renamedFrom("body"),
+        }),
+      ]),
+    );
+    expect(plan.steps).toEqual([
+      { kind: "rename-column", tableName: "notes", from: "body", to: "content" },
+    ]);
+  });
+
+  it("plans nothing when the catalog already matches", () => {
+    expect(planMigration(handBuilt, schema([notesTable()])).steps).toEqual([]);
+  });
+
+  it("plans a view replacement against a catalog that already has one", () => {
+    const withView: Catalog = {
+      ...handBuilt,
+      views: [
+        {
+          name: "recent",
+          sql: "SELECT id FROM notes",
+          columns: [
+            { id: "v-id", name: "id", type: "number", nullable: true, isAutoIncrementing: false },
+          ],
+        },
+      ],
+    };
+    const declared = view("recent", {
+      sql: "SELECT id FROM notes WHERE id > 10",
+      columns: { id: column.number() },
+    });
+    const plan = planMigration(withView, schema([notesTable()], { views: [declared] }));
+    expect(plan.steps).toEqual([{ kind: "replace-view", view: declared }]);
+
+    // Unchanged body plans nothing; a view the schema stops declaring is dropped.
+    const same = view("recent", { sql: "SELECT id FROM notes", columns: { id: column.number() } });
+    expect(planMigration(withView, schema([notesTable()], { views: [same] })).steps).toEqual([]);
+    const other = view("other", { sql: "SELECT id FROM notes", columns: { id: column.number() } });
+    expect(planMigration(withView, schema([notesTable()], { views: [other] })).steps).toEqual([
+      { kind: "replace-view", view: other },
+      { kind: "drop-view", viewName: "recent" },
+    ]);
+  });
+
+  it("refuses an unprovable change from a hand-built catalog too", () => {
+    expect(() =>
+      planMigration(
+        handBuilt,
+        schema([table("notes", { id: column.number().unique().autoIncrement() })]),
+      ),
+    ).toThrow("Dropping columns is not supported: notes.body");
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { MinnowDatabaseClient, type ClientTransport } from "../client.js";
-import { column, schema, table } from "../schema.js";
-import { attachDatabaseWorker, type RpcScope } from "../worker-host.js";
+import { MinnowDatabaseClient, type ClientTransport } from "@minnowdb/core";
+import { column, schema, table } from "@minnowdb/core";
+import { attachDatabaseWorker, type RpcScope } from "@minnowdb/core";
 import { Minnow } from "./db.js";
 import { type InferDatabase } from "./types.js";
 

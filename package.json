@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -b && npm run build --workspace @minnowdb/site",
     "site:dev": "npm run dev --workspace @minnowdb/site",
-    "site:build": "tsc -b packages/core packages/devtools && npm run build --workspace @minnowdb/site",
+    "site:build": "tsc -b packages/core packages/client packages/devtools && npm run build --workspace @minnowdb/site",
     "typecheck": "tsc -b --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit",
     "test": "npm run test:unit",
     "test:unit": "vitest run",

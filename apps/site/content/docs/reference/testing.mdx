@@ -116,4 +116,5 @@ npm run benchmark:sizes
 
 Each engine's browser entry is bundled and minified with identical esbuild settings, and the
 WebAssembly and data files it fetches at run time are added at their shipped size. The result
-lands in `apps/site/src/data/library-sizes.json`, which the page renders directly.
+lands in `apps/site/components/bench/library-sizes.json`. The benchmarks page carries the
+headline figure in `apps/site/components/bench/config.ts`, which is updated by hand from that run.

@@ -1,11 +1,11 @@
 /* eslint-disable @typescript-eslint/unbound-method -- expectTypeOf inspects method types
    without ever invoking them, so `this` scoping cannot go wrong here */
-import { MemoryBlockStore } from "../../storage/index.js";
+import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { MinnowDatabase } from "../database.js";
-import { column, schema, table } from "../schema.js";
+import { MinnowDatabase } from "@minnowdb/core";
+import { column, schema, table, view } from "@minnowdb/core";
 import { Minnow, createMinnow } from "./db.js";
-import { type InferDatabase } from "./types.js";
+import { type FromRow, type InferDatabase, type WritableTable } from "./types.js";
 
 /**
  * The TypeScript experience, pinned. The @ts-expect-error cases are enforced by `npm run
@@ -294,7 +294,7 @@ describe("infers precise row types", () => {
 type Digit = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 type TenColumns<TPrefix extends string> = Record<`${TPrefix}${Digit}`, number>;
 type WideRow = TenColumns<"a"> & TenColumns<"b"> & { id: number; label: string };
-type WideDB = Record<`table_${0 | 1 | 2 | 3 | 4}${Digit}`, WideRow>;
+type WideDB = Record<`table_${0 | 1 | 2 | 3 | 4}${Digit}`, FromRow<WideRow>>;
 
 describe("wide-schema type scalability", () => {
   it("keeps precise inference over a 50-table, 22-column database type", () => {
@@ -313,5 +313,47 @@ describe("wide-schema type scalability", () => {
     // @ts-expect-error -- unknown column stays rejected even on the widest schema
     void q.where("t.z9", "=", 1);
     expect(q.compile().plan.base.table).toBe("table_07");
+  });
+});
+
+describe("views are readable but not writable", () => {
+  const customers = table("customers", {
+    id: column.number().unique(),
+    status: column.string(),
+  });
+  const activeCustomers = view("active_customers", {
+    sql: `SELECT id, status FROM customers WHERE status = 'active'`,
+    columns: { id: column.number(), status: column.string() },
+  });
+  const viewSchema = schema([customers], { views: [activeCustomers] });
+  type ViewDB = InferDatabase<typeof viewSchema>;
+
+  it("declares the view alongside its tables", () => {
+    expect(viewSchema.views.map(({ name }) => name)).toEqual(["active_customers"]);
+  });
+
+  it("selects from a view with its declared row type", () => {
+    const db = new Minnow<ViewDB>(new MinnowDatabase(new MemoryBlockStore()));
+    const q = db.selectFrom("active_customers").select(["id", "status"]);
+    expectTypeOf(q.execute).returns.resolves.toEqualTypeOf<Array<{ id: number; status: string }>>();
+  });
+
+  it("refuses every write against a view", () => {
+    const db = new Minnow<ViewDB>(new MinnowDatabase(new MemoryBlockStore()));
+    // @ts-expect-error -- a view has no insert shape, so it is not a writable table
+    void db.insertInto("active_customers");
+    // @ts-expect-error -- likewise for updates
+    void db.updateTable("active_customers");
+    // @ts-expect-error -- and for deletes
+    void db.deleteFrom("active_customers");
+    // The real table behind it still accepts all three.
+    void db.insertInto("customers");
+    void db.updateTable("customers");
+    void db.deleteFrom("customers");
+  });
+
+  it("keeps a view out of WritableTable while leaving it selectable", () => {
+    expectTypeOf<WritableTable<ViewDB>>().toEqualTypeOf<"customers">();
+    expectTypeOf<keyof ViewDB>().toEqualTypeOf<"customers" | "active_customers">();
   });
 });

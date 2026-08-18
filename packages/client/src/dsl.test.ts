@@ -1,12 +1,19 @@
-import { MemoryBlockStore } from "../../storage/index.js";
+import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { MinnowDatabase } from "../database.js";
-import { compileQuery, compileStatement, type CompiledQuery } from "../query.js";
-import { column, schema, table, type Generated } from "../schema.js";
+import { MinnowDatabase } from "@minnowdb/core";
+import { compileQuery, compileStatement } from "@minnowdb/core";
+import { type CompiledQuery } from "@minnowdb/core/plan";
+import { column, schema, table, type Generated } from "@minnowdb/core";
 import { Minnow } from "./db.js";
 import { NoResultError, type SelectQueryBuilder } from "./select-query-builder.js";
 import { sql } from "./sql-tag.js";
-import { type InferDatabase } from "./types.js";
+import {
+  type FromRow,
+  type InferDatabase,
+  type InsertRowOf,
+  type SelectRowOf,
+  type UpdateRowOf,
+} from "./types.js";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -74,9 +81,23 @@ async function seededDb(): Promise<{ db: Minnow<DB>; database: MinnowDatabase }>
 
 describe("InferDatabase", () => {
   it("derives table row types keyed by literal table names", () => {
-    expectTypeOf<DB>().toEqualTypeOf<{
-      people: { name: string; score: number; city: string | null };
-      orders: { order_id: number; person: string; total: number };
+    // DB names the three shapes explicitly rather than making a reader decode a marker.
+    expectTypeOf<SelectRowOf<DB["people"]>>().toEqualTypeOf<{
+      name: string;
+      score: number;
+      city: string | null;
+    }>();
+    expectTypeOf<SelectRowOf<DB["orders"]>>().toEqualTypeOf<{
+      order_id: number;
+      person: string;
+      total: number;
+    }>();
+    expectTypeOf<InsertRowOf<DB["people"]>>().toEqualTypeOf<
+      { name: string; score: number } & { city?: string | null }
+    >();
+    expectTypeOf<UpdateRowOf<DB["people"]>>().toEqualTypeOf<{
+      score?: number | undefined;
+      city?: string | null | undefined;
     }>();
   });
 });
@@ -420,7 +441,8 @@ describe("select builder execution", () => {
 
   it("throws when a subquery builder executes directly", () => {
     const { db } = createDb();
-    let captured: SelectQueryBuilder<DB, { p: DB["people"] }, Record<never, unknown>> | undefined;
+    let captured:
+      SelectQueryBuilder<DB, { p: SelectRowOf<DB["people"]> }, Record<never, unknown>> | undefined;
     db.selectFrom("people as p")
       .where((eb) => {
         captured = eb.selectFrom("people as p");
@@ -581,8 +603,10 @@ describe("mutation builders", () => {
     const notesSchema = schema([notes]);
     // The Kysely convention: a hand-written DB interface marks engine-filled columns itself
     // instead of deriving the brand through InferDatabase.
+    // A hand-written DB: FromRow reads the Generated<> marker once, here, so nothing deeper
+    // in the stack has to look for it.
     interface HandDeclared {
-      notes: { id: Generated<number>; body: string };
+      notes: FromRow<{ id: Generated<number>; body: string }>;
     }
     const database = new MinnowDatabase(new MemoryBlockStore(), {
       rowsPerBlock: 8,

@@ -4,7 +4,8 @@
  *
  * Serve the repository root with vite and open /packages/devtools/demo/.
  */
-import { column, createMinnow, MinnowDatabase, schema, table } from "@minnowdb/core";
+import { column, MinnowDatabase, schema, table } from "@minnowdb/core";
+import { createMinnow } from "@minnowdb/client";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { mountMinnowDevtools, type DevtoolsTheme } from "@minnowdb/devtools";
 

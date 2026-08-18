@@ -1,4 +1,4 @@
-import { validateFtsQuery } from "../fts.js";
+import { validateFtsQuery } from "@minnowdb/core/plan";
 import {
   hasAggregate,
   type AggregateName,
@@ -6,7 +6,7 @@ import {
   type PredicateOperator,
   type QueryValue,
   type WindowFunctionName,
-} from "../query.js";
+} from "@minnowdb/core/plan";
 import {
   isBlockCompilable,
   materialize,

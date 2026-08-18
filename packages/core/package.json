@@ -7,6 +7,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./plan": {
+      "types": "./dist/plan/index.d.ts",
+      "default": "./dist/plan/index.js"
+    },
     "./client": {
       "types": "./dist/engine/client.d.ts",
       "default": "./dist/engine/client.js"

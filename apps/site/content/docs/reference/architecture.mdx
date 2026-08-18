@@ -148,7 +148,7 @@ Storage                IndexedDB, block codecs, manifests, leases, GC
 - Each tab owns its own coordinator worker.
 - Buffers cross the boundary as transferable `ArrayBuffer`s — no shared memory, which is why no
   cross-origin isolation is needed.
-- The [worker protocol](/docs/client/workers) is versioned RPC; each handle answers a fixed list of
+- The [worker protocol](/docs/engine/workers) is versioned RPC; each handle answers a fixed list of
   methods, nothing else.
 - Inside `@minnowdb/core`, the layers are separate modules — `block-format`, `storage`,
   `transactions`, and the engine — each importable on its own.

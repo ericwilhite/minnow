@@ -5,7 +5,7 @@ import {
   type Predicate,
   type QueryRow,
   type QueryValue,
-} from "../query.js";
+} from "@minnowdb/core/plan";
 import {
   buildBinaryCondition,
   createExpressionBuilder,
@@ -26,10 +26,11 @@ import {
   type ColumnReference,
   type CompileContext,
   type ExpressionSource,
-  type InsertRowFor,
+  type InsertRowOf,
   type ReferencedValue,
   type Simplify,
-  type UpdateChangesFor,
+  type SelectRowOf,
+  type UpdateRowOf,
 } from "./types.js";
 
 /**
@@ -117,7 +118,7 @@ export class InsertQueryBuilder<
   ) {}
 
   values(
-    rows: InsertRowFor<DB[TTable]> | ReadonlyArray<InsertRowFor<DB[TTable]>>,
+    rows: InsertRowOf<DB[TTable]> | ReadonlyArray<InsertRowOf<DB[TTable]>>,
   ): InsertQueryBuilder<DB, TTable, TReturn> {
     const additions = (Array.isArray(rows) ? rows : [rows]) as ReadonlyArray<
       Readonly<Record<string, unknown>>
@@ -143,9 +144,9 @@ export class InsertQueryBuilder<
   }
 
   /** Returns the written rows projected to these columns instead of an InsertResult. */
-  returning<TCol extends keyof DB[TTable] & string>(
+  returning<TCol extends keyof SelectRowOf<DB[TTable]> & string>(
     columns: readonly TCol[],
-  ): InsertQueryBuilder<DB, TTable, Simplify<Pick<DB[TTable], TCol>>> {
+  ): InsertQueryBuilder<DB, TTable, Simplify<Pick<SelectRowOf<DB[TTable]>, TCol>>> {
     return new InsertQueryBuilder(
       this.services,
       this.table,
@@ -156,7 +157,7 @@ export class InsertQueryBuilder<
   }
 
   /** Returns the complete written rows instead of an InsertResult. */
-  returningAll(): InsertQueryBuilder<DB, TTable, Simplify<DB[TTable]>> {
+  returningAll(): InsertQueryBuilder<DB, TTable, Simplify<SelectRowOf<DB[TTable]>>> {
     return new InsertQueryBuilder(
       this.services,
       this.table,
@@ -224,7 +225,7 @@ export class InsertQueryBuilder<
 
 // --- Shared filtered-mutation machinery ---------------------------------------------------------
 
-type Ctx<DB, TTable extends keyof DB & string> = Record<TTable, DB[TTable]>;
+type Ctx<DB, TTable extends keyof DB & string> = Record<TTable, SelectRowOf<DB[TTable]>>;
 
 type MutationWhereFactory<DB, TTable extends keyof DB & string> = (
   eb: ExpressionBuilder<DB, Ctx<DB, TTable>>,
@@ -287,15 +288,16 @@ export class UpdateQueryBuilder<
     private readonly returningColumns?: ReturningState,
   ) {}
 
-  set<TCol extends keyof DB[TTable] & string>(
+  set<TCol extends keyof UpdateRowOf<DB[TTable]> & string>(
     column: TCol,
-    value: DB[TTable][TCol] | ExpressionWrapper<DB[TTable][TCol]>,
+    value: UpdateRowOf<DB[TTable]>[TCol] | ExpressionWrapper<UpdateRowOf<DB[TTable]>[TCol]>,
   ): UpdateQueryBuilder<DB, TTable, TReturn>;
   set(
     changes:
-      | UpdateChangesFor<DB[TTable]>
+      | UpdateRowOf<DB[TTable]>
       | ((eb: ExpressionBuilder<DB, Ctx<DB, TTable>>) => {
-          [K in keyof DB[TTable]]?: DB[TTable][K] | ExpressionWrapper<DB[TTable][K]> | undefined;
+          [K in keyof UpdateRowOf<DB[TTable]>]?:
+            UpdateRowOf<DB[TTable]>[K] | ExpressionWrapper<UpdateRowOf<DB[TTable]>[K]> | undefined;
         }),
   ): UpdateQueryBuilder<DB, TTable, TReturn>;
   set(changes: unknown, value?: unknown): UpdateQueryBuilder<DB, TTable, TReturn> {
@@ -354,9 +356,9 @@ export class UpdateQueryBuilder<
   }
 
   /** Returns the affected rows (post-update values) projected to these columns. */
-  returning<TCol extends keyof DB[TTable] & string>(
+  returning<TCol extends keyof SelectRowOf<DB[TTable]> & string>(
     columns: readonly TCol[],
-  ): UpdateQueryBuilder<DB, TTable, Simplify<Pick<DB[TTable], TCol>>> {
+  ): UpdateQueryBuilder<DB, TTable, Simplify<Pick<SelectRowOf<DB[TTable]>, TCol>>> {
     return new UpdateQueryBuilder(
       this.services,
       this.table,
@@ -367,7 +369,7 @@ export class UpdateQueryBuilder<
   }
 
   /** Returns the complete affected rows (post-update values). */
-  returningAll(): UpdateQueryBuilder<DB, TTable, Simplify<DB[TTable]>> {
+  returningAll(): UpdateQueryBuilder<DB, TTable, Simplify<SelectRowOf<DB[TTable]>>> {
     return new UpdateQueryBuilder(this.services, this.table, this.wheres, this.assignments, "*");
   }
 
@@ -452,14 +454,14 @@ export class DeleteQueryBuilder<
   }
 
   /** Returns the deleted rows projected to these columns. */
-  returning<TCol extends keyof DB[TTable] & string>(
+  returning<TCol extends keyof SelectRowOf<DB[TTable]> & string>(
     columns: readonly TCol[],
-  ): DeleteQueryBuilder<DB, TTable, Simplify<Pick<DB[TTable], TCol>>> {
+  ): DeleteQueryBuilder<DB, TTable, Simplify<Pick<SelectRowOf<DB[TTable]>, TCol>>> {
     return new DeleteQueryBuilder(this.services, this.table, this.wheres, columns);
   }
 
   /** Returns the complete deleted rows. */
-  returningAll(): DeleteQueryBuilder<DB, TTable, Simplify<DB[TTable]>> {
+  returningAll(): DeleteQueryBuilder<DB, TTable, Simplify<SelectRowOf<DB[TTable]>>> {
     return new DeleteQueryBuilder(this.services, this.table, this.wheres, "*");
   }
 

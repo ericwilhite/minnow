@@ -775,6 +775,47 @@ tiers remain outstanding.
       and serve per-document scores directly from postings (row fetch-by-id) to skip candidate
       segments entirely.
 
+## Phase 20 — Public surface
+
+Landed August 2026: the schema DSL creates the FOREIGN KEY and CHECK constraints it declares (it
+previously dropped both, producing a weaker table than the equivalent SQL DDL); views are
+declarable with engine-verified column shapes; `@minnowdb/client` holds the typed query builder as
+its own package, built only from `@minnowdb/core/plan`; `introspect()` publishes a `Catalog` with
+stable column identity; `planMigration` diffs against that `Catalog` rather than storage records;
+and `InferDatabase` names each entry's select/insert/update shapes instead of the builder decoding
+a phantom marker.
+
+Remaining, in rough dependency order:
+
+- [ ] Collapse the main-thread mirror. `MinnowDatabaseClient` restates ~36 engine methods, so each
+      engine addition costs four edits and drift is routine (`dropTable`, `createView`, `dropView`
+      reached the engine and never the client). One contract — a statement in, a result out, plus
+      transactions, subscribe, introspect — implemented by both the in-process engine and the
+      worker client, reduces the wire surface to roughly seven frames.
+- [ ] Split the operator surface. Compaction, garbage collection, spill cleanup, segment
+      inspection, and snapshot import/export belong to devtools, not to applications.
+- [ ] Expose imperative `begin` / `commit` / `rollback`. The engine already has statement
+      transactions; a scoped `transaction(fn)` can be built on top, but not the reverse without
+      suspending a callback on deferred promises.
+- [ ] Make the plan IR a leaf module. `query.ts` holds 36 plan types and 71 parser/compiler/executor
+      values in one 8,451-line file; `@minnowdb/core/plan` re-exports from it today. Splitting
+      makes builder/SQL plan parity a property of the module graph rather than a comment and a test.
+- [ ] Delete the eager/deferred expression duality in the builder. `ExpressionSource` is
+      `Expression | ((ctx) => Expression)` so children can be built eagerly, which costs
+      index-based child access and `typeof` guards throughout. Measured: whole-query compile is
+      14.5 µs, 0.07% of a query, so the optimisation is not worth its complexity.
+- [ ] Make four thrown builder invariants unrepresentable through type-state: executing a
+      subquery, compiling without a select, `offset()` before `limit()`, and `select()` after
+      `selectAll()` are static facts currently raised at runtime.
+- [ ] Emit migration steps a caller could apply itself. `planMigration` is engine-free, but
+      applying still requires `migrate()` because a rename happens through a column's stable ID
+      and `ALTER TABLE` has no spelling for it.
+
+Explicitly rejected after measurement: passing pre-compiled plans across the worker boundary
+(parsing is 11–28 µs, 0.3–0.8% of any query touching real data), and micro-optimising the builder's
+state spread, alias regex, or expression-builder allocation (0.02–0.54 µs each, against a 23 ms
+query).
+
 ## Result recording
 
 Every checked-in benchmark result must include date/time, browser and version, operating system, logical/stored bytes, dataset shape, codec, block size/count, durability, write/read/decode/aggregate timings, verification result, and known environmental caveats. Results are observations, not promises, and should never be silently compared across materially different environments.

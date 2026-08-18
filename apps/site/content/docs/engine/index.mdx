@@ -1,0 +1,125 @@
+---
+title: The database API
+description: MinnowDatabase, batch writes, and the options that shape a database.
+---
+
+`MinnowDatabase` is the engine. It takes a [block store](/docs/storage) and exposes everything
+else — SQL, batch writes, the catalog, and maintenance.
+
+```ts
+import { MinnowDatabase } from "@minnowdb/core";
+import { IndexedDbBlockStore } from "@minnowdb/core/storage";
+
+const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }), {
+  compression: "gzip",
+  bufferPoolBytes: 64 * 1024 * 1024,
+});
+```
+
+The same surface is available from the main thread when the engine
+[runs in a worker](/docs/engine/workers) — `MinnowDatabaseClient` mirrors it call for call.
+
+## Catalog
+
+```ts
+await db.createTable({
+  name: "orders",
+  uniqueKey: "order_id",
+  columns: [
+    { name: "order_id", type: "number" },
+    { name: "total", type: "number" },
+    { name: "note", type: "string", nullable: true },
+  ],
+});
+
+await db.listTables();
+```
+
+`createTable` is the programmatic form of [`CREATE TABLE`](/docs/sql/ddl) and the only place
+column defaults can be declared.
+
+## Bulk writes
+
+Parsing an `INSERT` per row is the wrong shape for loading data. The batch APIs take rows
+directly:
+
+```ts
+await db.insertBatch("orders", [
+  { order_id: 1, total: 24.5, note: null },
+  { order_id: 2, total: 88.0, note: "gift wrap" },
+]);
+```
+
+Or columns, when you already hold them that way — which skips the pivot the engine would
+otherwise do:
+
+```ts
+await db.insertBatch("orders", {
+  columns: {
+    order_id: [1, 2],
+    total: [24.5, 88.0],
+    note: [null, "gift wrap"],
+  },
+});
+```
+
+The full set:
+
+| Call                                    | Effect                                               |
+| --------------------------------------- | ---------------------------------------------------- |
+| `insertBatch(table, input)`             | Append rows. A duplicate key throws.                 |
+| `upsertBatch(table, input)`             | Insert, replacing any row with the same key.         |
+| `updateBatch(table, { keys, changes })` | Change named columns on rows addressed by key.       |
+| `deleteBatch(table, { keys })`          | Remove rows by key.                                  |
+| `insert` / `upsert` / `update`          | Single-row convenience wrappers over the same paths. |
+
+Each returns what it did — `rowCount`, `blockCount`, `storedBytes`, and the published `version` —
+which is enough to drive a progress bar over a large load without a second query.
+
+One batch is one commit. To make several land together, wrap them in a
+[write scope](/docs/engine/transactions).
+
+### Buffered writing
+
+For a stream of small writes — telemetry, edits as a user types — a buffered writer coalesces them
+into blocks worth committing:
+
+```ts
+const writer = db.bufferedWriter("events", { maxRows: 5_000, maxDelayMs: 250 });
+writer.add({ event_id: id, kind: "click", at: new Date() });
+await writer.flush();
+```
+
+`attachLifecycleFlush` wires a writer's flush to page hide and freeze events, so a buffer does not
+follow the tab into the grave.
+
+## Options
+
+| Option             | Default  | What it does                                                                                                                                                                                 |
+| ------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `compression`      | `"gzip"` | Block codec. `"raw"` ingests about twice as fast; `gzip` halves stored bytes and reads _faster_ cold, because reading half the bytes out of IndexedDB more than pays for decompressing them. |
+| `rowsPerBlock`     | `65536`  | The scan's row group and the buffer pool's residency unit. Measured flat above ~16k; small blocks cost up to 66% on top-N.                                                                   |
+| `bufferPoolBytes`  | 64 MiB   | Retained decoded blocks and their vectorized forms. `0` disables it. Every entry is keyed by an immutable identity, so a cached entry can never be stale.                                    |
+| `ftsAutoIndexRows` | `4096`   | Rows above which a `MATCH` on an unindexed append-only column schedules a background index build.                                                                                            |
+| `maxCommitRetries` | `8`      | How many times a losing writer rebases and retries before giving up.                                                                                                                         |
+| `autoCompact`      | `true`   | Whether small segments are merged in the background.                                                                                                                                         |
+
+## Errors
+
+Errors are classes, so they can be caught by kind rather than by matching a message:
+
+```ts
+import { SqlCompileError, UniqueConstraintError, WriteConflictError } from "@minnowdb/core";
+```
+
+`SqlCompileError` carries the `offset` and `length` of the offending span, which is what the
+devtools editor underlines. `WriteConflictError` means another writer committed first; the engine
+retries these itself up to `maxCommitRetries` before surfacing one.
+
+## Closing
+
+```ts
+db.close();
+```
+
+Closes the underlying store. Any in-flight query rejects rather than hanging.

@@ -170,10 +170,13 @@ import {
 } from "./memory.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySetOptions } from "./live.js";
 import { chooseJoinOrder, renderPlan } from "./optimizer.js";
+import { toCatalog, type Catalog } from "./catalog.js";
 import {
   applyColumnSteps,
+  declaredForeignKeys,
   planMigration,
   type AnyTable,
+  type AnyView,
   type MigrationStep,
   type SchemaDefinition,
 } from "./schema.js";
@@ -1067,6 +1070,15 @@ export class MinnowDatabase {
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyStorage: "chunks-v2" as const }),
       createdAt: this.#now().toISOString(),
     });
+  }
+
+  /**
+   * The published catalog: stable column IDs, key identity, constraints, triggers, and view
+   * bodies. This is the introspection surface schema tooling builds on — `listTables()` answers
+   * what a reader can select, this answers what a planner needs to diff.
+   */
+  async introspect(): Promise<Catalog> {
+    return toCatalog(await this.store.listTables());
   }
 
   async listTables(): Promise<TableDefinition[]> {
@@ -4240,9 +4252,12 @@ export class MinnowDatabase {
    * steps — and every catalog alteration is one atomic compare-and-swap, so a concurrent
    * migrator fails explicitly with a conflict instead of interleaving.
    */
-  async migrate(
-    definition: SchemaDefinition<readonly AnyTable[]>,
-  ): Promise<{ createdTables: string[]; alteredTables: string[]; steps: MigrationStep[] }> {
+  async migrate(definition: SchemaDefinition<readonly AnyTable[]>): Promise<{
+    createdTables: string[];
+    alteredTables: string[];
+    replacedViews: string[];
+    steps: MigrationStep[];
+  }> {
     // Table revisions also move under background full-text index activity (build stamps,
     // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
     // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
@@ -4256,9 +4271,34 @@ export class MinnowDatabase {
     }
   }
 
-  async #migrateOnce(
-    definition: SchemaDefinition<readonly AnyTable[]>,
-  ): Promise<{ createdTables: string[]; alteredTables: string[]; steps: MigrationStep[] }> {
+  /**
+   * A declared view states the columns its author expects. The engine infers the real output
+   * schema when it creates the view; if the two disagree the declaration is a lie that every
+   * reader would inherit, so the migration fails here instead.
+   */
+  #assertViewMatchesDeclaration(record: TableRecord | undefined, step: { view: AnyView }): void {
+    if (record === undefined) throw new Error(`View was not created: ${step.view.name}`);
+    const declared = Object.entries(step.view.columns).map(([name, definition]) => ({
+      name,
+      type: definition.type,
+    }));
+    const inferred = record.columns.map(({ name, type }) => ({ name, type }));
+    const render = (columns: Array<{ name: string; type: string }>): string =>
+      columns.map(({ name, type }) => `${name} ${type}`).join(", ");
+    if (render(declared) !== render(inferred)) {
+      throw new TypeError(
+        `View ${step.view.name} declares (${render(declared)}) but its query produces ` +
+          `(${render(inferred)})`,
+      );
+    }
+  }
+
+  async #migrateOnce(definition: SchemaDefinition<readonly AnyTable[]>): Promise<{
+    createdTables: string[];
+    alteredTables: string[];
+    replacedViews: string[];
+    steps: MigrationStep[];
+  }> {
     // One listTables pass drives planning and execution: a create step exists only because the
     // table was absent from this snapshot, and each altered table applies all of its steps in a
     // single compare-and-swap, so a migration costs one catalog write per changed table however
@@ -4266,13 +4306,18 @@ export class MinnowDatabase {
     // explicitly through createTable's uniqueness check or the revision conflict.
     const records = await this.store.listTables();
     const recordsByName = new Map(records.map((record) => [record.name, record]));
-    const plan = planMigration(records, definition);
+    const plan = planMigration(toCatalog(records), definition);
     const createdTables: string[] = [];
+    const replacedViews: string[] = [];
     const alterationsByTable = new Map<string, MigrationStep[]>();
     for (const step of plan.steps) {
       if (step.kind === "create-table") {
         const entries = Object.entries(step.table.columns);
         const uniqueEntry = entries.find(([, columnDefinition]) => columnDefinition.isUnique);
+        // Constraints ride along with the columns: a table declared with a relation or a row
+        // condition must reject the same writes whichever path created it. Dropping them here
+        // is what made `migrate()` produce a weaker table than the equivalent SQL DDL.
+        const foreignKeys = declaredForeignKeys(step.table);
         await this.createTable({
           name: step.table.name,
           ...(uniqueEntry === undefined ? {} : { uniqueKey: uniqueEntry[0] }),
@@ -4287,8 +4332,22 @@ export class MinnowDatabase {
               ? {}
               : { enumValues: columnDefinition.enumValues }),
           })),
+          ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
+          ...(step.table.checks.length === 0 ? {} : { checks: [...step.table.checks] }),
         });
         createdTables.push(step.table.name);
+        continue;
+      }
+      // Views carry no data, so they are applied directly rather than batched into a table's
+      // atomic column rewrite. `orReplace` makes create and redefine one path.
+      if (step.kind === "replace-view") {
+        await this.createView(step.view.name, step.view.sql, { orReplace: true });
+        this.#assertViewMatchesDeclaration(await this.store.getTableByName(step.view.name), step);
+        replacedViews.push(step.view.name);
+        continue;
+      }
+      if (step.kind === "drop-view") {
+        await this.dropView(step.viewName, { ifExists: true });
         continue;
       }
       const steps = alterationsByTable.get(step.tableName) ?? [];
@@ -4350,7 +4409,7 @@ export class MinnowDatabase {
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
       alteredTables.push(tableName);
     }
-    return { createdTables, alteredTables, steps: plan.steps };
+    return { createdTables, alteredTables, replacedViews, steps: plan.steps };
   }
 
   /**

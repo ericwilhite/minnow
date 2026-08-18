@@ -1,4 +1,4 @@
-import { type QueryResult } from "../query.js";
+import { type QueryResult } from "@minnowdb/core/plan";
 import { type TypedQueryEnvelope } from "./types.js";
 
 /**

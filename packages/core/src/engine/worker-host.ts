@@ -126,6 +126,7 @@ class DatabaseRpcServer {
     >;
     switch (method) {
       case "createTable":
+      case "introspect":
       case "listTables":
       case "insertBatch":
       case "insert":

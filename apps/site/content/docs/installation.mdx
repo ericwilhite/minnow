@@ -7,9 +7,19 @@ description: Install the package and open a database.
 npm install @minnowdb/core
 ```
 
-One package, plain JavaScript, no post-install step and no binary to fetch. It is around 143 KB
-gzipped — roughly a third of SQLite's WebAssembly build, which also has to download and compile
-its module before it can answer anything.
+Plain JavaScript, no post-install step and no binary to fetch. It is around 159 KB gzipped —
+roughly a third of SQLite's WebAssembly build, which also has to download and compile its module
+before it can answer anything.
+
+The engine speaks SQL and needs nothing else. If you also want a typed query builder, add the
+optional client:
+
+```bash
+npm install @minnowdb/client
+```
+
+It ships as its own package so it can version independently of the engine, and it is built only
+from the primitives at `@minnowdb/core/plan` — the same ones any other builder would use.
 
 ## Entry points
 
@@ -19,8 +29,10 @@ its module before it can answer anything.
 | `@minnowdb/core/storage`      | Block stores: `IndexedDbBlockStore`, `MemoryBlockStore`, and the `BlockStore` contract. |
 | `@minnowdb/core/worker`       | A ready-made worker entry. Point a module worker at it.                                 |
 | `@minnowdb/core/client`       | `MinnowDatabaseClient`, the main-thread half of the worker pair.                        |
+| `@minnowdb/core/plan`         | Plan-construction primitives, for building a typed layer over the engine.               |
 | `@minnowdb/core/testing`      | `FaultInjectingBlockStore`, for testing behaviour under storage failure.                |
 | `@minnowdb/core/block-format` | The on-disk block encoding, for tools that read blocks directly.                        |
+| `@minnowdb/client`            | Optional typed query builder: `createMinnow`, `InferDatabase`.                          |
 
 ## Opening a database
 
@@ -52,5 +64,5 @@ Anything with IndexedDB and `CompressionStream`: current Chrome, Firefox, Safari
 window or a worker. There is no Node build — the engine targets browsers, and the tests run it in
 real ones.
 
-Most applications should [run the engine in a worker](/docs/client/workers). The API is identical
+Most applications should [run the engine in a worker](/docs/engine/workers). The API is identical
 on either side of the boundary, and query execution then never competes with rendering.

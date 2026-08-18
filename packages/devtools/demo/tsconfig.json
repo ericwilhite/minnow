@@ -7,5 +7,15 @@
     "noEmit": true
   },
   "include": ["main.ts"],
-  "references": [{ "path": "../../core" }, { "path": ".." }]
+  "references": [
+    {
+      "path": "../../core"
+    },
+    {
+      "path": ".."
+    },
+    {
+      "path": "../../client"
+    }
+  ]
 }

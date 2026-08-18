@@ -1,6 +1,6 @@
 /**
  * Measures what a browser downloads to run each comparison engine, and writes the result to
- * apps/site/src/data/library-sizes.json for the benchmarks page.
+ * apps/site/components/bench/library-sizes.json for the benchmarks page.
  *
  * Every engine gets identical treatment: its browser entry is bundled with the same esbuild
  * settings (ESM, browser platform, minified, production), and the binary assets the bundle

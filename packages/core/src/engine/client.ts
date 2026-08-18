@@ -18,6 +18,7 @@ import {
   type SerializedError,
 } from "../worker-protocol/index.js";
 import { toColumnarBatch, type BatchRow, type InsertBatchInput } from "./batch.js";
+import type { Catalog } from "./catalog.js";
 import type {
   BatchValue,
   BufferPoolStats,
@@ -217,6 +218,11 @@ export class MinnowDatabaseClient {
 
   async createTable(input: CreateTableInput): Promise<void> {
     await this.#call("createTable", [input]);
+  }
+
+  /** The published catalog; see `MinnowDatabase.introspect()`. */
+  async introspect(): Promise<Catalog> {
+    return (await this.#call("introspect", [])) as Catalog;
   }
 
   async listTables(): Promise<TableDefinition[]> {

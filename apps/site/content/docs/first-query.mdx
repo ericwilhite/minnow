@@ -70,7 +70,7 @@ const inserted = await db.execute(
 // inserted.kind === "insert", inserted.returnedRows === [{ order_id: 1001, total: 24.5 }]
 ```
 
-For loading a lot of rows at once, [`insertBatch`](/docs/client#bulk-writes) takes them
+For loading a lot of rows at once, [`insertBatch`](/docs/engine#bulk-writes) takes them
 columnar and skips the parser entirely.
 
 </Step>
@@ -123,5 +123,5 @@ it for real.
 
 - [Running SQL](/docs/sql) — the full statement API, parameters, and result shapes.
 - [Writing data](/docs/sql/dml) — inserts, updates, deletes, upserts, `RETURNING`.
-- [Transactions](/docs/client/transactions) — atomic multi-statement writes and stable reads.
-- [Workers](/docs/client/workers) — moving the engine off the main thread.
+- [Transactions](/docs/engine/transactions) — atomic multi-statement writes and stable reads.
+- [Workers](/docs/engine/workers) — moving the engine off the main thread.

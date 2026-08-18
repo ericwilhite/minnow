@@ -1,4 +1,4 @@
 {
-  "title": "Client",
-  "pages": ["index", "transactions", "workers", "memory"]
+  "title": "Typed client",
+  "pages": ["index", "queries", "writes", "live"]
 }

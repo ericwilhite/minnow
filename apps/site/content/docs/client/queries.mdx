@@ -1,0 +1,241 @@
+---
+title: Reading data
+description: The select builder — joins, expressions, aggregates, subqueries, and set operations.
+---
+
+Every builder is immutable: each call returns a new builder, so partial queries are safe to share
+and extend. Nothing runs until you call `execute()`.
+
+```ts
+const rows = await db
+  .selectFrom("customers")
+  .select(["customer_id", "name"])
+  .where("city", "=", "London")
+  .orderBy("name")
+  .limit(20)
+  .execute();
+// Array<{ customer_id: number; name: string }>
+```
+
+The row type follows the select list, not the table. Ask for two columns and you get two.
+
+## Selecting
+
+`select()` takes a column, an array of columns, or a callback for expressions. `selectAll()` takes
+every column in scope.
+
+```ts
+db.selectFrom("orders").select("total");
+db.selectFrom("orders").select(["order_id", "total"]);
+db.selectFrom("orders").select("total as amount"); // renames in the row type too
+db.selectFrom("orders").selectAll();
+```
+
+Repeated `select()` calls accumulate, so a query can be built in pieces. Mixing `select()` with
+`selectAll()` throws — the wildcard cannot carry named additions.
+
+Reach for the output type without running anything:
+
+```ts
+const query = db.selectFrom("orders").select(["order_id", "total"]);
+type Row = typeof query.$inferRow; // { order_id: number; total: number }
+```
+
+## Aliases and joins
+
+Alias a table with `"table as alias"`; every column reference then resolves against the aliases in
+scope.
+
+```ts
+const rows = await db
+  .selectFrom("orders as o")
+  .innerJoin("customers as c", "o.customer_id", "c.customer_id")
+  .select(["c.name", "o.total"])
+  .execute();
+```
+
+`leftJoin` widens the joined table's columns with `null` in the row type, because that is what a
+left join actually returns. For anything beyond a single equality, pass a callback:
+
+```ts
+db.selectFrom("orders as o").innerJoin("customers as c", (join) =>
+  join.onRef("o.customer_id", "=", "c.customer_id").on("c.city", "=", "London"),
+);
+```
+
+`onRef` compares two columns; `on` compares a column to a value. A join whose alias is already in
+scope is a compile error naming the collision rather than a silent overwrite.
+
+## Filtering
+
+The three-argument form covers most predicates:
+
+```ts
+db.selectFrom("orders")
+  .where("status", "=", "shipped")
+  .where("total", ">", 100) // repeated where() is AND
+  .where("note", "is", null)
+  .where("status", "in", ["shipped", "delivered"]);
+```
+
+For anything else, pass a callback and use the expression builder:
+
+```ts
+db.selectFrom("orders as o").where((eb) =>
+  eb.or([eb("o.total", ">", 500), eb.and([eb("o.status", "=", "vip"), eb("o.total", ">", 100)])]),
+);
+```
+
+### The expression builder
+
+`eb` is callable — `eb(column, operator, value)` — and carries these members:
+
+| Member                                      | Produces                                                      |
+| ------------------------------------------- | ------------------------------------------------------------- |
+| `eb.and([...])` / `eb.or([...])`            | Conditions folded left to right.                              |
+| `eb.not(condition)`                         | Negation.                                                     |
+| `eb.between(ref, lo, hi)` / `notBetween`    | A range, desugared exactly as the parser does.                |
+| `eb.exists(subquery)`                       | `EXISTS (...)`, capped at one row.                            |
+| `eb.ref("c.name")`                          | A column in value position, for column-to-column comparisons. |
+| `eb.val(42)`                                | A literal as an expression.                                   |
+| `eb.neg(x)`                                 | Arithmetic negation.                                          |
+| `eb.case()`                                 | `CASE WHEN ... THEN ... ELSE ... END`.                        |
+| `eb.match(columns, query)`                  | Full-text `MATCH ... AGAINST`.                                |
+| `eb.rowNumber()` / `rank()` / `denseRank()` | Ranking window functions; call `.over(...)`.                  |
+| `eb.selectFrom(table)`                      | A correlated or uncorrelated subquery.                        |
+| `eb.fn`                                     | Aggregates and scalar functions, below.                       |
+
+Strings on the left of an operator are column references; strings on the right are values. To
+compare two columns in a `where`, wrap one in `eb.ref`.
+
+## Aggregates and grouping
+
+`eb.fn` covers `count`, `countAll`, `sum`, `avg`, `min`, `max`, `round`, `coalesce`, `dateTrunc`,
+and `bm25`. Name each with `.as(alias)` — that alias becomes the row's key.
+
+```ts
+const revenue = await db
+  .selectFrom("orders as o")
+  .innerJoin("customers as c", "o.customer_id", "c.customer_id")
+  .select((eb) => ["c.city", eb.fn.sum("o.total").as("revenue"), eb.fn.countAll().as("orders")])
+  .groupBy("c.city")
+  .having((eb) => eb(eb.fn.sum("o.total"), ">", 1000))
+  .orderBy("revenue", "desc")
+  .execute();
+// Array<{ city: string; revenue: number | null; orders: number }>
+```
+
+Numeric functions only accept columns whose type fits, so `eb.fn.sum("c.name")` is a compile error
+rather than a runtime surprise. `eb.fn.count(...).distinct()` gives `COUNT(DISTINCT ...)`.
+
+Window functions take `.over()`:
+
+```ts
+db.selectFrom("orders as o").select((eb) => [
+  "o.order_id",
+  eb.fn
+    .sum("o.total")
+    .over((over) => over.partitionBy("o.customer_id"))
+    .as("running"),
+  eb
+    .rowNumber()
+    .over((over) => over.orderBy("o.total", "desc"))
+    .as("rank"),
+]);
+```
+
+## Subqueries, derived tables, and CTEs
+
+A builder used as a value becomes a subquery; `.as(alias)` makes it a derived table.
+
+```ts
+// Subquery in a predicate: pass the builder itself
+const bigSpenders = db.selectFrom("orders as o").select("o.customer_id").where("o.total", ">", 500);
+db.selectFrom("customers as c").where("c.customer_id", "in", bigSpenders);
+
+// Correlated, through the expression builder
+db.selectFrom("customers as c").where((eb) =>
+  eb.exists(
+    eb
+      .selectFrom("orders as o")
+      .select("o.order_id")
+      .where("o.customer_id", "=", eb.ref("c.customer_id")),
+  ),
+);
+
+// Derived table
+const big = db.selectFrom("orders").select(["customer_id", "total"]).where("total", ">", 500);
+db.selectFrom(big.as("b")).select(["b.customer_id"]);
+```
+
+`db.with(name, factory)` declares a common table expression, returning a facade that knows about it:
+
+```ts
+const scoped = db.with("recent", (qb) =>
+  qb.selectFrom("orders").select(["order_id", "customer_id"]).where("total", ">", 100),
+);
+await scoped.selectFrom("recent").select(["order_id"]).execute();
+```
+
+## Set operations
+
+`union`, `unionAll`, `intersect`, and `except` combine two builders with the same row type:
+
+```ts
+const a = db.selectFrom("customers").select(["name"]).where("city", "=", "London");
+const b = db.selectFrom("customers").select(["name"]).where("city", "=", "Paris");
+await a.union(b).orderBy("name").execute();
+```
+
+## Ordering, limits, and distinct
+
+```ts
+db.selectFrom("orders")
+  .select(["order_id", "total"])
+  .distinct()
+  .orderBy("total", "desc")
+  .limit(20)
+  .offset(40); // offset requires limit
+```
+
+`orderBy` accepts a column in scope, an output alias from the select list, or an expression
+callback.
+
+## Full-text search
+
+`.search(query)` filters to rows matching every term and orders by BM25 relevance — sugar for a
+`MATCH` predicate plus a `BM25` ordering, with the score riding as a hidden select item so your row
+shape is exactly what you asked for:
+
+```ts
+await db
+  .selectFrom("products")
+  .select(["product_id", "name"])
+  .search("wireless keyboard")
+  .limit(10)
+  .execute();
+```
+
+Select `eb.fn.bm25("*", query).as("score")` as well if you want the score value. Searching needs no
+index declaration — see [Full-text search](/docs/sql/full-text-search).
+
+## Running a query
+
+| Call                        | Returns                                   |
+| --------------------------- | ----------------------------------------- |
+| `execute()`                 | Every row.                                |
+| `executeTakeFirst()`        | The first row, or `undefined`.            |
+| `executeTakeFirstOrThrow()` | The first row, or throws `NoResultError`. |
+| `compile()`                 | The plan envelope, without running it.    |
+| `live()`                    | A [live query](/docs/client/live).        |
+
+## Escaping to SQL
+
+The `sql` template tag runs a statement the builder cannot express, with values bound as parameters
+rather than interpolated:
+
+```ts
+import { sql } from "@minnowdb/client";
+
+const rows = await sql`SELECT * FROM orders WHERE total > ${threshold}`.execute(db);
+```

@@ -1,8 +1,9 @@
-import { MemoryBlockStore } from "../../storage/index.js";
+import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { describe, expect, it } from "vitest";
-import { MinnowDatabase } from "../database.js";
-import { compileQuery, type CompiledQuery } from "../query.js";
-import { column, schema, table } from "../schema.js";
+import { MinnowDatabase } from "@minnowdb/core";
+import { compileQuery } from "@minnowdb/core";
+import { type CompiledQuery } from "@minnowdb/core/plan";
+import { column, schema, table } from "@minnowdb/core";
 import { Minnow } from "./db.js";
 import { sql } from "./sql-tag.js";
 import { type InferDatabase } from "./types.js";
@@ -563,6 +564,9 @@ describe("returning", () => {
       { name: "Barbara", score: 120, city: "London" },
     ]);
 
+    // orders.person is a real FOREIGN KEY, so the children go first; deleting a referenced
+    // parent under the default ON DELETE RESTRICT is rejected, which the next case asserts.
+    await db.deleteFrom("orders").where("person", "in", ["Ada", "Barbara"]).execute();
     const deleted = await db.deleteFrom("people").where("score", ">", 100).returningAll().execute();
     expect(deleted.map((row) => row.name).sort()).toEqual(["Ada", "Barbara"]);
     expect(deleted[0]?.joined instanceof Date || deleted[0]?.joined === null).toBe(true);
@@ -576,6 +580,20 @@ describe("returning", () => {
     await expect(
       db.deleteFrom("people").where("name", "=", "Nobody").returningAll().executeTakeFirstOrThrow(),
     ).rejects.toThrow("The query returned no result");
+  });
+
+  it("restricts deleting a parent row the schema's declared relation still references", async () => {
+    const { db } = await seeded();
+    await expect(db.deleteFrom("people").where("name", "=", "Grace").execute()).rejects.toThrow(
+      /FOREIGN KEY .* still has/,
+    );
+    // Katherine was never referenced, so the same delete succeeds for her.
+    const deleted = await db
+      .deleteFrom("people")
+      .where("name", "=", "Katherine")
+      .returningAll()
+      .execute();
+    expect(deleted.map((row) => row.name)).toEqual(["Katherine"]);
   });
 });
 

@@ -19,7 +19,7 @@ await restored.importSnapshot(bytes);
 ```
 
 Both take an `onProgress` callback, and both work the same way through the
-[worker client](/docs/client/workers) — there the file crosses the channel in slices, so the main
+[worker client](/docs/engine/workers) — there the file crosses the channel in slices, so the main
 thread copies a few megabytes at a time instead of stalling on one clone of the whole database.
 
 That is also what the devtools' **Download database** button does; see

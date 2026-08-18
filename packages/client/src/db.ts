@@ -4,8 +4,8 @@ import {
   type QueryResult,
   type QueryRow,
   type QueryValue,
-} from "../query.js";
-import { type AnyTable, type SchemaDefinition } from "../schema.js";
+} from "@minnowdb/core/plan";
+import { type AnyTable, type AnyView, type SchemaDefinition } from "@minnowdb/core";
 import { type LiveQueryServices, type LiveSubscriptionHandle } from "./live-query.js";
 import {
   DeleteQueryBuilder,
@@ -28,6 +28,8 @@ import {
   type InferDatabase,
   type TableExpression,
   type TypedQueryEnvelope,
+  type ViewShape,
+  type WritableTable,
 } from "./types.js";
 
 /**
@@ -108,10 +110,13 @@ type EmptyContext = Record<never, AnyRow>;
  * const db = createMinnow(database, { schema: appSchema });
  * ```
  */
-export function createMinnow<TTables extends readonly AnyTable[]>(
+export function createMinnow<
+  TTables extends readonly AnyTable[],
+  TViews extends readonly AnyView[],
+>(
   driver: DslDriver,
-  options: Omit<MinnowOptions, "schema"> & { schema: SchemaDefinition<TTables> },
-): Minnow<InferDatabase<SchemaDefinition<TTables>>>;
+  options: Omit<MinnowOptions, "schema"> & { schema: SchemaDefinition<TTables, TViews> },
+): Minnow<InferDatabase<SchemaDefinition<TTables, TViews>>>;
 export function createMinnow<DB>(driver: DslDriver, options?: MinnowOptions): Minnow<DB>;
 export function createMinnow<DB>(driver: DslDriver, options: MinnowOptions = {}): Minnow<DB> {
   return new Minnow<DB>(driver, options);
@@ -222,15 +227,15 @@ export class Minnow<in out DB> {
     };
   }
 
-  insertInto<TTable extends keyof DB & string>(table: TTable): InsertQueryBuilder<DB, TTable> {
+  insertInto<TTable extends WritableTable<DB>>(table: TTable): InsertQueryBuilder<DB, TTable> {
     return new InsertQueryBuilder(this.#mutationServices(), table);
   }
 
-  updateTable<TTable extends keyof DB & string>(table: TTable): UpdateQueryBuilder<DB, TTable> {
+  updateTable<TTable extends WritableTable<DB>>(table: TTable): UpdateQueryBuilder<DB, TTable> {
     return new UpdateQueryBuilder(this.#mutationServices(), table);
   }
 
-  deleteFrom<TTable extends keyof DB & string>(table: TTable): DeleteQueryBuilder<DB, TTable> {
+  deleteFrom<TTable extends WritableTable<DB>>(table: TTable): DeleteQueryBuilder<DB, TTable> {
     return new DeleteQueryBuilder(this.#mutationServices(), table);
   }
 
@@ -241,7 +246,7 @@ export class Minnow<in out DB> {
   with<TName extends string, TCteCtx, TCteRow extends AnyRow>(
     name: TName,
     factory: (creator: Minnow<DB>) => SelectQueryBuilder<DB, TCteCtx, TCteRow>,
-  ): Minnow<DB & Record<TName, TCteRow>> {
+  ): Minnow<DB & Record<TName, ViewShape<TCteRow>>> {
     const builder = factory(this) as BlockCompilable;
     return new Minnow(
       this.#driver,
