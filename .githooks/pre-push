@@ -1,0 +1,14 @@
+#!/bin/sh
+# The merge gate, run before anything leaves the machine.
+#
+# This is the same suite CI's first job runs, in the same order, so a red build is something you
+# see here in a couple of minutes rather than on GitHub after the push. `git push --no-verify`
+# skips it when you need to.
+#
+# It checks the working tree, not the commits being pushed, which is deliberate: this repository
+# is often worked on by more than one session at a time, and a file left unformatted or broken by
+# a neighbouring one is exactly what you want to find before you push from the same tree.
+set -e
+
+printf 'pre-push: running npm run check\n'
+npm run check

@@ -1,6 +1,6 @@
 # @minnowdb/client
 
-The typed query client for [Minnow](https://minnowdb.dev): a schema-aware builder over
+The typed query client for [Minnow](https://minnowdb.com): a schema-aware builder over
 `@minnowdb/core`, with inferred row types, typed mutations, and live queries.
 
 ```ts
@@ -26,4 +26,4 @@ own, and this client is one consumer of the plan primitives published at `@minno
 It ships separately so it can move at its own pace, and because building it only from those
 published primitives is what proves they are complete enough for anyone else to build on.
 
-Full documentation lives at [minnowdb.dev/docs/client](https://minnowdb.dev/docs/client/).
+Full documentation lives at [minnowdb.com/docs/client](https://minnowdb.com/docs/client/).

@@ -20,4 +20,4 @@ npm install @minnowdb/core
   `/testing`.
 
 Quick start, guides, benchmark results, contributor workflows, and the complete API reference live
-in the [Minnow docs](https://minnowdb.dev/docs/) — the single source of truth.
+in the [Minnow docs](https://minnowdb.com/docs/) — the single source of truth.

@@ -3,6 +3,9 @@
 **A columnar SQL engine that runs entirely in the browser.** Real SQL over immutable snapshots,
 durable on IndexedDB — no server, no WebAssembly to download, no build step.
 
+**[minnowdb.com](https://minnowdb.com)** — documentation, a live playground, and benchmarks you
+run yourself.
+
 ```bash
 npm install @minnowdb/core
 ```
@@ -34,12 +37,12 @@ npm install @minnowdb/core
   anything.
 - **Workers first** — a shipped worker entry and a main-thread client with an identical API.
 - **Snapshots** — copy one committed version out as a portable file and load it into any store.
-- **[Typed client](https://minnowdb.dev/docs/client/), optional** — `@minnowdb/client` adds a schema-aware query builder with inferred
+- **[Typed client](https://minnowdb.com/docs/client/), optional** — `@minnowdb/client` adds a schema-aware query builder with inferred
   row types, declared foreign keys and CHECK constraints, views, and live queries. It ships
   separately and is built only from the engine's published primitives, so anyone can build their
   own layer the same way.
 - **Extensible** — a published catalog with stable column IDs, plan-construction primitives, and a
-  machine-readable SQL feature matrix. See [Extending Minnow](https://minnowdb.dev/docs/reference/extending/).
+  machine-readable SQL feature matrix. See [Extending Minnow](https://minnowdb.com/docs/reference/extending/).
 - **Devtools** — an embeddable SQL console and data browser, shipped as a separate package.
 - **Differentially tested** — a seeded query corpus runs through both executors and two
   independent oracles (native SQLite and PGlite) on every test run; results must agree.
@@ -48,13 +51,13 @@ npm install @minnowdb/core
 
 Everything else — installation, running SQL, the language surface, the client API, transactions,
 workers, storage adapters, and the API reference — lives on the
-[docs site](https://minnowdb.dev/docs/).
+[docs site](https://minnowdb.com/docs/).
 
 Two pages there are worth knowing about specifically:
 
-- **[Playground](https://minnowdb.dev/playground/)** — a real database of around 590,000 rows,
+- **[Playground](https://minnowdb.com/playground/)** — a real database of around 590,000 rows,
   generated in your browser and stored in IndexedDB. Write whatever SQL you like against it.
-- **[Benchmarks](https://minnowdb.dev/benchmarks/)** — Minnow against SQLite Wasm and PGlite,
+- **[Benchmarks](https://minnowdb.com/benchmarks/)** — Minnow against SQLite Wasm and PGlite,
   run live on your machine at a dataset size you choose. There are no published numbers to take
   on trust; every result is checked against an independent oracle before its timing counts.
 
@@ -71,7 +74,13 @@ npm run test:browser   # library and site tests in real browsers
 npm run soak           # generative suites on fresh random seeds, to find new failures
 ```
 
-See [Testing](https://minnowdb.dev/docs/reference/testing/) for the full runner map and the
+`npm install` points git at `.githooks`, where a pre-push hook runs `npm run check` — the same
+suite, in the same order, as CI's first job. A red build is then something you see before the
+push rather than after it. The hook checks the working tree rather than the commits being pushed,
+so a file another session left broken stops you too; `git push --no-verify` is the way past it
+when that is what you want.
+
+See [Testing](https://minnowdb.com/docs/reference/testing/) for the full runner map and the
 release gate.
 
 ## Deployment

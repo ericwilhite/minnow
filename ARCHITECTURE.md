@@ -654,4 +654,4 @@ The project advances only when evidence supports the current layer:
 Measured failures should change the architecture before higher-level APIs make the decision expensive.
 
 The release verification and benchmark workflows are maintained in the public
-[Testing & benchmarks guide](https://minnowdb.dev/docs/testing/).
+[Testing & benchmarks guide](https://minnowdb.com/docs/testing/).

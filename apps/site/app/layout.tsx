@@ -5,7 +5,7 @@ import SearchDialog from "@/components/search";
 import "./global.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://minnowdb.dev"),
+  metadataBase: new URL("https://minnowdb.com"),
   title: {
     default: "Minnow — a SQL engine that runs in the browser",
     template: "%s · Minnow",
