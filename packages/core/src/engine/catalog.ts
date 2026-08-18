@@ -65,6 +65,12 @@ export interface CatalogView {
   readonly sql: string;
   /** The query's inferred output schema, so a view answers the same questions a table does. */
   readonly columns: readonly CatalogColumn[];
+  /**
+   * True when a migration created this view from a schema declaration. The schema is then
+   * authoritative over it and may drop it; a view created with `CREATE VIEW` — or one written
+   * before this was recorded — is not owned by any schema and no migration removes it.
+   */
+  readonly managed: boolean;
 }
 
 export interface Catalog {
@@ -92,7 +98,12 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
   for (const record of byName) {
     const columns = record.columns.map(toCatalogColumn);
     if (record.view !== undefined) {
-      views.push({ name: record.name, sql: record.view.sql, columns });
+      views.push({
+        name: record.name,
+        sql: record.view.sql,
+        columns,
+        managed: record.view.managed === true,
+      });
       continue;
     }
     tables.push({

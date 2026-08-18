@@ -1121,11 +1121,11 @@ describe("views in the schema", () => {
     store.close();
   });
 
-  it("leaves a view the schema stops declaring, and every undeclared view, in place", async () => {
+  it("drops a view it created once the schema stops declaring it", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store);
     await database.migrate(withView(ACTIVE_SQL));
-    await database.migrate(
+    const dropped = await database.migrate(
       schema([table("customers", { id: column.number().unique(), status: column.string() })], {
         views: [
           view("recent_customers", {
@@ -1135,25 +1135,33 @@ describe("views in the schema", () => {
         ],
       }),
     );
-    // Undeclared views survive: nothing distinguishes a view this schema used to own from one
-    // created with CREATE VIEW, so removal is explicit through dropView().
-    expect((await database.query("SELECT id FROM active_customers")).rows).toEqual([]);
-    expect((await database.query("SELECT id FROM recent_customers")).rows).toEqual([]);
-    expect(await database.dropView("active_customers")).toBe(true);
+    expect(dropped.droppedViews).toEqual(["active_customers"]);
     await expect(database.query("SELECT id FROM active_customers")).rejects.toThrow();
+    expect((await database.query("SELECT id FROM recent_customers")).rows).toEqual([]);
     store.close();
   });
 
-  it("never drops a view created outside the schema", async () => {
+  it("never drops a view it did not create", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store);
     await database.migrate(withView(ACTIVE_SQL));
+    // A CREATE VIEW record carries no ownership flag — which is also the shape of any view
+    // written before the flag existed, so this covers the upgrade case too.
     await database.execute(`CREATE VIEW handmade AS SELECT id FROM customers`);
-    await database.migrate(withView(`SELECT id, status FROM customers`));
-    expect((await database.introspect()).views.map(({ name }) => name).sort()).toEqual([
-      "active_customers",
-      "handmade",
-    ]);
+    // A schema that declares neither view: the one it made is gone, the hand-made one stays.
+    const result = await database.migrate(
+      schema([table("customers", { id: column.number().unique(), status: column.string() })], {
+        views: [
+          view("other", { sql: `SELECT id FROM customers`, columns: { id: column.number() } }),
+        ],
+      }),
+    );
+    expect(result.droppedViews).toEqual(["active_customers"]);
+    expect(
+      (await database.introspect()).views
+        .map(({ name, managed }) => `${name}:${managed ? "managed" : "unmanaged"}`)
+        .sort(),
+    ).toEqual(["handmade:unmanaged", "other:managed"]);
     store.close();
   });
 
@@ -1425,6 +1433,7 @@ describe("planning a migration without engine access", () => {
           columns: [
             { id: "v-id", name: "id", type: "number", nullable: true, isAutoIncrementing: false },
           ],
+          managed: true,
         },
       ],
     };
@@ -1440,6 +1449,15 @@ describe("planning a migration without engine access", () => {
     expect(planMigration(withView, schema([notesTable()], { views: [same] })).steps).toEqual([]);
     const other = view("other", { sql: "SELECT id FROM notes", columns: { id: column.number() } });
     expect(planMigration(withView, schema([notesTable()], { views: [other] })).steps).toEqual([
+      { kind: "replace-view", view: other },
+      { kind: "drop-view", viewName: "recent" },
+    ]);
+    // An unmanaged view of the same name is nobody's to drop.
+    const unmanaged: Catalog = {
+      ...withView,
+      views: withView.views.map((v) => ({ ...v, managed: false })),
+    };
+    expect(planMigration(unmanaged, schema([notesTable()], { views: [other] })).steps).toEqual([
       { kind: "replace-view", view: other },
     ]);
   });

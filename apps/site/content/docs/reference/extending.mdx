@@ -60,6 +60,7 @@ for (const declared of catalog.views) {
   declared.name;
   declared.sql; // the query text it stands for
   declared.columns; // the query's inferred output schema
+  declared.managed; // true when a migration created it, and may therefore drop it
 }
 ```
 

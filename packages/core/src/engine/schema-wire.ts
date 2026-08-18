@@ -62,7 +62,8 @@ export type WireMigrationStep =
       columnName: string;
       defaultValue: ColumnDefault | null;
     }
-  | { kind: "replace-view"; view: WireView };
+  | { kind: "replace-view"; view: WireView }
+  | { kind: "drop-view"; viewName: string };
 
 type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean, boolean>;
 

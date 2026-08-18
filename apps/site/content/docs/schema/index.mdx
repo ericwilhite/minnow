@@ -178,12 +178,13 @@ await db.insertInto("active_customers"); // compile error: not a writable table
 ```
 
 Because nothing is stored under a view, replacing one is always safe: change the `sql` and the next
-`migrate()` redefines it in place.
+`migrate()` redefines it in place. Removing the declaration drops the view — within a schema, the
+declaration is the source of truth.
 
-Removing a view from your schema does **not** drop it. Nothing distinguishes a view the schema used
-to declare from one someone created with `CREATE VIEW`, so dropping the undeclared ones would
-destroy the second kind — and "the schema stopped mentioning it" is not proof that it should go.
-Drop a view explicitly with `database.dropView(name)`.
+That authority stops at the views the schema created. A view made with `CREATE VIEW`, or one
+written before Minnow recorded ownership, belongs to no schema and no migration removes it —
+"the schema never mentioned it" is not proof that it should go. `introspect()` reports which is
+which as `managed`, and `database.dropView(name)` removes either.
 
 ## What migrate() does
 

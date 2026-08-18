@@ -1123,7 +1123,7 @@ export class MinnowDatabase {
   async createView(
     name: string,
     sql: string,
-    options: { orReplace?: boolean } = {},
+    options: { orReplace?: boolean; managed?: boolean } = {},
   ): Promise<void> {
     const viewName = validateName(name, "View");
     const plan = compileQuery(sql);
@@ -1153,7 +1153,7 @@ export class MinnowDatabase {
         type: column.type,
         nullable: true,
       })),
-      view: { sql },
+      view: { sql, ...(options.managed === true ? { managed: true } : {}) },
       createdAt: this.#now().toISOString(),
     });
     this.#planCache.clear();
@@ -4258,6 +4258,7 @@ export class MinnowDatabase {
     createdTables: string[];
     alteredTables: string[];
     replacedViews: string[];
+    droppedViews: string[];
     steps: MigrationStep[];
   }> {
     // Table revisions also move under background full-text index activity (build stamps,
@@ -4299,6 +4300,7 @@ export class MinnowDatabase {
     createdTables: string[];
     alteredTables: string[];
     replacedViews: string[];
+    droppedViews: string[];
     steps: MigrationStep[];
   }> {
     // One listTables pass drives planning and execution: a create step exists only because the
@@ -4311,6 +4313,7 @@ export class MinnowDatabase {
     const plan = planMigration(toCatalog(records), definition);
     const createdTables: string[] = [];
     const replacedViews: string[] = [];
+    const droppedViews: string[] = [];
     const alterationsByTable = new Map<string, MigrationStep[]>();
     for (const step of plan.steps) {
       if (step.kind === "create-table") {
@@ -4343,9 +4346,17 @@ export class MinnowDatabase {
       // Views carry no data, so they are applied directly rather than batched into a table's
       // atomic column rewrite. `orReplace` makes create and redefine one path.
       if (step.kind === "replace-view") {
-        await this.createView(step.view.name, step.view.sql, { orReplace: true });
+        await this.createView(step.view.name, step.view.sql, {
+          orReplace: true,
+          managed: true,
+        });
         this.#assertViewMatchesDeclaration(await this.store.getTableByName(step.view.name), step);
         replacedViews.push(step.view.name);
+        continue;
+      }
+      if (step.kind === "drop-view") {
+        await this.dropView(step.viewName, { ifExists: true });
+        droppedViews.push(step.viewName);
         continue;
       }
       const steps = alterationsByTable.get(step.tableName) ?? [];
@@ -4407,7 +4418,7 @@ export class MinnowDatabase {
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
       alteredTables.push(tableName);
     }
-    return { createdTables, alteredTables, replacedViews, steps: plan.steps };
+    return { createdTables, alteredTables, replacedViews, droppedViews, steps: plan.steps };
   }
 
   /**

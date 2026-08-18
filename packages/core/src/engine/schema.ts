@@ -599,10 +599,11 @@ export type MigrationStep =
    * data and needs none of the proofs a table alteration needs. `replace` covers both creating a
    * missing view and redefining an existing one.
    *
-   * There is deliberately no drop step. A migration never removes a view — see `planViewSteps` —
-   * so a step describing one would advertise something the planner refuses to do.
+   * `drop-view` removes a view a previous migration created and this schema no longer declares.
+   * It never names a view the schema did not make — see `planViewSteps`.
    */
-  | { kind: "replace-view"; view: AnyView };
+  | { kind: "replace-view"; view: AnyView }
+  | { kind: "drop-view"; viewName: string };
 
 export interface MigrationPlan {
   steps: MigrationStep[];
@@ -612,10 +613,11 @@ export interface MigrationPlan {
  * Views are derived: nothing is stored under one, so a body change is a replace rather than a
  * rewrite and needs none of the proofs a table alteration needs.
  *
- * A view the schema does not declare is left alone. There is no way to tell a view this schema
- * used to own from one someone created with `CREATE VIEW`, so dropping the undeclared ones would
- * silently destroy the second kind — and "the schema stopped mentioning it" is not proof that it
- * should go. Removing a view is therefore explicit, through `dropView()`.
+ * Within the set of views a migration created, the schema is authoritative — removing a
+ * declaration drops the view. Outside it nothing is touched: a view created with `CREATE VIEW`,
+ * or one written before ownership was recorded, is not any schema's to remove. That is the
+ * difference between a declaration being the source of truth and a declaration being allowed to
+ * destroy things it never made.
  */
 function planViewSteps(
   catalog: Catalog,
@@ -624,12 +626,17 @@ function planViewSteps(
 ): void {
   const tableNames = new Set(catalog.tables.map(({ name }) => name));
   const existing = new Map(catalog.views.map((record) => [record.name, record]));
+  const declared = new Set(definition.views.map(({ name }) => name));
   for (const viewDefinition of definition.views) {
     if (tableNames.has(viewDefinition.name)) {
       throw new TypeError(`A table already exists with this name: ${viewDefinition.name}`);
     }
     if (existing.get(viewDefinition.name)?.sql === viewDefinition.sql) continue;
     steps.push({ kind: "replace-view", view: viewDefinition });
+  }
+  for (const record of catalog.views) {
+    if (declared.has(record.name) || !record.managed) continue;
+    steps.push({ kind: "drop-view", viewName: record.name });
   }
 }
 

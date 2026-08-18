@@ -230,7 +230,16 @@ export interface TableRecord {
    * `columns` are the query's inferred output schema, so a view answers the same catalog
    * questions a table does — what a reader can select, and of what type.
    */
-  view?: { sql: string };
+  view?: {
+    sql: string;
+    /**
+     * True when `migrate()` created this view from a schema declaration, which makes the schema
+     * authoritative over it: dropping the declaration drops the view. A view created with
+     * `CREATE VIEW`, or one written before this field existed, is absent-or-false and no
+     * migration will remove it.
+     */
+    managed?: boolean;
+  };
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
   revision?: number;
