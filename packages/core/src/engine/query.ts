@@ -4317,7 +4317,7 @@ export function expressionColumnNames(expression: Expression): string[] {
   return expressionColumns(expression);
 }
 
-function expressionColumns(expression: Expression): string[] {
+export function expressionColumns(expression: Expression): string[] {
   if (expression.kind === "column") return [expression.reference];
   // A subquery or EXISTS resolves inside its own scope before the enclosing block binds.
   return childExpressions(expression).flatMap(expressionColumns);

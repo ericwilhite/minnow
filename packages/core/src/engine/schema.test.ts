@@ -11,6 +11,7 @@ import { MinnowDatabase } from "./database.js";
 import {
   column,
   declaredForeignKeys,
+  isDestructiveStep,
   planMigration,
   schema,
   table,
@@ -668,12 +669,13 @@ describe("migration planning rejections", () => {
         ]),
       ),
     ).toThrow("Column types cannot change");
-    expect(() =>
+    // A drop is planned, not refused — migrate() is what withholds it without an opt-in.
+    expect(
       planMigration(
         toCatalog(current),
         schema([table("people", { name: column.string().unique(), score: column.number() })]),
-      ),
-    ).toThrow("Dropping columns is not supported");
+      ).steps,
+    ).toEqual([{ kind: "drop-column", tableName: "people", columnName: "joined" }]);
     expect(() =>
       planMigration(
         toCatalog(current),
@@ -1361,6 +1363,7 @@ describe("planning a migration without engine access", () => {
     tables: [
       {
         name: "notes",
+        managed: true,
         uniqueKeyColumnId: "col-id",
         columns: [
           {
@@ -1468,13 +1471,27 @@ describe("planning a migration without engine access", () => {
     ]);
   });
 
-  it("refuses an unprovable change from a hand-built catalog too", () => {
+  it("plans a destructive step from a hand-built catalog, and flags it as one", () => {
+    const plan = planMigration(
+      handBuilt,
+      schema([table("notes", { id: column.number().unique().autoIncrement() })]),
+    );
+    expect(plan.steps).toEqual([{ kind: "drop-column", tableName: "notes", columnName: "body" }]);
+    expect(plan.steps.filter(isDestructiveStep)).toHaveLength(1);
+  });
+
+  it("still refuses what cannot be planned at all", () => {
     expect(() =>
       planMigration(
         handBuilt,
-        schema([table("notes", { id: column.number().unique().autoIncrement() })]),
+        schema([
+          table("notes", {
+            id: column.number().unique().autoIncrement(),
+            body: column.number(),
+          }),
+        ]),
       ),
-    ).toThrow("Dropping columns is not supported: notes.body");
+    ).toThrow("Column types cannot change");
   });
 });
 
@@ -1790,6 +1807,140 @@ describe("adopting and dropping auto-increment", () => {
     await database.migrate(schema([table("t", { id: column.number().unique() })]));
     expect((await database.introspect()).tables[0]?.columns[0]?.isAutoIncrementing).toBe(false);
     expect(await database.readTable("t")).toEqual(before);
+    store.close();
+  });
+});
+
+// --- Destructive migrations ---------------------------------------------------------------------
+
+describe("dropping columns and tables", () => {
+  const full = schema([
+    table("keep", { id: column.number().unique(), body: column.string() }),
+    table("gone", { id: column.number().unique() }),
+  ]);
+  const trimmed = schema([table("keep", { id: column.number().unique() })]);
+
+  async function seeded(): Promise<{ database: MinnowDatabase; store: MemoryBlockStore }> {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(full);
+    await database.insertBatch("keep", [{ id: 1, body: "text" }]);
+    await database.insertBatch("gone", [{ id: 1 }]);
+    return { database, store };
+  }
+
+  it("refuses to destroy anything by default, naming what it would have destroyed", async () => {
+    const { database, store } = await seeded();
+    await expect(database.migrate(trimmed, { schemaOwnsDatabase: true })).rejects.toThrow(
+      /would destroy data: column keep\.body, table gone/,
+    );
+    // And without claiming the whole database, the undeclared table is simply not its business.
+    await expect(database.migrate(trimmed)).rejects.toThrow(
+      /would destroy data: column keep\.body\. Pass/,
+    );
+    // Nothing was applied.
+    expect(await database.readTable("keep")).toEqual([{ id: 1, body: "text" }]);
+    expect((await database.introspect()).tables.map(({ name }) => name)).toEqual(["gone", "keep"]);
+    store.close();
+  });
+
+  it("applies the drops when the caller opts in", async () => {
+    const { database, store } = await seeded();
+    const result = await database.migrate(trimmed, {
+      allowDestructive: true,
+      schemaOwnsDatabase: true,
+    });
+    expect(result.droppedTables).toEqual(["gone"]);
+    expect((await database.introspect()).tables.map(({ name }) => name)).toEqual(["keep"]);
+    // The dropped column stops being readable; the surviving rows are untouched.
+    expect(await database.readTable("keep")).toEqual([{ id: 1 }]);
+    await expect(database.query("SELECT body FROM keep")).rejects.toThrow();
+    expect((await database.query("SELECT id FROM keep")).rows).toEqual([{ id: 1 }]);
+    store.close();
+  });
+
+  it("never drops a table it did not create", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(schema([table("keep", { id: column.number().unique() })]));
+    await database.execute(`CREATE TABLE handmade (id INTEGER PRIMARY KEY)`);
+    const result = await database.migrate(
+      schema([table("keep", { id: column.number().unique() })]),
+      { allowDestructive: true, schemaOwnsDatabase: true },
+    );
+    expect(result.droppedTables).toEqual([]);
+    expect((await database.introspect()).tables.map(({ name }) => name).sort()).toEqual([
+      "handmade",
+      "keep",
+    ]);
+    store.close();
+  });
+
+  it("refuses to drop a column the catalog still points at", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(
+      schema([
+        table("parents", { id: column.number().unique() }),
+        table(
+          "children",
+          {
+            id: column.number().unique(),
+            parent_id: column.number().references("parents", "id"),
+            qty: column.number(),
+          },
+          { checks: [{ name: "positive", sql: "qty > 0" }] },
+        ),
+      ]),
+    );
+    const without = (columns: Record<string, ReturnType<typeof column.number>>) =>
+      schema([
+        table("parents", { id: column.number().unique() }),
+        table(
+          "children",
+          { id: column.number().unique(), ...columns },
+          {
+            checks: [{ name: "positive", sql: "qty > 0" }],
+          },
+        ),
+      ]);
+    // The FK still uses parent_id.
+    await expect(
+      database.migrate(without({ qty: column.number() }), { allowDestructive: true }),
+    ).rejects.toThrow(
+      "FOREIGN KEY children_parent_id_fkey still uses this column: children.parent_id",
+    );
+    // And the CHECK guards its own column the same way.
+    await expect(
+      database.migrate(
+        schema([
+          table("parents", { id: column.number().unique() }),
+          table(
+            "children",
+            {
+              id: column.number().unique(),
+              parent_id: column.number().references("parents", "id"),
+            },
+            { checks: [{ name: "positive", sql: "qty > 0" }] },
+          ),
+        ]),
+        { allowDestructive: true },
+      ),
+    ).rejects.toThrow("CHECK positive still uses this column: children.qty");
+    store.close();
+  });
+
+  it("refuses to drop the unique key", async () => {
+    const { database, store } = await seeded();
+    await expect(
+      database.migrate(
+        schema([
+          table("keep", { body: column.string() }),
+          table("gone", { id: column.number().unique() }),
+        ]),
+        { allowDestructive: true },
+      ),
+    ).rejects.toThrow("The unique key cannot be dropped: keep.id");
     store.close();
   });
 });

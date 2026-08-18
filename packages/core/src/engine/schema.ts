@@ -5,7 +5,8 @@ import {
   type TableColumnRecord,
   type TableRecord,
 } from "../storage/index.js";
-import { type Catalog, type CatalogTable } from "./catalog.js";
+import { type Catalog, type CatalogColumn, type CatalogTable } from "./catalog.js";
+import { compileCheckExpression, expressionColumns } from "./query.js";
 import { type BatchRow } from "./batch.js";
 
 /**
@@ -658,6 +659,10 @@ export type MigrationStep =
    * `drop-view` removes a view a previous migration created and this schema no longer declares.
    * It never names a view the schema did not make — see `planViewSteps`.
    */
+  /** Destructive: the column stops being readable. See `isDestructiveStep`. */
+  | { kind: "drop-column"; tableName: string; columnName: string }
+  /** Destructive: the table and its rows stop being readable. See `isDestructiveStep`. */
+  | { kind: "drop-table"; tableName: string }
   | { kind: "replace-view"; view: AnyView }
   | { kind: "drop-view"; viewName: string };
 
@@ -720,6 +725,48 @@ function orderedForCreation(tables: readonly AnyTable[]): readonly AnyTable[] {
   };
   for (const definition of tables) visit(definition);
   return ordered;
+}
+
+/**
+ * Whether a step destroys data a reader could still see. These are the steps `migrate()` refuses
+ * to apply unless the caller opts in, so that a schema file drifting out of sync cannot delete
+ * rows the next time an application opens.
+ */
+export function isDestructiveStep(
+  step: MigrationStep,
+): step is Extract<MigrationStep, { kind: "drop-column" | "drop-table" }> {
+  return step.kind === "drop-column" || step.kind === "drop-table";
+}
+
+/**
+ * A column can stop being projected without rewriting anything, but not while something else in
+ * the catalog still points at it. Each of these would leave a constraint or key referring to a
+ * column no longer there, so the drop is refused rather than silently invalidating them.
+ */
+function assertColumnDroppable(record: CatalogTable, column: CatalogColumn): void {
+  const where = `${record.name}.${column.name}`;
+  if (record.uniqueKeyColumnId === column.id) {
+    throw new TypeError(
+      `The unique key cannot be dropped: ${where}. Unique-key changes need the table recreated.`,
+    );
+  }
+  for (const key of record.foreignKeys) {
+    if (key.column === column.name) {
+      throw new TypeError(`FOREIGN KEY ${key.name} still uses this column: ${where}`);
+    }
+  }
+  for (const check of record.checks) {
+    let referenced: readonly string[];
+    try {
+      referenced = expressionColumns(compileCheckExpression(check.sql, check.name));
+    } catch {
+      // A check the engine can no longer compile is not a licence to drop what it names.
+      throw new TypeError(`CHECK ${check.name} cannot be re-read, so ${where} is not droppable`);
+    }
+    if (referenced.includes(column.name)) {
+      throw new TypeError(`CHECK ${check.name} still uses this column: ${where}`);
+    }
+  }
 }
 
 /**
@@ -805,9 +852,23 @@ function assertConstraintsUnchanged(record: CatalogTable, definition: AnyTable):
  * nullable-to-non-null tightening, non-nullable additions, and rename sources that are missing
  * or still defined.
  */
+export interface PlanMigrationOptions {
+  /**
+   * Treats the schema as the whole database, so a managed table it no longer declares is planned
+   * for dropping.
+   *
+   * Off by default, because a schema is not necessarily complete: an application may migrate
+   * feature by feature, each call declaring only its own tables. Assuming otherwise would turn
+   * that into "drop everything the others made". A column is different — its table is right
+   * there in the declaration, so a column missing from it is missing on purpose.
+   */
+  readonly schemaOwnsDatabase?: boolean;
+}
+
 export function planMigration(
   catalog: Catalog,
   definition: SchemaDefinition<readonly AnyTable[]>,
+  options: PlanMigrationOptions = {},
 ): MigrationPlan {
   const steps: MigrationStep[] = [];
   const currentByName = new Map(catalog.tables.map((record) => [record.name, record]));
@@ -940,13 +1001,24 @@ export function planMigration(
       }
     }
     for (const columnRecord of record.columns) {
-      if (!definedNames.has(columnRecord.name) && !renameSources.has(columnRecord.name)) {
-        throw new TypeError(
-          `Dropping columns is not supported: ${tableDefinition.name}.${columnRecord.name}`,
-        );
-      }
+      if (definedNames.has(columnRecord.name) || renameSources.has(columnRecord.name)) continue;
+      assertColumnDroppable(record, columnRecord);
+      steps.push({
+        kind: "drop-column",
+        tableName: tableDefinition.name,
+        columnName: columnRecord.name,
+      });
     }
     assertConstraintsUnchanged(record, tableDefinition);
+  }
+  if (options.schemaOwnsDatabase === true) {
+    const declaredTables = new Set(definition.tables.map(({ name }) => name));
+    for (const record of catalog.tables) {
+      // Only tables a migration created; see `managed`. Rows are at stake, so an undeclared
+      // table someone else made is never a migration's to remove.
+      if (declaredTables.has(record.name) || !record.managed) continue;
+      steps.push({ kind: "drop-table", tableName: record.name });
+    }
   }
   planViewSteps(catalog, definition, steps);
   return { steps };
@@ -1067,6 +1139,13 @@ export function applyColumnSteps(
     if (step.kind === "widen-nullable") {
       const target = columns.find(({ name }) => name === step.columnName);
       if (target !== undefined) target.nullable = true;
+      continue;
+    }
+    if (step.kind === "drop-column") {
+      // The column record goes; the stored blocks stay until compaction rewrites the segments
+      // that hold them, which is what keeps the drop a metadata step.
+      const index = columns.findIndex(({ name }) => name === step.columnName);
+      if (index !== -1) columns.splice(index, 1);
       continue;
     }
     if (step.kind === "tighten-nullable") {

@@ -49,6 +49,12 @@ export interface CatalogTrigger {
 
 export interface CatalogTable {
   readonly name: string;
+  /**
+   * True when a migration created this table. The schema is then authoritative over it and may
+   * drop it; a table created with `CREATE TABLE` belongs to no schema and is never removed by
+   * one. See `CatalogView.managed`, which follows the same rule.
+   */
+  readonly managed: boolean;
   readonly columns: readonly CatalogColumn[];
   /** The unique key's column ID, absent on a table declared without one. */
   readonly uniqueKeyColumnId?: string;
@@ -111,6 +117,7 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
     }
     tables.push({
       name: record.name,
+      managed: record.managed === true,
       columns,
       ...(record.uniqueKeyColumnId === undefined
         ? {}

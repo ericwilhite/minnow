@@ -240,6 +240,14 @@ export interface TableRecord {
    */
   checks?: Array<{ name: string; sql: string }>;
   /**
+   * True when `migrate()` created this table from a schema declaration, which makes the schema
+   * authoritative over it: dropping the declaration may drop the table. A table created with
+   * `CREATE TABLE`, or one written before this field existed, is absent-or-false and no
+   * migration removes it — the same rule views follow, and it matters more here because a
+   * table holds rows.
+   */
+  managed?: boolean;
+  /**
    * A view rather than a table: the query text it stands for, and no segments of its own. The
    * `columns` are the query's inferred output schema, so a view answers the same catalog
    * questions a table does — what a reader can select, and of what type.

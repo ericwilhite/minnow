@@ -155,10 +155,16 @@ class DatabaseRpcServer {
       case "listGarbageCollectionJobs":
         return database[method]?.(...args);
       case "migrate": {
-        const result = await this.database.migrate(deserializeSchema(args[0] as WireSchema));
+        const result = await this.database.migrate(
+          deserializeSchema(args[0] as WireSchema),
+          args[1] ?? {},
+        );
         return {
           createdTables: result.createdTables,
           alteredTables: result.alteredTables,
+          droppedTables: result.droppedTables,
+          replacedViews: result.replacedViews,
+          droppedViews: result.droppedViews,
           steps: serializeMigrationSteps(result.steps),
         };
       }

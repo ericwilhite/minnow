@@ -247,15 +247,44 @@ block, with nothing decompressed or decoded:
   from each block's numeric zone map, so a generated id can never collide with one already written.
   Dropping the generator is free — writes simply stop being filled.
 
+## Dropping things
+
+Removing a column from a table you declare, or a table from a schema that speaks for the whole
+database, is a **metadata step** — the column stops being projected, the table record goes, and
+compaction reclaims the bytes when it next rewrites those segments. Nothing is scanned.
+
+It is also the only kind of migration that destroys data, and a migration runs when an application
+opens, with nobody to review it. A schema file that drifted — a rename typed wrong, a branch
+checked out — would otherwise delete rows on launch. So destroying anything is a decision you make:
+
+```ts
+await database.migrate(appSchema); // throws, naming exactly what it would have destroyed
+await database.migrate(appSchema, { allowDestructive: true }); // applies it
+```
+
+Tables need a second word. A schema is not necessarily the whole database — an application may
+migrate feature by feature, each call declaring only its own tables — so a table you no longer
+declare is left alone unless you say the schema speaks for everything:
+
+```ts
+await database.migrate(appSchema, { allowDestructive: true, schemaOwnsDatabase: true });
+```
+
+Even then, only tables a migration created are dropped. One made with `CREATE TABLE` belongs to no
+schema, exactly as with [views](#views).
+
+A drop is refused outright when something in the catalog still points at the column — the unique
+key, a `FOREIGN KEY`, or a `CHECK` — because dropping it would leave that constraint naming a
+column that is not there.
+
 Rejected outright, rather than attempted:
 
 - type changes
-- column or table drops
 - unique-key changes
 - non-nullable column additions **without a backfill**
 - removing enum values, or tightening a string column into an enum
 
-Those first three need the stored bytes rewritten, which is compaction's job, not a migration's.
+Both need the stored bytes rewritten, which is compaction's job, not a migration's.
 
 - adding, changing, or dropping a FOREIGN KEY or CHECK on an existing table
 

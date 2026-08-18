@@ -174,6 +174,7 @@ import { toCatalog, type Catalog } from "./catalog.js";
 import {
   applyColumnSteps,
   declaredForeignKeys,
+  isDestructiveStep,
   planMigration,
   type AnyTable,
   type AnyView,
@@ -321,11 +322,28 @@ export interface ColumnDefinition {
   backfill?: boolean | number | string | Date;
 }
 
+export interface MigrateOptions {
+  /**
+   * Allows steps that destroy data — dropping a column or a table. Off by default: a migration
+   * runs when an application opens, with nobody to review it.
+   */
+  readonly allowDestructive?: boolean;
+  /**
+   * Treats the schema as the whole database, so a table it created and no longer declares is
+   * dropped. Off by default: an application may migrate feature by feature, and each call
+   * declaring only its own tables must not mean "drop the others". Needs `allowDestructive`
+   * as well, since dropping a table destroys its rows.
+   */
+  readonly schemaOwnsDatabase?: boolean;
+}
+
 export interface CreateTableInput {
   name: string;
   columns: readonly ColumnDefinition[];
   /** Row conditions every written row must satisfy (E141-06); each is a boolean SQL expression. */
   checks?: ReadonlyArray<{ name: string; sql: string }>;
+  /** Marks the table as created from a schema, which lets a later migration drop it. */
+  managed?: boolean;
   /** Single-column references to another table's unique key (E141-04). */
   foreignKeys?: readonly ForeignKeyDefinition[];
   uniqueKey?: string;
@@ -1072,6 +1090,7 @@ export class MinnowDatabase {
       columns,
       ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
       ...(checks.length === 0 ? {} : { checks }),
+      ...(input.managed === true ? { managed: true } : {}),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyStorage: "chunks-v2" as const }),
@@ -4279,9 +4298,13 @@ export class MinnowDatabase {
    * steps — and every catalog alteration is one atomic compare-and-swap, so a concurrent
    * migrator fails explicitly with a conflict instead of interleaving.
    */
-  async migrate(definition: SchemaDefinition<readonly AnyTable[]>): Promise<{
+  async migrate(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+    options: MigrateOptions = {},
+  ): Promise<{
     createdTables: string[];
     alteredTables: string[];
+    droppedTables: string[];
     replacedViews: string[];
     droppedViews: string[];
     steps: MigrationStep[];
@@ -4292,7 +4315,7 @@ export class MinnowDatabase {
     // a genuinely concurrent migrator still fails explicitly once the retries are exhausted.
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.#migrateOnce(definition);
+        return await this.#migrateOnce(definition, options);
       } catch (error) {
         if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
       }
@@ -4405,9 +4428,13 @@ export class MinnowDatabase {
     await this.store.reserveAutoIncrement(table.id, column.id, 0, BigInt(Math.trunc(largest)) + 1n);
   }
 
-  async #migrateOnce(definition: SchemaDefinition<readonly AnyTable[]>): Promise<{
+  async #migrateOnce(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+    options: MigrateOptions = {},
+  ): Promise<{
     createdTables: string[];
     alteredTables: string[];
+    droppedTables: string[];
     replacedViews: string[];
     droppedViews: string[];
     steps: MigrationStep[];
@@ -4419,10 +4446,34 @@ export class MinnowDatabase {
     // explicitly through createTable's uniqueness check or the revision conflict.
     const records = await this.store.listTables();
     const recordsByName = new Map(records.map((record) => [record.name, record]));
-    const plan = planMigration(toCatalog(records), definition);
+    const plan = planMigration(toCatalog(records), definition, {
+      ...(options.schemaOwnsDatabase === undefined
+        ? {}
+        : { schemaOwnsDatabase: options.schemaOwnsDatabase }),
+    });
+    // A migration runs when an application opens, with nobody to review it. A schema file that
+    // drifted — a rename typed wrong, a branch checked out — would otherwise delete rows on
+    // launch, so destroying anything is a decision the caller makes, not a default.
+    if (options.allowDestructive !== true) {
+      const destructive = plan.steps.filter(isDestructiveStep);
+      if (destructive.length > 0) {
+        const described = destructive
+          .map((step) =>
+            step.kind === "drop-table"
+              ? `table ${step.tableName}`
+              : `column ${step.tableName}.${step.columnName}`,
+          )
+          .join(", ");
+        throw new TypeError(
+          `This migration would destroy data: ${described}. Pass { allowDestructive: true } to ` +
+            `apply it, or restore the declarations.`,
+        );
+      }
+    }
     const createdTables: string[] = [];
     const replacedViews: string[] = [];
     const droppedViews: string[] = [];
+    const droppedTables: string[] = [];
     const alterationsByTable = new Map<string, MigrationStep[]>();
     for (const step of plan.steps) {
       if (step.kind === "create-table") {
@@ -4456,6 +4507,7 @@ export class MinnowDatabase {
           })),
           ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
           ...(step.table.checks.length === 0 ? {} : { checks: [...step.table.checks] }),
+          managed: true,
         });
         createdTables.push(step.table.name);
         continue;
@@ -4469,6 +4521,11 @@ export class MinnowDatabase {
         });
         this.#assertViewMatchesDeclaration(await this.store.getTableByName(step.view.name), step);
         replacedViews.push(step.view.name);
+        continue;
+      }
+      if (step.kind === "drop-table") {
+        await this.dropTable(step.tableName, { ifExists: true });
+        droppedTables.push(step.tableName);
         continue;
       }
       if (step.kind === "drop-view") {
@@ -4555,7 +4612,14 @@ export class MinnowDatabase {
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
       alteredTables.push(tableName);
     }
-    return { createdTables, alteredTables, replacedViews, droppedViews, steps: plan.steps };
+    return {
+      createdTables,
+      alteredTables,
+      droppedTables,
+      replacedViews,
+      droppedViews,
+      steps: plan.steps,
+    };
   }
 
   /**

@@ -34,6 +34,7 @@ import type {
   CompactionJobProgress,
   CreateTableInput,
   DatabaseRow,
+  MigrateOptions,
   DeleteBatchInput,
   DeleteBatchResult,
   ExecuteResult,
@@ -110,6 +111,9 @@ export interface CloseClientOptions {
 export interface ClientMigrationResult {
   createdTables: string[];
   alteredTables: string[];
+  droppedTables: string[];
+  replacedViews: string[];
+  droppedViews: string[];
   steps: WireMigrationStep[];
 }
 
@@ -229,8 +233,14 @@ export class MinnowDatabaseClient {
     return (await this.#call("listTables", [])) as TableDefinition[];
   }
 
-  async migrate(definition: SchemaDefinition<readonly AnyTable[]>): Promise<ClientMigrationResult> {
-    return (await this.#call("migrate", [serializeSchema(definition)])) as ClientMigrationResult;
+  async migrate(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+    options: MigrateOptions = {},
+  ): Promise<ClientMigrationResult> {
+    return (await this.#call("migrate", [
+      serializeSchema(definition),
+      options,
+    ])) as ClientMigrationResult;
   }
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
