@@ -1,6 +1,28 @@
 {
   "name": "@minnowdb/core",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "A columnar SQL engine that runs entirely in the browser: real SQL over immutable snapshots, durable on IndexedDB, with no WebAssembly to download.",
+  "license": "MIT",
+  "author": "Eric Wilhite",
+  "homepage": "https://minnowdb.com/docs/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minnowdb/minnow.git",
+    "directory": "packages/core"
+  },
+  "bugs": "https://github.com/minnowdb/minnow/issues",
+  "keywords": [
+    "sql",
+    "database",
+    "browser",
+    "indexeddb",
+    "columnar",
+    "olap",
+    "in-browser",
+    "offline-first",
+    "full-text-search",
+    "query-engine"
+  ],
   "type": "module",
   "exports": {
     ".": {
@@ -39,7 +61,8 @@
       "types": "./dist/testing/index.d.ts",
       "default": "./dist/testing/index.js"
     },
-    "./sql-feature-matrix.json": "./sql-feature-matrix.json"
+    "./sql-feature-matrix.json": "./sql-feature-matrix.json",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",

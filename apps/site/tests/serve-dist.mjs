@@ -25,6 +25,7 @@ const contentTypes = new Map([
   [".wasm", "application/wasm"],
   [".woff2", "font/woff2"],
   [".txt", "text/plain; charset=utf-8"],
+  [".md", "text/markdown; charset=utf-8"],
 ]);
 
 /**
@@ -80,7 +81,14 @@ const server = createServer((request, response) => {
         });
         response.end(body);
       } catch {
-        response.writeHead(404, { "content-type": "text/plain" }).end("not found");
+        // What the host does with a path that matches nothing: the export's own 404 page, with
+        // the status that goes with it.
+        try {
+          const body = await readFile(join(root, "404.html"));
+          response.writeHead(404, { "content-type": "text/html; charset=utf-8" }).end(body);
+        } catch {
+          response.writeHead(404, { "content-type": "text/plain" }).end("not found");
+        }
       }
     }
   })();

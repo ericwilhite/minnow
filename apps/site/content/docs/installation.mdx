@@ -18,8 +18,10 @@ optional client:
 npm install @minnowdb/client
 ```
 
-It ships as its own package so it can version independently of the engine, and it is built only
-from the primitives at `@minnowdb/core/plan` — the same ones any other builder would use.
+It ships as its own package, built only from the primitives at `@minnowdb/core/plan` — the same
+ones any other builder would use. Every Minnow package shares a major version and moves
+independently inside it, so any `0.x` client works with any `0.x` engine and npm refuses a
+mixed-major pair on its own. See [Versioning](/docs/reference/versioning).
 
 ## Entry points
 

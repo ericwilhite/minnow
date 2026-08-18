@@ -58,6 +58,14 @@ describe("resolveOptions", () => {
     expect(resolveOptions({ zIndex: Number.NaN }).zIndex).toBe(2_147_483_000);
     expect(resolveOptions({ zIndex: 10 }).zIndex).toBe(10);
   });
+
+  it("leaves an inline panel in the page's stacking order", () => {
+    // The overlay's z-index on a panel in document flow paints it over the host page's own
+    // sticky header as soon as the reader scrolls.
+    expect(resolveOptions({ mode: "inline" }).zIndex).toBe(0);
+    expect(resolveOptions({ mode: "inline", zIndex: 5 }).zIndex).toBe(5);
+    expect(resolveOptions({ mode: "launcher" }).zIndex).toBe(2_147_483_000);
+  });
 });
 
 describe("optionsFromAttributes", () => {

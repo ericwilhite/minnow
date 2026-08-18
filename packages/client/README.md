@@ -27,3 +27,7 @@ It ships separately so it can move at its own pace, and because building it only
 published primitives is what proves they are complete enough for anyone else to build on.
 
 Full documentation lives at [minnowdb.com/docs/client](https://minnowdb.com/docs/client/).
+
+## License
+
+MIT

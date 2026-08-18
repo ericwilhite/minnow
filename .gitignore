@@ -11,3 +11,11 @@ apps/site/.next/
 apps/site/out/
 apps/site/.source/
 apps/site/public/vendor/
+# Written by apps/site/scripts/generate-llms.mjs before every dev run and build.
+apps/site/public/docs/
+apps/site/public/llms.txt
+apps/site/public/llms-full.txt
+apps/site/public/agent-rules.md
+apps/site/public/robots.txt
+apps/site/public/sitemap.xml
+apps/site/public/sql-feature-matrix.json

@@ -4,6 +4,7 @@ import { Step, Steps } from "fumadocs-ui/components/steps";
 import { Tab, Tabs } from "fumadocs-ui/components/tabs";
 import { TypeTable } from "fumadocs-ui/components/type-table";
 import type { MDXComponents } from "mdx/types";
+import { DevtoolsDemo } from "@/components/playground/devtools-demo";
 import { Playground } from "@/components/playground/playground";
 import { SqlFeatureMatrix } from "@/components/sql-feature-matrix";
 
@@ -20,6 +21,7 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     Tab,
     Tabs,
     TypeTable,
+    DevtoolsDemo,
     Playground,
     SqlFeatureMatrix,
     ...components,

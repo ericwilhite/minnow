@@ -52,3 +52,7 @@ Full guide: [Devtools](https://minnowdb.com/docs/devtools/).
 
 `packages/devtools/demo/` is a working page with an in-memory database. Serve the repository root
 with vite and open `/packages/devtools/demo/`.
+
+## License
+
+MIT

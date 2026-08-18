@@ -4,6 +4,7 @@ import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/layo
 import { createRelativeLink } from "fumadocs-ui/mdx";
 import { getMDXComponents } from "@/components/mdx";
 import { source } from "@/lib/source";
+import { basePath } from "@/lib/versions";
 
 export default async function Page(props: { params: Promise<{ slug?: string[] }> }) {
   const { slug } = await props.params;
@@ -32,5 +33,18 @@ export async function generateMetadata(props: {
   const { slug } = await props.params;
   const page = source.getPage(slug);
   if (!page) notFound();
-  return { title: page.data.title, description: page.data.description };
+
+  // Every page is published twice: as this page, and as the markdown it was written in, one path
+  // segment away. scripts/generate-llms.mjs writes the second one, and this is where a reader
+  // that prefers markdown — an agent fetching the page, usually — is told it exists.
+  const pathname =
+    slug === undefined || slug.length === 0 ? "/docs/index" : `/docs/${slug.join("/")}`;
+  return {
+    title: page.data.title,
+    description: page.data.description,
+    alternates: {
+      canonical: `${basePath}${pathname === "/docs/index" ? "/docs" : pathname}/`,
+      types: { "text/markdown": `${basePath}${pathname}.md` },
+    },
+  };
 }

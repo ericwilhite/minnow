@@ -79,7 +79,15 @@ export function resolveOptions(options: DevtoolsOptions = {}): ResolvedDevtoolsO
     hotkey: options.hotkey ?? "mod+shift+d",
     // Inline panels have no launcher to open them, so they start open whatever the caller said.
     defaultOpen: mode === "inline" ? true : (options.defaultOpen ?? false),
-    zIndex: Number.isFinite(options.zIndex) ? Number(options.zIndex) : 2_147_483_000,
+    // A floating panel is an overlay and has to clear whatever the page stacks above its own
+    // content. An inline one is a section of the document: given the overlay's z-index it would
+    // paint over the page's sticky header the moment the reader scrolled. It therefore sits in
+    // the page's own order unless the embedder asks for something else.
+    zIndex: Number.isFinite(options.zIndex)
+      ? Number(options.zIndex)
+      : mode === "inline"
+        ? 0
+        : 2_147_483_000,
     write: options.permissions?.write ?? true,
     initialQuery: options.initialQuery ?? "",
     storageKey: options.storageKey ?? "minnow-devtools",

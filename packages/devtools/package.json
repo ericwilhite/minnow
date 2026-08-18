@@ -1,6 +1,24 @@
 {
   "name": "@minnowdb/devtools",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "An embeddable SQL console and data browser for a Minnow database.",
+  "license": "MIT",
+  "author": "Eric Wilhite",
+  "homepage": "https://minnowdb.com/docs/devtools/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minnowdb/minnow.git",
+    "directory": "packages/devtools"
+  },
+  "bugs": "https://github.com/minnowdb/minnow/issues",
+  "keywords": [
+    "sql",
+    "database",
+    "browser",
+    "devtools",
+    "console",
+    "minnow"
+  ],
   "type": "module",
   "exports": {
     ".": {
@@ -19,6 +37,6 @@
     "@codemirror/lint": "^6.9.7",
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.8",
-    "@minnowdb/core": "0.0.0"
+    "@minnowdb/core": ">=0.1.0 <1.0.0"
   }
 }

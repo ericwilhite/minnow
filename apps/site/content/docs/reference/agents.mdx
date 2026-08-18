@@ -1,0 +1,110 @@
+---
+title: AI agents & LLMs
+description: Machine-readable documentation, and the rules to give an agent writing Minnow code.
+---
+
+Everything on this site is published twice: once as a page, and once as the markdown it was
+written from. An agent reading the second one gets the sentences without the navigation tree, the
+search dialog, or the syntax highlighter's markup around every keyword.
+
+## Machine-readable documentation
+
+| URL                                                    | What it is                                                                        |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| [`/llms.txt`](/llms.txt)                               | Every page, titled and described, linked to its markdown. Follows llmstxt.org.    |
+| [`/llms-full.txt`](/llms-full.txt)                     | The whole documentation set in one file, about 240 KB.                            |
+| `/docs/<page>.md`                                      | The markdown twin of any page: drop the trailing slash and add `.md`.             |
+| [`/sql-feature-matrix.json`](/sql-feature-matrix.json) | Every SQL form the engine supports and rejects, with a runnable example for each. |
+| [`/versions.json`](/versions.json)                     | Which versions are published, and the path each one is served at.                 |
+| [`/sitemap.xml`](/sitemap.xml)                         | Every page on the site.                                                           |
+
+Each page also declares its markdown twin in its head, as
+`<link rel="alternate" type="text/markdown">`, so a crawler finds it without being told the rule.
+
+The feature matrix is worth pointing an agent at directly. It is not a description of the engine
+written by hand — it is the fixture the engine is tested against, so every example in it is
+executed on every test run and every rejection is checked to still fail with the error recorded
+there. See [Feature matrix](/docs/sql/feature-matrix).
+
+Each of these is versioned with the docs it belongs to. `minnowdb.com/llms.txt` describes the
+current release; an archived release serves its own at `minnowdb.com/v0.1/llms.txt`. Point an
+agent at the version your project pins, and see [Versioning](/docs/reference/versioning).
+
+## Rules for an agent writing Minnow code
+
+Paste this into `AGENTS.md`, `CLAUDE.md`, or your editor's rules file. It is also served on its
+own at [`/agent-rules.md`](/agent-rules.md), so you can fetch it directly:
+
+```bash
+curl -o AGENTS-minnow.md https://minnowdb.com/agent-rules.md
+```
+
+```md
+# Minnow
+
+Minnow (`@minnowdb/core`) is a columnar SQL database that runs in the browser. Documentation for
+machines: https://minnowdb.com/llms.txt
+
+- Browser only. It needs IndexedDB and `CompressionStream`, and there is no Node build. In Node
+  tests, use `MemoryBlockStore` from `@minnowdb/core/storage`, or `fake-indexeddb`.
+- Open a database with `new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }))` —
+  `MinnowDatabase` from `@minnowdb/core`, `IndexedDbBlockStore` from `@minnowdb/core/storage`.
+- `@minnowdb/core`, `@minnowdb/client`, and `@minnowdb/devtools` share a major version and move
+  independently inside it. Install them on the same major; npm refuses a mixed-major set.
+- `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
+  statement that writes, rather than writing.
+- `db.execute(sql, params)` runs any statement and returns a tagged result. Check `result.kind`
+  (`rows`, `insert`, `update`, `delete`, `create-table`, `create-trigger`, `drop-trigger`) before
+  reading `rowCount`, `version`, or `returnedRows`.
+- Bind parameters with `?` in order or `$1` by position. Never concatenate values into SQL:
+  compiled plans are cached on the statement text, so a parameterized statement is planned once
+  and interpolation throws that work away on every call.
+- `UPDATE` and `DELETE` require a table with a `PRIMARY KEY`. A table without one can only be
+  appended to. Give a table a key if its rows will ever be edited.
+- Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
+- For anything interactive, run the engine in a worker:
+  `new MinnowDatabaseClient(new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }), { store: { kind: "indexeddb", name: "app-db" } })`,
+  importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Its API matches `MinnowDatabase`
+  call for call.
+- Full-text search is `MATCH(column) AGAINST 'terms'`, ranked with `BM25(column) AGAINST 'terms'`.
+  There is no index DDL to write; the index builds itself.
+- `db.explain(sql)` returns the optimized plan as text.
+- Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form. It
+  lists every supported and rejected form with an example.
+- Not supported, and what to write instead: `LATERAL` (rewrite as a join), `LISTAGG` and
+  `JSON_ARRAYAGG` (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
+  (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
+  `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
+  `SET TRANSACTION`, correlated `NOT IN` (use `NOT EXISTS`), and correlated subqueries whose
+  condition is not an equality.
+```
+
+## Why those rules
+
+They are the mistakes a model makes with Minnow specifically — the places where a habit learned
+from Postgres or SQLite produces code that fails, or code that works but is ten times slower than
+it needs to be.
+
+- **`query` versus `execute`.** Handing a write to `query` throws instead of writing, which is a
+  confusing failure if you assumed one entry point. See [Running SQL](/docs/sql).
+- **Parameters.** Interpolated values produce a new statement string per call, and the plan cache
+  is keyed on that string, so every call re-parses, re-plans, and re-optimizes.
+- **The unique key.** Mutations address rows by unique key, so `UPDATE` and `DELETE` are rejected
+  outright on a keyless table. This is the rejection agents hit most. See
+  [Writing data](/docs/sql/dml).
+- **Batch writes.** `insertBatch` skips the parser entirely and writes columns as columns. A loop
+  of `INSERT` statements is the single most common performance mistake. See
+  [The database API](/docs/engine).
+- **Workers.** Query execution on the main thread competes with rendering. The API is identical
+  either side of the boundary, so there is no reason to start on the main thread and move later.
+  See [Workers & multi-tab](/docs/engine/workers).
+- **The SQL surface.** It is large but not complete, and the rejections are deliberate and
+  documented. An agent that checks the matrix writes a supported form the first time instead of
+  discovering the gap through an error.
+
+## Verifying what an agent wrote
+
+The [playground](/playground) runs a real database of about 590,000 rows in the browser, so a
+query can be pasted in and run against a schema that already exists. In an application, the
+[devtools console](/docs/devtools) does the same against your own data, and its **Plan** tab shows
+what the optimizer made of the statement.

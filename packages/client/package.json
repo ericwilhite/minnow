@@ -1,6 +1,24 @@
 {
   "name": "@minnowdb/client",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Typed query client for Minnow: a schema-aware builder over @minnowdb/core with inferred row types, constraints, views, and live queries.",
+  "license": "MIT",
+  "author": "Eric Wilhite",
+  "homepage": "https://minnowdb.com/docs/client/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minnowdb/minnow.git",
+    "directory": "packages/client"
+  },
+  "bugs": "https://github.com/minnowdb/minnow/issues",
+  "keywords": [
+    "sql",
+    "database",
+    "browser",
+    "typescript",
+    "query-builder",
+    "minnow"
+  ],
   "type": "module",
   "exports": {
     ".": {
@@ -12,6 +30,6 @@
     "dist"
   ],
   "dependencies": {
-    "@minnowdb/core": "*"
+    "@minnowdb/core": ">=0.1.0 <1.0.0"
   }
 }

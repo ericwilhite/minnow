@@ -1,0 +1,106 @@
+---
+title: Versioning
+description: One major across every package, what a version change means, and how a release is cut.
+---
+
+Every Minnow package shares a major version and moves independently inside it. The major is the
+compatibility line: any `@minnowdb/client@0.x` works with any `@minnowdb/core@0.x`, whichever
+minors the two happen to be on.
+
+```bash
+npm install @minnowdb/core @minnowdb/client
+```
+
+The client and the devtools console are built on the engine's published primitives, and a change
+that breaks that contract is a major change by definition. So each package depends on its siblings
+by a range that spans the major and stops at it:
+
+```json
+"dependencies": { "@minnowdb/core": ">=0.1.0 <1.0.0" }
+```
+
+The ceiling is the compatibility line, and npm refuses a mixed-major install on its own. The floor
+is the sibling release this package was built against — when the devtools start using something
+the engine added in 0.4.0, their next release says `>=0.4.0` and npm resolves an engine that has
+it. Below the major, a fix to the console does not drag the engine's version along with it.
+
+## What 0.x means
+
+Minnow is in 0.x, and the usual 0.x rule applies: **breaking changes can land in a minor
+release.** Pin exact versions in an application, and read the release notes before moving from
+`0.1` to `0.2`.
+
+A change is breaking when it is one of these:
+
+- **The API.** An export removed or renamed, a signature narrowed, or a default changed.
+- **SQL.** A form that used to run and no longer does, or one that runs and now answers
+  differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
+- **Stored data.** A database written by the old version that the new one cannot open.
+
+From 1.0 onwards these move the major version — every package's, together — and minor releases
+stay additive.
+
+## The block format has its own version
+
+The version on the package describes the code. The bytes in IndexedDB carry a separate
+`BLOCK_FORMAT_VERSION`, and a snapshot file carries `SNAPSHOT_FORMAT_VERSION`. They move on their
+own schedule — most package releases do not touch them.
+
+Every released format version keeps a frozen database in `packages/core/format-fixtures/`, opened
+and queried on every test run, so a change that would make an existing database unreadable fails
+in CI rather than in an application. See [Testing](/docs/reference/testing) for how that suite
+works.
+
+## How a release is cut
+
+One command writes the versions, the dependency ranges between them, and the lockfile:
+
+```bash
+npm run version:set -- minor @minnowdb/core   # one package, inside the shared major
+npm run version:set -- major                  # every package to the next major, together
+```
+
+Then the gate, the tag, and the publish:
+
+```bash
+npm run check:release            # the local gate, the performance gate, all browser suites
+git commit -am "Release core 0.2.0" && git tag @minnowdb/core@0.2.0
+npm publish --workspace @minnowdb/core --access public
+```
+
+A major moves everything at once, so it is tagged `v2.0.0` and published with
+`npm publish --workspaces`. `npm run version:check` proves the workspace still agrees with itself
+— matching majors, ranges that span them, and a docs version that matches the engine — and runs
+as the first step of `npm run check`, so a hand-edited version fails before anything is published.
+
+## Where each version's documentation lives
+
+The documentation describes the engine, so it is versioned with `@minnowdb/core`: `v0.1` while
+Minnow is in 0.x, where a minor can break things, and `v1`, `v2` from 1.0 onwards.
+
+| URL                        | What it serves                                                |
+| -------------------------- | ------------------------------------------------------------- |
+| `minnowdb.com/docs/…`      | The current release. A link written here never goes stale.    |
+| `minnowdb.com/v0.1/docs/…` | 0.1.x, frozen at its tag, for as long as it is worth keeping. |
+
+The picker at the top of the docs sidebar moves between them and keeps you on the same page. It
+reads [`/versions.json`](/versions.json) from the site's root rather than the copy compiled into
+the build, so an archived version still lists releases that did not exist when it was frozen.
+
+Everything under an archived prefix is versioned with it: its search index, its
+[markdown and llms.txt](/docs/reference/agents), and every link between its pages. Archived pages
+also carry `noindex`, so a search engine offers the current documentation first. The playground
+and the benchmarks are not archived — they always run the current release.
+
+An archive is the same site built from the tag with a base path:
+
+```bash
+git worktree add ../minnow-v0.1 v0.1.0
+cd ../minnow-v0.1 && npm ci
+SITE_BASE_PATH=/v0.1 npm run site:build
+```
+
+`apps/site/out/` is then deployed at that prefix, and the version is added to the `archived` list
+in `apps/site/public/versions.json` on `main`. On Vercel that means a project of its own, with the
+main site rewriting `/v0.1/:path*` to it — a static export has no server to route with, so the
+prefix has to come from the platform.

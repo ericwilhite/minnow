@@ -1,6 +1,12 @@
 {
   "name": "minnow",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": "Eric Wilhite",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minnowdb/minnow.git"
+  },
   "private": true,
   "type": "module",
   "workspaces": [
@@ -22,10 +28,13 @@
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
-    "check": "npm run format && npm run typecheck && npm run lint && npm run build && npm run test:coverage",
+    "check": "npm run version:check && npm run format && npm run typecheck && npm run lint && npm run build && npm run test:coverage",
     "check:release": "npm run check && npm run benchmark:gate && npm run test:browser",
+    "version:check": "vite-node scripts/version.mts check",
+    "version:set": "vite-node scripts/version.mts set",
     "benchmark:gate": "vite-node scripts/perf-gate.mts",
     "soak": "vite-node scripts/soak.mts",
+    "fixture:format": "vite-node scripts/write-format-fixture.mts",
     "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts"
   },
   "devDependencies": {
@@ -35,6 +44,7 @@
     "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^10.8.1",
     "fake-indexeddb": "^6.2.5",
+    "fast-check": "^4.9.0",
     "globals": "^17.11.0",
     "prettier": "^3.9.6",
     "typescript": "^5.9.3",

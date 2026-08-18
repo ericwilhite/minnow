@@ -41,9 +41,20 @@ const developmentHeaders = [
   },
 ];
 
+/**
+ * Where this build is published. Empty for the current release, which is always served at the
+ * root, and `/v0.1` for an archived one built from that release's tag — every path it emits,
+ * including its search index and its llms.txt, is then versioned with it.
+ */
+const basePath = process.env.SITE_BASE_PATH ?? "";
+
 const config = {
   output: "export",
   trailingSlash: true,
+  ...(basePath === "" ? {} : { basePath }),
+  // Inlined so client components can build links out of an archived build and back to the
+  // current one. `basePath` alone is not readable from the browser.
+  env: { NEXT_PUBLIC_SITE_BASE_PATH: basePath },
   reactStrictMode: true,
   ...(process.env.NODE_ENV === "development"
     ? { headers: () => Promise.resolve(developmentHeaders) }

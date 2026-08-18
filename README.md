@@ -10,7 +10,10 @@ run yourself.
 npm install @minnowdb/core
 ```
 
-> **Experimental.** The block format carries no compatibility promise yet.
+> **Experimental.** Minnow is in 0.x, so breaking changes can land in a minor release and the
+> block format carries no compatibility promise yet. Every package shares a major version and
+> moves independently inside it — see
+> [Versioning](https://minnowdb.com/docs/reference/versioning/).
 
 ## Features
 
@@ -61,6 +64,13 @@ Two pages there are worth knowing about specifically:
   run live on your machine at a dataset size you choose. There are no published numbers to take
   on trust; every result is checked against an independent oracle before its timing counts.
 
+For agents and language models, the site publishes itself in machine-readable form:
+[`llms.txt`](https://minnowdb.com/llms.txt), [`llms-full.txt`](https://minnowdb.com/llms-full.txt),
+a `.md` twin of every page, the SQL surface as
+[JSON](https://minnowdb.com/sql-feature-matrix.json), and
+[`agent-rules.md`](https://minnowdb.com/agent-rules.md) — a short rules file to drop into an
+`AGENTS.md`. See [AI agents & LLMs](https://minnowdb.com/docs/reference/agents/).
+
 [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) are internal engineering
 records of the design and milestone gates.
 
@@ -72,6 +82,7 @@ npm run check          # format, typecheck, lint, build, unit tests with coverag
 npm run site:dev       # the docs site, playground and benchmarks
 npm run test:browser   # library and site tests in real browsers
 npm run soak           # generative suites on fresh random seeds, to find new failures
+npm run version:set -- minor @minnowdb/core   # one package; `major` moves them all together
 ```
 
 `npm install` points git at `.githooks`, where a pre-push hook runs `npm run check` — the same
@@ -81,7 +92,8 @@ so a file another session left broken stops you too; `git push --no-verify` is t
 when that is what you want.
 
 See [Testing](https://minnowdb.com/docs/reference/testing/) for the full runner map and the
-release gate.
+release gate, and [Versioning](https://minnowdb.com/docs/reference/versioning/) for how a release
+is cut.
 
 ## Deployment
 
@@ -93,9 +105,18 @@ workspace packages the site imports, so it needs the rest of the repository pres
 benchmarks page needs to reach SQLite's OPFS backend. They cannot live in `next.config.mjs`,
 because a static export serves plain files and Next.js drops its `headers()` config there.
 
+Documentation for an older release is the same site built from that release's tag with
+`SITE_BASE_PATH=/v0.1`, deployed at that prefix and listed in `apps/site/public/versions.json`.
+Every path it emits is versioned with it, and the picker in the docs sidebar moves between them.
+See [Versioning](https://minnowdb.com/docs/reference/versioning/).
+
 The benchmarks rule is written twice, and the trailing slash is the reason. A `source` matches a
 request path ending in `/` neither as `/benchmarks` nor as `/benchmarks/:path*`, and
 `trailingSlash` means the document is only ever served at `/benchmarks/` -- so the literal form is
 what covers the page itself, and the pattern covers anything below it. Check a change to these by
 reading `crossOriginIsolated` in the console on the deployed page; when it is false, SQLite has
 silently fallen back to the handle pool and the benchmarks measure a different browser.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -116,3 +116,124 @@ test("the benchmarks route is cross-origin isolated", async ({ page }) => {
   await page.goto("/docs/");
   expect(await page.evaluate(() => window.crossOriginIsolated)).toBe(false);
 });
+
+test("every docs page is published as markdown, with indexes above it", async ({
+  page,
+  request,
+}) => {
+  // llms.txt indexes the set; each entry links the markdown rather than the page, and links are
+  // site-relative so a local build reads as correctly as the deployed one.
+  const index = await request.get("/llms.txt");
+  expect(index.ok()).toBe(true);
+  const listed = await index.text();
+  expect(listed).toContain("](/docs/sql/select.md)");
+  expect(listed).not.toContain("](https://minnowdb.com");
+
+  // And the markdown it points at is the page's own prose, with its components expanded: the
+  // feature matrix is a table of the same fixture the engine is tested against.
+  const markdown = await request.get("/docs/sql/feature-matrix.md");
+  expect(markdown.ok()).toBe(true);
+  const text = await markdown.text();
+  expect(text).toContain("# Feature matrix");
+  expect(text).toContain("| `select.projection` | E051 |");
+  expect(text).not.toMatch(/<[A-Z]/);
+
+  // The rules file an agent is told to fetch is generated from the page that documents it, so
+  // the two cannot drift apart.
+  const rules = await request.get("/agent-rules.md");
+  expect(rules.ok()).toBe(true);
+  expect(await rules.text()).toContain(
+    "`UPDATE` and `DELETE` require a table with a `PRIMARY KEY`",
+  );
+
+  // And the whole set is one link away from every page.
+  await page.goto("/");
+  await expect(page.getByRole("link", { name: "AI & LLMs" }).first()).toHaveAttribute(
+    "href",
+    "/docs/reference/agents/",
+  );
+
+  // A reader that prefers markdown is told where it is without knowing the rule.
+  await page.goto("/docs/sql/select/");
+  const alternate = page.locator('link[rel="alternate"][type="text/markdown"]');
+  await expect(alternate).toHaveAttribute("href", "https://minnowdb.com/docs/sql/select.md");
+});
+
+test("the docs sidebar offers the version it is showing", async ({ page }) => {
+  await page.goto("/docs/");
+  const picker = page.getByLabel("Documentation version");
+  await expect(picker).toBeVisible();
+  // The unprefixed build is the current release, and the picker says so.
+  await expect(picker).toHaveValue("/");
+  await expect(picker.locator("option")).toHaveText([/\(latest\)/]);
+});
+
+test("search reads the index the build wrote", async ({ page }) => {
+  await page.goto("/docs/");
+  await page
+    .getByRole("button", { name: /search/i })
+    .first()
+    .click();
+  await page.getByPlaceholder("Search").fill("window functions");
+  // A result that could only come from the static index, not from the page already open. The
+  // index is named explicitly in components/search.tsx: the client's own default is a route a
+  // static export never emits, and searching then finds nothing at all.
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText("Window functions").first()).toBeVisible({ timeout: 15_000 });
+  await expect(dialog.getByText("Reading data").first()).toBeVisible();
+});
+
+test("the embedded console scrolls under the site header", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Run", exact: true })).toBeVisible({
+    timeout: 120_000,
+  });
+  await page.evaluate(() => {
+    window.scrollTo(0, 400);
+  });
+
+  // An inline panel is part of the document, not an overlay: whatever the devtools stack inside
+  // themselves, the page's own header stays on top of them.
+  const headerOnTop = await page.evaluate(() => {
+    const nav = document.querySelector("#nd-nav");
+    if (nav === null) return false;
+    const box = nav.getBoundingClientRect();
+    const painted = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    return painted !== null && nav.contains(painted);
+  });
+  expect(headerOnTop).toBe(true);
+});
+
+test("the devtools page opens the floating panel over itself", async ({ page }) => {
+  await page.goto("/docs/devtools/");
+  await page.getByRole("button", { name: "Open the floating panel" }).click();
+
+  // The panel lives in a shadow root, which Playwright's selector engine sees through.
+  const panel = page.getByRole("region", { name: "Minnow devtools" });
+  await expect(panel).toBeVisible({ timeout: 120_000 });
+  // This one runs in the page rather than a worker, which is what the badge reports.
+  await expect(panel.getByText("main thread")).toBeVisible();
+
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  // The status bar and the history entry both report it; the first is the status bar.
+  await expect(panel.getByText(/\d+ rows · \d+ms/).first()).toBeVisible({ timeout: 60_000 });
+
+  // Closing leaves the launcher behind, the way it does in an application.
+  await page.getByRole("button", { name: "Close devtools" }).click();
+  await expect(panel).toBeHidden();
+
+  // Removing it takes the panel and the database behind it away with it.
+  await page.getByRole("button", { name: "Remove it" }).click();
+  await expect(panel).toHaveCount(0);
+});
+
+test("a path that misses lands in the pond", async ({ page }) => {
+  const response = await page.goto("/pond/where-did-it-go/");
+  expect(response?.status()).toBe(404);
+  await expect(page.getByRole("heading", { name: "This one got away" })).toBeVisible();
+  // One 404.html serves every path that misses, so the path is read in the browser rather than
+  // rendered into the page.
+  await expect(page.getByText("'/pond/where-did-it-go/'")).toBeVisible();
+  // And the pond is really the pond, canvas and all.
+  await expect(page.locator("canvas")).toBeVisible();
+});

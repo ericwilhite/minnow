@@ -1,20 +1,20 @@
 {
   "name": "@minnowdb/site",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "predev": "npm run build:packages && node scripts/vendor-engines.mjs",
-    "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs",
+    "predev": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-llms.mjs",
+    "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-llms.mjs",
     "build:packages": "tsc -b ../../packages/core ../../packages/client ../../packages/devtools",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
-    "@minnowdb/core": "0.0.0",
-    "@minnowdb/devtools": "0.0.0",
+    "@minnowdb/core": ">=0.1.0 <1.0.0",
+    "@minnowdb/devtools": ">=0.1.0 <1.0.0",
     "fumadocs-core": "^16.14.4",
     "fumadocs-mdx": "^15.2.3",
     "fumadocs-ui": "^16.14.4",

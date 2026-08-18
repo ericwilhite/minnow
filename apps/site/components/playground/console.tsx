@@ -13,6 +13,7 @@ import type { MountedDevtools } from "@minnowdb/devtools";
 import { PLAYGROUND_DATABASE, isLoaded, loadRetailDataset } from "@/lib/dataset/load";
 import { retailSizes } from "@/lib/dataset/retail";
 import { defaultQuery, sampleQueries } from "./queries";
+import { useSiteTheme } from "./use-site-theme";
 
 type Status =
   | { kind: "starting" }
@@ -24,30 +25,6 @@ const SIZE_KEY = "minnow-playground-size";
 
 function format(value: number): string {
   return value.toLocaleString("en-US");
-}
-
-/**
- * The theme the site is showing. Fumadocs switches themes with a class on `<html>`, and the panel
- * lives in a shadow root that only knows the OS setting unless it is told otherwise — so a reader
- * on a light machine reading these docs in dark mode would get a white panel in a dark page.
- */
-function useSiteTheme(): "light" | "dark" {
-  const [theme, setTheme] = useState<"light" | "dark">("light");
-
-  useEffect(() => {
-    const root = document.documentElement;
-    const read = (): void => {
-      setTheme(root.classList.contains("dark") ? "dark" : "light");
-    };
-    read();
-    const observer = new MutationObserver(read);
-    observer.observe(root, { attributes: true, attributeFilter: ["class"] });
-    return () => {
-      observer.disconnect();
-    };
-  }, []);
-
-  return theme;
 }
 
 export function PlaygroundConsole({ height = 620 }: { height?: number }) {

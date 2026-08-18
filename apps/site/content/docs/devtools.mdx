@@ -8,10 +8,16 @@ floats over your page without blocking it, and every change asks first.
 
 ## Try it
 
-The [playground](/playground) is this panel, in its production shape: a database running in a web
-worker (the same [worker client](/docs/engine/workers) an app ships) over a seven-table retail
-dataset generated in your browser and kept in IndexedDB. The title-bar badge reads **worker**
-because the queries genuinely leave the page.
+This is the panel an application mounts: a launcher in the corner, and a window over the page that
+leaves the page underneath it usable. It builds a small retail database in memory here, so nothing
+is written to your machine and closing it throws the data away.
+
+<DevtoolsDemo />
+
+The [playground](/playground) is the same panel embedded inline, in its production shape: a
+database running in a web worker (the same [worker client](/docs/engine/workers) an app ships)
+over a seven-table retail dataset generated in your browser and kept in IndexedDB. The title-bar
+badge reads **worker** there because the queries genuinely leave the page.
 
 ## Install
 
@@ -57,18 +63,18 @@ The database is a property rather than an attribute, because it is an object.
 
 ## Options
 
-| Option         | Attribute       | Default             | What it does                                                               |
-| -------------- | --------------- | ------------------- | -------------------------------------------------------------------------- |
-| `mode`         | `mode`          | `"launcher"`        | `"launcher"` floats over the page; `"inline"` renders in flow.             |
-| `corner`       | `corner`        | `"bottom-right"`    | Which corner the launcher and the opening panel use.                       |
-| `hotkey`       | `hotkey`        | `"mod+shift+d"`     | Toggle shortcut. `mod` is Cmd or Ctrl. Empty turns it off.                 |
-| `defaultOpen`  | `open`          | `false`             | Open on mount. Inline panels are always open.                              |
-| `zIndex`       | `z-index`       | `2147483000`        | Stacking against your own overlays.                                        |
-| `permissions`  | `write`         | `{ write: true }`   | `write: false` refuses every statement that changes data.                  |
-| `initialQuery` | `initial-query` | `""`                | SQL the console starts with.                                               |
-| `storageKey`   | `storage-key`   | `"minnow-devtools"` | Namespace for the remembered panel geometry.                               |
-| `theme`        | `theme`         | `"system"`          | `"light"` or `"dark"` pins the palette; `"system"` follows the OS.         |
-| `height`       | `height`        | container           | Height of an inline panel. A number is pixels; a string is any CSS length. |
+| Option         | Attribute       | Default                  | What it does                                                                                                                  |
+| -------------- | --------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `mode`         | `mode`          | `"launcher"`             | `"launcher"` floats over the page; `"inline"` renders in flow.                                                                |
+| `corner`       | `corner`        | `"bottom-right"`         | Which corner the launcher and the opening panel use.                                                                          |
+| `hotkey`       | `hotkey`        | `"mod+shift+d"`          | Toggle shortcut. `mod` is Cmd or Ctrl. Empty turns it off.                                                                    |
+| `defaultOpen`  | `open`          | `false`                  | Open on mount. Inline panels are always open.                                                                                 |
+| `zIndex`       | `z-index`       | `2147483000`, `0` inline | Stacking against your own overlays. A floating panel clears the page; an inline one stays in its flow, under a sticky header. |
+| `permissions`  | `write`         | `{ write: true }`        | `write: false` refuses every statement that changes data.                                                                     |
+| `initialQuery` | `initial-query` | `""`                     | SQL the console starts with.                                                                                                  |
+| `storageKey`   | `storage-key`   | `"minnow-devtools"`      | Namespace for the remembered panel geometry.                                                                                  |
+| `theme`        | `theme`         | `"system"`               | `"light"` or `"dark"` pins the palette; `"system"` follows the OS.                                                            |
+| `height`       | `height`        | container                | Height of an inline panel. A number is pixels; a string is any CSS length.                                                    |
 
 ## The schema rail
 

@@ -32,6 +32,9 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # First, because a version that only moved on one package is a broken install rather than a
+      # broken build, and nothing later in this job would notice.
+      - run: npm run version:check
       - run: npm run format
       - run: npm run typecheck
       - run: npm run lint

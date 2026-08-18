@@ -1,7 +1,13 @@
 import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
 import { Logo } from "@/components/logo";
 
-/** Shared chrome for every layout: the wordmark, the top-level links, and the repository. */
+/**
+ * Shared chrome for every layout: the wordmark, the top-level links, and the repository.
+ *
+ * Which version a reader is on is the version picker's job, at the top of the docs sidebar, so
+ * that it sits with the pages it applies to rather than over the playground and the benchmarks —
+ * which are always the current release.
+ */
 export function baseOptions(): BaseLayoutProps {
   return {
     nav: {
@@ -17,6 +23,7 @@ export function baseOptions(): BaseLayoutProps {
       { text: "Docs", url: "/docs", active: "nested-url" },
       { text: "Playground", url: "/playground" },
       { text: "Benchmarks", url: "/benchmarks" },
+      { text: "AI & LLMs", url: "/docs/reference/agents" },
     ],
     githubUrl: "https://github.com/minnowdb/minnow",
   };
