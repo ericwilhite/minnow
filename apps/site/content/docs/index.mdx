@@ -42,7 +42,11 @@ in this repository — there is no SQLite or DuckDB underneath, and no WebAssemb
 
 - **[SQL](/docs/sql)** — how to run statements, and what the language surface is: joins, CTEs,
   window functions, set operations, grouping sets, upserts with `RETURNING`, full-text search.
-- **[Client](/docs/engine)** — the `MinnowDatabase` API, transactions and snapshots, running the
+- **[Schema](/docs/schema)** — declaring tables, constraints, and views in TypeScript, and what a
+  migration will and will not do to a database that already holds rows.
+- **[Typed client](/docs/client)** — the optional query builder: inferred row types, typed writes,
+  and live queries.
+- **[Engine](/docs/engine)** — the `MinnowDatabase` API, transactions and snapshots, running the
   engine in a worker, and the memory budget.
 - **[Storage](/docs/storage)** — the block store contract and the two adapters that implement it,
   plus snapshots and background maintenance.

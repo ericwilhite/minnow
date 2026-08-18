@@ -1,6 +1,6 @@
 ---
 title: Schema & migrations
-description: Define tables once in TypeScript; migrate with safe, metadata-only steps.
+description: Define tables once in TypeScript, and evolve them without rewriting stored data.
 ---
 
 Define tables once in TypeScript. The same declaration drives migrations, row types, and every
@@ -154,40 +154,6 @@ Each check is a boolean SQL expression over the table's own columns, compiled wh
 created — so an expression the engine cannot evaluate fails at migration time rather than on the
 first write.
 
-## Views
-
-A view is a named query. Declare it with the columns you expect it to produce:
-
-```ts
-const activeCustomers = view("active_customers", {
-  sql: `SELECT customer_id, name FROM customers WHERE status = 'active'`,
-  columns: { customer_id: column.number(), name: column.string() },
-});
-
-const appSchema = schema([customers, orders], { views: [activeCustomers] });
-```
-
-The engine infers the query's real output schema when it creates the view and compares it to what
-you declared, so a body that drifts from its declaration fails the migration instead of surprising
-a reader later.
-
-**Views are readable, not writable.** They join `DB` like tables, so `selectFrom` works and the row
-type is what you declared — but they carry no insert shape, which makes a write a compile error:
-
-```ts
-await db.selectFrom("active_customers").select(["name"]).execute(); // fine
-await db.insertInto("active_customers"); // compile error: not a writable table
-```
-
-Because nothing is stored under a view, replacing one is always safe: change the `sql` and the next
-`migrate()` redefines it in place. Removing the declaration drops the view — within a schema, the
-declaration is the source of truth.
-
-That authority stops at the views the schema created. A view made with `CREATE VIEW`, or one
-written before Minnow recorded ownership, belongs to no schema and no migration removes it —
-"the schema never mentioned it" is not proof that it should go. `introspect()` reports which is
-which as `managed`, and `database.dropView(name)` removes either.
-
 ### Backfilling an added column
 
 A column added by a migration has no data in older segments, so its rows would read NULL forever —
@@ -222,20 +188,68 @@ not supported.
 Backfills apply to non-nullable columns only. A nullable column already has an answer for rows that
 never had a value, and the declaration is rejected rather than quietly ignored.
 
+## Views
+
+A view is a named query. Declare it with the columns you expect it to produce:
+
+```ts
+const activeCustomers = view("active_customers", {
+  sql: `SELECT customer_id, name FROM customers WHERE status = 'active'`,
+  columns: { customer_id: column.number(), name: column.string() },
+});
+
+const appSchema = schema([customers, orders], { views: [activeCustomers] });
+```
+
+The engine infers the query's real output schema when it creates the view and compares it to what
+you declared, so a body that drifts from its declaration fails the migration instead of surprising
+a reader later.
+
+**Views are readable, not writable.** They join `DB` like tables, so `selectFrom` works and the row
+type is what you declared — but they carry no insert shape, which makes a write a compile error:
+
+```ts
+await db.selectFrom("active_customers").select(["name"]).execute(); // fine
+await db.insertInto("active_customers"); // compile error: not a writable table
+```
+
+Because nothing is stored under a view, replacing one is always safe: change the `sql` and the next
+`migrate()` redefines it in place. Removing the declaration drops the view — within a schema, the
+declaration is the source of truth.
+
+That authority stops at the views the schema created. A view made with `CREATE VIEW`, or one
+written before Minnow recorded ownership, belongs to no schema and no migration removes it —
+"the schema never mentioned it" is not proof that it should go. `introspect()` reports which is
+which as `managed`, and `database.dropView(name)` removes either.
+
 ## What migrate() does
 
 `migrate()` compares the live catalog with your declaration and applies the difference as
-deterministic, metadata-only steps: create table, add nullable column, rename, widen nullability,
-widen an enum's value set (or drop it to a plain string), and add/change/remove a column default
-(defaults are write-time only, so altering one never touches stored rows).
+deterministic steps:
+
+| Step                         | What it does                                                               |
+| ---------------------------- | -------------------------------------------------------------------------- |
+| create table                 | Including its constraints, and after any table it references.              |
+| add column                   | Nullable, or non-nullable [with a backfill](#backfilling-an-added-column). |
+| rename column                | Through the column's stable ID, so it is not a drop plus an add.           |
+| widen nullability            | NOT NULL to NULL.                                                          |
+| tighten nullability          | NULL to NOT NULL, [proven first](#proven-rather-than-assumed).             |
+| widen an enum                | Add values, or drop the restriction to a plain string.                     |
+| alter a default              | Defaults are write-time only, so changing one never touches stored rows.   |
+| adopt or drop auto-increment | [Proven first](#proven-rather-than-assumed) when adopting.                 |
+| replace a view               | Nothing is stored under a view, so a body change needs no proof.           |
+| drop a column or table       | Only [with your say-so](#dropping-things).                                 |
 
 - **Each step is atomic**, and the whole run is idempotent — an interrupted migration completes by
   re-running.
 - **Concurrent migrators can't interleave** — the loser fails with a typed conflict.
-- **Nothing is rewritten.** A column added later reads as NULL in old data without touching it;
-  physical rewrites are [compaction](/docs/sql/dml)'s job.
+- **Nothing is rewritten.** Not one stored byte changes: a column added later is answered at read
+  time, and folding it into the blocks is
+  [compaction](/docs/storage/maintenance#compaction)'s job, on its own schedule.
 
-Two changes are **proven rather than assumed**. Both read block headers only — the same
+### Proven rather than assumed
+
+Two changes are earned rather than declared. Both read block headers only — the same
 checksum-authenticated statistics that drive data skipping — so they cost one header read per
 block, with nothing decompressed or decoded:
 

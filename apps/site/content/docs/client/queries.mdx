@@ -1,7 +1,10 @@
 ---
-title: Reading data
+title: Queries
 description: The select builder — joins, expressions, aggregates, subqueries, and set operations.
 ---
+
+This is the builder. For the SQL the engine accepts — and for reading with `db.query()` instead —
+see [Reading data](/docs/sql/select); the two produce the same plans.
 
 Every builder is immutable: each call returns a new builder, so partial queries are safe to share
 and extend. Nothing runs until you call `execute()`.
