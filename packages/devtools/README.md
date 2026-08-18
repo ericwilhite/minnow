@@ -1,7 +1,11 @@
 # @minnowdb/devtools
 
-An embeddable SQL console for a Minnow database. A floating panel during development, an inline
-playground wherever you want one.
+An embeddable SQL console and data browser for a [Minnow](https://minnowdb.com) database. A
+floating panel during development, an inline playground wherever you want one.
+
+**[minnowdb.com](https://minnowdb.com)** — documentation, a live playground, and benchmarks you
+run yourself. The [devtools guide](https://minnowdb.com/docs/devtools/) opens this panel over the
+page, so you can try it before installing anything.
 
 ```bash
 npm install @minnowdb/devtools
@@ -43,10 +47,17 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
 - **`permissions: { write: false }`** refuses statements that change data before they reach the
   database.
 
+- **Inline or floating** — `mode: "inline"` renders the panel in your layout instead of over the
+  page, where it sits in the page's own stacking order rather than above it.
+
 Keep the mount behind a development check. This is a separate package so it never reaches a
 production bundle unless you put it there.
 
 Full guide: [Devtools](https://minnowdb.com/docs/devtools/).
+
+Every `@minnowdb` package shares a major version and moves independently inside it, so install
+this on the same major as the engine. See
+[Versioning](https://minnowdb.com/docs/reference/versioning/).
 
 ## Demo
 
