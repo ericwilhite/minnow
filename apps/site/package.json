@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/site",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,8 +13,8 @@
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
-    "@minnowdb/core": ">=0.1.0 <1.0.0",
-    "@minnowdb/devtools": ">=0.1.0 <1.0.0",
+    "@minnowdb/core": ">=0.1.1 <1.0.0",
+    "@minnowdb/devtools": ">=0.1.1 <1.0.0",
     "fumadocs-core": "^16.14.4",
     "fumadocs-mdx": "^15.2.3",
     "fumadocs-ui": "^16.14.4",
