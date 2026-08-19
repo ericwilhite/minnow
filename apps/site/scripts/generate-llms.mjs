@@ -161,7 +161,7 @@ function toMarkdown(page) {
   );
   body = body.replace(
     /<Playground[^>]*\/>/g,
-    `_An interactive SQL console runs here on the site: ${url("/playground/")}_`,
+    `_An interactive console runs here on the site, in SQL and in TypeScript: ${url("/#console")}_`,
   );
   body = body.replace(
     /<DevtoolsDemo[^>]*\/>/g,
@@ -270,7 +270,7 @@ write(
     ]),
     "## Optional",
     "",
-    `- [Playground](${url("/playground/")}): a live database of ~590,000 rows, generated in the browser, that any SQL can be run against.`,
+    `- [Console](${url("/#console")}): a live database of ~590,000 rows, generated in the browser, that any SQL can be run against — or queried through the typed client, in a TypeScript editor with the published declarations loaded.`,
     `- [Benchmarks](${url("/benchmarks/")}): Minnow against SQLite Wasm and PGlite, run in the visitor's browser.`,
     `- [Source](https://github.com/ericwilhite/minnow): the repository, MIT licensed.`,
     "",
@@ -290,7 +290,7 @@ write(
   ].join("\n"),
 );
 
-const staticPages = ["/", "/playground/", "/benchmarks/", ...everyPage.map(pagePath)];
+const staticPages = ["/", "/benchmarks/", ...everyPage.map(pagePath)];
 write(
   "/sitemap.xml",
   [

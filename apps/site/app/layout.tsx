@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import type { Metadata } from "next";
-import { RootProvider } from "fumadocs-ui/provider/next";
-import SearchDialog from "@/components/search";
+import { Providers } from "@/components/providers";
 import { isArchived } from "@/lib/versions";
 import "./global.css";
 
@@ -23,7 +22,7 @@ export default function Layout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
       <body className="flex min-h-screen flex-col">
-        <RootProvider search={{ SearchDialog }}>{children}</RootProvider>
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

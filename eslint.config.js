@@ -64,6 +64,10 @@ export default tseslint.config(
       "apps/site/bench/engines/**/*.ts",
       "apps/site/bench/worker/feature-suite.ts",
       "apps/site/lib/dataset/docs-sql.test.ts",
+      // Reads the generated declaration bundle off disk and runs the compiler over it, which is
+      // how the console's type checking is proved without a browser.
+      "apps/site/components/playground/snippets.test.ts",
+      "vitest.config.ts",
       "apps/site/tests/serve-dist.mjs",
       "apps/site/scripts/*.mjs",
       "packages/core/src/engine/sql-conformance.test.ts",

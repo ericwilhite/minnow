@@ -29,9 +29,14 @@
 - Benchmarks are not published numbers. `/benchmarks` runs the suites live in the visitor's
   browser from `apps/site/bench`, so there are no capture files to regenerate and no results to
   keep in step with the code.
-- The playground is the runnable example. `apps/site/lib/dataset` generates a retailer's data in
-  the browser and the docs query it; prose examples should use that schema so a reader can paste
-  them straight into the console.
+- The console on the home page is the runnable example. `apps/site/lib/dataset` declares a
+  retailer's schema with the core DSL and generates its data in the browser; the docs query it,
+  so prose examples should use that schema and a reader can paste them straight in. There is no
+  separate playground page — `/#console` is the link.
+- The console has two tabs over one database. SQL is the shipped devtools panel; TypeScript is a
+  Monaco editor running the real language service against the `.d.ts` files in `packages/*/dist`,
+  collected by `apps/site/scripts/generate-playground-types.mjs`. Both are handed the same
+  worker-hosted client, so a row written in one is visible in the other.
 - The README is a feature list plus install and development pointers. It links to the docs site
   rather than repeating anything from it. Package READMEs are short summaries with the same rule.
 - Documentation is part of the change, not a follow-up. A change that alters behaviour and leaves
@@ -72,9 +77,13 @@ reach for `MemoryBlockStore` in tests. Every one of them is then wrong, and no t
 
 What the suites do and do not cover:
 
-- **Covered.** The SELECT guide's SQL runs against the playground dataset (`docs-sql.test.ts`).
-  The SQL feature matrix is a fixture the engine is tested against, so that page cannot drift.
-  `generate-llms.mjs` fails the build on a component it cannot render as markdown, and
-  `npm run version:check` fails on a version claim that no longer matches the manifests.
+- **Covered.** The SELECT guide's SQL runs against the retail dataset (`docs-sql.test.ts`), and
+  so do the console's SQL chips (`queries.test.ts`). The console's TypeScript snippets are both
+  typechecked against the published declarations and executed (`snippets.test.ts`) — that suite
+  also proves the whole editor pipeline offline, so a broken `paths` map or a declaration the
+  resolver cannot follow fails in Vitest rather than in a browser. The SQL feature matrix is a
+  fixture the engine is tested against, so that page cannot drift. `generate-llms.mjs` fails the
+  build on a component it cannot render as markdown, and `npm run version:check` fails on a
+  version claim that no longer matches the manifests.
 - **Not covered.** Every sentence of prose, every capability claim, every number in the README,
   and the rules block. Those are yours to keep true.

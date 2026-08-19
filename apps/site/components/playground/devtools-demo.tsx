@@ -56,13 +56,7 @@ export function DevtoolsDemo() {
       ]);
 
     const database = new MinnowDatabase(new MemoryBlockStore());
-    for (const table of dataset.retailSchema) {
-      await database.createTable({
-        name: table.name,
-        uniqueKey: table.uniqueKey,
-        columns: table.columns,
-      });
-    }
+    await database.migrate(dataset.retailDefinition);
     // A fiftieth of the playground's data: enough for a query to have something to say, small
     // enough to build while the reader is still looking at the button they pressed.
     for (const batch of dataset.retailBatches({ scale: 0.02 })) {

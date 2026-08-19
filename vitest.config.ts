@@ -1,6 +1,12 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // The site's own modules import each other through the `@/` alias its tsconfig declares, so a
+  // test of one of them resolves the same way the browser build does.
+  resolve: {
+    alias: { "@/": `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
+  },
   test: {
     include: ["packages/**/*.test.ts", "apps/site/{lib,bench,components}/**/*.test.ts"],
     /**

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { retailBatches, retailSchema } from "./retail";
+import { retailBatches, retailDefinition } from "./retail";
 
 /**
  * The SQL in the reading docs, executed. Every example is written against the playground's schema
@@ -24,13 +24,7 @@ function sqlBlocks(path: string): string[] {
 describe("the SELECT guide's examples", () => {
   it("all run against the playground dataset", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
-    for (const table of retailSchema) {
-      await database.createTable({
-        name: table.name,
-        uniqueKey: table.uniqueKey,
-        columns: table.columns,
-      });
-    }
+    await database.migrate(retailDefinition);
     for (const batch of retailBatches({ scale: 0.05 })) {
       await database.insertBatch(batch.table, batch.rows);
     }

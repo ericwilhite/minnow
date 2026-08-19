@@ -7,17 +7,19 @@
     "dev": "next dev",
     "build": "node scripts/build.mjs",
     "start": "next start",
-    "predev": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-llms.mjs",
-    "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-llms.mjs",
+    "predev": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-playground-types.mjs && node scripts/generate-llms.mjs",
+    "prebuild": "npm run build:packages && node scripts/vendor-engines.mjs && node scripts/generate-playground-types.mjs && node scripts/generate-llms.mjs",
     "build:packages": "tsc -b ../../packages/core ../../packages/client ../../packages/devtools",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
+    "@minnowdb/client": ">=0.1.1 <1.0.0",
     "@minnowdb/core": ">=0.1.1 <1.0.0",
     "@minnowdb/devtools": ">=0.1.1 <1.0.0",
     "fumadocs-core": "^16.14.4",
     "fumadocs-mdx": "^15.2.3",
     "fumadocs-ui": "^16.14.4",
+    "monaco-editor": "^0.56.0",
     "next": "^16.3.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

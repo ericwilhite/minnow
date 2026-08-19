@@ -44,6 +44,12 @@ export default function HomePage() {
             Read the docs
           </Link>
           <Link
+            href="#console"
+            className="rounded-lg border border-fd-border px-4 py-2 font-medium hover:bg-fd-accent"
+          >
+            Open the console
+          </Link>
+          <Link
             href="/benchmarks"
             className="rounded-lg border border-fd-border px-4 py-2 font-medium hover:bg-fd-accent"
           >
@@ -57,9 +63,12 @@ export default function HomePage() {
 
       {/*
         The console is the argument. It is not a screenshot or a canned response: the page builds
-        a real database in this browser and answers whatever gets typed into it.
+        a real database in this browser and answers whatever gets typed into it — in SQL, or in
+        TypeScript through the typed client, over the same database either way.
+
+        It carries the id every link that used to point at a separate playground page now uses.
       */}
-      <section className="mx-auto w-full max-w-6xl px-4 pb-16">
+      <section id="console" className="mx-auto w-full max-w-6xl px-4 pb-16 scroll-mt-20">
         <Playground />
       </section>
 

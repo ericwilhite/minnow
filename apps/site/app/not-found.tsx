@@ -12,7 +12,7 @@ export const metadata: Metadata = {
 
 const ELSEWHERE = [
   { href: "/docs", label: "Read the docs" },
-  { href: "/playground", label: "Open the playground" },
+  { href: "/#console", label: "Open the console" },
   { href: "/benchmarks", label: "Run the benchmarks" },
   { href: "/", label: "Back to the surface" },
 ];

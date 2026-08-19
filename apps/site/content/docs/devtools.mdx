@@ -14,7 +14,8 @@ is written to your machine and closing it throws the data away.
 
 <DevtoolsDemo />
 
-The [playground](/playground) is the same panel embedded inline, in its production shape: a
+The [console on the home page](/#console) is the same panel embedded inline, in its production
+shape: a
 database running in a web worker (the same [worker client](/docs/engine/workers) an app ships)
 over a seven-table retail dataset generated in your browser and kept in IndexedDB. The title-bar
 badge reads **worker** there because the queries genuinely leave the page.
@@ -253,8 +254,8 @@ everything. History is namespaced by `storageKey`, so two panels on a page keep 
 ## Embedding a playground
 
 `mode: "inline"` renders the panel in the document instead of over it, with no launcher — the same
-panel, in flow. The [playground](/playground) is exactly this, over a worker client with its
-blocks in IndexedDB:
+panel, in flow. The [console on the home page](/#console) is exactly this, over a worker client
+with its blocks in IndexedDB:
 
 ```ts
 mountMinnowDevtools(db, {

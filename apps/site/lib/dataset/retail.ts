@@ -19,6 +19,7 @@
  * - Names, cities, and product names come from combinatorial pools (see `./pools.ts`), so
  *   GROUP BY over any of them produces thousands of buckets rather than a dozen.
  */
+import { column, schema, table, type AnyTable, type SchemaColumnType } from "@minnowdb/core";
 import {
   BRANDS,
   CATEGORIES,
@@ -33,7 +34,7 @@ import {
   type City,
 } from "./pools";
 
-export type ColumnType = "boolean" | "number" | "string" | "datetime";
+export type ColumnType = SchemaColumnType;
 
 export interface ColumnSpec {
   name: string;
@@ -54,124 +55,128 @@ export type Row = Record<string, Value>;
 
 /**
  * The schema, in dependency order — every table's foreign keys point at a table already created.
+ *
+ * This is the single declaration. `migrate()` creates the tables from it, `InferDatabase` turns
+ * it into the row types the typed console hands to the visitor, and `retailSchema` below reduces
+ * it back to the plain shape the loader and the tests read. Nothing here is written twice, so a
+ * column added to a table cannot be missing from the types that describe it.
  */
-export const retailSchema: readonly TableSpec[] = [
-  {
-    name: "stores",
-    uniqueKey: "store_id",
-    description: "Physical locations, each with a city, a format, and an opening date.",
-    columns: [
-      { name: "store_id", type: "number" },
-      { name: "code", type: "string" },
-      { name: "name", type: "string" },
-      { name: "city", type: "string" },
-      { name: "region", type: "string" },
-      { name: "country", type: "string" },
-      { name: "format", type: "string" },
-      { name: "floor_sqm", type: "number" },
-      { name: "opened_on", type: "datetime" },
-    ],
-  },
-  {
-    name: "employees",
-    uniqueKey: "employee_id",
-    description: "Staff assigned to a store, with a role and an hourly rate.",
-    columns: [
-      { name: "employee_id", type: "number" },
-      { name: "store_id", type: "number" },
-      { name: "name", type: "string" },
-      { name: "role", type: "string" },
-      { name: "hourly_rate", type: "number" },
-      { name: "hired_on", type: "datetime" },
-      { name: "active", type: "boolean" },
-    ],
-  },
-  {
-    name: "products",
-    uniqueKey: "product_id",
-    description: "The catalogue: SKU, category, brand, cost and list price.",
-    columns: [
-      { name: "product_id", type: "number" },
-      { name: "sku", type: "string" },
-      { name: "name", type: "string" },
-      { name: "category", type: "string" },
-      { name: "subcategory", type: "string" },
-      { name: "brand", type: "string" },
-      { name: "unit_cost", type: "number" },
-      { name: "list_price", type: "number" },
-      { name: "launched_on", type: "datetime" },
-      { name: "discontinued", type: "boolean" },
-    ],
-  },
-  {
-    name: "customers",
-    uniqueKey: "customer_id",
-    description: "People, with a home city, a signup date, and a loyalty tier.",
-    columns: [
-      { name: "customer_id", type: "number" },
-      { name: "name", type: "string" },
-      { name: "email", type: "string" },
-      { name: "city", type: "string" },
-      { name: "region", type: "string" },
-      { name: "country", type: "string" },
-      { name: "postal_code", type: "string" },
-      { name: "loyalty_tier", type: "string" },
-      { name: "birth_year", type: "number" },
-      { name: "marketing_opt_in", type: "boolean" },
-      { name: "signed_up_on", type: "datetime" },
-    ],
-  },
-  {
-    name: "orders",
-    uniqueKey: "order_id",
-    description: "One basket: who, where, when, how it was paid for, and what it came to.",
-    columns: [
-      { name: "order_id", type: "number" },
-      { name: "customer_id", type: "number" },
-      { name: "store_id", type: "number" },
-      { name: "employee_id", type: "number", nullable: true },
-      { name: "channel", type: "string" },
-      { name: "status", type: "string" },
-      { name: "payment_method", type: "string" },
-      { name: "item_count", type: "number" },
-      { name: "subtotal", type: "number" },
-      { name: "discount", type: "number" },
-      { name: "tax", type: "number" },
-      { name: "shipping", type: "number" },
-      { name: "total", type: "number" },
-      { name: "placed_at", type: "datetime" },
-    ],
-  },
-  {
-    name: "order_items",
-    uniqueKey: "order_item_id",
-    description: "Order lines: the product, how many, and what was actually charged.",
-    columns: [
-      { name: "order_item_id", type: "number" },
-      { name: "order_id", type: "number" },
-      { name: "product_id", type: "number" },
-      { name: "quantity", type: "number" },
-      { name: "unit_price", type: "number" },
-      { name: "discount", type: "number" },
-      { name: "line_total", type: "number" },
-    ],
-  },
-  {
-    name: "returns",
-    uniqueKey: "return_id",
-    description: "Refunded lines, with a reason and the amount given back.",
-    columns: [
-      { name: "return_id", type: "number" },
-      { name: "order_item_id", type: "number" },
-      { name: "order_id", type: "number" },
-      { name: "product_id", type: "number" },
-      { name: "quantity", type: "number" },
-      { name: "reason", type: "string" },
-      { name: "refund_amount", type: "number" },
-      { name: "returned_at", type: "datetime" },
-    ],
-  },
-];
+export const retailTables = [
+  table("stores", {
+    store_id: column.number().unique(),
+    code: column.string(),
+    name: column.string(),
+    city: column.string(),
+    region: column.string(),
+    country: column.string(),
+    format: column.string(),
+    floor_sqm: column.number(),
+    opened_on: column.datetime(),
+  }),
+  table("employees", {
+    employee_id: column.number().unique(),
+    store_id: column.number(),
+    name: column.string(),
+    role: column.string(),
+    hourly_rate: column.number(),
+    hired_on: column.datetime(),
+    active: column.boolean(),
+  }),
+  table("products", {
+    product_id: column.number().unique(),
+    sku: column.string(),
+    name: column.string(),
+    category: column.string(),
+    subcategory: column.string(),
+    brand: column.string(),
+    unit_cost: column.number(),
+    list_price: column.number(),
+    launched_on: column.datetime(),
+    discontinued: column.boolean(),
+  }),
+  table("customers", {
+    customer_id: column.number().unique(),
+    name: column.string(),
+    email: column.string(),
+    city: column.string(),
+    region: column.string(),
+    country: column.string(),
+    postal_code: column.string(),
+    loyalty_tier: column.string(),
+    birth_year: column.number(),
+    marketing_opt_in: column.boolean(),
+    signed_up_on: column.datetime(),
+  }),
+  table("orders", {
+    order_id: column.number().unique(),
+    customer_id: column.number(),
+    store_id: column.number(),
+    employee_id: column.number().nullable(),
+    channel: column.string(),
+    status: column.string(),
+    payment_method: column.string(),
+    item_count: column.number(),
+    subtotal: column.number(),
+    discount: column.number(),
+    tax: column.number(),
+    shipping: column.number(),
+    total: column.number(),
+    placed_at: column.datetime(),
+  }),
+  table("order_items", {
+    order_item_id: column.number().unique(),
+    order_id: column.number(),
+    product_id: column.number(),
+    quantity: column.number(),
+    unit_price: column.number(),
+    discount: column.number(),
+    line_total: column.number(),
+  }),
+  table("returns", {
+    return_id: column.number().unique(),
+    order_item_id: column.number(),
+    order_id: column.number(),
+    product_id: column.number(),
+    quantity: column.number(),
+    reason: column.string(),
+    refund_amount: column.number(),
+    returned_at: column.datetime(),
+  }),
+] as const;
+
+/** The schema `migrate()` takes, and the value the typed client infers its row types from. */
+export const retailDefinition = schema(retailTables);
+
+/**
+ * What each table holds, in one line. Read by the typed console, which prints them as doc
+ * comments on the generated row types — so hovering `orders` in the editor says what an order is.
+ */
+export const retailDescriptions: Record<string, string> = {
+  stores: "Physical locations, each with a city, a format, and an opening date.",
+  employees: "Staff assigned to a store, with a role and an hourly rate.",
+  products: "The catalogue: SKU, category, brand, cost and list price.",
+  customers: "People, with a home city, a signup date, and a loyalty tier.",
+  orders: "One basket: who, where, when, how it was paid for, and what it came to.",
+  order_items: "Order lines: the product, how many, and what was actually charged.",
+  returns: "Refunded lines, with a reason and the amount given back.",
+};
+
+/** The declaration above, flattened — the shape the loader and the dataset tests read. */
+export const retailSchema: readonly TableSpec[] = retailTables.map((definition: AnyTable) => {
+  const entries = Object.entries(definition.columns);
+  const unique = entries.find(([, builder]) => builder.isUnique);
+  if (unique === undefined) throw new Error(`${definition.name} declares no unique key`);
+  return {
+    name: definition.name,
+    uniqueKey: unique[0],
+    columns: entries.map(([name, builder]) => ({
+      name,
+      type: builder.type,
+      ...(builder.isNullable ? { nullable: true } : {}),
+    })),
+    description: retailDescriptions[definition.name] ?? "",
+  };
+});
 
 /** How many rows each size produces, and roughly how long a browser spends building it. */
 export interface RetailSize {

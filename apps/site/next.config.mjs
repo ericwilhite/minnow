@@ -61,7 +61,7 @@ const config = {
     : {}),
   // The engine and the devtools panel ship as ESM built from source in this repo, and both are
   // loaded only inside client components.
-  transpilePackages: ["@minnowdb/core", "@minnowdb/devtools"],
+  transpilePackages: ["@minnowdb/client", "@minnowdb/core", "@minnowdb/devtools"],
   typedRoutes: false,
   images: { unoptimized: true },
 };

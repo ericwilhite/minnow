@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { retailBatches, retailSchema } from "../../lib/dataset/retail";
+import { retailBatches, retailDefinition } from "../../lib/dataset/retail";
 import { sampleQueries } from "./queries";
 
 /**
@@ -13,13 +13,7 @@ import { sampleQueries } from "./queries";
 /** The smallest scale that still fills every table: enough for the queries, quick to build. */
 async function build(): Promise<MinnowDatabase> {
   const database = new MinnowDatabase(new MemoryBlockStore());
-  for (const table of retailSchema) {
-    await database.createTable({
-      name: table.name,
-      uniqueKey: table.uniqueKey,
-      columns: table.columns,
-    });
-  }
+  await database.migrate(retailDefinition);
   for (const batch of retailBatches({ scale: 0.05 })) {
     await database.insertBatch(batch.table, batch.rows);
   }

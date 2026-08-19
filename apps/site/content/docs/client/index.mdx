@@ -51,6 +51,14 @@ The named `interface DB extends InferDatabase<...> {}` is the standard form: it 
 errors, and emitted declarations printing `Minnow<DB>` instead of the fully expanded schema, which
 matters as soon as you have more than a table or two.
 
+## Try it without installing anything
+
+The [console on the home page](/#console) has a TypeScript tab: an editor running the real
+TypeScript language service, loaded with the declarations these packages publish, over a database
+of about 590,000 rows already built in your browser. Autocomplete lists the tables that exist, a
+misspelled column is marked before anything runs, and pressing Run executes the snippet against
+that database. It is the same `db` these pages describe.
+
 ## Where to go next
 
 - **[Reading data](/docs/client/queries)** — joins, expressions, aggregates, subqueries, and set

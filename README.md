@@ -3,7 +3,7 @@
 **A columnar SQL engine that runs entirely in the browser.** Real SQL over immutable snapshots,
 durable on IndexedDB — no server, no WebAssembly to download, no build step.
 
-**[minnowdb.com](https://minnowdb.com)** — documentation, a live playground, and benchmarks you
+**[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
 run yourself.
 
 ```bash
@@ -56,10 +56,12 @@ Everything else — installation, running SQL, the language surface, the client 
 workers, storage adapters, and the API reference — lives on the
 [docs site](https://minnowdb.com/docs/).
 
-Two pages there are worth knowing about specifically:
+Two things there are worth knowing about specifically:
 
-- **[Playground](https://minnowdb.com/playground/)** — a real database of around 590,000 rows,
-  generated in your browser and stored in IndexedDB. Write whatever SQL you like against it.
+- **[The console](https://minnowdb.com/#console)** — a real database of around 590,000 rows,
+  generated in your browser and stored in IndexedDB, on the home page. Write whatever SQL you
+  like against it, or switch to the TypeScript tab and query the same database through the typed
+  client, in an editor holding the declarations the packages publish.
 - **[Benchmarks](https://minnowdb.com/benchmarks/)** — Minnow against SQLite Wasm and PGlite,
   run live on your machine at a dataset size you choose. There are no published numbers to take
   on trust; every result is checked against an independent oracle before its timing counts.
@@ -79,7 +81,7 @@ records of the design and milestone gates.
 ```bash
 npm install
 npm run check          # format, typecheck, lint, build, unit tests with coverage floors
-npm run site:dev       # the docs site, playground and benchmarks
+npm run site:dev       # the docs site, the console and the benchmarks
 npm run test:browser   # library and site tests in real browsers
 npm run soak           # generative suites on fresh random seeds, to find new failures
 npm run version:set -- minor @minnowdb/core   # one package; `major` moves them all together

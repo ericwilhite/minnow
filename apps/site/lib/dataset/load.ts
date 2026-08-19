@@ -8,7 +8,7 @@
  * which is the point of doing it this way rather than the convenient way.
  */
 import type { MinnowDatabaseClient } from "@minnowdb/core/client";
-import { retailBatches, retailEstimatedRows, retailSchema } from "./retail";
+import { retailBatches, retailDefinition, retailEstimatedRows, retailSchema } from "./retail";
 
 export interface LoadProgress {
   phase: "schema" | "rows" | "ready";
@@ -37,13 +37,9 @@ export async function loadRetailDataset(
   };
 
   report("schema", "", 0);
-  for (const table of retailSchema) {
-    await client.createTable({
-      name: table.name,
-      uniqueKey: table.uniqueKey,
-      columns: table.columns,
-    });
-  }
+  // The declaration in ./retail is the same value the typed console infers its row types from,
+  // so the tables a query is written against are the tables that were created.
+  await client.migrate(retailDefinition);
 
   let rows = 0;
   for (const batch of retailBatches({ scale: options.scale })) {

@@ -25,27 +25,194 @@ test("the home page builds a database in the browser and answers a query", async
   });
 });
 
-test("the playground reopens an existing database instead of rebuilding it", async ({ page }) => {
-  await page.goto("/playground/");
+test("the console reopens an existing database instead of rebuilding it", async ({ page }) => {
+  await page.goto("/");
   await expect(page.locator("[data-minnow-devtools] .statusbar").first()).toBeVisible({
     timeout: 120_000,
   });
 
   // The inline panel fills the box the page gives it rather than standing at a height of its own.
+  // The box is the host element itself: `mountMinnowDevtools` adopts the container it is handed.
   expect(
     await page.evaluate(() => {
       const host = document.querySelector("[data-minnow-devtools]");
-      const box = host?.parentElement;
       const inline = host?.shadowRoot?.querySelector(".panel");
-      if (box === null || box === undefined || inline === null || inline === undefined) return null;
-      return [box.getBoundingClientRect().height, inline.getBoundingClientRect().height];
+      if (host === null || inline === null || inline === undefined) return null;
+      return [host.getBoundingClientRect().height, inline.getBoundingClientRect().height];
     }),
-  ).toEqual([720, 720]);
+  ).toEqual([620, 620]);
 
   await page.reload();
   await expect(page.getByText("this database was already on your machine")).toBeVisible({
     timeout: 60_000,
   });
+});
+
+test("the TypeScript tab checks a snippet against the schema and runs it", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Run", exact: true })).toBeVisible({
+    timeout: 120_000,
+  });
+
+  // Nothing of the editor is fetched until the tab is picked, which is the whole reason it is a
+  // tab rather than a second panel.
+  await page.getByRole("tab", { name: "TypeScript" }).click();
+  const console_ = page.locator('[data-minnow-console="typescript"]');
+  await expect(console_.locator(".monaco-editor").first()).toBeVisible({ timeout: 120_000 });
+
+  // The seeded snippet is a grouped aggregate through the builder. Rows come back as a table.
+  await console_.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(console_.locator("table")).toBeVisible({ timeout: 60_000 });
+  await expect(console_.getByRole("columnheader", { name: "revenue" })).toBeVisible();
+
+  // And the type checking is real: a column the schema does not have never reaches the database.
+  // Clicking the rendered lines rather than the editor's own hidden textarea, and inserting the
+  // text rather than typing it: typed keystrokes would meet the editor's auto-closing brackets.
+  await console_.locator(".monaco-editor .view-lines").first().click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(
+    'const rows = await db.selectFrom("orders").select(["nmae"]).execute();',
+  );
+  await console_.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(console_.getByText("the compiler refused it")).toBeVisible({ timeout: 60_000 });
+  await expect(console_.getByText(/nmae/)).toBeVisible();
+});
+
+/**
+ * The editor's own IntelliSense, which is a separate thing from the type checking above: Run
+ * compiles through the worker directly, so it passes perfectly well while the editor has no
+ * completion, hover, or squiggles registered at all. That is not hypothetical — it is what
+ * shipped the first time. Everything here is what a reader actually sees.
+ */
+test("the TypeScript editor completes and hovers from the playground's schema", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Run", exact: true })).toBeVisible({
+    timeout: 120_000,
+  });
+  await page.getByRole("tab", { name: "TypeScript" }).click();
+  const console_ = page.locator('[data-minnow-console="typescript"]');
+  await expect(console_.locator(".monaco-editor").first()).toBeVisible({ timeout: 120_000 });
+
+  const suggestions = page.locator(".suggest-widget");
+  const type = async (text: string): Promise<void> => {
+    await page.keyboard.press("Escape");
+    await console_.locator(".monaco-editor .view-lines").first().click();
+    await page.keyboard.press("ControlOrMeta+a");
+    // Inserted rather than typed, so the editor's auto-closing brackets leave it alone; the one
+    // character that has to be genuinely typed is the quote, below.
+    await page.keyboard.insertText(text);
+  };
+
+  // Nothing is pressed to ask for any of this. A reader who does not know the API or the schema
+  // is the reader this tab is for, so the list has to arrive on its own.
+  await type("db");
+  await page.keyboard.type(".");
+  await expect(suggestions).toBeVisible({ timeout: 60_000 });
+  await expect(suggestions).toContainText("selectFrom");
+
+  // Opening a quote offers the tables. The language service's only trigger character is `.`, so
+  // without the console's own handler this is where a reader is left guessing.
+  await type("db.selectFrom()");
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type('"');
+  await expect(suggestions).toBeVisible({ timeout: 60_000 });
+  // Every table, and only tables: the list is this schema's, not a word list from the buffer.
+  for (const table of ["customers", "order_items", "orders", "products", "returns", "stores"]) {
+    await expect(suggestions).toContainText(table);
+  }
+
+  // And one table deeper, the columns of that table. The list is virtualized, so these two are
+  // named because they are inside the first screen of it, not because they are the only ones.
+  await type('db.selectFrom("orders").select([])');
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type('"');
+  await expect(suggestions).toBeVisible({ timeout: 60_000 });
+  await expect(suggestions).toContainText("discount");
+  await expect(suggestions).toContainText("item_count");
+
+  // The list is taller than the room above the line that summoned it, and the console is a short
+  // box with `overflow: hidden`. It stays inside that box in the DOM and escapes it by being
+  // positioned against the viewport instead — so both halves are checked: the positioning that
+  // does the escaping, and that the top of the list is really painted where it claims to be.
+  expect(
+    await page.evaluate(() => {
+      const widget = document.querySelector(".suggest-widget");
+      if (widget === null) return "no list";
+      if (getComputedStyle(widget).position !== "fixed") return "clipped by the console";
+      const box = widget.getBoundingClientRect();
+      if (box.height < 100) return "list too short to judge";
+      const painted = document.elementFromPoint(box.left + 20, box.top + 8);
+      return painted !== null && widget.contains(painted) ? "painted" : "covered";
+    }),
+  ).toBe("painted");
+
+  // The selected row has to be readable. Overriding its background without its foreground leaves
+  // the base theme's white text on a near-white row, which is what this number catches.
+  expect(
+    await page.evaluate(() => {
+      const row = document.querySelector(".suggest-widget .monaco-list-row.focused");
+      if (row === null) return 0;
+      const style = getComputedStyle(row);
+      const luminance = (color: string): number => {
+        const [r = 0, g = 0, b = 0] = (/(\d+), (\d+), (\d+)/.exec(color) ?? [])
+          .slice(1)
+          .map((part) => {
+            const channel = Number(part) / 255;
+            return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+          });
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      };
+      const [dark, light] = [luminance(style.color), luminance(style.backgroundColor)].sort(
+        (a, b) => a - b,
+      ) as [number, number];
+      return (light + 0.05) / (dark + 0.05);
+    }),
+  ).toBeGreaterThan(4.5);
+
+  // And hovering reports the type the select list built — three keys, not the table's fourteen
+  // columns, which is exactly what the seeded snippet's comment tells the reader to look for.
+  await page.keyboard.press("Escape");
+  await console_.getByRole("button", { name: "Revenue by month" }).click();
+  await console_.locator(".view-line span", { hasText: "rows" }).last().hover();
+  const hover = page.locator(".hover-contents").first();
+  await expect(hover).toContainText("const rows", { timeout: 60_000 });
+  await expect(hover).toContainText("revenue: number");
+});
+
+/**
+ * A bare `d` toggles light and dark. Fumadocs decides the reader was not typing by looking at the
+ * tag name of the event's target, and neither console presents one: CodeMirror sits in a shadow
+ * root, so the event retargets to the plain host `<div>`, and Monaco writes through an
+ * `EditContext` `<div>` that is not `contentEditable`. Every `d` in `discount`, `id`, or
+ * `product_id` flipped the whole page mid-word.
+ */
+test("typing in either console does not trip the site's theme shortcut", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Run", exact: true })).toBeVisible({
+    timeout: 120_000,
+  });
+  const theme = (): Promise<string> => page.evaluate(() => document.documentElement.className);
+  const before = await theme();
+
+  await page.locator("[data-minnow-devtools] .cm-content").first().click();
+  await page.keyboard.type("select discount from orders");
+  expect(await theme()).toBe(before);
+
+  await page.getByRole("tab", { name: "TypeScript" }).click();
+  const console_ = page.locator('[data-minnow-console="typescript"]');
+  await expect(console_.locator(".monaco-editor").first()).toBeVisible({ timeout: 120_000 });
+  await console_.locator(".monaco-editor .view-lines").first().click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("const discount = 1;");
+  expect(await theme()).toBe(before);
+
+  // And the shortcut still does its job everywhere it was meant to.
+  await page.getByRole("heading", { level: 1 }).click();
+  await page.keyboard.press("d");
+  await expect.poll(theme).not.toBe(before);
 });
 
 test("the SQL docs render and the feature matrix comes from the checked-in fixture", async ({

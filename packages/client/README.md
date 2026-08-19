@@ -3,7 +3,7 @@
 The typed query client for [Minnow](https://minnowdb.com): a schema-aware builder over
 `@minnowdb/core`, with inferred row types, typed mutations, and live queries.
 
-**[minnowdb.com](https://minnowdb.com)** — documentation, a live playground, and benchmarks you
+**[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
 run yourself.
 
 ```bash

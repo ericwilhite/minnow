@@ -3,7 +3,7 @@
 An embeddable SQL console and data browser for a [Minnow](https://minnowdb.com) database. A
 floating panel during development, an inline playground wherever you want one.
 
-**[minnowdb.com](https://minnowdb.com)** — documentation, a live playground, and benchmarks you
+**[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
 run yourself. The [devtools guide](https://minnowdb.com/docs/devtools/) opens this panel over the
 page, so you can try it before installing anything.
 

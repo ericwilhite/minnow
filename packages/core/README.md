@@ -4,7 +4,7 @@ Columnar SQL engine for the browser: real SQL over immutable snapshots, durable 
 no WebAssembly to download. It runs in the thread that constructs it (`MinnowDatabase`), or in a
 worker with a main-thread client that mirrors it call for call (`MinnowDatabaseClient`).
 
-**[minnowdb.com](https://minnowdb.com)** — documentation, a live playground, and benchmarks you
+**[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
 run yourself.
 
 ```bash
