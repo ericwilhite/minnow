@@ -7563,32 +7563,31 @@ describe("prepared-input cache and shared read lease", () => {
     expect(store.catalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
   });
 
-  it("reports buffer pool stats and schedules read-triggered compaction", async () => {
+  it("reports buffer pool stats and compacts a fragmented table in the background", async () => {
     const store = new LeaseCountingStore();
     const database = new MinnowDatabase(store, { rowsPerBlock: 4 });
     await database.createTable({
       name: "fragmented",
       columns: [{ name: "value", type: "number" }],
     });
-    // 50 one-row commits: far past the 48-segment threshold a streamed scan reacts to.
+    // 50 one-row commits: past the 48-segment threshold both a commit and a streamed scan
+    // react to, so the fold may already be under way before the query runs.
     for (let index = 0; index < 50; index += 1) {
       await database.insertBatch("fragmented", { columns: { value: [index] } });
     }
-    const before = (await database.listVisibleSegments("fragmented")).length;
-    expect(before).toBe(50);
     await database.query("SELECT SUM(value) AS total FROM fragmented");
     const stats = database.bufferPoolStats();
     expect(stats.limitBytes).toBe(64 * 1024 * 1024);
     expect(stats.usedBytes).toBeGreaterThan(0);
     expect(stats.usedBytes).toBeLessThanOrEqual(stats.limitBytes);
     expect(stats.hits + stats.misses).toBeGreaterThan(0);
-    // The scan scheduled one fire-and-forget compaction step; poll briefly for its commit.
-    let after = before;
-    for (let attempt = 0; attempt < 200 && after >= before; attempt += 1) {
+    // Compaction is fire-and-forget; poll briefly for its publish.
+    let after = 50;
+    for (let attempt = 0; attempt < 200 && after >= 50; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
       after = (await database.listVisibleSegments("fragmented")).length;
     }
-    expect(after).toBeLessThan(before);
+    expect(after).toBeLessThan(50);
     // Results stay exact across the background rewrite.
     expect((await database.query("SELECT SUM(value) AS total FROM fragmented")).rows).toEqual([
       { total: 1225 },
@@ -7607,6 +7606,85 @@ describe("prepared-input cache and shared read lease", () => {
     await optOut.query("SELECT SUM(value) AS total FROM fragmented");
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect((await optOut.listVisibleSegments("fragmented")).length).toBe(50);
+  });
+
+  it("folds a keyed table's deltas from the write path, with no read to trigger it", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 64 });
+    await database.createTable({
+      name: "accounts",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "balance", type: "number" },
+      ],
+    });
+    const ids = Array.from({ length: 200 }, (_, index) => index);
+    await database.insertBatch("accounts", { columns: { id: ids, balance: ids } });
+    // Forty point updates and not one query: the commits alone must schedule the fold.
+    for (let id = 0; id < 40; id += 1) {
+      await database.updateBatch("accounts", { keys: [id], changes: { balance: [1000 + id] } });
+    }
+    let visible = 41;
+    for (let attempt = 0; attempt < 300 && visible >= 41; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      visible = (await database.listVisibleSegments("accounts")).length;
+    }
+    // The job planned at the 32-delta threshold folded those; at most the later few remain.
+    expect(visible).toBeLessThan(20);
+    expect(
+      (await database.query("SELECT id, balance FROM accounts WHERE id < 40 ORDER BY id")).rows,
+    ).toEqual(ids.slice(0, 40).map((id) => ({ id, balance: 1000 + id })));
+    expect(
+      (await database.query("SELECT SUM(balance) AS total FROM accounts WHERE id >= 40")).rows,
+    ).toEqual([{ total: ids.slice(40).reduce((sum, id) => sum + id, 0) }]);
+  });
+
+  it("merges a keyed table whose row count alone once exceeded the planner budget", async () => {
+    // The planner's memory used to scale with rows × columns (256 bytes a cell); 60k rows of
+    // three columns modelled as 61 MiB against the 32 MiB default, so a table this size could
+    // never fold its deltas. The slot-based replay scales with the deltas instead.
+    const database = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+    await database.createTable({
+      name: "wide",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    const rows = 60_000;
+    const ids = Array.from({ length: rows }, (_, index) => index);
+    await database.insertBatch("wide", {
+      columns: {
+        id: ids,
+        label: ids.map((id) => `item-${String(id % 97)}`),
+        amount: ids.map((id) => id % 1000),
+      },
+    });
+    await database.updateBatch("wide", { keys: [5, 59_999], changes: { amount: [-1, -2] } });
+    await database.deleteBatch("wide", { keys: [7] });
+    await database.upsertBatch("wide", {
+      columns: { id: [9, rows], label: ["nine", "new"], amount: [90, 1] },
+    });
+    const result = await database.compactTable("wide");
+    expect(result.compacted).toBe(true);
+    expect(result.memoryBudgetBytes).toBe(32 * 1024 * 1024);
+    expect(result.rowCount).toBe(rows);
+    expect((await database.listVisibleSegments("wide")).length).toBe(1);
+    expect(
+      (
+        await database.query(
+          "SELECT id, label, amount FROM wide WHERE id IN (5, 7, 9, 59999, 60000) ORDER BY id",
+        )
+      ).rows,
+    ).toEqual([
+      { id: 5, label: "item-5", amount: -1 },
+      { id: 9, label: "nine", amount: 90 },
+      { id: 59_999, label: `item-${String(59_999 % 97)}`, amount: -2 },
+      { id: 60_000, label: "new", amount: 1 },
+    ]);
+    expect((await database.query("SELECT COUNT(*) AS n FROM wide")).rows).toEqual([{ n: rows }]);
   });
 
   it("memoizes results under the probe and stays fresh and unpoisonable", async () => {

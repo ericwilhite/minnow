@@ -73,8 +73,8 @@ import {
   GarbageCollectionJobConflictError,
   type GarbageCollectionJobRecord,
   type GarbageCollectionJobState,
+  type ManifestSummary,
   type MergeCompactionOutputColumn,
-  type MergeCompactionOutputSourceRange,
   type MergeCompactionRewritePlan,
   type MergeCompactionSourceBlock,
   type MergeCompactionSourceColumn,
@@ -199,7 +199,7 @@ const FTS_FOLD_DELTA_CHUNKS = 16;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
-const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS = 16;
+const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS = 64;
 const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_STORED_BYTES = 64 * 1024 * 1024;
 const DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION = 16;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
@@ -209,10 +209,20 @@ const INTERNAL_READ_LEASE_TTL_MS = 60_000;
 const CATALOG_STATE_CACHE_LIMIT = 64;
 /** Blocks fetched per round trip when a streamed scan window needs more data. */
 const STREAMED_SCAN_LOOKAHEAD_BLOCKS = 8;
-/** Visible segments per table at which a streamed scan schedules a compaction step. */
+/** Visible segments per table at which a scan or a commit schedules a compaction step. */
 const AUTO_COMPACT_SCAN_SEGMENTS = 48;
-/** Visible delete/update segments at which a streamed scan schedules a compaction step. */
-const AUTO_COMPACT_DELTA_SEGMENTS = 8;
+/** Visible delete/update segments at which a scan or a commit schedules a compaction step. */
+const AUTO_COMPACT_DELTA_SEGMENTS = 32;
+/** Commits to one table between auto-compaction checks on the write path. */
+const AUTO_COMPACT_COMMIT_CHECK_INTERVAL = 8;
+/** Output blocks one background compaction step writes before yielding to the event loop. */
+const AUTO_COMPACT_STEP_BLOCKS = 4;
+/**
+ * Level-zero segments one background fold may absorb. Folding rewrites the table's anchor, so
+ * absorbing everything pending in one pass costs one rewrite where the default would cost
+ * several; the stored-bytes ceiling still bounds the pass.
+ */
+const AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS = 256;
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
 const ZONE_DESCRIPTION_CACHE_BYTES = 160;
 
@@ -282,11 +292,6 @@ interface PhysicalCompactionLayout {
 interface MergeResolvedSource {
   readonly blockId: string;
   readonly sourceRowIndex: number;
-}
-
-interface MergeResolvedRow {
-  readonly rowId: bigint;
-  readonly sources: MergeResolvedSource[];
 }
 
 interface SegmentVisibilityCatalog {
@@ -914,6 +919,10 @@ export class MinnowDatabase {
   readonly #autoCompactionsInFlight = new Set<string>();
   /** Per table: the visible segment count a failed auto-compaction must see before retrying. */
   readonly #autoCompactionBackoff = new Map<string, number>();
+  /** Data commits per table since its last write-path auto-compaction check. */
+  readonly #commitsSinceCompactionCheck = new Map<string, number>();
+  /** The compaction step in flight per table, so steps on one table run one at a time. */
+  readonly #compactionSteps = new Map<string, Promise<unknown>>();
   /**
    * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
    * optimization — subquery resolution and CTE expansion clone before rewriting and join
@@ -1540,7 +1549,7 @@ export class MinnowDatabase {
         try {
           const manifest = await transaction.commit();
           commitMs += performance.now() - commitStarted;
-          this.#notifyLiveCommit();
+          this.#afterCommit(manifest);
           return {
             tableName: table.name,
             segmentId,
@@ -1717,7 +1726,7 @@ export class MinnowDatabase {
         try {
           const manifest = await transaction.commit();
           commitMs += performance.now() - commitStarted;
-          this.#notifyLiveCommit();
+          this.#afterCommit(manifest);
           return {
             tableName: table.name,
             segmentId,
@@ -1959,7 +1968,7 @@ export class MinnowDatabase {
         try {
           const manifest = await transaction.commit();
           commitMs += performance.now() - commitStarted;
-          this.#notifyLiveCommit();
+          this.#afterCommit(manifest);
           return {
             tableName: table.name,
             segmentId,
@@ -3040,19 +3049,14 @@ export class MinnowDatabase {
    */
   #maybeScheduleAutoCompaction(table: TableRecord, segments: readonly SegmentRecord[]): void {
     if (!this.#autoCompact) return;
-    const deltas = segments.filter((segment) => {
-      const kind = segment.kind ?? "insert";
-      return kind !== "insert" && kind !== "base";
-    }).length;
-    if (segments.length < AUTO_COMPACT_SCAN_SEGMENTS && deltas < AUTO_COMPACT_DELTA_SEGMENTS) {
-      return;
-    }
+    if (!autoCompactionDue(segments)) return;
     if (segments.length < (this.#autoCompactionBackoff.get(table.id) ?? 0)) return;
     if (this.#autoCompactionsInFlight.has(table.id)) return;
     this.#autoCompactionsInFlight.add(table.id);
-    void this.compactTableStep(table.name, { maxBlocks: 4 })
-      .then(() => {
-        this.#autoCompactionBackoff.delete(table.id);
+    void this.#runAutoCompaction(table)
+      .then((folded) => {
+        if (folded) this.#autoCompactionBackoff.delete(table.id);
+        else this.#autoCompactionBackoff.set(table.id, Math.max(2, segments.length * 2));
       })
       .catch(() => {
         this.#autoCompactionBackoff.set(table.id, Math.max(2, segments.length * 2));
@@ -3060,6 +3064,85 @@ export class MinnowDatabase {
       .finally(() => {
         this.#autoCompactionsInFlight.delete(table.id);
       });
+  }
+
+  /**
+   * Plans a compaction job and drives it to publication in small steps, yielding to the event
+   * loop between them so queries and writes interleave with the maintenance; then, while the
+   * table is still due, plans the next. A job that only advanced when the next scan happened
+   * to trigger it would sit half-written in an idle tab, its output staged and its sources
+   * still read on every query, and the deltas that landed while it ran would wait for a scan
+   * that may never come. Returns whether anything was folded: a table compaction cannot help
+   * (an unsupported layout, keys living in published partitions) must not be re-planned on
+   * every trigger, so the caller backs it off as it would a failure.
+   */
+  async #runAutoCompaction(table: TableRecord): Promise<boolean> {
+    const options = {
+      maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
+      maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+    };
+    let folded = false;
+    for (;;) {
+      let progress = await this.compactTableStep(table.name, options);
+      while (progress.result === null) {
+        if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
+        await yieldToEventLoop();
+        progress = await this.resumeCompactionJob(progress.jobId, options);
+      }
+      if (!progress.result.compacted) return folded;
+      folded = true;
+      await yieldToEventLoop();
+      const current = await this.store.getTable(table.id);
+      if (
+        current === undefined ||
+        !autoCompactionDue(await this.#currentVisibleSegments(current))
+      ) {
+        return folded;
+      }
+    }
+  }
+
+  /** The table's visible segments at the current manifest. */
+  async #currentVisibleSegments(table: TableRecord): Promise<SegmentRecord[]> {
+    const version = await this.store.getCurrentManifestVersion();
+    return this.#withLeasedSnapshot(version, (snapshot) =>
+      this.#visibleSegmentRecords(table, snapshot),
+    );
+  }
+
+  /**
+   * What every data commit shares: live sets learn of it, and the tables it changed count
+   * toward their next write-path auto-compaction check.
+   */
+  #afterCommit(manifest: ManifestSummary): void {
+    this.#notifyLiveCommit();
+    if (!this.#autoCompact) return;
+    for (const tableId of manifest.changedTableIds ?? []) {
+      const commits = (this.#commitsSinceCompactionCheck.get(tableId) ?? 0) + 1;
+      if (commits < AUTO_COMPACT_COMMIT_CHECK_INTERVAL) {
+        this.#commitsSinceCompactionCheck.set(tableId, commits);
+        continue;
+      }
+      this.#commitsSinceCompactionCheck.delete(tableId);
+      void this.#checkAutoCompaction(tableId);
+    }
+  }
+
+  /**
+   * The write-path auto-compaction check: the table's visible segments at the current manifest,
+   * judged by the same thresholds a streamed scan applies. Without it a write-heavy phase with
+   * no reads in between piles deltas up unfolded, and the next query pays for all of them at
+   * once. Background maintenance never surfaces through a write; a failed check waits for the
+   * next one.
+   */
+  async #checkAutoCompaction(tableId: string): Promise<void> {
+    try {
+      const table = await this.store.getTable(tableId);
+      if (table === undefined) return;
+      this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
+    } catch {
+      // Deliberately silent: the next commit or scan checks again.
+    }
   }
 
   /**
@@ -3737,7 +3820,7 @@ export class MinnowDatabase {
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         try {
           const manifest = await transaction.commit();
-          this.#notifyLiveCommit();
+          this.#afterCommit(manifest);
           return { result, version: manifest.version };
         } catch (error) {
           if (!(error instanceof WriteConflictError) || attempt === this.#maxCommitRetries) {
@@ -7137,23 +7220,25 @@ export class MinnowDatabase {
     options: CompactTableStepOptions = {},
   ): Promise<CompactionJobProgress> {
     const table = await this.#findTable(tableName);
-    const active = (await this.store.listCompactionJobs(table.id)).find((job) =>
-      isActiveCompactionState(job.state),
-    );
-    let job = active;
-    if (job === undefined) {
-      const planned = await this.#planCompaction(table, options);
-      if ("compacted" in planned) return compactionSkippedProgress(planned);
-      job = planned;
-    }
-    return this.#runCompactionJob(
-      table,
-      job,
-      positiveWholeNumber(
-        options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
-        "Compaction step block limit",
-      ),
-    );
+    return this.#serializedCompactionStep(table.id, async () => {
+      const active = (await this.store.listCompactionJobs(table.id)).find((job) =>
+        isActiveCompactionState(job.state),
+      );
+      let job = active;
+      if (job === undefined) {
+        const planned = await this.#planCompaction(table, options);
+        if ("compacted" in planned) return compactionSkippedProgress(planned);
+        job = planned;
+      }
+      return this.#runCompactionJob(
+        table,
+        job,
+        positiveWholeNumber(
+          options.maxBlocks ?? options.maxBlocksPerStep ?? 1,
+          "Compaction step block limit",
+        ),
+      );
+    });
   }
 
   /** Continues a persisted compaction job after a cooperative yield or restart. */
@@ -7165,11 +7250,31 @@ export class MinnowDatabase {
     if (job === undefined) throw new Error(`Compaction job not found: ${jobId}`);
     const table = await this.store.getTable(job.tableId);
     if (table === undefined) throw new Error(`Compaction table not found: ${job.tableId}`);
-    return this.#runCompactionJob(
-      table,
-      job,
-      positiveWholeNumber(options.maxBlocks ?? 1, "Compaction step block limit"),
+    return this.#serializedCompactionStep(table.id, () =>
+      this.#runCompactionJob(
+        table,
+        job,
+        positiveWholeNumber(options.maxBlocks ?? 1, "Compaction step block limit"),
+      ),
     );
+  }
+
+  /**
+   * One compaction step at a time per table within this database: background compaction
+   * drives a job in steps, and a caller stepping the same table explicitly must take turns with
+   * it rather than advance the same job concurrently, which would write its output blocks
+   * twice. Each step loads the job record fresh, so alternating drivers simply continue where
+   * the other left off. Between instances and tabs the job's revision is the guard.
+   */
+  async #serializedCompactionStep<T>(tableId: string, step: () => Promise<T>): Promise<T> {
+    const previous = this.#compactionSteps.get(tableId) ?? Promise.resolve();
+    const run = previous.then(step, step);
+    this.#compactionSteps.set(tableId, run);
+    try {
+      return await run;
+    } finally {
+      if (this.#compactionSteps.get(tableId) === run) this.#compactionSteps.delete(tableId);
+    }
   }
 
   async listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]> {
@@ -8185,6 +8290,27 @@ export class MinnowDatabase {
     };
   }
 
+  /**
+   * Replays the source segments' mutations into one canonical output order, in memory that
+   * scales with the deltas rather than with the table.
+   *
+   * Every row of every row-bearing source (base, insert, upsert) gets a slot, numbered in
+   * canonical source order, and the output is the live slots in slot order. A row can only be
+   * referenced later through its key, and only delete, update, and upsert sources reference
+   * keys, so the first pass collects those keys — the touched set — and the replay then tracks
+   * slots for touched keys alone. An untouched row can never be deleted, patched, or replaced:
+   * it passes through as part of a run, one output range per source block rather than one per
+   * row. Memory is O(delta rows + touched rows) plus two bytes per slot.
+   *
+   * The semantics are those of a per-row replay:
+   * - delete: the key's live slot dies; a later insert of the key takes a new slot.
+   * - update: the named columns of the key's live slot come from the update row; the key must
+   *   be live.
+   * - upsert: when the key is live, every column of that slot comes from the upsert row and the
+   *   upsert row's own slot dies, so the row keeps its position and row ID; otherwise the
+   *   upsert row is a new live row.
+   * - insert/base: a new live row; a second live occurrence of a touched key is an error.
+   */
   async #resolveMergeOutput(
     table: TableRecord,
     segments: readonly MergeCompactionSourceSegment[],
@@ -8201,87 +8327,131 @@ export class MinnowDatabase {
       throw new CompactionMemoryBudgetError(memoryBudgetBytes, plannerMemoryBytes);
     }
     const columnIndexById = new Map(table.columns.map((column, index) => [column.id, index]));
-    const rows: Array<MergeResolvedRow | undefined> = [];
-    const rowIndexByKey = new Map<string, number>();
+
+    // Pass 1: the keys any delta references, and each delta's keys in row order.
+    const touched = new Set<OverlayKey>();
+    const deltaKeys = new Map<string, OverlayKey[]>();
+    for (const segment of segments) {
+      if (!mergeSourceReferencesKeys(segment.kind)) continue;
+      const keys: OverlayKey[] = [];
+      await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value) => {
+        const key = overlayKeyOf(keyColumn.type, value);
+        keys.push(key);
+        touched.add(key);
+      });
+      deltaKeys.set(segment.segmentId, keys);
+    }
+
+    // Pass 2: replay into slot state.
+    let slotCount = 0;
+    for (const segment of segments) {
+      if (mergeSourceBearsRows(segment.kind)) slotCount += segment.rowCount;
+    }
+    const dead = new Uint8Array(slotCount);
+    const patched = new Uint8Array(slotCount);
+    const patches = new Map<number, Array<MergeResolvedSource | undefined>>();
+    const liveSlotByKey = new Map<OverlayKey, number>();
+    let slotBase = 0;
     for (const segment of segments) {
       if (segment.kind === "delete") {
-        await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value) => {
-          const token = keyToken(keyColumn.type, value);
-          const existingIndex = rowIndexByKey.get(token);
-          if (existingIndex !== undefined) rows[existingIndex] = undefined;
-          rowIndexByKey.delete(token);
-        });
+        for (const key of deltaKeys.get(segment.segmentId) ?? []) {
+          const slot = liveSlotByKey.get(key);
+          if (slot === undefined) continue;
+          dead[slot] = 1;
+          patched[slot] = 0;
+          patches.delete(slot);
+          liveSlotByKey.delete(key);
+        }
         continue;
       }
       if (segment.kind === "update") {
-        const changedColumnIds = segment.columns
+        const changedColumns = segment.columns
           .map((column) => column.columnId)
-          .filter((columnId) => columnId !== keyColumn.id);
-        await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value, rowIndex) => {
-          const token = keyToken(keyColumn.type, value);
-          const existingIndex = rowIndexByKey.get(token);
-          const existing = existingIndex === undefined ? undefined : rows[existingIndex];
-          if (existingIndex === undefined || existing === undefined) {
-            throw new Error(`Update segment references a missing key: ${segment.segmentId}`);
-          }
-          for (const columnId of changedColumnIds) {
+          .filter((columnId) => columnId !== keyColumn.id)
+          .map((columnId) => {
             const columnIndex = columnIndexById.get(columnId);
             if (columnIndex === undefined) {
               throw new Error(`Mutation compaction column is missing: ${columnId}`);
             }
-            existing.sources[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
+            return { columnId, columnIndex };
+          });
+        const keys = deltaKeys.get(segment.segmentId) ?? [];
+        for (let rowIndex = 0; rowIndex < keys.length; rowIndex += 1) {
+          const key = keys[rowIndex];
+          const slot = key === undefined ? undefined : liveSlotByKey.get(key);
+          if (slot === undefined) {
+            throw new Error(`Update segment references a missing key: ${segment.segmentId}`);
           }
-        });
+          let patch = patches.get(slot);
+          if (patch === undefined) {
+            patch = new Array<MergeResolvedSource | undefined>(table.columns.length).fill(
+              undefined,
+            );
+            patches.set(slot, patch);
+            patched[slot] = 1;
+          }
+          for (const { columnId, columnIndex } of changedColumns) {
+            patch[columnIndex] = mergeSourceAt(segment, columnId, rowIndex);
+          }
+        }
         continue;
       }
-
-      await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value, rowIndex) => {
-        const token = keyToken(keyColumn.type, value);
-        const existingIndex = rowIndexByKey.get(token);
-        const sources = table.columns.map((column) => mergeSourceAt(segment, column.id, rowIndex));
-        if (segment.kind === "upsert" && existingIndex !== undefined) {
-          const existing = rows[existingIndex];
-          if (existing === undefined) {
-            throw new Error(`Upsert segment references an invalid row slot: ${segment.segmentId}`);
-          }
-          rows[existingIndex] = { rowId: existing.rowId, sources };
+      // A row-bearing source: base, insert, or upsert.
+      const base = slotBase;
+      const visit = (key: OverlayKey, rowIndex: number): void => {
+        if (!touched.has(key)) return;
+        const slot = base + rowIndex;
+        const existing = liveSlotByKey.get(key);
+        if (existing === undefined) {
+          liveSlotByKey.set(key, slot);
           return;
         }
-        if (existingIndex !== undefined) {
+        if (segment.kind !== "upsert") {
           throw new Error(`Insert segment contains a duplicate unique key: ${segment.segmentId}`);
         }
-        rowIndexByKey.set(token, rows.length);
-        rows.push({ rowId: rowIdAt(segment.rowIdSpans, rowIndex), sources });
-      });
-    }
-
-    const rowIdSpans: RowIdSpan[] = [];
-    const sourceRangesByColumn = table.columns.map(() => [] as MergeCompactionOutputSourceRange[]);
-    let totalRows = 0;
-    for (const row of rows) {
-      if (row === undefined) continue;
-      appendRowIdSpan(rowIdSpans, totalRows, row.rowId);
-      for (let columnIndex = 0; columnIndex < table.columns.length; columnIndex += 1) {
-        const column = table.columns[columnIndex];
-        const source = row.sources[columnIndex];
-        if (column === undefined || source === undefined) {
-          throw new Error("Mutation compaction row is missing a column source");
-        }
-        const sourceRanges = sourceRangesByColumn[columnIndex];
-        if (sourceRanges === undefined) throw new Error("Mutation output column is missing");
-        appendMergeOutputRange(sourceRanges, totalRows, source);
+        patches.set(
+          existing,
+          table.columns.map((column) => mergeSourceAt(segment, column.id, rowIndex)),
+        );
+        patched[existing] = 1;
+        dead[slot] = 1;
+      };
+      const keys = deltaKeys.get(segment.segmentId);
+      if (keys !== undefined) {
+        keys.forEach(visit);
+      } else {
+        await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value, rowIndex) => {
+          visit(overlayKeyOf(keyColumn.type, value), rowIndex);
+        });
       }
-      totalRows += 1;
+      slotBase += segment.rowCount;
     }
-    return {
-      rowIdSpans,
-      columns: table.columns.map((column, columnIndex) => {
-        const sourceRanges = sourceRangesByColumn[columnIndex];
-        if (sourceRanges === undefined) throw new Error("Mutation output column is missing");
-        return { columnId: column.id, type: column.type, sourceRanges };
-      }),
-      totalRows,
-    };
+    touched.clear();
+    liveSlotByKey.clear();
+    deltaKeys.clear();
+
+    // Pass 3: the live slots in slot order, as runs wherever nothing touched them.
+    const output = new MergeOutputBuilder(table.columns);
+    slotBase = 0;
+    for (const segment of segments) {
+      if (!mergeSourceBearsRows(segment.kind)) continue;
+      let runStart = -1;
+      for (let rowIndex = 0; rowIndex < segment.rowCount; rowIndex += 1) {
+        const slot = slotBase + rowIndex;
+        if (dead[slot] === 1 || patched[slot] === 1) {
+          if (runStart >= 0) {
+            output.appendRun(segment, runStart, rowIndex - runStart);
+            runStart = -1;
+          }
+          if (patched[slot] === 1) output.appendPatchedRow(segment, rowIndex, patches.get(slot));
+          continue;
+        }
+        if (runStart < 0) runStart = rowIndex;
+      }
+      if (runStart >= 0) output.appendRun(segment, runStart, segment.rowCount - runStart);
+      slotBase += segment.rowCount;
+    }
+    return output.finish();
   }
 
   async #forEachMergeSourceKey(
@@ -11377,6 +11547,27 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
   }
 }
 
+/**
+ * Whether a table's visible segments warrant a background fold: enough segments for a scan to
+ * pay per-segment overhead, or enough deltas that every query replays a history. Counted in
+ * segments, not rows — a handful of deltas costs little however many rows they hold, and
+ * folding rewrites the table's anchor, so it is reserved for when the count has built up.
+ */
+function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
+  if (segments.length >= AUTO_COMPACT_SCAN_SEGMENTS) return true;
+  let deltas = 0;
+  for (const segment of segments) {
+    const kind = segment.kind ?? "insert";
+    if (kind !== "insert" && kind !== "base") deltas += 1;
+  }
+  return deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
+}
+
+/** A macrotask boundary, so background work lets queued queries and writes run between steps. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function keyToken(type: SimpleDataType, value: BatchValue): string {
   if (value === null) throw new TypeError("Unique key cannot be null");
   switch (type) {
@@ -12529,40 +12720,286 @@ function sourceOrderTuple(
   };
 }
 
+/**
+ * The planner's working memory, as `#resolveMergeOutput` allocates it: two bytes per slot, the
+ * touched-key set and live-slot map over the delta keys, one patch array per patched row, one
+ * decoded key block at a time, and the output ranges themselves — which number the source
+ * blocks plus one per patched cell, not one per row. Deliberately generous per element; this
+ * bound is what a caller's `memoryBudgetBytes` is judged against, so it must not be optimistic.
+ */
 function mergePlannerMemoryBound(
   table: TableRecord,
   segments: readonly MergeCompactionSourceSegment[],
   keyColumnId: string,
 ): number {
-  const candidateRows = safeWholeNumberSum(
-    segments
-      .filter(
-        (segment) =>
-          segment.kind === "insert" || segment.kind === "upsert" || segment.kind === "base",
-      )
-      .map((segment) => segment.rowCount),
-    "Mutation compaction candidate rows",
-  );
-  const keyEncodedBytes = safeWholeNumberSum(
-    segments.flatMap((segment) =>
-      (segment.columns.find((column) => column.columnId === keyColumnId)?.sourceBlocks ?? []).map(
-        (block) => block.encodedBytes,
-      ),
-    ),
-    "Mutation compaction key bytes",
-  );
-  const rowMetadataBytes = safeWholeNumberProduct(
-    candidateRows,
-    safeWholeNumberSum(
-      [256, safeWholeNumberProduct(table.columns.length, 256, "Mutation compaction row cells")],
-      "Mutation compaction row metadata",
-    ),
-    "Mutation compaction row metadata",
-  );
+  const SLOT_BYTES = 2;
+  const KEY_BYTES = 96;
+  const PATCH_ROW_BYTES = 64;
+  const PATCH_CELL_BYTES = 48;
+  const RANGE_BYTES = 80;
+  const DECODED_KEY_BLOCK_FACTOR = 4;
+  let slotRows = 0;
+  let deltaKeys = 0;
+  let patchRows = 0;
+  let sourceBlocks = 0;
+  let largestKeyBlockBytes = 0;
+  for (const segment of segments) {
+    if (mergeSourceBearsRows(segment.kind)) slotRows += segment.rowCount;
+    if (mergeSourceReferencesKeys(segment.kind)) deltaKeys += segment.rowCount;
+    if (segment.kind === "update" || segment.kind === "upsert") patchRows += segment.rowCount;
+    for (const column of segment.columns) {
+      sourceBlocks += column.sourceBlocks.length;
+      if (column.columnId !== keyColumnId) continue;
+      for (const block of column.sourceBlocks) {
+        largestKeyBlockBytes = Math.max(largestKeyBlockBytes, block.encodedBytes);
+      }
+    }
+  }
+  const columns = table.columns.length;
   return safeWholeNumberSum(
-    [rowMetadataBytes, safeWholeNumberProduct(keyEncodedBytes, 4, "Mutation compaction keys")],
+    [
+      safeWholeNumberProduct(slotRows, SLOT_BYTES, "Mutation compaction slots"),
+      safeWholeNumberProduct(deltaKeys, KEY_BYTES, "Mutation compaction keys"),
+      safeWholeNumberProduct(
+        patchRows,
+        safeWholeNumberSum(
+          [
+            PATCH_ROW_BYTES,
+            safeWholeNumberProduct(columns, PATCH_CELL_BYTES, "Mutation patch cells"),
+          ],
+          "Mutation compaction patch row",
+        ),
+        "Mutation compaction patches",
+      ),
+      safeWholeNumberProduct(
+        safeWholeNumberSum(
+          [sourceBlocks, safeWholeNumberProduct(patchRows, columns, "Mutation patched cells")],
+          "Mutation compaction ranges",
+        ),
+        RANGE_BYTES,
+        "Mutation compaction range bytes",
+      ),
+      safeWholeNumberProduct(
+        largestKeyBlockBytes,
+        DECODED_KEY_BLOCK_FACTOR,
+        "Mutation compaction decoded key block",
+      ),
+    ],
     "Mutation compaction planner memory",
   );
+}
+
+/** Whether a source of this kind contributes rows to the merged output. */
+function mergeSourceBearsRows(kind: SegmentKind): boolean {
+  return kind === "insert" || kind === "upsert" || kind === "base";
+}
+
+/** Whether a source of this kind names existing rows by key. */
+function mergeSourceReferencesKeys(kind: SegmentKind): boolean {
+  return kind === "delete" || kind === "update" || kind === "upsert";
+}
+
+/**
+ * A decoded key value as the primitive the overlay replay keys on (`OverlayKey`): equal keys
+ * are equal primitives, and one table's key has one type, so nothing can collide.
+ */
+function overlayKeyOf(type: SimpleDataType, value: BatchValue): OverlayKey {
+  if (value === null) throw new TypeError("Unique key cannot be null");
+  switch (type) {
+    case "boolean":
+      if (typeof value !== "boolean") throw new TypeError("Invalid boolean unique key");
+      return value;
+    case "number":
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw new TypeError("Invalid number unique key");
+      }
+      return value;
+    case "string":
+      if (typeof value !== "string") throw new TypeError("Invalid string unique key");
+      return value;
+    case "datetime":
+      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+        throw new TypeError("Invalid datetime unique key");
+      }
+      return value.getTime();
+  }
+}
+
+interface MutableRowIdSpan {
+  rowStart: number;
+  rowCount: number;
+  rowIdStart: bigint;
+}
+
+interface MutableMergeOutputSourceRange {
+  outputRowStart: number;
+  sourceBlockId: string;
+  sourceRowStart: number;
+  rowCount: number;
+}
+
+/**
+ * Accumulates the merged output as coalesced row-ID spans and per-column source ranges. A run
+ * of untouched rows appends at most one range per source block it crosses, whatever its
+ * length; a patched row appends one range per column. Adjacent ranges over the same block
+ * merge in place, so the finished plan is proportional to blocks plus patched cells.
+ */
+class MergeOutputBuilder {
+  readonly #columns: readonly TableColumnRecord[];
+  readonly #rowIdSpans: MutableRowIdSpan[] = [];
+  readonly #rangesByColumn: MutableMergeOutputSourceRange[][];
+  readonly #blocksBySegment = new Map<
+    string,
+    ReadonlyArray<readonly MergeCompactionSourceBlock[]>
+  >();
+  #totalRows = 0;
+
+  constructor(columns: readonly TableColumnRecord[]) {
+    this.#columns = columns;
+    this.#rangesByColumn = columns.map(() => []);
+  }
+
+  /** Rows `[rowStart, rowStart + rowCount)` of a row-bearing source, unchanged. */
+  appendRun(segment: MergeCompactionSourceSegment, rowStart: number, rowCount: number): void {
+    if (rowCount <= 0) return;
+    this.#appendRowIds(segment, rowStart, rowCount);
+    const blocksByColumn = this.#sourceBlocks(segment);
+    for (let columnIndex = 0; columnIndex < this.#columns.length; columnIndex += 1) {
+      const blocks = blocksByColumn[columnIndex];
+      const ranges = this.#rangesByColumn[columnIndex];
+      if (blocks === undefined || ranges === undefined) {
+        throw new Error("Mutation output column is missing");
+      }
+      let outputRow = this.#totalRows;
+      let remaining = rowCount;
+      let rowIndex = rowStart;
+      while (remaining > 0) {
+        const block = rowRangeAt(blocks, rowIndex);
+        if (block === undefined) {
+          throw new Error(`Mutation source row is missing: ${segment.segmentId}`);
+        }
+        const count = Math.min(remaining, block.rowStart + block.rowCount - rowIndex);
+        appendMergeOutputRange(ranges, outputRow, block.blockId, rowIndex - block.rowStart, count);
+        outputRow += count;
+        rowIndex += count;
+        remaining -= count;
+      }
+    }
+    this.#totalRows += rowCount;
+  }
+
+  /** One row of a row-bearing source whose columns may come from later mutations. */
+  appendPatchedRow(
+    segment: MergeCompactionSourceSegment,
+    rowIndex: number,
+    patch: ReadonlyArray<MergeResolvedSource | undefined> | undefined,
+  ): void {
+    this.#appendRowIds(segment, rowIndex, 1);
+    for (let columnIndex = 0; columnIndex < this.#columns.length; columnIndex += 1) {
+      const column = this.#columns[columnIndex];
+      const ranges = this.#rangesByColumn[columnIndex];
+      if (column === undefined || ranges === undefined) {
+        throw new Error("Mutation output column is missing");
+      }
+      const source = patch?.[columnIndex] ?? mergeSourceAt(segment, column.id, rowIndex);
+      appendMergeOutputRange(ranges, this.#totalRows, source.blockId, source.sourceRowIndex, 1);
+    }
+    this.#totalRows += 1;
+  }
+
+  finish(): {
+    columns: MergeCompactionOutputColumn[];
+    rowIdSpans: RowIdSpan[];
+    totalRows: number;
+  } {
+    return {
+      rowIdSpans: this.#rowIdSpans,
+      columns: this.#columns.map((column, columnIndex) => {
+        const sourceRanges = this.#rangesByColumn[columnIndex];
+        if (sourceRanges === undefined) throw new Error("Mutation output column is missing");
+        return { columnId: column.id, type: column.type, sourceRanges };
+      }),
+      totalRows: this.#totalRows,
+    };
+  }
+
+  #sourceBlocks(
+    segment: MergeCompactionSourceSegment,
+  ): ReadonlyArray<readonly MergeCompactionSourceBlock[]> {
+    let blocks = this.#blocksBySegment.get(segment.segmentId);
+    if (blocks === undefined) {
+      blocks = this.#columns.map((column) => {
+        const source = segment.columns.find((candidate) => candidate.columnId === column.id);
+        if (source === undefined) {
+          throw new Error(`Mutation source row is missing: ${segment.segmentId}:${column.id}`);
+        }
+        return source.sourceBlocks;
+      });
+      this.#blocksBySegment.set(segment.segmentId, blocks);
+    }
+    return blocks;
+  }
+
+  #appendRowIds(segment: MergeCompactionSourceSegment, rowStart: number, rowCount: number): void {
+    let outputRow = this.#totalRows;
+    let remaining = rowCount;
+    let rowIndex = rowStart;
+    while (remaining > 0) {
+      const span = rowRangeAt(segment.rowIdSpans, rowIndex);
+      if (span === undefined) {
+        throw new Error(`Mutation source row ID is missing: ${String(rowIndex)}`);
+      }
+      const count = Math.min(remaining, span.rowStart + span.rowCount - rowIndex);
+      appendRowIdSpan(
+        this.#rowIdSpans,
+        outputRow,
+        span.rowIdStart + BigInt(rowIndex - span.rowStart),
+        count,
+      );
+      outputRow += count;
+      rowIndex += count;
+      remaining -= count;
+    }
+  }
+}
+
+/** Appends `rowCount` consecutive row IDs from `rowId`, extending the last span when contiguous. */
+function appendRowIdSpan(
+  spans: MutableRowIdSpan[],
+  rowStart: number,
+  rowId: bigint,
+  rowCount: number,
+): void {
+  const previous = spans[spans.length - 1];
+  if (
+    previous !== undefined &&
+    previous.rowStart + previous.rowCount === rowStart &&
+    previous.rowIdStart + BigInt(previous.rowCount) === rowId
+  ) {
+    previous.rowCount += rowCount;
+  } else {
+    spans.push({ rowStart, rowCount, rowIdStart: rowId });
+  }
+}
+
+/** Appends `rowCount` output rows read from one source block, extending the last range when contiguous. */
+function appendMergeOutputRange(
+  ranges: MutableMergeOutputSourceRange[],
+  outputRowStart: number,
+  sourceBlockId: string,
+  sourceRowStart: number,
+  rowCount: number,
+): void {
+  const previous = ranges[ranges.length - 1];
+  if (
+    previous?.sourceBlockId === sourceBlockId &&
+    previous.outputRowStart + previous.rowCount === outputRowStart &&
+    previous.sourceRowStart + previous.rowCount === sourceRowStart
+  ) {
+    previous.rowCount += rowCount;
+  } else {
+    ranges.push({ outputRowStart, sourceBlockId, sourceRowStart, rowCount });
+  }
 }
 
 function mergeSourceAt(
@@ -12576,12 +13013,6 @@ function mergeSourceAt(
     throw new Error(`Mutation source row is missing: ${segment.segmentId}:${columnId}`);
   }
   return { blockId: block.blockId, sourceRowIndex: rowIndex - block.rowStart };
-}
-
-function rowIdAt(spans: readonly RowIdSpan[], rowIndex: number): bigint {
-  const span = rowRangeAt(spans, rowIndex);
-  if (span === undefined) throw new Error(`Mutation source row ID is missing: ${String(rowIndex)}`);
-  return span.rowIdStart + BigInt(rowIndex - span.rowStart);
 }
 
 function rowRangeAt<T extends { readonly rowStart: number; readonly rowCount: number }>(
@@ -12605,19 +13036,6 @@ function rowRangeAt<T extends { readonly rowStart: number; readonly rowCount: nu
   return undefined;
 }
 
-function appendRowIdSpan(spans: RowIdSpan[], rowStart: number, rowId: bigint): void {
-  const previous = spans[spans.length - 1];
-  if (
-    previous !== undefined &&
-    previous.rowStart + previous.rowCount === rowStart &&
-    previous.rowIdStart + BigInt(previous.rowCount) === rowId
-  ) {
-    spans[spans.length - 1] = { ...previous, rowCount: previous.rowCount + 1 };
-  } else {
-    spans.push({ rowStart, rowCount: 1, rowIdStart: rowId });
-  }
-}
-
 function rowIdSpanEnvelope(spans: readonly RowIdSpan[]): {
   start: bigint;
   endExclusive: bigint;
@@ -12631,28 +13049,6 @@ function rowIdSpanEnvelope(spans: readonly RowIdSpan[]): {
     if (spanEnd > endExclusive) endExclusive = spanEnd;
   }
   return { start, endExclusive };
-}
-
-function appendMergeOutputRange(
-  ranges: MergeCompactionOutputSourceRange[],
-  outputRowStart: number,
-  source: MergeResolvedSource,
-): void {
-  const previous = ranges[ranges.length - 1];
-  if (
-    previous?.sourceBlockId === source.blockId &&
-    previous.outputRowStart + previous.rowCount === outputRowStart &&
-    previous.sourceRowStart + previous.rowCount === source.sourceRowIndex
-  ) {
-    ranges[ranges.length - 1] = { ...previous, rowCount: previous.rowCount + 1 };
-  } else {
-    ranges.push({
-      outputRowStart,
-      sourceBlockId: source.blockId,
-      sourceRowStart: source.sourceRowIndex,
-      rowCount: 1,
-    });
-  }
 }
 
 function validatePhysicalTablePlan(table: TableRecord, plan: PhysicalCompactionRewritePlan): void {

@@ -17,8 +17,10 @@ overhead after a long run of small writes.
 await db.compactTable("orders");
 ```
 
-It runs automatically by default. To drive it yourself — a slice per idle callback, so it never
-holds the main thread:
+It runs automatically by default: a scan or a run of commits that finds a table past the
+threshold plans a fold and drives it to publication in small steps, yielding between them, and
+keeps going while the table is still due. To drive it yourself — a slice per idle callback, so it
+never holds the main thread:
 
 ```ts
 const db = new MinnowDatabase(store, { autoCompact: false });
@@ -40,9 +42,10 @@ from the same scan every other table gets, plus the cost of the deltas themselve
 compaction adds is returning the table to a plain append — the deltas stop being re-read on every
 query, and the storage they occupy is freed.
 
-One limit worth knowing: merging a keyed table plans the merge in memory, and a large table can
-need more than the default 32 MiB budget. Raise it with `memoryBudgetBytes` when a compaction
-reports `CompactionMemoryBudgetError`:
+Merging a keyed table plans the merge in memory proportional to its deltas, not its rows, and
+every output block is measured against a memory budget before it is written. The default budget
+is 32 MiB; raise it with `memoryBudgetBytes` when a compaction reports
+`CompactionMemoryBudgetError`:
 
 ```ts
 await db.compactTable("orders", { memoryBudgetBytes: 256 * 1024 * 1024 });
