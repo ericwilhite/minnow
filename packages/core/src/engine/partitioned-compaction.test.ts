@@ -808,9 +808,9 @@ describe("partitioned folds under the background loop", () => {
       if (operation % 300 === 0) await check(`after operation ${String(operation)}`);
     }
 
-    // Let the background loop settle — planning is not a job record yet, so "settled" is no
-    // active job and a visible segment count that has stopped moving — then the folded shape
-    // must be bounded partitions.
+    // Let the background loop settle. Planning is not a job record yet, so an unchanged segment
+    // count alone is not a completion signal under slow coverage instrumentation: keep waiting
+    // while the actual fold condition is still due.
     const active = async (): Promise<number> =>
       (await database.listCompactionJobs("items")).filter(
         (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
@@ -819,8 +819,14 @@ describe("partitioned folds under the background loop", () => {
     let lastVisible = -1;
     for (let attempt = 0; attempt < 4_000 && stable < 30; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-      const visible = (await database.listVisibleSegments("items")).length;
-      stable = (await active()) === 0 && visible === lastVisible ? stable + 1 : 0;
+      const currentRecords = await visibleRecords(database, store, "items");
+      const visible = currentRecords.length;
+      const deltas = currentRecords.filter((segment) => {
+        const kind = segment.kind ?? "insert";
+        return kind !== "insert" && kind !== "base";
+      }).length;
+      const due = visible >= 48 || deltas >= 32;
+      stable = (await active()) === 0 && !due && visible === lastVisible ? stable + 1 : 0;
       lastVisible = visible;
     }
     expect(await active()).toBe(0);
