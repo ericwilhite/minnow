@@ -35,6 +35,7 @@
     "release:publish": "vite-node scripts/publish-packages.mts",
     "benchmark:gate": "vite-node scripts/perf-gate.mts",
     "soak": "vite-node scripts/soak.mts",
+    "soak:memory": "NODE_OPTIONS=--expose-gc vite-node scripts/memory-soak.mts",
     "fixture:format": "vite-node scripts/write-format-fixture.mts",
     "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts"
   },

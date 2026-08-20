@@ -10,6 +10,23 @@ export function queryResultMemoKey(sql: string, params: readonly unknown[]): str
 }
 
 /**
+ * A memo key for a compiled plan: its JSON with the values JSON cannot tell apart made
+ * distinct — a Date from its ISO string, -0 from 0, NaN and the infinities from null — so two
+ * plans with the same key are the same query over the same literals.
+ */
+export function planMemoKey(plan: unknown): string {
+  return JSON.stringify(plan, (_key, value: unknown) => {
+    if (value instanceof Date) return { $date: value.getTime() };
+    if (typeof value === "bigint") return { $bigint: value.toString() };
+    if (typeof value === "number") {
+      if (Object.is(value, -0)) return { $number: "-0" };
+      if (!Number.isFinite(value)) return { $number: String(value) };
+    }
+    return value;
+  });
+}
+
+/**
  * Defensive copy because callers own query results and may mutate both rows and Dates. Object
  * spread copies own enumerable properties with define semantics, so a column named `__proto__`
  * stays an own property; only a Date cell needs the explicit define, and only because its

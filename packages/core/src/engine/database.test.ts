@@ -15,7 +15,7 @@ import {
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { TransactionManager } from "../transactions/index.js";
 import { QueryMemoryBudgetError } from "./memory.js";
-import type { QueryRow } from "./query.js";
+import { compileQuery, type QueryRow } from "./query.js";
 import { column, schema, table } from "./schema.js";
 import {
   attachLifecycleFlush,
@@ -7447,6 +7447,12 @@ describe("prepared-input cache and shared read lease", () => {
   class LeaseCountingStore extends CountingMemoryBlockStore {
     leaseCreates = 0;
     catalogStateCalls = 0;
+    probeCalls = 0;
+
+    override getCatalogProbe(): ReturnType<MemoryBlockStore["getCatalogProbe"]> {
+      this.probeCalls += 1;
+      return super.getCatalogProbe();
+    }
 
     override async createLease(
       record: Parameters<MemoryBlockStore["createLease"]>[0],
@@ -7745,6 +7751,46 @@ describe("prepared-input cache and shared read lease", () => {
       { id: 60_000, label: "new", amount: 1 },
     ]);
     expect((await database.query("SELECT COUNT(*) AS n FROM wide")).rows).toEqual([{ n: rows }]);
+  });
+
+  it("probes the catalog once per query, and memoizes typed queries like SQL", async () => {
+    // Every probe is a read transaction on IndexedDB — a floor under every small query — so the
+    // one read before execution is handed to the view lookup and the catalog state rather than
+    // each probing again: a cold memoizable query pays two (before and after, for the memo), a
+    // hit or an unmemoized query one.
+    const { store, database } = await seededStore();
+    const sql = "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region";
+    await database.query(sql, { memoize: false });
+    let before = store.probeCalls;
+    await database.query(sql, { memoize: false });
+    expect(store.probeCalls - before).toBe(1);
+    before = store.probeCalls;
+    await database.query(sql);
+    expect(store.probeCalls - before).toBe(2);
+    before = store.probeCalls;
+    await database.query(sql);
+    expect(store.probeCalls - before).toBe(1);
+
+    // A typed query is compiled once and run many times; it gets the same memo.
+    const typed = { kind: "typed-query" as const, plan: compileQuery(sql) };
+    const first = await database.run(typed);
+    expect(first).toEqual([
+      { region: "east", total: 14 },
+      { region: "north", total: 4 },
+      { region: "west", total: 15 },
+    ]);
+    before = store.probeCalls;
+    const stateReads = store.catalogStateCalls;
+    const again = await database.run(typed);
+    expect(again).toEqual(first);
+    expect(store.probeCalls - before).toBe(1);
+    expect(store.catalogStateCalls).toBe(stateReads);
+    // And stays fresh: a commit moves the epoch and the next run re-executes.
+    await database.insertBatch("orders", { columns: { region: ["north"], amount: [1] } });
+    expect((await database.run(typed))[1]).toEqual({ region: "north", total: 5 });
+    // A run's rows are the caller's: mutating them must not poison the next hit.
+    ((await database.run(typed))[0] as Record<string, unknown>).total = -1;
+    expect((await database.run(typed))[0]).toEqual({ region: "east", total: 14 });
   });
 
   it("memoizes results under the probe and stays fresh and unpoisonable", async () => {

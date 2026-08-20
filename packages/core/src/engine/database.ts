@@ -73,6 +73,7 @@ import {
   GarbageCollectionJobConflictError,
   type GarbageCollectionJobRecord,
   type GarbageCollectionJobState,
+  type CatalogProbe,
   type ManifestSummary,
   type MergeCompactionOutputColumn,
   type MergeCompactionRewritePlan,
@@ -158,6 +159,7 @@ import {
 } from "./query.js";
 import {
   copyQueryResult,
+  planMemoKey,
   queryResultMemoKey,
   queryResultRetainedBytes,
   RESULT_MEMO_MAX_BYTES,
@@ -234,6 +236,8 @@ const AUTO_COLLECT_QUIET_MS = 60_000;
 const AUTO_COLLECT_STEP_ITEMS = 64;
 /** Passes one background collection run makes before handing the rest to the next trigger. */
 const AUTO_COLLECT_MAX_PASSES = 32;
+/** Finished job records of each kind a background run leaves for inspection. */
+const AUTO_COLLECT_RETAINED_JOB_RECORDS = 8;
 /** Output blocks one background compaction step writes before yielding to the event loop. */
 const AUTO_COMPACT_STEP_BLOCKS = 4;
 /**
@@ -2189,13 +2193,14 @@ export class MinnowDatabase {
   async #prepareCompiledPlan(
     plan: CompiledQuery,
     options: QueryOptions = {},
+    probe?: CatalogProbe,
   ): Promise<PreparedQuery> {
     // The ORDER-BY-expression desugar's wrapper is projection-only: prepare the inner block
     // directly (no derived materialization) and project each result to the visible aliases,
     // so `.search()` costs the same whether or not the caller also selects the score.
     const wrapper = transparentProjectionSource(plan);
     if (wrapper !== undefined) {
-      const prepared = await this.#prepareCompiledPlan(wrapper.inner, options);
+      const prepared = await this.#prepareCompiledPlan(wrapper.inner, options, probe);
       return {
         sql: prepared.sql,
         tables: prepared.tables,
@@ -2268,7 +2273,11 @@ export class MinnowDatabase {
           await prepareAtSnapshot(snapshot, realTables, visibility);
         });
       } else {
-        await this.#withSharedCatalogSnapshot(collectRealTableNames(plan), prepareAtSnapshot);
+        await this.#withSharedCatalogSnapshot(
+          collectRealTableNames(plan),
+          prepareAtSnapshot,
+          probe,
+        );
       }
       return createPreparedColumnarQuery(
         chooseJoinOrder(resolvedPlan, columnarTables),
@@ -2297,9 +2306,10 @@ export class MinnowDatabase {
       realTables: Map<string, TableRecord>,
       visibility: SegmentVisibilityCatalog,
     ) => Promise<T>,
+    probe?: CatalogProbe,
   ): Promise<T> {
     for (;;) {
-      const state = await this.#cachedCatalogState(names);
+      const state = await this.#cachedCatalogState(names, probe);
       const realTables = new Map<string, TableRecord>();
       names.forEach((name, index) => {
         const table = state.tables[index];
@@ -2339,10 +2349,15 @@ export class MinnowDatabase {
    * cached state was read, so reuse is exact, not heuristic. Stores without a probe are never
    * cached. Entries key on the requested table-name set; a changed epoch clears them all.
    */
-  async #cachedCatalogState(names: readonly string[]): Promise<QueryCatalogState> {
-    const probe = this.store.getCatalogProbe?.bind(this.store);
-    if (probe === undefined) return this.#queryCatalogState(names);
-    const { catalogEpoch } = await probe();
+  async #cachedCatalogState(
+    names: readonly string[],
+    probe?: CatalogProbe,
+  ): Promise<QueryCatalogState> {
+    // A probe the caller read moments earlier in the same statement serves: a state read under
+    // it is at least as fresh, and the cache is only consulted under its epoch.
+    const read = this.store.getCatalogProbe?.bind(this.store);
+    if (read === undefined) return this.#queryCatalogState(names);
+    const { catalogEpoch } = probe ?? (await read());
     // Table names are only trimmed, never charset-restricted, so no join separator is
     // collision-free; JSON encoding is.
     const key = JSON.stringify(names);
@@ -2729,12 +2744,31 @@ export class MinnowDatabase {
       options.spillPageRows === undefined &&
       probe !== undefined;
     if (probe === undefined || !memoizable) return this.#queryCompiled(plan, options);
-    const key = `res ${queryResultMemoKey(sql, options.params ?? [])}`;
+    return this.#memoizedQuery(
+      plan,
+      `res ${queryResultMemoKey(sql, options.params ?? [])}`,
+      options,
+      probe,
+    );
+  }
+
+  /**
+   * The result memo: a pure cache over the freshness probe, keyed by the statement and the
+   * catalog epoch it was answered at. The probe read before execution is handed down to the
+   * execution itself — the view lookup and the catalog state would otherwise each probe again,
+   * and on IndexedDB every probe is a read transaction, a floor under every small query.
+   */
+  async #memoizedQuery(
+    plan: CompiledQuery,
+    key: string,
+    options: QueryOptions,
+    probe: () => Promise<CatalogProbe>,
+  ): Promise<QueryResult> {
     const before = await probe();
     const cached = this.#cacheGet(`${key}\u0001${String(before.catalogEpoch)}`) as
       QueryResult | undefined;
     if (cached !== undefined) return copyQueryResult(cached);
-    const result = await this.#queryCompiled(plan, options);
+    const result = await this.#queryCompiled(plan, options, before);
     const bytes = queryResultRetainedBytes(result);
     if (bytes <= RESULT_MEMO_MAX_BYTES) {
       // Cache only when the epoch did not move during execution: the result is then exactly
@@ -2757,14 +2791,14 @@ export class MinnowDatabase {
    * (E051-09), and a NATURAL join becomes the equality over the columns its sides share
    * (F401-01). Reads the catalog only for the statements that ask for one of them.
    */
-  async #applyCatalogRewrites(plan: CompiledQuery): Promise<CompiledQuery> {
+  async #applyCatalogRewrites(plan: CompiledQuery, probe?: CatalogProbe): Promise<CompiledQuery> {
     const aliased = planHasSourceColumnAliases(plan);
     const natural = planHasNaturalJoins(plan);
     // Whether a name is a view cannot be read off the statement, so this is the one thing every
     // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
     // result memoization — and only re-reads the view set when the catalog has actually moved.
     // A database with no views therefore pays one probe, not a catalog scan per query.
-    const { views } = await this.#catalogFacts();
+    const { views } = await this.#catalogFacts(probe);
     let rewritten = plan;
     if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
@@ -2798,8 +2832,8 @@ export class MinnowDatabase {
    * the steady state has to be one epoch probe and no allocation; the facts are rebuilt only
    * when a catalog mutation — anywhere, including another tab — moves the epoch.
    */
-  async #catalogFacts(): Promise<CatalogFacts> {
-    const probe = await this.store.getCatalogProbe?.();
+  async #catalogFacts(probe?: CatalogProbe): Promise<CatalogFacts> {
+    probe ??= await this.store.getCatalogProbe?.();
     const epoch = probe?.catalogEpoch;
     const cached = this.#catalogCache;
     if (cached !== undefined && epoch !== undefined && cached.epoch === epoch) return cached.facts;
@@ -2828,14 +2862,21 @@ export class MinnowDatabase {
    * re-runs — routes through the same streaming-first execution, so builder/SQL parity holds
    * for the execution path as well as the plan.
    */
-  async #queryCompiled(plan: CompiledQuery, options: QueryOptions = {}): Promise<QueryResult> {
-    plan = await this.#applyCatalogRewrites(plan);
+  async #queryCompiled(
+    plan: CompiledQuery,
+    options: QueryOptions = {},
+    probe?: CatalogProbe,
+  ): Promise<QueryResult> {
+    // One freshness probe per query: read here unless the caller already has one, and handed
+    // to the view lookup and the catalog state below, which would otherwise probe again each.
+    probe ??= await this.store.getCatalogProbe?.();
+    plan = await this.#applyCatalogRewrites(plan, probe);
     const spillPageRows =
       options.spillPageRows === undefined
         ? undefined
         : positiveWholeNumber(options.spillPageRows, "Query spill page rows");
     if (this.#canStreamPlanShape(plan, options)) {
-      const streamed = await this.#queryStreamed(plan, options, spillPageRows);
+      const streamed = await this.#queryStreamed(plan, options, spillPageRows, probe);
       if (streamed !== undefined) return streamed;
     } else {
       // An ORDER-BY-expression wrapper is a pure projection over the real query: stream the
@@ -2843,11 +2884,11 @@ export class MinnowDatabase {
       // query its streaming eligibility.
       const wrapper = transparentProjectionSource(plan);
       if (wrapper !== undefined && this.#canStreamPlanShape(wrapper.inner, options)) {
-        const streamed = await this.#queryStreamed(wrapper.inner, options, spillPageRows);
+        const streamed = await this.#queryStreamed(wrapper.inner, options, spillPageRows, probe);
         if (streamed !== undefined) return projectResultColumns(streamed, wrapper.aliases);
       }
     }
-    const prepared = await this.#prepareCompiledPlan(plan, options);
+    const prepared = await this.#prepareCompiledPlan(plan, options, probe);
     // Read the peak before close(): closing releases the context and zeroes what it tracked.
     const report = (result: QueryResult): QueryResult => {
       options.onStats?.({ peakMemoryBytes: prepared.memoryUsage.peakBytes });
@@ -4544,7 +4585,14 @@ export class MinnowDatabase {
     plan: CompiledQuery;
     __row?: TRow;
   }): Promise<TRow[]> {
-    return (await this.#queryCompiled(query.plan)).rows as TRow[];
+    const probe = this.store.getCatalogProbe?.bind(this.store);
+    // The same memo a SQL query gets, keyed by the plan: a typed query is compiled once by the
+    // builder and run many times, and it used to re-execute on every run.
+    if (probe === undefined || query.plan.usesStatementDatetime === true) {
+      return (await this.#queryCompiled(query.plan)).rows as TRow[];
+    }
+    return (await this.#memoizedQuery(query.plan, `typed ${planMemoKey(query.plan)}`, {}, probe))
+      .rows as TRow[];
   }
 
   /**
@@ -5882,21 +5930,25 @@ export class MinnowDatabase {
     plan: CompiledQuery,
     options: QueryOptions,
     spillPageRows: number | undefined,
+    probe?: CatalogProbe,
   ): Promise<QueryResult | undefined> {
     const tableNames = [plan.base.table, ...plan.joins.map((join) => join.table)];
     const uniqueTableNames = [...new Set(tableNames)];
     if (options.version === undefined) {
       // The common path shares the probe-gated catalog state and the shared reader lease
       // with every other statement at the current version.
-      return this.#withSharedCatalogSnapshot(uniqueTableNames, (snapshot, realTables, visibility) =>
-        this.#queryStreamedAtSnapshot(
-          plan,
-          options,
-          spillPageRows,
-          snapshot,
-          [...realTables.values()],
-          visibility,
-        ),
+      return this.#withSharedCatalogSnapshot(
+        uniqueTableNames,
+        (snapshot, realTables, visibility) =>
+          this.#queryStreamedAtSnapshot(
+            plan,
+            options,
+            spillPageRows,
+            snapshot,
+            [...realTables.values()],
+            visibility,
+          ),
+        probe,
       );
     }
     // Explicit time travel keeps the per-call lease and version-anchored reads.
@@ -7649,9 +7701,34 @@ export class MinnowDatabase {
         result.reclaimedBlockCount === 0 &&
         result.reclaimedSegmentCount === 0
       ) {
-        return;
+        break;
       }
       await yieldToEventLoop();
+    }
+    await this.#pruneFinishedJobRecords();
+  }
+
+  /**
+   * Drops the records of finished background jobs beyond the most recent few of each kind. A
+   * published fold keeps its source lists and a completed collection pass its candidate lists,
+   * so left alone they grow the store by a few kilobytes per pass, forever — the one thing a
+   * database that runs all day would still accumulate. Cancelled and aborted folds stay: the
+   * L2 write-amplification ceiling is computed over them.
+   */
+  async #pruneFinishedJobRecords(): Promise<void> {
+    const newestFirst = <T extends { updatedAt: string }>(jobs: T[]): T[] =>
+      jobs.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const compactions = newestFirst(
+      (await this.store.listCompactionJobs()).filter((job) => job.state === "published"),
+    );
+    for (const job of compactions.slice(AUTO_COLLECT_RETAINED_JOB_RECORDS)) {
+      await this.store.removeCompactionJob(job.id);
+    }
+    const collections = newestFirst(
+      (await this.store.listGarbageCollectionJobs()).filter((job) => job.state === "completed"),
+    );
+    for (const job of collections.slice(AUTO_COLLECT_RETAINED_JOB_RECORDS)) {
+      await this.store.removeGarbageCollectionJob(job.id);
     }
   }
 
