@@ -5,10 +5,11 @@ import type { EngineId } from "@/bench/protocol";
 import { relationalTotalRows } from "@/bench/benchmark";
 
 /**
- * A column in the results, which is not quite the same thing as an engine: Minnow appears twice,
- * once executing every call and once with the result memo an application gets by default. Both
- * are the same database doing the same work, so they share one materialized copy — the second
- * column reports what a repeat costs rather than a second engine.
+ * A column in the results, which is not quite the same thing as an engine: Minnow appears three
+ * times per store — executing every call, with the result memo an application gets by default,
+ * and through the main-thread client an application actually calls. All are the same database
+ * doing the same work, so they share one materialized copy — the variant columns report what a
+ * repeat, or the worker channel, costs rather than a second engine.
  */
 export interface EngineChoice {
   id: ColumnId;
@@ -16,14 +17,27 @@ export interface EngineChoice {
   engine: EngineId;
   label: string;
   note: string;
-  /** Read the memoized repeat instead of a fresh execution. */
-  cached?: boolean;
+  /**
+   * Which of the engine's read measurements the column shows: the memoized repeat, or the
+   * statement through `MinnowDatabaseClient` over the worker channel. Absent is plain execution.
+   */
+  variant?: "cached" | "client";
   /** Roughly what the browser downloads to run it, from scripts/measure-library-sizes.mts. */
   download?: string;
 }
 
 export type ColumnId =
-  "minnow" | "minnow-cached" | "minnow-opfs" | "minnow-opfs-cached" | "sqlite" | "pglite";
+  | "minnow"
+  | "minnow-cached"
+  | "minnow-client"
+  | "minnow-opfs"
+  | "minnow-opfs-cached"
+  | "minnow-opfs-client"
+  | "sqlite"
+  | "pglite";
+
+const CLIENT_NOTE =
+  "The same statement issued through MinnowDatabaseClient over a message channel: the RPC frame, the result crossing in its columnar wire form, and the rows rebuilt on the receiving side. It is what an application on the main thread pays; the gap to the plain column is the client layer.";
 
 export const ENGINES: readonly EngineChoice[] = [
   {
@@ -36,9 +50,16 @@ export const ENGINES: readonly EngineChoice[] = [
   {
     id: "minnow-cached",
     engine: "minnow",
-    cached: true,
+    variant: "cached",
     label: "Minnow (cached)",
     note: "The same statement repeated with the probe-validated result memo left on, which is the default an application gets. It measures the cache, not execution.",
+  },
+  {
+    id: "minnow-client",
+    engine: "minnow",
+    variant: "client",
+    label: "Minnow (client)",
+    note: CLIENT_NOTE,
   },
   {
     id: "minnow-opfs",
@@ -49,9 +70,16 @@ export const ENGINES: readonly EngineChoice[] = [
   {
     id: "minnow-opfs-cached",
     engine: "minnow-opfs",
-    cached: true,
+    variant: "cached",
     label: "Minnow (OPFS, cached)",
     note: "The OPFS store's repeat with the probe-validated result memo left on, which is the default an application gets. It measures the cache, not execution.",
+  },
+  {
+    id: "minnow-opfs-client",
+    engine: "minnow-opfs",
+    variant: "client",
+    label: "Minnow (OPFS, client)",
+    note: CLIENT_NOTE,
   },
   {
     id: "sqlite",
@@ -90,16 +118,22 @@ export function columnsFor(selected: readonly ColumnId[]): EngineChoice[] {
  * the rule and hoping it held.
  */
 export function storageLabel(choice: EngineChoice, observed?: string): string {
+  const suffix =
+    choice.variant === "cached"
+      ? " · result memo on"
+      : choice.variant === "client"
+        ? " · through the worker client"
+        : "";
   if (observed !== undefined) {
     // The engine's own sentence is written for the storage table; the selector wants the name.
     const vfs = observed.split(" · ")[0];
-    return choice.cached === true ? `${vfs ?? observed} · result memo on` : (vfs ?? observed);
+    return `${vfs ?? observed}${suffix}`;
   }
   switch (choice.engine) {
     case "minnow":
-      return choice.cached === true ? "IndexedDB · result memo on" : "IndexedDB";
+      return `IndexedDB${suffix}`;
     case "minnow-opfs":
-      return choice.cached === true ? "OPFS · result memo on" : "OPFS";
+      return `OPFS${suffix}`;
     case "sqlite":
       return "OPFS";
     case "pglite":
@@ -108,7 +142,7 @@ export function storageLabel(choice: EngineChoice, observed?: string): string {
 }
 
 export interface SuiteChoice {
-  id: "reference" | "write" | "features";
+  id: "reference" | "write" | "live" | "features";
   label: string;
   note: string;
   /** Whether the suite needs a materialized dataset before it can run. */
@@ -126,6 +160,12 @@ export const SUITES: readonly SuiteChoice[] = [
     id: "reference",
     label: "Reads",
     note: "21 queries split between selective lookups and scans, joins and aggregates. Every result is checked against an independent oracle before a timing counts.",
+    needsDataset: true,
+  },
+  {
+    id: "live",
+    label: "Live queries",
+    note: "1 to 100 subscriptions registered through the worker client, then one commit: the time until every affected subscription has been notified, with its rows in hand. Minnow only — the other engines have no live-query layer.",
     needsDataset: true,
   },
   {

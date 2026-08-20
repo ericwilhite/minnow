@@ -70,6 +70,14 @@ starts and stops) and satisfies `worker-src` content-security policies from your
 - **`migrate()` takes the same schema DSL** — it's serialized over the wire automatically.
 - **Typed errors survive the trip.** `instanceof UniqueConstraintError` works on the client, with
   its fields; stack traces point into the worker.
+- **Results cross as columns, not rows.** A query result leaves the worker as one array per
+  column — typed arrays for numbers, booleans, and datetimes, transferred rather than copied, and
+  strings as one flat text with offsets — and the client rebuilds the row objects on the main
+  thread. You see the same `QueryResult` either way: `rows` of plain objects keyed in column
+  order, `Date` instances, booleans, `null`s, and numbers exactly as the engine produced them.
+  Only the cost of a large result crossing changes: structured-cloning 20,000 row objects is
+  several times slower than rebuilding them from columns. Live-query change events take the same
+  path.
 - **Functions can't cross.** Construction options like `now`, `createId`, or a custom store need
   a custom entry (below).
 

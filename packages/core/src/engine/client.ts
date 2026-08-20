@@ -65,6 +65,7 @@ import {
 import type { LiveQueryInput, LiveQueryStats, LiveQuerySubscribeOptions } from "./live.js";
 import { QueryMemoryBudgetError } from "./memory.js";
 import type { CompiledQuery, CompiledStatement, QueryResult, QueryValue } from "./query.js";
+import { decodeQueryResult } from "./result-wire.js";
 import type { AnyTable, SchemaDefinition } from "./schema.js";
 import { serializeSchema, type WireMigrationStep } from "./schema-wire.js";
 import type { DatabaseInitPayload, StoreDescriptor, WireDatabaseOptions } from "./worker-host.js";
@@ -321,11 +322,14 @@ export class MinnowDatabaseClient {
     )) as DatabaseRow[];
   }
 
+  /**
+   * Results cross the channel as one array per column (typed arrays for numbers, booleans, and
+   * datetimes) and are rebuilt into row objects here; see `result-wire.ts`.
+   */
   async query(sql: string, options?: QueryOptions): Promise<QueryResult> {
-    return (await this.#call(
-      "query",
-      options === undefined ? [sql] : [sql, options],
-    )) as QueryResult;
+    return decodeQueryResult(
+      await this.#call("query", options === undefined ? [sql] : [sql, options]),
+    );
   }
 
   async run<TRow>(query: {
@@ -333,7 +337,7 @@ export class MinnowDatabaseClient {
     plan: CompiledQuery;
     __row?: TRow;
   }): Promise<TRow[]> {
-    return (await this.#call("run", [query])) as TRow[];
+    return decodeQueryResult(await this.#call("run", [query])).rows as TRow[];
   }
 
   async explain(sql: string): Promise<string> {
@@ -400,8 +404,8 @@ export class MinnowDatabaseClient {
     ): Promise<StagedWriteResult> =>
       this._invoke(opened.handleId, "stage", [op, tableName, input]) as Promise<StagedWriteResult>;
     const session: ClientWriteSession = {
-      query: (sql, options) =>
-        this._invoke(opened.handleId, "query", [sql, options]) as Promise<QueryResult>,
+      query: async (sql, options) =>
+        decodeQueryResult(await this._invoke(opened.handleId, "query", [sql, options])),
       insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
       upsertBatch: (tableName, input) => stage("upsertBatch", tableName, input),
       updateBatch: (tableName, input) => stage("updateBatch", tableName, input),
@@ -648,7 +652,7 @@ export class MinnowDatabaseClient {
     if (response.kind === "rpc-event") {
       const route = this.#events.get(response.handleId);
       if (route === undefined) return;
-      if (response.event === "change") route.onChange?.(response.payload as QueryResult);
+      if (response.event === "change") route.onChange?.(decodeQueryResult(response.payload));
       else if (response.event === "error") {
         route.onError?.(rehydrateError(response.payload as SerializedError));
       } else if (response.event === "progress") route.onProgress?.(response.payload);

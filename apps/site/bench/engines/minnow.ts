@@ -1,4 +1,5 @@
-import { MinnowDatabase } from "@minnowdb/core";
+import { MinnowDatabase, exposeDatabase } from "@minnowdb/core";
+import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { IndexedDbBlockStore, type BlockStore } from "@minnowdb/core/storage";
 import { generateEntityBatch, getScenario } from "../benchmark";
 import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol";
@@ -6,12 +7,39 @@ import { canonicalizeRow, normalizeRows } from "./shared";
 import type {
   EngineDriver,
   EngineSession,
+  LiveSession,
   LoadContext,
   WriteSession,
   WriteTableSchema,
 } from "./session";
 
 const BATCH_ROWS = 50_000;
+
+/**
+ * The client an application holds, wired to this database over a message channel inside the
+ * bench worker. Every call crosses the channel exactly as it would cross a worker boundary —
+ * RPC frames out, results back in their columnar wire form, rows rebuilt on the receiving
+ * side — so what it measures is the client layer, not the engine again. Close it and the
+ * channel goes with it; the database and store are the caller's.
+ */
+export function connectClient(database: MinnowDatabase): {
+  client: MinnowDatabaseClient;
+  close(): Promise<void>;
+} {
+  const channel = new MessageChannel();
+  exposeDatabase(database, channel.port1);
+  channel.port1.start();
+  channel.port2.start();
+  const client = new MinnowDatabaseClient(channel.port2, { store: { kind: "memory" } });
+  return {
+    client,
+    async close() {
+      await client.close();
+      channel.port1.close();
+      channel.port2.close();
+    },
+  };
+}
 
 /** One name for a dataset's storage whichever store holds it; the namespaces never collide. */
 export function datasetStorageName(record: DatasetRecord): string {
@@ -105,6 +133,7 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
     async openSession(record: DatasetRecord): Promise<EngineSession> {
       const store = await backend.openStore(record);
       const database = new MinnowDatabase(store, databaseOptions(record));
+      const connection = connectClient(database);
       return {
         engine: backend.id,
         async prepare(sql) {
@@ -115,6 +144,7 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             peakMemoryBytes?: number;
             execute: () => Promise<Array<Record<string, unknown>>>;
             executeCached: () => Promise<Array<Record<string, unknown>>>;
+            executeClient: () => Promise<Array<Record<string, unknown>>>;
             close: () => void;
           } = {
             plan,
@@ -136,13 +166,58 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             // rather than instead of it.
             executeCached: async () =>
               normalizeRows((await database.query(sql)).rows).map(canonicalizeRow),
+            // The same execution through the client: memo off, so the difference from
+            // `execute` is the channel and the rows rebuilt on the receiving side.
+            executeClient: async () =>
+              normalizeRows((await connection.client.query(sql, { memoize: false })).rows).map(
+                canonicalizeRow,
+              ),
             close: () => undefined,
           };
           return statement;
         },
-        close() {
+        async close() {
+          await connection.close();
           store.close();
-          return Promise.resolve();
+        },
+      };
+    },
+
+    async openLiveSession(record: DatasetRecord): Promise<LiveSession> {
+      const store = await backend.openStore(record);
+      const database = new MinnowDatabase(store, databaseOptions(record));
+      const connection = connectClient(database);
+      // Subscriptions and writes share one client, as they do in an application: the commit the
+      // client issues hints the worker-side live set, whose change events come back over the
+      // same channel the subscription was registered on.
+      const live = connection.client.liveQueries();
+      return {
+        engine: backend.id,
+        async createTable(schema: WriteTableSchema) {
+          await database.createTable({
+            name: schema.name,
+            uniqueKey: schema.primaryKey,
+            columns: schema.columns.map((column) => ({ name: column.name, type: column.type })),
+          });
+        },
+        async insert(table, batch) {
+          await connection.client.insertBatch(table, {
+            columns: batch.columns,
+            rowCount: batch.rowCount,
+          });
+        },
+        async subscribe(sql, onChange) {
+          const subscription = await live.subscribe(sql, {
+            onChange: (result) => {
+              onChange(normalizeRows(result.rows));
+            },
+          });
+          return { close: () => subscription.close() };
+        },
+        async close() {
+          await live.close();
+          await connection.close();
+          store.close();
         },
       };
     },

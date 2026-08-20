@@ -1,4 +1,4 @@
-export const protocolVersion = 1 as const;
+export const protocolVersion = 2 as const;
 
 export type WorkerOperation =
   | "ping"
@@ -14,7 +14,8 @@ export type WorkerOperation =
   | "runQuery"
   | "suiteReference"
   | "suiteWrite"
-  | "suiteFeatureMatrix";
+  | "suiteFeatureMatrix"
+  | "suiteLive";
 
 export interface WorkerRequest<T = unknown> {
   version: typeof protocolVersion;
@@ -217,5 +218,6 @@ function isOperation(value: unknown): value is WorkerOperation {
     "suiteReference",
     "suiteWrite",
     "suiteFeatureMatrix",
+    "suiteLive",
   ].includes(String(value));
 }

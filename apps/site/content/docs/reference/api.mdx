@@ -297,7 +297,9 @@ inspection; it is the layer the no-compatibility-promise applies to most directl
 The versioned, structured-clone-safe RPC frames between client and worker: `protocolVersion`,
 request/response/event frame types, `parseRequest` / `parseRpcRequest` / `parseRpcResponse`,
 `serializeError`, and the frame constructors. Method dispatch is whitelisted per handle — the
-worker never dispatches arbitrary property access.
+worker never dispatches arbitrary property access. Query results and live change events travel
+inside these frames in a columnar form (one array per column, typed arrays transferred) that the
+client turns back into `QueryResult` rows; see [Workers](/docs/engine/workers).
 
 ## `@minnowdb/core/testing`
 

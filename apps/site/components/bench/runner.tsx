@@ -15,6 +15,7 @@ import type {
   DatasetRecord,
   EngineId,
   FeatureSuiteResult,
+  LiveSuiteResult,
   ReferenceSuiteResult,
   WorkProgress,
   WriteSuiteResult,
@@ -32,7 +33,7 @@ import {
   formatRows,
   type ColumnId,
 } from "./config";
-import { FeatureResults, ReadResults, StorageResults, WriteResults } from "./results";
+import { FeatureResults, LiveResults, ReadResults, StorageResults, WriteResults } from "./results";
 
 type Phase =
   | { kind: "idle" }
@@ -44,6 +45,7 @@ interface Results {
   dataset?: DatasetRecord;
   reference?: ReferenceSuiteResult;
   write?: WriteSuiteResult;
+  live?: LiveSuiteResult;
   features?: FeatureSuiteResult;
 }
 
@@ -51,7 +53,7 @@ export function BenchRunner() {
   const worker = useRef<BenchWorker | undefined>(undefined);
   const running = useRef<string | undefined>(undefined);
   const [columns, setColumns] = useState<ColumnId[]>(["minnow", "minnow-cached", "sqlite"]);
-  const [suites, setSuites] = useState<string[]>(["write", "reference"]);
+  const [suites, setSuites] = useState<string[]>(["write", "reference", "live"]);
   const [scale, setScale] = useState(0.5);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [results, setResults] = useState<Results>({});
@@ -149,6 +151,18 @@ export function BenchRunner() {
           );
           running.current = task.requestId;
           next.reference = await task.result;
+          setResults({ ...next });
+        }
+        // Last, because it registers subscriptions and commits through the worker client on
+        // the same storage; a Wasm engine in the selection is reported as having no live layer.
+        if (suites.includes("live")) {
+          const task = client.start<LiveSuiteResult>(
+            "suiteLive",
+            { datasetId: dataset.id, engines: ready },
+            onProgress("Running live queries"),
+          );
+          running.current = task.requestId;
+          next.live = await task.result;
           setResults({ ...next });
         }
       }
@@ -303,6 +317,7 @@ export function BenchRunner() {
 
       {results.write ? <WriteResults result={results.write} columns={chosen} /> : null}
       {results.reference ? <ReadResults result={results.reference} columns={chosen} /> : null}
+      {results.live ? <LiveResults result={results.live} columns={chosen} /> : null}
       {results.dataset ? <StorageResults record={results.dataset} /> : null}
       {results.features ? <FeatureResults result={results.features} /> : null}
 

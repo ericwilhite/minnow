@@ -18,6 +18,14 @@ export interface PreparedStatement {
    */
   executeCached?(): Promise<Array<Record<string, unknown>>>;
   /**
+   * minnow only: the same statement issued through `MinnowDatabaseClient` over a message
+   * channel, with the memo off like `execute()`. It adds what an application on the main thread
+   * pays on top of execution — the RPC frame, the result crossing the channel in its columnar
+   * wire form, and the rows rebuilt on the receiving side — and is reported beside `execute()`
+   * so a regression in that layer shows as the gap between the two.
+   */
+  executeClient?(): Promise<Array<Record<string, unknown>>>;
+  /**
    * Peak modeled execution memory, in bytes, for the most recent `execute()`. Reported by
    * engines that can measure their own execution; the browser's cross-engine memory API
    * (performance.measureUserAgentSpecificMemory) is unavailable in this harness, so this is
@@ -89,6 +97,30 @@ export interface WriteSession {
   close(): Promise<void>;
 }
 
+/** One live subscription: closing it stops its change callbacks. */
+export interface LiveSubscriptionHandle {
+  close(): Promise<void>;
+}
+
+/**
+ * A connection for the live-query suite, driven the way an application drives it — through the
+ * engine's main-thread client, so every notification crosses the worker channel before it counts.
+ * Only engines with a live-query layer provide one; the suite reports the others as unsupported.
+ */
+export interface LiveSession {
+  engine: EngineId;
+  /** Creates one empty table; the suite writes into it and watches it. */
+  createTable(schema: WriteTableSchema): Promise<void>;
+  /** Inserts through the same client the subscriptions were registered on. */
+  insert(table: string, batch: WriteBatch): Promise<void>;
+  /** Registers a query; `onChange` receives its initial rows and then every changed result. */
+  subscribe(
+    sql: string,
+    onChange: (rows: Array<Record<string, unknown>>) => void,
+  ): Promise<LiveSubscriptionHandle>;
+  close(): Promise<void>;
+}
+
 export interface LoadContext {
   record: DatasetRecord;
   /** Rows loaded so far into this engine; the caller scales to overall progress. */
@@ -107,6 +139,8 @@ export interface EngineDriver {
    * engine's persistence settings identical to the read comparison.
    */
   openWriteSession(record: DatasetRecord): Promise<WriteSession>;
+  /** Engines with a live-query layer; absent means the live suite reports "unsupported". */
+  openLiveSession?(record: DatasetRecord): Promise<LiveSession>;
   deleteDataset(materialization: EngineMaterialization): Promise<void>;
 }
 

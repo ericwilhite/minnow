@@ -186,6 +186,22 @@ and batch size visible the same way. Nothing is reported unless it was verified 
 match an independent JavaScript oracle and every write is read back and compared row for row, and
 a query an engine got wrong or could not run prints a dash instead of a timing.
 
+Two further measurements cover what an application pays above the engine, so a regression in the
+worker client or the live-query layer shows on the page instead of hiding behind engine numbers:
+
+- **The client columns** (`Minnow (client)`, `Minnow (OPFS, client)`) issue each read through
+  `MinnowDatabaseClient` over a message channel inside the bench worker: the RPC frame out, the
+  result back in its columnar wire form, and the rows rebuilt on the receiving side. The gap to the
+  plain Minnow column is the cost of the worker boundary. The client's rows are checked against
+  the oracle too, so a wire format that dropped a value could not pass as a faster number.
+- **The live-query suite** registers 1 to 100 subscriptions through that client, commits one row,
+  and times the commit until the last affected subscription's `onChange` has fired with its rows
+  in hand. One case keeps 99 of 100 subscriptions on a table the commit never touches, which
+  measures the cost of ruling them out. Every affected subscription must fire exactly once per
+  commit and end on the row count the commits imply, and no other may fire at all. The suite owns
+  its tables and never writes the dataset's, so the read oracles stay true after it. Only Minnow
+  takes part; the Wasm engines have no live-query layer and are reported as such.
+
 There is nothing to publish or regenerate. The [benchmarks page](/benchmarks) has no checked-in
 numbers: it builds every engine and runs the suites in the visitor's browser, on the engines,
 suites, and dataset size they pick, and explains the measurement methodology, storage differences,

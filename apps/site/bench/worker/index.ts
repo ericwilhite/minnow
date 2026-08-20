@@ -11,6 +11,7 @@ import { failure, parseRequest, success } from "@minnowdb/core/worker-protocol";
 import type { MemorySample } from "../memory-probe";
 import { datasetCreate, datasetDelete, datasetList, validateCreatePayload } from "./datasets";
 import { runFeatureSuite, validateFeaturePayload } from "./feature-suite";
+import { runLiveSuite, validateLivePayload } from "./live-suite";
 import { runQuery, validateRunQueryPayload } from "./run-query";
 import { runReferenceSuite, validateReferencePayload } from "./reference-suite";
 import { runWriteSuite, validateWritePayload } from "./write-suite";
@@ -81,6 +82,17 @@ async function runRequest(raw: unknown): Promise<void> {
         try {
           self.postMessage(
             success(request.requestId, await runWriteSuite(request.requestId, payload)),
+          );
+        } finally {
+          cancelledRuns.delete(request.requestId);
+        }
+        return;
+      }
+      case "suiteLive": {
+        const payload = validateLivePayload(request.payload);
+        try {
+          self.postMessage(
+            success(request.requestId, await runLiveSuite(request.requestId, payload)),
           );
         } finally {
           cancelledRuns.delete(request.requestId);

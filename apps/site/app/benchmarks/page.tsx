@@ -43,6 +43,13 @@ export default function BenchmarksPage() {
           excluded.
         </p>
         <p className="mb-2">
+          The Minnow client columns and the live-query suite measure what an application pays above
+          the engine: every call goes through <code>MinnowDatabaseClient</code> over a message
+          channel, so the number includes the RPC frame, the result crossing the channel in its
+          columnar wire form, and the rows rebuilt on the receiving side. The live suite then
+          commits a row and stops the clock when the last affected subscription has been told.
+        </p>
+        <p className="mb-2">
           Timings are taken by the batch. The browser&rsquo;s clock ticks every 5µs on this page and
           every 100µs on an origin that is not cross-origin isolated, which is coarser than most of
           what is measured here — so anything quicker than the clock is executed many times inside

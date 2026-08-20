@@ -14,8 +14,11 @@ import {
   type BufferedTableWriter,
   type BatchValue,
   type BufferedWriterOptions,
+  type QueryOptions,
 } from "./database.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
+import type { CompiledQuery, QueryRow } from "./query.js";
+import { encodeQueryResult, encodeQueryRows, type EncodedQueryResult } from "./result-wire.js";
 import { deserializeSchema, serializeMigrationSteps, type WireSchema } from "./schema-wire.js";
 
 /**
@@ -56,6 +59,15 @@ function isStageOp(value: unknown): value is StageOp {
   return typeof value === "string" && (stageOps as readonly string[]).includes(value);
 }
 
+/**
+ * A call result that travels as a columnar frame with its buffers transferred. Only query
+ * results take this path: rows of objects are what structured clone is slowest at, so they are
+ * pivoted into per-column arrays here and rebuilt by the client.
+ */
+class ColumnarResult {
+  constructor(readonly encoded: EncodedQueryResult) {}
+}
+
 class WriteScopeAbortedError extends Error {
   override readonly name = "WriteScopeAbortedError";
 
@@ -67,7 +79,11 @@ class WriteScopeAbortedError extends Error {
 /** The slice of DedicatedWorkerGlobalScope (or MessagePort) the host needs. */
 export interface RpcScope {
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
-  postMessage(message: unknown): void;
+  /**
+   * Query results arrive with their typed-array buffers listed for transfer; a scope that
+   * ignores the second argument still works, it just clones them.
+   */
+  postMessage(message: unknown, options?: { transfer: ArrayBuffer[] }): void;
 }
 
 export interface ExposeDatabaseOptions {
@@ -121,7 +137,13 @@ class DatabaseRpcServer {
         request.handleId === null
           ? await this.#callRoot(request.method, request.args)
           : await this.#callHandle(request.handleId, request.method, request.args);
-      this.scope.postMessage(rpcResult(request.requestId, result));
+      if (result instanceof ColumnarResult) {
+        this.scope.postMessage(rpcResult(request.requestId, result.encoded.payload), {
+          transfer: result.encoded.transfer,
+        });
+      } else {
+        this.scope.postMessage(rpcResult(request.requestId, result));
+      }
     } catch (error) {
       this.scope.postMessage(rpcFailure(request.requestId, error));
     }
@@ -144,8 +166,6 @@ class DatabaseRpcServer {
       case "update":
       case "deleteBatch":
       case "readTable":
-      case "query":
-      case "run":
       case "runStatement":
       case "explain":
       case "execute":
@@ -162,6 +182,14 @@ class DatabaseRpcServer {
       case "bufferPoolStats":
       case "listGarbageCollectionJobs":
         return database[method]?.(...args);
+      case "query": {
+        const [sql, options] = args as [string, QueryOptions | undefined];
+        return new ColumnarResult(encodeQueryResult(await this.database.query(sql, options)));
+      }
+      case "run": {
+        const query = args[0] as { kind: "typed-query"; plan: CompiledQuery; __row?: QueryRow };
+        return new ColumnarResult(encodeQueryRows(await this.database.run(query)));
+      }
       case "migrate": {
         const result = await this.database.migrate(
           deserializeSchema(args[0] as WireSchema),
@@ -289,7 +317,9 @@ class DatabaseRpcServer {
       case "write": {
         if (method === "query") {
           const [sql, options] = args as [string, { params?: unknown } | undefined];
-          return handle.session.query(sql, options as never);
+          return new ColumnarResult(
+            encodeQueryResult(await handle.session.query(sql, options as never)),
+          );
         }
         if (method === "stage") {
           const [op, tableName, input] = args as [unknown, string, never];
@@ -453,7 +483,10 @@ class DatabaseRpcServer {
         const query = args[1] as LiveQueryInput;
         const subscription = await handle.set.subscribe(query, {
           onChange: (result) => {
-            this.scope.postMessage(rpcEvent(subscriptionId, "change", result));
+            const encoded = encodeQueryResult(result);
+            this.scope.postMessage(rpcEvent(subscriptionId, "change", encoded.payload), {
+              transfer: encoded.transfer,
+            });
           },
           onError: (error) => {
             this.scope.postMessage(rpcEvent(subscriptionId, "error", serializeError(error)));

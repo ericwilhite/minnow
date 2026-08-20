@@ -11,6 +11,7 @@ import type {
   DatasetRecord,
   EngineId,
   FeatureSuiteResult,
+  LiveSuiteResult,
   ReferenceSuiteResult,
   WriteSuiteResult,
   WorkloadKind,
@@ -160,13 +161,16 @@ export function ReadResults({
               cells: shown.map((column) => {
                 const measured = query.engines.find((entry) => entry.engine === column.engine);
                 // An unsupported query, or one whose answer did not match the oracle, has no
-                // number worth printing. Neither has a cached column for an engine with no cache.
+                // number worth printing. Neither has a variant column for an engine without
+                // that layer — no result memo, no worker client.
                 const usable = measured?.supported === true && measured.verified;
                 const ms = !usable
                   ? null
-                  : column.cached === true
+                  : column.variant === "cached"
                     ? (measured.cachedMedianMs ?? null)
-                    : measured.medianMs;
+                    : column.variant === "client"
+                      ? (measured.clientMedianMs ?? null)
+                      : measured.medianMs;
                 return {
                   id: column.id,
                   ms,
@@ -187,9 +191,10 @@ export function WriteResults({
   result: WriteSuiteResult;
   columns: readonly EngineChoice[];
 }) {
-  // Nothing caches a write, so the cached column would be a stripe of dashes.
+  // Nothing caches a write and the write path is not measured through the client, so the
+  // variant columns would be stripes of dashes.
   const shown = columns.filter(
-    (column) => column.cached !== true && result.engines.includes(column.engine),
+    (column) => column.variant === undefined && result.engines.includes(column.engine),
   );
   const batched = result.cases
     .flatMap((entry) => entry.engines.map((measured) => measured.batchSize ?? 1))
@@ -229,6 +234,73 @@ export function WriteResults({
             }))}
         />
       ))}
+    </section>
+  );
+}
+
+export function LiveResults({
+  result,
+  columns,
+}: {
+  result: LiveSuiteResult;
+  columns: readonly EngineChoice[];
+}) {
+  // Every live number already goes through the worker client — that is the path a notification
+  // takes — so the variant columns have nothing separate to show. Engines without a live-query
+  // layer (the Wasm engines) report no number at all, and the table says so rather than
+  // printing a stripe of dashes against them.
+  const shown = columns.filter(
+    (column) =>
+      column.variant === undefined &&
+      result.engines.includes(column.engine) &&
+      (result.supportedByEngine[column.engine] ?? 0) > 0,
+  );
+  const missing = columns
+    .filter(
+      (column) =>
+        column.variant === undefined &&
+        result.engines.includes(column.engine) &&
+        (result.supportedByEngine[column.engine] ?? 0) === 0,
+    )
+    .map((column) => column.label);
+  return (
+    <section>
+      <h3 className="text-xl font-semibold">Live queries</h3>
+      <p className="mt-1 text-sm text-fd-muted-foreground">
+        Median of {result.sampleCount} commits per case, after one untimed warm-up: from issuing the
+        write through the worker client until the last affected subscription&rsquo;s{" "}
+        <code>onChange</code> has fired with its rows rebuilt on this side of the channel.{" "}
+        {result.passed
+          ? "Every affected subscription fired exactly once per commit and none of the others did."
+          : "Some subscriptions fired the wrong number of times or on the wrong result — treat these timings as suspect."}
+        {missing.length > 0
+          ? ` ${missing.join(" and ")} ${missing.length === 1 ? "has" : "have"} no live-query layer, so there is nothing to time.`
+          : ""}
+      </p>
+      {shown.length === 0 ? (
+        <p className="mt-3 text-sm text-fd-muted-foreground">
+          No selected engine could run the live-query suite.
+        </p>
+      ) : (
+        <Table
+          caption="Commit to notification"
+          note="Subscriptions count the rows above a threshold in a table this suite owns; one commit adds a row, and the clock stops when every subscription that depends on that table has been told. The quiet subscriptions watch a table the commit never touches."
+          columns={shown}
+          rows={result.cases.map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            detail: `${String(entry.affected)} of ${String(entry.subscriptions)} affected`,
+            cells: shown.map((column) => {
+              const measured = entry.engines.find((item) => item.engine === column.engine);
+              return {
+                id: column.id,
+                ms: measured?.supported === true && measured.verified ? measured.medianMs : null,
+                ...(measured?.error === undefined ? {} : { note: measured.error }),
+              };
+            }),
+          }))}
+        />
+      )}
     </section>
   );
 }

@@ -229,6 +229,113 @@ describe("MinnowDatabaseClient", () => {
     expect(rows).toEqual([{ name: "Grace" }, { name: "Ada" }]);
   });
 
+  it("rebuilds rows of every value type from the columnar result frame", async () => {
+    // Results cross as one array per column; the client's rows must be indistinguishable from
+    // the worker's: plain objects keyed in column order, Dates as Date instances, booleans and
+    // nulls intact, and a mixed-type column (CASE) carried value by value.
+    const client = connect();
+    await client.createTable({
+      name: "mixed",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string", nullable: true },
+        { name: "flag", type: "boolean", nullable: true },
+        { name: "at", type: "datetime", nullable: true },
+        { name: "score", type: "number", nullable: true },
+      ],
+    });
+    await client.insertBatch("mixed", {
+      columns: {
+        id: [1, 2, 3],
+        label: ["one", null, ""],
+        flag: [true, null, false],
+        at: [new Date("2024-01-02T03:04:05.678Z"), null, new Date(0)],
+        score: [null, 2.5, -0],
+      },
+    });
+    const result = await client.query(
+      "SELECT id, label, flag, at, score, CASE WHEN id = 2 THEN label ELSE id END AS either, NULL AS nothing FROM mixed ORDER BY id",
+    );
+    expect(result.columns).toEqual(["id", "label", "flag", "at", "score", "either", "nothing"]);
+    expect(result.rows).toEqual([
+      {
+        id: 1,
+        label: "one",
+        flag: true,
+        at: new Date("2024-01-02T03:04:05.678Z"),
+        score: null,
+        either: 1,
+        nothing: null,
+      },
+      { id: 2, label: null, flag: null, at: null, score: 2.5, either: null, nothing: null },
+      { id: 3, label: "", flag: false, at: new Date(0), score: -0, either: 3, nothing: null },
+    ]);
+    expect(result.rows.map((row) => Object.keys(row))).toEqual(
+      result.rows.map(() => result.columns),
+    );
+    expect(result.rows[0]?.at).toBeInstanceOf(Date);
+    expect(Object.is(result.rows[2]?.score, -0)).toBe(true);
+    expect(Object.getPrototypeOf(result.rows[0])).toBe(Object.prototype);
+    const empty = await client.query("SELECT id FROM mixed WHERE id > 10");
+    expect(empty).toEqual({ columns: ["id"], rows: [] });
+    await client.close();
+  });
+
+  it("rebuilds a `__proto__` result column as an own property", async () => {
+    const client = connect();
+    await client.createTable({
+      name: "special_names",
+      columns: [{ name: "__proto__", type: "string" }],
+    });
+    await client.insertBatch("special_names", { columns: { ["__proto__"]: ["kept"] } });
+    const result = await client.query('SELECT "__proto__" FROM special_names');
+    expect(result.columns).toEqual(["__proto__"]);
+    const row = result.rows[0] ?? {};
+    expect(Object.hasOwn(row, "__proto__")).toBe(true);
+    expect(Reflect.get(row, "__proto__")).toBe("kept");
+    expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+    await client.close();
+  });
+
+  it("serves a real message port, transferring result buffers instead of copying them", async () => {
+    const channel = new MessageChannel();
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const transfers: boolean[] = [];
+    exposeDatabase(database, {
+      addEventListener: (type, listener) => {
+        channel.port1.addEventListener(type, listener);
+      },
+      postMessage: (message, options) => {
+        channel.port1.postMessage(message, options);
+        // After a transfer the sender's buffers are detached; a copy would leave them intact.
+        if (options !== undefined && options.transfer.length > 0) {
+          transfers.push(options.transfer.every((buffer) => buffer.byteLength === 0));
+        }
+      },
+    });
+    channel.port1.start();
+    channel.port2.start();
+    const client = new MinnowDatabaseClient(channel.port2);
+    await createPeopleTable(client);
+    await client.insertBatch("people", {
+      columns: {
+        id: [1, 2],
+        name: ["Ada", "Grace"],
+        joined: [new Date("2024-01-02T03:04:05Z"), new Date("2024-06-07T08:09:10Z")],
+      },
+    });
+    const result = await client.query("SELECT id, name, joined FROM people ORDER BY id");
+    expect(result.rows).toEqual([
+      { id: 1, name: "Ada", joined: new Date("2024-01-02T03:04:05Z") },
+      { id: 2, name: "Grace", joined: new Date("2024-06-07T08:09:10Z") },
+    ]);
+    expect(transfers).toEqual([true]);
+    await client.close();
+    channel.port1.close();
+    channel.port2.close();
+  });
+
   it("runs an atomic write scope across the channel", async () => {
     const client = connect();
     await createPeopleTable(client);
@@ -351,10 +458,18 @@ describe("MinnowDatabaseClient", () => {
     await live.refresh();
     expect(changes.length).toBe(2);
     expect(changes[1]?.rows).toEqual([{ name: "Ada" }, { name: "Grace" }]);
+    // Change events cross as columnar frames too; the rows arrive rebuilt, Dates included.
+    const dated = await live.subscribe("SELECT name, joined FROM people ORDER BY name", {
+      onChange: (result) => changes.push(result),
+    });
+    expect(changes[2]?.columns).toEqual(["name", "joined"]);
+    expect(changes[2]?.rows.map((row) => row.name)).toEqual(["Ada", "Grace"]);
+    expect(changes[2]?.rows.every((row) => row.joined instanceof Date)).toBe(true);
+    await dated.close();
     await subscription.close();
     await client.insert("people", { id: 3, name: "Edsger", joined: new Date() });
     await live.refresh();
-    expect(changes.length).toBe(2);
+    expect(changes.length).toBe(3);
     const stats = await live.stats();
     expect(stats.sweeps).toBeGreaterThanOrEqual(1);
     await live.close();

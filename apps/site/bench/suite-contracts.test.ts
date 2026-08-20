@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { engineIds, type WorkloadKind } from "./protocol";
+import { liveCaseDefinitions } from "./worker/live-suite";
 import { referenceQueryDefinitions } from "./worker/reference-suite";
 import { validateDatasetSuitePayload } from "./worker/support";
 import { writeCaseDefinitions } from "./worker/write-suite";
@@ -7,6 +8,21 @@ import { writeCaseDefinitions } from "./worker/write-suite";
 describe("benchmark suite contracts", () => {
   it("limits benchmark comparisons to the storage peers", () => {
     expect(engineIds).toEqual(["minnow", "minnow-opfs", "sqlite", "pglite"]);
+  });
+
+  it("scales the live-query cases from one subscription to a hundred", () => {
+    const cases = liveCaseDefinitions();
+    expect(cases.map(({ subscriptions, affected }) => [subscriptions, affected])).toEqual([
+      [1, 1],
+      [10, 10],
+      [100, 100],
+      [100, 1],
+    ]);
+    // Every case names how many of its subscriptions the commit touches, never more than exist.
+    expect(
+      cases.every(({ subscriptions, affected }) => affected >= 1 && affected <= subscriptions),
+    ).toBe(true);
+    expect(new Set(cases.map(({ id }) => id)).size).toBe(cases.length);
   });
 
   it("keeps OLTP and OLAP coverage explicit for reads and writes", () => {

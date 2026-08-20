@@ -8,7 +8,7 @@ it("accepts a versioned known operation", () => {
 });
 
 it("rejects unknown versions and operations", () => {
-  expect(() => parseRequest({ version: 2, requestId: "one", operation: "ping" })).toThrow(
+  expect(() => parseRequest({ version: 99, requestId: "one", operation: "ping" })).toThrow(
     "version",
   );
   expect(() =>

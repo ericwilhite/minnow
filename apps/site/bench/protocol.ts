@@ -134,6 +134,15 @@ export interface ReferenceEngineMeasurement {
   cachedMedianMs?: number;
   cachedBatchSize?: number;
   /**
+   * Minnow engines only: median of the same statement issued through `MinnowDatabaseClient`
+   * over a message channel — the RPC frame, the result crossing the channel in its columnar
+   * wire form, and the rows rebuilt on the receiving side. This is what an application on the
+   * main thread pays; `medianMs` is what the engine alone costs. Absent for engines that have
+   * no such client layer.
+   */
+  clientMedianMs?: number;
+  clientBatchSize?: number;
+  /**
    * Peak modeled execution memory in bytes, self-reported by engines that measure their own
    * execution. The browser's cross-engine memory API is unavailable in this harness (Chromium
    * refuses it without full site isolation, which Playwright's build lacks, and it does not
@@ -234,6 +243,52 @@ export interface WriteSuiteResult {
   totalMsByEngine: Partial<Record<EngineId, number>>;
   supportedByEngine: Partial<Record<EngineId, number>>;
   /** Every case an engine could run left the table exactly as the oracle predicts. */
+  passed: boolean;
+}
+
+export interface LiveSuitePayload {
+  datasetId: string;
+  engines: EngineId[];
+}
+
+export interface LiveEngineMeasurement {
+  engine: EngineId;
+  /** The engine has a live-query layer and ran the case. False carries the reason in `error`. */
+  supported: boolean;
+  error?: string;
+  /** Time to register every subscription and receive each one's initial result. */
+  subscribeMs: number;
+  /**
+   * Commit to notification: from issuing the write until the last affected subscription's
+   * `onChange` has fired with rows in hand, through the client — the RPC, the worker's commit,
+   * the live-query sweep, and the change event crossing the channel.
+   */
+  medianMs: number;
+  p95Ms: number;
+  /** Change notifications received per commit, which must equal the affected subscriptions. */
+  notifications: number;
+  /** Every affected subscription ended on the row count the commits imply, and no other fired. */
+  verified: boolean;
+}
+
+export interface LiveCaseReport {
+  id: string;
+  name: string;
+  /** Subscriptions registered before the commit. */
+  subscriptions: number;
+  /** How many of them depend on the table the commit writes. */
+  affected: number;
+  engines: LiveEngineMeasurement[];
+}
+
+export interface LiveSuiteResult {
+  datasetId: string;
+  scale: number;
+  sampleCount: number;
+  engines: EngineId[];
+  cases: LiveCaseReport[];
+  supportedByEngine: Partial<Record<EngineId, number>>;
+  /** Every case an engine could run delivered exactly the expected notifications. */
   passed: boolean;
 }
 
