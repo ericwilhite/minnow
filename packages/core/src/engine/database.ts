@@ -3451,10 +3451,25 @@ export class MinnowDatabase {
 
   /** The table's visible segments at the current manifest. */
   async #currentVisibleSegments(table: TableRecord): Promise<SegmentRecord[]> {
-    const version = await this.store.getCurrentManifestVersion();
-    return this.#withLeasedSnapshot(version, (snapshot) =>
-      this.#visibleSegmentRecords(table, snapshot),
-    );
+    // This is an optimistic metadata read, not a user snapshot: taking a durable reader lease
+    // here would add a readwrite transaction to whichever foreground write happened to trigger
+    // maintenance. Verify the manifest did not move while its segment records were loaded; the
+    // current manifest itself cannot be pruned, so a matching version is the same stability proof
+    // without persistent state. Do not chase a busy writer forever: this probe is only a hint,
+    // periodic checks keep arriving during the burst, and the quiet-tail check gets a stable view
+    // once it ends.
+    let segments: SegmentRecord[] = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const manifest = await this.store.getCurrentManifest();
+      segments = await this.#visibleSegmentRecords(
+        table,
+        new Snapshot(this.store, manifest?.version ?? null, manifest?.blockIds ?? []),
+      );
+      if ((await this.store.getCurrentManifestVersion()) === (manifest?.version ?? null)) {
+        return segments;
+      }
+    }
+    return segments;
   }
 
   /**
@@ -3482,7 +3497,6 @@ export class MinnowDatabase {
         continue;
       }
       this.#commitsSinceCompactionCheck.delete(tableId);
-      this.#idleCompactionTableIds.delete(tableId);
       void this.#checkAutoCompaction(tableId);
     }
     this.#armIdleCompactionCheck();
