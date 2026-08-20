@@ -12,6 +12,7 @@
     "differential": [],
     "concurrency-simulation": [],
     "compaction-soak": [],
-    "compaction-soak-snapshots": []
+    "compaction-soak-snapshots": [],
+    "auto-compaction-soak": []
   }
 }

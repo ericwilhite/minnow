@@ -987,6 +987,8 @@ export class MinnowDatabase {
    */
   #collectionWatermark: number | null = null;
   #autoCollectionInFlight = false;
+  /** A trigger that arrived while a run was in flight; honoured when the run ends. */
+  #autoCollectionRequested = false;
   #autoCollectionBackoffUntilCommit = 0;
   /** When the last background collection pass started, by the database clock. */
   #lastCollectionAt: number | undefined;
@@ -2427,6 +2429,20 @@ export class MinnowDatabase {
       void previous.lease.release().catch(() => undefined);
     }
     return entry;
+  }
+
+  /**
+   * Drops the shared reader lease when nothing holds it and it has fallen behind the current
+   * version. The lease outlives the query that took it so the next query at the same version
+   * reuses it — but after a burst of writes and a fold, an idle database's last lease sits at a
+   * pre-fold version and roots every block that version referenced, which is exactly what a
+   * collection pass is trying to reclaim. The next query simply takes a fresh lease.
+   */
+  #releaseIdleSharedLease(): void {
+    const current = this.#sharedLease;
+    if (current?.refCount !== 0) return;
+    this.#sharedLease = undefined;
+    void current.lease.release().catch(() => undefined);
   }
 
   #releaseSharedLease(entry: SharedLeaseEntry): void {
@@ -7560,9 +7576,17 @@ export class MinnowDatabase {
    * write or a scan; a failed pass backs off for an interval of commits.
    */
   #maybeScheduleAutoCollection(): void {
-    if (!this.#autoCollect || this.#autoCollectionInFlight) return;
+    if (!this.#autoCollect) return;
+    if (this.#autoCollectionInFlight) {
+      // A fold finishing or a quiet minute passing while a run is under way is a reason for
+      // one more run once this one ends — a dropped trigger after the last commit of a burst
+      // would otherwise leave the burst's leftovers until the next one.
+      this.#autoCollectionRequested = true;
+      return;
+    }
     if (this.#commitsSinceCollection < this.#autoCollectionBackoffUntilCommit) return;
     this.#autoCollectionInFlight = true;
+    this.#autoCollectionRequested = false;
     this.#commitsSinceCollection = 0;
     this.#lastCollectionAt = this.#now().getTime();
     void this.#runAutoCollection()
@@ -7574,6 +7598,12 @@ export class MinnowDatabase {
       })
       .finally(() => {
         this.#autoCollectionInFlight = false;
+        if (this.#autoCollectionRequested) {
+          this.#autoCollectionRequested = false;
+          void yieldToEventLoop().then(() => {
+            this.#maybeScheduleAutoCollection();
+          });
+        }
       });
   }
 
@@ -7599,6 +7629,7 @@ export class MinnowDatabase {
     // outran the passes between them — takes several. Keep passing while a pass still finds
     // something, up to a ceiling that keeps a pathological store from pinning the loop.
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
+      this.#releaseIdleSharedLease();
       let progress = await this.#collectGarbageStep(
         {
           maxItems: AUTO_COLLECT_STEP_ITEMS,
@@ -7777,17 +7808,26 @@ export class MinnowDatabase {
     currentBlockIds: ReadonlySet<string>,
     limit: number,
   ): Promise<string[]> {
-    const candidates: string[] = [];
+    if (limit <= 0) return [];
+    // A block the current manifest still carries is not garbage, whatever else references it,
+    // and an unpruned manifest shares nearly all of its blocks with the current one. Deciding
+    // that from the set first leaves the store lookups to the few blocks that might be gone —
+    // reading every block of every manifest to find them made a planning pass cost the table
+    // times the history.
+    const possible: string[] = [];
     const seen = new Set<string>();
-    for (let start = 0; start < ids.length && candidates.length < limit; start += 64) {
-      const page = ids.slice(start, start + 64);
+    for (const id of ids) {
+      if (currentBlockIds.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      possible.push(id);
+    }
+    const candidates: string[] = [];
+    for (let start = 0; start < possible.length && candidates.length < limit; start += 64) {
+      const page = possible.slice(start, start + 64);
       const blocks = await this.store.getBlocks(page);
       for (let index = 0; index < page.length && candidates.length < limit; index += 1) {
         const id = page[index] ?? "";
-        if (blocks[index] !== undefined && !currentBlockIds.has(id) && !seen.has(id)) {
-          seen.add(id);
-          candidates.push(id);
-        }
+        if (blocks[index] !== undefined) candidates.push(id);
       }
     }
     return candidates;

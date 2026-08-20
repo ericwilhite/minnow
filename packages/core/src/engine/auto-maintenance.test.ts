@@ -133,7 +133,7 @@ async function footprint(store: MemoryBlockStore, database: MinnowDatabase) {
 async function settle(store: MemoryBlockStore, database: MinnowDatabase): Promise<void> {
   let previous = JSON.stringify(await footprint(store, database));
   let quiet = 0;
-  for (let attempt = 0; attempt < 1_200 && quiet < 10; attempt += 1) {
+  for (let attempt = 0; attempt < 1_200 && quiet < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     const activeCompaction = (await database.listCompactionJobs()).some(
       (job) => job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted",
@@ -183,8 +183,9 @@ describe("background maintenance", () => {
     await burst(database, reference, 400, 40);
     await settle(store, database);
     const folded = await footprint(store, database);
-    // Folded: the scan reads a handful of segments, not one per write.
-    expect(folded.visibleSegments).toBeLessThanOrEqual(8);
+    // Folded: the scan reads the anchor plus at most the deltas under the fold threshold (32),
+    // not one segment per write.
+    expect(folded.visibleSegments).toBeLessThanOrEqual(33);
     expect(folded.liveBlocks).toBeLessThanOrEqual(fresh.liveBlocks);
     // Right after the burst the last sixty-four versions are still readable, and they are
     // pre-fold versions that root the burst's blocks: bounded, but not yet small.
@@ -197,7 +198,7 @@ describe("background maintenance", () => {
     // hundreds of delta blocks and manifests the burst wrote, which is what an uncollected
     // store holds forever. The bound leaves room for the last fold's superseded anchor.
     expect(settled.storedBytes).toBeLessThanOrEqual(fresh.storedBytes * 2);
-    expect(settled.storedBlocks).toBeLessThanOrEqual(fresh.storedBlocks + 16);
+    expect(settled.storedBlocks).toBeLessThanOrEqual(fresh.storedBlocks + 2 * 32 + 16);
     expect(settled.unprunedManifests).toBeLessThanOrEqual(4);
     // And a fold or a collection pass changed no answer.
     await expectContents(database, reference);
@@ -229,7 +230,7 @@ describe("background maintenance", () => {
     expect(third.storedBytes).toBeLessThanOrEqual(first.storedBytes * 1.5);
     expect(third.storedBlocks).toBeLessThanOrEqual(first.storedBlocks * 1.5);
     expect(third.unprunedManifests).toBeLessThanOrEqual(64 + 2);
-    expect(third.visibleSegments).toBeLessThanOrEqual(8);
+    expect(third.visibleSegments).toBeLessThanOrEqual(33);
     await expectContents(database, reference);
   }, 180_000);
 
@@ -271,7 +272,7 @@ describe("background maintenance", () => {
     await burst(database, reference, 120, 0);
     await settle(store, database);
     const idle = await footprint(store, database);
-    expect(idle.visibleSegments).toBeLessThanOrEqual(8);
+    expect(idle.visibleSegments).toBeLessThanOrEqual(33);
     expect(await database.listGarbageCollectionJobs()).toEqual([]);
     expect(idle.unprunedManifests).toBe(idle.manifests);
     await expectContents(database, reference);

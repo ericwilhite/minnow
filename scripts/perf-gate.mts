@@ -419,6 +419,93 @@ for (let start = 0; start < rows.length; start += 50_000) {
   );
 }
 await minnow.deleteBatch("data_mut", { keys: [7] });
+
+/**
+ * A settled history: the same rows with a thousand point updates applied and the background
+ * maintenance — folds and collection passes — allowed to finish. This is the steady state a
+ * table open all day lives in, and SQLite's and PGlite's costs do not move with history, so the
+ * ratio on the settled-* shapes is the engine's own cost of having been used: a regression here
+ * is a read getting slower as a table is written to, or maintenance failing to keep up. The
+ * settle itself is timed once, against the same updates applied to the other engines, so a fold
+ * or a collection pass that grows expensive shows up as well.
+ */
+const SETTLED_UPDATES = 1_000;
+const settledStore = new MemoryBlockStore();
+const settled = new MinnowDatabase(settledStore);
+await settled.createTable({
+  name: "data_settled",
+  uniqueKey: "id",
+  columns: [
+    { name: "id", type: "number" },
+    { name: "region", type: "string", nullable: true },
+    { name: "amount", type: "number" },
+    { name: "active", type: "boolean" },
+    { name: "joined", type: "datetime", nullable: true },
+    { name: "label", type: "string" },
+  ],
+});
+for (let start = 0; start < rows.length; start += 50_000) {
+  await settled.insertBatch(
+    "data_settled",
+    rows.slice(start, start + 50_000).map((row) => ({
+      ...row,
+      joined: row.joined === null ? null : new Date(row.joined),
+    })),
+  );
+}
+const settledKey = (index: number): number => ((index * 7919) % MUTATION_KEYS) + 1;
+const settleMs = { minnow: 0, sqlite: 0, pglite: 0 };
+{
+  const started = performance.now();
+  for (let index = 0; index < SETTLED_UPDATES; index += 1) {
+    await settled.execute("UPDATE data_settled SET amount = amount + 1 WHERE id = ?", [
+      settledKey(index),
+    ]);
+  }
+  // Wait for the background loops to finish: no active job, the table folded, and the store's
+  // footprint no longer moving. A history that does not settle is a failure of the gate, not a
+  // slow sample: maintenance has to keep up with a thousand updates.
+  const footprint = async (): Promise<string> =>
+    JSON.stringify([
+      (await settled.listVisibleSegments("data_settled")).length,
+      (await settledStore.listBlockIds()).length,
+      (await settledStore.listManifests()).filter((manifest) => manifest.prunedAt === undefined)
+        .length,
+    ]);
+  let previous = await footprint();
+  let quiet = 0;
+  const deadline = performance.now() + 60_000;
+  while (quiet < 10) {
+    if (performance.now() > deadline) {
+      throw new Error(`data_settled did not settle within a minute: ${previous}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const activeCompaction = (await settled.listCompactionJobs()).some(
+      (job) => job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted",
+    );
+    const activeCollection = (await settled.listGarbageCollectionJobs()).some(
+      (job) => job.state === "planned" || job.state === "running",
+    );
+    const due = (await settled.listVisibleSegments("data_settled")).length >= 32;
+    const current = await footprint();
+    quiet = !activeCompaction && !activeCollection && !due && current === previous ? quiet + 1 : 0;
+    previous = current;
+  }
+  settleMs.minnow = performance.now() - started;
+}
+const SETTLED_QUERIES: readonly PerfQuery[] = [
+  {
+    name: "settled-point-lookup",
+    sql: "SELECT id, amount, label FROM data_settled WHERE id = ?",
+    params: [123_457],
+  },
+  { name: "settled-count-star", sql: "SELECT COUNT(*) AS n FROM data_settled" },
+  {
+    name: "settled-filter-scan",
+    sql: "SELECT id, amount FROM data_settled WHERE amount > ? AND region = ?",
+    params: [9000, "west"],
+  },
+];
 for (let index = 0; index < CATALOG_TABLES; index += 1) {
   await minnow.createTable({
     name: `spare_${String(index)}`,
@@ -456,6 +543,19 @@ sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
   }
   sqlite.exec("COMMIT");
   sqlite.exec("DELETE FROM data_mut WHERE id = 7");
+  sqlite.exec(
+    `CREATE TABLE data_settled ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+  );
+  const settledInsert = sqlite.prepare("INSERT INTO data_settled VALUES (?, ?, ?, ?, ?, ?)");
+  sqlite.exec("BEGIN");
+  for (const row of rows) {
+    settledInsert.run(row.id, row.region, row.amount, row.active ? 1 : 0, row.joined, row.label);
+  }
+  sqlite.exec("COMMIT");
+  const settledUpdate = sqlite.prepare("UPDATE data_settled SET amount = amount + 1 WHERE id = ?");
+  const settledStarted = performance.now();
+  for (let index = 0; index < SETTLED_UPDATES; index += 1) settledUpdate.run(settledKey(index));
+  settleMs.sqlite = performance.now() - settledStarted;
 }
 
 function sqlLiteral(value: unknown): string {
@@ -515,6 +615,30 @@ for (let start = 0; start < rows.length; start += 2000) {
   await pglite.exec(`INSERT INTO data_mut VALUES ${batch}`);
 }
 await pglite.exec("DELETE FROM data_mut WHERE id = 7");
+await pglite.exec(
+  `CREATE TABLE data_settled ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+);
+for (let start = 0; start < rows.length; start += 2000) {
+  const batch = rows
+    .slice(start, start + 2000)
+    .map(
+      (row) =>
+        `(${[row.id, row.region, row.amount, row.active, row.joined, row.label]
+          .map(sqlLiteral)
+          .join(", ")})`,
+    )
+    .join(", ");
+  await pglite.exec(`INSERT INTO data_settled VALUES ${batch}`);
+}
+{
+  const started = performance.now();
+  for (let index = 0; index < SETTLED_UPDATES; index += 1) {
+    await pglite.query("UPDATE data_settled SET amount = amount + 1 WHERE id = $1", [
+      settledKey(index),
+    ]);
+  }
+  settleMs.pglite = performance.now() - started;
+}
 
 function pgliteRunner(query: PerfQuery): () => Promise<unknown> {
   const sql = positionalToNumbered(query.sql);
@@ -597,6 +721,39 @@ for (const mutation of MUTATIONS) {
   const iterations = iterationsFor(Math.max(...singleRuns));
   results.push({
     name: mutation.name,
+    minnow: await timeRepeated(runners.minnow, iterations),
+    engine: {
+      sqlite: await timeRepeated(runners.sqlite, iterations),
+      pglite: await timeRepeated(runners.pglite, iterations),
+    },
+  });
+}
+
+/**
+ * The settled shapes: the same read shapes over the history that was written to a thousand
+ * times and then maintained, plus the settle itself, once.
+ */
+results.push({
+  name: "settle-after-updates",
+  minnow: onceOnly(settleMs.minnow),
+  engine: { sqlite: onceOnly(settleMs.sqlite), pglite: onceOnly(settleMs.pglite) },
+});
+for (const query of SETTLED_QUERIES) {
+  const statement = sqlite.prepare(query.sql);
+  const sqliteParams = (query.params ?? []) as Array<number | string>;
+  const runners = {
+    minnow: minnowRunner(settled, query),
+    sqlite: () => statement.all(...sqliteParams),
+    pglite: pgliteRunner(query),
+  };
+  const singleRuns = [
+    await warmUp(runners.minnow),
+    await warmUp(runners.sqlite),
+    await warmUp(runners.pglite),
+  ];
+  const iterations = iterationsFor(Math.max(...singleRuns));
+  results.push({
+    name: query.name,
     minnow: await timeRepeated(runners.minnow, iterations),
     engine: {
       sqlite: await timeRepeated(runners.sqlite, iterations),
