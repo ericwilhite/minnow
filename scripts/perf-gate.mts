@@ -350,7 +350,11 @@ const CATALOG_TABLES = 100;
 
 const rows = buildRows();
 
-const minnow = new MinnowDatabase(new MemoryBlockStore());
+// Background compaction is off: the gate times the query and write paths, and a fold of the
+// 200k-row table landing under a measurement would make a once-only shape such as bulk-delete
+// swing threefold between runs for reasons that have nothing to do with the path under test.
+// The mutation history the delta-* and write shapes read therefore stays as written.
+const minnow = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
 await minnow.createTable({
   name: "data",
   uniqueKey: "id",

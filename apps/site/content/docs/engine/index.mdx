@@ -113,8 +113,8 @@ import { SqlCompileError, UniqueConstraintError, WriteConflictError } from "@min
 ```
 
 `SqlCompileError` carries the `offset` and `length` of the offending span, which is what the
-devtools editor underlines. `WriteConflictError` means another writer committed first; the engine
-retries these itself up to `maxCommitRetries` before surfacing one.
+devtools editor underlines. `WriteConflictError` means a writer in another tab, or a write scope,
+committed first; the engine retries these itself up to `maxCommitRetries` before surfacing one.
 
 ## Closing
 

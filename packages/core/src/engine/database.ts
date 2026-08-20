@@ -261,6 +261,13 @@ const GZIP_REPROBE_BLOCKS = 32;
 
 /** Blocks smaller than this are written with the configured codec; the choice cannot repay. */
 const GZIP_DECISION_MIN_BYTES = 64 * 1024;
+/**
+ * Below this many logical bytes a block is written raw: the compression pass on the write and
+ * the decompression pass on every read would cost more than the bytes they save, and a point
+ * update's or delete's one-row block is the common case — it used to pay a CompressionStream
+ * round trip to shrink a few dozen bytes.
+ */
+const GZIP_MINIMUM_INPUT_BYTES = 4 * 1024;
 /** Bounds concurrent compression work without serializing independent column blocks. */
 const WRITE_ENCODE_CONCURRENCY = 6;
 
@@ -945,6 +952,8 @@ export class MinnowDatabase {
   readonly #commitsSinceCompactionCheck = new Map<string, number>();
   /** The compaction step in flight per table, so steps on one table run one at a time. */
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
+  /** The simple writes in flight, chained so they commit one after another: see #runWrite. */
+  #writeChain: Promise<unknown> = Promise.resolve();
   /**
    * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
    * optimization — subquery resolution and CTE expansion clone before rewriting and join
@@ -1149,14 +1158,37 @@ export class MinnowDatabase {
    * conflict: unlike the plain rebase-and-retry, a restart re-reads pre-images and re-runs
    * trigger bodies at the fresh state, so derivations can never publish stale values.
    */
-  async #withTriggerRestarts<T>(run: () => Promise<T>): Promise<T> {
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await run();
-      } catch (error) {
-        if (!(error instanceof StaleTriggerDerivationsError)) throw error;
-        if (attempt >= this.#maxCommitRetries) throw error.conflict;
+  /**
+   * Runs one simple write — insert, upsert, update, or delete — after every simple write this
+   * database already has in flight, restarting it when its trigger derivations went stale.
+   *
+   * Commits are optimistic: a writer reads the manifest version, stages, and publishes only if
+   * the version has not moved, rebasing and retrying otherwise up to `maxCommitRetries`.
+   * Writers issued concurrently from one database used to all read the same version and spend
+   * a retry per rival that landed first, so past `maxCommitRetries + 1` of them the rest failed
+   * for nothing — contention this database need not create, and the queue does not. Writers in
+   * other instances and other tabs still contend, and the retry loop is still what resolves
+   * them. Write scopes are not queued: a scope's callback may issue a plain write of its own,
+   * which must not wait on the scope that contains it.
+   */
+  async #runWrite<T>(run: () => Promise<T>): Promise<T> {
+    const restarting = async (): Promise<T> => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await run();
+        } catch (error) {
+          if (!(error instanceof StaleTriggerDerivationsError)) throw error;
+          if (attempt >= this.#maxCommitRetries) throw error.conflict;
+        }
       }
+    };
+    const previous = this.#writeChain;
+    const current = previous.then(restarting, restarting);
+    this.#writeChain = current;
+    try {
+      return await current;
+    } finally {
+      if (this.#writeChain === current) this.#writeChain = Promise.resolve();
     }
   }
 
@@ -1314,7 +1346,7 @@ export class MinnowDatabase {
       autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
         ? batchKeys(table, batch)
         : undefined;
-    const result = await this.#withTriggerRestarts(() =>
+    const result = await this.#runWrite(() =>
       this.#writeBatch(table, batch, "insert", keys, autoIncrement),
     );
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
@@ -1358,7 +1390,7 @@ export class MinnowDatabase {
     );
     const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
     const keys = deferred ? undefined : batchKeys(table, batch);
-    const result = await this.#withTriggerRestarts(() =>
+    const result = await this.#runWrite(() =>
       this.#writeBatch(table, batch, "upsert", keys, autoIncrement),
     );
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
@@ -1385,7 +1417,7 @@ export class MinnowDatabase {
       (column) => input.changes[column] ?? [],
       (sql, params) => this.query(sql, { params, memoize: false }),
     );
-    return this.#withTriggerRestarts(() => this.#writeUpdateBatch(table, keyColumn, input, keys));
+    return this.#runWrite(() => this.#writeUpdateBatch(table, keyColumn, input, keys));
   }
 
   async update(
@@ -1402,7 +1434,7 @@ export class MinnowDatabase {
   async deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
     const dependents = await this.#childForeignKeys(tableName);
     if (dependents.length === 0) {
-      return this.#withTriggerRestarts(() => this.#deleteBatchOnce(tableName, input));
+      return this.#runWrite(() => this.#deleteBatchOnce(tableName, input));
     }
     // E141-04: the referential actions and the delete itself publish as one commit, so no tab
     // can observe a parent gone while its children still point at it.
@@ -1539,23 +1571,24 @@ export class MinnowDatabase {
         deleteValueAt,
         "before",
       );
-      let stageStarted = performance.now();
-      await transaction.stageBlocks(blockWrites);
-      stageMs += performance.now() - stageStarted;
-      stageStarted = performance.now();
-      await transaction.stageSegment({
-        id: segmentId,
-        tableId: table.id,
-        transactionId: transaction.id,
-        rowCount: keys.size,
-        rowIdStart: 0n,
-        rowIdEndExclusive: 0n,
-        columnBlockIds: { [keyColumn.id]: blockIds },
-        kind: "delete",
-        keyColumnId: keyColumn.id,
-        level: 0,
-        createdAt: this.#now().toISOString(),
-      });
+      const stageStarted = performance.now();
+      // One journal step for the key blocks and the segment, as the update path stages: on a
+      // store with the combined operation that is one storage transaction, not four.
+      await transaction.stageArtifacts(blockWrites, [
+        {
+          id: segmentId,
+          tableId: table.id,
+          transactionId: transaction.id,
+          rowCount: keys.size,
+          rowIdStart: 0n,
+          rowIdEndExclusive: 0n,
+          columnBlockIds: { [keyColumn.id]: blockIds },
+          kind: "delete",
+          keyColumnId: keyColumn.id,
+          level: 0,
+          createdAt: this.#now().toISOString(),
+        },
+      ]);
       await this.#stageTriggerDerivedInserts(
         transaction,
         table,
@@ -5274,18 +5307,14 @@ export class MinnowDatabase {
       having: [],
       orderBy: [],
     };
-    const prepared = await this.#prepareCompiledPlan(plan);
-    let existing: Set<QueryValue | string>;
-    try {
-      existing = new Set(
-        prepared.execute().rows.map((row) => {
-          const value = row.key ?? null;
-          return value instanceof Date ? value.toISOString() : value;
-        }),
-      );
-    } finally {
-      prepared.close();
-    }
+    // The streaming-first pipeline: a keyed IN list narrows to the blocks that can hold the
+    // keys, where the prepared path materialized the table's columns first.
+    const existing = new Set<QueryValue | string>(
+      (await this.#queryCompiled(plan)).rows.map((row) => {
+        const value = row.key ?? null;
+        return value instanceof Date ? value.toISOString() : value;
+      }),
+    );
     return {
       ...statement,
       rows: statement.rows.filter((row) => {
@@ -5651,12 +5680,10 @@ export class MinnowDatabase {
       // has already staged — an UPDATE after an INSERT in the same transaction finds that row.
       rows = (await options.writer.queryPlan(plan)).rows;
     } else {
-      const prepared = await this.#prepareCompiledPlan(plan);
-      try {
-        rows = prepared.execute().rows;
-      } finally {
-        prepared.close();
-      }
+      // The same streaming-first pipeline a SELECT takes: its zone pruning and ascending-range
+      // narrowing find the rows to touch, where the prepared path materialized the table's
+      // columns first — most of a bulk delete's cost, at 200k rows.
+      rows = (await this.#queryCompiled(plan)).rows;
     }
     const keys = rows.map((row) => row[keyColumn.name]);
     if (keys.some((key) => key === null || key === undefined)) {
@@ -6840,9 +6867,49 @@ export class MinnowDatabase {
     memory: QueryMemoryContext,
     zonePruned: boolean,
   ): Promise<StreamedOverlayState> {
-    // Phase A: materialize each mutation segment's key vector, and every column an update
-    // changed — resident and reserved, bounded by the mutation history's size. All of an
-    // update's columns, not only the ones this query projects: the state outlives the query.
+    // Phase A: each mutation segment's key vector, and every column an update changed —
+    // resident and reserved, bounded by the mutation history's size. All of an update's
+    // columns, not only the ones this query projects: the state outlives the query. The
+    // history's blocks come out of the buffer pool in one round trip, as block vectors: one
+    // await per segment is what made a table with a few hundred deltas pay ten milliseconds
+    // to rebuild this state after every commit.
+    const deltaSegments = baseSegments.filter(mutationSegmentKind);
+    const deltaBlockIds = new Set<string>();
+    for (const segment of deltaSegments) {
+      for (const column of table.columns) {
+        for (const blockId of segment.columnBlockIds[column.id] ?? []) deltaBlockIds.add(blockId);
+      }
+    }
+    const decodedDeltaBlocks = new Map<string, DecodedPhysicalBlock>();
+    if (deltaBlockIds.size > 0) {
+      const ids = [...deltaBlockIds];
+      const decoded = await this.#decodedBlocksThroughCache(ids, snapshot);
+      ids.forEach((id, index) => {
+        const block = decoded[index];
+        if (block !== undefined) decodedDeltaBlocks.set(id, block);
+      });
+    }
+    const deltaVector = async (
+      column: TableColumnRecord,
+      segment: SegmentRecord,
+    ): Promise<ColumnVector> => {
+      const blockIds = segment.columnBlockIds[column.id] ?? [];
+      const blockId = blockIds[0];
+      if (blockIds.length !== 1 || blockId === undefined) {
+        // A delta written in more than one block — a bulk update past rowsPerBlock — concatenates.
+        return this.#materializeAppendColumnVector(column, [segment], snapshot, segment.rowCount);
+      }
+      const decoded = decodedDeltaBlocks.get(blockId);
+      if (decoded === undefined) throw new Error(`Visible block is missing: ${blockId}`);
+      if (decoded.column.type !== column.type) {
+        throw new Error(`Column type mismatch: ${column.name}`);
+      }
+      const vector = this.#blockColumnVector(blockId, decoded);
+      if (vector.length !== segment.rowCount) {
+        throw new Error(`Column row count mismatch: ${column.name}`);
+      }
+      return vector;
+    };
     const mutationKeyVectors = new Map<string, ColumnVector>();
     const mutationChangedVectors = new Map<string, Map<string, ColumnVector>>();
     // Keys as the primitives the vectors already hold. The replay used to build one string
@@ -6850,15 +6917,9 @@ export class MinnowDatabase {
     // hash of every key in the table.
     const touched = new Set<OverlayKey>();
     let retainedBytes = 0;
-    for (const segment of baseSegments) {
+    for (const segment of deltaSegments) {
       const kind = segment.kind ?? "insert";
-      if (kind !== "update" && kind !== "delete") continue;
-      const keyVector = await this.#materializeAppendColumnVector(
-        keyColumn,
-        [segment],
-        snapshot,
-        segment.rowCount,
-      );
+      const keyVector = await deltaVector(keyColumn, segment);
       memory.reserve(columnVectorRetainedBytes(keyVector), "Streamed mutation replay");
       mutationKeyVectors.set(segment.id, keyVector);
       const readMutationKey = requiredColumnVectorKeyReader(keyVector);
@@ -6870,12 +6931,7 @@ export class MinnowDatabase {
         for (const column of table.columns) {
           if (column.id === keyColumn.id) continue;
           if ((segment.columnBlockIds[column.id]?.length ?? 0) === 0) continue;
-          const vector = await this.#materializeAppendColumnVector(
-            column,
-            [segment],
-            snapshot,
-            segment.rowCount,
-          );
+          const vector = await deltaVector(column, segment);
           const bytes = columnVectorRetainedBytes(vector);
           memory.reserve(bytes, "Streamed mutation replay");
           retainedBytes += bytes;
@@ -11054,6 +11110,7 @@ export class MinnowDatabase {
    */
   async #encodeColumnBlock(columnId: string, input: ColumnInput): Promise<Uint8Array> {
     if (this.#compression !== "gzip") return encodeBlock(input, this.#compression);
+    if (columnInputBytesBelow(input, GZIP_MINIMUM_INPUT_BYTES)) return encodeBlock(input, "raw");
     const verdict = this.#gzipVerdicts.get(columnId);
     if (verdict !== undefined && !verdict.worthwhile) {
       if (verdict.blocksSince < GZIP_REPROBE_BLOCKS) {
@@ -11576,6 +11633,21 @@ function batchKeys(
     keys.set(token, value);
   }
   return keys;
+}
+
+/**
+ * Whether a column block's logical payload is under `limit` bytes: strings by length (two
+ * bytes a code unit, stopping as soon as the limit is reached), everything else eight bytes a
+ * value. An estimate, for the write path's codec choice — not an encoded size.
+ */
+function columnInputBytesBelow(input: ColumnInput, limit: number): boolean {
+  if (input.type !== "string") return input.values.length * 8 < limit;
+  let bytes = 0;
+  for (const value of input.values) {
+    bytes += 8 + (value === null ? 0 : value.length * 2);
+    if (bytes >= limit) return false;
+  }
+  return true;
 }
 
 /** `keyToken` for values that may not encode: undefined instead of a thrown encoding error. */

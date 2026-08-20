@@ -2707,8 +2707,11 @@ for (const outputCompression of ["raw", "gzip"] as const) {
       columns: { value: [null, 4], label: ["b", "c"] },
     });
     const gzip = new MinnowDatabase(store, { compression: "gzip", rowsPerBlock: 64 });
+    // A label long enough that its block clears the gzip floor; the two-number value block
+    // stays under it and is written raw, which is exactly the codec mix this test wants.
+    const longLabel = "d".repeat(2_100);
     const gzipInsert = await gzip.insertBatch("events", {
-      columns: { value: [5, 6], label: [null, "d"] },
+      columns: { value: [5, 6], label: [null, longLabel] },
     });
     const expected = [
       { value: 1, label: "a" },
@@ -2716,20 +2719,21 @@ for (const outputCompression of ["raw", "gzip"] as const) {
       { value: null, label: "b" },
       { value: 4, label: "c" },
       { value: 5, label: null },
-      { value: 6, label: "d" },
+      { value: 6, label: longLabel },
     ];
 
-    for (const [segmentId, compression] of [
-      [rawInsert.segmentId, "raw"],
-      [secondRawInsert.segmentId, "raw"],
-      [gzipInsert.segmentId, "gzip"],
+    for (const [segmentId, compressionOf] of [
+      [rawInsert.segmentId, () => "raw"],
+      [secondRawInsert.segmentId, () => "raw"],
+      [gzipInsert.segmentId, (type: string) => (type === "string" ? "gzip" : "raw")],
     ] as const) {
       const segment = await store.getSegment(segmentId);
       if (segment === undefined) throw new Error(`Expected source segment ${segmentId}`);
       for (const blockId of Object.values(segment.columnBlockIds).flat()) {
         const bytes = await store.getBlock(blockId);
         if (bytes === undefined) throw new Error(`Expected source block ${blockId}`);
-        expect(inspectBlock(bytes).compression).toBe(compression);
+        const description = inspectBlock(bytes);
+        expect(description.compression).toBe(compressionOf(description.type));
       }
     }
 
@@ -4174,9 +4178,12 @@ it("preserves logical row order when row-ID reservation order differs from commi
 
   const firstPromise = database.insert("reverse_ids", { email: "first@example.com", score: 1 });
   await store.firstCommitReached;
+  // One database runs its writes in turn, so the overtaking insert comes from a second
+  // instance over the same store — another tab, whose commit lands while the first is held.
+  const overtaking = new MinnowDatabase(store);
   let second;
   try {
-    second = await database.insert("reverse_ids", { email: "second@example.com", score: 2 });
+    second = await overtaking.insert("reverse_ids", { email: "second@example.com", score: 2 });
   } finally {
     store.releaseFirstCommit();
   }

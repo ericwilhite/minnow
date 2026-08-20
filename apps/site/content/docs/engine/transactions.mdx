@@ -64,9 +64,12 @@ transaction it reads through.
 
 ## Conflicts
 
-Readers never block writers and writers never block readers. Two writers that touch overlapping
-data do conflict, and the loser rebases onto the winner's version and retries — up to
-`maxCommitRetries`, eight by default. Past that you get a `WriteConflictError` to handle yourself.
+Readers never block writers and writers never block readers. One database runs its plain writes
+— `insertBatch`, `updateBatch`, `deleteBatch`, `upsertBatch` and the statements that become them —
+one after another, so they never conflict with each other however many are in flight. Writers in
+different tabs, and write scopes, do conflict when they touch the same data, and the loser rebases
+onto the winner's version and retries — up to `maxCommitRetries`, eight by default. Past that you
+get a `WriteConflictError` to handle yourself.
 
 ```ts
 import { WriteConflictError } from "@minnowdb/core";

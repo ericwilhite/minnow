@@ -145,14 +145,16 @@ row or a compactor that stops folding actually shows up:
 ## Concurrent writes
 
 `write-contention.test.ts` documents a sharp edge. Writes commit optimistically and rebase on
-conflict, up to `maxCommitRetries` attempts. Issued sequentially, they all land. Issued
-concurrently against IndexedDB, at most `maxCommitRetries + 1` land — and that ceiling does not
-move with the number of writers, because each commit that wins costs every other in-flight writer
-one retry. Sixty-four parallel writes leave the same nine winners as sixteen do.
+conflict, up to `maxCommitRetries` attempts. Writes issued through one database never contend: it
+runs its simple writes one after another, so all of them land however many are in flight. Writes
+issued concurrently from different instances — different tabs — do contend, and against
+IndexedDB at most `maxCommitRetries + 1` of them land; that ceiling does not move with the number
+of writers, because each commit that wins costs every other in-flight writer one retry.
+Sixty-four parallel tabs leave the same nine winners as sixteen do.
 
 The tests guarantee the losses are clean: a rejected write leaves nothing behind, an accepted one
-is fully present, and which is which is deterministic. An application issuing parallel writes to
-one table should await them, or retry the rejections.
+is fully present, and which is which is deterministic. An application issuing parallel writes
+from several tabs should funnel them through one, or retry the rejections.
 
 ## The fault sweep
 
