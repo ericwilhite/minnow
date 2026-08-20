@@ -780,25 +780,32 @@ export class RecordCore {
       return segment;
     });
     const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
-    // Entries apply in operation order over per-table working sets, so a scope that inserts
-    // the same key twice conflicts exactly like two separate commits would. The working sets
-    // become the tables' new membership at the mutation step below.
-    const uniqueKeyWorking = new Map<string, Set<string>>();
+    // Entries apply in operation order over per-table deltas against the live membership, so
+    // a scope that inserts the same key twice conflicts exactly like two separate commits
+    // would. A delta rather than a working copy of the table's whole key set: the copy made
+    // every keyed commit cost O(table), and it is only ever adopted after validation passes,
+    // which the delta achieves by being applied at the mutation step below.
+    const uniqueKeyDeltas = new Map<string, { added: Set<string>; removed: Set<string> }>();
     for (const entry of uniqueKeyEntries) {
-      let tokens = uniqueKeyWorking.get(entry.tableId);
-      if (tokens === undefined) {
-        tokens = new Set(this.#uniqueKeys.get(entry.tableId) ?? []);
-        uniqueKeyWorking.set(entry.tableId, tokens);
+      let delta = uniqueKeyDeltas.get(entry.tableId);
+      if (delta === undefined) {
+        delta = { added: new Set(), removed: new Set() };
+        uniqueKeyDeltas.set(entry.tableId, delta);
       }
+      const existing = this.#uniqueKeys.get(entry.tableId);
       for (const token of entry.keyTokens) {
         if (entry.remove === true) {
-          tokens.delete(token);
+          delta.added.delete(token);
+          delta.removed.add(token);
           continue;
         }
-        if (entry.requireAbsent && tokens.has(token)) {
+        const present =
+          delta.added.has(token) || (existing?.has(token) === true && !delta.removed.has(token));
+        if (entry.requireAbsent && present) {
           throw new UniqueKeyConflictError(entry.tableId, token);
         }
-        tokens.add(token);
+        delta.removed.delete(token);
+        delta.added.add(token);
       }
     }
     const manifest = createManifest({
@@ -822,9 +829,15 @@ export class RecordCore {
         logicalOrder: segment.logicalOrder ?? manifest.version,
       });
     }
-    // The validation pass already built each table's exact final membership; adopt it rather
-    // than replaying every token a second time.
-    for (const [tableId, tokens] of uniqueKeyWorking) this.#uniqueKeys.set(tableId, tokens);
+    for (const [tableId, delta] of uniqueKeyDeltas) {
+      let tokens = this.#uniqueKeys.get(tableId);
+      if (tokens === undefined) {
+        tokens = new Set();
+        this.#uniqueKeys.set(tableId, tokens);
+      }
+      for (const token of delta.removed) tokens.delete(token);
+      for (const token of delta.added) tokens.add(token);
+    }
     this.#applyFtsChanges(pendingSegments, input.ftsChanges, manifest.version);
     this.#catalogEpoch += 1;
     // Match the IndexedDB store's observable commit shape: the summary without blockIds.
