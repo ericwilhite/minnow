@@ -82,9 +82,6 @@ a `.md` twin of every page, the SQL surface as
 [`agent-rules.md`](https://minnowdb.com/agent-rules.md) — a short rules file to drop into an
 `AGENTS.md`. See [AI agents & LLMs](https://minnowdb.com/docs/reference/agents/).
 
-[`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) are internal engineering
-records of the design and milestone gates.
-
 ## Development
 
 ```bash

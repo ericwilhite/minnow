@@ -7,8 +7,8 @@ Minnow is built for how browsers actually behave: tabs close without warning, st
 the same app may be open in five tabs at once. Everything below follows from that.
 
 The short version: data lives in compressed columnar blocks inside IndexedDB or OPFS, reads see consistent
-snapshots (MVCC), and queries run through a vectorized executor. The full design document is
-`ARCHITECTURE.md` in the repository. This page covers the choices and the reasons.
+snapshots (MVCC), and queries run through a vectorized executor. This page covers the choices and
+the reasons; the code is the full record.
 
 ## The ground rules
 
