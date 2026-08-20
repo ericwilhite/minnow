@@ -102,25 +102,48 @@ function isSubscriptionClosed(subscription: Subscription): boolean {
   return subscription.closed;
 }
 
+const digestScratch = new DataView(new ArrayBuffer(8));
+
+/**
+ * A 32-bit FNV-1a digest of a result, mixed from typed values: a number's eight bytes, a
+ * string's char codes, a tag per type and per null. Building a string per cell and hashing
+ * that used to cost several times the query it digested.
+ */
 function digestResult(result: QueryResult): number {
   let hash = 0x811c9dc5;
-  const mix = (text: string): void => {
+  const mixByte = (byte: number): void => {
+    hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  };
+  const mixNumber = (value: number): void => {
+    digestScratch.setFloat64(0, value);
+    for (let index = 0; index < 8; index += 1) mixByte(digestScratch.getUint8(index));
+  };
+  const mixString = (text: string): void => {
     for (let index = 0; index < text.length; index += 1) {
       const code = text.charCodeAt(index);
-      hash = Math.imul(hash ^ (code & 0xff), 0x01000193) >>> 0;
-      hash = Math.imul(hash ^ (code >>> 8), 0x01000193) >>> 0;
+      mixByte(code & 0xff);
+      mixByte(code >>> 8);
     }
-    hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
+    mixByte(0xff);
   };
-  for (const column of result.columns) mix(column);
+  for (const column of result.columns) mixString(column);
   for (const row of result.rows) {
     for (const column of result.columns) {
       const value: QueryValue = row[column] ?? null;
-      if (value === null) mix("\0n");
-      else if (value instanceof Date) mix(`\0d${String(value.getTime())}`);
-      else mix(`\0${typeof value}${String(value)}`);
+      if (value === null) mixByte(1);
+      else if (typeof value === "number") {
+        mixByte(2);
+        mixNumber(value);
+      } else if (typeof value === "string") {
+        mixByte(3);
+        mixString(value);
+      } else if (typeof value === "boolean") mixByte(value ? 4 : 5);
+      else {
+        mixByte(6);
+        mixNumber(value.getTime());
+      }
     }
-    hash = Math.imul(hash ^ 0xfe, 0x01000193) >>> 0;
+    mixByte(0xfe);
   }
   return hash;
 }

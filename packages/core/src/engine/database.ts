@@ -205,6 +205,8 @@ const DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION = 16;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
 const INTERNAL_READ_LEASE_TTL_MS = 60_000;
+/** Live proof windows kept resident; a sweep uses one, concurrent sets a few. */
+const LIVE_PROOF_CONTEXT_LIMIT = 4;
 /** Distinct table-name sets whose catalog state stays resident; entries are tiny (records only). */
 const CATALOG_STATE_CACHE_LIMIT = 64;
 /** Blocks fetched per round trip when a streamed scan window needs more data. */
@@ -292,6 +294,24 @@ interface PhysicalCompactionLayout {
 interface MergeResolvedSource {
   readonly blockId: string;
   readonly sourceRowIndex: number;
+}
+
+/** A table's part of a live proof window: see `#liveProofContext`. */
+interface LiveProofTable {
+  readonly table: TableRecord;
+  /** Segments whose transaction committed inside the window, in store order. */
+  readonly windowSegments: readonly SegmentRecord[];
+  /** The committed versions those segments account for. */
+  readonly coveredVersions: ReadonlySet<number>;
+}
+
+/** What every live proof over one commit window shares: see `#liveProofContext`. */
+interface LiveProofContext {
+  readonly after: number | null;
+  readonly until: number;
+  /** Versions in (after, until] that recorded a change to each table. */
+  readonly changedVersions: ReadonlyMap<string, ReadonlySet<number>>;
+  readonly tables: Map<string, Promise<LiveProofTable | undefined>>;
 }
 
 interface SegmentVisibilityCatalog {
@@ -909,6 +929,8 @@ export class MinnowDatabase {
   readonly #createId: () => string;
   readonly #internalLeaseOwnerId = `minnow/${crypto.randomUUID()}`;
   readonly #liveSets = new Set<LiveQuerySet>();
+  /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
+  readonly #liveProofContexts = new Map<string, Promise<LiveProofContext>>();
   #internalLeaseSequence = 0;
   readonly #artifactCache: ArtifactCache;
   readonly #ftsAutoIndexRows: number;
@@ -2881,12 +2903,13 @@ export class MinnowDatabase {
   }
 
   /**
-   * Data-layer live-query selectivity: proves, when it can, that the commits in
-   * (after, until] to the given tables cannot change the query's result. Pure compaction
-   * rewrites are data-neutral; a pure-insert commit whose every new block's zone statistics
-   * reject the plan's predicates for that table cannot add a matching row. Everything else —
-   * updates, deletes, upserts (which can remove rows from a result), missing statistics,
-   * full-text plans, tables without zone-analyzable predicates — answers true.
+   * The data-layer proof behind a live sweep's zone skips: whether the commits in
+   * (after, until] to these tables can change this query's result. False only on proof —
+   * every segment the window introduced to the table is a compaction rewrite or an insert
+   * whose zone maps reject the query's predicates, and every version that changed the table
+   * left a segment to inspect.
+   *
+   * Its inputs come from `#liveProofContext`, shared by every subscription in the sweep.
    */
   async #liveChangeCanAffect(
     query: LiveQueryInput,
@@ -2900,43 +2923,12 @@ export class MinnowDatabase {
     // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
     // predicates reject (e.g. `value > (SELECT AVG(value) FROM t)`).
     if (planReadsBeyondSingleScan(plan)) return true;
-    // Versions in (after, until] that recorded a change to each table. Proof requires every
-    // one of them to be accounted for by a surviving, inspected segment: garbage collection
-    // deletes reclaimed segments outright, so "no segment in the window" is absence of
-    // evidence, not evidence of neutrality.
-    const changedVersions = new Map<string, Set<number>>();
-    {
-      let cursor = after;
-      pages: for (;;) {
-        const page = await this.store.listManifestPage(cursor, 64);
-        for (const manifest of page.records) {
-          if (manifest.version > until) break pages;
-          for (const tableId of manifest.changedTableIds ?? []) {
-            const versions = changedVersions.get(tableId) ?? new Set<number>();
-            versions.add(manifest.version);
-            changedVersions.set(tableId, versions);
-          }
-          if (manifest.version === until) break pages;
-        }
-        if (page.nextCursor === null) break;
-        cursor = page.nextCursor;
-      }
-    }
+    const context = await this.#liveProofContext(after, until);
     for (const tableId of tableIds) {
-      const table = await this.store.getTable(tableId);
-      if (table === undefined) return true;
-      const predicates = zonePredicates(plan, table);
-      const segments = await this.store.listSegments(tableId);
-      const transactions = new Map(
-        (await this.#transactionRecordsForSegments(segments)).map(
-          (record) => [record.id, record] as const,
-        ),
-      );
-      const coveredVersions = new Set<number>();
-      for (const segment of segments) {
-        const committed = transactions.get(segment.transactionId)?.committedVersion ?? null;
-        if (committed === null || committed <= (after ?? -1) || committed > until) continue;
-        coveredVersions.add(committed);
+      const entry = await this.#liveProofTable(context, tableId);
+      if (entry === undefined) return true;
+      const predicates = zonePredicates(plan, entry.table);
+      for (const segment of entry.windowSegments) {
         const kind = segment.kind ?? "insert";
         // Compaction rewrites are visible-data-neutral by construction.
         if (kind === "base") continue;
@@ -2997,11 +2989,82 @@ export class MinnowDatabase {
       }
       // A version that changed this table but left no surviving segment to inspect (its
       // segments were compacted away and reclaimed) cannot be proven neutral.
-      for (const version of changedVersions.get(tableId) ?? []) {
-        if (!coveredVersions.has(version)) return true;
+      for (const version of context.changedVersions.get(tableId) ?? []) {
+        if (!entry.coveredVersions.has(version)) return true;
       }
     }
     return false;
+  }
+
+  /**
+   * The inputs every live proof over one commit window shares: the versions in (after, until]
+   * that recorded a change to each table, and — filled in per table as proofs ask — the table
+   * record, its segments committed in the window, and the versions those segments account
+   * for. A sweep proves each subscription separately, and twenty subscriptions on one table
+   * used to list its segments and transactions twenty times, a readonly transaction each on
+   * IndexedDB and a cross-tab round trip each on an OPFS follower. A few recent windows stay
+   * resident so concurrent sets sweeping different windows do not evict each other.
+   */
+  async #liveProofContext(after: number | null, until: number): Promise<LiveProofContext> {
+    const key = `${String(after)}:${String(until)}`;
+    const cached = this.#liveProofContexts.get(key);
+    if (cached !== undefined) return cached;
+    const context = (async (): Promise<LiveProofContext> => {
+      // Proof requires every version to be accounted for by a surviving, inspected segment:
+      // garbage collection deletes reclaimed segments outright, so "no segment in the window"
+      // is absence of evidence, not evidence of neutrality.
+      const changedVersions = new Map<string, Set<number>>();
+      let cursor = after;
+      pages: for (;;) {
+        const page = await this.store.listManifestPage(cursor, 64);
+        for (const manifest of page.records) {
+          if (manifest.version > until) break pages;
+          for (const tableId of manifest.changedTableIds ?? []) {
+            const versions = changedVersions.get(tableId) ?? new Set<number>();
+            versions.add(manifest.version);
+            changedVersions.set(tableId, versions);
+          }
+          if (manifest.version === until) break pages;
+        }
+        if (page.nextCursor === null) break;
+        cursor = page.nextCursor;
+      }
+      return { after, until, changedVersions, tables: new Map() };
+    })();
+    this.#liveProofContexts.set(key, context);
+    if (this.#liveProofContexts.size > LIVE_PROOF_CONTEXT_LIMIT) {
+      const oldest = this.#liveProofContexts.keys().next().value;
+      if (oldest !== undefined) this.#liveProofContexts.delete(oldest);
+    }
+    return context;
+  }
+
+  #liveProofTable(context: LiveProofContext, tableId: string): Promise<LiveProofTable | undefined> {
+    const cached = context.tables.get(tableId);
+    if (cached !== undefined) return cached;
+    const entry = (async (): Promise<LiveProofTable | undefined> => {
+      const table = await this.store.getTable(tableId);
+      if (table === undefined) return undefined;
+      const segments = await this.store.listSegments(tableId);
+      const transactions = new Map(
+        (await this.#transactionRecordsForSegments(segments)).map(
+          (record) => [record.id, record] as const,
+        ),
+      );
+      const windowSegments: SegmentRecord[] = [];
+      const coveredVersions = new Set<number>();
+      for (const segment of segments) {
+        const committed = transactions.get(segment.transactionId)?.committedVersion ?? null;
+        if (committed === null || committed <= (context.after ?? -1) || committed > context.until) {
+          continue;
+        }
+        coveredVersions.add(committed);
+        windowSegments.push(segment);
+      }
+      return { table, windowSegments, coveredVersions };
+    })();
+    context.tables.set(tableId, entry);
+    return entry;
   }
 
   /**
