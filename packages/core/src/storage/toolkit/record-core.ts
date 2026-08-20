@@ -411,6 +411,7 @@ export class RecordCore {
     job: GarbageCollectionJobRecord;
     prunedManifestVersions: readonly number[];
     reclaimedSegmentIds: readonly string[];
+    reclaimedTransactionIds?: readonly string[];
     updatedAt: string;
   }): void {
     for (const version of effect.prunedManifestVersions) {
@@ -420,6 +421,7 @@ export class RecordCore {
       }
     }
     for (const id of effect.reclaimedSegmentIds) this.#segments.delete(id);
+    for (const id of effect.reclaimedTransactionIds ?? []) this.#transactions.delete(id);
     this.#garbageCollectionJobs.set(effect.job.id, structuredClone(effect.job));
   }
 
@@ -1189,6 +1191,9 @@ export class RecordCore {
     const reclaimedBlockIds: string[] = [];
     const retainedBlockIds: string[] = [];
     const missingBlockIds: string[] = [];
+    const reclaimedTransactionIds: string[] = [];
+    const retainedTransactionIds: string[] = [];
+    const missingTransactionIds: string[] = [];
     let reclaimedBlockBytes = 0;
     let remaining = input.maxItems;
 
@@ -1269,6 +1274,51 @@ export class RecordCore {
     }
 
     let blockIndex = current.cursor.blockIndex;
+    // Transaction records are last. A committed record remains an
+    // idempotency/reconciliation witness until its manifest has actually been pruned, and it
+    // remains structural metadata while any segment or unfinished fold still names it.
+    let transactionIndex = current.cursor.transactionIndex;
+    if (
+      remaining > 0 &&
+      manifestIndex === current.candidateManifestVersions.length &&
+      segmentIndex === current.candidateSegmentIds.length &&
+      blockIndex === current.candidateBlockIds.length
+    ) {
+      const segmentOwners = new Set(
+        [...this.#segments.values()]
+          .filter((segment) => !reclaimedSegmentIds.includes(segment.id))
+          .map((segment) => segment.transactionId),
+      );
+      const unfinishedCompactionOwners = new Set(
+        [...this.#compactionJobs.values()].flatMap((job) =>
+          !isTerminalCompactionJob(job) && job.transactionId !== null ? [job.transactionId] : [],
+        ),
+      );
+      while (remaining > 0 && transactionIndex < current.candidateTransactionIds.length) {
+        const id = current.candidateTransactionIds[transactionIndex];
+        if (id === undefined) throw new Error("Garbage collection transaction cursor is invalid");
+        const record = this.#transactions.get(id);
+        const manifest =
+          record?.committedVersion === null || record?.committedVersion === undefined
+            ? undefined
+            : this.#manifests.get(record.committedVersion);
+        if (record === undefined) missingTransactionIds.push(id);
+        else if (
+          record.status !== "committed" ||
+          (manifest?.prunedAt === undefined &&
+            !prunedManifestVersionSet.has(record.committedVersion ?? -1)) ||
+          segmentOwners.has(id) ||
+          unfinishedCompactionOwners.has(id)
+        ) {
+          retainedTransactionIds.push(id);
+        } else {
+          reclaimedTransactionIds.push(id);
+        }
+        transactionIndex += 1;
+        remaining -= 1;
+      }
+    }
+
     while (
       remaining > 0 &&
       manifestIndex === current.candidateManifestVersions.length &&
@@ -1309,6 +1359,13 @@ export class RecordCore {
       retainedBlockCount: retainedBlockIds.length,
       missingBlockCount: missingBlockIds.length,
       reclaimedBlockBytes,
+      examinedTransactionCount:
+        reclaimedTransactionIds.length +
+        retainedTransactionIds.length +
+        missingTransactionIds.length,
+      reclaimedTransactionCount: reclaimedTransactionIds.length,
+      retainedTransactionCount: retainedTransactionIds.length,
+      missingTransactionCount: missingTransactionIds.length,
       updatedAt: input.updatedAt,
     });
     // A pruned manifest is a tombstone: it cannot be pinned or read, and it roots nothing. The
@@ -1332,6 +1389,7 @@ export class RecordCore {
       }
     });
     reclaimedSegmentIds.forEach((id) => this.#segments.delete(id));
+    reclaimedTransactionIds.forEach((id) => this.#transactions.delete(id));
     this.#garbageCollectionJobs.set(updated.id, updated);
     return {
       job: structuredClone(updated),
@@ -1346,6 +1404,9 @@ export class RecordCore {
       retainedBlockIds,
       missingBlockIds,
       reclaimedBlockBytes,
+      reclaimedTransactionIds,
+      retainedTransactionIds,
+      missingTransactionIds,
     };
   }
 
@@ -1738,6 +1799,14 @@ function assertGarbageCollectionCandidateProvenance(
       throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
     }
   }
+  for (const id of job.candidateTransactionIds) {
+    const transaction = transactions.get(id);
+    if (transaction?.status !== "committed" || transaction.committedVersion === null) {
+      throw new Error(
+        `Garbage collection transaction candidate is not a committed transaction: ${id}`,
+      );
+    }
+  }
   const blockHasProvenance = (id: string): boolean => {
     for (const version of job.candidateManifestVersions) {
       if (manifests.get(version)?.blockIds.includes(id)) return true;
@@ -1979,6 +2048,9 @@ function emptyGarbageCollectionStep(job: GarbageCollectionJobRecord): GarbageCol
     retainedBlockIds: [],
     missingBlockIds: [],
     reclaimedBlockBytes: 0,
+    reclaimedTransactionIds: [],
+    retainedTransactionIds: [],
+    missingTransactionIds: [],
   };
 }
 

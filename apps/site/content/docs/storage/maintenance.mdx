@@ -44,13 +44,19 @@ query, and the storage they occupy is freed.
 
 ### Partitioned folds
 
-A keyed table's folded form is a run of level-one partitions, each aiming at `partitionRows`
-rows (16,384 by default) in the order the rows were written. A fold rewrites
-only the partitions its deltas touch — the ones holding a key some delete, update, or upsert
-names — plus the last partition while new rows are still joining it. Every other partition is
-left exactly as it is, so absorbing a run of point updates costs the partitions they land in,
-not the table: thirty-two updates rewrite at most thirty-two partitions, however many rows the
-table holds. Rows keep their hidden row IDs and their order across every fold.
+A folded table is a run of level-one partitions of at most `partitionRows` rows (16,384 by
+default) in the order the rows were written. On a keyed table, a fold rewrites only the
+partitions its deltas touch — the ones holding a key some delete, update, or upsert names — plus
+the last partition while new rows are still joining it. Every other partition is left exactly
+as it is, so absorbing a run of point updates costs the partitions they land in, not the table:
+thirty-two updates rewrite at most thirty-two partitions, however many rows the table holds.
+Rows keep their hidden row IDs and their order across every fold.
+
+An append-only table uses the same partition shape through the rechunk path. Its old partitions
+never need rewriting; only a partial tail joins the next batch. Partition descriptors use stable
+fractional logical orders between their unchanged neighbours, so an oversized partition written
+by an older Minnow version is split the next time a fold includes it instead of being left large
+because adjacent commit versions have no spare integer between them.
 
 Smaller partitions make folds cheaper and give a scan more blocks to walk; the default suits
 tables from thousands to millions of rows. Set it per call, or for every fold the database
@@ -79,14 +85,16 @@ compaction is visible-data-neutral by construction, so cancelling it can never l
 
 ## Garbage collection
 
-Reclaims blocks no live version references any more, and prunes the manifests of old versions:
+Reclaims blocks and segments no live version references any more, prunes old manifests, and
+removes committed transaction records after their manifest is pruned and no segment or running
+job still names them:
 
 ```ts
 await db.collectGarbage();
 ```
 
-A block is only collectable when no manifest, no open reader lease, and no non-terminal job still
-roots it. That is what makes it safe to run while a report is being read: an open
+A record is only collectable when no manifest, no open reader lease, no segment, and no
+non-terminal job still roots it. That is what makes collection safe while a report is being read: an open
 [snapshot scope](/docs/engine/transactions#stable-reads) pins its version, and collection skips
 everything that version needs.
 

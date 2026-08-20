@@ -147,7 +147,9 @@ Compaction and garbage collection run for a long time inside a tab that can die 
 - **Cancellation is a real outcome.** Cancel and publish settle atomically — exactly one wins.
 - **Garbage collection is reachability.** Whatever the current manifest, unexpired leases, live
   transactions, and running compactions still reference is kept. Each deletion re-checks liveness
-  atomically, so nothing is revived after it's gone.
+  atomically, so nothing is revived after it's gone. Once a committed transaction's manifest is
+  pruned and no segment or unfinished compaction names it, its record is collected too; ordinary
+  commits leave no permanent per-commit journal residue.
 - **Compaction has a write budget.** A rewrite that would cost more than a set multiple of the
   data it consolidates is refused up front, not discovered in the quota bill.
 

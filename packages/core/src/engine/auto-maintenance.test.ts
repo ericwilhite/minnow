@@ -121,6 +121,7 @@ async function footprint(store: MemoryBlockStore, database: MinnowDatabase) {
     storedBytes,
     manifests: manifests.length,
     unprunedManifests: manifests.filter((manifest) => manifest.prunedAt === undefined).length,
+    transactions: (await store.listTransactions()).length,
   };
 }
 
@@ -200,6 +201,9 @@ describe("background maintenance", () => {
     expect(settled.storedBytes).toBeLessThanOrEqual(fresh.storedBytes * 2);
     expect(settled.storedBlocks).toBeLessThanOrEqual(fresh.storedBlocks + 2 * 32 + 16);
     expect(settled.unprunedManifests).toBeLessThanOrEqual(4);
+    // Every surviving committed transaction either owns visible segments or sits in the small
+    // retained maintenance/history tail; old per-commit records do not accumulate forever.
+    expect(settled.transactions).toBeLessThanOrEqual(settled.visibleSegments + 8);
     // And a fold or a collection pass changed no answer.
     await expectContents(database, reference);
     // The maintenance that ran is visible to the caller as terminal jobs.
@@ -231,6 +235,7 @@ describe("background maintenance", () => {
     expect(third.storedBlocks).toBeLessThanOrEqual(first.storedBlocks * 1.5);
     expect(third.unprunedManifests).toBeLessThanOrEqual(64 + 2);
     expect(third.visibleSegments).toBeLessThanOrEqual(33);
+    expect(third.transactions).toBeLessThanOrEqual(third.visibleSegments + 8);
     await expectContents(database, reference);
   }, 180_000);
 

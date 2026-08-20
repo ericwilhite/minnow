@@ -50,6 +50,12 @@ observably not. `commitTransaction` is the heart: manifest CAS, publication, seg
 finalization, unique keys, full-text deltas, and the record flip — one durable all-or-nothing
 step, including against a crash at any moment.
 
+`runGarbageCollectionStep` owns record reclamation as well as blob reclamation. It processes
+manifests, segments, blocks, then committed transactions; a transaction can disappear only after
+its manifest is pruned and no segment or unfinished compaction names it. Adapters must apply that
+whole step atomically. A file-backed adapter may delete the immutable block payload after logging
+the resolved step, as the toolkit example does.
+
 **Conflicts are typed, by exact class.** Compare-and-swap failures throw the exported error
 classes (`WriteConflictError`, `TransactionRecordConflictError`, and the rest) — not wrappers,
 not subclasses. The engine's retry and rebase loops match on them, and the worker client

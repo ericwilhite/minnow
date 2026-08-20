@@ -82,7 +82,8 @@ function assertPartitionLayout(
     const kind = partition.kind ?? "insert";
     expect(kind === "base" || kind === "insert").toBe(true);
     expect(partition.partitionOrdinal).toBeUndefined();
-    expect(Number.isSafeInteger(partition.logicalOrder)).toBe(true);
+    expect(Number.isFinite(partition.logicalOrder)).toBe(true);
+    expect(partition.logicalOrder ?? -1).toBeGreaterThanOrEqual(0);
     const previous = partitions[partitions.length - 1];
     if (previous !== undefined) {
       expect(partition.logicalOrder ?? -1).toBeGreaterThan(previous.logicalOrder ?? -1);
@@ -198,6 +199,57 @@ async function requiredJob(store: MemoryBlockStore, jobId: string): Promise<Comp
 }
 
 describe("partitioned folds of a keyed table", () => {
+  it("splits oversized interior partitions when the target is lowered", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, {
+      rowsPerBlock: 8,
+      compression: "raw",
+      autoCompact: false,
+    });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "amount", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    const expected: Row[] = [];
+    for (let batch = 0; batch < 12; batch += 1) {
+      const rows = Array.from({ length: 10 }, (_, offset) => {
+        const id = batch * 10 + offset;
+        return { id, amount: id, label: "seed" } satisfies Row;
+      });
+      expected.push(...rows);
+      await database.insertBatch("items", rows);
+    }
+    await database.compactTable("items", { partitionRows: 40, outputCompression: "raw" });
+    const before = assertPartitionLayout(
+      await visibleRecords(database, store, "items"),
+      40,
+    ).partitions;
+    expect(before.map((partition) => partition.rowCount)).toEqual([40, 40, 40]);
+
+    await database.updateBatch("items", { keys: [55], changes: { amount: [-55] } });
+    expected[55] = { id: 55, amount: -55, label: "seed" };
+    const result = await database.compactTable("items", {
+      partitionRows: PARTITION_ROWS,
+      minimumLevel0Segments: 1,
+      outputCompression: "raw",
+    });
+    expect(result).toMatchObject({ compacted: true, sourceSegmentCount: 4, rowCount: 120 });
+    const after = assertPartitionLayout(
+      await visibleRecords(database, store, "items"),
+      PARTITION_ROWS,
+    );
+    expect(after.level0).toHaveLength(0);
+    expect(after.partitions).toHaveLength(9);
+    expect(after.partitions.every((partition) => partition.rowCount <= PARTITION_ROWS)).toBe(true);
+    expect(await database.readTable("items")).toEqual(expected);
+    store.close();
+  });
+
   it("keeps the table as ordered, bounded, disjoint level-one partitions across folds", async () => {
     const { store, database, reference, order, partitions } = await partitionedFixture();
     const before = new Map(partitions.map((partition) => [partition.logicalOrder, partition]));
@@ -543,6 +595,108 @@ describe("partitioned folds of a keyed table", () => {
         "straddle",
       ),
     ).rejects.toThrow("straddle");
+    store.close();
+  });
+});
+
+describe("partitioned rechunk folds of a keyless table", () => {
+  it("publishes bounded partitions, rewrites only the tail, and rebases across an append", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, {
+      rowsPerBlock: 8,
+      compression: "raw",
+      autoCompact: false,
+    });
+    await database.createTable({
+      name: "events",
+      columns: [
+        { name: "sequence", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    const expected: Array<{ sequence: number; label: string }> = [];
+    const append = async (count: number): Promise<void> => {
+      const start = expected.length;
+      const rows = Array.from({ length: count }, (_, offset) => ({
+        sequence: start + offset,
+        label: `event-${String(start + offset)}`,
+      }));
+      expected.push(...rows);
+      await database.insertBatch("events", rows);
+    };
+    for (let batch = 0; batch < 20; batch += 1) await append(5);
+
+    const first = await database.compactTable("events", {
+      partitionRows: PARTITION_ROWS,
+      outputCompression: "raw",
+    });
+    expect(first.outputSegmentIds).toHaveLength(7);
+    const initial = assertPartitionLayout(
+      await visibleRecords(database, store, "events"),
+      PARTITION_ROWS,
+    ).partitions;
+    expect(initial.map((partition) => partition.rowCount)).toEqual([16, 16, 16, 16, 16, 16, 4]);
+    expect(initial.every((partition) => (partition.kind ?? "insert") === "insert")).toBe(true);
+
+    await append(26);
+    const tail = await database.compactTable("events", {
+      partitionRows: PARTITION_ROWS,
+      minimumLevel0Segments: 1,
+      outputCompression: "raw",
+    });
+    expect(tail).toMatchObject({ compacted: true, sourceSegmentCount: 2, rowCount: 30 });
+    const afterTail = assertPartitionLayout(
+      await visibleRecords(database, store, "events"),
+      PARTITION_ROWS,
+    );
+    expect(afterTail.partitions.slice(0, 6).map((partition) => partition.id)).toEqual(
+      initial.slice(0, 6).map((partition) => partition.id),
+    );
+    expect(afterTail.partitions.slice(6).map((partition) => partition.rowCount)).toEqual([16, 14]);
+
+    await append(20);
+    const started = await database.compactTableStep("events", {
+      partitionRows: PARTITION_ROWS,
+      minimumLevel0Segments: 1,
+      outputCompression: "raw",
+      maxBlocks: 1,
+    });
+    if (started.jobId === null) throw new Error("Expected a keyless partition job");
+    expect(started.result).toBeNull();
+    await append(2);
+    const reopened = new MinnowDatabase(store, {
+      rowsPerBlock: 8,
+      compression: "raw",
+      autoCompact: false,
+    });
+    let progress = await reopened.resumeCompactionJob(started.jobId, { maxBlocks: 2 });
+    while (progress.result === null) {
+      progress = await reopened.resumeCompactionJob(started.jobId, { maxBlocks: 2 });
+    }
+    const rebased = assertPartitionLayout(
+      await visibleRecords(reopened, store, "events"),
+      PARTITION_ROWS,
+    );
+    expect(rebased.level0).toHaveLength(1);
+    expect(await reopened.readTable("events")).toEqual(expected);
+
+    const promoted = await reopened.compactTable("events", {
+      targetLevel: 2,
+      minimumLevel0Segments: 1,
+      maxWriteAmplification: 1_000,
+      outputCompression: "raw",
+    });
+    expect(promoted).toMatchObject({
+      compacted: true,
+      sourceSegmentCount: 1,
+      outputPartitionOrdinal: 0,
+    });
+    const afterPromotion = await visibleRecords(reopened, store, "events");
+    expect(afterPromotion.slice(0, rebased.partitions.length).map((segment) => segment.id)).toEqual(
+      rebased.partitions.map((segment) => segment.id),
+    );
+    expect(afterPromotion.at(-1)).toMatchObject({ level: 2, partitionOrdinal: 0, rowCount: 2 });
+    expect(await reopened.readTable("events")).toEqual(expected);
     store.close();
   });
 });

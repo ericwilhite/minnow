@@ -99,6 +99,7 @@ type Frame =
         prunedManifestVersions: number[];
         reclaimedSegmentIds: string[];
         reclaimedBlockIds: string[];
+        reclaimedTransactionIds?: string[];
         updatedAt: string;
       };
     }
@@ -699,6 +700,7 @@ class MiniLogStore implements BlockStore {
             prunedManifestVersions: [...step.prunedManifestVersions],
             reclaimedSegmentIds: [...step.reclaimedSegmentIds],
             reclaimedBlockIds: [...step.reclaimedBlockIds],
+            reclaimedTransactionIds: [...step.reclaimedTransactionIds],
             updatedAt: input.updatedAt,
           },
         } satisfies Frame,

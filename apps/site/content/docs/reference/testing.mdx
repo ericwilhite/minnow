@@ -144,8 +144,9 @@ row or a compactor that stops folding actually shows up:
 - `auto-compaction-soak.test.ts` is the same kind of history with the background maintenance
   left on, as it ships: 1,800 seeded mutations and reads while folds and collection passes land
   underneath them, the table checked against the reference at every checkpoint, then settled and
-  held to convergence bounds — a scan reads at most the anchor and the deltas under the fold
-  threshold, and the store holds the data rather than the history.
+  held to convergence bounds — a scan reads the bounded folded partitions and only a level-zero
+  tail below both background fold thresholds, and the store holds the data rather than the
+  history.
 
 ## Background maintenance, size, and memory
 

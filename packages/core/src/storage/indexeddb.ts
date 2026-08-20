@@ -2103,6 +2103,7 @@ export class IndexedDbBlockStore implements BlockStore {
       const manifestStore = transaction.objectStore("manifests");
       const segmentStore = transaction.objectStore("segments");
       const blockStore = transaction.objectStore("blocks");
+      const transactionStore = transaction.objectStore("transactions");
       const currentVersionValue: unknown = await requestResult(catalog.get(CURRENT_MANIFEST_KEY));
       if (
         currentVersionValue !== undefined &&
@@ -2130,6 +2131,9 @@ export class IndexedDbBlockStore implements BlockStore {
       const reclaimedBlockIds: string[] = [];
       const retainedBlockIds: string[] = [];
       const missingBlockIds: string[] = [];
+      const reclaimedTransactionIds: string[] = [];
+      const retainedTransactionIds: string[] = [];
+      const missingTransactionIds: string[] = [];
       let reclaimedBlockBytes = 0;
       let remaining = input.maxItems;
       let manifestIndex = current.cursor.manifestIndex;
@@ -2203,6 +2207,62 @@ export class IndexedDbBlockStore implements BlockStore {
       }
 
       let blockIndex = current.cursor.blockIndex;
+      let transactionIndex = current.cursor.transactionIndex;
+      if (
+        remaining > 0 &&
+        manifestIndex === current.candidateManifestVersions.length &&
+        segmentIndex === current.candidateSegmentIds.length &&
+        blockIndex === current.candidateBlockIds.length
+      ) {
+        const candidates = new Set(current.candidateTransactionIds.slice(transactionIndex));
+        const segmentOwners = new Set<string>();
+        await visitObjectStoreSequentially(segmentStore, (value) => {
+          const owner = asSegmentRecord(value).transactionId;
+          if (candidates.has(owner)) segmentOwners.add(owner);
+        });
+        const unfinishedCompactionOwners = new Set<string>();
+        await visitObjectStoreSequentially(gcStore, (value) => {
+          if (!isCompactionJobEnvelope(value)) return;
+          const job = asCompactionJobEnvelope(value);
+          if (
+            !isTerminalCompactionJob(job) &&
+            job.transactionId !== null &&
+            candidates.has(job.transactionId)
+          ) {
+            unfinishedCompactionOwners.add(job.transactionId);
+          }
+        });
+        while (remaining > 0 && transactionIndex < current.candidateTransactionIds.length) {
+          const id = current.candidateTransactionIds[transactionIndex];
+          if (id === undefined) {
+            throw new Error("Garbage collection transaction cursor is invalid");
+          }
+          const transactionValue: unknown = await requestResult(transactionStore.get(id));
+          const record =
+            transactionValue === undefined ? undefined : asTransactionRecord(transactionValue);
+          const manifestValue: unknown =
+            record?.committedVersion === null || record?.committedVersion === undefined
+              ? undefined
+              : await requestResult(manifestStore.get(record.committedVersion));
+          const manifest =
+            manifestValue === undefined ? undefined : asStoredManifestRecord(manifestValue);
+          if (record === undefined) missingTransactionIds.push(id);
+          else if (
+            record.status !== "committed" ||
+            manifest?.prunedAt === undefined ||
+            segmentOwners.has(id) ||
+            unfinishedCompactionOwners.has(id)
+          ) {
+            retainedTransactionIds.push(id);
+          } else {
+            transactionStore.delete(id);
+            reclaimedTransactionIds.push(id);
+          }
+          transactionIndex += 1;
+          remaining -= 1;
+        }
+      }
+
       while (
         remaining > 0 &&
         manifestIndex === current.candidateManifestVersions.length &&
@@ -2245,6 +2305,13 @@ export class IndexedDbBlockStore implements BlockStore {
         retainedBlockCount: retainedBlockIds.length,
         missingBlockCount: missingBlockIds.length,
         reclaimedBlockBytes,
+        examinedTransactionCount:
+          reclaimedTransactionIds.length +
+          retainedTransactionIds.length +
+          missingTransactionIds.length,
+        reclaimedTransactionCount: reclaimedTransactionIds.length,
+        retainedTransactionCount: retainedTransactionIds.length,
+        missingTransactionCount: missingTransactionIds.length,
         updatedAt: input.updatedAt,
       });
       gcStore.put(garbageCollectionJobEnvelope(updated), key);
@@ -2262,6 +2329,9 @@ export class IndexedDbBlockStore implements BlockStore {
         retainedBlockIds,
         missingBlockIds,
         reclaimedBlockBytes,
+        reclaimedTransactionIds,
+        retainedTransactionIds,
+        missingTransactionIds,
       };
     } catch (error) {
       abortIfActive(transaction);
@@ -2964,6 +3034,15 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
       await resolveManifestBlockSetInTransaction(manifestStore, asStoredManifestRecord(value)),
     );
   }
+  for (const id of job.candidateTransactionIds) {
+    const value: unknown = await requestResult(transaction.objectStore("transactions").get(id));
+    const record = value === undefined ? undefined : asTransactionRecord(value);
+    if (record?.status !== "committed" || record.committedVersion === null) {
+      throw new Error(
+        `Garbage collection transaction candidate is not a committed transaction: ${id}`,
+      );
+    }
+  }
   const blockHasProvenance = async (id: string): Promise<boolean> => {
     if (candidateManifestBlockIds.some((blockIds) => blockIds.has(id))) return true;
     const transactionProven = await visitObjectStoreSequentially(
@@ -3217,6 +3296,9 @@ function emptyGarbageCollectionStep(job: GarbageCollectionJobRecord): GarbageCol
     retainedBlockIds: [],
     missingBlockIds: [],
     reclaimedBlockBytes: 0,
+    reclaimedTransactionIds: [],
+    retainedTransactionIds: [],
+    missingTransactionIds: [],
   };
 }
 

@@ -13,6 +13,6 @@
     "concurrency-simulation": [],
     "compaction-soak": [],
     "compaction-soak-snapshots": [],
-    "auto-compaction-soak": []
+    "auto-compaction-soak": [26172526]
   }
 }

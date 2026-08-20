@@ -5114,10 +5114,6 @@ it("skips unsupported compaction level layouts without creating jobs", async () 
   const database = new MinnowDatabase(store);
   const layouts = [
     {
-      tableName: "multiple_anchors",
-      levels: [1, 1, 0, 0],
-    },
-    {
       tableName: "nonleading_anchor",
       levels: [0, 1, 0],
     },
@@ -7147,6 +7143,49 @@ for (const implementation of implementations()) {
 }
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} reclaims committed transaction records after their segments and manifests`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+    await database.createTable({
+      name: "gc_transaction_records",
+      columns: [{ name: "value", type: "number" }],
+    });
+    for (let value = 0; value < 6; value += 1) {
+      await database.insert("gc_transaction_records", { value });
+    }
+    const sourceRecords = await Promise.all(
+      (await database.listVisibleSegments("gc_transaction_records")).map((segment) =>
+        store.getSegment(segment.id),
+      ),
+    );
+    const sourceTransactionIds = sourceRecords.map((segment) => {
+      if (segment === undefined) throw new Error("Expected a source segment record");
+      return segment.transactionId;
+    });
+    expect(new Set(sourceTransactionIds).size).toBe(6);
+
+    const compacted = await database.compactTable("gc_transaction_records", {
+      outputCompression: "raw",
+    });
+    expect(compacted.compacted).toBe(true);
+    const outputSummary = (await database.listVisibleSegments("gc_transaction_records"))[0];
+    const output =
+      outputSummary === undefined ? undefined : await store.getSegment(outputSummary.id);
+    if (output === undefined) throw new Error("Expected a folded output segment");
+
+    // The first pass removes the superseded segments. Their owners were structural roots when
+    // that pass was planned, so the next pass is the one allowed to nominate the records.
+    await database.collectGarbage();
+    const reclaimed = await database.collectGarbage();
+    expect(reclaimed.reclaimedTransactionCount).toBeGreaterThanOrEqual(sourceTransactionIds.length);
+    for (const id of sourceTransactionIds) expect(await store.getTransaction(id)).toBeUndefined();
+    expect(await store.getTransaction(output.transactionId)).toMatchObject({ status: "committed" });
+    expect(await database.readTable("gc_transaction_records")).toEqual(
+      Array.from({ length: 6 }, (_, value) => ({ value })),
+    );
+    store.close();
+  });
+
   it(`${implementation.name} reclaims cancelled compaction output without changing current rows`, async () => {
     const store = await implementation.create();
     const database = new MinnowDatabase(store);

@@ -692,7 +692,7 @@ export interface CancelCompactionJobResult {
 export interface CollectGarbageOptions {
   /** Maximum candidates examined and checkpointed by each durable reclamation step. */
   maxItemsPerStep?: number;
-  /** Maximum block/segment candidates copied into one durable planning record. */
+  /** Maximum block, segment, and transaction candidates copied into one durable planning record. */
   maxPlanningItems?: number;
   /**
    * Manifest versions below the current one to leave unpruned, newest first, so a reader that
@@ -706,7 +706,7 @@ export interface CollectGarbageOptions {
 export interface CollectGarbageStepOptions {
   /** Maximum candidates examined and checkpointed by this durable reclamation step. */
   maxItems?: number;
-  /** Maximum block/segment candidates copied into a newly planned job. */
+  /** Maximum block, segment, and transaction candidates copied into a newly planned job. */
   maxPlanningItems?: number;
   /** See `CollectGarbageOptions.retainRecentVersions`; applies when this step plans a job. */
   retainRecentVersions?: number;
@@ -724,6 +724,9 @@ export interface GarbageCollectionResult {
   reclaimedBlockCount: number;
   retainedBlockCount: number;
   missingBlockCount: number;
+  reclaimedTransactionCount: number;
+  retainedTransactionCount: number;
+  missingTransactionCount: number;
   physicallyReclaimedBytes: number;
 }
 
@@ -733,6 +736,7 @@ export interface GarbageCollectionProgress {
   examinedManifestCount: number;
   examinedSegmentCount: number;
   examinedBlockCount: number;
+  examinedTransactionCount: number;
   result: GarbageCollectionResult | null;
 }
 
@@ -7787,7 +7791,8 @@ export class MinnowDatabase {
       if (
         result.prunedManifestCount === 0 &&
         result.reclaimedBlockCount === 0 &&
-        result.reclaimedSegmentCount === 0
+        result.reclaimedSegmentCount === 0 &&
+        result.reclaimedTransactionCount === 0
       ) {
         break;
       }
@@ -7840,10 +7845,14 @@ export class MinnowDatabase {
     const candidateManifestVersions: number[] = [];
     const candidateBlockIds: string[] = [];
     const candidateSegmentIds: string[] = [];
+    const candidateTransactionIds: string[] = [];
     const candidateBlockIdSet = new Set<string>();
     const candidateSegmentIdSet = new Set<string>();
     const remaining = () =>
-      maxPlanningItems - candidateBlockIds.length - candidateSegmentIds.length;
+      maxPlanningItems -
+      candidateBlockIds.length -
+      candidateSegmentIds.length -
+      candidateTransactionIds.length;
     const addBlocks = (ids: readonly string[]) => {
       for (const id of ids) {
         if (remaining() <= 0) break;
@@ -7902,24 +7911,45 @@ export class MinnowDatabase {
     this.#collectionWatermark = deadPrefixEnd;
 
     if (remaining() > 0) {
+      const segmentOwnerIds = new Set(
+        (await this.store.listSegments()).map((segment) => segment.transactionId),
+      );
+      const manifestEligibility = new Map<number, boolean>();
+      const candidateManifestSet = new Set(candidateManifestVersions);
       let transactionCursor: string | null = null;
       do {
         const page = await this.store.listTransactionPage(transactionCursor, 64);
         for (const transaction of page.records) {
-          if (transaction.status !== "aborted") continue;
-          addBlocks(
-            await this.#existingGarbageBlockCandidates(
-              transaction.pendingBlockIds,
-              currentBlockIds,
-              remaining(),
-            ),
-          );
-          addSegments(
-            await this.#existingGarbageSegmentCandidates(
-              transaction.pendingSegmentIds,
-              remaining(),
-            ),
-          );
+          if (transaction.status === "aborted") {
+            addBlocks(
+              await this.#existingGarbageBlockCandidates(
+                transaction.pendingBlockIds,
+                currentBlockIds,
+                remaining(),
+              ),
+            );
+            addSegments(
+              await this.#existingGarbageSegmentCandidates(
+                transaction.pendingSegmentIds,
+                remaining(),
+              ),
+            );
+          } else if (
+            transaction.status === "committed" &&
+            transaction.committedVersion !== null &&
+            !segmentOwnerIds.has(transaction.id) &&
+            remaining() > 0
+          ) {
+            let eligible = manifestEligibility.get(transaction.committedVersion);
+            if (eligible === undefined) {
+              const manifest = await this.store.getManifest(transaction.committedVersion);
+              eligible =
+                manifest?.prunedAt !== undefined ||
+                candidateManifestSet.has(transaction.committedVersion);
+              manifestEligibility.set(transaction.committedVersion, eligible);
+            }
+            if (eligible) candidateTransactionIds.push(transaction.id);
+          }
           if (remaining() <= 0) break;
         }
         if (remaining() <= 0) break;
@@ -7960,6 +7990,7 @@ export class MinnowDatabase {
       candidateManifestVersions,
       candidateSegmentIds,
       candidateBlockIds,
+      candidateTransactionIds,
       leaseCutoff: timestamp,
       createdAt: timestamp,
     });
@@ -8142,6 +8173,7 @@ export class MinnowDatabase {
     let outputPartitionOrdinal: number | undefined;
     let keyedLevelTwo = false;
     let keyedLevelOne: KeyedLevelOneLayout | undefined;
+    let keylessLevelOne: KeyedLevelOneLayout | undefined;
     if (targetLevel === 1 && table.uniqueKeyColumnId !== undefined) {
       // Keyed L1: a prefix of level-one partitions, then level-zero history. A fold rewrites
       // only the partitions the selected deltas touch (and the tail partition new rows join),
@@ -8161,13 +8193,8 @@ export class MinnowDatabase {
       effectiveMinimumLevel0Segments =
         layout.partitions.length > 0 ? minimumLevel0Segments : Math.max(2, minimumLevel0Segments);
     } else if (targetLevel === 1) {
-      const firstLevel = visibleSegments[0]?.level ?? 0;
-      const hasAnchor = firstLevel === 1;
-      const level0Offset = hasAnchor ? 1 : 0;
-      const supportedLevelLayout =
-        firstLevel <= 1 &&
-        visibleSegments.slice(level0Offset).every((segment) => (segment.level ?? 0) === 0);
-      if (!supportedLevelLayout) {
+      const layout = keylessLevelOneLayout(visibleSegments);
+      if (layout === null) {
         return compactTableSkipped(
           table.name,
           "unsupported-level-layout",
@@ -8176,11 +8203,10 @@ export class MinnowDatabase {
           version,
         );
       }
-      anchors = hasAnchor ? visibleSegments.slice(0, 1) : [];
-      level0Segments = visibleSegments.slice(level0Offset);
-      effectiveMinimumLevel0Segments = hasAnchor
-        ? minimumLevel0Segments
-        : Math.max(2, minimumLevel0Segments);
+      keylessLevelOne = layout;
+      level0Segments = layout.level0Segments;
+      effectiveMinimumLevel0Segments =
+        layout.partitions.length > 0 ? minimumLevel0Segments : Math.max(2, minimumLevel0Segments);
     } else if (
       table.uniqueKeyColumnId !== undefined ||
       visibleSegments.some(
@@ -8247,6 +8273,7 @@ export class MinnowDatabase {
       snapshot,
     );
     let partitioning: KeyedPartitioning | undefined;
+    let rechunkPartitioning: RechunkPartitioning | undefined;
     if (keyedLevelOne !== undefined) {
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
@@ -8270,12 +8297,26 @@ export class MinnowDatabase {
         bearsNewRows &&
         (touched.has(last.id) || last.rowCount < partitionRows);
       anchors = keyedLevelOne.partitions.filter(
-        (partition) => touched.has(partition.id) || (absorbsTail && partition.id === last.id),
+        (partition) =>
+          partition.rowCount > partitionRows ||
+          touched.has(partition.id) ||
+          (absorbsTail && partition.id === last.id),
       );
       partitioning = {
         partitions: keyedLevelOne.partitions,
         partitionRows,
         absorbsTail,
+        nextLevelZeroOrder: level0Selection.nextLogicalOrder ?? version + 1,
+      };
+    } else if (keylessLevelOne !== undefined) {
+      const last = keylessLevelOne.partitions.at(-1);
+      // A partial tail is extended. An oversized legacy anchor is included once so this fold
+      // heals it into bounded partitions; a full tail stays immutable and new rows start after it.
+      const absorbsTail =
+        last !== undefined && (last.rowCount < partitionRows || last.rowCount > partitionRows);
+      anchors = absorbsTail ? [last] : [];
+      rechunkPartitioning = {
+        partitionRows,
         nextLevelZeroOrder: level0Selection.nextLogicalOrder ?? version + 1,
       };
     }
@@ -8354,6 +8395,7 @@ export class MinnowDatabase {
         outputCompression,
         memoryBudgetBytes,
         snapshot,
+        rechunkPartitioning,
       ));
     const minimumMemoryBytes = compactionMinimumMemoryBytes(rewritePlan);
     if (minimumMemoryBytes > memoryBudgetBytes) {
@@ -8701,6 +8743,7 @@ export class MinnowDatabase {
     outputCompression: Compression,
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
+    partitioning?: RechunkPartitioning,
   ): Promise<RechunkCompactionRewritePlan> {
     const first = sourceSegments[0];
     const last = sourceSegments[sourceSegments.length - 1];
@@ -8769,12 +8812,26 @@ export class MinnowDatabase {
       1,
       Math.min(0xffff_ffff, Math.floor(targetBlockBytes / maximumEncodedBytesPerRow)),
     );
+    const logicalOrder = await this.#firstLogicalOrder(sourceSegments);
+    const partitions =
+      partitioning === undefined
+        ? undefined
+        : planLinearOutputPartitions(
+            totalRows,
+            partitioning.partitionRows,
+            logicalOrder,
+            partitioning.nextLevelZeroOrder,
+          );
     const estimatedOutputs: RechunkCompactionOutputWindow[] = [];
-    for (let rowStart = 0; rowStart < totalRows; rowStart += rowsPerOutput) {
-      estimatedOutputs.push({
-        rowStart,
-        rowCount: Math.min(rowsPerOutput, totalRows - rowStart),
-      });
+    const outputRegions = partitions ?? [{ rowStart: 0, rowCount: totalRows }];
+    for (const region of outputRegions) {
+      const regionEnd = region.rowStart + region.rowCount;
+      for (let rowStart = region.rowStart; rowStart < regionEnd; rowStart += rowsPerOutput) {
+        estimatedOutputs.push({
+          rowStart,
+          rowCount: Math.min(rowsPerOutput, regionEnd - rowStart),
+        });
+      }
     }
     const outputs = await this.#refinePhysicalOutputWindows(
       rechunkPhysicalColumns(columns),
@@ -8792,9 +8849,10 @@ export class MinnowDatabase {
       totalRows,
       rowIdStart: first.rowIdStart,
       rowIdEndExclusive: last.rowIdEndExclusive,
-      logicalOrder: await this.#firstLogicalOrder(sourceSegments),
+      logicalOrder,
       columns,
       outputs,
+      ...(partitions === undefined ? {} : { partitions }),
     };
   }
 
@@ -8802,7 +8860,7 @@ export class MinnowDatabase {
    * Plans a merge of the sources into one canonical output. With `partitioning`, the output
    * is also cut into level-one partitions: each rewritten source partition keeps its rows (and
    * its logical order) in place, new rows form the tail, and every run is chunked to at most
-   * `partitionRows` where the integer orders between neighbours leave room.
+   * `partitionRows`, using fractional orders between unchanged neighbours.
    */
   async #createMergeCompactionPlan(
     table: TableRecord,
@@ -9829,20 +9887,19 @@ export class MinnowDatabase {
     if (
       job.outputPartitionOrdinal === undefined &&
       job.targetLevel === 1 &&
-      plan.kind !== "copy-v1"
+      plan.kind !== "copy-v1" &&
+      plan.partitions !== undefined
     ) {
       const table = await this.store.getTable(job.tableId);
       if (table === undefined) throw new Error(`Compaction table is missing: ${job.tableId}`);
-      if (table.uniqueKeyColumnId !== undefined) {
-        await this.#assertKeyedLevelOneSnapshotOrder(
-          job,
-          plan,
-          table,
-          visibleSegments,
-          transactions,
-        );
-        return;
-      }
+      await this.#assertPartitionedLevelOneSnapshotOrder(
+        job,
+        plan,
+        table,
+        visibleSegments,
+        transactions,
+      );
+      return;
     }
     if (job.outputPartitionOrdinal !== undefined) {
       if (plan.kind === "rechunk-v1") {
@@ -9864,8 +9921,11 @@ export class MinnowDatabase {
       const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
-        const owner = actual === undefined ? undefined : transactions.get(actual.transactionId);
-        if (actual === undefined || !sameMergeSourceSegment(actual, owner, planned)) {
+        if (actual === undefined) {
+          throw new Error(`Compaction source is no longer visible: ${planned.segmentId}`);
+        }
+        const owner = transactions.get(actual.transactionId);
+        if (!sameMergeSourceSegment(actual, owner, planned)) {
           throw new Error(`Compaction source segment differs from its plan: ${planned.segmentId}`);
         }
       }
@@ -9932,14 +9992,15 @@ export class MinnowDatabase {
   }
 
   /**
-   * The keyed level-one rebase rule. The sources must be exactly as planned. Every partition
-   * the plan left alone must still be visible and unchanged — they are read back from the
-   * planning snapshot's manifest, which the job roots until it ends, so the check needs no
-   * record of its own. Every other visible segment must be level-zero history committed after
-   * the latest source and ordered after every partition the job publishes, so the output
-   * slots into the same place relative to the deltas it did not absorb.
+   * The partitioned level-one rebase rule, shared by keyed merges and keyless rechunks. The
+   * sources must be exactly as planned. Every partition the plan left alone must still be visible
+   * and unchanged — they are read back from the planning snapshot's manifest, which the job
+   * roots until it ends, so the check needs no record of its own. Every other visible segment
+   * must be level-zero history committed after the latest source and ordered after every
+   * partition the job publishes, so the output slots into the same place relative to the deltas
+   * it did not absorb.
    */
-  async #assertKeyedLevelOneSnapshotOrder(
+  async #assertPartitionedLevelOneSnapshotOrder(
     job: CompactionJobRecord,
     plan: PhysicalCompactionRewritePlan,
     table: TableRecord,
@@ -9959,7 +10020,10 @@ export class MinnowDatabase {
       new Snapshot(this.store, sourceManifest.version, sourceManifest.blockIds),
     );
     const plannedById = new Map(plannedVisible.map((segment) => [segment.id, segment]));
-    const plannedLayout = keyedLevelOneLayout(plannedVisible);
+    const plannedLayout =
+      table.uniqueKeyColumnId === undefined
+        ? keylessLevelOneLayout(plannedVisible)
+        : keyedLevelOneLayout(plannedVisible);
     if (plannedLayout === null) throw new Error("Compaction planned layout is no longer valid");
 
     let latestSource: Pick<
@@ -9969,8 +10033,11 @@ export class MinnowDatabase {
     if (plan.kind === "merge-v1") {
       for (const planned of plan.sourceSegments) {
         const actual = visibleById.get(planned.segmentId);
-        const owner = actual === undefined ? undefined : transactions.get(actual.transactionId);
-        if (actual === undefined || !sameMergeSourceSegment(actual, owner, planned)) {
+        if (actual === undefined) {
+          throw new Error(`Compaction source is no longer visible: ${planned.segmentId}`);
+        }
+        const owner = transactions.get(actual.transactionId);
+        if (!sameMergeSourceSegment(actual, owner, planned)) {
           throw new Error(`Compaction source segment differs from its plan: ${planned.segmentId}`);
         }
       }
@@ -9979,8 +10046,8 @@ export class MinnowDatabase {
       for (const id of job.sourceSegmentIds) {
         const actual = visibleById.get(id);
         const planned = plannedById.get(id);
+        if (actual === undefined) throw new Error(`Compaction source is no longer visible: ${id}`);
         if (
-          actual === undefined ||
           actual.transactionId !== planned?.transactionId ||
           !sameCompactionSegment(actual, planned)
         ) {
@@ -9994,9 +10061,12 @@ export class MinnowDatabase {
     }
     if (latestSource === null) throw new Error("Compaction source order is unavailable");
     const maxOutputOrder =
-      plan.kind === "merge-v1" && plan.partitions !== undefined
-        ? Math.max(plan.logicalOrder, ...plan.partitions.map((partition) => partition.logicalOrder))
-        : plan.logicalOrder;
+      plan.partitions === undefined
+        ? plan.logicalOrder
+        : Math.max(
+            plan.logicalOrder,
+            ...plan.partitions.map((partition) => partition.logicalOrder),
+          );
     const retained = new Map(
       plannedLayout.partitions
         .filter((partition) => !sourceIds.has(partition.id))
@@ -13847,6 +13917,33 @@ interface KeyedPartitioning {
   readonly nextLevelZeroOrder: number;
 }
 
+interface RechunkPartitioning {
+  readonly partitionRows: number;
+  /** Exclusive upper bound: first unselected L0 order, or the next manifest version. */
+  readonly nextLevelZeroOrder: number;
+}
+
+function planLinearOutputPartitions(
+  totalRows: number,
+  partitionRows: number,
+  firstOrder: number,
+  nextOrder: number,
+): MergeOutputPartition[] {
+  const count = Math.max(1, Math.ceil(totalRows / partitionRows));
+  const orders = fractionalLogicalOrders(firstOrder, nextOrder, count);
+  const partitions: MergeOutputPartition[] = [];
+  for (let index = 0, rowStart = 0; index < count; index += 1) {
+    const rowCount = Math.min(partitionRows, totalRows - rowStart);
+    const logicalOrder = orders[index];
+    if (rowCount <= 0 || logicalOrder === undefined) {
+      throw new Error("Rechunk partition layout is incomplete");
+    }
+    partitions.push({ rowStart, rowCount, logicalOrder });
+    rowStart += rowCount;
+  }
+  return partitions;
+}
+
 /**
  * Cuts the canonical merged output into the partitions a keyed fold publishes.
  *
@@ -13854,13 +13951,13 @@ interface KeyedPartitioning {
  * logical order, and so its place among the partitions the fold leaves alone. The rows of the
  * level-zero sources — the tail — form a region behind every existing partition, or extend
  * the last partition's region when the fold absorbs them into it. A region is then chunked to
- * at most `partitionRows` rows per published partition as far as the integer orders below its
- * successor leave room: the first chunk of a partition region keeps the partition's order and
- * every further chunk takes the next free integer; a fresh tail starts at its earliest source's
- * order when that fits. When the room runs out the remaining rows stay in one larger chunk.
- * The size is a target; the order is the contract: a published partition sorts strictly between
- * its neighbours and below every level-zero segment, and its order never changes, so a later
- * fold rewrites it alone without moving a row.
+ * at most `partitionRows` rows per published partition. The first chunk keeps the source
+ * partition's order and every further chunk takes an evenly spaced fractional order before
+ * the unchanged successor;
+ * a fresh tail starts at its earliest source's order. Fractional orders make room independent
+ * of adjacent commit versions, so every output is bounded by `partitionRows`. The order is
+ * stable: a published partition sorts strictly between its neighbours and below every
+ * level-zero segment, so a later fold rewrites it alone without moving a row.
  */
 function planOutputPartitions(
   partitioning: KeyedPartitioning,
@@ -13939,27 +14036,24 @@ function planOutputPartitions(
   const output: MergeOutputPartition[] = [];
   for (const region of regions) {
     if (region.rowCount <= 0) continue;
-    const wanted = Math.max(1, Math.ceil(region.rowCount / partitionRows));
-    let firstOrder: number;
-    let chunks: number;
-    if (region.anchorOrder !== null) {
-      firstOrder = region.anchorOrder;
-      chunks = Math.min(wanted, Math.max(1, region.roomEnd - region.anchorOrder));
-    } else {
-      const room = region.roomEnd - region.roomStart - 1;
-      if (room < 1) throw new Error("Partitioned merge has no free logical order for its tail");
-      chunks = Math.min(wanted, room);
-      firstOrder = Math.max(
-        region.roomStart + 1,
-        Math.min(region.preferredOrder, region.roomEnd - chunks),
-      );
+    const chunks = Math.max(1, Math.ceil(region.rowCount / partitionRows));
+    const firstOrder = region.anchorOrder ?? region.preferredOrder;
+    if (
+      !validLogicalOrder(firstOrder) ||
+      firstOrder >= region.roomEnd ||
+      (region.anchorOrder === null && firstOrder <= region.roomStart)
+    ) {
+      throw new Error("Partitioned merge has no logical-order interval for its output");
     }
+    const logicalOrders = fractionalLogicalOrders(firstOrder, region.roomEnd, chunks);
     const baseRows = Math.floor(region.rowCount / chunks);
     const extraRows = region.rowCount % chunks;
     let rowStart = region.rowStart;
     for (let chunk = 0; chunk < chunks; chunk += 1) {
       const rowCount = baseRows + (chunk < extraRows ? 1 : 0);
-      output.push({ rowStart, rowCount, logicalOrder: firstOrder + chunk });
+      const logicalOrder = logicalOrders[chunk];
+      if (logicalOrder === undefined) throw new Error("Partition logical order is unavailable");
+      output.push({ rowStart, rowCount, logicalOrder });
       rowStart += rowCount;
     }
   }
@@ -13980,6 +14074,27 @@ function planOutputPartitions(
     throw new Error("Partitioned merge partitions do not cover the merged output");
   }
   return output;
+}
+
+/** `count` increasing doubles in [first, upper), retaining `first` exactly. */
+function fractionalLogicalOrders(first: number, upper: number, count: number): number[] {
+  if (!validLogicalOrder(first) || !Number.isFinite(upper) || upper <= first || count < 1) {
+    throw new Error("Partition logical-order interval is invalid");
+  }
+  const orders: number[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const order = index === 0 ? first : first + ((upper - first) * index) / count;
+    const previous = orders[index - 1];
+    if (
+      !validLogicalOrder(order) ||
+      order >= upper ||
+      (previous !== undefined && order <= previous)
+    ) {
+      throw new Error("Partition logical-order precision is exhausted");
+    }
+    orders.push(order);
+  }
+  return orders;
 }
 
 /**
@@ -14562,7 +14677,9 @@ function partitionOutputSegmentId(outputSegmentId: string, index: number): strin
 function compactionOutputSegmentIds(job: CompactionJobRecord): string[] {
   if (job.outputSegmentId === null) return [];
   const plan = job.rewritePlan;
-  if (plan?.kind !== "merge-v1" || plan.partitions === undefined) return [job.outputSegmentId];
+  if ((plan?.kind !== "merge-v1" && plan?.kind !== "rechunk-v1") || plan.partitions === undefined) {
+    return [job.outputSegmentId];
+  }
   const outputSegmentId = job.outputSegmentId;
   return plan.partitions.map((_partition, index) =>
     partitionOutputSegmentId(outputSegmentId, index),
@@ -14571,9 +14688,8 @@ function compactionOutputSegmentIds(job: CompactionJobRecord): string[] {
 
 /**
  * The segments a physical compaction publishes, with the blocks of the windows each covers.
- * A partitioned merge publishes one level-one partition per planned partition, each carrying
- * the slice of the output's row-ID spans that falls in its rows; every other plan publishes
- * one segment over the whole output.
+ * A partitioned rewrite publishes one level-one segment per planned partition. A merge carries
+ * the slice of its row-ID spans; a rechunk carries the corresponding contiguous interval.
  */
 function compactionOutputSegments(
   table: TableRecord,
@@ -14590,10 +14706,19 @@ function compactionOutputSegments(
     job.outputPartitionOrdinal === undefined
       ? {}
       : { partitionOrdinal: job.outputPartitionOrdinal };
-  if (plan.kind === "merge-v1" && plan.partitions !== undefined) {
+  if (plan.partitions !== undefined) {
     return plan.partitions.map((partition, index) => {
-      const rowIdSpans = sliceRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount);
-      const envelope = rowIdSpanEnvelope(rowIdSpans);
+      const rowIdSpans =
+        plan.kind === "merge-v1"
+          ? sliceRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount)
+          : undefined;
+      const envelope =
+        rowIdSpans === undefined
+          ? {
+              start: plan.rowIdStart + BigInt(partition.rowStart),
+              endExclusive: plan.rowIdStart + BigInt(partition.rowStart + partition.rowCount),
+            }
+          : rowIdSpanEnvelope(rowIdSpans);
       return {
         id: partitionOutputSegmentId(outputSegmentId, index),
         tableId: table.id,
@@ -14602,12 +14727,12 @@ function compactionOutputSegments(
         rowIdStart: envelope.start,
         rowIdEndExclusive: envelope.endExclusive,
         columnBlockIds: physicalOutputColumns(job.id, plan, partition),
-        kind: "base",
+        kind: plan.kind === "merge-v1" ? "base" : "insert",
         ...keyColumn,
         level: job.targetLevel,
         ...partitionOrdinal,
         logicalOrder: partition.logicalOrder,
-        rowIdSpans,
+        ...(rowIdSpans === undefined ? {} : { rowIdSpans }),
         createdAt,
       };
     });
@@ -14793,6 +14918,9 @@ function garbageCollectionProgress(job: GarbageCollectionJobRecord): GarbageColl
           reclaimedBlockCount: job.reclaimedBlockCount,
           retainedBlockCount: job.retainedBlockCount,
           missingBlockCount: job.missingBlockCount,
+          reclaimedTransactionCount: job.reclaimedTransactionCount,
+          retainedTransactionCount: job.retainedTransactionCount,
+          missingTransactionCount: job.missingTransactionCount,
           physicallyReclaimedBytes: job.reclaimedBlockBytes,
         }
       : null;
@@ -14802,6 +14930,7 @@ function garbageCollectionProgress(job: GarbageCollectionJobRecord): GarbageColl
     examinedManifestCount: job.cursor.manifestIndex,
     examinedSegmentCount: job.cursor.segmentIndex,
     examinedBlockCount: job.cursor.blockIndex,
+    examinedTransactionCount: job.cursor.transactionIndex,
     result,
   };
 }
@@ -15023,6 +15152,10 @@ function hasContiguousRowIds(segments: readonly SegmentRecord[]): boolean {
   });
 }
 
+function validLogicalOrder(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value >= 0;
+}
+
 interface AppendLevelTwoLayout {
   retainedPrefix: readonly SegmentRecord[];
   levelTwoSegments: readonly SegmentRecord[];
@@ -15030,23 +15163,19 @@ interface AppendLevelTwoLayout {
 }
 
 function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTwoLayout | null {
-  let index = 0;
+  const levelOneSegments = levelOnePartitionPrefix(segments);
+  if (
+    levelOneSegments === null ||
+    levelOneSegments.some(
+      (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+    )
+  ) {
+    return null;
+  }
+  let index = levelOneSegments.length;
   const retainedPrefix: SegmentRecord[] = [];
   const levelTwoSegments: SegmentRecord[] = [];
-  const first = segments[0];
-  if (first !== undefined && (first.level ?? 0) === 1) {
-    if (
-      (first.kind ?? "insert") !== "insert" ||
-      first.rowIdSpans !== undefined ||
-      first.partitionOrdinal !== undefined ||
-      (first.logicalOrder !== undefined &&
-        (!Number.isSafeInteger(first.logicalOrder) || first.logicalOrder < 0))
-    ) {
-      return null;
-    }
-    retainedPrefix.push(first);
-    index += 1;
-  }
+  retainedPrefix.push(...levelOneSegments);
   for (;;) {
     const segment = segments[index];
     if (segment === undefined || (segment.level ?? 0) !== 2) break;
@@ -15054,8 +15183,7 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
       (segment.kind ?? "insert") !== "insert" ||
       segment.rowIdSpans !== undefined ||
       segment.partitionOrdinal !== levelTwoSegments.length ||
-      !Number.isSafeInteger(segment.logicalOrder) ||
-      (segment.logicalOrder ?? -1) < 0 ||
+      !validLogicalOrder(segment.logicalOrder) ||
       segment.rowIdEndExclusive - segment.rowIdStart !== BigInt(segment.rowCount)
     ) {
       return null;
@@ -15072,8 +15200,7 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
         segment.partitionOrdinal !== undefined ||
         (segment.kind ?? "insert") !== "insert" ||
         segment.rowIdSpans !== undefined ||
-        (segment.logicalOrder !== undefined &&
-          (!Number.isSafeInteger(segment.logicalOrder) || segment.logicalOrder < 0)),
+        (segment.logicalOrder !== undefined && !validLogicalOrder(segment.logicalOrder)),
     )
   ) {
     return null;
@@ -15121,6 +15248,31 @@ function keyedLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOneL
   return { partitions, level0Segments };
 }
 
+/** The append-only counterpart: bounded L1 partitions followed by contiguous insert deltas. */
+function keylessLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOneLayout | null {
+  const partitions = levelOnePartitionPrefix(segments);
+  if (
+    partitions === null ||
+    partitions.some((segment) => (segment.kind ?? "insert") !== "insert")
+  ) {
+    return null;
+  }
+  const level0Segments = segments.slice(partitions.length);
+  if (
+    level0Segments.some(
+      (segment) =>
+        (segment.level ?? 0) !== 0 ||
+        segment.partitionOrdinal !== undefined ||
+        (segment.kind ?? "insert") !== "insert" ||
+        segment.rowIdSpans !== undefined,
+    ) ||
+    !hasContiguousRowIds(segments)
+  ) {
+    return null;
+  }
+  return { partitions, level0Segments };
+}
+
 /**
  * The leading level-one segments, when they form a valid partition prefix: insert or base
  * kinds, no L2 ordinal, and explicit strictly increasing logical orders. Null otherwise.
@@ -15134,7 +15286,7 @@ function levelOnePartitionPrefix(segments: readonly SegmentRecord[]): SegmentRec
     if (
       (kind !== "insert" && kind !== "base") ||
       segment.partitionOrdinal !== undefined ||
-      !Number.isSafeInteger(segment.logicalOrder) ||
+      !validLogicalOrder(segment.logicalOrder) ||
       (segment.logicalOrder ?? -1) <= previousOrder
     ) {
       return null;
@@ -15196,8 +15348,7 @@ function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoL
     const kind = segment.kind ?? "insert";
     if (
       segment.partitionOrdinal !== levelTwoSegments.length ||
-      !Number.isSafeInteger(segment.logicalOrder) ||
-      (segment.logicalOrder ?? -1) < 0 ||
+      !validLogicalOrder(segment.logicalOrder) ||
       (kind !== "insert" && kind !== "base") ||
       (kind === "insert" && segment.rowIdSpans !== undefined) ||
       (kind === "base" && (segment.rowIdSpans?.length ?? 0) === 0)

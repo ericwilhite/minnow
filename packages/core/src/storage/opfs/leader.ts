@@ -153,6 +153,8 @@ type WalEntryBody =
         prunedManifestVersions: number[];
         reclaimedSegmentIds: string[];
         reclaimedBlockIds: string[];
+        /** Missing on log frames written before transaction-record collection shipped. */
+        reclaimedTransactionIds?: string[];
         updatedAt: string;
       };
     }
@@ -1129,6 +1131,7 @@ export class OpfsLeader {
           prunedManifestVersions: [...step.prunedManifestVersions],
           reclaimedSegmentIds: [...step.reclaimedSegmentIds],
           reclaimedBlockIds: [...step.reclaimedBlockIds],
+          reclaimedTransactionIds: [...step.reclaimedTransactionIds],
           updatedAt: input.updatedAt,
         },
       });

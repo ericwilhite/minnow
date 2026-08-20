@@ -418,6 +418,8 @@ export interface RechunkCompactionRewritePlan {
   readonly columns: readonly RechunkCompactionSourceColumn[];
   /** Shared row windows, emitted in output-window-major then column order. */
   readonly outputs: readonly RechunkCompactionOutputWindow[];
+  /** Optional level-one publication layout; partitions tile the output without splitting windows. */
+  readonly partitions?: readonly MergeOutputPartition[];
 }
 
 export interface MergeCompactionSourceBlock {
@@ -467,14 +469,14 @@ export interface MergeCompactionOutputColumn {
 }
 
 /**
- * One output segment of a partitioned merge: a contiguous run of the canonical merged output,
- * published as its own level-one partition under its own logical order.
+ * One output segment of a partitioned physical rewrite: a contiguous run of the canonical
+ * output, published as its own level-one partition under its own logical order.
  */
 export interface MergeOutputPartition {
   /** Row offset within the canonical merged output. */
   readonly rowStart: number;
   readonly rowCount: number;
-  /** The published segment's logical order; strictly increasing across partitions. */
+  /** The finite, non-negative published order; strictly increasing across partitions. */
   readonly logicalOrder: number;
 }
 
@@ -601,10 +603,16 @@ export class CompactionJobConflictError extends Error {
 export const garbageCollectionJobStates = ["planned", "running", "completed"] as const;
 export type GarbageCollectionJobState = (typeof garbageCollectionJobStates)[number];
 
+/**
+ * How far a job has examined each of its candidate lists, in the order a step works through
+ * them: manifests, then segments, then blocks, then transactions. Transactions come last so a
+ * segment the same job reclaims has already released the transaction that wrote it.
+ */
 export interface GarbageCollectionCursor {
   manifestIndex: number;
   segmentIndex: number;
   blockIndex: number;
+  transactionIndex: number;
 }
 
 export interface CreateGarbageCollectionJobInput {
@@ -612,6 +620,12 @@ export interface CreateGarbageCollectionJobInput {
   candidateManifestVersions: readonly number[];
   candidateSegmentIds: readonly string[];
   candidateBlockIds: readonly string[];
+  /**
+   * Committed transaction records the planner believes nothing needs any more: below its
+   * retained window, with no segment left that names them. Optional, so a caller that only
+   * reclaims artifacts need not mention them. The store decides for itself at step time.
+   */
+  candidateTransactionIds?: readonly string[];
   /** Fixed cutoff used to decide which persisted leases protect a manifest for this job. */
   leaseCutoff: string;
   createdAt: string;
@@ -622,6 +636,7 @@ export interface GarbageCollectionJobRecord {
   candidateManifestVersions: number[];
   candidateSegmentIds: string[];
   candidateBlockIds: string[];
+  candidateTransactionIds: string[];
   cursor: GarbageCollectionCursor;
   prunedManifestCount: number;
   alreadyPrunedManifestCount: number;
@@ -634,6 +649,9 @@ export interface GarbageCollectionJobRecord {
   retainedBlockCount: number;
   missingBlockCount: number;
   reclaimedBlockBytes: number;
+  reclaimedTransactionCount: number;
+  retainedTransactionCount: number;
+  missingTransactionCount: number;
   state: GarbageCollectionJobState;
   revision: number;
   leaseCutoff: string;
@@ -661,6 +679,9 @@ export interface GarbageCollectionStepResult {
   retainedBlockIds: string[];
   missingBlockIds: string[];
   reclaimedBlockBytes: number;
+  reclaimedTransactionIds: string[];
+  retainedTransactionIds: string[];
+  missingTransactionIds: string[];
 }
 
 export interface StoragePage<T, Cursor> {
@@ -705,6 +726,10 @@ export interface GarbageCollectionStepAccounting {
   retainedBlockCount: number;
   missingBlockCount: number;
   reclaimedBlockBytes: number;
+  examinedTransactionCount: number;
+  reclaimedTransactionCount: number;
+  retainedTransactionCount: number;
+  missingTransactionCount: number;
   updatedAt: string;
 }
 
@@ -1470,7 +1495,7 @@ export function normalizeSegmentRecord(record: SegmentRecord): SegmentRecord {
   if (record.logicalOrder === undefined) {
     throw new TypeError("A partitioned segment requires an explicit logical order");
   }
-  nonNegativeWholeNumber(record.logicalOrder, "Segment logical order");
+  nonNegativeFiniteNumber(record.logicalOrder, "Segment logical order");
   const rowCount = positiveWholeNumber(record.rowCount, "Segment row count");
   if (kind === "insert") {
     // Append-row-range partition: one contiguous positive row-ID interval, no spans.
@@ -1553,17 +1578,24 @@ export function createGarbageCollectionJobRecord(
     "Garbage collection candidate block ID",
     true,
   );
+  const candidateTransactionIds = uniqueIds(
+    input.candidateTransactionIds ?? [],
+    "Garbage collection candidate transaction ID",
+    true,
+  );
   const createdAt = validTimestamp(input.createdAt, "Garbage collection creation timestamp");
   const complete =
     candidateManifestVersions.length === 0 &&
     candidateSegmentIds.length === 0 &&
-    candidateBlockIds.length === 0;
+    candidateBlockIds.length === 0 &&
+    candidateTransactionIds.length === 0;
   return {
     id: nonEmptyString(input.id, "Garbage collection job ID"),
     candidateManifestVersions,
     candidateSegmentIds,
     candidateBlockIds,
-    cursor: { manifestIndex: 0, segmentIndex: 0, blockIndex: 0 },
+    candidateTransactionIds,
+    cursor: { manifestIndex: 0, segmentIndex: 0, blockIndex: 0, transactionIndex: 0 },
     prunedManifestCount: 0,
     alreadyPrunedManifestCount: 0,
     retainedManifestCount: 0,
@@ -1575,6 +1607,9 @@ export function createGarbageCollectionJobRecord(
     retainedBlockCount: 0,
     missingBlockCount: 0,
     reclaimedBlockBytes: 0,
+    reclaimedTransactionCount: 0,
+    retainedTransactionCount: 0,
+    missingTransactionCount: 0,
     state: complete ? "completed" : "planned",
     revision: 0,
     leaseCutoff: validTimestamp(input.leaseCutoff, "Garbage collection lease cutoff"),
@@ -1586,6 +1621,7 @@ export function createGarbageCollectionJobRecord(
 export function normalizeGarbageCollectionJobRecord(
   record: GarbageCollectionJobRecord,
 ): GarbageCollectionJobRecord {
+  const legacy = record as Partial<GarbageCollectionJobRecord>;
   const candidateManifestVersions = uniqueWholeNumbers(
     record.candidateManifestVersions,
     "Garbage collection candidate manifest version",
@@ -1600,6 +1636,13 @@ export function normalizeGarbageCollectionJobRecord(
     "Garbage collection candidate block ID",
     true,
   );
+  // These fields were added after durable jobs shipped. Missing values are the empty fourth
+  // phase, which lets an old planned/running job resume after an upgrade without migration.
+  const candidateTransactionIds = uniqueIds(
+    legacy.candidateTransactionIds ?? [],
+    "Garbage collection candidate transaction ID",
+    true,
+  );
   const cursor = normalizeGarbageCollectionCursor(record.cursor);
   const normalized: GarbageCollectionJobRecord = {
     ...record,
@@ -1607,6 +1650,7 @@ export function normalizeGarbageCollectionJobRecord(
     candidateManifestVersions,
     candidateSegmentIds,
     candidateBlockIds,
+    candidateTransactionIds,
     cursor,
     prunedManifestCount: nonNegativeWholeNumber(
       record.prunedManifestCount,
@@ -1652,6 +1696,18 @@ export function normalizeGarbageCollectionJobRecord(
       record.reclaimedBlockBytes,
       "Garbage collection reclaimed block bytes",
     ),
+    reclaimedTransactionCount: nonNegativeWholeNumber(
+      legacy.reclaimedTransactionCount ?? 0,
+      "Garbage collection reclaimed transaction count",
+    ),
+    retainedTransactionCount: nonNegativeWholeNumber(
+      legacy.retainedTransactionCount ?? 0,
+      "Garbage collection retained transaction count",
+    ),
+    missingTransactionCount: nonNegativeWholeNumber(
+      legacy.missingTransactionCount ?? 0,
+      "Garbage collection missing transaction count",
+    ),
     state: garbageCollectionJobState(record.state),
     revision: nonNegativeWholeNumber(record.revision, "Garbage collection job revision"),
     leaseCutoff: validTimestamp(record.leaseCutoff, "Garbage collection lease cutoff"),
@@ -1679,14 +1735,23 @@ export function normalizeGarbageCollectionJobRecord(
     safeSum(
       [normalized.reclaimedBlockCount, normalized.retainedBlockCount, normalized.missingBlockCount],
       "Garbage collection examined block count",
-    ) !== cursor.blockIndex
+    ) !== cursor.blockIndex ||
+    safeSum(
+      [
+        normalized.reclaimedTransactionCount,
+        normalized.retainedTransactionCount,
+        normalized.missingTransactionCount,
+      ],
+      "Garbage collection examined transaction count",
+    ) !== cursor.transactionIndex
   ) {
     throw new TypeError("Garbage collection cursor does not match its persisted accounting");
   }
   if (
     cursor.manifestIndex > candidateManifestVersions.length ||
     cursor.segmentIndex > candidateSegmentIds.length ||
-    cursor.blockIndex > candidateBlockIds.length
+    cursor.blockIndex > candidateBlockIds.length ||
+    cursor.transactionIndex > candidateTransactionIds.length
   ) {
     throw new RangeError("Garbage collection cursor is outside its candidate selection");
   }
@@ -1700,7 +1765,10 @@ export function normalizeGarbageCollectionJobRecord(
   }
   if (
     normalized.state === "planned" &&
-    (cursor.manifestIndex !== 0 || cursor.segmentIndex !== 0 || cursor.blockIndex !== 0)
+    (cursor.manifestIndex !== 0 ||
+      cursor.segmentIndex !== 0 ||
+      cursor.blockIndex !== 0 ||
+      cursor.transactionIndex !== 0)
   ) {
     throw new TypeError("A planned garbage collection job cannot contain progress");
   }
@@ -1770,6 +1838,22 @@ export function advanceGarbageCollectionJobRecord(
       accounting.reclaimedBlockBytes,
       "Garbage collection reclaimed block byte increment",
     ),
+    examinedTransactionCount: nonNegativeWholeNumber(
+      accounting.examinedTransactionCount,
+      "Garbage collection examined transaction increment",
+    ),
+    reclaimedTransactionCount: nonNegativeWholeNumber(
+      accounting.reclaimedTransactionCount,
+      "Garbage collection reclaimed transaction increment",
+    ),
+    retainedTransactionCount: nonNegativeWholeNumber(
+      accounting.retainedTransactionCount,
+      "Garbage collection retained transaction increment",
+    ),
+    missingTransactionCount: nonNegativeWholeNumber(
+      accounting.missingTransactionCount,
+      "Garbage collection missing transaction increment",
+    ),
   };
   if (
     increments.examinedManifestCount !==
@@ -1799,6 +1883,15 @@ export function advanceGarbageCollectionJobRecord(
           increments.missingBlockCount,
         ],
         "Garbage collection block increment",
+      ) ||
+    increments.examinedTransactionCount !==
+      safeSum(
+        [
+          increments.reclaimedTransactionCount,
+          increments.retainedTransactionCount,
+          increments.missingTransactionCount,
+        ],
+        "Garbage collection transaction increment",
       )
   ) {
     throw new TypeError("Garbage collection step accounting is incomplete");
@@ -1815,6 +1908,10 @@ export function advanceGarbageCollectionJobRecord(
     blockIndex: safeSum(
       [current.cursor.blockIndex, increments.examinedBlockCount],
       "Garbage collection block cursor",
+    ),
+    transactionIndex: safeSum(
+      [current.cursor.transactionIndex, increments.examinedTransactionCount],
+      "Garbage collection transaction cursor",
     ),
   };
   const updated: GarbageCollectionJobRecord = {
@@ -1863,6 +1960,18 @@ export function advanceGarbageCollectionJobRecord(
     reclaimedBlockBytes: safeSum(
       [current.reclaimedBlockBytes, increments.reclaimedBlockBytes],
       "Garbage collection reclaimed block bytes",
+    ),
+    reclaimedTransactionCount: safeSum(
+      [current.reclaimedTransactionCount, increments.reclaimedTransactionCount],
+      "Garbage collection reclaimed transaction count",
+    ),
+    retainedTransactionCount: safeSum(
+      [current.retainedTransactionCount, increments.retainedTransactionCount],
+      "Garbage collection retained transaction count",
+    ),
+    missingTransactionCount: safeSum(
+      [current.missingTransactionCount, increments.missingTransactionCount],
+      "Garbage collection missing transaction count",
     ),
     state: "running",
     revision: current.revision + 1,
@@ -2509,6 +2618,11 @@ function normalizeCompactionRewritePlan(value: unknown): CompactionRewritePlan {
     };
   });
   validateContiguousRows(outputs, totalRows, "Rechunk output windows");
+  const partitionsValue: unknown = Reflect.get(value, "partitions");
+  const partitions =
+    partitionsValue === undefined
+      ? undefined
+      : normalizeMergeOutputPartitions(partitionsValue, totalRows, outputs);
 
   return {
     kind: "rechunk-v1",
@@ -2520,12 +2634,13 @@ function normalizeCompactionRewritePlan(value: unknown): CompactionRewritePlan {
     totalRows,
     rowIdStart,
     rowIdEndExclusive,
-    logicalOrder: nonNegativeWholeNumber(
+    logicalOrder: nonNegativeFiniteNumber(
       Reflect.get(value, "logicalOrder"),
       "Rechunk logical order",
     ),
     columns,
     outputs,
+    ...(partitions === undefined ? {} : { partitions }),
   };
 }
 
@@ -2688,7 +2803,7 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
   });
   validateContiguousRows(outputs, totalRows, "Merge output windows");
 
-  const logicalOrder = nonNegativeWholeNumber(
+  const logicalOrder = nonNegativeFiniteNumber(
     Reflect.get(value, "logicalOrder"),
     "Merge logical order",
   );
@@ -2742,7 +2857,7 @@ function normalizeMergeOutputPartitions(
     return {
       rowStart: nonNegativeWholeNumber(Reflect.get(partition, "rowStart"), `${label} row start`),
       rowCount: positiveWholeNumber(Reflect.get(partition, "rowCount"), `${label} row count`),
-      logicalOrder: nonNegativeWholeNumber(
+      logicalOrder: nonNegativeFiniteNumber(
         Reflect.get(partition, "logicalOrder"),
         `${label} logical order`,
       ),
@@ -2835,7 +2950,7 @@ function normalizeMergeSourceSegment(
     kind,
     keyColumnId: nullableId(Reflect.get(value, "keyColumnId"), `${label} key column ID`),
     level: nonNegativeWholeNumber(Reflect.get(value, "level"), `${label} level`),
-    logicalOrder: nonNegativeWholeNumber(
+    logicalOrder: nonNegativeFiniteNumber(
       Reflect.get(value, "logicalOrder"),
       `${label} logical order`,
     ),
@@ -3205,6 +3320,10 @@ function normalizeGarbageCollectionCursor(value: unknown): GarbageCollectionCurs
       Reflect.get(value, "blockIndex"),
       "Garbage collection block cursor",
     ),
+    transactionIndex: nonNegativeWholeNumber(
+      Reflect.get(value, "transactionIndex") ?? 0,
+      "Garbage collection transaction cursor",
+    ),
   };
 }
 
@@ -3212,7 +3331,8 @@ function garbageCollectionJobComplete(record: GarbageCollectionJobRecord): boole
   return (
     record.cursor.manifestIndex === record.candidateManifestVersions.length &&
     record.cursor.segmentIndex === record.candidateSegmentIds.length &&
-    record.cursor.blockIndex === record.candidateBlockIds.length
+    record.cursor.blockIndex === record.candidateBlockIds.length &&
+    record.cursor.transactionIndex === record.candidateTransactionIds.length
   );
 }
 
@@ -3278,6 +3398,13 @@ function positiveWholeNumber(value: unknown, label: string): number {
 function positiveFiniteNumber(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     throw new RangeError(`${label} must be a positive finite number`);
+  }
+  return value;
+}
+
+function nonNegativeFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(`${label} must be a non-negative finite number`);
   }
   return value;
 }

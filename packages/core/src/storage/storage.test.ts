@@ -1024,14 +1024,14 @@ for (const implementation of stores()) {
         rowIdEndExclusive: 4n,
         columnBlockIds: { "name-id": ["block-2"] },
         level: 1,
-        logicalOrder: 4,
+        logicalOrder: 4.5,
         createdAt: "2026-01-01T00:00:01.000Z",
       });
 
       expect((await store.listTables())[0]?.name).toBe("people");
       expect((await store.listSegments("people-id"))[0]?.rowIdEndExclusive).toBe(3n);
       expect(await store.getSegment("segment-1")).not.toHaveProperty("level");
-      expect(await store.getSegment("segment-2")).toMatchObject({ level: 1, logicalOrder: 4 });
+      expect(await store.getSegment("segment-2")).toMatchObject({ level: 1, logicalOrder: 4.5 });
       store.close();
     });
 
@@ -1178,7 +1178,7 @@ for (const implementation of stores()) {
         },
         {
           record: { ...valid, id: "negative-logical-order", logicalOrder: -1 },
-          message: "logical order must be a non-negative whole number",
+          message: "logical order must be a non-negative finite number",
         },
         {
           record: { ...valid, id: "spanned-partition", rowIdSpans: [] },
@@ -2935,6 +2935,56 @@ for (const implementation of stores()) {
       expect(result.retainedBlockIds).toEqual([`${prefix}/old-block`]);
       expect(await store.getSegment(`${prefix}/uncheckpointed-segment`)).toBeDefined();
       expect(await store.getBlock(`${prefix}/old-block`)).toBeDefined();
+      store.close();
+    });
+
+    it("reclaims a committed transaction only after its manifest and segments stop rooting it", async () => {
+      const store = await implementation.create();
+      const prefix = "committed-transaction-gc";
+      await createSupersededStorage(store, prefix);
+      const transactionId = `${prefix}/old-transaction`;
+      const segmentId = `${prefix}/old-segment`;
+      const first = await store.createGarbageCollectionJob({
+        id: `${prefix}/gc-retained`,
+        candidateManifestVersions: [0],
+        candidateSegmentIds: [],
+        candidateBlockIds: [],
+        candidateTransactionIds: [transactionId],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:02:00.000Z",
+      });
+      const retained = await store.runGarbageCollectionStep({
+        jobId: first.id,
+        expectedRevision: first.revision,
+        maxItems: 2,
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      });
+      expect(retained.prunedManifestVersions).toEqual([0]);
+      expect(retained.retainedTransactionIds).toEqual([transactionId]);
+      expect(await store.getTransaction(transactionId)).toMatchObject({ status: "committed" });
+
+      await store.removeSegment(segmentId);
+      const second = await store.createGarbageCollectionJob({
+        id: `${prefix}/gc-reclaimed`,
+        candidateManifestVersions: [],
+        candidateSegmentIds: [],
+        candidateBlockIds: [],
+        candidateTransactionIds: [transactionId],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:04:00.000Z",
+      });
+      const reclaimed = await store.runGarbageCollectionStep({
+        jobId: second.id,
+        expectedRevision: second.revision,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:05:00.000Z",
+      });
+      expect(reclaimed.reclaimedTransactionIds).toEqual([transactionId]);
+      expect(reclaimed.job).toMatchObject({
+        state: "completed",
+        reclaimedTransactionCount: 1,
+      });
+      expect(await store.getTransaction(transactionId)).toBeUndefined();
       store.close();
     });
 
