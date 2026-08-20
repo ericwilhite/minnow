@@ -95,14 +95,15 @@ follow the tab into the grave.
 
 ## Options
 
-| Option             | Default  | What it does                                                                                                                                                                               |
-| ------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `compression`      | `"gzip"` | Block codec. `"raw"` ingests about twice as fast; `gzip` halves stored bytes and reads _faster_ cold, because reading half the bytes out of storage more than pays for decompressing them. |
-| `rowsPerBlock`     | `65536`  | The scan's row group and the buffer pool's residency unit. Measured flat above ~16k; small blocks cost up to 66% on top-N.                                                                 |
-| `bufferPoolBytes`  | 64 MiB   | Retained decoded blocks and their vectorized forms. `0` disables it. Every entry is keyed by an immutable identity, so a cached entry can never be stale.                                  |
-| `ftsAutoIndexRows` | `4096`   | Rows above which a `MATCH` on an unindexed append-only column schedules a background index build.                                                                                          |
-| `maxCommitRetries` | `8`      | How many times a losing writer rebases and retries before giving up.                                                                                                                       |
-| `autoCompact`      | `true`   | Whether small segments are merged in the background.                                                                                                                                       |
+| Option             | Default       | What it does                                                                                                                                                                               |
+| ------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `compression`      | `"gzip"`      | Block codec. `"raw"` ingests about twice as fast; `gzip` halves stored bytes and reads _faster_ cold, because reading half the bytes out of storage more than pays for decompressing them. |
+| `rowsPerBlock`     | `65536`       | The scan's row group and the buffer pool's residency unit. Measured flat above ~16k; small blocks cost up to 66% on top-N.                                                                 |
+| `bufferPoolBytes`  | 64 MiB        | Retained decoded blocks and their vectorized forms. `0` disables it. Every entry is keyed by an immutable identity, so a cached entry can never be stale.                                  |
+| `ftsAutoIndexRows` | `4096`        | Rows above which a `MATCH` on an unindexed append-only column schedules a background index build.                                                                                          |
+| `maxCommitRetries` | `8`           | How many times a losing writer rebases and retries before giving up.                                                                                                                       |
+| `autoCompact`      | `true`        | Whether fragmented tables and delta histories are folded in the background; see [compaction](/docs/storage/maintenance).                                                                   |
+| `autoCollect`      | `autoCompact` | Whether superseded blocks and old versions are collected in the background; see [garbage collection](/docs/storage/maintenance#garbage-collection).                                        |
 
 ## Errors
 

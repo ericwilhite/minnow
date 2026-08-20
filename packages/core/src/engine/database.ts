@@ -217,6 +217,23 @@ const AUTO_COMPACT_SCAN_SEGMENTS = 48;
 const AUTO_COMPACT_DELTA_SEGMENTS = 32;
 /** Commits to one table between auto-compaction checks on the write path. */
 const AUTO_COMPACT_COMMIT_CHECK_INTERVAL = 8;
+/** Commits between background collection passes; each prunes the manifests they wrote. */
+const AUTO_COLLECT_COMMIT_INTERVAL = 64;
+/**
+ * Manifest versions background collection leaves readable behind the current one, and how
+ * old one may be before it is collected regardless. A version is kept only while both hold: the
+ * count serves a reader that names a version it was just handed, the age keeps a burst of
+ * commits from pinning everything it superseded until the next burst — an idle tab reclaims
+ * within a minute.
+ */
+const AUTO_COLLECT_RETAINED_VERSIONS = 64;
+const AUTO_COLLECT_RETAINED_VERSION_MS = 60_000;
+/** A commit this long after the last collection pass starts one, whatever the commit count. */
+const AUTO_COLLECT_QUIET_MS = 60_000;
+/** Candidates one background collection step examines before yielding to the event loop. */
+const AUTO_COLLECT_STEP_ITEMS = 64;
+/** Passes one background collection run makes before handing the rest to the next trigger. */
+const AUTO_COLLECT_MAX_PASSES = 32;
 /** Output blocks one background compaction step writes before yielding to the event loop. */
 const AUTO_COMPACT_STEP_BLOCKS = 4;
 /**
@@ -650,6 +667,13 @@ export interface CollectGarbageOptions {
   maxItemsPerStep?: number;
   /** Maximum block/segment candidates copied into one durable planning record. */
   maxPlanningItems?: number;
+  /**
+   * Manifest versions below the current one to leave unpruned, newest first, so a reader that
+   * names a recent version — `query({ version })`, `readTable(name, version)` — still finds it.
+   * Defaults to 0: an explicit call reclaims everything no lease or job pins. Background
+   * collection keeps 64.
+   */
+  retainRecentVersions?: number;
 }
 
 export interface CollectGarbageStepOptions {
@@ -657,6 +681,8 @@ export interface CollectGarbageStepOptions {
   maxItems?: number;
   /** Maximum block/segment candidates copied into a newly planned job. */
   maxPlanningItems?: number;
+  /** See `CollectGarbageOptions.retainRecentVersions`; applies when this step plans a job. */
+  retainRecentVersions?: number;
 }
 
 export interface GarbageCollectionResult {
@@ -741,12 +767,21 @@ export interface MinnowDatabaseOptions {
    */
   ftsAutoIndexRows?: number;
   /**
-   * Read-triggered compaction: when a streamed scan observes a table fragmented past
-   * 48 visible segments, one incremental compaction step is scheduled fire-and-forget —
-   * the same self-maintenance pattern as the full-text auto index. Correctness never waits
-   * on it; repeated scans advance further steps. false disables.
+   * Background compaction: when a scan or a run of commits finds a table fragmented past 48
+   * visible segments or carrying 32 delete/update deltas, a fold is planned and driven to
+   * publication in small yielding steps, and re-planned while the table stays due — the same
+   * self-maintenance pattern as the full-text auto index. Correctness never waits on it.
+   * false disables, leaving `compactTable` to the caller.
    */
   autoCompact?: boolean;
+  /**
+   * Background collection: a garbage-collection pass after every background fold, and one
+   * every 64 commits, each keeping the 64 most recent versions readable. Without it the
+   * blocks a fold supersedes and the manifest every commit writes stay on disk until the
+   * caller runs `collectGarbage`. Defaults to `autoCompact`; false leaves collection to the
+   * caller.
+   */
+  autoCollect?: boolean;
 }
 
 export interface QuerySpillCleanupOptions {
@@ -942,6 +977,23 @@ export class MinnowDatabase {
   readonly #artifactCache: ArtifactCache;
   readonly #ftsAutoIndexRows: number;
   readonly #autoCompact: boolean;
+  readonly #autoCollect: boolean;
+  /** Data commits since the last background collection pass. */
+  #commitsSinceCollection = 0;
+  /**
+   * The highest manifest version below which everything is known to be collected — pruned,
+   * with no block left behind; a collection plan starts its walk there. In memory only: a
+   * fresh instance walks the whole history once and learns it again.
+   */
+  #collectionWatermark: number | null = null;
+  #autoCollectionInFlight = false;
+  #autoCollectionBackoffUntilCommit = 0;
+  /** When the last background collection pass started, by the database clock. */
+  #lastCollectionAt: number | undefined;
+  /** The idle pass scheduled after the last commit; reset by the next commit. */
+  #idleCollectionTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The garbage-collection step in flight, so steps run one at a time: see #serializedCollectionStep. */
+  #collectionSteps: Promise<unknown> = Promise.resolve();
   /** One background build attempt per (table, column) per session; misses just stay scans. */
   readonly #ftsBuildsInFlight = new Set<string>();
   /** Tables with a fire-and-forget compaction step already running. */
@@ -1004,6 +1056,7 @@ export class MinnowDatabase {
     this.#artifactCache = new ArtifactCache(options.bufferPoolBytes ?? 64 * 1024 * 1024);
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
     this.#autoCompact = options.autoCompact ?? true;
+    this.#autoCollect = options.autoCollect ?? this.#autoCompact;
     if (!Number.isSafeInteger(this.#ftsAutoIndexRows) || this.#ftsAutoIndexRows < 0) {
       throw new RangeError(
         "Full-text auto-index row threshold must be a non-negative whole number",
@@ -3187,6 +3240,8 @@ export class MinnowDatabase {
       }
       if (!progress.result.compacted) return folded;
       folded = true;
+      // The fold's sources are garbage now; collect before planning the next fold.
+      this.#maybeScheduleAutoCollection();
       await yieldToEventLoop();
       const current = await this.store.getTable(table.id);
       if (
@@ -3212,6 +3267,16 @@ export class MinnowDatabase {
    */
   #afterCommit(manifest: ManifestSummary): void {
     this.#notifyLiveCommit();
+    this.#commitsSinceCollection += 1;
+    const now = this.#now().getTime();
+    if (
+      this.#commitsSinceCollection >= AUTO_COLLECT_COMMIT_INTERVAL ||
+      (this.#lastCollectionAt !== undefined &&
+        now - this.#lastCollectionAt >= AUTO_COLLECT_QUIET_MS)
+    ) {
+      this.#maybeScheduleAutoCollection();
+    }
+    this.#armIdleCollection();
     if (!this.#autoCompact) return;
     for (const tableId of manifest.changedTableIds ?? []) {
       const commits = (this.#commitsSinceCompactionCheck.get(tableId) ?? 0) + 1;
@@ -7409,6 +7474,9 @@ export class MinnowDatabase {
       ...(options.maxPlanningItems === undefined
         ? {}
         : { maxPlanningItems: options.maxPlanningItems }),
+      ...(options.retainRecentVersions === undefined
+        ? {}
+        : { retainRecentVersions: options.retainRecentVersions }),
     });
     while (progress.result === null) {
       progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
@@ -7420,18 +7488,36 @@ export class MinnowDatabase {
   async collectGarbageStep(
     options: CollectGarbageStepOptions = {},
   ): Promise<GarbageCollectionProgress> {
-    const active = (await this.store.listGarbageCollectionJobs()).find(
-      (job) => job.state === "planned" || job.state === "running",
-    );
-    const job =
-      active ??
-      (await this.#planGarbageCollection(
-        positiveWholeNumber(options.maxPlanningItems ?? 1_024, "Garbage collection planning limit"),
-      ));
-    return this.#runGarbageCollectionJob(
-      job,
-      positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
-    );
+    return this.#collectGarbageStep(options);
+  }
+
+  /** `collectGarbageStep`, with the age bound background collection adds to its retention. */
+  async #collectGarbageStep(
+    options: CollectGarbageStepOptions,
+    retainedVersionMaxAgeMs = Number.POSITIVE_INFINITY,
+  ): Promise<GarbageCollectionProgress> {
+    return this.#serializedCollectionStep(async () => {
+      const active = (await this.store.listGarbageCollectionJobs()).find(
+        (job) => job.state === "planned" || job.state === "running",
+      );
+      const job =
+        active ??
+        (await this.#planGarbageCollection(
+          positiveWholeNumber(
+            options.maxPlanningItems ?? 1_024,
+            "Garbage collection planning limit",
+          ),
+          nonNegativeWholeNumber(
+            options.retainRecentVersions ?? 0,
+            "Garbage collection retained versions",
+          ),
+          retainedVersionMaxAgeMs,
+        ));
+      return this.#runGarbageCollectionJob(
+        job,
+        positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
+      );
+    });
   }
 
   /** Continues a persisted reclamation pass after a cooperative yield or restart. */
@@ -7441,19 +7527,120 @@ export class MinnowDatabase {
   ): Promise<GarbageCollectionProgress> {
     const job = await this.store.getGarbageCollectionJob(jobId);
     if (job === undefined) throw new Error(`Garbage collection job not found: ${jobId}`);
-    return this.#runGarbageCollectionJob(
-      job,
-      positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
+    return this.#serializedCollectionStep(() =>
+      this.#runGarbageCollectionJob(
+        job,
+        positiveWholeNumber(options.maxItems ?? 1, "Garbage collection item limit"),
+      ),
     );
+  }
+
+  /**
+   * One garbage-collection step at a time within this database, for the same reason
+   * compaction steps take turns (`#serializedCompactionStep`): background collection drives
+   * a job in steps, and a caller stepping collection explicitly continues the same job rather
+   * than racing it.
+   */
+  async #serializedCollectionStep<T>(step: () => Promise<T>): Promise<T> {
+    const previous = this.#collectionSteps;
+    const run = previous.then(step, step);
+    this.#collectionSteps = run;
+    try {
+      return await run;
+    } finally {
+      if (this.#collectionSteps === run) this.#collectionSteps = Promise.resolve();
+    }
+  }
+
+  /**
+   * Background collection: plans one pass and drives it to completion in yielding steps.
+   * Runs after a background fold, whose superseded blocks are what a pass reclaims, and every
+   * AUTO_COLLECT_COMMIT_INTERVAL commits, since every commit writes a manifest that stays on
+   * disk until pruned. Keeps the most recent versions readable. Never surfaces through a
+   * write or a scan; a failed pass backs off for an interval of commits.
+   */
+  #maybeScheduleAutoCollection(): void {
+    if (!this.#autoCollect || this.#autoCollectionInFlight) return;
+    if (this.#commitsSinceCollection < this.#autoCollectionBackoffUntilCommit) return;
+    this.#autoCollectionInFlight = true;
+    this.#commitsSinceCollection = 0;
+    this.#lastCollectionAt = this.#now().getTime();
+    void this.#runAutoCollection()
+      .then(() => {
+        this.#autoCollectionBackoffUntilCommit = 0;
+      })
+      .catch(() => {
+        this.#autoCollectionBackoffUntilCommit = AUTO_COLLECT_COMMIT_INTERVAL * 2;
+      })
+      .finally(() => {
+        this.#autoCollectionInFlight = false;
+      });
+  }
+
+  /**
+   * A pass a quiet period after the last commit, for a tab that stops writing: the retained
+   * window's age bound lets that pass reclaim what the last burst superseded, which no commit
+   * would otherwise arrive to trigger. Re-armed by every commit; unreferenced, so it never
+   * keeps a process alive.
+   */
+  #armIdleCollection(): void {
+    if (!this.#autoCollect) return;
+    if (this.#idleCollectionTimer !== undefined) clearTimeout(this.#idleCollectionTimer);
+    const timer = setTimeout(() => {
+      this.#idleCollectionTimer = undefined;
+      this.#maybeScheduleAutoCollection();
+    }, AUTO_COLLECT_QUIET_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.#idleCollectionTimer = timer;
+  }
+
+  async #runAutoCollection(): Promise<void> {
+    // One pass plans a bounded number of candidates, so a backlog — a burst of commits that
+    // outran the passes between them — takes several. Keep passing while a pass still finds
+    // something, up to a ceiling that keeps a pathological store from pinning the loop.
+    for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
+      let progress = await this.#collectGarbageStep(
+        {
+          maxItems: AUTO_COLLECT_STEP_ITEMS,
+          retainRecentVersions: AUTO_COLLECT_RETAINED_VERSIONS,
+        },
+        AUTO_COLLECT_RETAINED_VERSION_MS,
+      );
+      while (progress.result === null) {
+        await yieldToEventLoop();
+        progress = await this.resumeGarbageCollectionJob(progress.jobId, {
+          maxItems: AUTO_COLLECT_STEP_ITEMS,
+        });
+      }
+      const result = progress.result;
+      if (
+        result.prunedManifestCount === 0 &&
+        result.reclaimedBlockCount === 0 &&
+        result.reclaimedSegmentCount === 0
+      ) {
+        return;
+      }
+      await yieldToEventLoop();
+    }
   }
 
   async listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]> {
     return this.store.listGarbageCollectionJobs();
   }
 
-  async #planGarbageCollection(maxPlanningItems: number): Promise<GarbageCollectionJobRecord> {
+  async #planGarbageCollection(
+    maxPlanningItems: number,
+    retainRecentVersions: number,
+    retainedVersionMaxAgeMs = Number.POSITIVE_INFINITY,
+  ): Promise<GarbageCollectionJobRecord> {
     const current = await this.store.getCurrentManifest();
     const currentBlockIds = new Set(current?.blockIds ?? []);
+    // Manifest versions are consecutive, so the retained window is a version floor; a version
+    // inside it is still collected once it is older than the window's age.
+    const retainAbove = (current?.version ?? 0) - retainRecentVersions;
+    const retainAfter = this.#now().getTime() - retainedVersionMaxAgeMs;
+    const retained = (manifest: { version: number; createdAt: string }): boolean =>
+      manifest.version > retainAbove && Date.parse(manifest.createdAt) > retainAfter;
     const candidateManifestVersions: number[] = [];
     const candidateBlockIds: string[] = [];
     const candidateSegmentIds: string[] = [];
@@ -7477,25 +7664,46 @@ export class MinnowDatabase {
         candidateSegmentIds.push(id);
       }
     };
-    let manifestCursor: number | null = null;
-    do {
+    // The walk starts past the prefix of history this database has already seen fully
+    // collected — every manifest pruned and none of its blocks left — and extends that prefix
+    // as it goes. A pruned manifest's blocks can only disappear, and a block it shares with a
+    // later manifest is found through that manifest or the job that superseded it, so skipping
+    // the dead prefix loses nothing; it is what keeps a pass proportional to the live history
+    // rather than to everything the database ever committed.
+    let manifestCursor: number | null = this.#collectionWatermark;
+    let deadPrefixEnd = this.#collectionWatermark;
+    let prefixContiguous = true;
+    walk: do {
       const page = await this.store.listManifestPage(manifestCursor, 64);
       for (const manifest of page.records) {
-        if (manifest.version === current?.version) continue;
+        if (manifest.version === current?.version) break walk;
+        if (retained(manifest)) {
+          prefixContiguous = false;
+          continue;
+        }
         const existing = await this.#existingGarbageBlockCandidates(
           manifest.blockIds,
           currentBlockIds,
           remaining(),
         );
-        if (manifest.prunedAt === undefined || existing.length > 0) {
-          candidateManifestVersions.push(manifest.version);
-          addBlocks(existing);
+        if (manifest.prunedAt === undefined) {
+          // Only an unpruned manifest is a pruning candidate: one already pruned would spend a
+          // step's capacity confirming it, and with enough of them in front, the unpruned ones
+          // behind them were never reached at all. Their leftover blocks still count.
+          if (candidateManifestVersions.length < 64)
+            candidateManifestVersions.push(manifest.version);
+          prefixContiguous = false;
+        } else if (prefixContiguous && existing.length === 0) {
+          deadPrefixEnd = manifest.version;
+        } else {
+          prefixContiguous = false;
         }
-        if (remaining() <= 0 || candidateManifestVersions.length === 64) break;
+        addBlocks(existing);
+        if (remaining() <= 0) break walk;
       }
-      if (remaining() <= 0 || candidateManifestVersions.length === 64) break;
       manifestCursor = page.nextCursor;
     } while (manifestCursor !== null);
+    this.#collectionWatermark = deadPrefixEnd;
 
     if (remaining() > 0) {
       let transactionCursor: string | null = null;
@@ -11704,6 +11912,13 @@ function keyToken(type: SimpleDataType, value: BatchValue): string {
 
 function formatValue(value: Exclude<BatchValue, null>): string {
   return value instanceof Date ? value.toISOString() : String(value);
+}
+
+function nonNegativeWholeNumber(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative whole number`);
+  }
+  return value;
 }
 
 function positiveWholeNumber(value: number, name: string): number {

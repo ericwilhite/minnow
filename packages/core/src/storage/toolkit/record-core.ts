@@ -1178,10 +1178,25 @@ export class RecordCore {
       reclaimedBlockBytes,
       updatedAt: input.updatedAt,
     });
+    // A pruned manifest is a tombstone: it cannot be pinned or read, and it roots nothing. The
+    // only use left for its block list is finding the blocks that became garbage when it was
+    // pruned — the ones the current manifest no longer carries — so that is all it keeps.
+    // Keeping the whole list made every commit's manifest cost O(blocks) of memory forever,
+    // and every OPFS checkpoint re-serialize all of them.
+    const currentBlockIds = new Set(
+      this.#currentVersion === null
+        ? []
+        : (this.#manifests.get(this.#currentVersion)?.blockIds ?? []),
+    );
     prunedManifestVersions.forEach((version) => {
       const manifest = this.#manifests.get(version);
-      if (manifest !== undefined)
-        this.#manifests.set(version, { ...manifest, prunedAt: input.updatedAt });
+      if (manifest !== undefined) {
+        this.#manifests.set(version, {
+          ...manifest,
+          prunedAt: input.updatedAt,
+          blockIds: manifest.blockIds.filter((id) => !currentBlockIds.has(id)),
+        });
+      }
     });
     reclaimedSegmentIds.forEach((id) => this.#segments.delete(id));
     this.#garbageCollectionJobs.set(updated.id, updated);

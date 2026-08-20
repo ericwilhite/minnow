@@ -60,7 +60,7 @@ compaction is visible-data-neutral by construction, so cancelling it can never l
 
 ## Garbage collection
 
-Reclaims blocks no live version references any more:
+Reclaims blocks no live version references any more, and prunes the manifests of old versions:
 
 ```ts
 await db.collectGarbage();
@@ -71,6 +71,14 @@ roots it. That is what makes it safe to run while a report is being read: an ope
 [snapshot scope](/docs/engine/transactions#stable-reads) pins its version, and collection skips
 everything that version needs.
 
+It runs automatically by default (`autoCollect`, which follows `autoCompact`): a pass after every
+background fold, whose superseded blocks are what a pass reclaims; a pass every 64 commits, since
+every commit writes a manifest; and a pass a minute after the last commit, so a tab that stops
+writing still shrinks. Background passes keep the 64 most recent versions readable for up to a
+minute, so `query({ version })` on a version you were just handed still finds it. An explicit
+`collectGarbage()` reclaims everything no lease or job pins; pass `retainRecentVersions` to keep a
+window.
+
 The same stepped shape applies:
 
 ```ts
@@ -79,7 +87,9 @@ await db.collectGarbageStep({ jobId, maxItems: 128 });
 
 ## Scheduling
 
-Neither job needs to run on a timer. Reasonable triggers:
+With `autoCompact` and `autoCollect` on, nothing needs scheduling: a scan or a run of commits
+starts a fold, a fold or a quiet minute starts a collection pass, and both run in small steps that
+yield between them. To drive them yourself instead, turn both off and use the stepped calls:
 
 - After a bulk load, compact the tables it touched.
 - On an idle callback, take one step of whatever is outstanding.
