@@ -25,6 +25,9 @@
     "query-engine"
   ],
   "type": "module",
+  "sideEffects": [
+    "./dist/engine/worker.js"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

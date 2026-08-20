@@ -64,6 +64,21 @@ async function createPeopleTable(client: MinnowDatabaseClient): Promise<void> {
 }
 
 describe("MinnowDatabaseClient", () => {
+  it("replays a failed init's reason to calls that arrive after it", async () => {
+    const { clientSide, workerSide } = createBoundary();
+    attachDatabaseWorker(workerSide);
+    // Node has no IndexedDB and none is injected, so the store open fails inside the worker.
+    const client = new MinnowDatabaseClient(clientSide, {
+      store: { kind: "indexeddb", name: "nowhere" },
+    });
+    await expect(client.ready()).rejects.toThrow("IndexedDB is unavailable");
+    // The failure reset the worker for a retry; a pipelined call landing after that reset must
+    // carry the real reason, not a generic "send init first".
+    await expect(client.listTables()).rejects.toThrow(
+      /Database initialization failed: .*IndexedDB is unavailable/,
+    );
+  });
+
   it("initializes, writes, and queries through the boundary", async () => {
     const client = connect();
     await client.ready();

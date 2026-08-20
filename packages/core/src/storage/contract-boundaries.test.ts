@@ -10,8 +10,9 @@
  * 3. **The engine sees only the contract surface.** Engine, plan, and transaction sources
  *    import storage only through its public barrels (`storage/index.js`, `storage/types.js`,
  *    `storage/snapshot.js`) — never an adapter's internals and never the toolkit. The one
- *    place adapters get constructed is the worker host's descriptor switch, and even that
- *    goes through the barrel.
+ *    exception is the worker host's descriptor switch — the composition root — which
+ *    dynamically imports exactly the three adapter entry modules, so a bundler can split them
+ *    into their own chunks and an application ships only the store it opens.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -62,15 +63,18 @@ describe("storage contract boundaries", () => {
   });
 
   it("the engine reaches storage only through its public surface", () => {
+    // The worker host is the composition root: the one module allowed to name the adapter
+    // entry modules, and only those, so its dynamic imports can code-split them.
+    const compositionRoot = join(SRC, "engine", "worker-host.ts");
+    const adapterEntries = ["storage/indexeddb.js", "storage/memory.js", "storage/opfs/index.js"];
     const layers = ["engine", "plan", "transactions"].map((name) => join(SRC, name));
     for (const file of layers.flatMap(sourceFiles)) {
       for (const specifier of importsOf(file)) {
         if (!specifier.includes("/storage/")) continue;
         const surface = specifier.replace(/^(\.\.\/)+/, "");
-        expect(
-          ["storage/index.js", "storage/types.js", "storage/snapshot.js"],
-          `${file} imports ${specifier}`,
-        ).toContain(surface);
+        const allowed = ["storage/index.js", "storage/types.js", "storage/snapshot.js"];
+        if (file === compositionRoot) allowed.push(...adapterEntries);
+        expect(allowed, `${file} imports ${specifier}`).toContain(surface);
       }
     }
   });

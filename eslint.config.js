@@ -80,6 +80,8 @@ export default tseslint.config(
       // Reads the package's own sources off disk to assert the layering rules between the
       // storage contract, the adapter toolkit, and the engine.
       "packages/core/src/storage/contract-boundaries.test.ts",
+      // Bundles the built package with esbuild to prove the storage adapters tree-shake.
+      "packages/core/src/tree-shaking.test.ts",
       "scripts/*.mts",
     ],
     rules: { "no-restricted-imports": "off" },

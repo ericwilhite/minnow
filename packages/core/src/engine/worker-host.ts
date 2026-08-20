@@ -1,9 +1,4 @@
-import {
-  IndexedDbBlockStore,
-  MemoryBlockStore,
-  OpfsBlockStore,
-  type BlockStore,
-} from "../storage/index.js";
+import type { BlockStore } from "../storage/index.js";
 import {
   parseRpcRequest,
   rpcEvent,
@@ -560,6 +555,7 @@ export function attachDatabaseWorker(
   options: AttachDatabaseWorkerOptions = {},
 ): void {
   let initialized: Promise<DatabaseRpcServer> | undefined;
+  let initFailure: unknown;
   scope.addEventListener("message", (event: MessageEvent<unknown>) => {
     let request: RpcRequest | null;
     try {
@@ -571,18 +567,35 @@ export function attachDatabaseWorker(
     }
     if (request === null) return;
     if (request.kind === "rpc-init" && initialized === undefined) {
+      initFailure = undefined;
       const attempt = createServer(scope, request.payload as DatabaseInitPayload, options);
       initialized = attempt;
-      attempt.catch(() => {
-        // Leave the worker reusable: a failed store open (quota, blocked upgrade) may be retried.
-        if (initialized === attempt) initialized = undefined;
+      attempt.catch((error: unknown) => {
+        // Leave the worker reusable: a failed store open (quota, blocked upgrade) may be
+        // retried. Remember why it failed — the client pipelines calls behind init, so the
+        // ones that land after this reset must carry the real reason, not a generic refusal.
+        if (initialized === attempt) {
+          initialized = undefined;
+          initFailure = error;
+        }
       });
     }
     const pending = initialized;
     if (pending === undefined) {
-      scope.postMessage(
-        rpcFailure(request.requestId, new Error("Database is not initialized: send init first")),
-      );
+      const failure =
+        initFailure === undefined
+          ? new Error("Database is not initialized: send init first")
+          : new Error(
+              `Database initialization failed: ${
+                initFailure instanceof Error
+                  ? `${initFailure.name}: ${initFailure.message}`
+                  : typeof initFailure === "string"
+                    ? initFailure
+                    : "unknown reason"
+              }`,
+              { cause: initFailure },
+            );
+      scope.postMessage(rpcFailure(request.requestId, failure));
       return;
     }
     void pending
@@ -608,17 +621,27 @@ async function createServer(
   });
 }
 
+/**
+ * The composition root: the one place adapters are named. Each loads only when its descriptor
+ * asks for it — a bundler splits the adapters into their own chunks, so an application's worker
+ * downloads the store it opens and none of the others.
+ */
 async function createStore(
   descriptor: StoreDescriptor,
   options: AttachDatabaseWorkerOptions,
 ): Promise<BlockStore> {
-  if (descriptor.kind === "memory") return new MemoryBlockStore();
+  if (descriptor.kind === "memory") {
+    const { MemoryBlockStore } = await import("../storage/memory.js");
+    return new MemoryBlockStore();
+  }
   if (descriptor.kind === "opfs") {
+    const { OpfsBlockStore } = await import("../storage/opfs/index.js");
     return OpfsBlockStore.open({
       name: descriptor.name,
       ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
     });
   }
+  const { IndexedDbBlockStore } = await import("../storage/indexeddb.js");
   return IndexedDbBlockStore.open({
     name: descriptor.name,
     ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),

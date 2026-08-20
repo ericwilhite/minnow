@@ -137,7 +137,9 @@ const client = new MinnowDatabaseClient(
 
 The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
 `opfs`, or `memory`) plus `compression`, `rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and
-`bufferPoolBytes`. For anything a message can't carry — a custom `BlockStore`, deterministic
+`bufferPoolBytes`. It loads each storage adapter only when its descriptor asks for it, so a
+bundler splits the adapters into their own chunks and the worker downloads the store it opens,
+not the other two. For anything a message can't carry — a custom `BlockStore`, deterministic
 `now`/`createId` — write your own entry:
 
 ```ts

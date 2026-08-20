@@ -39,9 +39,10 @@ npm install @minnowdb/core
   itself.
 - **Bounded memory** — execution works in batches under a budget you set and spills to storage
   rather than failing. A whole table is never required to be resident.
-- **Small** — about 172 KB gzipped, and no Wasm blob: just over a third of SQLite's WebAssembly
-  build and a thirty-second of PGlite's, both of which download and compile a module before answering
-  anything.
+- **Small** — about 172 KB gzipped with every storage adapter included, and no Wasm blob: just
+  over a third of SQLite's WebAssembly build and a thirty-second of PGlite's, both of which
+  download and compile a module before answering anything. The adapters tree-shake, so an app
+  that uses one store ships less.
 - **Workers first** — a shipped worker entry and a main-thread client with an identical API.
 - **Snapshots** — copy one committed version out as a portable file and load it into any store.
 - **[Typed client](https://minnowdb.com/docs/client/), optional** — `@minnowdb/client` adds a schema-aware query builder with inferred

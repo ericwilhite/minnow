@@ -42,6 +42,9 @@ directories it fetches at run time. Dexie is its shipped `dexie.min.js`; DuckDB-
 bundle's Wasm module plus its worker. Gzip is level 9 throughout, which is what a static host
 serves.
 
+Minnow's number is the whole library, every storage adapter included; the adapters tree-shake,
+so an application that uses one store ships less than the table says.
+
 Size is not the argument on its own — a 5 MB engine that caches well is fine for a tool people
 open every day. It is the argument for a page that has to be interactive on first visit.
 
