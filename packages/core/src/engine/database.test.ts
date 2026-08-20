@@ -7771,7 +7771,12 @@ describe("prepared-input cache and shared read lease", () => {
     expect(result.compacted).toBe(true);
     expect(result.memoryBudgetBytes).toBe(32 * 1024 * 1024);
     expect(result.rowCount).toBe(rows);
-    expect((await database.listVisibleSegments("wide")).length).toBe(1);
+    // The fold publishes the table as bounded level-one partitions: 60k rows at the default
+    // 16,384-row target is four, each a separate segment.
+    const visible = await database.listVisibleSegments("wide");
+    expect(visible.length).toBe(Math.ceil(rows / 16_384));
+    expect(visible.map((segment) => segment.id)).toEqual(result.outputSegmentIds);
+    expect(visible.every((segment) => segment.rowCount <= 16_384)).toBe(true);
     expect(
       (
         await database.query(

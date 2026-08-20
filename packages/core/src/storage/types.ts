@@ -466,6 +466,18 @@ export interface MergeCompactionOutputColumn {
   readonly sourceRanges: readonly MergeCompactionOutputSourceRange[];
 }
 
+/**
+ * One output segment of a partitioned merge: a contiguous run of the canonical merged output,
+ * published as its own level-one partition under its own logical order.
+ */
+export interface MergeOutputPartition {
+  /** Row offset within the canonical merged output. */
+  readonly rowStart: number;
+  readonly rowCount: number;
+  /** The published segment's logical order; strictly increasing across partitions. */
+  readonly logicalOrder: number;
+}
+
 /** An immutable logical replay result followed by a physical, output-driven rewrite. */
 export interface MergeCompactionRewritePlan {
   readonly kind: "merge-v1";
@@ -481,6 +493,13 @@ export interface MergeCompactionRewritePlan {
   readonly sourceSegments: readonly MergeCompactionSourceSegment[];
   readonly columns: readonly MergeCompactionOutputColumn[];
   readonly outputs: readonly RechunkCompactionOutputWindow[];
+  /**
+   * How the output is split into published segments. Missing on plans that publish the whole
+   * output as one segment under `logicalOrder`. When present, the partitions tile the output
+   * contiguously, every output window lies inside one partition, and partition `i` publishes
+   * as the job's output segment ID for `i === 0` and `${outputSegmentId}/${i}` after that.
+   */
+  readonly partitions?: readonly MergeOutputPartition[];
 }
 
 export type CompactionRewritePlan =
@@ -2676,6 +2695,11 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
   if (logicalOrder !== sourceSegments[0]?.logicalOrder) {
     throw new TypeError("Merge logical order must match its earliest source segment");
   }
+  const partitionsValue: unknown = Reflect.get(value, "partitions");
+  const partitions =
+    partitionsValue === undefined
+      ? undefined
+      : normalizeMergeOutputPartitions(partitionsValue, totalRows, outputs);
 
   return {
     kind: "merge-v1",
@@ -2693,7 +2717,65 @@ function normalizeMergeCompactionRewritePlan(value: object): MergeCompactionRewr
     sourceSegments,
     columns,
     outputs,
+    ...(partitions === undefined ? {} : { partitions }),
   };
+}
+
+/**
+ * Output partitions tile the merged output, carry strictly increasing logical orders, and
+ * never split an output window: a window's blocks belong to exactly one published segment.
+ */
+function normalizeMergeOutputPartitions(
+  value: unknown,
+  totalRows: number,
+  outputs: readonly RechunkCompactionOutputWindow[],
+): MergeOutputPartition[] {
+  if (!Array.isArray(value)) throw new TypeError("Merge output partitions must be an array");
+  if ((totalRows === 0) !== (value.length === 0)) {
+    throw new TypeError("Merge output partitions must be empty exactly when no rows survive");
+  }
+  const partitions = value.map((partition, index) => {
+    if (typeof partition !== "object" || partition === null) {
+      throw new TypeError(`Merge output partition ${String(index)} must be an object`);
+    }
+    const label = `Merge output partition ${String(index)}`;
+    return {
+      rowStart: nonNegativeWholeNumber(Reflect.get(partition, "rowStart"), `${label} row start`),
+      rowCount: positiveWholeNumber(Reflect.get(partition, "rowCount"), `${label} row count`),
+      logicalOrder: nonNegativeWholeNumber(
+        Reflect.get(partition, "logicalOrder"),
+        `${label} logical order`,
+      ),
+    };
+  });
+  validateContiguousRows(partitions, totalRows, "Merge output partitions");
+  for (let index = 1; index < partitions.length; index += 1) {
+    const previous = partitions[index - 1];
+    const current = partitions[index];
+    if (
+      previous !== undefined &&
+      current !== undefined &&
+      current.logicalOrder <= previous.logicalOrder
+    ) {
+      throw new RangeError("Merge output partitions must carry strictly increasing logical orders");
+    }
+  }
+  let partitionIndex = 0;
+  for (const output of outputs) {
+    let partition = partitions[partitionIndex];
+    while (partition !== undefined && output.rowStart >= partition.rowStart + partition.rowCount) {
+      partitionIndex += 1;
+      partition = partitions[partitionIndex];
+    }
+    if (
+      partition === undefined ||
+      output.rowStart < partition.rowStart ||
+      output.rowStart + output.rowCount > partition.rowStart + partition.rowCount
+    ) {
+      throw new RangeError("Merge output windows cannot straddle output partitions");
+    }
+  }
+  return partitions;
 }
 
 function normalizeMergeSourceSegment(

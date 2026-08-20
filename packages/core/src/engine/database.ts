@@ -80,6 +80,7 @@ import {
   type MergeCompactionSourceBlock,
   type MergeCompactionSourceColumn,
   type MergeCompactionSourceSegment,
+  type MergeOutputPartition,
   type QueryCatalogState,
   type RowIdRange,
   type RechunkCompactionOutputWindow,
@@ -203,6 +204,12 @@ const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 const DEFAULT_COMPACTION_MINIMUM_LEVEL_ZERO_SEGMENTS = 2;
 const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_SEGMENTS = 64;
 const DEFAULT_COMPACTION_MAXIMUM_LEVEL_ZERO_STORED_BYTES = 64 * 1024 * 1024;
+/**
+ * Rows a keyed fold aims to keep in one level-one partition. A fold rewrites only the
+ * partitions its deltas touch, so this bounds how much one touched key costs to absorb; the
+ * table's partition count, and with it the per-query block count, grows as rows divided by it.
+ */
+const DEFAULT_COMPACTION_PARTITION_ROWS = 16_384;
 const DEFAULT_LEVEL_TWO_MAX_WRITE_AMPLIFICATION = 16;
 const MAX_COMPACTION_TARGET_BLOCK_BYTES = 64 * 1024 * 1024;
 const MAX_BLOCK_ENVELOPE_BYTES = 1024;
@@ -241,9 +248,10 @@ const AUTO_COLLECT_RETAINED_JOB_RECORDS = 8;
 /** Output blocks one background compaction step writes before yielding to the event loop. */
 const AUTO_COMPACT_STEP_BLOCKS = 4;
 /**
- * Level-zero segments one background fold may absorb. Folding rewrites the table's anchor, so
- * absorbing everything pending in one pass costs one rewrite where the default would cost
- * several; the stored-bytes ceiling still bounds the pass.
+ * Level-zero segments one background fold may absorb. A fold rewrites every partition its
+ * deltas touch, and a partition touched by several deltas is rewritten once, so absorbing
+ * everything pending in one pass costs one rewrite of those partitions where the default would
+ * cost several; the stored-bytes ceiling still bounds the pass.
  */
 const AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS = 256;
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
@@ -579,6 +587,12 @@ export interface CompactTableOptions {
   maxLevel0Segments?: number;
   /** Target maximum stored L0 bytes promoted by one job. The L1 anchor is excluded. */
   maxLevel0StoredBytes?: number;
+  /**
+   * Target maximum rows per level-one partition a keyed fold publishes. A fold rewrites only
+   * the partitions its deltas touch, so smaller partitions make folds cheaper and scans read
+   * more blocks. Ignored by keyless tables and by L2 promotion.
+   */
+  partitionRows?: number;
   /** Number of immutable output blocks processed before yielding and checkpointing. */
   maxBlocksPerStep?: number;
   /** Output level. L2 is the append-only row-range partition policy. */
@@ -613,6 +627,8 @@ export interface CompactTableResult {
   sourceSegmentCount: number;
   sourceBlockCount: number;
   outputSegmentId: string | null;
+  /** Every published output segment; a keyed fold publishes one per partition it wrote. */
+  outputSegmentIds?: string[];
   outputBlockCount: number;
   rowCount: number;
   sourceStoredBytes: number;
@@ -786,6 +802,14 @@ export interface MinnowDatabaseOptions {
    * caller.
    */
   autoCollect?: boolean;
+  /**
+   * Defaults for every compaction this database plans, background folds included. A call's
+   * own `CompactTableOptions` override them.
+   */
+  compaction?: {
+    /** Target maximum rows per level-one partition of a keyed table. Defaults to 16,384. */
+    partitionRows?: number;
+  };
 }
 
 export interface QuerySpillCleanupOptions {
@@ -981,6 +1005,7 @@ export class MinnowDatabase {
   readonly #artifactCache: ArtifactCache;
   readonly #ftsAutoIndexRows: number;
   readonly #autoCompact: boolean;
+  readonly #compactionPartitionRows: number;
   readonly #autoCollect: boolean;
   /** Data commits since the last background collection pass. */
   #commitsSinceCollection = 0;
@@ -1065,6 +1090,10 @@ export class MinnowDatabase {
     this.#ftsAutoIndexRows = options.ftsAutoIndexRows ?? 4096;
     this.#autoCompact = options.autoCompact ?? true;
     this.#autoCollect = options.autoCollect ?? this.#autoCompact;
+    this.#compactionPartitionRows = positiveWholeNumber(
+      options.compaction?.partitionRows ?? DEFAULT_COMPACTION_PARTITION_ROWS,
+      "Compaction partition rows",
+    );
     if (!Number.isSafeInteger(this.#ftsAutoIndexRows) || this.#ftsAutoIndexRows < 0) {
       throw new RangeError(
         "Full-text auto-index row threshold must be a non-negative whole number",
@@ -7906,10 +7935,7 @@ export class MinnowDatabase {
           );
           addSegments(
             await this.#existingGarbageSegmentCandidates(
-              [
-                ...job.sourceSegmentIds,
-                ...(job.outputSegmentId === null ? [] : [job.outputSegmentId]),
-              ],
+              [...job.sourceSegmentIds, ...compactionOutputSegmentIds(job)],
               remaining(),
             ),
           );
@@ -8071,12 +8097,61 @@ export class MinnowDatabase {
           )
         : undefined;
 
-    let anchor: SegmentRecord | undefined;
+    const targetBlockBytes = positiveWholeNumber(
+      options.targetBlockBytes ?? DEFAULT_COMPACTION_TARGET_BLOCK_BYTES,
+      "Compaction target block bytes",
+    );
+    if (targetBlockBytes > MAX_COMPACTION_TARGET_BLOCK_BYTES) {
+      throw new RangeError(
+        `Compaction target block bytes cannot exceed ${String(MAX_COMPACTION_TARGET_BLOCK_BYTES)}`,
+      );
+    }
+    const outputCompression = validateCompression(
+      options.outputCompression ?? "gzip",
+      "Compaction output compression",
+    );
+    if (
+      getCompressionMemoryBound(outputCompression, targetBlockBytes).maximumOutputBytes >
+      MAX_COMPACTION_TARGET_BLOCK_BYTES
+    ) {
+      throw new RangeError(
+        `Compaction target block bytes exceed the ${outputCompression} worst-case format limit`,
+      );
+    }
+    const memoryBudgetBytes = positiveWholeNumber(
+      options.memoryBudgetBytes ?? DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
+      "Compaction memory budget",
+    );
+    const partitionRows = positiveWholeNumber(
+      options.partitionRows ?? this.#compactionPartitionRows,
+      "Compaction partition rows",
+    );
+
+    let anchors: readonly SegmentRecord[] = [];
     let level0Segments: readonly SegmentRecord[];
     let effectiveMinimumLevel0Segments: number;
     let outputPartitionOrdinal: number | undefined;
     let keyedLevelTwo = false;
-    if (targetLevel === 1) {
+    let keyedLevelOne: KeyedLevelOneLayout | undefined;
+    if (targetLevel === 1 && table.uniqueKeyColumnId !== undefined) {
+      // Keyed L1: a prefix of level-one partitions, then level-zero history. A fold rewrites
+      // only the partitions the selected deltas touch (and the tail partition new rows join),
+      // so which partitions it sources is decided after the level-zero selection below.
+      const layout = keyedLevelOneLayout(visibleSegments);
+      if (layout === null) {
+        return compactTableSkipped(
+          table.name,
+          "unsupported-level-layout",
+          visibleSegments,
+          visibleBlockIds,
+          version,
+        );
+      }
+      keyedLevelOne = layout;
+      level0Segments = layout.level0Segments;
+      effectiveMinimumLevel0Segments =
+        layout.partitions.length > 0 ? minimumLevel0Segments : Math.max(2, minimumLevel0Segments);
+    } else if (targetLevel === 1) {
       const firstLevel = visibleSegments[0]?.level ?? 0;
       const hasAnchor = firstLevel === 1;
       const level0Offset = hasAnchor ? 1 : 0;
@@ -8092,7 +8167,7 @@ export class MinnowDatabase {
           version,
         );
       }
-      anchor = hasAnchor ? visibleSegments[0] : undefined;
+      anchors = hasAnchor ? visibleSegments.slice(0, 1) : [];
       level0Segments = visibleSegments.slice(level0Offset);
       effectiveMinimumLevel0Segments = hasAnchor
         ? minimumLevel0Segments
@@ -8103,9 +8178,9 @@ export class MinnowDatabase {
         (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
       )
     ) {
-      // Keyed multi-range L2: merge (optional anchor + oldest level-zero prefix) into a new
-      // span-carrying partition. Published partitions are never rewritten; mutation kinds
-      // without a unique key cannot merge and keep the materialized skip.
+      // Keyed multi-range L2: merge (the level-one partitions + oldest level-zero prefix) into
+      // a new span-carrying partition. Published partitions are never rewritten; mutation
+      // kinds without a unique key cannot merge and keep the materialized skip.
       if (table.uniqueKeyColumnId === undefined) {
         return compactTableSkipped(
           table.name,
@@ -8125,7 +8200,7 @@ export class MinnowDatabase {
           version,
         );
       }
-      anchor = layout.anchor;
+      anchors = layout.anchors;
       level0Segments = layout.level0Segments;
       effectiveMinimumLevel0Segments = minimumLevel0Segments;
       outputPartitionOrdinal = layout.levelTwoSegments.length;
@@ -8154,27 +8229,72 @@ export class MinnowDatabase {
         version,
       );
     }
-    const selection = await this.#selectCompactionSources(
-      anchor,
+    if (version === null) throw new Error("Visible compaction segments require a manifest");
+    const level0Selection = await this.#selectLevelZeroSources(
       level0Segments,
       effectiveMinimumLevel0Segments,
       maxLevel0Segments,
       maxLevel0StoredBytes,
       snapshot,
     );
+    let partitioning: KeyedPartitioning | undefined;
+    if (keyedLevelOne !== undefined) {
+      const keyColumn = getUniqueKeyColumn(table);
+      if (keyColumn === undefined) {
+        throw new Error(`Mutation compaction requires a unique key: ${table.name}`);
+      }
+      const touched = await this.#touchedPartitionIds(
+        keyColumn,
+        keyedLevelOne.partitions,
+        level0Selection.segments,
+        memoryBudgetBytes,
+        snapshot,
+      );
+      // New rows join the last partition while it is small, or when it is being rewritten
+      // anyway; otherwise they open a new partition behind it and it stays untouched.
+      const last = keyedLevelOne.partitions[keyedLevelOne.partitions.length - 1];
+      const bearsNewRows = level0Selection.segments.some((segment) =>
+        mergeSourceBearsRows(segment.kind ?? "insert"),
+      );
+      const absorbsTail =
+        last !== undefined &&
+        bearsNewRows &&
+        (touched.has(last.id) || last.rowCount < partitionRows);
+      anchors = keyedLevelOne.partitions.filter(
+        (partition) => touched.has(partition.id) || (absorbsTail && partition.id === last.id),
+      );
+      partitioning = {
+        partitions: keyedLevelOne.partitions,
+        partitionRows,
+        absorbsTail,
+        nextLevelZeroOrder: level0Selection.nextLogicalOrder ?? version + 1,
+      };
+    }
+    const anchorMeasurement = await this.#measureCompactionSources(
+      anchors,
+      level0Selection.blockIds,
+      snapshot,
+    );
+    const selection = {
+      sourceSegments: [...anchors, ...level0Selection.segments],
+      level0SourceStoredBytes: level0Selection.storedBytes,
+      anchorSourceStoredBytes: anchorMeasurement.storedBytes,
+    };
     const sourceSegments = selection.sourceSegments;
     const sourceBlockIds = uniqueSegmentBlockIds(sourceSegments);
     const hasContiguousSourceRowIds = hasContiguousRowIds(sourceSegments);
     const hasPositiveSourceRowIds = (sourceSegments[0]?.rowIdStart ?? 0n) > 0n;
-    // A keyed L2 promotion always merges: one uniform partition shape (a full-row base with
-    // row-ID spans) regardless of whether the selected prefix happens to be pure inserts.
-    const requiresMerge = keyedLevelTwo
-      ? true
-      : targetLevel === 1 &&
-        (sourceSegments.some(
-          (segment) => (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
-        ) ||
-          (!hasContiguousSourceRowIds && table.uniqueKeyColumnId !== undefined));
+    // A keyed fold always merges: one uniform partition shape (a full-row base with row-ID
+    // spans, bounded by `partitionRows`) regardless of whether the selected prefix happens to
+    // be pure inserts.
+    const requiresMerge =
+      keyedLevelTwo || keyedLevelOne !== undefined
+        ? true
+        : targetLevel === 1 &&
+          sourceSegments.some(
+            (segment) =>
+              (segment.kind ?? "insert") !== "insert" || segment.rowIdSpans !== undefined,
+          );
     if (
       !requiresMerge &&
       (!hasContiguousSourceRowIds || (targetLevel === 2 && !hasPositiveSourceRowIds))
@@ -8187,33 +8307,7 @@ export class MinnowDatabase {
         version,
       );
     }
-    if (version === null) throw new Error("Visible compaction segments require a manifest");
 
-    const targetBlockBytes = positiveWholeNumber(
-      options.targetBlockBytes ?? DEFAULT_COMPACTION_TARGET_BLOCK_BYTES,
-      "Compaction target block bytes",
-    );
-    if (targetBlockBytes > MAX_COMPACTION_TARGET_BLOCK_BYTES) {
-      throw new RangeError(
-        `Compaction target block bytes cannot exceed ${String(MAX_COMPACTION_TARGET_BLOCK_BYTES)}`,
-      );
-    }
-    const outputCompression = validateCompression(
-      options.outputCompression ?? "gzip",
-      "Compaction output compression",
-    );
-    if (
-      getCompressionMemoryBound(outputCompression, targetBlockBytes).maximumOutputBytes >
-      MAX_COMPACTION_TARGET_BLOCK_BYTES
-    ) {
-      throw new RangeError(
-        `Compaction target block bytes exceed the ${outputCompression} worst-case format limit`,
-      );
-    }
-    const memoryBudgetBytes = positiveWholeNumber(
-      options.memoryBudgetBytes ?? DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
-      "Compaction memory budget",
-    );
     let mergePlan: MergeCompactionRewritePlan | undefined;
     if (requiresMerge) {
       try {
@@ -8224,6 +8318,7 @@ export class MinnowDatabase {
           outputCompression,
           memoryBudgetBytes,
           snapshot,
+          partitioning,
         );
       } catch (error) {
         // A keyed L2 prefix whose mutations reference keys living in already-published
@@ -8384,25 +8479,56 @@ export class MinnowDatabase {
     }
   }
 
-  async #selectCompactionSources(
-    anchor: SegmentRecord | undefined,
+  /**
+   * Sums the stored bytes of the given segments' blocks, refusing a block that appears twice
+   * among them or in `seenBlockIds` — a source block may only be superseded once.
+   */
+  async #measureCompactionSources(
+    segments: readonly SegmentRecord[],
+    seenBlockIds: ReadonlySet<string>,
+    snapshot: LeasedSnapshot,
+  ): Promise<{ storedBytes: number; blockIds: string[] }> {
+    let total = 0;
+    const blockIds: string[] = [];
+    const measuredBlockIds = new Set<string>();
+    for (const segment of segments) {
+      for (const blockId of Object.values(segment.columnBlockIds).flat()) {
+        if (seenBlockIds.has(blockId) || measuredBlockIds.has(blockId)) {
+          throw new Error(`Compaction source block is referenced more than once: ${blockId}`);
+        }
+        measuredBlockIds.add(blockId);
+        blockIds.push(blockId);
+        await this.#renewInternalLeaseIfNeeded(snapshot);
+        const bytes = await this.store.getBlock(blockId);
+        if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
+        total = safeWholeNumberSum([total, bytes.byteLength], "Compaction selected stored bytes");
+      }
+    }
+    return { storedBytes: total, blockIds };
+  }
+
+  /**
+   * The oldest level-zero prefix one job promotes: whole equal-order groups, at least the
+   * minimum, and past it no more than the segment and stored-byte ceilings allow. Also reports
+   * the order of the first segment left behind, which bounds the orders a fold may publish.
+   */
+  async #selectLevelZeroSources(
     level0Segments: readonly SegmentRecord[],
     minimumLevel0Segments: number,
     maxLevel0Segments: number,
     maxLevel0StoredBytes: number,
     snapshot: LeasedSnapshot,
   ): Promise<{
-    sourceSegments: SegmentRecord[];
-    level0SourceStoredBytes: number;
-    anchorSourceStoredBytes: number;
+    segments: SegmentRecord[];
+    storedBytes: number;
+    blockIds: Set<string>;
+    nextLogicalOrder: number | null;
   }> {
     const transactions = new Map(
-      (
-        await this.#transactionRecordsForSegments([
-          ...(anchor === undefined ? [] : [anchor]),
-          ...level0Segments,
-        ])
-      ).map((record) => [record.id, record]),
+      (await this.#transactionRecordsForSegments(level0Segments)).map((record) => [
+        record.id,
+        record,
+      ]),
     );
     const logicalOrder = (segment: SegmentRecord): number => {
       const owner = transactions.get(segment.transactionId);
@@ -8412,50 +8538,10 @@ export class MinnowDatabase {
       return segment.logicalOrder ?? owner.committedVersion;
     };
     const seenBlockIds = new Set<string>();
-    const measureStoredBytes = async (
-      segments: readonly SegmentRecord[],
-    ): Promise<{ storedBytes: number; blockIds: string[]; duplicateBlockId: string | null }> => {
-      let total = 0;
-      const blockIds: string[] = [];
-      const measuredBlockIds = new Set<string>();
-      let duplicateBlockId: string | null = null;
-      for (const segment of segments) {
-        for (const blockId of Object.values(segment.columnBlockIds).flat()) {
-          if (seenBlockIds.has(blockId) || measuredBlockIds.has(blockId)) {
-            duplicateBlockId ??= blockId;
-          }
-          measuredBlockIds.add(blockId);
-          blockIds.push(blockId);
-          await this.#renewInternalLeaseIfNeeded(snapshot);
-          const bytes = await this.store.getBlock(blockId);
-          if (bytes === undefined)
-            throw new Error(`Compaction source block is missing: ${blockId}`);
-          total = safeWholeNumberSum([total, bytes.byteLength], "Compaction selected stored bytes");
-        }
-      }
-      return { storedBytes: total, blockIds, duplicateBlockId };
-    };
-    const acceptMeasurement = (measurement: {
-      blockIds: readonly string[];
-      duplicateBlockId: string | null;
-    }): void => {
-      if (measurement.duplicateBlockId !== null) {
-        throw new Error(
-          `Compaction source block is referenced more than once: ${measurement.duplicateBlockId}`,
-        );
-      }
-      measurement.blockIds.forEach((blockId) => seenBlockIds.add(blockId));
-    };
-
-    let anchorSourceStoredBytes = 0;
-    if (anchor !== undefined) {
-      const anchorMeasurement = await measureStoredBytes([anchor]);
-      acceptMeasurement(anchorMeasurement);
-      anchorSourceStoredBytes = anchorMeasurement.storedBytes;
-    }
-    const selectedLevel0: SegmentRecord[] = [];
-    let level0SourceStoredBytes = 0;
-    for (let start = 0; start < level0Segments.length;) {
+    const selected: SegmentRecord[] = [];
+    let storedBytes = 0;
+    let start = 0;
+    while (start < level0Segments.length) {
       const first = level0Segments[start];
       if (first === undefined) throw new Error("Compaction L0 source selection is unavailable");
       const order = logicalOrder(first);
@@ -8467,34 +8553,136 @@ export class MinnowDatabase {
       }
       const group = level0Segments.slice(start, end);
       if (
-        selectedLevel0.length >= minimumLevel0Segments &&
-        selectedLevel0.length + group.length > maxLevel0Segments
+        selected.length >= minimumLevel0Segments &&
+        selected.length + group.length > maxLevel0Segments
       ) {
         break;
       }
-      const groupMeasurement = await measureStoredBytes(group);
+      const measurement = await this.#measureCompactionSources(group, seenBlockIds, snapshot);
       if (
-        selectedLevel0.length >= minimumLevel0Segments &&
-        groupMeasurement.storedBytes > maxLevel0StoredBytes - level0SourceStoredBytes
+        selected.length >= minimumLevel0Segments &&
+        measurement.storedBytes > maxLevel0StoredBytes - storedBytes
       ) {
         break;
       }
-      acceptMeasurement(groupMeasurement);
-      selectedLevel0.push(...group);
-      level0SourceStoredBytes = safeWholeNumberSum(
-        [level0SourceStoredBytes, groupMeasurement.storedBytes],
+      measurement.blockIds.forEach((blockId) => seenBlockIds.add(blockId));
+      selected.push(...group);
+      storedBytes = safeWholeNumberSum(
+        [storedBytes, measurement.storedBytes],
         "Compaction selected L0 stored bytes",
       );
       start = end;
     }
-    if (selectedLevel0.length < minimumLevel0Segments) {
+    if (selected.length < minimumLevel0Segments) {
       throw new Error("Compaction source selection did not satisfy its minimum L0 segment count");
     }
+    const next = level0Segments[start];
     return {
-      sourceSegments: anchor === undefined ? selectedLevel0 : [anchor, ...selectedLevel0],
-      level0SourceStoredBytes,
-      anchorSourceStoredBytes,
+      segments: selected,
+      storedBytes,
+      blockIds: seenBlockIds,
+      nextLogicalOrder: next === undefined ? null : logicalOrder(next),
     };
+  }
+
+  /**
+   * Which level-one partitions the selected deltas reach into: those holding a key that some
+   * delete, update, or upsert among them names. Inserts and upserts of new keys touch nothing;
+   * their rows join the tail. Key blocks whose zone map rules every referenced key out are
+   * skipped from the header, so a sorted key costs one decoded block per partition at most and
+   * usually none; the referenced-key set is the same size the merge planner's is.
+   */
+  async #touchedPartitionIds(
+    keyColumn: TableColumnRecord,
+    partitions: readonly SegmentRecord[],
+    level0Segments: readonly SegmentRecord[],
+    memoryBudgetBytes: number,
+    snapshot: LeasedSnapshot,
+  ): Promise<Set<string>> {
+    const touched = new Set<string>();
+    if (partitions.length === 0) return touched;
+    const deltas = level0Segments.filter((segment) =>
+      mergeSourceReferencesKeys(segment.kind ?? "insert"),
+    );
+    if (deltas.length === 0) return touched;
+    const referencedBytes = safeWholeNumberProduct(
+      deltas.reduce((total, segment) => total + segment.rowCount, 0),
+      MERGE_PLANNER_KEY_BYTES,
+      "Compaction referenced keys",
+    );
+    if (referencedBytes > memoryBudgetBytes) {
+      throw new CompactionMemoryBudgetError(memoryBudgetBytes, referencedBytes);
+    }
+    const referenced = new Set<OverlayKey>();
+    for (const segment of deltas) {
+      await this.#forEachSegmentKey(segment, keyColumn, snapshot, (value) => {
+        referenced.add(overlayKeyOf(keyColumn.type, value));
+      });
+    }
+    const predicate = touchedKeyPredicate(keyColumn, referenced);
+    const descriptions =
+      predicate === undefined
+        ? new Map<string, ReturnType<typeof inspectBlock>>()
+        : await this.#zoneDescriptions(
+            partitions.flatMap((partition) => partition.columnBlockIds[keyColumn.id] ?? []),
+            snapshot,
+          );
+    for (const partition of partitions) {
+      const blockIds = partition.columnBlockIds[keyColumn.id] ?? [];
+      if (blockIds.length === 0) {
+        throw new Error(`Partition has no key column blocks: ${partition.id}`);
+      }
+      for (const blockId of blockIds) {
+        const description = descriptions.get(blockId);
+        if (
+          predicate !== undefined &&
+          description !== undefined &&
+          !zoneMapCanMatch(description, predicate)
+        ) {
+          continue;
+        }
+        await this.#renewInternalLeaseIfNeeded(snapshot);
+        const bytes = await this.store.getBlock(blockId);
+        if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
+        const decoded = await decodeBlock(bytes);
+        if (decoded.column.type !== keyColumn.type) {
+          throw new Error(`Compaction source block differs from table schema: ${blockId}`);
+        }
+        if (
+          decoded.column.values.some((value) => referenced.has(overlayKeyOf(keyColumn.type, value)))
+        ) {
+          touched.add(partition.id);
+          break;
+        }
+      }
+    }
+    return touched;
+  }
+
+  /** Decodes a segment's key column in row order, one block resident at a time. */
+  async #forEachSegmentKey(
+    segment: SegmentRecord,
+    keyColumn: TableColumnRecord,
+    snapshot: LeasedSnapshot,
+    action: (value: BatchValue, rowIndex: number) => void,
+  ): Promise<void> {
+    let rowIndex = 0;
+    for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      const bytes = await this.store.getBlock(blockId);
+      if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
+      const decoded = await decodeBlock(bytes);
+      if (decoded.column.type !== keyColumn.type) {
+        throw new Error(`Compaction source block differs from table schema: ${blockId}`);
+      }
+      for (const value of decoded.column.values) {
+        action(value, rowIndex);
+        rowIndex += 1;
+      }
+    }
+    if (rowIndex !== segment.rowCount) {
+      throw new Error(`Mutation segment key rows differ: ${segment.id}`);
+    }
   }
 
   async #createRechunkCompactionPlan(
@@ -8601,6 +8789,12 @@ export class MinnowDatabase {
     };
   }
 
+  /**
+   * Plans a merge of the sources into one canonical output. With `partitioning`, the output
+   * is also cut into level-one partitions: each rewritten source partition keeps its rows (and
+   * its logical order) in place, new rows form the tail, and every run is chunked to at most
+   * `partitionRows` where the integer orders between neighbours leave room.
+   */
   async #createMergeCompactionPlan(
     table: TableRecord,
     sourceSegments: readonly SegmentRecord[],
@@ -8608,6 +8802,7 @@ export class MinnowDatabase {
     outputCompression: Compression,
     memoryBudgetBytes: number,
     snapshot: LeasedSnapshot,
+    partitioning?: KeyedPartitioning,
   ): Promise<MergeCompactionRewritePlan> {
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
@@ -8704,6 +8899,15 @@ export class MinnowDatabase {
     );
     const { columns, rowIdSpans, totalRows } = resolved;
     const rowIdEnvelope = rowIdSpanEnvelope(rowIdSpans);
+    const partitions =
+      partitioning === undefined
+        ? undefined
+        : planOutputPartitions(
+            partitioning,
+            describedSegments,
+            resolved.sourceOutputRowStarts,
+            totalRows,
+          );
     let outputs: RechunkCompactionOutputWindow[] = [];
     if (totalRows > 0) {
       let maximumEncodedBytesPerRow = 0;
@@ -8728,12 +8932,16 @@ export class MinnowDatabase {
         1,
         Math.min(0xffff_ffff, Math.floor(targetBlockBytes / maximumEncodedBytesPerRow)),
       );
+      // Windows never straddle a partition: each partition's blocks are its own.
       const estimatedOutputs: RechunkCompactionOutputWindow[] = [];
-      for (let rowStart = 0; rowStart < totalRows; rowStart += rowsPerOutput) {
-        estimatedOutputs.push({
-          rowStart,
-          rowCount: Math.min(rowsPerOutput, totalRows - rowStart),
-        });
+      for (const region of partitions ?? [{ rowStart: 0, rowCount: totalRows }]) {
+        const regionEnd = region.rowStart + region.rowCount;
+        for (let rowStart = region.rowStart; rowStart < regionEnd; rowStart += rowsPerOutput) {
+          estimatedOutputs.push({
+            rowStart,
+            rowCount: Math.min(rowsPerOutput, regionEnd - rowStart),
+          });
+        }
       }
       outputs = await this.#refinePhysicalOutputWindows(
         mergePhysicalColumns(columns, describedSegments),
@@ -8758,6 +8966,7 @@ export class MinnowDatabase {
       sourceSegments: describedSegments,
       columns,
       outputs,
+      ...(partitions === undefined ? {} : { partitions }),
     };
   }
 
@@ -8792,6 +9001,8 @@ export class MinnowDatabase {
     columns: MergeCompactionOutputColumn[];
     rowIdSpans: RowIdSpan[];
     totalRows: number;
+    /** The output row at which each row-bearing source's surviving rows begin. */
+    sourceOutputRowStarts: Map<string, number>;
   }> {
     const plannerMemoryBytes = mergePlannerMemoryBound(table, segments, keyColumn.id);
     if (plannerMemoryBytes > memoryBudgetBytes) {
@@ -8890,7 +9101,8 @@ export class MinnowDatabase {
       const keys = deltaKeys.get(segment.segmentId);
       if (keys !== undefined) {
         keys.forEach(visit);
-      } else {
+      } else if (touched.size > 0) {
+        // With nothing referencing keys there is nothing to track: every row passes through.
         await this.#forEachMergeSourceKey(segment, keyColumn, snapshot, (value, rowIndex) => {
           visit(overlayKeyOf(keyColumn.type, value), rowIndex);
         });
@@ -8903,9 +9115,11 @@ export class MinnowDatabase {
 
     // Pass 3: the live slots in slot order, as runs wherever nothing touched them.
     const output = new MergeOutputBuilder(table.columns);
+    const sourceOutputRowStarts = new Map<string, number>();
     slotBase = 0;
     for (const segment of segments) {
       if (!mergeSourceBearsRows(segment.kind)) continue;
+      sourceOutputRowStarts.set(segment.segmentId, output.totalRows);
       let runStart = -1;
       for (let rowIndex = 0; rowIndex < segment.rowCount; rowIndex += 1) {
         const slot = slotBase + rowIndex;
@@ -8922,7 +9136,7 @@ export class MinnowDatabase {
       if (runStart >= 0) output.appendRun(segment, runStart, segment.rowCount - runStart);
       slotBase += segment.rowCount;
     }
-    return output.finish();
+    return { ...output.finish(), sourceOutputRowStarts };
   }
 
   async #forEachMergeSourceKey(
@@ -9274,60 +9488,37 @@ export class MinnowDatabase {
         }
       } else {
         if (outputSegmentId === null) throw new Error("Compaction output segment ID is missing");
-        const desiredOutputSegment: SegmentRecord = {
-          id: outputSegmentId,
-          tableId: table.id,
-          transactionId: transaction.id,
-          rowCount: outputRowCount,
-          rowIdStart:
-            rewritePlan.kind === "copy-v1" ? (first?.rowIdStart ?? 0n) : rewritePlan.rowIdStart,
-          rowIdEndExclusive:
-            rewritePlan.kind === "copy-v1"
-              ? (last?.rowIdEndExclusive ?? 0n)
-              : rewritePlan.rowIdEndExclusive,
-          columnBlockIds:
-            rewritePlan.kind === "copy-v1"
-              ? compactionOutputColumns(table, sourceSegments, job.id)
-              : physicalOutputColumns(job.id, rewritePlan),
-          kind: rewritePlan.kind === "merge-v1" ? "base" : "insert",
-          ...(table.uniqueKeyColumnId === undefined
-            ? {}
-            : { keyColumnId: table.uniqueKeyColumnId }),
-          level: job.targetLevel,
-          ...(job.outputPartitionOrdinal === undefined
-            ? {}
-            : { partitionOrdinal: job.outputPartitionOrdinal }),
-          logicalOrder:
-            rewritePlan.kind === "copy-v1"
-              ? await this.#firstLogicalOrder(sourceSegments)
-              : rewritePlan.logicalOrder,
-          ...(rewritePlan.kind === "merge-v1"
-            ? { rowIdSpans: structuredClone(rewritePlan.rowIdSpans) }
-            : {}),
-          createdAt: this.#now().toISOString(),
-        };
-        const outputSegment = await this.store.getSegment(outputSegmentId);
-        if (outputSegment === undefined) {
-          await transaction.stageSegment(desiredOutputSegment);
-        } else if (outputSegment.transactionId === transaction.id) {
-          if (!sameCompactionSegment(outputSegment, desiredOutputSegment)) {
-            throw new Error(`A resumed compaction segment differs: ${outputSegmentId}`);
-          }
-          await transaction.stageExistingSegment(outputSegmentId);
-        } else {
-          const owner = await this.store.getTransaction(outputSegment.transactionId);
-          if (
-            (owner !== undefined && owner.status !== "aborted") ||
-            !sameCompactionSegment(outputSegment, desiredOutputSegment)
-          ) {
-            throw new Error(`Compaction output segment cannot be adopted: ${outputSegmentId}`);
-          }
-          const visible = await this.#unprunedManifestContainsAll(expectedOutputIds);
-          if (visible) {
-            throw new Error(`Compaction output segment is already visible: ${outputSegmentId}`);
-          }
-          await this.store.removeSegment(outputSegmentId);
-          await transaction.stageSegment(desiredOutputSegment);
+        const createdAt = this.#now().toISOString();
+        const desiredOutputSegments: SegmentRecord[] =
+          rewritePlan.kind === "copy-v1"
+            ? [
+                {
+                  id: outputSegmentId,
+                  tableId: table.id,
+                  transactionId: transaction.id,
+                  rowCount: outputRowCount,
+                  rowIdStart: first?.rowIdStart ?? 0n,
+                  rowIdEndExclusive: last?.rowIdEndExclusive ?? 0n,
+                  columnBlockIds: compactionOutputColumns(table, sourceSegments, job.id),
+                  kind: "insert",
+                  ...(table.uniqueKeyColumnId === undefined
+                    ? {}
+                    : { keyColumnId: table.uniqueKeyColumnId }),
+                  level: job.targetLevel,
+                  ...(job.outputPartitionOrdinal === undefined
+                    ? {}
+                    : { partitionOrdinal: job.outputPartitionOrdinal }),
+                  logicalOrder: await this.#firstLogicalOrder(sourceSegments),
+                  createdAt,
+                },
+              ]
+            : compactionOutputSegments(table, job, rewritePlan, transaction.id, createdAt);
+        for (const desiredOutputSegment of desiredOutputSegments) {
+          await this.#stageCompactionOutputSegment(
+            transaction,
+            desiredOutputSegment,
+            expectedOutputIds,
+          );
         }
       }
       if (job.state !== "ready") {
@@ -9626,6 +9817,24 @@ export class MinnowDatabase {
         throw new Error(`Concurrent segment shares a compaction source block: ${segment.id}`);
       }
     }
+    if (
+      job.outputPartitionOrdinal === undefined &&
+      job.targetLevel === 1 &&
+      plan.kind !== "copy-v1"
+    ) {
+      const table = await this.store.getTable(job.tableId);
+      if (table === undefined) throw new Error(`Compaction table is missing: ${job.tableId}`);
+      if (table.uniqueKeyColumnId !== undefined) {
+        await this.#assertKeyedLevelOneSnapshotOrder(
+          job,
+          plan,
+          table,
+          visibleSegments,
+          transactions,
+        );
+        return;
+      }
+    }
     if (job.outputPartitionOrdinal !== undefined) {
       if (plan.kind === "rechunk-v1") {
         await this.#assertLevelTwoSnapshotOrder(job, plan, snapshot, transactions);
@@ -9709,6 +9918,107 @@ export class MinnowDatabase {
         retainedPartitionOrdinals.some((ordinal, index) => ordinal !== index)
       ) {
         throw new Error("Concurrent segments violate the planned L2 layout");
+      }
+    }
+  }
+
+  /**
+   * The keyed level-one rebase rule. The sources must be exactly as planned. Every partition
+   * the plan left alone must still be visible and unchanged — they are read back from the
+   * planning snapshot's manifest, which the job roots until it ends, so the check needs no
+   * record of its own. Every other visible segment must be level-zero history committed after
+   * the latest source and ordered after every partition the job publishes, so the output
+   * slots into the same place relative to the deltas it did not absorb.
+   */
+  async #assertKeyedLevelOneSnapshotOrder(
+    job: CompactionJobRecord,
+    plan: PhysicalCompactionRewritePlan,
+    table: TableRecord,
+    visibleSegments: readonly SegmentRecord[],
+    transactions: ReadonlyMap<string, { status: string; committedVersion: number | null }>,
+  ): Promise<void> {
+    const sourceIds = new Set(job.sourceSegmentIds);
+    const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
+    const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
+    if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
+      throw new Error(
+        `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
+      );
+    }
+    const plannedVisible = await this.#visibleSegmentRecords(
+      table,
+      new Snapshot(this.store, sourceManifest.version, sourceManifest.blockIds),
+    );
+    const plannedById = new Map(plannedVisible.map((segment) => [segment.id, segment]));
+    const plannedLayout = keyedLevelOneLayout(plannedVisible);
+    if (plannedLayout === null) throw new Error("Compaction planned layout is no longer valid");
+
+    let latestSource: Pick<
+      MergeCompactionSourceSegment,
+      "logicalOrder" | "committedVersion" | "segmentId"
+    > | null = null;
+    if (plan.kind === "merge-v1") {
+      for (const planned of plan.sourceSegments) {
+        const actual = visibleById.get(planned.segmentId);
+        const owner = actual === undefined ? undefined : transactions.get(actual.transactionId);
+        if (actual === undefined || !sameMergeSourceSegment(actual, owner, planned)) {
+          throw new Error(`Compaction source segment differs from its plan: ${planned.segmentId}`);
+        }
+      }
+      latestSource = plan.sourceSegments[plan.sourceSegments.length - 1] ?? null;
+    } else {
+      for (const id of job.sourceSegmentIds) {
+        const actual = visibleById.get(id);
+        const planned = plannedById.get(id);
+        if (
+          actual === undefined ||
+          actual.transactionId !== planned?.transactionId ||
+          !sameCompactionSegment(actual, planned)
+        ) {
+          throw new Error(`Compaction source segment differs from its plan: ${id}`);
+        }
+        const tuple = sourceOrderTuple(actual, transactions, "Compaction source");
+        if (latestSource === null || compareMergeSourceOrder(latestSource, tuple) < 0) {
+          latestSource = tuple;
+        }
+      }
+    }
+    if (latestSource === null) throw new Error("Compaction source order is unavailable");
+    const maxOutputOrder =
+      plan.kind === "merge-v1" && plan.partitions !== undefined
+        ? Math.max(plan.logicalOrder, ...plan.partitions.map((partition) => partition.logicalOrder))
+        : plan.logicalOrder;
+    const retained = new Map(
+      plannedLayout.partitions
+        .filter((partition) => !sourceIds.has(partition.id))
+        .map((partition) => [partition.id, partition]),
+    );
+    for (const segment of visibleSegments) {
+      if (sourceIds.has(segment.id)) continue;
+      if ((segment.level ?? 0) === 1) {
+        const planned = retained.get(segment.id);
+        if (
+          planned?.transactionId !== segment.transactionId ||
+          !sameCompactionSegment(segment, planned)
+        ) {
+          throw new Error(`Concurrent segment is not a retained partition: ${segment.id}`);
+        }
+        continue;
+      }
+      if ((segment.level ?? 0) !== 0) {
+        throw new Error(`Concurrent segment has an unsupported compaction level: ${segment.id}`);
+      }
+      const tuple = sourceOrderTuple(segment, transactions, "Concurrent compaction segment");
+      if (
+        tuple.logicalOrder <= maxOutputOrder ||
+        compareMergeSourceOrder(latestSource, tuple) >= 0
+      ) {
+        throw new Error(`Concurrent segment would reorder compaction output: ${segment.id}`);
+      }
+    }
+    for (const id of retained.keys()) {
+      if (!visibleById.has(id)) {
+        throw new Error(`Retained compaction partition is no longer visible: ${id}`);
       }
     }
   }
@@ -9906,6 +10216,42 @@ export class MinnowDatabase {
     }
   }
 
+  /**
+   * Stages one output segment, reconciling with what a previous attempt left: the same
+   * segment staged by this transaction is reused, one left by an aborted transaction is
+   * adopted when it matches and was never published, anything else is an error.
+   */
+  async #stageCompactionOutputSegment(
+    transaction: DatabaseTransaction,
+    desired: SegmentRecord,
+    expectedOutputIds: readonly string[],
+  ): Promise<void> {
+    const existing = await this.store.getSegment(desired.id);
+    if (existing === undefined) {
+      await transaction.stageSegment(desired);
+      return;
+    }
+    if (existing.transactionId === transaction.id) {
+      if (!sameCompactionSegment(existing, desired)) {
+        throw new Error(`A resumed compaction segment differs: ${desired.id}`);
+      }
+      await transaction.stageExistingSegment(desired.id);
+      return;
+    }
+    const owner = await this.store.getTransaction(existing.transactionId);
+    if (
+      (owner !== undefined && owner.status !== "aborted") ||
+      !sameCompactionSegment(existing, desired)
+    ) {
+      throw new Error(`Compaction output segment cannot be adopted: ${desired.id}`);
+    }
+    if (await this.#unprunedManifestContainsAll(expectedOutputIds)) {
+      throw new Error(`Compaction output segment is already visible: ${desired.id}`);
+    }
+    await this.store.removeSegment(desired.id);
+    await transaction.stageSegment(desired);
+  }
+
   async #abortCompactionJob(job: CompactionJobRecord, error: string): Promise<CompactionJobRecord> {
     return this.store.updateCompactionJob(job.id, job.revision, {
       state: "aborted",
@@ -9941,6 +10287,7 @@ export class MinnowDatabase {
       sourceSegmentCount: job.sourceSegmentIds.length,
       sourceBlockCount: job.sourceBlockIds.length,
       outputSegmentId: job.outputSegmentId,
+      outputSegmentIds: compactionOutputSegmentIds(job),
       outputBlockCount: job.outputBlockIds.length,
       rowCount,
       sourceStoredBytes: job.sourceStoredBytes,
@@ -12040,14 +12387,21 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
  * segments, not rows — a handful of deltas costs little however many rows they hold, and
  * folding rewrites the table's anchor, so it is reserved for when the count has built up.
  */
+/**
+ * Whether a table's visible history warrants a background fold: enough level-zero segments to
+ * fragment a scan, or enough deltas to cost one. Partitions compaction itself published
+ * (level one and above) are the folded state, not fragmentation, and do not count — a large
+ * keyed table is many partitions by design.
+ */
 function autoCompactionDue(segments: readonly SegmentRecord[]): boolean {
-  if (segments.length >= AUTO_COMPACT_SCAN_SEGMENTS) return true;
+  let levelZero = 0;
   let deltas = 0;
   for (const segment of segments) {
+    if ((segment.level ?? 0) === 0) levelZero += 1;
     const kind = segment.kind ?? "insert";
     if (kind !== "insert" && kind !== "base") deltas += 1;
   }
-  return deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
+  return levelZero >= AUTO_COMPACT_SCAN_SEGMENTS || deltas >= AUTO_COMPACT_DELTA_SEGMENTS;
 }
 
 /** A macrotask boundary, so background work lets queued queries and writes run between steps. */
@@ -13469,6 +13823,156 @@ function sourceOrderTuple(
   };
 }
 
+/** Modeled bytes per referenced key the merge planner and the partition probe hold resident. */
+const MERGE_PLANNER_KEY_BYTES = 96;
+
+/** How a keyed level-one fold cuts its output into partitions. */
+interface KeyedPartitioning {
+  /** Every level-one partition of the table at planning, in visible order. */
+  readonly partitions: readonly SegmentRecord[];
+  /** Target maximum rows per published partition. */
+  readonly partitionRows: number;
+  /** Whether new rows join the last partition rather than opening a partition behind it. */
+  readonly absorbsTail: boolean;
+  /** Exclusive upper bound for a published partition's order: the first unselected level-zero segment's order, or the next manifest version. */
+  readonly nextLevelZeroOrder: number;
+}
+
+/**
+ * Cuts the canonical merged output into the partitions a keyed fold publishes.
+ *
+ * Each rewritten source partition's surviving rows form one region that keeps the partition's
+ * logical order, and so its place among the partitions the fold leaves alone. The rows of the
+ * level-zero sources — the tail — form a region behind every existing partition, or extend
+ * the last partition's region when the fold absorbs them into it. A region is then chunked to
+ * at most `partitionRows` rows per published partition as far as the integer orders below its
+ * successor leave room: the first chunk of a partition region keeps the partition's order and
+ * every further chunk takes the next free integer; a fresh tail starts at its earliest source's
+ * order when that fits. When the room runs out the remaining rows stay in one larger chunk.
+ * The size is a target; the order is the contract: a published partition sorts strictly between
+ * its neighbours and below every level-zero segment, and its order never changes, so a later
+ * fold rewrites it alone without moving a row.
+ */
+function planOutputPartitions(
+  partitioning: KeyedPartitioning,
+  sources: readonly MergeCompactionSourceSegment[],
+  sourceOutputRowStarts: ReadonlyMap<string, number>,
+  totalRows: number,
+): MergeOutputPartition[] {
+  const { partitions, partitionRows, absorbsTail, nextLevelZeroOrder } = partitioning;
+  const startOf = (segmentId: string): number => {
+    const start = sourceOutputRowStarts.get(segmentId);
+    if (start === undefined) throw new Error(`Merge source has no output position: ${segmentId}`);
+    return start;
+  };
+  const levelZeroRowSources = sources.filter(
+    (source) => source.level === 0 && mergeSourceBearsRows(source.kind),
+  );
+  const tailStart =
+    levelZeroRowSources.length === 0 ? totalRows : startOf(levelZeroRowSources[0]?.segmentId ?? "");
+  const sourceIds = new Set(sources.map((source) => source.segmentId));
+  const sourcedPartitionIndexes = partitions.flatMap((partition, index) =>
+    sourceIds.has(partition.id) ? [index] : [],
+  );
+
+  interface Region {
+    rowStart: number;
+    rowCount: number;
+    /** The order the first chunk keeps, or null for a fresh tail. */
+    anchorOrder: number | null;
+    /** Exclusive lower bound for the orders of chunks that take fresh integers. */
+    roomStart: number;
+    /** Exclusive upper bound for every chunk order. */
+    roomEnd: number;
+    /** The order a fresh tail starts at when it fits. */
+    preferredOrder: number;
+  }
+  const regions: Region[] = [];
+  for (const [position, index] of sourcedPartitionIndexes.entries()) {
+    const partition = partitions[index];
+    const order = partition?.logicalOrder;
+    if (partition === undefined || order === undefined) {
+      throw new Error("Partitioned merge source is not a level-one partition");
+    }
+    const nextSourced = sourcedPartitionIndexes[position + 1];
+    const isLast = index === partitions.length - 1;
+    const rowStart = startOf(partition.id);
+    const rowEnd =
+      isLast && absorbsTail
+        ? totalRows
+        : nextSourced === undefined
+          ? tailStart
+          : startOf(partitions[nextSourced]?.id ?? "");
+    const successorOrder = partitions[index + 1]?.logicalOrder ?? nextLevelZeroOrder;
+    regions.push({
+      rowStart,
+      rowCount: rowEnd - rowStart,
+      anchorOrder: order,
+      roomStart: order,
+      roomEnd: successorOrder,
+      preferredOrder: order,
+    });
+  }
+  if (!(absorbsTail && partitions.length > 0)) {
+    const lastOrder = partitions[partitions.length - 1]?.logicalOrder ?? -1;
+    regions.push({
+      rowStart: tailStart,
+      rowCount: totalRows - tailStart,
+      anchorOrder: null,
+      roomStart: lastOrder,
+      roomEnd: nextLevelZeroOrder,
+      preferredOrder: Math.min(
+        ...sources.filter((source) => source.level === 0).map((source) => source.logicalOrder),
+      ),
+    });
+  }
+
+  const output: MergeOutputPartition[] = [];
+  for (const region of regions) {
+    if (region.rowCount <= 0) continue;
+    const wanted = Math.max(1, Math.ceil(region.rowCount / partitionRows));
+    let firstOrder: number;
+    let chunks: number;
+    if (region.anchorOrder !== null) {
+      firstOrder = region.anchorOrder;
+      chunks = Math.min(wanted, Math.max(1, region.roomEnd - region.anchorOrder));
+    } else {
+      const room = region.roomEnd - region.roomStart - 1;
+      if (room < 1) throw new Error("Partitioned merge has no free logical order for its tail");
+      chunks = Math.min(wanted, room);
+      firstOrder = Math.max(
+        region.roomStart + 1,
+        Math.min(region.preferredOrder, region.roomEnd - chunks),
+      );
+    }
+    const baseRows = Math.floor(region.rowCount / chunks);
+    const extraRows = region.rowCount % chunks;
+    let rowStart = region.rowStart;
+    for (let chunk = 0; chunk < chunks; chunk += 1) {
+      const rowCount = baseRows + (chunk < extraRows ? 1 : 0);
+      output.push({ rowStart, rowCount, logicalOrder: firstOrder + chunk });
+      rowStart += rowCount;
+    }
+  }
+  let coveredRows = 0;
+  for (const [index, partition] of output.entries()) {
+    const previous = output[index - 1];
+    if (
+      partition.rowStart !== coveredRows ||
+      partition.rowCount <= 0 ||
+      partition.logicalOrder >= nextLevelZeroOrder ||
+      (previous !== undefined && previous.logicalOrder >= partition.logicalOrder)
+    ) {
+      throw new Error("Partitioned merge produced an invalid partition layout");
+    }
+    coveredRows += partition.rowCount;
+  }
+  if (coveredRows !== totalRows) {
+    throw new Error("Partitioned merge partitions do not cover the merged output");
+  }
+  return output;
+}
+
 /**
  * The planner's working memory, as `#resolveMergeOutput` allocates it: two bytes per slot, the
  * touched-key set and live-slot map over the delta keys, one patch array per patched row, one
@@ -13482,7 +13986,7 @@ function mergePlannerMemoryBound(
   keyColumnId: string,
 ): number {
   const SLOT_BYTES = 2;
-  const KEY_BYTES = 96;
+  const KEY_BYTES = MERGE_PLANNER_KEY_BYTES;
   const PATCH_ROW_BYTES = 64;
   const PATCH_CELL_BYTES = 48;
   const RANGE_BYTES = 80;
@@ -13606,6 +14110,11 @@ class MergeOutputBuilder {
   constructor(columns: readonly TableColumnRecord[]) {
     this.#columns = columns;
     this.#rangesByColumn = columns.map(() => []);
+  }
+
+  /** Output rows appended so far. */
+  get totalRows(): number {
+    return this.#totalRows;
   }
 
   /** Rows `[rowStart, rowStart + rowCount)` of a row-bearing source, unchanged. */
@@ -14017,15 +14526,124 @@ function physicalOutputBlockIds(jobId: string, plan: PhysicalCompactionRewritePl
 function physicalOutputColumns(
   jobId: string,
   plan: PhysicalCompactionRewritePlan,
+  window: { readonly rowStart: number; readonly rowCount: number } = {
+    rowStart: 0,
+    rowCount: plan.totalRows,
+  },
 ): Record<string, string[]> {
+  const windowEnd = window.rowStart + window.rowCount;
   return Object.fromEntries(
     plan.columns.map((column, columnIndex) => [
       column.columnId,
-      plan.outputs.map((_output, outputIndex) =>
-        physicalOutputBlockId(jobId, outputIndex, columnIndex),
+      plan.outputs.flatMap((output, outputIndex) =>
+        output.rowStart >= window.rowStart && output.rowStart + output.rowCount <= windowEnd
+          ? [physicalOutputBlockId(jobId, outputIndex, columnIndex)]
+          : [],
       ),
     ]),
   );
+}
+
+/** The segment ID partition `index` of a partitioned merge publishes under. */
+function partitionOutputSegmentId(outputSegmentId: string, index: number): string {
+  return index === 0 ? outputSegmentId : `${outputSegmentId}/${String(index)}`;
+}
+
+/** Every segment a job publishes: one per output partition, or the single output segment. */
+function compactionOutputSegmentIds(job: CompactionJobRecord): string[] {
+  if (job.outputSegmentId === null) return [];
+  const plan = job.rewritePlan;
+  if (plan?.kind !== "merge-v1" || plan.partitions === undefined) return [job.outputSegmentId];
+  const outputSegmentId = job.outputSegmentId;
+  return plan.partitions.map((_partition, index) =>
+    partitionOutputSegmentId(outputSegmentId, index),
+  );
+}
+
+/**
+ * The segments a physical compaction publishes, with the blocks of the windows each covers.
+ * A partitioned merge publishes one level-one partition per planned partition, each carrying
+ * the slice of the output's row-ID spans that falls in its rows; every other plan publishes
+ * one segment over the whole output.
+ */
+function compactionOutputSegments(
+  table: TableRecord,
+  job: CompactionJobRecord,
+  plan: PhysicalCompactionRewritePlan,
+  transactionId: string,
+  createdAt: string,
+): SegmentRecord[] {
+  const outputSegmentId = job.outputSegmentId;
+  if (outputSegmentId === null) throw new Error("Compaction output segment ID is missing");
+  const keyColumn =
+    table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId };
+  const partitionOrdinal =
+    job.outputPartitionOrdinal === undefined
+      ? {}
+      : { partitionOrdinal: job.outputPartitionOrdinal };
+  if (plan.kind === "merge-v1" && plan.partitions !== undefined) {
+    return plan.partitions.map((partition, index) => {
+      const rowIdSpans = sliceRowIdSpans(plan.rowIdSpans, partition.rowStart, partition.rowCount);
+      const envelope = rowIdSpanEnvelope(rowIdSpans);
+      return {
+        id: partitionOutputSegmentId(outputSegmentId, index),
+        tableId: table.id,
+        transactionId,
+        rowCount: partition.rowCount,
+        rowIdStart: envelope.start,
+        rowIdEndExclusive: envelope.endExclusive,
+        columnBlockIds: physicalOutputColumns(job.id, plan, partition),
+        kind: "base",
+        ...keyColumn,
+        level: job.targetLevel,
+        ...partitionOrdinal,
+        logicalOrder: partition.logicalOrder,
+        rowIdSpans,
+        createdAt,
+      };
+    });
+  }
+  return [
+    {
+      id: outputSegmentId,
+      tableId: table.id,
+      transactionId,
+      rowCount: plan.totalRows,
+      rowIdStart: plan.rowIdStart,
+      rowIdEndExclusive: plan.rowIdEndExclusive,
+      columnBlockIds: physicalOutputColumns(job.id, plan),
+      kind: plan.kind === "merge-v1" ? "base" : "insert",
+      ...keyColumn,
+      level: job.targetLevel,
+      ...partitionOrdinal,
+      logicalOrder: plan.logicalOrder,
+      ...(plan.kind === "merge-v1" ? { rowIdSpans: structuredClone(plan.rowIdSpans) } : {}),
+      createdAt,
+    },
+  ];
+}
+
+/** The spans of output rows `[rowStart, rowStart + rowCount)`, rebased to start at row zero. */
+function sliceRowIdSpans(
+  spans: readonly RowIdSpan[],
+  rowStart: number,
+  rowCount: number,
+): RowIdSpan[] {
+  const sliced: MutableRowIdSpan[] = [];
+  const rowEnd = rowStart + rowCount;
+  for (const span of spans) {
+    const spanEnd = span.rowStart + span.rowCount;
+    if (spanEnd <= rowStart || span.rowStart >= rowEnd) continue;
+    const start = Math.max(span.rowStart, rowStart);
+    const end = Math.min(spanEnd, rowEnd);
+    appendRowIdSpan(
+      sliced,
+      start - rowStart,
+      span.rowIdStart + BigInt(start - span.rowStart),
+      end - start,
+    );
+  }
+  return sliced;
 }
 
 interface CompactionBlockEntry {
@@ -14466,19 +15084,99 @@ function appendLevelTwoLayout(segments: readonly SegmentRecord[]): AppendLevelTw
   return { retainedPrefix, levelTwoSegments, level0Segments };
 }
 
+interface KeyedLevelOneLayout {
+  /** The level-one partitions, in visible order: each a merged base or an append-shaped insert. */
+  partitions: readonly SegmentRecord[];
+  level0Segments: readonly SegmentRecord[];
+}
+
+/**
+ * Validates a keyed table's visible history for a partitioned level-one fold: a prefix of
+ * level-one partitions — merged bases carrying row-ID spans, or append-shaped inserts — each
+ * with an explicit logical order, strictly increasing along the prefix; then level-zero
+ * segments of any mutation kind. Every row footprint must be pairwise disjoint. Returns null
+ * when the shape does not hold so the planner skips explicitly.
+ */
+function keyedLevelOneLayout(segments: readonly SegmentRecord[]): KeyedLevelOneLayout | null {
+  const partitions = levelOnePartitionPrefix(segments);
+  if (partitions === null) return null;
+  const level0Segments = segments.slice(partitions.length);
+  if (
+    level0Segments.some(
+      (segment) => (segment.level ?? 0) !== 0 || segment.partitionOrdinal !== undefined,
+    )
+  ) {
+    return null;
+  }
+  if (!disjointRowIdFootprints(segments)) return null;
+  return { partitions, level0Segments };
+}
+
+/**
+ * The leading level-one segments, when they form a valid partition prefix: insert or base
+ * kinds, no L2 ordinal, and explicit strictly increasing logical orders. Null otherwise.
+ */
+function levelOnePartitionPrefix(segments: readonly SegmentRecord[]): SegmentRecord[] | null {
+  const partitions: SegmentRecord[] = [];
+  for (const segment of segments) {
+    if ((segment.level ?? 0) !== 1) break;
+    const kind = segment.kind ?? "insert";
+    const previousOrder = partitions[partitions.length - 1]?.logicalOrder ?? -1;
+    if (
+      (kind !== "insert" && kind !== "base") ||
+      segment.partitionOrdinal !== undefined ||
+      !Number.isSafeInteger(segment.logicalOrder) ||
+      (segment.logicalOrder ?? -1) <= previousOrder
+    ) {
+      return null;
+    }
+    partitions.push(segment);
+  }
+  return partitions;
+}
+
+/**
+ * Whether the segments' row footprints — spans where present, otherwise the contiguous
+ * interval — are positive and pairwise disjoint. Update and delete deltas carry no footprint.
+ */
+function disjointRowIdFootprints(segments: readonly SegmentRecord[]): boolean {
+  const intervals: Array<{ start: bigint; end: bigint }> = [];
+  for (const segment of segments) {
+    if (segment.rowIdSpans !== undefined) {
+      for (const span of segment.rowIdSpans) {
+        intervals.push({ start: span.rowIdStart, end: span.rowIdStart + BigInt(span.rowCount) });
+      }
+      continue;
+    }
+    if (segment.rowIdEndExclusive <= segment.rowIdStart) continue;
+    if (segment.rowIdEndExclusive - segment.rowIdStart !== BigInt(segment.rowCount)) return false;
+    intervals.push({ start: segment.rowIdStart, end: segment.rowIdEndExclusive });
+  }
+  intervals.sort((left, right) =>
+    left.start < right.start ? -1 : left.start > right.start ? 1 : 0,
+  );
+  for (const [intervalIndex, interval] of intervals.entries()) {
+    if (interval.start <= 0n) return false;
+    const previous = intervals[intervalIndex - 1];
+    if (previous !== undefined && interval.start < previous.end) return false;
+  }
+  return true;
+}
+
 interface KeyedLevelTwoLayout {
   levelTwoSegments: readonly SegmentRecord[];
-  anchor: SegmentRecord | undefined;
+  /** The level-one partitions a promotion folds along with the level-zero prefix. */
+  anchors: readonly SegmentRecord[];
   level0Segments: readonly SegmentRecord[];
 }
 
 /**
  * Validates a keyed table's visible history for multi-range L2 promotion: existing partitions
  * (append-shaped inserts or merged bases carrying row-ID spans) with ordinals exactly 0..N-1,
- * then an optional single level-one anchor, then level-zero segments of any mutation kind. Every
- * row footprint — a partition's spans or interval, the anchor's, and each level-zero
- * insert/upsert interval — must be pairwise disjoint; update and delete deltas carry no
- * footprint. Returns null when the shape does not hold so the planner skips explicitly.
+ * then the level-one partitions, then level-zero segments of any mutation kind. Every row
+ * footprint — a partition's spans or interval, the anchors', and each level-zero insert/upsert
+ * interval — must be pairwise disjoint; update and delete deltas carry no footprint. Returns
+ * null when the shape does not hold so the planner skips explicitly.
  */
 function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoLayout | null {
   let index = 0;
@@ -14500,16 +15198,9 @@ function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoL
     levelTwoSegments.push(segment);
     index += 1;
   }
-  let anchor: SegmentRecord | undefined;
-  const maybeAnchor = segments[index];
-  if (maybeAnchor !== undefined && (maybeAnchor.level ?? 0) === 1) {
-    const kind = maybeAnchor.kind ?? "insert";
-    if ((kind !== "insert" && kind !== "base") || maybeAnchor.partitionOrdinal !== undefined) {
-      return null;
-    }
-    anchor = maybeAnchor;
-    index += 1;
-  }
+  const anchors = levelOnePartitionPrefix(segments.slice(index));
+  if (anchors === null) return null;
+  index += anchors.length;
   const level0Segments = segments.slice(index);
   if (
     level0Segments.some(
@@ -14518,27 +15209,8 @@ function keyedLevelTwoLayout(segments: readonly SegmentRecord[]): KeyedLevelTwoL
   ) {
     return null;
   }
-  const intervals: Array<{ start: bigint; end: bigint }> = [];
-  for (const segment of segments) {
-    if (segment.rowIdSpans !== undefined) {
-      for (const span of segment.rowIdSpans) {
-        intervals.push({ start: span.rowIdStart, end: span.rowIdStart + BigInt(span.rowCount) });
-      }
-      continue;
-    }
-    if (segment.rowIdEndExclusive <= segment.rowIdStart) continue;
-    if (segment.rowIdEndExclusive - segment.rowIdStart !== BigInt(segment.rowCount)) return null;
-    intervals.push({ start: segment.rowIdStart, end: segment.rowIdEndExclusive });
-  }
-  intervals.sort((left, right) =>
-    left.start < right.start ? -1 : left.start > right.start ? 1 : 0,
-  );
-  for (const [intervalIndex, interval] of intervals.entries()) {
-    if (interval.start <= 0n) return null;
-    const previous = intervals[intervalIndex - 1];
-    if (previous !== undefined && interval.start < previous.end) return null;
-  }
-  return { levelTwoSegments, anchor, level0Segments };
+  if (!disjointRowIdFootprints(segments)) return null;
+  return { levelTwoSegments, anchors, level0Segments };
 }
 
 function compactionWriteAmplificationSkipped(input: {

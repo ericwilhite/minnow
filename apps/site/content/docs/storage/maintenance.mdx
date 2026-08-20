@@ -42,6 +42,25 @@ from the same scan every other table gets, plus the cost of the deltas themselve
 compaction adds is returning the table to a plain append — the deltas stop being re-read on every
 query, and the storage they occupy is freed.
 
+### Partitioned folds
+
+A keyed table's folded form is a run of level-one partitions, each aiming at `partitionRows`
+rows (16,384 by default) in the order the rows were written. A fold rewrites
+only the partitions its deltas touch — the ones holding a key some delete, update, or upsert
+names — plus the last partition while new rows are still joining it. Every other partition is
+left exactly as it is, so absorbing a run of point updates costs the partitions they land in,
+not the table: thirty-two updates rewrite at most thirty-two partitions, however many rows the
+table holds. Rows keep their hidden row IDs and their order across every fold.
+
+Smaller partitions make folds cheaper and give a scan more blocks to walk; the default suits
+tables from thousands to millions of rows. Set it per call, or for every fold the database
+plans — background ones included — when you know better:
+
+```ts
+await db.compactTable("orders", { partitionRows: 4096 });
+const db = new MinnowDatabase(store, { compaction: { partitionRows: 4096 } });
+```
+
 Merging a keyed table plans the merge in memory proportional to its deltas, not its rows, and
 every output block is measured against a memory budget before it is written. The default budget
 is 32 MiB; raise it with `memoryBudgetBytes` when a compaction reports
