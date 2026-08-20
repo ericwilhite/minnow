@@ -316,6 +316,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.runGarbageCollectionStep(input);
   }
 
+  removePrunedManifestRecords(): Promise<number> {
+    return this.inner.removePrunedManifestRecords();
+  }
+
   removeGarbageCollectionJob(id: string): Promise<void> {
     return this.inner.removeGarbageCollectionJob(id);
   }

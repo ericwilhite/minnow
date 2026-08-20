@@ -137,6 +137,7 @@ const RPC_METHODS = new Set([
   "getGarbageCollectionJob",
   "listGarbageCollectionJobs",
   "runGarbageCollectionStep",
+  "removePrunedManifestRecords",
   "removeGarbageCollectionJob",
   "createTempOwner",
   "getTempOwner",
@@ -1070,6 +1071,10 @@ export class OpfsBlockStore implements BlockStore {
 
   async removeGarbageCollectionJob(id: string): Promise<void> {
     await this.#dispatch("removeGarbageCollectionJob", [id]);
+  }
+
+  async removePrunedManifestRecords(): Promise<number> {
+    return (await this.#dispatch("removePrunedManifestRecords", [])) as number;
   }
 
   async getLogicalStorageBytes(): Promise<number> {

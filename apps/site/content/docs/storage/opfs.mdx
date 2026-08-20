@@ -80,6 +80,11 @@ write-ahead log), `checkpoint-a` and `checkpoint-b` (alternating full-state snap
 spill). Deleting the directory deletes the database — `deleteOpfsDatabase({ name })` does
 exactly that.
 
+Collection deletes a sealed extent when it becomes empty and repacks one once dead payloads take
+more than half its file. Sealed extent bytes therefore stay below twice their live payload, plus
+the single append tail. Relocations are WAL-logged like any other index change and survive a
+crash without changing block IDs.
+
 The log is folded into a checkpoint slot at a size bound, always in the order write → flush →
 reset, so a crash at any moment leaves either a torn tail frame — detectably invalid, invisible
 — or a torn slot with the other slot and the un-reset log still holding everything. Opening the

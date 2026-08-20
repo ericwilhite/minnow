@@ -36,8 +36,8 @@ export interface Manifest extends ManifestSummary {
  * carries only this commit's added and removed ids plus its distance from the checkpoint below
  * it. Reads resolve a version by walking back to the nearest checkpoint and applying deltas
  * forward, so publishing a commit writes O(changed blocks) instead of rewriting every live
- * block id. Records are never physically deleted (pruning tombstones them via `prunedAt`), so a
- * chain below any readable version always resolves.
+ * block id. Pruning first tombstones records; maintenance later deletes only the obsolete prefix
+ * below the checkpoint that the earliest readable version needs.
  */
 export interface StoredManifestRecord extends ManifestSummary {
   blockIds?: string[];
@@ -621,9 +621,10 @@ export interface CreateGarbageCollectionJobInput {
   candidateSegmentIds: readonly string[];
   candidateBlockIds: readonly string[];
   /**
-   * Committed transaction records the planner believes nothing needs any more: below its
-   * retained window, with no segment left that names them. Optional, so a caller that only
-   * reclaims artifacts need not mention them. The store decides for itself at step time.
+   * Transaction records the planner believes nothing needs any more: committed records below
+   * the retained window with no segment owner, or aborted records after their pending artifacts
+   * are gone. Optional, so a caller that only reclaims artifacts need not mention them. The
+   * store decides for itself at step time.
    */
   candidateTransactionIds?: readonly string[];
   /** Fixed cutoff used to decide which persisted leases protect a manifest for this job. */
@@ -1219,8 +1220,9 @@ export interface LeaseStore {
  * `runGarbageCollectionStep` does real deletion and MUST be atomic: it re-verifies lease and
  * transaction pins inside the same storage transaction that prunes manifests and deletes
  * segments and blocks, advancing the job's cursors so an interrupted collection resumes
- * rather than restarts. Reclaimed manifests are tombstoned (`prunedAt`), never physically
- * deleted, so delta chains below any readable version always resolve.
+ * rather than restarts. Reclaimed manifests are first tombstoned (`prunedAt`);
+ * `removePrunedManifestRecords` may then delete only the old prefix no readable delta chain
+ * needs.
  */
 export interface MaintenanceStore {
   createCompactionJob(record: CompactionJobRecord): Promise<void>;
@@ -1257,6 +1259,8 @@ export interface MaintenanceStore {
   runGarbageCollectionStep(
     input: RunGarbageCollectionStepInput,
   ): Promise<GarbageCollectionStepResult>;
+  /** Deletes obsolete tombstones while retaining the checkpoint prefix readable deltas need. */
+  removePrunedManifestRecords(): Promise<number>;
   removeGarbageCollectionJob(id: string): Promise<void>;
 }
 

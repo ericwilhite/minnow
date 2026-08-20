@@ -96,6 +96,19 @@ describe("extent pool", () => {
     pool.close();
   });
 
+  it("identifies sealed extents whose dead space exceeds their live payload", async () => {
+    const shim = new MemoryOpfs();
+    const tree = new OpfsTree(shim.root);
+    const pool = await ExtentPool.open(tree, undefined);
+    const dead = await pool.append(new Uint8Array(6 * 1024 * 1024), false);
+    await pool.append(new Uint8Array(2 * 1024 * 1024), false);
+    await pool.append(Uint8Array.of(1), false); // seals extent 0
+    expect(await pool.fragmentedExtentId()).toBeUndefined();
+    pool.release([dead]);
+    expect(await pool.fragmentedExtentId()).toBe(0);
+    pool.close();
+  });
+
   it("round-trips its meta through a checkpoint and restores replayed placements", async () => {
     const shim = new MemoryOpfs();
     const tree = new OpfsTree(shim.root);

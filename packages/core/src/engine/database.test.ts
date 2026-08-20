@@ -2708,7 +2708,7 @@ it("refines skewed strings to exact target-sized windows before persisting the p
 });
 
 for (const outputCompression of ["raw", "gzip"] as const) {
-  it(`rewrites mixed source codecs to persisted ${outputCompression} output after reopen`, async () => {
+  it(`rewrites mixed source codecs with ${outputCompression} preferred after reopen`, async () => {
     const store = new MemoryBlockStore();
     const raw = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 64 });
     await raw.createTable({
@@ -2792,7 +2792,9 @@ for (const outputCompression of ["raw", "gzip"] as const) {
     for (const blockId of Object.values(outputSegment.columnBlockIds).flat()) {
       const bytes = await store.getBlock(blockId);
       if (bytes === undefined) throw new Error(`Expected output block ${blockId}`);
-      expect(inspectBlock(bytes).compression).toBe(outputCompression);
+      // These deliberately tiny target blocks stay raw even when gzip is preferred; the
+      // persisted plan records the preference while every block records its actual codec.
+      expect(inspectBlock(bytes).compression).toBe("raw");
     }
     expect(await reopened.readTable("events")).toEqual(expected);
     expect(await reopened.readTable("events", gzipInsert.version)).toEqual(expected);
@@ -2921,7 +2923,7 @@ it("resumes with persisted rewrite settings after an IndexedDB close and reopen"
   for (const blockId of Object.values(outputSegment.columnBlockIds).flat()) {
     const bytes = await store.getBlock(blockId);
     if (bytes === undefined) throw new Error(`Expected compaction block ${blockId}`);
-    expect(inspectBlock(bytes).compression).toBe("gzip");
+    expect(inspectBlock(bytes).compression).toBe("raw");
   }
   expect(await reopened.readTable("events")).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
   store.close();
@@ -3090,10 +3092,12 @@ it("reconciles a valid gzip header variant by decoded physical content", async (
   const database = new MinnowDatabase(store);
   await database.createTable({
     name: "events",
-    columns: [{ name: "value", type: "number" }],
+    columns: [{ name: "value", type: "string" }],
   });
-  await database.insert("events", { value: 1 });
-  await database.insert("events", { value: 2 });
+  const firstValue = "a".repeat(5_000);
+  const secondValue = "b".repeat(5_000);
+  await database.insert("events", { value: firstValue });
+  await database.insert("events", { value: secondValue });
 
   await expect(
     database.compactTableStep("events", {
@@ -3120,7 +3124,10 @@ it("reconciles a valid gzip header variant by decoded physical content", async (
 
   expect(result).toMatchObject({ compacted: true, outputCompression: "gzip", rowCount: 2 });
   expect(store.variantReadCount).toBeGreaterThan(0);
-  expect(await database.readTable("events")).toEqual([{ value: 1 }, { value: 2 }]);
+  expect(await database.readTable("events")).toEqual([
+    { value: firstValue },
+    { value: secondValue },
+  ]);
   store.close();
 });
 
@@ -7143,6 +7150,53 @@ for (const implementation of implementations()) {
 }
 
 for (const implementation of implementations()) {
+  it(`${implementation.name} collection sweeps crashed leases, spill owners, and aborted journals`, async () => {
+    const store = await implementation.create();
+    const nowMs = Date.parse("2026-01-01T00:02:00.000Z");
+    const database = new MinnowDatabase(store, {
+      autoCollect: false,
+      now: () => new Date(nowMs),
+    });
+    const manager = new TransactionManager(store, {
+      createId: () => "abandoned-transaction",
+      now: () => new Date(nowMs),
+    });
+    const transaction = await manager.begin();
+    await transaction.stageBlock("abandoned-block", Uint8Array.of(1, 2, 3));
+    await transaction.abort();
+    await store.createLease({
+      id: "crashed-reader",
+      kind: "reader",
+      manifestVersion: null,
+      ownerId: "dead-tab",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await store.createTempOwner({
+      ownerId: "crashed-query",
+      expiresAt: "2026-01-01T00:01:00.000Z",
+      revision: 0,
+    });
+    await store.putTempRunPage({
+      ownerId: "crashed-query",
+      runId: "run",
+      pageIndex: 0,
+      bytes: Uint8Array.of(4),
+    });
+
+    await database.collectGarbage();
+    expect(await store.getBlock("abandoned-block")).toBeUndefined();
+    expect(await store.getLease("crashed-reader")).toBeUndefined();
+    expect(await store.getTempOwner("crashed-query")).toBeUndefined();
+    expect(await store.getTempRunPage("crashed-query", "run", 0)).toBeUndefined();
+    // The journal was still a provenance root when the first pass planned its block. Once the
+    // artifact is gone, the next pass is allowed to remove the terminal record itself.
+    const second = await database.collectGarbage();
+    expect(second.reclaimedTransactionCount).toBe(1);
+    expect(await store.getTransaction("abandoned-transaction")).toBeUndefined();
+    store.close();
+  });
+
   it(`${implementation.name} reclaims committed transaction records after their segments and manifests`, async () => {
     const store = await implementation.create();
     const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
@@ -7226,6 +7280,41 @@ for (const implementation of implementations()) {
     store.close();
   });
 
+  it(`${implementation.name} cancels an active fold before dropping its table`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { autoCollect: false });
+    await database.createTable({
+      name: "drop_during_fold",
+      columns: [{ name: "value", type: "string" }],
+    });
+    for (let value = 0; value < 8; value += 1) {
+      await database.insert("drop_during_fold", { value: `value-${String(value).repeat(20)}` });
+    }
+    const progress = await database.compactTableStep("drop_during_fold", {
+      maxBlocks: 1,
+      targetBlockBytes: 32,
+      outputCompression: "raw",
+    });
+    if (progress.jobId === null || progress.result !== null) {
+      throw new Error("Expected a partially written compaction");
+    }
+    const active = await store.getCompactionJob(progress.jobId);
+    if (active?.transactionId === null || active?.transactionId === undefined) {
+      throw new Error("Expected the fold's active transaction");
+    }
+    const outputIds = [...active.outputBlockIds];
+
+    expect(await database.dropTable("drop_during_fold")).toBe(true);
+    expect(await store.getCompactionJob(progress.jobId)).toMatchObject({ state: "cancelled" });
+    expect(await store.getTransaction(active.transactionId)).toMatchObject({ status: "aborted" });
+    await database.collectGarbage();
+    await database.collectGarbage();
+    for (const id of outputIds) expect(await store.getBlock(id)).toBeUndefined();
+    expect(await store.getTransaction(active.transactionId)).toBeUndefined();
+    expect(await store.getTableByName("drop_during_fold")).toBeUndefined();
+    store.close();
+  });
+
   it(`${implementation.name} caps each paged garbage-collection plan`, async () => {
     const store = await implementation.create();
     const database = new MinnowDatabase(store);
@@ -7253,6 +7342,59 @@ for (const implementation of implementations()) {
         job.candidateBlockIds.length +
         job.candidateSegmentIds.length,
     ).toBeGreaterThan(0);
+    store.close();
+  });
+
+  it(`${implementation.name} bounds failed compaction history`, async () => {
+    const store = await implementation.create();
+    const database = new MinnowDatabase(store, { autoCollect: false });
+    await database.createTable({
+      name: "bounded_failed_jobs",
+      columns: [{ name: "value", type: "number" }],
+    });
+    await database.insert("bounded_failed_jobs", { value: 1 });
+    const table = await store.getTableByName("bounded_failed_jobs");
+    const version = await store.getCurrentManifestVersion();
+    if (table === undefined || version === null) throw new Error("Expected a source snapshot");
+    const source = (await store.listSegments(table.id))[0];
+    if (source === undefined) throw new Error("Expected a source segment");
+    const sourceBlockIds = Object.values(source.columnBlockIds).flat();
+    const sourceStoredBytes = (
+      await Promise.all(sourceBlockIds.map((id) => store.getBlock(id)))
+    ).reduce((total, bytes) => total + (bytes?.byteLength ?? 0), 0);
+    const baseId = `compaction/${table.id}/manifest/${String(version)}`;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const timestamp = new Date(Date.UTC(2026, 0, 1, 0, 0, attempt)).toISOString();
+      await store.createCompactionJob({
+        id: attempt === 0 ? baseId : `${baseId}/retry/${String(attempt)}`,
+        tableId: table.id,
+        sourceManifestVersion: version,
+        sourceSegmentIds: [source.id],
+        sourceBlockIds,
+        outputBlockIds: [],
+        cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+        processedRows: 0,
+        sourceStoredBytes,
+        outputStoredBytes: 10,
+        logicalBytes: 100,
+        targetLevel: 2,
+        state: "cancelled",
+        transactionId: null,
+        outputSegmentId: null,
+        publishedVersion: null,
+        revision: 0,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    }
+
+    await database.collectGarbage();
+    const retained = await store.listCompactionJobs(table.id);
+    expect(retained).toHaveLength(8);
+    expect(retained.at(-1)).toMatchObject({
+      id: `${baseId}/retry/19`,
+      outputStoredBytes: 10,
+    });
     store.close();
   });
 

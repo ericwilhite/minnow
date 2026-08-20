@@ -48,6 +48,12 @@ Columns beat rows here because most reads touch a few columns across many rows: 
 scan. Similar values sit together, so they compress well, and queries fetch only the columns they
 use.
 
+`gzip` is adaptive per column and per physical output. Inputs below 4 KiB stay raw; larger probes
+stay gzip only when they save at least 20%, and an unhelpful column is re-probed every 32 blocks.
+The configured codec is therefore a preference: each self-describing block records the codec it
+actually used. This keeps repetitive strings compressed without making random numeric data pay a
+compression and decompression pass for single-digit percentage savings.
+
 Immutability is the rule that pays for everything else:
 
 - A crash can strand unused data — it can never corrupt visible data.
@@ -148,8 +154,10 @@ Compaction and garbage collection run for a long time inside a tab that can die 
 - **Garbage collection is reachability.** Whatever the current manifest, unexpired leases, live
   transactions, and running compactions still reference is kept. Each deletion re-checks liveness
   atomically, so nothing is revived after it's gone. Once a committed transaction's manifest is
-  pruned and no segment or unfinished compaction names it, its record is collected too; ordinary
-  commits leave no permanent per-commit journal residue.
+  pruned and no segment or unfinished compaction names it, its record is collected too. Aborted
+  journals follow their pending artifacts. Expired leases, abandoned spill owners, old manifest
+  tombstones, and finished job history are swept as part of the same maintenance cycle; ordinary
+  use leaves no permanent per-operation metadata residue.
 - **Compaction has a write budget.** A rewrite that would cost more than a set multiple of the
   data it consolidates is refused up front, not discovered in the quota bill.
 

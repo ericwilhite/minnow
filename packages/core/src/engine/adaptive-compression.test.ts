@@ -11,7 +11,7 @@ import { inspectBlock } from "../block-format/index.js";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 
-/** Enough rows per block that the decision threshold applies. */
+/** Large enough to clear the 4 KiB floor where compression can begin repaying its CPU cost. */
 const ROWS_PER_BLOCK = 16_384;
 const BLOCKS = 4;
 const TOTAL = ROWS_PER_BLOCK * BLOCKS;
@@ -83,12 +83,11 @@ describe("adaptive block compression", () => {
       incompressible: noiseValues,
       compressible: Array.from({ length: TOTAL }, (_, index) => index),
     });
-
     const noise = await codecsPerBlock(store, "noise");
     const label = await codecsPerBlock(store, "label");
 
-    // The first block is what the verdict is learned from, so it is compressed either way;
-    // every block after it should be raw.
+    // The first block is probed, found not worthwhile, and immediately re-encoded raw; every
+    // block after it reuses that verdict.
     expect(noise.codecs).toHaveLength(BLOCKS);
     expect(noise.codecs[0]).toBe("raw");
     expect(new Set(noise.codecs.slice(1))).toEqual(new Set(["raw"]));
@@ -120,6 +119,67 @@ describe("adaptive block compression", () => {
     const noise = await codecsPerBlock(store, "noise");
     // 8 bytes per double plus per-block envelope; gzip on this shape lands slightly above it.
     expect(noise.storedBytes).toBeLessThan(TOTAL * 8 + BLOCKS * 4096);
+  });
+
+  it("judges medium blocks instead of gziping them through a size loophole", async () => {
+    const random = mulberry32(0x9182);
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { compression: "gzip", rowsPerBlock: 4_096 });
+    await database.createTable({
+      name: "t",
+      columns: [{ name: "noise", type: "number" }],
+    });
+    await database.insertBatch("t", {
+      columns: { noise: Array.from({ length: 4_096 }, () => random() * 1e6) },
+    });
+    expect((await codecsPerBlock(store, "noise")).codecs).toEqual(["raw"]);
+    store.close();
+  });
+
+  it("applies the same adaptive decision to folded output and resumes mixed codecs", async () => {
+    const random = mulberry32(0x71c4);
+    const { store, database } = await load({
+      incompressible: Array.from({ length: TOTAL }, () => random() * 1e6),
+      compressible: Array.from({ length: TOTAL }, (_, index) => index),
+    });
+    await database.insert("t", {
+      id: TOTAL + 1,
+      noise: random() * 1e6,
+      label: "region-0",
+    });
+    let progress = await database.compactTableStep("t", {
+      maxBlocks: 1,
+      targetBlockBytes: 512 * 1024,
+      outputCompression: "gzip",
+    });
+    if (progress.jobId === null) throw new Error("Expected a persisted fold");
+    const jobId = progress.jobId;
+    while (progress.result === null) {
+      progress = await database.resumeCompactionJob(jobId, { maxBlocks: 1 });
+    }
+    const job = await store.getCompactionJob(jobId);
+    if (job?.outputSegmentId === null || job?.outputSegmentId === undefined) {
+      throw new Error("Expected folded output");
+    }
+    const segment = await store.getSegment(job.outputSegmentId);
+    const table = await store.getTableByName("t");
+    if (segment === undefined || table === undefined) throw new Error("Expected folded records");
+    const codecs = new Map<string, Set<string>>();
+    for (const column of table.columns) {
+      const columnCodecs = new Set<string>();
+      for (const id of segment.columnBlockIds[column.id] ?? []) {
+        const bytes = await store.getBlock(id);
+        if (bytes === undefined) throw new Error(`Missing folded block ${id}`);
+        columnCodecs.add(inspectBlock(bytes).compression);
+      }
+      codecs.set(column.name, columnCodecs);
+    }
+    expect(codecs.get("noise")).toEqual(new Set(["raw"]));
+    expect(codecs.get("label")).toEqual(new Set(["gzip"]));
+    expect(await database.query("SELECT COUNT(*) AS n FROM t", { memoize: false })).toMatchObject({
+      rows: [{ n: TOTAL + 1 }],
+    });
+    store.close();
   });
 
   it("leaves an explicitly raw database alone", async () => {

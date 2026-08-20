@@ -485,6 +485,10 @@ export class MemoryBlockStore implements BlockStore {
     });
   }
 
+  async removePrunedManifestRecords(): Promise<number> {
+    return this.#runAtomic(() => this.#core.removePrunedManifestRecords().length);
+  }
+
   async removeGarbageCollectionJob(id: string): Promise<void> {
     return this.#runAtomic(() => {
       this.#core.removeGarbageCollectionJob(id);

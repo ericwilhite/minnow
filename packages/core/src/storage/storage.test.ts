@@ -28,6 +28,51 @@ it("floors amplification products without rounding a binary ratio upward", () =>
   expect(floorWholeNumberProduct(50, 1.3399999999999999, "Amplification product")).toBe(66);
 });
 
+it("OPFS repacks mixed live/dead extents when collection completes", async () => {
+  const shim = new MemoryOpfs();
+  const name = crypto.randomUUID();
+  const store = await OpfsBlockStore.open({ name, root: shim.root });
+  const blocks = Array.from({ length: 5 }, (_, index) => ({
+    id: `extent-block-${String(index)}`,
+    bytes: new Uint8Array(2 * 1024 * 1024).fill(index + 1),
+  }));
+  await store.addBlocks(blocks);
+  await store.publishManifest({
+    expectedVersion: null,
+    blockIds: blocks.map((block) => block.id),
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  await store.publishManifest({
+    expectedVersion: 0,
+    blockIds: [blocks[3]?.id ?? "", blocks[4]?.id ?? ""],
+    createdAt: "2026-01-01T00:00:01.000Z",
+  });
+  const job = await store.createGarbageCollectionJob({
+    id: "repack-extents",
+    candidateManifestVersions: [0],
+    candidateSegmentIds: [],
+    candidateBlockIds: blocks.slice(0, 3).map((block) => block.id),
+    leaseCutoff: "2026-01-01T00:01:00.000Z",
+    createdAt: "2026-01-01T00:01:00.000Z",
+  });
+  const result = await store.runGarbageCollectionStep({
+    jobId: job.id,
+    expectedRevision: job.revision,
+    maxItems: 10,
+    updatedAt: "2026-01-01T00:01:01.000Z",
+  });
+
+  expect(result.job.state).toBe("completed");
+  expect(shim.readFileBytes(`minnowdb/${name}/extents/000000`)).toBeUndefined();
+  expect(await store.getBlock("extent-block-3")).toEqual(blocks[3]?.bytes);
+  expect(await store.getBlock("extent-block-4")).toEqual(blocks[4]?.bytes);
+  store.close();
+  const reopened = await OpfsBlockStore.open({ name, root: shim.root });
+  expect(await reopened.getBlock("extent-block-3")).toEqual(blocks[3]?.bytes);
+  expect(await reopened.getBlock("extent-block-4")).toEqual(blocks[4]?.bytes);
+  reopened.close();
+});
+
 function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
     { name: "memory", create: async () => new MemoryBlockStore() },
@@ -90,6 +135,42 @@ for (const implementation of stores()) {
     for (const manifest of page.records) {
       expect(manifest.blockIds).toEqual(expectedByVersion[manifest.version]);
     }
+    store.close();
+  });
+
+  it(`${implementation.name} physically bounds pruned manifest history without breaking delta reads`, async () => {
+    const store = await implementation.create();
+    for (let version = 0; version < 70; version += 1) {
+      await store.publishManifest({
+        expectedVersion: version === 0 ? null : version - 1,
+        blockIds: [],
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, version)).toISOString(),
+      });
+    }
+    const candidates = Array.from({ length: 40 }, (_, version) => version);
+    const job = await store.createGarbageCollectionJob({
+      id: "manifest-prefix-cleanup",
+      candidateManifestVersions: candidates,
+      candidateSegmentIds: [],
+      candidateBlockIds: [],
+      leaseCutoff: "2027-01-01T00:00:00.000Z",
+      createdAt: "2027-01-01T00:00:00.000Z",
+    });
+    await store.runGarbageCollectionStep({
+      jobId: job.id,
+      expectedRevision: job.revision,
+      maxItems: 100,
+      updatedAt: "2027-01-01T00:00:01.000Z",
+    });
+
+    expect(await store.removePrunedManifestRecords()).toBe(40);
+    expect(await store.getManifest(39)).toBeUndefined();
+    expect(await store.getManifest(40)).toMatchObject({ version: 40, blockIds: [] });
+    expect(await store.getCurrentManifest()).toMatchObject({ version: 69, blockIds: [] });
+    expect((await store.listManifests()).map((manifest) => manifest.version)).toEqual(
+      Array.from({ length: 30 }, (_, index) => index + 40),
+    );
+    expect(await store.removePrunedManifestRecords()).toBe(0);
     store.close();
   });
 

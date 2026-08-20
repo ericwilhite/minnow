@@ -149,6 +149,25 @@ export class ExtentPool {
     return bytes;
   }
 
+  /**
+   * Returns the sealed extent with the most dead space once less than half its physical bytes
+   * remain live. Relocating that extent keeps sealed-file bytes below twice live payload bytes;
+   * the append tail contributes only one bounded extent beyond that ratio.
+   */
+  async fragmentedExtentId(): Promise<number | undefined> {
+    let candidate: { id: number; wasteRatio: number } | undefined;
+    for (const [id, liveBytes] of this.#liveBytes) {
+      if (id === this.#tailId || liveBytes === 0) continue;
+      const size = (await this.#readHandle(id)).getSize();
+      if (size === 0 || liveBytes * 2 >= size) continue;
+      const wasteRatio = (size - liveBytes) / size;
+      if (candidate === undefined || wasteRatio > candidate.wasteRatio) {
+        candidate = { id, wasteRatio };
+      }
+    }
+    return candidate?.id;
+  }
+
   async #readHandle(extent: number): Promise<SyncFileHandle> {
     const cached = this.#readHandles.get(extent);
     if (cached !== undefined) {

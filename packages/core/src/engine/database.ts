@@ -226,6 +226,8 @@ const AUTO_COMPACT_SCAN_SEGMENTS = 48;
 const AUTO_COMPACT_DELTA_SEGMENTS = 32;
 /** Commits to one table between auto-compaction checks on the write path. */
 const AUTO_COMPACT_COMMIT_CHECK_INTERVAL = 8;
+/** Quiet time after a write burst before checking its final, sub-interval tail. */
+const AUTO_COMPACT_IDLE_CHECK_MS = 25;
 /** Commits between background collection passes; each prunes the manifests they wrote. */
 const AUTO_COLLECT_COMMIT_INTERVAL = 64;
 /**
@@ -287,9 +289,9 @@ const GZIP_WORTHWHILE_RATIO = 1.2;
  * bounds how long a wrong observation can persist if the data changes underneath it.
  */
 const GZIP_REPROBE_BLOCKS = 32;
+/** Failed per-column probes retained in one database session. */
+const GZIP_VERDICT_CACHE_LIMIT = 256;
 
-/** Blocks smaller than this are written with the configured codec; the choice cannot repay. */
-const GZIP_DECISION_MIN_BYTES = 64 * 1024;
 /**
  * Below this many logical bytes a block is written raw: the compression pass on the write and
  * the decompression pass on every read would cost more than the bytes they save, and a point
@@ -1001,8 +1003,8 @@ export class MinnowDatabase {
       }
     | undefined;
   readonly #compression: Compression;
-  /** Per-column record of whether gzip repaid itself, and how many blocks ago that was seen. */
-  readonly #gzipVerdicts = new Map<string, { worthwhile: boolean; blocksSince: number }>();
+  /** Per-column count since gzip last failed to repay itself; successful probes need no entry. */
+  readonly #gzipVerdicts = new Map<string, number>();
   readonly #rowsPerBlock: number;
   readonly #maxCommitRetries: number;
   readonly #now: () => Date;
@@ -1040,6 +1042,13 @@ export class MinnowDatabase {
   readonly #ftsBuildsInFlight = new Set<string>();
   /** Tables with a fire-and-forget compaction step already running. */
   readonly #autoCompactionsInFlight = new Set<string>();
+  /** Tables whose maintenance threshold was observed again while their fold was still running. */
+  readonly #autoCompactionsRequested = new Set<string>();
+  /** Changed tables awaiting the debounced check that closes a write burst. */
+  readonly #idleCompactionTableIds = new Set<string>();
+  #idleCompactionTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Tables whose drop is retiring data; prevents a new background fold from starting. */
+  readonly #droppingTables = new Set<string>();
   /** Per table: the visible segment count a failed auto-compaction must see before retrying. */
   readonly #autoCompactionBackoff = new Map<string, number>();
   /** Data commits per table since its last write-path auto-compaction check. */
@@ -1401,38 +1410,54 @@ export class MinnowDatabase {
         }
       }
     }
-    // Retiring the blocks is a commit like any other, and background compaction publishes
-    // underneath it: a block this table owned a moment ago can already have been rewritten. The
-    // list is therefore taken from the transaction's own snapshot — the manifest its commit will
-    // be validated against — and a scope that loses the race simply runs again.
-    for (let attempt = 0; ; attempt += 1) {
-      const transaction = await this.#transactions.begin();
-      try {
-        const segments = await this.store.listSegments(table.id);
-        const snapshot =
-          transaction.snapshotVersion === null
-            ? undefined
-            : await this.store.getManifest(transaction.snapshotVersion);
-        const live = new Set(snapshot?.blockIds ?? []);
-        const blockIds = [
-          ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
-        ].filter((id) => live.has(id));
-        transaction.markTableChanged(table.id);
-        if (blockIds.length > 0) transaction.supersedeBlocks(blockIds);
-        await transaction.commit();
-        break;
-      } catch (error) {
-        await transaction.abort();
-        if (!(error instanceof WriteConflictError) || attempt >= this.#maxCommitRetries)
-          throw error;
+    this.#droppingTables.add(table.id);
+    try {
+      // Stop every fold already attached to the table before its catalog record disappears.
+      // Otherwise an unpublished job can no longer resume or be cancelled by table name, and
+      // its transaction and staged output become permanent roots.
+      await this.#cancelTableCompactions(table.id);
+      // Retiring the blocks is a commit like any other, and background compaction publishes
+      // underneath it: a block this table owned a moment ago can already have been rewritten. The
+      // list is therefore taken from the transaction's own snapshot — the manifest its commit will
+      // be validated against — and a scope that loses the race simply runs again.
+      for (let attempt = 0; ; attempt += 1) {
+        const transaction = await this.#transactions.begin();
+        try {
+          const segments = await this.store.listSegments(table.id);
+          const snapshot =
+            transaction.snapshotVersion === null
+              ? undefined
+              : await this.store.getManifest(transaction.snapshotVersion);
+          const live = new Set(snapshot?.blockIds ?? []);
+          const blockIds = [
+            ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+          ].filter((id) => live.has(id));
+          transaction.markTableChanged(table.id);
+          if (blockIds.length > 0) transaction.supersedeBlocks(blockIds);
+          await transaction.commit();
+          break;
+        } catch (error) {
+          await transaction.abort();
+          if (!(error instanceof WriteConflictError) || attempt >= this.#maxCommitRetries)
+            throw error;
+        }
       }
+      // The catalog goes last: until it does, the table is merely empty of live blocks, and a
+      // crash in between leaves a table whose rows are gone rather than a segment pointing at a
+      // table that is not there.
+      // Catch a fold that was already between its scheduling check and job creation when the
+      // drop began. The dropping marker prevents another one from starting after this point.
+      await this.#cancelTableCompactions(table.id);
+      await this.store.removeTable(table.id, table.revision ?? 0);
+      for (const column of table.columns) this.#gzipVerdicts.delete(column.id);
+      this.#autoCompactionBackoff.delete(table.id);
+      this.#commitsSinceCompactionCheck.delete(table.id);
+      this.#idleCompactionTableIds.delete(table.id);
+      this.#planCache.clear();
+      return true;
+    } finally {
+      this.#droppingTables.delete(table.id);
     }
-    // The catalog goes last: until it does, the table is merely empty of live blocks, and a
-    // crash in between leaves a table whose rows are gone rather than a segment pointing at a
-    // table that is not there.
-    await this.store.removeTable(table.id, table.revision ?? 0);
-    this.#planCache.clear();
-    return true;
   }
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
@@ -3347,20 +3372,41 @@ export class MinnowDatabase {
    */
   #maybeScheduleAutoCompaction(table: TableRecord, segments: readonly SegmentRecord[]): void {
     if (!this.#autoCompact) return;
+    if (this.#droppingTables.has(table.id)) return;
     if (!autoCompactionDue(segments)) return;
     if (segments.length < (this.#autoCompactionBackoff.get(table.id) ?? 0)) return;
-    if (this.#autoCompactionsInFlight.has(table.id)) return;
+    if (this.#autoCompactionsInFlight.has(table.id)) {
+      // A final burst can cross the threshold while the prior fold is still planning or
+      // running. Remember it: otherwise no later commit or scan may arrive to trigger the fold
+      // that the final state still needs.
+      this.#autoCompactionsRequested.add(table.id);
+      return;
+    }
     this.#autoCompactionsInFlight.add(table.id);
     void this.#runAutoCompaction(table)
       .then((folded) => {
         if (folded) this.#autoCompactionBackoff.delete(table.id);
-        else this.#autoCompactionBackoff.set(table.id, Math.max(2, segments.length * 2));
+        else {
+          this.#autoCompactionBackoff.set(
+            table.id,
+            Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, segments.length * 2)),
+          );
+        }
       })
       .catch(() => {
-        this.#autoCompactionBackoff.set(table.id, Math.max(2, segments.length * 2));
+        // Back off deterministic failures, but never beyond the maximum L0 prefix a fold can
+        // consume. A transient conflict near the end of a burst must not strand hundreds of
+        // segments waiting for a segment count the idle database can never reach.
+        this.#autoCompactionBackoff.set(
+          table.id,
+          Math.min(AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS, Math.max(2, segments.length * 2)),
+        );
       })
       .finally(() => {
         this.#autoCompactionsInFlight.delete(table.id);
+        if (this.#autoCompactionsRequested.delete(table.id)) {
+          void yieldToEventLoop().then(() => this.#checkAutoCompaction(table.id));
+        }
       });
   }
 
@@ -3381,6 +3427,7 @@ export class MinnowDatabase {
     };
     let folded = false;
     for (;;) {
+      if (this.#droppingTables.has(table.id)) return folded;
       let progress = await this.compactTableStep(table.name, options);
       while (progress.result === null) {
         if (progress.jobId === null) throw new Error("Compaction progress lost its job ID");
@@ -3428,14 +3475,39 @@ export class MinnowDatabase {
     this.#armIdleCollection();
     if (!this.#autoCompact) return;
     for (const tableId of manifest.changedTableIds ?? []) {
+      this.#idleCompactionTableIds.add(tableId);
       const commits = (this.#commitsSinceCompactionCheck.get(tableId) ?? 0) + 1;
       if (commits < AUTO_COMPACT_COMMIT_CHECK_INTERVAL) {
         this.#commitsSinceCompactionCheck.set(tableId, commits);
         continue;
       }
       this.#commitsSinceCompactionCheck.delete(tableId);
+      this.#idleCompactionTableIds.delete(tableId);
       void this.#checkAutoCompaction(tableId);
     }
+    this.#armIdleCompactionCheck();
+  }
+
+  /**
+   * Debounces the final write-path check for a burst. Sampling every few commits keeps the hot
+   * path cheap, but the last one through seven commits can be the ones that cross a fold
+   * threshold. Without this check an idle table can remain due forever because no later write or
+   * scan arrives to notice it.
+   */
+  #armIdleCompactionCheck(): void {
+    if (this.#idleCompactionTableIds.size === 0) return;
+    if (this.#idleCompactionTimer !== undefined) clearTimeout(this.#idleCompactionTimer);
+    const timer = setTimeout(() => {
+      this.#idleCompactionTimer = undefined;
+      const tableIds = [...this.#idleCompactionTableIds];
+      this.#idleCompactionTableIds.clear();
+      for (const tableId of tableIds) {
+        this.#commitsSinceCompactionCheck.delete(tableId);
+        void this.#checkAutoCompaction(tableId);
+      }
+    }, AUTO_COMPACT_IDLE_CHECK_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.#idleCompactionTimer = timer;
   }
 
   /**
@@ -7623,6 +7695,14 @@ export class MinnowDatabase {
     }
   }
 
+  async #cancelTableCompactions(tableId: string): Promise<void> {
+    for (const job of await this.store.listCompactionJobs(tableId)) {
+      if (job.state === "planned" || job.state === "running" || job.state === "ready") {
+        await this.cancelCompactionJob(job.id);
+      }
+    }
+  }
+
   /** Runs restart-safe lease-aware reclamation to completion in bounded durable steps. */
   async collectGarbage(options: CollectGarbageOptions = {}): Promise<GarbageCollectionResult> {
     const maxItems = positiveWholeNumber(
@@ -7641,6 +7721,7 @@ export class MinnowDatabase {
     while (progress.result === null) {
       progress = await this.resumeGarbageCollectionJob(progress.jobId, { maxItems });
     }
+    await this.#pruneFinishedJobRecords();
     return progress.result;
   }
 
@@ -7801,21 +7882,39 @@ export class MinnowDatabase {
     await this.#pruneFinishedJobRecords();
   }
 
-  /**
-   * Drops the records of finished background jobs beyond the most recent few of each kind. A
-   * published fold keeps its source lists and a completed collection pass its candidate lists,
-   * so left alone they grow the store by a few kilobytes per pass, forever — the one thing a
-   * database that runs all day would still accumulate. Cancelled and aborted folds stay: the
-   * L2 write-amplification ceiling is computed over them.
-   */
+  /** Drops finished maintenance records while preserving the state needed for safe L2 retries. */
   async #pruneFinishedJobRecords(): Promise<void> {
     const newestFirst = <T extends { updatedAt: string }>(jobs: T[]): T[] =>
       jobs.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    const compactions = newestFirst(
-      (await this.store.listCompactionJobs()).filter((job) => job.state === "published"),
+    const terminalCompactions = newestFirst(
+      (await this.store.listCompactionJobs()).filter(
+        (job) => job.state === "published" || job.state === "cancelled" || job.state === "aborted",
+      ),
     );
-    for (const job of compactions.slice(AUTO_COLLECT_RETAINED_JOB_RECORDS)) {
-      await this.store.removeCompactionJob(job.id);
+    const retainedCompactionIds = new Set(
+      terminalCompactions.slice(0, AUTO_COLLECT_RETAINED_JOB_RECORDS).map((job) => job.id),
+    );
+    // A retry persists the cumulative bytes written by earlier attempts. Keep only the newest
+    // failure for each still-readable source snapshot; it carries the whole lifetime budget.
+    // Once the source manifest is pruned, that exact retry can never be planned again.
+    const retainedFailureBases = new Set<string>();
+    const manifestReadable = new Map<number, boolean>();
+    for (const job of terminalCompactions) {
+      if (job.state !== "cancelled" && job.state !== "aborted") continue;
+      const baseId = job.id.split("/retry/", 1)[0] ?? job.id;
+      if (retainedFailureBases.has(baseId)) continue;
+      let readable = manifestReadable.get(job.sourceManifestVersion);
+      if (readable === undefined) {
+        const manifest = await this.store.getManifest(job.sourceManifestVersion);
+        readable = manifest !== undefined && manifest.prunedAt === undefined;
+        manifestReadable.set(job.sourceManifestVersion, readable);
+      }
+      if (!readable) continue;
+      retainedFailureBases.add(baseId);
+      retainedCompactionIds.add(job.id);
+    }
+    for (const job of terminalCompactions) {
+      if (!retainedCompactionIds.has(job.id)) await this.store.removeCompactionJob(job.id);
     }
     const collections = newestFirst(
       (await this.store.listGarbageCollectionJobs()).filter((job) => job.state === "completed"),
@@ -7834,6 +7933,11 @@ export class MinnowDatabase {
     retainRecentVersions: number,
     retainedVersionMaxAgeMs = Number.POSITIVE_INFINITY,
   ): Promise<GarbageCollectionJobRecord> {
+    // Crashed readers and query spill owners are metadata roots too. Sweep their expired
+    // records as part of every explicit or background collection so callers never need a
+    // separate maintenance loop to keep either family bounded.
+    await this.#transactions.removeExpiredLeases(this.#now());
+    await this.cleanupQuerySpill();
     const current = await this.store.getCurrentManifest();
     const currentBlockIds = new Set(current?.blockIds ?? []);
     // Manifest versions are consecutive, so the retained window is a version floor; a version
@@ -7921,19 +8025,22 @@ export class MinnowDatabase {
         const page = await this.store.listTransactionPage(transactionCursor, 64);
         for (const transaction of page.records) {
           if (transaction.status === "aborted") {
-            addBlocks(
-              await this.#existingGarbageBlockCandidates(
-                transaction.pendingBlockIds,
-                currentBlockIds,
-                remaining(),
-              ),
+            const pendingBlocks = await this.#existingGarbageBlockCandidates(
+              transaction.pendingBlockIds,
+              currentBlockIds,
+              remaining(),
             );
-            addSegments(
-              await this.#existingGarbageSegmentCandidates(
-                transaction.pendingSegmentIds,
-                remaining(),
-              ),
+            addBlocks(pendingBlocks);
+            const pendingSegments = await this.#existingGarbageSegmentCandidates(
+              transaction.pendingSegmentIds,
+              remaining(),
             );
+            addSegments(pendingSegments);
+            // The artifacts are deleted before transaction candidates within a job. A later
+            // pass sees the empty journal and removes the aborted record itself.
+            if (pendingBlocks.length === 0 && pendingSegments.length === 0 && remaining() > 0) {
+              candidateTransactionIds.push(transaction.id);
+            }
           } else if (
             transaction.status === "committed" &&
             transaction.committedVersion !== null &&
@@ -7944,7 +8051,8 @@ export class MinnowDatabase {
             if (eligible === undefined) {
               const manifest = await this.store.getManifest(transaction.committedVersion);
               eligible =
-                manifest?.prunedAt !== undefined ||
+                manifest === undefined ||
+                manifest.prunedAt !== undefined ||
                 candidateManifestSet.has(transaction.committedVersion);
               manifestEligibility.set(transaction.committedVersion, eligible);
             }
@@ -8047,7 +8155,10 @@ export class MinnowDatabase {
   ): Promise<GarbageCollectionProgress> {
     let job = initialJob;
     for (;;) {
-      if (job.state === "completed") return garbageCollectionProgress(job);
+      if (job.state === "completed") {
+        await this.store.removePrunedManifestRecords();
+        return garbageCollectionProgress(job);
+      }
       try {
         const step = await this.store.runGarbageCollectionStep({
           jobId: job.id,
@@ -8055,6 +8166,7 @@ export class MinnowDatabase {
           maxItems,
           updatedAt: this.#now().toISOString(),
         });
+        if (step.job.state === "completed") await this.store.removePrunedManifestRecords();
         return garbageCollectionProgress(step.job);
       } catch (error) {
         if (!(error instanceof GarbageCollectionJobConflictError)) throw error;
@@ -8436,7 +8548,17 @@ export class MinnowDatabase {
             (candidate.state === "cancelled" || candidate.state === "aborted") &&
             (candidate.id === baseJobId || candidate.id.startsWith(`${baseJobId}/retry/`)),
         )
-        .reduce((total, candidate) => total + candidate.outputStoredBytes, 0);
+        .reduce(
+          (largest, candidate) =>
+            Math.max(
+              largest,
+              safeWholeNumberSum(
+                [candidate.priorAttemptOutputStoredBytes ?? 0, candidate.outputStoredBytes],
+                "Compaction prior-attempt output stored bytes",
+              ),
+            ),
+          0,
+        );
       const maximumOutputStoredBytes = Math.max(
         0,
         floorWholeNumberProduct(
@@ -9599,11 +9721,23 @@ export class MinnowDatabase {
 
       transaction.supersedeBlocks(job.sourceBlockIds);
       transaction.markLogicallyUnchanged();
-      let manifest;
-      try {
-        manifest = await transaction.commit();
-      } catch (error) {
-        if (!(error instanceof WriteConflictError)) throw error;
+      let manifest: ManifestSummary;
+      for (;;) {
+        let publicationConflict: WriteConflictError | undefined;
+        try {
+          manifest = await transaction.commit();
+          break;
+        } catch (error) {
+          if (!(error instanceof WriteConflictError)) throw error;
+          publicationConflict = error;
+        }
+
+        // Publication is logically neutral, so it may follow any number of concurrent data
+        // commits while every source remains visible and in the same logical position. A single
+        // retry is not sufficient: another tab (or this database's write queue) can win the
+        // manifest CAS again between rebase and commit, leaving an otherwise complete job stuck
+        // in `ready` after the last write. Keep rebasing until publication wins or a source
+        // genuinely changes.
         const current = await this.store.getCurrentManifest();
         const currentIds = new Set(current?.blockIds ?? []);
         if (job.sourceBlockIds.some((id) => !currentIds.has(id))) {
@@ -9612,7 +9746,7 @@ export class MinnowDatabase {
             job,
             "Compaction sources changed before publication",
           );
-          throw new Error(job.error, { cause: error });
+          throw new Error(job.error, { cause: publicationConflict });
         }
         const rebased = await transaction.rebase();
         try {
@@ -9629,11 +9763,11 @@ export class MinnowDatabase {
             job,
             `Compaction source is no longer visible: ${missingSourceId}`,
           );
-          throw new Error(job.error, { cause: error });
+          throw new Error(job.error, { cause: publicationConflict });
         }
         transaction.supersedeBlocks(job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
-        manifest = await transaction.commit();
+        await yieldToEventLoop();
       }
       job = await this.#markCompactionPublished(job, manifest.version);
       return compactionProgress(
@@ -9707,12 +9841,17 @@ export class MinnowDatabase {
       const existing = await this.store.getBlock(outputBlockId);
       let outputBytes: Uint8Array;
       if (existing === undefined) {
-        outputBytes = await encodePhysicalBlock(built.physical, plan.outputCompression);
+        outputBytes = await this.#encodePreferredBlock(
+          column.columnId,
+          plan.outputCompression,
+          built.physical.bytes.byteLength < GZIP_MINIMUM_INPUT_BYTES,
+          (compression) => encodePhysicalBlock(built.physical, compression),
+        );
       } else {
         const decoded = await decodePhysicalBlock(existing);
         if (
           decoded.description.type !== column.type ||
-          decoded.description.compression !== plan.outputCompression ||
+          (plan.outputCompression === "raw" && decoded.description.compression !== "raw") ||
           decoded.description.rowCount !== output.rowCount ||
           !sameBytes(decoded.column.bytes, built.physical.bytes)
         ) {
@@ -11910,25 +12049,52 @@ export class MinnowDatabase {
    * bytes and never correctness.
    */
   async #encodeColumnBlock(columnId: string, input: ColumnInput): Promise<Uint8Array> {
-    if (this.#compression !== "gzip") return encodeBlock(input, this.#compression);
-    if (columnInputBytesBelow(input, GZIP_MINIMUM_INPUT_BYTES)) return encodeBlock(input, "raw");
+    return this.#encodePreferredBlock(
+      columnId,
+      this.#compression,
+      columnInputBytesBelow(input, GZIP_MINIMUM_INPUT_BYTES),
+      (compression) => encodeBlock(input, compression),
+    );
+  }
+
+  /**
+   * Applies the same adaptive gzip rule to ordinary writes and compaction output. `gzip` is a
+   * preference, not a promise: tiny inputs and probes that save less than 20% stay raw. Only a
+   * failed verdict is cached, so successful columns do not leave one map entry behind forever.
+   */
+  async #encodePreferredBlock(
+    columnId: string,
+    preferred: Compression,
+    belowMinimum: boolean,
+    encode: (compression: Compression) => Promise<Uint8Array>,
+  ): Promise<Uint8Array> {
+    if (preferred !== "gzip") return encode(preferred);
+    if (belowMinimum) return encode("raw");
     const verdict = this.#gzipVerdicts.get(columnId);
-    if (verdict !== undefined && !verdict.worthwhile) {
-      if (verdict.blocksSince < GZIP_REPROBE_BLOCKS) {
-        verdict.blocksSince += 1;
-        return encodeBlock(input, "raw");
+    if (verdict !== undefined) {
+      if (verdict < GZIP_REPROBE_BLOCKS) {
+        this.#gzipVerdicts.set(columnId, verdict + 1);
+        return encode("raw");
       }
       this.#gzipVerdicts.delete(columnId);
     }
-    const bytes = await encodeBlock(input, "gzip");
+    const bytes = await encode("gzip");
     const description = inspectBlock(bytes);
-    if (description.encodedLength >= GZIP_DECISION_MIN_BYTES) {
-      const worthwhile = description.encodedLength >= bytes.byteLength * GZIP_WORTHWHILE_RATIO;
-      this.#gzipVerdicts.set(columnId, { worthwhile, blocksSince: 0 });
+    const worthwhile = description.encodedLength >= bytes.byteLength * GZIP_WORTHWHILE_RATIO;
+    if (!worthwhile) {
+      if (
+        !this.#gzipVerdicts.has(columnId) &&
+        this.#gzipVerdicts.size >= GZIP_VERDICT_CACHE_LIMIT
+      ) {
+        const oldest = this.#gzipVerdicts.keys().next().value;
+        if (oldest !== undefined) this.#gzipVerdicts.delete(oldest);
+      }
+      this.#gzipVerdicts.set(columnId, 0);
       // Nothing was gained, so hand back the uncompressed form rather than make every read of
       // this block pay to inflate it.
-      if (!worthwhile) return encodeBlock(input, "raw");
+      return encode("raw");
     }
+    this.#gzipVerdicts.delete(columnId);
     return bytes;
   }
 

@@ -104,6 +104,7 @@ type Frame =
       };
     }
   | { op: "removeGarbageCollectionJob"; id: string }
+  | { op: "removePrunedManifestRecords" }
   | { op: "createTempOwner"; record: TempOwnerRecord }
   | { op: "renewTempOwner"; ownerId: string; expectedRevision: number; expiresAt: string }
   | { op: "removeTempOwnerIfExpired"; ownerId: string; expiresAtCutoff: string }
@@ -300,6 +301,9 @@ class MiniLogStore implements BlockStore {
         break;
       case "removeGarbageCollectionJob":
         this.#core.removeGarbageCollectionJob(frame.id);
+        break;
+      case "removePrunedManifestRecords":
+        this.#core.removePrunedManifestRecords();
         break;
       case "createTempOwner":
         this.#core.createTempOwner(frame.record);
@@ -716,6 +720,15 @@ class MiniLogStore implements BlockStore {
       this.#logged({ op: "removeGarbageCollectionJob", id }, () => {
         this.#core.removeGarbageCollectionJob(id);
       }),
+    );
+  }
+
+  async removePrunedManifestRecords(): Promise<number> {
+    return this.#run(() =>
+      this.#logged(
+        { op: "removePrunedManifestRecords" },
+        () => this.#core.removePrunedManifestRecords().length,
+      ),
     );
   }
 

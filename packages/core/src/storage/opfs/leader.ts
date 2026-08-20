@@ -62,6 +62,19 @@ interface IdPlacement {
   placement: Placement;
 }
 
+interface BlockRelocation {
+  id: string;
+  from: Placement;
+  placement: Placement;
+}
+
+interface FtsChunkRelocation {
+  key: string;
+  ordinal: number;
+  from: Placement;
+  placement: Placement;
+}
+
 interface FtsBasePointer {
   coversVersion: number;
   totalTokens: number;
@@ -80,6 +93,11 @@ interface CheckpointState {
 type WalEntryBody =
   | { op: "addBlocks"; placements: IdPlacement[] }
   | { op: "removeBlock"; id: string }
+  | {
+      op: "relocatePayloads";
+      blocks: BlockRelocation[];
+      ftsChunks: FtsChunkRelocation[];
+    }
   | { op: "addTable"; record: TableRecord }
   | {
       op: "updateTable";
@@ -159,6 +177,7 @@ type WalEntryBody =
       };
     }
   | { op: "removeGarbageCollectionJob"; id: string }
+  | { op: "removePrunedManifestRecords" }
   | { op: "createTempOwner"; record: TempOwnerRecord }
   | { op: "renewTempOwner"; ownerId: string; expectedRevision: number; expiresAt: string }
   | { op: "removeTempOwnerIfExpired"; ownerId: string; expiresAtCutoff: string }
@@ -415,6 +434,32 @@ export class OpfsLeader {
         if (placement !== undefined) this.#pool.release([placement]);
         return undefined;
       }
+      case "relocatePayloads": {
+        // Validate the complete move before changing an index: a stale relocation must leave
+        // both indexes and live-byte accounting untouched.
+        for (const move of body.blocks) {
+          if (!samePlacement(this.#blockIndex.get(move.id), move.from)) {
+            throw new Error(`OPFS block moved before relocation: ${move.id}`);
+          }
+        }
+        for (const move of body.ftsChunks) {
+          if (!samePlacement(this.#ftsBases.get(move.key)?.chunks[move.ordinal], move.from)) {
+            throw new Error(`OPFS full-text chunk moved before relocation: ${move.key}`);
+          }
+        }
+        for (const move of body.blocks) this.#blockIndex.set(move.id, move.placement);
+        for (const move of body.ftsChunks) {
+          const pointer = this.#ftsBases.get(move.key);
+          if (pointer === undefined) throw new Error(`OPFS full-text base is missing: ${move.key}`);
+          pointer.chunks[move.ordinal] = move.placement;
+          this.#dropFtsChunkCache(move.key);
+        }
+        this.#pool.release([
+          ...body.blocks.map((move) => move.from),
+          ...body.ftsChunks.map((move) => move.from),
+        ]);
+        return undefined;
+      }
       case "addTable":
         return this.#core.addTable(body.record);
       case "updateTable":
@@ -512,6 +557,8 @@ export class OpfsLeader {
       }
       case "removeGarbageCollectionJob":
         return this.#core.removeGarbageCollectionJob(body.id);
+      case "removePrunedManifestRecords":
+        return this.#core.removePrunedManifestRecords().length;
       case "createTempOwner":
         return this.#core.createTempOwner(body.record);
       case "renewTempOwner":
@@ -593,6 +640,51 @@ export class OpfsLeader {
     }
   }
 
+  /** Re-packs every sealed extent below 50% occupancy; each source file is at most 8 MiB. */
+  async #compactFragmentedExtents(): Promise<void> {
+    for (;;) {
+      const extent = await this.#pool.fragmentedExtentId();
+      if (extent === undefined) return;
+      const blockSources = [...this.#blockIndex.entries()]
+        .filter(([, placement]) => placement.extent === extent)
+        .map(([id, from]) => ({ id, from }));
+      const ftsSources = [...this.#ftsBases.entries()].flatMap(([key, pointer]) =>
+        pointer.chunks.flatMap((from, ordinal) =>
+          from.extent === extent ? [{ key, ordinal, from }] : [],
+        ),
+      );
+      if (blockSources.length === 0 && ftsSources.length === 0) {
+        throw new Error(`OPFS extent ${String(extent)} has live bytes but no indexed payload`);
+      }
+      const blocks: BlockRelocation[] = [];
+      const ftsChunks: FtsChunkRelocation[] = [];
+      const appended: Placement[] = [];
+      try {
+        for (const source of blockSources) {
+          const placement = await this.#pool.append(
+            await this.#pool.read(source.from),
+            this.#strict,
+          );
+          appended.push(placement);
+          blocks.push({ ...source, placement });
+        }
+        for (const source of ftsSources) {
+          const placement = await this.#pool.append(
+            await this.#pool.read(source.from),
+            this.#strict,
+          );
+          appended.push(placement);
+          ftsChunks.push({ ...source, placement });
+        }
+        this.#logged({ op: "relocatePayloads", blocks, ftsChunks });
+      } catch (error) {
+        this.#pool.release(appended);
+        throw error;
+      }
+      await this.#deleteDrainedExtents();
+    }
+  }
+
   // ---------------------------------------------------------------------------------------
   // Blocks.
   // ---------------------------------------------------------------------------------------
@@ -640,11 +732,12 @@ export class OpfsLeader {
   }
 
   async removeBlock(id: string): Promise<void> {
-    await this.#run(() => {
+    await this.#run(async () => {
       if (!this.#blockIndex.has(id)) return;
       this.#logged({ op: "removeBlock", id });
+      await this.#deleteDrainedExtents();
+      await this.#compactFragmentedExtents();
     });
-    await this.#deleteDrainedExtents();
   }
 
   async listBlockIds(): Promise<string[]> {
@@ -879,8 +972,11 @@ export class OpfsLeader {
   }
 
   async removeTable(id: string, expectedRevision: number): Promise<void> {
-    await this.#run(() => this.#logged({ op: "removeTable", id, expectedRevision }));
-    await this.#deleteDrainedExtents();
+    await this.#run(async () => {
+      this.#logged({ op: "removeTable", id, expectedRevision });
+      await this.#deleteDrainedExtents();
+      await this.#compactFragmentedExtents();
+    });
   }
 
   async addSegment(record: SegmentRecord): Promise<void> {
@@ -1119,7 +1215,7 @@ export class OpfsLeader {
   async runGarbageCollectionStep(
     input: RunGarbageCollectionStepInput,
   ): Promise<GarbageCollectionStepResult> {
-    const result = await this.#run(() => {
+    return this.#run(async () => {
       // Computed against provably-current state, logged as the resolved effect so replay
       // needs no knowledge of physical placement.
       const step = this.#core.runGarbageCollectionStep(input);
@@ -1135,14 +1231,18 @@ export class OpfsLeader {
           updatedAt: input.updatedAt,
         },
       });
+      await this.#deleteDrainedExtents();
+      if (step.job.state === "completed") await this.#compactFragmentedExtents();
       return step;
     });
-    await this.#deleteDrainedExtents();
-    return result;
   }
 
   async removeGarbageCollectionJob(id: string): Promise<void> {
     await this.#run(() => this.#logged({ op: "removeGarbageCollectionJob", id }));
+  }
+
+  async removePrunedManifestRecords(): Promise<number> {
+    return this.#run(() => this.#logged({ op: "removePrunedManifestRecords" }) as number);
   }
 
   // ---------------------------------------------------------------------------------------
@@ -1174,8 +1274,9 @@ export class OpfsLeader {
         })),
       };
       this.#logged({ op: "writeFtsBase", tableId, columnId, pointer });
+      await this.#deleteDrainedExtents();
+      await this.#compactFragmentedExtents();
     });
-    await this.#deleteDrainedExtents();
   }
 
   async readFtsCandidates(
@@ -1368,9 +1469,20 @@ function placementsOf(entry: WalEntry): Placement[] {
       return entry.pointer.chunks;
     case "importSnapshot":
       return entry.blockPlacements.map(({ placement }) => placement);
+    case "relocatePayloads":
+      return [
+        ...entry.blocks.map(({ placement }) => placement),
+        ...entry.ftsChunks.map(({ placement }) => placement),
+      ];
     default:
       return [];
   }
+}
+
+function samePlacement(left: Placement | undefined, right: Placement): boolean {
+  return (
+    left?.extent === right.extent && left.offset === right.offset && left.length === right.length
+  );
 }
 
 function encodeFtsChunk(chunk: FtsPosting[]): Uint8Array {

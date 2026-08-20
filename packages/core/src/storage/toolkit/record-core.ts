@@ -566,6 +566,24 @@ export class RecordCore {
     };
   }
 
+  /** RecordCore keeps resolved manifests, so every tombstone before the first readable one is safe. */
+  removePrunedManifestRecords(): number[] {
+    const earliestReadable = [...this.#manifests.values()]
+      .filter((manifest) => manifest.prunedAt === undefined)
+      .reduce(
+        (earliest, manifest) => Math.min(earliest, manifest.version),
+        Number.POSITIVE_INFINITY,
+      );
+    const safeBelow = earliestReadable;
+    const removed: number[] = [];
+    for (const [version, manifest] of this.#manifests) {
+      if (manifest.prunedAt === undefined || version >= safeBelow) continue;
+      this.#manifests.delete(version);
+      removed.push(version);
+    }
+    return removed.sort((left, right) => left - right);
+  }
+
   publishManifest(input: PublishManifestInput): Manifest {
     if (this.#currentVersion !== input.expectedVersion) {
       throw new WriteConflictError(input.expectedVersion, this.#currentVersion);
@@ -1304,11 +1322,16 @@ export class RecordCore {
             : this.#manifests.get(record.committedVersion);
         if (record === undefined) missingTransactionIds.push(id);
         else if (
-          record.status !== "committed" ||
-          (manifest?.prunedAt === undefined &&
-            !prunedManifestVersionSet.has(record.committedVersion ?? -1)) ||
-          segmentOwners.has(id) ||
-          unfinishedCompactionOwners.has(id)
+          unfinishedCompactionOwners.has(id) ||
+          (record.status === "committed"
+            ? (manifest !== undefined &&
+                manifest.prunedAt === undefined &&
+                !prunedManifestVersionSet.has(record.committedVersion ?? -1)) ||
+              segmentOwners.has(id)
+            : record.status === "aborted"
+              ? record.pendingBlockIds.some((blockId) => this.#physical.hasBlock(blockId)) ||
+                record.pendingSegmentIds.some((segmentId) => this.#segments.has(segmentId))
+              : true)
         ) {
           retainedTransactionIds.push(id);
         } else {
@@ -1801,10 +1824,12 @@ function assertGarbageCollectionCandidateProvenance(
   }
   for (const id of job.candidateTransactionIds) {
     const transaction = transactions.get(id);
-    if (transaction?.status !== "committed" || transaction.committedVersion === null) {
-      throw new Error(
-        `Garbage collection transaction candidate is not a committed transaction: ${id}`,
-      );
+    if (
+      transaction === undefined ||
+      (transaction.status !== "aborted" &&
+        (transaction.status !== "committed" || transaction.committedVersion === null))
+    ) {
+      throw new Error(`Garbage collection transaction candidate is not terminal: ${id}`);
     }
   }
   const blockHasProvenance = (id: string): boolean => {

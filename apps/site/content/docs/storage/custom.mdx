@@ -51,10 +51,12 @@ finalization, unique keys, full-text deltas, and the record flip — one durable
 step, including against a crash at any moment.
 
 `runGarbageCollectionStep` owns record reclamation as well as blob reclamation. It processes
-manifests, segments, blocks, then committed transactions; a transaction can disappear only after
-its manifest is pruned and no segment or unfinished compaction names it. Adapters must apply that
-whole step atomically. A file-backed adapter may delete the immutable block payload after logging
-the resolved step, as the toolkit example does.
+manifests, segments, blocks, then terminal transactions; a committed transaction can disappear
+only after its manifest is pruned and no segment or unfinished compaction names it, while an
+aborted one waits for every pending artifact to disappear. Adapters must apply that whole step
+atomically. `removePrunedManifestRecords` then deletes only the tombstone prefix no readable delta
+chain needs. A file-backed adapter may delete immutable block payloads after logging the resolved
+step, as the toolkit example does.
 
 **Conflicts are typed, by exact class.** Compare-and-swap failures throw the exported error
 classes (`WriteConflictError`, `TransactionRecordConflictError`, and the rest) — not wrappers,
@@ -142,7 +144,7 @@ everyone.
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `RecordCore`                   | The record-state machine behind the memory and OPFS adapters: every record family, validation order, typed conflict, and defensive copy the contract requires, one synchronous method per operation, plus `dump()`/`load()` for checkpoints. |
 | `WalWriter`, `replayWalFrames` | Checksummed write-ahead-log frames over one held file handle. Replay stops at the first torn frame, which is exactly what a crash can leave.                                                                                                 |
-| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length }`, with sealing and a read-handle cache.                                                                                                          |
+| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length }`, with sealing, live-byte accounting, fragmentation detection, and a read-handle cache.                                                          |
 | `encodeRecordJson` and friends | The JSON codec (bigints included) and the checksummed, versioned envelopes for checkpoints and immutable chunks.                                                                                                                             |
 | `SyncFileHandle`               | The only substrate assumption the file-shaped pieces make: positioned synchronous read/write/truncate/flush. The browser's `FileSystemSyncAccessHandle` satisfies it as-is; a Node file descriptor wrapper is a dozen lines.                 |
 

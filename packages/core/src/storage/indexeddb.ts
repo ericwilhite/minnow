@@ -2248,10 +2248,13 @@ export class IndexedDbBlockStore implements BlockStore {
             manifestValue === undefined ? undefined : asStoredManifestRecord(manifestValue);
           if (record === undefined) missingTransactionIds.push(id);
           else if (
-            record.status !== "committed" ||
-            manifest?.prunedAt === undefined ||
-            segmentOwners.has(id) ||
-            unfinishedCompactionOwners.has(id)
+            unfinishedCompactionOwners.has(id) ||
+            (record.status === "committed"
+              ? (manifest !== undefined && manifest.prunedAt === undefined) || segmentOwners.has(id)
+              : record.status === "aborted"
+                ? (await anyObjectStoreKeyExists(blockStore, record.pendingBlockIds)) ||
+                  (await anyObjectStoreKeyExists(segmentStore, record.pendingSegmentIds))
+                : true)
           ) {
             retainedTransactionIds.push(id);
           } else {
@@ -2335,6 +2338,34 @@ export class IndexedDbBlockStore implements BlockStore {
       };
     } catch (error) {
       abortIfActive(transaction);
+      await ignoreAbort(transaction);
+      throw error;
+    }
+  }
+
+  async removePrunedManifestRecords(): Promise<number> {
+    const transaction = this.#transaction("manifests", "readwrite");
+    const store = transaction.objectStore("manifests");
+    try {
+      const values: unknown[] = await requestResult(store.getAll());
+      const records = values.map(asStoredManifestRecord);
+      const earliestReadable = records
+        .filter((record) => record.prunedAt === undefined)
+        .sort((left, right) => left.version - right.version)[0];
+      const safeBelow =
+        earliestReadable === undefined
+          ? Number.POSITIVE_INFINITY
+          : earliestReadable.version - (earliestReadable.deltaDepth ?? 0);
+      let removed = 0;
+      for (const record of records) {
+        if (record.prunedAt === undefined || record.version >= safeBelow) continue;
+        store.delete(record.version);
+        removed += 1;
+      }
+      await transactionDone(transaction);
+      return removed;
+    } catch (error) {
+      transaction.abort();
       await ignoreAbort(transaction);
       throw error;
     }
@@ -2722,6 +2753,16 @@ function asStoredManifestRecord(value: unknown): StoredManifestRecord {
   return structuredClone(value) as StoredManifestRecord;
 }
 
+async function anyObjectStoreKeyExists(
+  store: IDBObjectStore,
+  ids: readonly string[],
+): Promise<boolean> {
+  for (const id of ids) {
+    if ((await requestResult(store.getKey(id))) !== undefined) return true;
+  }
+  return false;
+}
+
 /** Builds the resolved public view of one stored record from its resolved block set. */
 function manifestView(record: StoredManifestRecord, blockIds: ReadonlySet<string>): Manifest {
   return {
@@ -3037,10 +3078,12 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   for (const id of job.candidateTransactionIds) {
     const value: unknown = await requestResult(transaction.objectStore("transactions").get(id));
     const record = value === undefined ? undefined : asTransactionRecord(value);
-    if (record?.status !== "committed" || record.committedVersion === null) {
-      throw new Error(
-        `Garbage collection transaction candidate is not a committed transaction: ${id}`,
-      );
+    if (
+      record === undefined ||
+      (record.status !== "aborted" &&
+        (record.status !== "committed" || record.committedVersion === null))
+    ) {
+      throw new Error(`Garbage collection transaction candidate is not terminal: ${id}`);
     }
   }
   const blockHasProvenance = async (id: string): Promise<boolean> => {
