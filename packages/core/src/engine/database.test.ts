@@ -96,6 +96,13 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
     this.pendingBlockJournalSizes.push(updated.pendingBlockIds.length);
     return updated;
   }
+
+  override async writeTransaction(
+    input: Parameters<NonNullable<MemoryBlockStore["writeTransaction"]>>[0],
+  ) {
+    if (input.blocks.length > 0) this.blockWriteCalls += 1;
+    return super.writeTransaction(input);
+  }
 }
 
 class ReplacementRestageFaultMemoryBlockStore extends CountingMemoryBlockStore {
@@ -220,12 +227,24 @@ class FirstCommitBarrierMemoryBlockStore extends MemoryBlockStore {
   override async commitTransaction(
     input: Parameters<MemoryBlockStore["commitTransaction"]>[0],
   ): ReturnType<MemoryBlockStore["commitTransaction"]> {
+    await this.#pauseFirst();
+    return super.commitTransaction(input);
+  }
+
+  // The engine's simple writes commit through the single-shot path; the barrier sits there too.
+  override async writeTransaction(
+    input: Parameters<NonNullable<MemoryBlockStore["writeTransaction"]>>[0],
+  ): ReturnType<NonNullable<MemoryBlockStore["writeTransaction"]>> {
+    await this.#pauseFirst();
+    return super.writeTransaction(input);
+  }
+
+  async #pauseFirst(): Promise<void> {
     if (this.#pauseNextCommit) {
       this.#pauseNextCommit = false;
       this.#signalFirstCommit?.();
       await this.#firstCommitRelease;
     }
-    return super.commitTransaction(input);
   }
 }
 
@@ -7446,6 +7465,7 @@ it("executes the extended SQL surface through the stored query path", async () =
 describe("prepared-input cache and shared read lease", () => {
   class LeaseCountingStore extends CountingMemoryBlockStore {
     leaseCreates = 0;
+    leaseMoves = 0;
     catalogStateCalls = 0;
     probeCalls = 0;
 
@@ -7459,6 +7479,13 @@ describe("prepared-input cache and shared read lease", () => {
     ): Promise<void> {
       this.leaseCreates += 1;
       return super.createLease(record);
+    }
+
+    override async moveLease(
+      ...args: Parameters<NonNullable<MemoryBlockStore["moveLease"]>>
+    ): ReturnType<NonNullable<MemoryBlockStore["moveLease"]>> {
+      this.leaseMoves += 1;
+      return super.moveLease(...args);
     }
 
     override async getQueryCatalogState(
@@ -7522,17 +7549,24 @@ describe("prepared-input cache and shared read lease", () => {
     expect(store.blockReadCalls).toBe(blockReadsAfterFirst);
   });
 
-  it("serves fresh rows and a fresh lease after a write changes the segment set", async () => {
+  it("serves fresh rows and re-pins the shared lease after a write changes the segment set", async () => {
     const { store, database } = await seededStore();
     const before = await database.query("SELECT COUNT(*) AS orders FROM orders");
     expect(before.rows).toEqual([{ orders: 6 }]);
     const leasesBeforeWrite = store.leaseCreates;
-    await database.insertBatch("orders", {
+    const movesBeforeWrite = store.leaseMoves;
+    const written = await database.insertBatch("orders", {
       columns: { region: ["south"], amount: [11] },
     });
     const after = await database.query("SELECT COUNT(*) AS orders FROM orders");
     expect(after.rows).toEqual([{ orders: 7 }]);
-    expect(store.leaseCreates).toBeGreaterThan(leasesBeforeWrite);
+    // No reader was left on the old version, so the one lease record moved to the new one in
+    // place: one storage write, no second record, nothing to remove later.
+    expect(store.leaseMoves).toBe(movesBeforeWrite + 1);
+    expect(store.leaseCreates).toBe(leasesBeforeWrite);
+    const leases = await store.listLeases();
+    expect(leases).toHaveLength(1);
+    expect(leases[0]?.manifestVersion).toBe(written.version);
     const totals = await database.query(
       "SELECT region, SUM(amount) AS total FROM orders WHERE region = 'south' GROUP BY region",
     );

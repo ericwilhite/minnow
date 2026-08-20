@@ -774,6 +774,30 @@ export interface CommitTransactionInput {
   committedAt: string;
 }
 
+/**
+ * The single-shot write: stage these blocks and segments and commit them, in one atomic storage
+ * transaction. Carries the same commit change as `CommitTransactionInput`; the artifacts become
+ * the transaction's journaled pending ids on the way through.
+ */
+export interface WriteTransactionInput extends Omit<
+  CommitTransactionInput,
+  "transactionId" | "expectedTransactionRevision"
+> {
+  /**
+   * Which transaction publishes. `{ id, expectedRevision }` names an active transaction begun
+   * earlier (typically with `beginTransaction`, when the artifacts depend on a row-id or
+   * auto-increment reservation); its journal is extended and its revision compare-and-swapped
+   * (`TransactionRecordConflictError`). `{ record }` begins the transaction in the same step —
+   * a fresh record (revision 0, empty journal) the store pins at `expectedManifestVersion` —
+   * so a write that needed no reservation costs one round trip in total.
+   */
+  transaction:
+    | { id: string; expectedRevision: number }
+    | { record: Omit<TransactionRecord, "snapshotVersion"> };
+  blocks: readonly BlockWrite[];
+  segments: readonly SegmentRecord[];
+}
+
 export interface UniqueKeyChanges {
   tableId: string;
   keyTokens: readonly string[];
@@ -1344,6 +1368,32 @@ export interface BlockStore
    * crash. Callers fall back to those calls when this is absent.
    */
   stageTransactionArtifacts?(input: StageTransactionArtifactsInput): Promise<TransactionRecord>;
+  /**
+   * Optional: the single-shot write — begin (or continue) a transaction, stage its blocks and
+   * segments, and commit, all in one atomic storage transaction. Must be exactly equivalent to
+   * `stageTransactionArtifacts` followed by `commitTransaction` (preceded by `createTransaction`
+   * at `expectedManifestVersion` when the input carries a fresh record): the same validation,
+   * the same typed conflicts (`WriteConflictError`, `TransactionRecordConflictError`,
+   * `UniqueKeyConflictError`), the same finalized records afterwards — and nothing at all
+   * written when any part refuses, including the fresh record. This is what lets a simple
+   * write cost one durable storage commit instead of three; callers fall back to the sequence
+   * when it is absent.
+   */
+  writeTransaction?(input: WriteTransactionInput): Promise<ManifestSummary>;
+  /**
+   * Optional: re-pins a lease to another manifest version and renews it, in one atomic step —
+   * `createLease` at the new version plus `removeLease` of the old pin, as one round trip that
+   * keeps the record and its id. Compare-and-swap on `expectedRevision` (`LeaseConflictError`);
+   * the target version's manifest must be available (`SnapshotManifestMissingError`), and a
+   * refused move leaves the lease exactly as it was. The engine uses it to carry its shared
+   * reader pin forward after each commit; callers fall back to create + remove when absent.
+   */
+  moveLease?(
+    id: string,
+    expectedRevision: number,
+    manifestVersion: number | null,
+    expiresAt: string,
+  ): Promise<LeaseRecord>;
   /**
    * Optional: one committed version copied out as a portable snapshot — see
    * `/docs/storage/snapshots` for what it carries, drops, and guarantees. A store without it

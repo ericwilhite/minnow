@@ -176,6 +176,127 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("commits a deferred transaction in one step, and a refused one leaves nothing", async () => {
+      const store = await implementation.create();
+      const manager = new TransactionManager(store);
+      const segmentFor = (transactionId: string, blockId: string) => ({
+        id: `segment-${blockId}`,
+        tableId: "table",
+        transactionId,
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: { value: [blockId] },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      const left = await manager.beginDeferred();
+      const right = await manager.beginDeferred();
+      const leftManifest = await left.stageArtifactsAndCommit(
+        [{ id: "left", bytes: Uint8Array.of(1) }],
+        [segmentFor(left.id, "left")],
+      );
+      expect(leftManifest.version).toBe(0);
+      expect(left.status).toBe("committed");
+      expect(await store.getTransaction(left.id)).toMatchObject({
+        status: "committed",
+        committedVersion: 0,
+        snapshotVersion: null,
+        pendingBlockIds: ["left"],
+        pendingSegmentIds: ["segment-left"],
+      });
+      expect((await store.getSegment("segment-left"))?.logicalOrder).toBe(0);
+
+      // The loser's single-shot write refuses as a typed conflict and wrote nothing at all —
+      // not even its record; a rebase and the same call again then commits on top.
+      await expect(
+        right.stageArtifactsAndCommit(
+          [{ id: "right", bytes: Uint8Array.of(2) }],
+          [segmentFor(right.id, "right")],
+        ),
+      ).rejects.toBeInstanceOf(WriteConflictError);
+      expect(right.status).toBe("active");
+      expect(await store.getTransaction(right.id)).toBeUndefined();
+      expect(await store.getBlock("right")).toBeUndefined();
+      expect(await store.getSegment("segment-right")).toBeUndefined();
+      await right.rebase();
+      const rightManifest = await right.stageArtifactsAndCommit(
+        [{ id: "right", bytes: Uint8Array.of(2) }],
+        [segmentFor(right.id, "right")],
+      );
+      expect(rightManifest.version).toBe(1);
+      expect((await store.getManifest(1))?.blockIds).toEqual(["left", "right"]);
+
+      // An aborted deferred transaction that staged nothing never touched the store.
+      const abandoned = await manager.beginDeferred();
+      await abandoned.abort();
+      expect(abandoned.status).toBe("aborted");
+      expect((await store.listTransactions()).map((record) => record.id).sort()).toEqual(
+        [left.id, right.id].sort(),
+      );
+      store.close();
+    });
+
+    it("moves a leased snapshot to a newer version in place", async () => {
+      const store = await implementation.create();
+      const ids = ["txn-a", "reader", "txn-b", "reader-2"];
+      const manager = new TransactionManager(store, {
+        createId: () => ids.shift() ?? crypto.randomUUID(),
+      });
+      const first = await manager.begin();
+      await first.stageBlock("a", Uint8Array.of(1));
+      await first.commit();
+      const pinned = await manager.openLeasedSnapshot({ ownerId: "tab-1", ttlMs: 60_000 });
+      expect(pinned.version).toBe(0);
+      const second = await manager.begin();
+      await second.stageBlock("b", Uint8Array.of(2));
+      await second.commit();
+
+      // Moving to a version with no manifest refuses and leaves the snapshot open and pinned.
+      await expect(
+        manager.moveLeasedSnapshot(pinned, { ownerId: "tab-1", ttlMs: 60_000, version: 99 }),
+      ).rejects.toBeInstanceOf(SnapshotManifestMissingError);
+      expect(await pinned.getBlock("a")).toEqual(Uint8Array.of(1));
+
+      const moved = await manager.moveLeasedSnapshot(pinned, {
+        id: "reader-2",
+        ownerId: "tab-1",
+        ttlMs: 60_000,
+        version: 1,
+      });
+      expect(moved.version).toBe(1);
+      expect(moved.listBlockIds()).toEqual(["a", "b"]);
+      expect(await moved.getBlock("b")).toEqual(Uint8Array.of(2));
+      await expect(pinned.getBlock("a")).rejects.toThrow("released");
+      // One record, re-pinned and renewed — never a second one to remove later.
+      const leases = await store.listLeases();
+      expect(leases.map((lease) => [lease.id, lease.manifestVersion, lease.revision])).toEqual([
+        ["reader", 1, 1],
+      ]);
+      await moved.renew(60_000);
+      expect((await store.getLease("reader"))?.revision).toBe(2);
+      await moved.release();
+      expect(await store.listLeases()).toEqual([]);
+
+      // A lease the store swept meanwhile is replaced by a fresh one rather than failing.
+      const swept = await manager.openLeasedSnapshot({
+        id: "swept",
+        ownerId: "tab-1",
+        ttlMs: 60_000,
+      });
+      await store.removeLease("swept");
+      const replacement = await manager.moveLeasedSnapshot(swept, {
+        id: "fresh",
+        ownerId: "tab-1",
+        ttlMs: 60_000,
+        version: 1,
+      });
+      expect(replacement.version).toBe(1);
+      expect((await store.listLeases()).map((lease) => lease.id)).toEqual(["fresh"]);
+      await expect(swept.getBlock("a")).rejects.toThrow("released");
+      store.close();
+    });
+
     it("atomically replaces snapshot blocks while older snapshots retain them", async () => {
       const store = await implementation.create();
       const manager = new TransactionManager(store);
@@ -708,6 +829,68 @@ it("resumes an active transaction and reconciles an existing immutable block", a
     "written-before-checkpoint",
   ]);
   await expect(manager.resume(transaction.id)).rejects.toBeInstanceOf(TransactionClosedError);
+  store.close();
+});
+
+it("falls back to the two-step shapes on a store without the single-shot write or lease move", async () => {
+  // The fault-injecting proxy deliberately lacks writeTransaction and moveLease.
+  const store = new FaultInjectingBlockStore(new MemoryBlockStore(), () => undefined);
+  const ids = ["txn-left", "txn-right", "reader", "txn-c", "reader-2"];
+  const manager = new TransactionManager(store, {
+    createId: () => ids.shift() ?? crypto.randomUUID(),
+  });
+  const segmentFor = (transactionId: string, blockId: string) => ({
+    id: `segment-${blockId}`,
+    tableId: "table",
+    transactionId,
+    rowCount: 1,
+    rowIdStart: 1n,
+    rowIdEndExclusive: 2n,
+    columnBlockIds: { value: [blockId] },
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  const left = await manager.beginDeferred();
+  const right = await manager.beginDeferred();
+  expect(await store.listTransactions()).toEqual([]);
+  await left.stageArtifactsAndCommit(
+    [{ id: "left", bytes: Uint8Array.of(1) }],
+    [segmentFor("txn-left", "left")],
+  );
+  expect(await store.getTransaction("txn-left")).toMatchObject({
+    status: "committed",
+    committedVersion: 0,
+  });
+  // Staged in two steps, the loser's artifacts are journaled when its commit refuses; the
+  // retry after the rebase commits them rather than staging them a second time.
+  await expect(
+    right.stageArtifactsAndCommit(
+      [{ id: "right", bytes: Uint8Array.of(2) }],
+      [segmentFor("txn-right", "right")],
+    ),
+  ).rejects.toBeInstanceOf(WriteConflictError);
+  expect(right.pendingBlockIds).toEqual(["right"]);
+  await right.rebase();
+  const manifest = await right.stageArtifactsAndCommit(
+    [{ id: "right", bytes: Uint8Array.of(2) }],
+    [segmentFor("txn-right", "right")],
+  );
+  expect(manifest.version).toBe(1);
+  expect((await store.getManifest(1))?.blockIds).toEqual(["left", "right"]);
+
+  const pinned = await manager.openLeasedSnapshot({ ownerId: "tab-1", ttlMs: 60_000, version: 0 });
+  const moved = await manager.moveLeasedSnapshot(pinned, {
+    id: "reader-2",
+    ownerId: "tab-1",
+    ttlMs: 60_000,
+    version: 1,
+  });
+  expect(moved.version).toBe(1);
+  expect(moved.listBlockIds()).toEqual(["left", "right"]);
+  // Create at the new version, then remove the old pin: the same end state, two round trips.
+  expect((await store.listLeases()).map((lease) => [lease.id, lease.manifestVersion])).toEqual([
+    ["reader-2", 1],
+  ]);
+  await expect(pinned.getBlock("left")).rejects.toThrow("released");
   store.close();
 });
 

@@ -54,6 +54,7 @@ import {
   updateCompactionJobRecord,
   updateTransactionRecord,
   WriteConflictError,
+  type WriteTransactionInput,
 } from "./types.js";
 import {
   selectLiveRecords,
@@ -1141,34 +1142,123 @@ export class IndexedDbBlockStore implements BlockStore {
       ["blocks", "catalog", "manifests", "transactions", "segments"],
       "readwrite",
     );
-    const transactionStore = transaction.objectStore("transactions");
-    const transactionValue: unknown = await requestResult<unknown>(
-      transactionStore.get(input.transactionId),
-    );
-    const record =
-      transactionValue === undefined ? undefined : asTransactionRecord(transactionValue);
-    if (record?.revision !== input.expectedTransactionRevision || record.status !== "active") {
-      transaction.abort();
-      await ignoreAbort(transaction);
-      throw new TransactionRecordConflictError(
+    try {
+      const record = await readActiveTransactionRecord(
+        transaction,
         input.transactionId,
         input.expectedTransactionRevision,
-        record?.revision ?? null,
       );
+      const outcome = await this.#commitInTransaction(transaction, record, input);
+      await transactionDone(transaction);
+      outcome.settle();
+      return outcome.manifest;
+    } catch (error) {
+      abortIfActive(transaction);
+      await ignoreAbort(transaction);
+      throw error;
     }
+  }
 
+  async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
+    const blockIds = new Set<string>();
+    for (const block of input.blocks) {
+      if (block.id.length === 0) throw new TypeError("Block ID cannot be empty");
+      if (blockIds.has(block.id)) throw new Error(`Block already exists: ${block.id}`);
+      blockIds.add(block.id);
+    }
+    if (
+      "record" in input.transaction &&
+      (input.transaction.record.pendingBlockIds.length > 0 ||
+        input.transaction.record.pendingSegmentIds.length > 0)
+    ) {
+      throw new TypeError("A fresh transaction cannot begin with pending artifacts");
+    }
+    const transaction = this.#transaction(
+      ["blocks", "catalog", "manifests", "transactions", "segments"],
+      "readwrite",
+    );
+    try {
+      const transactionStore = transaction.objectStore("transactions");
+      let base: TransactionRecord;
+      if ("record" in input.transaction) {
+        const id = input.transaction.record.id;
+        if ((await requestResult(transactionStore.getKey(id))) !== undefined) {
+          throw new Error(`Transaction already exists: ${id}`);
+        }
+        // The fresh record pins the version the caller prepared against, so the commit below
+        // is the same compare-and-swap a begun transaction would make; a moved manifest is a
+        // WriteConflictError with nothing written, record included.
+        const current = (await requestResult(
+          transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY),
+        )) as number | undefined;
+        const actualVersion = current ?? null;
+        if (actualVersion !== input.expectedManifestVersion) {
+          throw new WriteConflictError(input.expectedManifestVersion, actualVersion);
+        }
+        base = { ...structuredClone(input.transaction.record), snapshotVersion: actualVersion };
+      } else {
+        base = await readActiveTransactionRecord(
+          transaction,
+          input.transaction.id,
+          input.transaction.expectedRevision,
+        );
+      }
+      const staged = updateTransactionRecord(base, {
+        pendingBlockIds: [...base.pendingBlockIds, ...blockIds],
+        pendingSegmentIds: [
+          ...base.pendingSegmentIds,
+          ...input.segments.map((segment) => segment.id),
+        ],
+        updatedAt: input.committedAt,
+      });
+      // Only previously journaled artifacts need existence probes; the ones added below commit
+      // or fail atomically with everything else.
+      await assertPendingArtifactsAvailableInTransaction(transaction, base);
+      const blockStore = transaction.objectStore("blocks");
+      for (const block of input.blocks) {
+        const bytes =
+          block.bytes.byteOffset === 0 && block.bytes.byteLength === block.bytes.buffer.byteLength
+            ? block.bytes
+            : block.bytes.slice();
+        blockStore.add(bytes, block.id);
+      }
+      const segmentStore = transaction.objectStore("segments");
+      for (const segment of input.segments) {
+        const normalized = normalizeSegmentRecord(segment);
+        segmentStore.add(normalized, normalized.id);
+      }
+      const outcome = await this.#commitInTransaction(transaction, staged, input);
+      await transactionDone(transaction);
+      outcome.settle();
+      return outcome.manifest;
+    } catch (error) {
+      abortIfActive(transaction);
+      await ignoreAbort(transaction);
+      throw error;
+    }
+  }
+
+  /**
+   * The commit proper, inside an open readwrite transaction over every commit store, against a
+   * record the caller already resolved as active at the expected revision — the journaled
+   * record for `commitTransaction`, the freshly staged one for `writeTransaction`. Throws to
+   * refuse (the caller aborts the storage transaction); returns the summary plus the cache
+   * advances to apply once the transaction has proven durable.
+   */
+  async #commitInTransaction(
+    transaction: IDBTransaction,
+    record: TransactionRecord,
+    input: Omit<CommitTransactionInput, "transactionId" | "expectedTransactionRevision">,
+  ): Promise<{ manifest: ManifestSummary; settle: () => void }> {
+    const transactionStore = transaction.objectStore("transactions");
     const catalog = transaction.objectStore("catalog");
     const current = (await requestResult(catalog.get(CURRENT_MANIFEST_KEY))) as number | undefined;
     const actualVersion = current ?? null;
     if (actualVersion !== input.expectedManifestVersion) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new WriteConflictError(input.expectedManifestVersion, actualVersion);
     }
 
     if (record.snapshotVersion !== input.expectedManifestVersion) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new Error("Transaction snapshot does not match the expected manifest");
     }
 
@@ -1183,15 +1273,11 @@ export class IndexedDbBlockStore implements BlockStore {
             return value === undefined ? undefined : asStoredManifestRecord(value);
           })();
     if (input.expectedManifestVersion !== null && baseRecord === undefined) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new Error(`Snapshot manifest is missing: ${String(input.expectedManifestVersion)}`);
     }
     const removedBlockIds = [...new Set(input.removedBlockIds ?? [])].sort();
     const pendingRemovedBlock = removedBlockIds.find((id) => record.pendingBlockIds.includes(id));
     if (pendingRemovedBlock !== undefined) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new Error(`Cannot supersede a pending block: ${pendingRemovedBlock}`);
     }
     // The resolved base block set is needed only to validate removals and to write checkpoints;
@@ -1216,8 +1302,6 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       const invalidRemovedBlock = removedBlockIds.find((id) => !baseBlockIdSet?.has(id));
       if (invalidRemovedBlock !== undefined) {
-        transaction.abort();
-        await ignoreAbort(transaction);
         throw new Error(
           `Cannot supersede a block outside the transaction snapshot: ${invalidRemovedBlock}`,
         );
@@ -1230,8 +1314,6 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     const missingBlockIndex = storedBlockKeys.findIndex((key) => key === undefined);
     if (missingBlockIndex >= 0) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new Error(
         `Manifest references missing block: ${record.pendingBlockIds[missingBlockIndex] ?? ""}`,
       );
@@ -1243,8 +1325,6 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     const missingSegmentIndex = pendingSegmentValues.findIndex((value) => value === undefined);
     if (missingSegmentIndex >= 0) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new Error(
         `Transaction references missing segment: ${record.pendingSegmentIds[missingSegmentIndex] ?? ""}`,
       );
@@ -1252,8 +1332,6 @@ export class IndexedDbBlockStore implements BlockStore {
     const pendingSegments = pendingSegmentValues.map(asSegmentRecord);
     const foreignSegment = pendingSegments.find((segment) => segment.transactionId !== record.id);
     if (foreignSegment !== undefined) {
-      transaction.abort();
-      await ignoreAbort(transaction);
       throw new Error(`Segment ${foreignSegment.id} belongs to another transaction`);
     }
 
@@ -1300,8 +1378,6 @@ export class IndexedDbBlockStore implements BlockStore {
         conflictToken = uniqueKeyChanges.keyTokens.find((token) => keyState?.existing.has(token));
       }
       if (conflictToken !== undefined) {
-        transaction.abort();
-        await ignoreAbort(transaction);
         throw new UniqueKeyConflictError(uniqueKeyChanges.tableId, conflictToken);
       }
     }
@@ -1335,8 +1411,6 @@ export class IndexedDbBlockStore implements BlockStore {
               continue;
             }
             if (entry.requireAbsent && present.has(token)) {
-              transaction.abort();
-              await ignoreAbort(transaction);
               throw new UniqueKeyConflictError(tableId, token);
             }
             present.add(token);
@@ -1634,60 +1708,61 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
     transactionStore.put(committed, committed.id);
-    await transactionDone(transaction);
-    if (uniqueKeyEntries.length > 1) {
-      // Multi-entry commits take the merged path above; the single-table membership cache
-      // cannot describe them, so it drops and rebuilds on the next bulk load.
-      this.#uniqueKeyCache = undefined;
-    }
-    // The unique-key cache follows the same rule as the manifest cache below: advance it only
-    // after the durable commit. Commits from this instance cannot silently change another
-    // table's key records, so a cache for a different table just moves to the new version.
-    if (uniqueKeyChanges !== undefined && keyCachePlan !== undefined) {
-      if (keyCachePlan.action === "keep" && keyCacheValid) {
-        // In-place delta on the live cache: no copies of a multi-million-token set per batch.
-        applyChunk(keyCache.present, keyCachePlan.chunk);
-        keyCache.chunks.push(keyCachePlan.chunk);
-        keyCache.index = keyCachePlan.index;
-        keyCache.version = manifest.version;
-      } else if (keyCachePlan.action === "replace") {
-        this.#uniqueKeyCache = {
-          version: manifest.version,
-          tableId: uniqueKeyChanges.tableId,
-          present: keyCachePlan.present,
-          chunks: keyCachePlan.chunks,
-          index: keyCachePlan.index,
-        };
-      } else if (this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId) {
+    const settle = (): void => {
+      if (uniqueKeyEntries.length > 1) {
+        // Multi-entry commits take the merged path above; the single-table membership cache
+        // cannot describe them, so it drops and rebuilds on the next bulk load.
         this.#uniqueKeyCache = undefined;
+      }
+      // The unique-key cache follows the same rule as the manifest cache below: advance it only
+      // after the durable commit. Commits from this instance cannot silently change another
+      // table's key records, so a cache for a different table just moves to the new version.
+      if (uniqueKeyChanges !== undefined && keyCachePlan !== undefined) {
+        if (keyCachePlan.action === "keep" && keyCacheValid) {
+          // In-place delta on the live cache: no copies of a multi-million-token set per batch.
+          applyChunk(keyCache.present, keyCachePlan.chunk);
+          keyCache.chunks.push(keyCachePlan.chunk);
+          keyCache.index = keyCachePlan.index;
+          keyCache.version = manifest.version;
+        } else if (keyCachePlan.action === "replace") {
+          this.#uniqueKeyCache = {
+            version: manifest.version,
+            tableId: uniqueKeyChanges.tableId,
+            present: keyCachePlan.present,
+            chunks: keyCachePlan.chunks,
+            index: keyCachePlan.index,
+          };
+        } else if (this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId) {
+          this.#uniqueKeyCache = undefined;
+        } else if (this.#uniqueKeyCache !== undefined) {
+          this.#uniqueKeyCache.version = manifest.version;
+        }
+      } else if (
+        uniqueKeyChanges !== undefined &&
+        this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId
+      ) {
+        // A no-op key write against the cached table: nothing changed on disk, so the cache
+        // just moves to the new version.
+        this.#uniqueKeyCache.version = manifest.version;
       } else if (this.#uniqueKeyCache !== undefined) {
         this.#uniqueKeyCache.version = manifest.version;
       }
-    } else if (
-      uniqueKeyChanges !== undefined &&
-      this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId
-    ) {
-      // A no-op key write against the cached table: nothing changed on disk, so the cache
-      // just moves to the new version.
-      this.#uniqueKeyCache.version = manifest.version;
-    } else if (this.#uniqueKeyCache !== undefined) {
-      this.#uniqueKeyCache.version = manifest.version;
-    }
-    // Advance the resolved-set cache only after the durable commit succeeded. A checkpoint
-    // commit already built the new set; a delta commit with a resolved base applies the delta
-    // in place (the cache owns that set from here on).
-    if (checkpointBlockIds !== undefined) {
-      this.#manifestCache = { version: manifest.version, blockIds: checkpointBlockIds };
-    } else if (baseBlockIdSet !== undefined || cacheOwnsBaseSet) {
-      const blockIds = baseBlockIdSet ?? new Set<string>();
-      for (const id of removedBlockIds) blockIds.delete(id);
-      for (const id of addedBlockIds) blockIds.add(id);
-      this.#manifestCache = { version: manifest.version, blockIds };
-    } else {
-      // No resolved base was materialized; a later removal or checkpoint commit will resolve.
-      this.#manifestCache = undefined;
-    }
-    return manifest;
+      // Advance the resolved-set cache only after the durable commit succeeded. A checkpoint
+      // commit already built the new set; a delta commit with a resolved base applies the delta
+      // in place (the cache owns that set from here on).
+      if (checkpointBlockIds !== undefined) {
+        this.#manifestCache = { version: manifest.version, blockIds: checkpointBlockIds };
+      } else if (baseBlockIdSet !== undefined || cacheOwnsBaseSet) {
+        const blockIds = baseBlockIdSet ?? new Set<string>();
+        for (const id of removedBlockIds) blockIds.delete(id);
+        for (const id of addedBlockIds) blockIds.add(id);
+        this.#manifestCache = { version: manifest.version, blockIds };
+      } else {
+        // No resolved base was materialized; a later removal or checkpoint commit will resolve.
+        this.#manifestCache = undefined;
+      }
+    };
+    return { manifest, settle };
   }
 
   async createLease(record: LeaseRecord): Promise<void> {
@@ -1735,6 +1810,35 @@ export class IndexedDbBlockStore implements BlockStore {
       store.put(renewed, id);
       await transactionDone(transaction);
       return structuredClone(renewed);
+    } catch (error) {
+      abortIfActive(transaction);
+      await ignoreAbort(transaction);
+      throw error;
+    }
+  }
+
+  async moveLease(
+    id: string,
+    expectedRevision: number,
+    manifestVersion: number | null,
+    expiresAt: string,
+  ): Promise<LeaseRecord> {
+    validateLeaseExpiration(expiresAt);
+    const transaction = this.#transaction(["leases", "manifests", "blocks"], "readwrite");
+    const store = transaction.objectStore("leases");
+    const value: unknown = await requestResult(store.get(id));
+    const record = value === undefined ? undefined : asLeaseRecord(value);
+    if (record?.revision !== expectedRevision) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new LeaseConflictError(id, expectedRevision, record?.revision ?? null);
+    }
+    try {
+      await assertSnapshotAvailableInTransaction(transaction, manifestVersion);
+      const moved = { ...record, manifestVersion, expiresAt, revision: record.revision + 1 };
+      store.put(moved, id);
+      await transactionDone(transaction);
+      return structuredClone(moved);
     } catch (error) {
       abortIfActive(transaction);
       await ignoreAbort(transaction);
@@ -2636,6 +2740,26 @@ function asLeaseRecord(value: unknown): LeaseRecord {
  * deletes blocks unreachable from every non-pruned manifest — so this stays O(chain) instead of
  * probing every live block on each transaction and lease creation.
  */
+/**
+ * The transaction record a commit needs: present, active, and at the expected revision —
+ * otherwise a `TransactionRecordConflictError`, the caller's storage transaction still open for
+ * it to abort.
+ */
+async function readActiveTransactionRecord(
+  transaction: IDBTransaction,
+  id: string,
+  expectedRevision: number,
+): Promise<TransactionRecord> {
+  const value: unknown = await requestResult<unknown>(
+    transaction.objectStore("transactions").get(id),
+  );
+  const record = value === undefined ? undefined : asTransactionRecord(value);
+  if (record?.revision !== expectedRevision || record.status !== "active") {
+    throw new TransactionRecordConflictError(id, expectedRevision, record?.revision ?? null);
+  }
+  return record;
+}
+
 async function assertSnapshotAvailableInTransaction(
   transaction: IDBTransaction,
   version: number | null,

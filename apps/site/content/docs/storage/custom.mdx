@@ -63,10 +63,10 @@ space frees.
 buffers it hands you and mutate the records you return.
 
 **Optional means atomic.** `getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
-`stageTransactionArtifacts`, `putTempRunPages`, and the snapshot pair are optional so an
-adapter that can do something in one atomic step may say so. Callers trust a present method
-completely and fall back to sequential calls otherwise — never implement one as the sequential
-calls in a trench coat.
+`stageTransactionArtifacts`, `writeTransaction`, `moveLease`, `putTempRunPages`, and the
+snapshot pair are optional so an adapter that can do something in one atomic step may say so.
+Callers trust a present method completely and fall back to sequential calls otherwise — never
+implement one as the sequential calls in a trench coat.
 
 **Tabs are plural and mortal.** Several connections may open one database; readers never block
 writers; a connection can die between any two operations without corrupting anything. How you
@@ -162,7 +162,13 @@ for quota and crash suites.
 ## What the optional methods buy
 
 The engine works over the required surface alone, at a cost: without `getCatalogProbe` it
-cannot cache catalog state at all, and without `beginTransaction` /
-`stageTransactionArtifacts` every commit spends extra round trips. Implement the probe first
-(it is the single most valuable), then the batched pair; add `putTempRunPages` when your
-substrate charges per call, and the snapshot pair when your store should be exportable.
+cannot cache catalog state at all, and without the batched transaction methods every commit
+spends extra round trips. `writeTransaction` is the one that matters most for writes: it
+begins (or continues) a transaction, stages its blocks and segments, and commits, all in one
+storage transaction, so a point update or delete costs one durable commit instead of three and
+an insert two (its row ids are reserved by `beginTransaction` first). `moveLease` re-pins the
+engine's shared reader lease to each new version in place, which saves a lease create and a
+later remove on the first read after every commit. Implement the probe first (it is the single
+most valuable), then `writeTransaction` and `beginTransaction`, then `moveLease` and
+`stageTransactionArtifacts`; add `putTempRunPages` when your substrate charges per call, and
+the snapshot pair when your store should be exportable.

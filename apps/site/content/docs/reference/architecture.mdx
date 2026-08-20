@@ -86,6 +86,14 @@ orphaned blocks for the garbage collector — never a manifest pointing at half-
 Step 4 is the concurrency control. If another tab published first, the commit fails cleanly and
 retries against the new version. Conflicts surface as typed errors, never as silent interleaving.
 
+A simple write — an insert, a point update, a delete, with no triggers staging rows of their own
+— folds steps 2 to 5 into one storage transaction where the store offers it (every shipped store
+does): the blocks, the segment, the transaction record, and the manifest flip land together or not
+at all. Durable storage commits are what a write costs in a browser, so this matters: a point
+update or delete is one, an insert two (its row ids are reserved first), and the first read after
+a commit re-pins the engine's shared reader lease in place rather than creating a new one and
+removing the old one later.
+
 Encoding is bounded but parallel across independent columns. Blocks within each column keep their
 original order, and the staged metadata stays in schema order, so native compressors can overlap
 without making the committed layout depend on completion timing.

@@ -30,6 +30,7 @@ import {
   type TempRunPage,
   type TransactionRecord,
   type TransactionRecordUpdate,
+  type WriteTransactionInput,
 } from "./types.js";
 import type { DatabaseSnapshot, SnapshotLoadProgress } from "./snapshot.js";
 import {
@@ -370,6 +371,15 @@ export class MemoryBlockStore implements BlockStore {
     return this.#runAtomic(() => this.#core.commitTransaction(input));
   }
 
+  async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
+    return this.#runAtomic(() => {
+      const summary = this.#core.writeTransaction(input);
+      // The record half validated everything; the bytes land in this same atomic step.
+      for (const block of input.blocks) this.#blocks.set(block.id, new Uint8Array(block.bytes));
+      return summary;
+    });
+  }
+
   async createLease(record: LeaseRecord): Promise<void> {
     return this.#runAtomic(() => {
       this.#core.createLease(record);
@@ -386,6 +396,17 @@ export class MemoryBlockStore implements BlockStore {
 
   async renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord> {
     return this.#runAtomic(() => this.#core.renewLease(id, expectedRevision, expiresAt));
+  }
+
+  async moveLease(
+    id: string,
+    expectedRevision: number,
+    manifestVersion: number | null,
+    expiresAt: string,
+  ): Promise<LeaseRecord> {
+    return this.#runAtomic(() =>
+      this.#core.moveLease(id, expectedRevision, manifestVersion, expiresAt),
+    );
   }
 
   async removeLeaseIfExpired(

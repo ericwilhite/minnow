@@ -1,6 +1,7 @@
 import {
   CompactionJobConflictError,
   LeaseConflictError,
+  SnapshotManifestMissingError,
   TableRecordConflictError,
   TempOwnerConflictError,
   TransactionRecordConflictError,
@@ -798,13 +799,237 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
+      name: "the single-shot write, when present, commits atomically and refuses typed",
+      async run(target) {
+        const store = await target.create();
+        const write = store.writeTransaction?.bind(store);
+        if (write === undefined) {
+          store.close();
+          return;
+        }
+        await store.addTable(table("t", true));
+        const fresh = (id: string): Omit<TransactionRecord, "snapshotVersion"> => {
+          const { snapshotVersion: _pinned, ...record } = transaction(id, null);
+          void _pinned;
+          return record;
+        };
+        // A fresh record: begun, staged, and committed in the one step.
+        const first = await write({
+          transaction: { record: fresh("txn-w1") },
+          blocks: [{ id: "block-w1", bytes: Uint8Array.of(1) }],
+          segments: [segment("segment-w1", "table-t", "txn-w1", "block-w1")],
+          expectedManifestVersion: null,
+          uniqueKeyChanges: [{ tableId: "table-t", keyTokens: ["number:1"], requireAbsent: true }],
+          committedAt: LATER,
+        });
+        checkEqual(first.version, 0, "the first single-shot write must publish version 0");
+        const committed = await store.getTransaction("txn-w1");
+        check(
+          committed?.status === "committed" &&
+            committed.committedVersion === 0 &&
+            committed.snapshotVersion === null,
+          "the fresh record must end committed, pinned at the expected version",
+        );
+        checkEqual(
+          committed.pendingBlockIds,
+          ["block-w1"],
+          "the single-shot write must journal its blocks on the record",
+        );
+        check(
+          (await store.getBlock("block-w1")) !== undefined &&
+            (await store.getSegment("segment-w1"))?.logicalOrder === 0,
+          "the single-shot write must land bytes and finalized segments",
+        );
+        checkEqual(
+          await store.getExistingUniqueKeys("table-t", ["number:1"]),
+          ["number:1"],
+          "the single-shot write must apply unique-key changes",
+        );
+        // A stale version refuses as WriteConflictError and leaves nothing behind — not even
+        // the record.
+        await checkThrows(
+          () =>
+            write({
+              transaction: { record: fresh("txn-stale") },
+              blocks: [{ id: "block-stale", bytes: Uint8Array.of(2) }],
+              segments: [segment("segment-stale", "table-t", "txn-stale", "block-stale")],
+              expectedManifestVersion: null,
+              committedAt: LATER,
+            }),
+          WriteConflictError,
+          "a single-shot write against a moved manifest",
+        );
+        check(
+          (await store.getTransaction("txn-stale")) === undefined &&
+            (await store.getBlock("block-stale")) === undefined &&
+            (await store.getSegment("segment-stale")) === undefined,
+          "a refused single-shot write must leave no record, block, or segment",
+        );
+        // So does a duplicate unique key.
+        await checkThrows(
+          () =>
+            write({
+              transaction: { record: fresh("txn-dup") },
+              blocks: [{ id: "block-dup", bytes: Uint8Array.of(3) }],
+              segments: [segment("segment-dup", "table-t", "txn-dup", "block-dup")],
+              expectedManifestVersion: 0,
+              uniqueKeyChanges: [
+                { tableId: "table-t", keyTokens: ["number:1"], requireAbsent: true },
+              ],
+              committedAt: LATER,
+            }),
+          UniqueKeyConflictError,
+          "a single-shot write inserting an existing unique key",
+        );
+        check(
+          (await store.getTransaction("txn-dup")) === undefined &&
+            (await store.getBlock("block-dup")) === undefined,
+          "a key conflict must leave no record or block",
+        );
+        checkEqual(await store.getCurrentManifestVersion(), 0, "refusals must not advance");
+        // A begun transaction — the shape a reservation needs — continues into the same step.
+        await store.createTransaction(transaction("txn-w2", 0));
+        await checkThrows(
+          () =>
+            write({
+              transaction: { id: "txn-w2", expectedRevision: 4 },
+              blocks: [{ id: "block-w2", bytes: Uint8Array.of(4) }],
+              segments: [segment("segment-w2", "table-t", "txn-w2", "block-w2")],
+              expectedManifestVersion: 0,
+              committedAt: LATER,
+            }),
+          TransactionRecordConflictError,
+          "a single-shot write with a stale transaction revision",
+        );
+        check(
+          (await store.getBlock("block-w2")) === undefined,
+          "a revision conflict must leave no block",
+        );
+        const second = await write({
+          transaction: { id: "txn-w2", expectedRevision: 0 },
+          blocks: [{ id: "block-w2", bytes: Uint8Array.of(4) }],
+          segments: [segment("segment-w2", "table-t", "txn-w2", "block-w2")],
+          expectedManifestVersion: 0,
+          removedBlockIds: ["block-w1"],
+          changedTableIds: ["table-t"],
+          committedAt: LATER,
+        });
+        checkEqual(second.version, 1, "the continued write must publish the next version");
+        checkEqual(second.changedTableIds, ["table-t"], "the summary must carry the change set");
+        const manifest = await store.getManifest(1);
+        checkEqual(
+          manifest?.blockIds,
+          ["block-w2"],
+          "the continued write must add its blocks and apply supersessions",
+        );
+        check(
+          (await store.getTransaction("txn-w2"))?.status === "committed",
+          "the begun record must end committed",
+        );
+        store.close();
+      },
+    },
+    {
+      name: "the lease move, when present, re-pins in place and refuses typed",
+      async run(target) {
+        const store = await target.create();
+        const move = store.moveLease?.bind(store);
+        if (move === undefined) {
+          store.close();
+          return;
+        }
+        await store.addTable(table("t"));
+        const first = await commitOne(store, "one");
+        const second = await commitOne(store, "two");
+        await store.createLease({
+          id: "lease-m",
+          kind: "reader",
+          manifestVersion: first.version,
+          ownerId: "owner-m",
+          expiresAt: LATER,
+          revision: 0,
+        });
+        await checkThrows(
+          () => move("lease-m", 9, second.version, FAR_FUTURE),
+          LeaseConflictError,
+          "moving with a stale revision",
+        );
+        await checkThrows(
+          () => move("lease-m", 0, 999, FAR_FUTURE),
+          SnapshotManifestMissingError,
+          "moving to a version with no manifest",
+        );
+        checkEqual(
+          await store.getLease("lease-m"),
+          {
+            id: "lease-m",
+            kind: "reader",
+            manifestVersion: first.version,
+            ownerId: "owner-m",
+            expiresAt: LATER,
+            revision: 0,
+          },
+          "a refused move must leave the lease exactly as it was",
+        );
+        const moved = await move("lease-m", 0, second.version, FAR_FUTURE);
+        checkEqual(
+          moved,
+          {
+            id: "lease-m",
+            kind: "reader",
+            manifestVersion: second.version,
+            ownerId: "owner-m",
+            expiresAt: FAR_FUTURE,
+            revision: 1,
+          },
+          "a move must re-pin, renew, and advance the revision",
+        );
+        checkEqual(
+          (await store.listLeases()).map((lease) => lease.id),
+          ["lease-m"],
+          "a move must keep the one record, not create a second",
+        );
+        store.close();
+      },
+    },
+    {
       name: "everything committed survives a reopen",
       async run(target) {
         if (target.reopen === undefined) return;
         let store = await target.create();
         await store.addTable(table("t", true));
-        const { version, blockId } = await commitOne(store, "one", { keyTokens: ["number:1"] });
+        let { version, blockId } = await commitOne(store, "one", { keyTokens: ["number:1"] });
         const reserved = await store.reserveRowIds("table-t", 10);
+        // The single-shot write and the lease move, when present, must be just as durable.
+        const write = store.writeTransaction?.bind(store);
+        if (write !== undefined) {
+          const { snapshotVersion: _pinned, ...record } = transaction("txn-single", null);
+          void _pinned;
+          const summary = await write({
+            transaction: { record },
+            blocks: [{ id: "block-single", bytes: Uint8Array.of(1, 2, 3, 4) }],
+            segments: [segment("segment-single", "table-t", "txn-single", "block-single")],
+            expectedManifestVersion: version,
+            uniqueKeyChanges: [
+              { tableId: "table-t", keyTokens: ["number:1"], requireAbsent: false },
+            ],
+            committedAt: LATER,
+          });
+          version = summary.version;
+          blockId = "block-single";
+        }
+        const move = store.moveLease?.bind(store);
+        if (move !== undefined) {
+          await store.createLease({
+            id: "lease-durable",
+            kind: "reader",
+            manifestVersion: null,
+            ownerId: "owner",
+            expiresAt: FAR_FUTURE,
+            revision: 0,
+          });
+          await move("lease-durable", 0, version, FAR_FUTURE);
+        }
         store = await target.reopen(store);
 
         checkEqual(
@@ -812,6 +1037,13 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           version,
           "the committed version must survive a reopen",
         );
+        if (move !== undefined) {
+          checkEqual(
+            (await store.getLease("lease-durable"))?.manifestVersion,
+            version,
+            "a moved lease must survive a reopen at its new version",
+          );
+        }
         checkEqual(
           await store.getBlock(blockId),
           Uint8Array.of(1, 2, 3, 4),

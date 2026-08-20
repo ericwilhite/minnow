@@ -3,6 +3,7 @@ import {
   type CommitTransactionInput,
   type Manifest,
   type StoragePage,
+  type WriteTransactionInput,
 } from "../storage/index.js";
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
@@ -222,6 +223,13 @@ describe("live queries", () => {
             const { changedTableIds, ...rest } = input;
             void changedTableIds;
             return target.commitTransaction(rest);
+          };
+        }
+        if (property === "writeTransaction") {
+          return (input: WriteTransactionInput) => {
+            const { changedTableIds, ...rest } = input;
+            void changedTableIds;
+            return target.writeTransaction(rest);
           };
         }
         const value = Reflect.get(target, property, receiver) as unknown;

@@ -29,6 +29,7 @@ import {
   type TransactionRecord,
   type TransactionRecordUpdate,
   type TriggerRecord,
+  type WriteTransactionInput,
   collectFtsCandidates,
 } from "../types.js";
 import type { DatabaseSnapshot, SnapshotLoadProgress } from "../snapshot.js";
@@ -119,8 +120,20 @@ type WalEntryBody =
       updatedAt: string;
     }
   | { op: "commitTransaction"; input: CommitTransactionInput }
+  | {
+      op: "writeTransaction";
+      input: Omit<WriteTransactionInput, "blocks">;
+      blocks: IdPlacement[];
+    }
   | { op: "createLease"; record: LeaseRecord }
   | { op: "renewLease"; id: string; expectedRevision: number; expiresAt: string }
+  | {
+      op: "moveLease";
+      id: string;
+      expectedRevision: number;
+      manifestVersion: number | null;
+      expiresAt: string;
+    }
   | { op: "removeLeaseIfExpired"; id: string; expectedRevision: number; expiresAtCutoff: string }
   | { op: "removeLease"; id: string }
   | { op: "createCompactionJob"; record: CompactionJobRecord }
@@ -451,10 +464,27 @@ export class OpfsLeader {
       }
       case "commitTransaction":
         return this.#core.commitTransaction(body.input);
+      case "writeTransaction": {
+        // The core counts this step's own blocks as present, so the index is set only once the
+        // whole write has been accepted — a refusal leaves no stray placements behind.
+        const summary = this.#core.writeTransaction(
+          { ...body.input, blocks: body.blocks.map(({ id }) => ({ id, bytes: EMPTY_BYTES })) },
+          { blocksPrevalidated: true },
+        );
+        for (const { id, placement } of body.blocks) this.#blockIndex.set(id, placement);
+        return summary;
+      }
       case "createLease":
         return this.#core.createLease(body.record);
       case "renewLease":
         return this.#core.renewLease(body.id, body.expectedRevision, body.expiresAt);
+      case "moveLease":
+        return this.#core.moveLease(
+          body.id,
+          body.expectedRevision,
+          body.manifestVersion,
+          body.expiresAt,
+        );
       case "removeLeaseIfExpired":
         return this.#core.removeLeaseIfExpired(
           body.id,
@@ -956,6 +986,38 @@ export class OpfsLeader {
     return this.#run(() => this.#logged({ op: "commitTransaction", input }) as ManifestSummary);
   }
 
+  async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
+    return this.#run(async () => {
+      const ids = new Set<string>();
+      for (const block of input.blocks) {
+        validateId(block.id);
+        if (ids.has(block.id) || this.#blockIndex.has(block.id)) {
+          throw new Error(`Block already exists: ${block.id}`);
+        }
+        ids.add(block.id);
+      }
+      const { blocks: bytes, ...rest } = input;
+      const blocks: IdPlacement[] = [];
+      try {
+        for (const block of bytes) {
+          blocks.push({
+            id: block.id,
+            placement: await this.#pool.append(block.bytes, this.#strict),
+          });
+        }
+        return this.#logged({
+          op: "writeTransaction",
+          input: { ...rest, segments: [...input.segments] },
+          blocks,
+        }) as ManifestSummary;
+      } catch (error) {
+        // Nothing was recorded; the written bytes are dead space. Undo the accounting.
+        this.#pool.release(blocks.map(({ placement }) => placement));
+        throw error;
+      }
+    });
+  }
+
   async createLease(record: LeaseRecord): Promise<void> {
     await this.#run(() => this.#logged({ op: "createLease", record }));
   }
@@ -963,6 +1025,24 @@ export class OpfsLeader {
   async renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord> {
     return this.#run(
       () => this.#logged({ op: "renewLease", id, expectedRevision, expiresAt }) as LeaseRecord,
+    );
+  }
+
+  async moveLease(
+    id: string,
+    expectedRevision: number,
+    manifestVersion: number | null,
+    expiresAt: string,
+  ): Promise<LeaseRecord> {
+    return this.#run(
+      () =>
+        this.#logged({
+          op: "moveLease",
+          id,
+          expectedRevision,
+          manifestVersion,
+          expiresAt,
+        }) as LeaseRecord,
     );
   }
 
@@ -1279,6 +1359,7 @@ function placementsOf(entry: WalEntry): Placement[] {
     case "addBlocks":
       return entry.placements.map(({ placement }) => placement);
     case "stageTransactionArtifacts":
+    case "writeTransaction":
       return entry.blocks.map(({ placement }) => placement);
     case "writeFtsBase":
       return entry.pointer.chunks;

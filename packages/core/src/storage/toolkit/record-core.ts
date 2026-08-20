@@ -42,6 +42,7 @@ import {
   TransactionRecordConflictError,
   type TransactionRecordUpdate,
   UniqueKeyConflictError,
+  type WriteTransactionInput,
   normalizeCompactionJobRecord,
   normalizeSegmentRecord,
   updateCompactionJobRecord,
@@ -83,6 +84,15 @@ export interface RecordCoreState {
   >;
   uniqueKeys: Array<readonly [string, string[]]>;
   tempOwners: TempOwnerRecord[];
+}
+
+/** A commit validated and resolved but not yet applied: everything `#applyCommit` writes. */
+interface CommitPlan {
+  manifest: Manifest;
+  committed: TransactionRecord;
+  pendingSegments: SegmentRecord[];
+  uniqueKeyDeltas: Map<string, { added: Set<string>; removed: Set<string> }>;
+  ftsChanges: readonly FtsChanges[] | undefined;
 }
 
 /**
@@ -737,6 +747,101 @@ export class RecordCore {
         transaction?.revision ?? null,
       );
     }
+    const plan = this.#planCommit(
+      transaction,
+      input,
+      (id) => this.#physical.hasBlock(id),
+      (id) => this.#segments.get(id),
+    );
+    return this.#applyCommit(plan);
+  }
+
+  /**
+   * The single-shot write: begin or continue a transaction, journal the artifacts, and commit
+   * — validated in full before anything mutates, so a refusal anywhere (a stale revision, a
+   * moved manifest, a duplicate key) leaves the core exactly as it was, fresh record included.
+   * Block bytes are the enclosing store's to write afterwards, in the same atomic step.
+   */
+  writeTransaction(
+    input: WriteTransactionInput,
+    options: {
+      /** As on `stageTransactionArtifacts`: the enclosing store already checked the block ids. */
+      blocksPrevalidated?: boolean;
+    } = {},
+  ): ManifestSummary {
+    const blockIds = new Set<string>();
+    for (const block of input.blocks) {
+      if (options.blocksPrevalidated !== true) {
+        validateId(block.id);
+        if (blockIds.has(block.id) || this.#physical.hasBlock(block.id)) {
+          throw new Error(`Block already exists: ${block.id}`);
+        }
+      }
+      blockIds.add(block.id);
+    }
+    const segments = new Map<string, SegmentRecord>();
+    for (const segment of input.segments) {
+      if (segments.has(segment.id) || this.#segments.has(segment.id)) {
+        throw new Error(`Segment already exists: ${segment.id}`);
+      }
+      segments.set(segment.id, normalizeSegmentRecord(segment));
+    }
+    let base: TransactionRecord;
+    if ("record" in input.transaction) {
+      validateBeginTransactionInput({ record: input.transaction.record });
+      if (this.#transactions.has(input.transaction.record.id)) {
+        throw new Error(`Transaction already exists: ${input.transaction.record.id}`);
+      }
+      if (this.#currentVersion !== input.expectedManifestVersion) {
+        throw new WriteConflictError(input.expectedManifestVersion, this.#currentVersion);
+      }
+      base = {
+        ...structuredClone(input.transaction.record),
+        snapshotVersion: input.expectedManifestVersion,
+      };
+      this.#assertSnapshotAvailable(base.snapshotVersion);
+    } else {
+      const current = this.#transactions.get(input.transaction.id);
+      if (current?.revision !== input.transaction.expectedRevision) {
+        throw new TransactionRecordConflictError(
+          input.transaction.id,
+          input.transaction.expectedRevision,
+          current?.revision ?? null,
+        );
+      }
+      base = current;
+    }
+    const update: TransactionRecordUpdate = {
+      pendingBlockIds: [...base.pendingBlockIds, ...blockIds],
+      pendingSegmentIds: [...base.pendingSegmentIds, ...segments.keys()],
+      updatedAt: input.committedAt,
+    };
+    assertGenericTransactionUpdateAllowed(base, update);
+    const staged = updateTransactionRecord(base, update);
+    // Previously journaled artifacts must exist; the ones staged here land with the commit.
+    this.#assertPendingArtifactsAvailable(base, true, true);
+    const plan = this.#planCommit(
+      staged,
+      input,
+      (id) => blockIds.has(id) || this.#physical.hasBlock(id),
+      (id) => segments.get(id) ?? this.#segments.get(id),
+    );
+    for (const [id, segment] of segments) this.#segments.set(id, segment);
+    this.#transactions.set(staged.id, staged);
+    return this.#applyCommit(plan);
+  }
+
+  /**
+   * Everything a commit checks, against a transaction record the caller already resolved, with
+   * the artifact lookups injected so the single-shot write can count its not-yet-stored blocks
+   * and segments as present. Pure: mutations happen in `#applyCommit`.
+   */
+  #planCommit(
+    transaction: TransactionRecord,
+    input: Omit<CommitTransactionInput, "transactionId" | "expectedTransactionRevision">,
+    hasBlock: (id: string) => boolean,
+    getSegment: (id: string) => SegmentRecord | undefined,
+  ): CommitPlan {
     if (this.#currentVersion !== input.expectedManifestVersion) {
       throw new WriteConflictError(input.expectedManifestVersion, this.#currentVersion);
     }
@@ -769,10 +874,10 @@ export class RecordCore {
       ...transaction.pendingBlockIds,
     ];
     for (const id of transaction.pendingBlockIds) {
-      if (!this.#physical.hasBlock(id)) throw new Error(`Manifest references missing block: ${id}`);
+      if (!hasBlock(id)) throw new Error(`Manifest references missing block: ${id}`);
     }
     const pendingSegments = transaction.pendingSegmentIds.map((id) => {
-      const segment = this.#segments.get(id);
+      const segment = getSegment(id);
       if (segment === undefined) throw new Error(`Transaction references missing segment: ${id}`);
       if (segment.transactionId !== transaction.id) {
         throw new Error(`Segment ${id} belongs to another transaction`);
@@ -819,9 +924,20 @@ export class RecordCore {
       committedVersion: manifest.version,
       updatedAt: input.committedAt,
     });
+    return {
+      manifest,
+      committed,
+      pendingSegments,
+      uniqueKeyDeltas,
+      ftsChanges: input.ftsChanges,
+    };
+  }
+
+  #applyCommit(plan: CommitPlan): ManifestSummary {
+    const { manifest, committed, pendingSegments } = plan;
     this.#manifests.set(manifest.version, manifest);
     this.#currentVersion = manifest.version;
-    this.#transactions.set(transaction.id, committed);
+    this.#transactions.set(committed.id, committed);
     for (const segment of pendingSegments) {
       this.#segments.set(segment.id, {
         ...segment,
@@ -829,7 +945,7 @@ export class RecordCore {
         logicalOrder: segment.logicalOrder ?? manifest.version,
       });
     }
-    for (const [tableId, delta] of uniqueKeyDeltas) {
+    for (const [tableId, delta] of plan.uniqueKeyDeltas) {
       let tokens = this.#uniqueKeys.get(tableId);
       if (tokens === undefined) {
         tokens = new Set();
@@ -838,7 +954,7 @@ export class RecordCore {
       for (const token of delta.removed) tokens.delete(token);
       for (const token of delta.added) tokens.add(token);
     }
-    this.#applyFtsChanges(pendingSegments, input.ftsChanges, manifest.version);
+    this.#applyFtsChanges(pendingSegments, plan.ftsChanges, manifest.version);
     this.#catalogEpoch += 1;
     // Match the IndexedDB store's observable commit shape: the summary without blockIds.
     const { blockIds: _resolved, ...summary } = manifest;
@@ -874,6 +990,23 @@ export class RecordCore {
     const renewed = { ...record, expiresAt, revision: record.revision + 1 };
     this.#leases.set(id, renewed);
     return structuredClone(renewed);
+  }
+
+  moveLease(
+    id: string,
+    expectedRevision: number,
+    manifestVersion: number | null,
+    expiresAt: string,
+  ): LeaseRecord {
+    validateLeaseExpiration(expiresAt);
+    const record = this.#leases.get(id);
+    if (record?.revision !== expectedRevision) {
+      throw new LeaseConflictError(id, expectedRevision, record?.revision ?? null);
+    }
+    this.#assertSnapshotAvailable(manifestVersion);
+    const moved = { ...record, manifestVersion, expiresAt, revision: record.revision + 1 };
+    this.#leases.set(id, moved);
+    return structuredClone(moved);
   }
 
   removeLeaseIfExpired(id: string, expectedRevision: number, expiresAtCutoff: string): boolean {

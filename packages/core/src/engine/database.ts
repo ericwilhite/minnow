@@ -1028,6 +1028,8 @@ export class MinnowDatabase {
   readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
   #sharedLeaseRenewal: Promise<void> | undefined;
+  /** An in-flight re-pin of the shared lease; acquirers wait for it, never join it. */
+  #sharedLeaseMove: Promise<void> | undefined;
   /**
    * Catalog states keyed by requested table-name set, valid only at #catalogStateEpoch.
    * The (version, epoch) probe is the sole validity signal: a matched epoch proves a cached
@@ -1544,7 +1546,9 @@ export class MinnowDatabase {
     });
     const logicalBytes = estimateValuesBytes(input.keys);
 
-    const transaction = await this.#transactions.begin();
+    // Deferred: the record is written only if something stages in two steps (trigger rows),
+    // and otherwise rides the single-shot commit below — or never exists, for a no-op delete.
+    const transaction = await this.#transactions.beginDeferred();
     const segmentId = this.#createId();
     transaction.setUniqueKeyChanges({
       tableId: table.id,
@@ -1630,38 +1634,42 @@ export class MinnowDatabase {
         deleteValueAt,
         "before",
       );
+      const segment: SegmentRecord = {
+        id: segmentId,
+        tableId: table.id,
+        transactionId: transaction.id,
+        rowCount: keys.size,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        columnBlockIds: { [keyColumn.id]: blockIds },
+        kind: "delete",
+        keyColumnId: keyColumn.id,
+        level: 0,
+        createdAt: this.#now().toISOString(),
+      };
+      // AFTER triggers stage derived rows between the segment and the commit, which keeps the
+      // two apart; without them the stage and the commit collapse into one storage write.
+      const stagesAfter = firesAfterTriggers(table, "delete");
       const stageStarted = performance.now();
-      // One journal step for the key blocks and the segment, as the update path stages: on a
-      // store with the combined operation that is one storage transaction, not four.
-      await transaction.stageArtifacts(blockWrites, [
-        {
-          id: segmentId,
-          tableId: table.id,
-          transactionId: transaction.id,
-          rowCount: keys.size,
-          rowIdStart: 0n,
-          rowIdEndExclusive: 0n,
-          columnBlockIds: { [keyColumn.id]: blockIds },
-          kind: "delete",
-          keyColumnId: keyColumn.id,
-          level: 0,
-          createdAt: this.#now().toISOString(),
-        },
-      ]);
-      await this.#stageTriggerDerivedInserts(
-        transaction,
-        table,
-        "delete",
-        deletePreImages.length,
-        deleteValueAt,
-        "after",
-      );
+      if (stagesAfter) {
+        await transaction.stageArtifacts(blockWrites, [segment]);
+        await this.#stageTriggerDerivedInserts(
+          transaction,
+          table,
+          "delete",
+          deletePreImages.length,
+          deleteValueAt,
+          "after",
+        );
+      }
       stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
         try {
-          const manifest = await transaction.commit();
+          const manifest = stagesAfter
+            ? await transaction.commit()
+            : await transaction.stageArtifactsAndCommit(blockWrites, [segment]);
           commitMs += performance.now() - commitStarted;
           this.#afterCommit(manifest);
           return {
@@ -1720,7 +1728,8 @@ export class MinnowDatabase {
         (total, values) => total + estimateValuesBytes(values),
         0,
       );
-    const transaction = await this.#transactions.begin();
+    // Deferred: the record rides the single-shot commit below unless trigger rows stage first.
+    const transaction = await this.#transactions.beginDeferred();
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const changedColumns = Object.keys(input.changes).sort();
@@ -1809,36 +1818,42 @@ export class MinnowDatabase {
         updateValueAt,
         "before",
       );
+      const segment: SegmentRecord = {
+        id: segmentId,
+        tableId: table.id,
+        transactionId: transaction.id,
+        rowCount: input.keys.length,
+        rowIdStart: 0n,
+        rowIdEndExclusive: 0n,
+        columnBlockIds,
+        kind: "update",
+        keyColumnId: keyColumn.id,
+        level: 0,
+        createdAt: this.#now().toISOString(),
+      };
+      // AFTER triggers stage derived rows between the segment and the commit, which keeps the
+      // two apart; without them the stage and the commit collapse into one storage write.
+      const stagesAfter = firesAfterTriggers(table, "update");
       const stageStarted = performance.now();
-      await transaction.stageArtifacts(batchBlockWrites, [
-        {
-          id: segmentId,
-          tableId: table.id,
-          transactionId: transaction.id,
-          rowCount: input.keys.length,
-          rowIdStart: 0n,
-          rowIdEndExclusive: 0n,
-          columnBlockIds,
-          kind: "update",
-          keyColumnId: keyColumn.id,
-          level: 0,
-          createdAt: this.#now().toISOString(),
-        },
-      ]);
-      await this.#stageTriggerDerivedInserts(
-        transaction,
-        table,
-        "update",
-        input.keys.length,
-        updateValueAt,
-        "after",
-      );
+      if (stagesAfter) {
+        await transaction.stageArtifacts(batchBlockWrites, [segment]);
+        await this.#stageTriggerDerivedInserts(
+          transaction,
+          table,
+          "update",
+          input.keys.length,
+          updateValueAt,
+          "after",
+        );
+      }
       stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
         try {
-          const manifest = await transaction.commit();
+          const manifest = stagesAfter
+            ? await transaction.commit()
+            : await transaction.stageArtifactsAndCommit(batchBlockWrites, [segment]);
           commitMs += performance.now() - commitStarted;
           this.#afterCommit(manifest);
           return {
@@ -2062,25 +2077,35 @@ export class MinnowDatabase {
       } else if (upsertFirings !== undefined) {
         await this.#stageUpsertTriggerFirings(transaction, table, input, upsertFirings, "before");
       }
-      await transaction.stageArtifacts(batchBlockWrites, [segment]);
-      if (kind === "insert") {
-        await this.#stageTriggerDerivedInserts(
-          transaction,
-          table,
-          "insert",
-          rowCount,
-          insertValueAt,
-          "after",
-        );
-      } else if (upsertFirings !== undefined) {
-        await this.#stageUpsertTriggerFirings(transaction, table, input, upsertFirings, "after");
+      // AFTER triggers stage derived rows between the segment and the commit, which keeps the
+      // two apart; without them the stage and the commit collapse into one storage write.
+      const stagesAfter =
+        kind === "insert"
+          ? firesAfterTriggers(table, "insert")
+          : upsertFirings !== undefined && firesAfterTriggers(table, "insert", "update");
+      if (stagesAfter) {
+        await transaction.stageArtifacts(batchBlockWrites, [segment]);
+        if (kind === "insert") {
+          await this.#stageTriggerDerivedInserts(
+            transaction,
+            table,
+            "insert",
+            rowCount,
+            insertValueAt,
+            "after",
+          );
+        } else if (upsertFirings !== undefined) {
+          await this.#stageUpsertTriggerFirings(transaction, table, input, upsertFirings, "after");
+        }
       }
       stageMs += performance.now() - stageStarted;
 
       for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
         const commitStarted = performance.now();
         try {
-          const manifest = await transaction.commit();
+          const manifest = stagesAfter
+            ? await transaction.commit()
+            : await transaction.stageArtifactsAndCommit(batchBlockWrites, [segment]);
           commitMs += performance.now() - commitStarted;
           this.#afterCommit(manifest);
           return {
@@ -2406,44 +2431,69 @@ export class MinnowDatabase {
 
   /**
    * Reuses the shared internal reader lease when it targets the requested version and has
-   * not expired; otherwise opens a fresh lease at that exact version and retires the old
-   * one once its readers drain. Returns undefined when the version's manifest disappeared
-   * between the catalog read and the lease, so the caller can re-read.
+   * not expired. Otherwise the pin has to move: with no reader left on the old version the
+   * one lease record is re-pinned in place (one storage write, instead of a create now and a
+   * remove once the old one drains); while readers remain, a fresh lease opens at the exact
+   * version and the old one retires as they finish. Returns undefined when the version's
+   * manifest disappeared between the catalog read and the lease, so the caller can re-read.
    */
   async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
-    const current = this.#sharedLease;
-    if (
-      current?.version === version &&
-      current.lease.expiresAt.getTime() - this.#now().getTime() > 0
-    ) {
-      current.refCount += 1;
-      try {
-        await this.#renewInternalLeaseIfNeeded(current.lease);
-        return current;
-      } catch (error) {
-        this.#releaseSharedLease(current);
-        throw error;
+    for (;;) {
+      // A move in flight is closing the shared snapshot it re-pins; wait for it rather than
+      // hand that snapshot out, then look again.
+      if (this.#sharedLeaseMove !== undefined) {
+        await this.#sharedLeaseMove;
+        continue;
       }
-    }
-    let lease: LeasedSnapshot;
-    try {
-      lease = await this.#transactions.openLeasedSnapshot({
+      const current = this.#sharedLease;
+      if (
+        current?.version === version &&
+        current.lease.expiresAt.getTime() - this.#now().getTime() > 0
+      ) {
+        current.refCount += 1;
+        try {
+          await this.#renewInternalLeaseIfNeeded(current.lease);
+          return current;
+        } catch (error) {
+          this.#releaseSharedLease(current);
+          throw error;
+        }
+      }
+      const options = {
         id: `${this.#internalLeaseOwnerId}/${String(this.#internalLeaseSequence++)}`,
         ownerId: this.#internalLeaseOwnerId,
         ttlMs: INTERNAL_READ_LEASE_TTL_MS,
         version,
-      });
-    } catch (error) {
-      if (error instanceof SnapshotManifestMissingError) return undefined;
-      throw error;
+      };
+      let lease: LeasedSnapshot;
+      try {
+        if (current?.refCount === 0) {
+          const move = this.#transactions.moveLeasedSnapshot(current.lease, options);
+          this.#sharedLeaseMove = move.then(
+            () => undefined,
+            () => undefined,
+          );
+          try {
+            lease = await move;
+          } finally {
+            this.#sharedLeaseMove = undefined;
+          }
+        } else {
+          lease = await this.#transactions.openLeasedSnapshot(options);
+        }
+      } catch (error) {
+        if (error instanceof SnapshotManifestMissingError) return undefined;
+        throw error;
+      }
+      const entry: SharedLeaseEntry = { lease, version, refCount: 1 };
+      const previous = this.#sharedLease;
+      this.#sharedLease = entry;
+      if (previous?.refCount === 0) {
+        // Already closed when it was the one just moved; a remove otherwise.
+        void previous.lease.release().catch(() => undefined);
+      }
+      return entry;
     }
-    const entry: SharedLeaseEntry = { lease, version, refCount: 1 };
-    const previous = this.#sharedLease;
-    this.#sharedLease = entry;
-    if (previous?.refCount === 0) {
-      void previous.lease.release().catch(() => undefined);
-    }
-    return entry;
   }
 
   /**
@@ -14134,6 +14184,16 @@ interface SharedLeaseEntry {
   lease: LeasedSnapshot;
   version: number | null;
   refCount: number;
+}
+
+/** Whether any of the table's triggers for these events fire AFTER the write, staging rows. */
+function firesAfterTriggers(
+  table: TableRecord,
+  ...events: Array<"insert" | "update" | "delete">
+): boolean {
+  return (table.triggers ?? []).some(
+    (trigger) => trigger.timing === "after" && events.includes(trigger.event),
+  );
 }
 
 /** Collects every real table name referenced by a block, its derived sources, or its subqueries. */

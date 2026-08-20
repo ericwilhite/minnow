@@ -30,6 +30,7 @@ import {
   type TransactionRecordUpdate,
   type TriggerRecord,
   type FtsPosting,
+  type WriteTransactionInput,
 } from "../types.js";
 import type { DatabaseSnapshot, SnapshotLoadProgress } from "../snapshot.js";
 import {
@@ -117,10 +118,12 @@ const RPC_METHODS = new Set([
   "updateTransaction",
   "stageTransactionArtifacts",
   "commitTransaction",
+  "writeTransaction",
   "createLease",
   "getLease",
   "listLeases",
   "renewLease",
+  "moveLease",
   "removeLeaseIfExpired",
   "removeLease",
   "createCompactionJob",
@@ -940,6 +943,10 @@ export class OpfsBlockStore implements BlockStore {
     return (await this.#dispatch("commitTransaction", [input])) as ManifestSummary;
   }
 
+  async writeTransaction(input: WriteTransactionInput): Promise<ManifestSummary> {
+    return (await this.#dispatch("writeTransaction", [input])) as ManifestSummary;
+  }
+
   async createLease(record: LeaseRecord): Promise<void> {
     await this.#dispatch("createLease", [record]);
   }
@@ -954,6 +961,20 @@ export class OpfsBlockStore implements BlockStore {
 
   async renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord> {
     return (await this.#dispatch("renewLease", [id, expectedRevision, expiresAt])) as LeaseRecord;
+  }
+
+  async moveLease(
+    id: string,
+    expectedRevision: number,
+    manifestVersion: number | null,
+    expiresAt: string,
+  ): Promise<LeaseRecord> {
+    return (await this.#dispatch("moveLease", [
+      id,
+      expectedRevision,
+      manifestVersion,
+      expiresAt,
+    ])) as LeaseRecord;
   }
 
   async removeLeaseIfExpired(

@@ -13,6 +13,7 @@ import {
   TransactionRecordConflictError,
   type FtsChanges,
   type UniqueKeyChanges,
+  WriteConflictError,
 } from "../storage/index.js";
 
 export interface TransactionManagerOptions {
@@ -115,9 +116,33 @@ export class LeasedSnapshot extends Snapshot {
     return new Date(this.#record.expiresAt);
   }
 
+  /**
+   * Re-pins this lease to another version in one store step, handing the record over to the
+   * returned snapshot; this one is closed on success (the lease is not released — it has
+   * moved). Undefined when the store lacks the atomic move; the store's typed refusals
+   * (`SnapshotManifestMissingError`, `LeaseConflictError`) leave this snapshot open and pass
+   * through.
+   */
+  async moveTo(version: number | null, ttlMs: number): Promise<LeasedSnapshot | undefined> {
+    this.#assertOpen();
+    validateTtl(ttlMs);
+    const move = this.#store.moveLease?.bind(this.#store);
+    if (move === undefined) return undefined;
+    const target = await loadSnapshot(this.#store, version);
+    const expiresAt = new Date(this.now().getTime() + ttlMs).toISOString();
+    const record = await move(this.#record.id, this.#record.revision, version, expiresAt);
+    this.#released = true;
+    return new LeasedSnapshot(this.#store, version, target.listBlockIds(), record, this.now);
+  }
+
   async release(): Promise<void> {
     if (this.#released) return;
     await this.#store.removeLease(this.#record.id);
+    this.#released = true;
+  }
+
+  /** Closes this snapshot without touching the store — for a lease the store no longer holds. */
+  discard(): void {
     this.#released = true;
   }
 
@@ -133,13 +158,22 @@ export class DatabaseTransaction {
   readonly #supersededBlockIds = new Set<string>();
   readonly #changedTableIds = new Set<string>();
   #logicallyUnchanged = false;
+  /**
+   * Whether the record exists in the store. A deferred transaction (`beginDeferred`) starts
+   * without one: it is written on the first two-step staging call, or folded into the
+   * single-shot `stageArtifactsAndCommit`, or never — an abort of an unpersisted transaction
+   * touches nothing.
+   */
+  #persisted: boolean;
 
   constructor(
     private readonly store: BlockStore,
     record: TransactionRecord,
     private readonly now: () => Date,
+    options: { persisted?: boolean } = {},
   ) {
     this.#record = structuredClone(record);
+    this.#persisted = options.persisted ?? true;
   }
 
   get id(): string {
@@ -200,6 +234,7 @@ export class DatabaseTransaction {
   async stageBlocks(blocks: readonly BlockWrite[]): Promise<void> {
     this.#assertActive();
     if (blocks.length === 0) return;
+    await this.#ensurePersisted();
     await this.store.addBlocks(blocks);
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingBlockIds: [...this.#record.pendingBlockIds, ...blocks.map((block) => block.id)],
@@ -238,6 +273,7 @@ export class DatabaseTransaction {
       return;
     }
     if (blocks.length === 0 && ordered.length === 0) return;
+    await this.#ensurePersisted();
     this.#record = await batched({
       transactionId: this.id,
       expectedRevision: this.#record.revision,
@@ -246,6 +282,89 @@ export class DatabaseTransaction {
       updatedAt: this.now().toISOString(),
     });
     for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
+  }
+
+  /**
+   * Stages blocks and segments and commits, in one step. On a store with the single-shot
+   * `writeTransaction` that is one storage transaction — and for a deferred transaction the
+   * only one, the record begun, journaled, and committed together. Elsewhere it is
+   * `stageArtifacts` followed by `commit`. The outcome and its typed refusals match the
+   * two-step shape exactly, and a retry after `WriteConflictError` + `rebase()` is safe:
+   * artifacts a failed attempt left journaled are committed rather than staged twice, and a
+   * single-shot refusal left nothing to repeat.
+   */
+  async stageArtifactsAndCommit(
+    blocks: readonly BlockWrite[],
+    segments: readonly SegmentRecord[],
+  ): Promise<ManifestSummary> {
+    this.#assertActive();
+    for (const segment of segments) {
+      if (segment.transactionId !== this.id) {
+        throw new Error(`Segment ${segment.id} belongs to another transaction`);
+      }
+    }
+    const pendingBlockIds = new Set(this.#record.pendingBlockIds);
+    const pendingSegmentIds = new Set(this.#record.pendingSegmentIds);
+    if (
+      blocks.length + segments.length > 0 &&
+      blocks.every((block) => pendingBlockIds.has(block.id)) &&
+      segments.every((segment) => pendingSegmentIds.has(segment.id))
+    ) {
+      return this.commit();
+    }
+    const single = this.store.writeTransaction?.bind(this.store);
+    if (single === undefined) {
+      await this.stageArtifacts(blocks, segments);
+      return this.commit();
+    }
+    const ordinalBase = this.#record.pendingSegmentIds.length;
+    const ordered = segments.map((segment, index) => ({
+      ...segment,
+      commitOrdinal: segment.commitOrdinal ?? ordinalBase + index,
+    }));
+    const changedTableIds = new Set(this.#changedTableIds);
+    for (const segment of ordered) changedTableIds.add(segment.tableId);
+    const { snapshotVersion: _pinned, ...fresh } = this.#record;
+    void _pinned;
+    const committedAt = this.now().toISOString();
+    try {
+      const manifest = await single({
+        transaction: this.#persisted
+          ? { id: this.id, expectedRevision: this.#record.revision }
+          : { record: fresh },
+        blocks,
+        segments: ordered,
+        expectedManifestVersion: this.#record.snapshotVersion,
+        changedTableIds: this.#logicallyUnchanged ? [] : [...changedTableIds],
+        ...(this.#supersededBlockIds.size === 0
+          ? {}
+          : { removedBlockIds: [...this.#supersededBlockIds] }),
+        ...(this.#uniqueKeyChanges.length === 0
+          ? {}
+          : { uniqueKeyChanges: this.#uniqueKeyChanges }),
+        ...(this.#ftsChanges.length === 0 ? {} : { ftsChanges: this.#ftsChanges }),
+        committedAt,
+      });
+      for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
+      this.#record = {
+        ...this.#record,
+        pendingBlockIds: [
+          ...new Set([...pendingBlockIds, ...blocks.map((block) => block.id)]),
+        ].sort(),
+        pendingSegmentIds: [
+          ...new Set([...pendingSegmentIds, ...ordered.map((segment) => segment.id)]),
+        ].sort(),
+        status: "committed",
+        committedVersion: manifest.version,
+        // One journal step and one commit, as the two-step shape would have left it.
+        revision: this.#record.revision + 2,
+        updatedAt: committedAt,
+      };
+      this.#persisted = true;
+      return manifest;
+    } catch (error) {
+      return this.#recoverCommitted(error);
+    }
   }
 
   /**
@@ -268,6 +387,7 @@ export class DatabaseTransaction {
         throw new Error(`Cannot stage a missing existing block: ${id}`);
       }
     }
+    await this.#ensurePersisted();
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingBlockIds: [...this.#record.pendingBlockIds, ...additions],
       updatedAt: this.now().toISOString(),
@@ -283,6 +403,7 @@ export class DatabaseTransaction {
       record = { ...record, commitOrdinal: this.#record.pendingSegmentIds.length };
     }
     this.#changedTableIds.add(record.tableId);
+    await this.#ensurePersisted();
     await this.store.addSegment(record);
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingSegmentIds: [...this.#record.pendingSegmentIds, record.id],
@@ -301,6 +422,7 @@ export class DatabaseTransaction {
       throw new Error(`Segment ${segmentId} belongs to another transaction`);
     }
     this.#changedTableIds.add(record.tableId);
+    await this.#ensurePersisted();
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       pendingSegmentIds: [...this.#record.pendingSegmentIds, segmentId],
       updatedAt: this.now().toISOString(),
@@ -402,6 +524,7 @@ export class DatabaseTransaction {
 
   async commit(): Promise<ManifestSummary> {
     this.#assertActive();
+    await this.#ensurePersisted();
     // The store derives the published manifest from its stored base plus this delta, so the
     // commit neither loads nor rebuilds the full block list.
     const committedAt = this.now().toISOString();
@@ -429,15 +552,7 @@ export class DatabaseTransaction {
       };
       return manifest;
     } catch (error) {
-      const persisted = await this.store.getTransaction(this.id);
-      if (persisted?.status === "committed" && persisted.committedVersion !== null) {
-        const manifest = await this.store.getManifest(persisted.committedVersion);
-        if (manifest !== undefined) {
-          this.#record = persisted;
-          return manifest;
-        }
-      }
-      throw error;
+      return this.#recoverCommitted(error);
     }
   }
 
@@ -445,6 +560,15 @@ export class DatabaseTransaction {
     this.#assertActive();
     for (;;) {
       const current = await this.store.getCurrentManifest();
+      if (!this.#persisted) {
+        // Nothing is in the store yet, so the pin moves locally; it lands with the record.
+        this.#record = {
+          ...this.#record,
+          snapshotVersion: current?.version ?? null,
+          updatedAt: this.now().toISOString(),
+        };
+        return new Snapshot(this.store, current?.version ?? null, current?.blockIds ?? []);
+      }
       try {
         this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
           snapshotVersion: current?.version ?? null,
@@ -462,6 +586,11 @@ export class DatabaseTransaction {
 
   async abort(): Promise<void> {
     this.#assertActive();
+    if (!this.#persisted) {
+      // Never written, so there is nothing to mark: the transaction simply ends here.
+      this.#record = { ...this.#record, status: "aborted", updatedAt: this.now().toISOString() };
+      return;
+    }
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       status: "aborted",
       updatedAt: this.now().toISOString(),
@@ -470,6 +599,41 @@ export class DatabaseTransaction {
 
   #assertActive(): void {
     if (this.#record.status !== "active") throw new TransactionClosedError(this.id);
+  }
+
+  /**
+   * Writes a deferred transaction's record before the first two-step staging call. The pinned
+   * version can only be unavailable if a commit moved the manifest on and collection pruned it
+   * meanwhile, so that surfaces as the `WriteConflictError` the rebase loops already handle.
+   */
+  async #ensurePersisted(): Promise<void> {
+    if (this.#persisted) return;
+    try {
+      await this.store.createTransaction(this.#record);
+    } catch (error) {
+      if (error instanceof SnapshotManifestMissingError) {
+        throw new WriteConflictError(
+          this.#record.snapshotVersion,
+          await this.store.getCurrentManifestVersion(),
+        );
+      }
+      throw error;
+    }
+    this.#persisted = true;
+  }
+
+  /** A commit whose acknowledgement was lost still committed: answer from the persisted record. */
+  async #recoverCommitted(error: unknown): Promise<ManifestSummary> {
+    const persisted = await this.store.getTransaction(this.id);
+    if (persisted?.status === "committed" && persisted.committedVersion !== null) {
+      const manifest = await this.store.getManifest(persisted.committedVersion);
+      if (manifest !== undefined) {
+        this.#record = persisted;
+        this.#persisted = true;
+        return manifest;
+      }
+    }
+    throw error;
   }
 }
 
@@ -487,6 +651,34 @@ export class TransactionManager {
 
   async begin(): Promise<DatabaseTransaction> {
     return (await this.beginWithReservation()).transaction;
+  }
+
+  /**
+   * Begins a transaction without a storage write: the record is pinned at the current manifest
+   * version (one read) and written only when something is staged through the two-step methods
+   * — or never, when the whole write goes through `stageArtifactsAndCommit` on a store with
+   * the single-shot `writeTransaction`, or the transaction aborts untouched. For writes whose
+   * artifacts need no prior reservation; `beginWithReservation` is the shape for the rest.
+   */
+  async beginDeferred(): Promise<DatabaseTransaction> {
+    const currentVersion = await this.store.getCurrentManifestVersion();
+    const timestamp = this.#now().toISOString();
+    return new DatabaseTransaction(
+      this.store,
+      {
+        id: this.#createId(),
+        snapshotVersion: currentVersion,
+        pendingBlockIds: [],
+        pendingSegmentIds: [],
+        status: "active",
+        revision: 0,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        committedVersion: null,
+      },
+      this.#now,
+      { persisted: false },
+    );
   }
 
   /**
@@ -623,6 +815,35 @@ export class TransactionManager {
         throw error;
       }
     }
+  }
+
+  /**
+   * Re-pins an open leased snapshot to another version — one reader moving on to a newer
+   * commit. With the store's atomic `moveLease` the record stays and moves in one round trip;
+   * otherwise a fresh lease is created at the target (`options.id` names it) and the old one
+   * released. A lease the store no longer holds — expired and swept — is simply replaced. The
+   * given snapshot is closed on return either way; a missing target manifest throws
+   * `SnapshotManifestMissingError` and leaves it open.
+   */
+  async moveLeasedSnapshot(
+    snapshot: LeasedSnapshot,
+    options: OpenLeasedSnapshotOptions & { version: number | null },
+  ): Promise<LeasedSnapshot> {
+    validateTtl(options.ttlMs);
+    try {
+      const moved = await snapshot.moveTo(options.version, options.ttlMs);
+      if (moved !== undefined) return moved;
+    } catch (error) {
+      if (!(error instanceof LeaseConflictError)) throw error;
+      // Not ours to move any more — swept after expiring, most likely. A fresh lease takes its
+      // place; whatever record remains is left to expire rather than deleted from under anyone.
+      const replacement = await this.openLeasedSnapshot(options);
+      snapshot.discard();
+      return replacement;
+    }
+    const replacement = await this.openLeasedSnapshot(options);
+    await snapshot.release();
+    return replacement;
   }
 
   async removeExpiredLeases(at: Date = this.#now()): Promise<string[]> {
