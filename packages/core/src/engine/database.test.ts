@@ -6551,6 +6551,59 @@ for (const implementation of implementations()) {
   });
 }
 
+it("pages a streamed scan the same at every depth, ties kept in arrival order", async () => {
+  const database = new MinnowDatabase(new MemoryBlockStore(), {
+    rowsPerBlock: 512,
+    compression: "raw",
+  });
+  await database.createTable({
+    name: "paged",
+    columns: [
+      { name: "v", type: "number" },
+      { name: "tag", type: "string", nullable: true },
+      { name: "score", type: "number", nullable: true },
+    ],
+  });
+  const rowCount = 10_000;
+  await database.insertBatch("paged", {
+    columns: {
+      v: Array.from({ length: rowCount }, (_, index) => index),
+      tag: Array.from({ length: rowCount }, (_, index) =>
+        index % 7 === 0 ? null : `tag-${String(index % 5)}`,
+      ),
+      score: Array.from({ length: rowCount }, (_, index) =>
+        index % 13 === 0 ? null : (index * 7919) % 1000,
+      ),
+    },
+  });
+  // Rows arrive in `v` order, so a stable sort on the other columns alone must agree with the
+  // same sort tie-broken by `v` explicitly — whichever way the page is kept: a bound under a
+  // tenth of the table, or every row kept and sorted once above it.
+  const pages: ReadonlyArray<[limit: number, offset: number]> = [
+    [100, 0],
+    [900, 50],
+    [1_000, 0],
+    [2_500, 500],
+    [9_000, 2_000],
+    [50, 9_990],
+  ];
+  for (const [order, tieBroken] of [
+    ["tag, score DESC", "tag, score DESC, v"],
+    ["score DESC NULLS LAST", "score DESC NULLS LAST, v"],
+    ["tag DESC NULLS FIRST, score", "tag DESC NULLS FIRST, score, v"],
+  ]) {
+    const reference = await database.query(
+      `SELECT v, tag, score FROM paged ORDER BY ${tieBroken ?? ""}`,
+    );
+    expect(reference.rows).toHaveLength(rowCount);
+    for (const [limit, offset] of pages) {
+      const sql = `SELECT v, tag, score FROM paged ORDER BY ${order ?? ""} LIMIT ${String(limit)} OFFSET ${String(offset)}`;
+      const page = await database.query(sql);
+      expect(page.rows, sql).toEqual(reference.rows.slice(offset, offset + limit));
+    }
+  }
+});
+
 for (const implementation of implementations()) {
   it(`${implementation.name} streams append scans through a budget too small to materialize`, async () => {
     const store = await implementation.create();

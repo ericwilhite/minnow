@@ -126,6 +126,38 @@ describe("vector query execution", () => {
     prepared.close();
   });
 
+  it("drops the top-N bound for a page that keeps a tenth of the scan or more", () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
+      id: index,
+      bucket: index % 11,
+    }));
+    const tables = new Map([["rows", rows]]);
+    const peakOf = (sql: string): number => {
+      const plan = compileQuery(sql);
+      const prepared = createPreparedQuery(plan, tables, {});
+      expect(prepared.execute(), sql).toEqual(executeRowQuery(plan, tables));
+      const peak = prepared.memoryUsage.peakBytes;
+      prepared.close();
+      return peak;
+    };
+    const unlimited = peakOf("SELECT id, bucket FROM rows ORDER BY bucket, id DESC");
+    // 450 of 5,000 rows is under the tenth: the bound holds, so the peak is a fraction of a
+    // full sort's. 500 is the tenth exactly: every row is kept and sorted once, at the full
+    // sort's cost in memory and less than its cost in time.
+    expect(
+      peakOf("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 400 OFFSET 50"),
+    ).toBeLessThan(unlimited / 2);
+    expect(
+      peakOf("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 500"),
+    ).toBeGreaterThan(unlimited / 2);
+    expect(
+      peakOf("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 4000 OFFSET 1000"),
+    ).toBeGreaterThan(unlimited / 2);
+    // The edges: a page that runs past the end, and one that starts past it.
+    peakOf("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 10 OFFSET 4995");
+    peakOf("SELECT id, bucket FROM rows ORDER BY bucket, id DESC LIMIT 10 OFFSET 6000");
+  });
+
   it("partitions high-cardinality hash aggregates and merges ordered result runs", async () => {
     const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, id) => ({ id }));
     const plan = compileQuery(

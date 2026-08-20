@@ -154,10 +154,11 @@ const QUERIES: readonly PerfQuery[] = [
     sql: "SELECT id, amount FROM data ORDER BY amount",
   },
   {
-    // A page deep enough that the bounded top-K sink retains most of what it scans. The bound
-    // buys a memory guarantee — retention stays proportional to the limit rather than the table
-    // — and past roughly a quarter of the rows it costs more time than sorting everything once.
-    // Gated so that trade stays where it was measured instead of drifting.
+    // A page deep enough that a bounded top-K sink would retain most of what it scans. The
+    // bound buys a memory guarantee — retention proportional to the limit rather than the table
+    // — but past a tenth of the rows it costs more time than sorting everything once, so the
+    // sink drops it and this shape pays a full scan and one sort. Gated so that trade stays
+    // where it was measured instead of drifting.
     name: "deep-page",
     sql: "SELECT id, amount FROM data ORDER BY region, id LIMIT 100000",
   },

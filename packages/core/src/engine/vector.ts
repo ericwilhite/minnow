@@ -43,7 +43,7 @@ import {
   type QueryMemoryUsage,
 } from "./memory.js";
 import { compareSqlStrings, defineSqlResultProperty } from "./sql-semantics.js";
-import { buildSortKeyColumn } from "./sort-keys.js";
+import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
 /** Above this, locating each IN member separately costs more than scanning between them. */
@@ -3202,21 +3202,28 @@ function appendJoinedRow(
   }
 }
 
-interface RetainedTopRow {
-  row: QueryRow;
+interface RetainedRow {
   keys: QueryValue[];
   seq: number;
-  reservation: QueryMemoryReservation;
-}
-
-interface DeferredTopRow {
-  keys: QueryValue[];
-  seq: number;
+  /** The scan row to project at finish, when projection is deferred; -1 otherwise. */
   sourceRow: number;
+  /** The projected row, kept when the scan cannot be re-read at finish. */
+  row: QueryRow | undefined;
   bytes: number;
 }
 
-const DEFERRED_SELECTION_BYTES = 2 * QUERY_REFERENCE_BYTES;
+const RETAINED_ROW_BYTES = 3 * QUERY_REFERENCE_BYTES;
+
+/**
+ * A LIMIT that keeps at least this share of the scanned rows is not a bound worth enforcing:
+ * what the bounded sink saves in memory it spends in time, and past the share it is cheaper to
+ * keep every row and sort once. Measured at 200k rows, `ORDER BY region, id` and `ORDER BY
+ * amount`, against an unbounded scan-and-sort that costs the same (30 ms and 21 ms) whatever the
+ * LIMIT: at 5% the bound wins (22 ms and 17 ms), at 10% it loses (39 ms and 31 ms), and at 50%
+ * it loses by three times (97 ms and 72 ms). The crossover sits between those two shares, so
+ * the bound stops at the upper one.
+ */
+const BOUNDED_SINK_MAX_SHARE = 0.1;
 
 /**
  * Accumulates ungrouped result rows. With ORDER BY and LIMIT the sink keeps only the best
@@ -3225,15 +3232,18 @@ const DEFERRED_SELECTION_BYTES = 2 * QUERY_REFERENCE_BYTES;
  * ties resolve by arrival order, so the retained set is precisely the slice a full stable sort
  * would have produced.
  *
- * Two bounded strategies:
- * - Deferred selection (single-source plans whose order keys resolve to select expressions and
- *   whose scan vectors outlive the scan): rows are tracked as (keys, arrival, source row) and
- *   compacted by sort once the selection buffer reaches twice the capacity; only the final
- *   survivors are projected. A losing row never allocates a result object, so even the
- *   adversarial ascending-input/descending-order case stays allocation-free per row.
- * - Eager heap (joins, wildcard selects, or windowed scans): each retained row is projected into
- *   a worst-at-root heap; a candidate that cannot beat the current worst is rejected before
- *   projection whenever the order keys are resolvable.
+ * Candidates are tracked as (keys, arrival) entries in a selection buffer that is compacted by
+ * quickselect once it reaches twice the capacity, so a retained row costs a few comparisons
+ * amortized, and a row that cannot beat the current cut line costs nothing past its keys.
+ * Whether the entry also carries the projected row depends on the scan: when the scan
+ * vectors outlive the scan and the order keys resolve to select expressions, projection waits
+ * for the survivors; a streamed scan, a join, or a wildcard select projects the candidate as it
+ * arrives, since there is nothing to read it back from later.
+ *
+ * The bound is dropped for a page that would keep most of the scan anyway: a single-source
+ * plan whose `limit + offset` reaches BOUNDED_SINK_MAX_SHARE of the scan rows keeps every row
+ * and leaves the ordering to one final sort. A join's output size is not known from its scan, so
+ * a joined plan stays bounded.
  */
 class ResultSink {
   readonly #plan: BoundPlan;
@@ -3242,10 +3252,9 @@ class ResultSink {
   readonly #keyExpressions: readonly BoundExpression[] | undefined;
   readonly #deferred: boolean;
   readonly #rows: QueryRow[] = [];
-  readonly #heap: RetainedTopRow[] = [];
-  readonly #selection: DeferredTopRow[] = [];
+  readonly #selection: RetainedRow[] = [];
   readonly #keyScratch: QueryValue[] = [];
-  #threshold: DeferredTopRow | undefined;
+  #threshold: RetainedRow | undefined;
   /** The threshold's first order key as an unboxed float, when the fast reject applies. */
   #thresholdFirst: number | null | undefined;
   readonly #fastFirstKey:
@@ -3257,8 +3266,14 @@ class ResultSink {
   constructor(plan: BoundPlan, memory: QueryMemoryContext, stableScan: boolean) {
     this.#plan = plan;
     this.#memory = memory;
-    const bounded = !plan.grouped && plan.orderBy.length > 0 && plan.limit !== undefined;
-    this.#capacity = bounded ? (plan.limit ?? 0) + (plan.offset ?? 0) : undefined;
+    const capacity = (plan.limit ?? 0) + (plan.offset ?? 0);
+    const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
+    const bounded =
+      !plan.grouped &&
+      plan.orderBy.length > 0 &&
+      plan.limit !== undefined &&
+      (plan.joins.length > 0 || capacity < scanRows * BOUNDED_SINK_MAX_SHARE);
+    this.#capacity = bounded ? capacity : undefined;
     let keyExpressions: BoundExpression[] | undefined;
     if (bounded && !plan.wildcard) {
       keyExpressions = [];
@@ -3319,7 +3334,7 @@ class ResultSink {
     for (let row = 0; row < batch.length; row += 1) {
       const threshold = this.#thresholdFirst;
       if (threshold === undefined || threshold === null) {
-        this.#addSlow(batch, row);
+        this.#addCandidate(batch, row);
         continue;
       }
       const sourceRow = rows?.[row] ?? -1;
@@ -3333,14 +3348,9 @@ class ResultSink {
           }
         }
       }
-      this.#addSlow(batch, row);
+      this.#addCandidate(batch, row);
     }
     return true;
-  }
-
-  #addSlow(batch: BatchRows, row: number): void {
-    if (this.#deferred) this.#addDeferred(batch, row);
-    else this.#addEager(batch, row);
   }
 
   add(batch: BatchRows, row: number): void {
@@ -3351,21 +3361,17 @@ class ResultSink {
       return;
     }
     if (this.#capacity === 0) return;
-    if (this.#deferred) {
-      this.#addDeferred(batch, row);
-      return;
-    }
-    this.#addEager(batch, row);
+    this.#addCandidate(batch, row);
   }
 
   /** Returns accepted rows in arrival order, ready for the shared stable sort and trim. */
   finish(): QueryRow[] {
     if (this.#capacity === undefined) return this.#rows;
-    if (!this.#deferred) {
-      return this.#heap.sort((left, right) => left.seq - right.seq).map((entry) => entry.row);
-    }
     this.#compactSelection();
     this.#selection.sort((left, right) => left.seq - right.seq);
+    if (!this.#deferred) {
+      return this.#selection.map((entry) => required(entry.row, "Retained row is missing"));
+    }
     const scanIndex = new Int32Array(1);
     const rowsBySource = [scanIndex];
     const batch: BatchRows = { length: 1, rowsBySource };
@@ -3379,7 +3385,7 @@ class ResultSink {
     return rows;
   }
 
-  #addDeferred(batch: BatchRows, row: number): void {
+  #addCandidate(batch: BatchRows, row: number): void {
     const fast = this.#fastFirstKey;
     if (fast !== undefined && this.#thresholdFirst !== undefined && this.#thresholdFirst !== null) {
       const value = rawFloat64Value(fast.vector, batch.rowsBySource[fast.source]?.[row] ?? -1);
@@ -3392,7 +3398,17 @@ class ResultSink {
         }
       }
     }
-    this.#evaluateKeys(batch, row);
+    let projected: QueryRow | undefined;
+    if (this.#keyExpressions === undefined) {
+      // The order keys are not select expressions, so the projected row is where they live.
+      projected = projectBatchRow(this.#plan, batch, row);
+      for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
+        const order = required(this.#plan.orderBy[index], "Order term is missing");
+        this.#keyScratch[index] = projected[order.outputName] ?? null;
+      }
+    } else {
+      this.#evaluateKeys(batch, row);
+    }
     const seq = this.#seq;
     this.#seq += 1;
     // The candidate arrived after every retained row, so an order-key tie keeps the retained
@@ -3403,7 +3419,10 @@ class ResultSink {
     ) {
       return;
     }
-    let bytes = DEFERRED_SELECTION_BYTES;
+    if (!this.#deferred && projected === undefined) {
+      projected = projectBatchRow(this.#plan, batch, row);
+    }
+    let bytes = RETAINED_ROW_BYTES;
     for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
       bytes = safeMemorySum(
         bytes,
@@ -3411,10 +3430,14 @@ class ResultSink {
         "Top-N selection entry",
       );
     }
+    if (projected !== undefined) {
+      bytes = safeMemorySum(bytes, queryRowPayloadBytes(projected), "Top-N selection entry");
+    }
     this.#selection.push({
       keys: this.#keyScratch.slice(0, this.#plan.orderBy.length),
       seq,
-      sourceRow: batch.rowsBySource[this.#plan.scanSource]?.[row] ?? -1,
+      sourceRow: this.#deferred ? (batch.rowsBySource[this.#plan.scanSource]?.[row] ?? -1) : -1,
+      row: projected,
       bytes,
     });
     this.#reserveSelectionBytes(bytes);
@@ -3474,7 +3497,7 @@ class ResultSink {
    */
   #selectBest(count: number): void {
     const entries = this.#selection;
-    const worse = (left: DeferredTopRow, right: DeferredTopRow): boolean => {
+    const worse = (left: RetainedRow, right: RetainedRow): boolean => {
       const comparison = this.#compareKeys(left.keys, right.keys);
       return comparison !== 0 ? comparison > 0 : left.seq > right.seq;
     };
@@ -3529,68 +3552,6 @@ class ResultSink {
     }
   }
 
-  #addEager(batch: BatchRows, row: number): void {
-    let projected: QueryRow | undefined;
-    if (this.#keyExpressions === undefined) {
-      projected = projectBatchRow(this.#plan, batch, row);
-      for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
-        const order = required(this.#plan.orderBy[index], "Order term is missing");
-        this.#keyScratch[index] = projected[order.outputName] ?? null;
-      }
-    } else {
-      this.#evaluateKeys(batch, row);
-    }
-    const seq = this.#seq;
-    this.#seq += 1;
-    const capacity = this.#capacity ?? 0;
-    if (this.#heap.length >= capacity) {
-      const worst = required(this.#heap[0], "Top-N heap root is missing");
-      // An order-key tie keeps the earlier-arriving retained row.
-      if (this.#compareKeys(this.#keyScratch, worst.keys) >= 0) return;
-      const resultRow = projected ?? projectBatchRow(this.#plan, batch, row);
-      const reservation = this.#memory.reserve(
-        this.#entryPayloadBytes(resultRow),
-        "Top-N result row",
-      );
-      worst.reservation.release();
-      this.#heap[0] = {
-        row: resultRow,
-        keys: this.#keyScratch.slice(0, this.#plan.orderBy.length),
-        seq,
-        reservation,
-      };
-      this.#siftDown(0);
-      this.#updateEagerThreshold();
-      return;
-    }
-    const resultRow = projected ?? projectBatchRow(this.#plan, batch, row);
-    const reservation = this.#memory.reserve(
-      this.#entryPayloadBytes(resultRow),
-      "Top-N result row",
-    );
-    this.#heap.push({
-      row: resultRow,
-      keys: this.#keyScratch.slice(0, this.#plan.orderBy.length),
-      seq,
-      reservation,
-    });
-    this.#siftUp(this.#heap.length - 1);
-    this.#updateEagerThreshold();
-  }
-
-  /**
-   * The eager cut line for the unboxed batch loop: once the heap is full, its root's first
-   * order key as a float. Non-numeric keys leave the threshold null, which sends every row
-   * through the full comparison.
-   */
-  #updateEagerThreshold(): void {
-    if (this.#fastFirstKey === undefined) return;
-    if (this.#heap.length < (this.#capacity ?? 0)) return;
-    const first = this.#heap[0]?.keys[0];
-    this.#thresholdFirst =
-      typeof first === "number" ? first : first instanceof Date ? first.getTime() : null;
-  }
-
   #evaluateKeys(batch: BatchRows, row: number): void {
     const expressions = required(this.#keyExpressions, "Order keys are missing");
     for (let index = 0; index < expressions.length; index += 1) {
@@ -3599,18 +3560,6 @@ class ResultSink {
         evaluateBatchExpression(this.#plan, expression, batch, row),
       );
     }
-  }
-
-  #entryPayloadBytes(row: QueryRow): number {
-    let bytes = queryRowPayloadBytes(row);
-    for (let index = 0; index < this.#plan.orderBy.length; index += 1) {
-      bytes = safeMemorySum(
-        bytes,
-        queryValuePayloadBytes(this.#keyScratch[index] ?? null),
-        "Top-N order keys",
-      );
-    }
-    return bytes;
   }
 
   #compareKeys(left: readonly QueryValue[], right: readonly QueryValue[]): number {
@@ -3623,51 +3572,6 @@ class ResultSink {
       if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
     }
     return 0;
-  }
-
-  /** Entry `left` loses to `right` when it sorts later under (keys, arrival). */
-  #isWorse(left: RetainedTopRow, right: RetainedTopRow): boolean {
-    const comparison = this.#compareKeys(left.keys, right.keys);
-    if (comparison !== 0) return comparison > 0;
-    return left.seq > right.seq;
-  }
-
-  #siftUp(index: number): void {
-    let child = index;
-    while (child > 0) {
-      const parent = (child - 1) >> 1;
-      const childEntry = required(this.#heap[child], "Heap entry is missing");
-      const parentEntry = required(this.#heap[parent], "Heap entry is missing");
-      if (!this.#isWorse(childEntry, parentEntry)) break;
-      this.#heap[child] = parentEntry;
-      this.#heap[parent] = childEntry;
-      child = parent;
-    }
-  }
-
-  #siftDown(index: number): void {
-    let parent = index;
-    for (;;) {
-      let worst = parent;
-      let worstEntry = required(this.#heap[worst], "Heap entry is missing");
-      const left = parent * 2 + 1;
-      const right = left + 1;
-      const leftEntry = this.#heap[left];
-      if (leftEntry !== undefined && this.#isWorse(leftEntry, worstEntry)) {
-        worst = left;
-        worstEntry = leftEntry;
-      }
-      const rightEntry = this.#heap[right];
-      if (rightEntry !== undefined && this.#isWorse(rightEntry, worstEntry)) {
-        worst = right;
-        worstEntry = rightEntry;
-      }
-      if (worst === parent) return;
-      const parentEntry = required(this.#heap[parent], "Heap entry is missing");
-      this.#heap[parent] = worstEntry;
-      this.#heap[worst] = parentEntry;
-      parent = worst;
-    }
   }
 }
 
@@ -5173,68 +5077,17 @@ function groupKey(value: unknown): GroupIndexKey {
 }
 
 function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
-  if (rows.length > 0xffffffff) throw new RangeError("Too many rows to order");
-  const indexes = new Uint32Array(rows.length);
-  const scratch = new Uint32Array(rows.length);
-  for (let index = 0; index < indexes.length; index += 1) indexes[index] = index;
-  let source = indexes;
-  let target = scratch;
-  // One prepared column per term, extracted once; see sort-keys.ts for why the comparison
-  // rather than the merge is what a sort costs. Direction and explicit NULL placement are
-  // resolved here, outside the comparison, because they never vary row to row.
-  const termCount = orderBy.length;
+  // One prepared column per term, extracted once; see sort-keys.ts for the kernel and for why
+  // the comparison rather than the merge is what a sort costs.
   const terms = orderBy.map((order) => ({
-    /** Signed placement for an explicit NULLS FIRST/LAST, or 0 when the default applies. */
-    nullPlacement: order.nulls === undefined ? 0 : order.nulls === "first" ? 1 : -1,
-    descending: order.direction === "desc",
-  }));
-  const columns = orderBy.map((order) =>
-    buildSortKeyColumn(
+    column: buildSortKeyColumn(
       rows.length,
       (index) => required(rows[index], "Ordering row is missing")[order.outputName],
     ),
-  );
-  const compareIndexes = (leftIndex: number, rightIndex: number): number => {
-    for (let term = 0; term < termCount; term += 1) {
-      const column = required(columns[term], "Order keys are missing");
-      const { nullPlacement, descending } = required(terms[term], "Order term is missing");
-      if (nullPlacement !== 0) {
-        // An explicit placement is absolute: direction must not negate it.
-        const leftNull = column.isNull(leftIndex);
-        const rightNull = column.isNull(rightIndex);
-        if (leftNull || rightNull) {
-          if (leftNull && rightNull) continue;
-          return (leftNull ? -1 : 1) * nullPlacement;
-        }
-      }
-      const comparison = column.compare(leftIndex, rightIndex);
-      if (comparison !== 0) return descending ? -comparison : comparison;
-    }
-    return 0;
-  };
-  for (let width = 1; width < rows.length; width *= 2) {
-    for (let start = 0; start < rows.length; start += width * 2) {
-      const middle = Math.min(start + width, rows.length);
-      const end = Math.min(start + width * 2, rows.length);
-      let left = start;
-      let right = middle;
-      for (let output = start; output < end; output += 1) {
-        if (
-          right >= end ||
-          (left < middle && compareIndexes(source[left] ?? 0, source[right] ?? 0) <= 0)
-        ) {
-          target[output] = source[left] ?? 0;
-          left += 1;
-        } else {
-          target[output] = source[right] ?? 0;
-          right += 1;
-        }
-      }
-    }
-    [source, target] = [target, source];
-  }
-  if (source !== indexes) indexes.set(source);
-
+    descending: order.direction === "desc",
+    nulls: order.nulls,
+  }));
+  const indexes = sortKeyIndexes(rows.length, terms);
   const visited = new Uint8Array(rows.length);
   for (let start = 0; start < rows.length; start += 1) {
     if (visited[start] === 1) continue;

@@ -37,7 +37,13 @@ executed once per outer row. The two correlated forms that cannot be rewritten t
 rejected rather than run row-by-row — see the
 [feature matrix](/docs/sql/feature-matrix).
 
-**Top-N.** `ORDER BY … LIMIT n` keeps a bounded heap instead of sorting the whole input.
+**Top-N.** `ORDER BY … LIMIT n` keeps only the best `n` rows as it scans instead of sorting the
+whole input, while `n` is under a tenth of the rows scanned. A page deeper than that keeps every
+row and sorts once, which is faster than maintaining the bound.
+
+**Sorting.** Numbers, datetimes, booleans, and strings sort as typed keys, not by comparing
+values: strings are ranked through their distinct set first. Input that already arrives in order
+is recognized and not sorted again.
 
 ## Execution
 

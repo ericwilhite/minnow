@@ -12,7 +12,7 @@ import {
   type FtsStats,
 } from "./fts.js";
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
-import { buildSortKeyColumn } from "./sort-keys.js";
+import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 import { stringArgument } from "./sql-semantics.js";
 import { jsonAtPath, jsonConstructor, jsonIsValid, parseJsonPath } from "./sql-json.js";
 import { optimizePlan } from "./optimizer.js";
@@ -2917,7 +2917,7 @@ function aggregateWindowMembers(
  */
 function applyAggregateWindow(
   rows: QueryRow[],
-  indexes: readonly number[],
+  indexes: Uint32Array,
   window: WindowSpec,
   samePartition: (left: number, right: number) => boolean,
   sameOrderKeys: (left: number, right: number) => boolean,
@@ -2941,7 +2941,7 @@ function applyAggregateWindow(
 
 function applyAggregateWindowPartition(
   rows: QueryRow[],
-  indexes: readonly number[],
+  indexes: Uint32Array,
   window: WindowSpec,
   frame: WindowFrame,
   sameOrderKeys: (left: number, right: number) => boolean,
@@ -3108,7 +3108,7 @@ function applyAggregateWindowPartition(
  */
 function applyDistributionWindow(
   rows: QueryRow[],
-  indexes: readonly number[],
+  indexes: Uint32Array,
   window: WindowSpec,
   samePartition: (left: number, right: number) => boolean,
   sameOrderKeys: (left: number, right: number) => boolean,
@@ -3159,7 +3159,7 @@ function applyDistributionWindow(
 /** Computes LAG/LEAD over partition-sorted row indexes: the argument value offset rows away. */
 function applyOffsetWindow(
   rows: QueryRow[],
-  indexes: readonly number[],
+  indexes: Uint32Array,
   window: WindowSpec,
   samePartition: (left: number, right: number) => boolean,
 ): void {
@@ -3220,7 +3220,6 @@ export function applyWindowFunctions(
 ): QueryResult {
   const rows = result.rows.map((row) => ({ ...row }));
   for (const window of windows) {
-    const indexes = rows.map((_, index) => index);
     // Decorate before sorting: `comparable` was being re-run inside the comparator, so every
     // key was converted O(n log n) times per alias instead of once per row. Precomputing the
     // comparable value per row per alias makes the comparator pure array reads, and the
@@ -3241,34 +3240,15 @@ export function applyWindowFunctions(
     const orderColumns = orderKeys.map((keys) =>
       buildSortKeyColumn(keys.length, (index) => keys[index]),
     );
-    const orderTerms = window.orderAliases.map((term) => ({
-      nullPlacement: term.nulls === undefined ? 0 : term.nulls === "first" ? 1 : -1,
-      descending: term.direction === "desc",
-    }));
-    const compare = (left: number, right: number): number => {
-      for (const column of partitionColumns) {
-        const comparison = column.compare(left, right);
-        if (comparison !== 0) return comparison;
-      }
-      for (let index = 0; index < orderColumns.length; index += 1) {
-        const column = orderColumns[index];
-        const term = orderTerms[index];
-        if (column === undefined || term === undefined) continue;
-        if (term.nullPlacement !== 0) {
-          const leftNull = column.isNull(left);
-          const rightNull = column.isNull(right);
-          if (leftNull || rightNull) {
-            if (leftNull && rightNull) continue;
-            return (leftNull ? -1 : 1) * term.nullPlacement;
-          }
-        }
-        const comparison = column.compare(left, right);
-        if (comparison !== 0) return term.descending ? -comparison : comparison;
-      }
-      // Arrival order breaks the remaining ties, which is what makes the walk deterministic.
-      return left - right;
-    };
-    indexes.sort(compare);
+    // The sort is stable, so arrival order breaks the remaining ties, which is what makes the
+    // walk deterministic.
+    const indexes = sortKeyIndexes(rows.length, [
+      ...partitionColumns.map((column) => ({ column, descending: false, nulls: undefined })),
+      ...orderColumns.map((column, index) => {
+        const term = window.orderAliases[index];
+        return { column, descending: term?.direction === "desc", nulls: term?.nulls };
+      }),
+    ]);
     const samePartition = (left: number, right: number): boolean => {
       for (const column of partitionColumns) {
         if (column.compare(left, right) !== 0) return false;
