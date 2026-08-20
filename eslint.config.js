@@ -12,6 +12,8 @@ export default tseslint.config(
       "**/.next/**",
       "**/out/**",
       "**/.source/**",
+      // Agent worktrees the Claude Code harness checks out inside the repository.
+      ".claude/worktrees/**",
       // Third-party engine builds, copied in verbatim by scripts/vendor-engines.mjs.
       "apps/site/public/vendor/**",
     ],
