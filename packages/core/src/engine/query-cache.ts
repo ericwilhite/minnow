@@ -9,18 +9,22 @@ export function queryResultMemoKey(sql: string, params: readonly unknown[]): str
   return JSON.stringify([sql, params.map(encodeParameter)]);
 }
 
-/** Defensive copy because callers own query results and may mutate both rows and Dates. */
+/**
+ * Defensive copy because callers own query results and may mutate both rows and Dates. Object
+ * spread copies own enumerable properties with define semantics, so a column named `__proto__`
+ * stays an own property; only a Date cell needs the explicit define, and only because its
+ * value is replaced. This used to define every cell, which made a memo hit on a result of a
+ * few thousand rows cost more than re-executing the query.
+ */
 export function copyQueryResult(result: QueryResult): QueryResult {
+  const columns = result.columns;
   return {
-    columns: [...result.columns],
+    columns: [...columns],
     rows: result.rows.map((row) => {
-      const copy: QueryRow = {};
-      for (const [name, value] of Object.entries(row)) {
-        defineSqlResultProperty(
-          copy,
-          name,
-          value instanceof Date ? new Date(value.getTime()) : value,
-        );
+      const copy: QueryRow = { ...row };
+      for (const name of columns) {
+        const value = copy[name];
+        if (value instanceof Date) defineSqlResultProperty(copy, name, new Date(value.getTime()));
       }
       return copy;
     }),
