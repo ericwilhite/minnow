@@ -141,6 +141,32 @@ row or a compactor that stops folding actually shows up:
   outcome is explicable: every visible row was written by some tab, acknowledged writes are
   present, no key appears twice, the write the store acknowledged _last_ is the one visible, and
   every tab sees the same database afterwards.
+- `auto-compaction-soak.test.ts` is the same kind of history with the background maintenance
+  left on, as it ships: 1,800 seeded mutations and reads while folds and collection passes land
+  underneath them, the table checked against the reference at every checkpoint, then settled and
+  held to convergence bounds — a scan reads at most the anchor and the deltas under the fold
+  threshold, and the store holds the data rather than the history.
+
+## Background maintenance, size, and memory
+
+`auto-maintenance.test.ts` pins what `autoCompact` and `autoCollect` guarantee, as bounds rather
+than timings: a burst of writes folds back down and, a quiet minute later, collects to a store no
+bigger than twice the data; repeated bursts settle to the same place instead of each leaving a
+residue; versions from a moment ago stay readable and old ones are pruned; the switches off do
+nothing; the buffer pool stays inside its budget under many distinct queries.
+
+The heap itself is checked by the memory soak, which the unit suites cannot do honestly:
+
+```bash
+npm run soak:memory                     # node --expose-gc; four workloads, eight rounds each
+npm run soak:memory -- --rounds 12 --workload writes
+```
+
+Each workload — queries, writes with background maintenance, live query sets opened and closed,
+databases opened and closed over one store — runs in rounds with a forced collection and a heap
+reading after each. The assertion is a plateau: the last rounds may not sit more than a bounded
+margin above the early ones. The database runs with a small buffer pool so the pool fills during
+the warm-up rounds, which are excluded; a climb that continues past a full pool is a leak.
 
 ## Concurrent writes
 
@@ -211,6 +237,16 @@ and the page that drives them in `apps/site/app/benchmarks`.
 To iterate on the harness, run the unit tests (`npm test`) for the generator, oracles, and suite
 contracts, then `npm run test:browser:site` to run a suite in real browsers. To try a change by
 hand, `npm run site:dev` and open `/benchmarks`.
+
+## The settled history
+
+Most gate shapes read a table as it was loaded. The `settled-*` shapes read it as it is after a
+day of use: the same rows with a thousand point updates applied and the background maintenance
+allowed to finish, timed against SQLite and PGlite with the same updates. Their costs do not move
+with history, so the ratio is the engine's own cost of having been written to — a read that
+slows down as a table is used, or maintenance that stops keeping up, moves one of these numbers.
+`settle-after-updates` times the updates and the settle itself, once, so a fold or a collection
+pass that grows expensive shows up too.
 
 ## Update the performance-gate baseline
 
