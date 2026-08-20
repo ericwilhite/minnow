@@ -263,6 +263,27 @@ benchmarkTest(
   async ({ page }) => {
     await page.goto("/benchmarks/");
 
+    // Some WebKit builds (notably Playwright's Linux port) expose no OPFS inside dedicated
+    // workers, persistent context or not; this run asserts the OPFS column's success, so probe
+    // from a real worker and skip honestly where the API does not exist.
+    const opfsInWorkers = await page.evaluate(
+      () =>
+        new Promise<boolean>((resolve) => {
+          const code = "self.postMessage(typeof navigator?.storage?.getDirectory === 'function');";
+          const worker = new Worker(
+            URL.createObjectURL(new Blob([code], { type: "text/javascript" })),
+          );
+          worker.addEventListener("message", (event) => {
+            resolve(event.data === true);
+            worker.terminate();
+          });
+          setTimeout(() => {
+            resolve(false);
+          }, 5_000);
+        }),
+    );
+    benchmarkTest.skip(!opfsInWorkers, "this WebKit build exposes no OPFS in workers");
+
     // Both Minnow stores at the smallest scale: enough to prove the whole chain — including the
     // OPFS column's own materialized copy — without asking a test runner to download two
     // WebAssembly builds. Reads alone, so the assertions below name one section's tables rather
