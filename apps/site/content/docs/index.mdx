@@ -4,7 +4,7 @@ description: A columnar SQL engine that runs entirely in the browser.
 ---
 
 Minnow is a SQL database that runs in the browser. You give it SQL; it parses, plans, optimizes,
-and executes that SQL against columnar data stored in IndexedDB. There is no server, no
+and executes that SQL against columnar data stored in IndexedDB or OPFS. There is no server, no
 WebAssembly module to download and compile, and no build step.
 
 ```ts
@@ -48,8 +48,10 @@ in this repository — there is no SQLite or DuckDB underneath, and no WebAssemb
   and live queries.
 - **[Engine](/docs/engine)** — the `MinnowDatabase` API, transactions and snapshots, running the
   engine in a worker, and the memory budget.
-- **[Storage](/docs/storage)** — the block store contract and the two adapters that implement it,
+- **[Storage](/docs/storage)** — the block store contract and the three adapters that implement it,
   plus snapshots and background maintenance.
+- **[Comparison](/docs/comparison)** — Minnow against IndexedDB, Dexie, SQLite Wasm, PGlite, and
+  DuckDB-Wasm, including where each of them is the better answer.
 
 ## What it is for
 
@@ -65,8 +67,9 @@ browser's storage quota, with one writer's worth of throughput.
 
 Four rules are fixed. The reasoning is in [Architecture](/docs/reference/architecture).
 
-- **IndexedDB is the source of truth.** Correctness never depends on `BroadcastChannel`, Web
-  Locks, or page-close handlers. Durability ends at a committed IndexedDB transaction.
+- **The durable store is the source of truth.** Correctness never depends on `BroadcastChannel`,
+  Web Locks, or page-close handlers. Durability ends at a committed storage write — an IndexedDB
+  transaction, or a checksummed OPFS log entry.
 - **Published data is immutable.** Writes append and publish atomically; another tab sees the old
   version or the new one, never a partial write.
 - **Reads are snapshot reads.** A query executes against one version. Reads never block writes and

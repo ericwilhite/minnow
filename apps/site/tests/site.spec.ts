@@ -1,9 +1,30 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, webkit, type Page } from "@playwright/test";
 
 /**
  * The site's claims are all things that either happen in the visitor's browser or do not happen
  * at all, so these tests exercise them rather than checking that the words are on the page.
  */
+
+/**
+ * Playwright's default ephemeral context is private-browsing storage, and Safari's private
+ * browsing has no OPFS — so the one test that materializes an OPFS dataset gives WebKit a
+ * persistent context, the storage a real Safari visitor has. (On real private browsing the
+ * page still runs; the OPFS column reports its failure and the other columns proceed.)
+ */
+const benchmarkTest = test.extend<{ page: Page }>({
+  page: async ({ browserName, page }, use, testInfo) => {
+    if (browserName !== "webkit") {
+      await use(page);
+      return;
+    }
+    const context = await webkit.launchPersistentContext(testInfo.outputPath("webkit-profile"), {
+      baseURL: testInfo.project.use.baseURL ?? "",
+    });
+    const persistentPage = await context.newPage();
+    await use(persistentPage);
+    await context.close();
+  },
+});
 
 test("the home page builds a database in the browser and answers a query", async ({ page }) => {
   await page.goto("/");
@@ -237,44 +258,68 @@ test("the docs navigation covers every section", async ({ page }) => {
   }
 });
 
-test("the benchmarks page runs a suite in the browser and verifies it", async ({ page }) => {
-  await page.goto("/benchmarks/");
+benchmarkTest(
+  "the benchmarks page runs a suite in the browser and verifies it",
+  async ({ page }) => {
+    await page.goto("/benchmarks/");
 
-  // Minnow alone at the smallest scale: enough to prove the whole chain without asking a test
-  // runner to download two WebAssembly builds. Reads alone, so the assertions below name one
-  // section's tables rather than matching the write suite's too.
-  await page.getByRole("checkbox", { name: /SQLite/ }).uncheck();
-  await page.getByRole("checkbox", { name: /Writes/ }).uncheck();
-  await page.getByRole("button", { name: "0.1×" }).click();
-  await page.getByRole("button", { name: "Run", exact: true }).click();
+    // Both Minnow stores at the smallest scale: enough to prove the whole chain — including the
+    // OPFS column's own materialized copy — without asking a test runner to download two
+    // WebAssembly builds. Reads alone, so the assertions below name one section's tables rather
+    // than matching the write suite's too.
+    await page.getByRole("checkbox", { name: /SQLite/ }).uncheck();
+    await page.getByRole("checkbox", { name: /Minnow \(OPFS\)/ }).check();
+    await page.getByRole("checkbox", { name: /Minnow \(OPFS, cached\)/ }).check();
+    await page.getByRole("checkbox", { name: /Writes/ }).uncheck();
+    await page.getByRole("button", { name: "0.1×" }).click();
+    await page.getByRole("button", { name: "Run", exact: true }).click();
 
-  const failure = page.locator(".text-red-500");
-  await expect
-    .poll(
-      async () =>
-        (await page.getByRole("heading", { name: "Reads" }).count()) > 0
-          ? "done"
-          : (await failure.count()) > 0
-            ? await failure.innerText()
-            : "running",
-      { timeout: 240_000, intervals: [2_000] },
-    )
-    .toBe("done");
-  await expect(page.getByText("agreed with the independent oracle")).toBeVisible();
-  // OLTP and OLAP stay split; a blended score would hide the trade-off.
-  await expect(page.getByRole("heading", { name: "OLTP" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "OLAP" })).toBeVisible();
+    const failure = page.locator(".text-red-500");
+    await expect
+      .poll(
+        async () =>
+          (await page.getByRole("heading", { name: "Reads" }).count()) > 0
+            ? "done"
+            : (await failure.count()) > 0
+              ? await failure.innerText()
+              : "running",
+        { timeout: 240_000, intervals: [2_000] },
+      )
+      .toBe("done");
+    await expect(page.getByText("agreed with the independent oracle")).toBeVisible();
+    // OLTP and OLAP stay split; a blended score would hide the trade-off.
+    await expect(page.getByRole("heading", { name: "OLTP" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "OLAP" })).toBeVisible();
 
-  // Timings are measured by the batch, so a lookup faster than the clock's tick reports its own
-  // cost. Before that, every sub-millisecond case on this page read as a multiple of 0.1 ms.
-  const oltpValues = await page.locator("table").first().locator("td.tabular-nums").allInnerTexts();
-  expect(oltpValues.length).toBeGreaterThan(3);
-  expect(oltpValues.every((value) => /^0\.00 ms$|^0\.\d0 ms$/.test(value))).toBe(false);
+    // Timings are measured by the batch, so a lookup faster than the clock's tick reports its own
+    // cost. Before that, every sub-millisecond case on this page read as a multiple of 0.1 ms.
+    const oltpValues = await page
+      .locator("table")
+      .first()
+      .locator("td.tabular-nums")
+      .allInnerTexts();
+    expect(oltpValues.length).toBeGreaterThan(3);
+    expect(oltpValues.every((value) => /^0\.00 ms$|^0\.\d0 ms$/.test(value))).toBe(false);
 
-  // Storage is reported per engine from each engine's own accounting.
-  await expect(page.getByRole("heading", { name: "Storage" })).toBeVisible();
-  await expect(page.getByText("as each engine stored them just now")).toBeVisible();
-});
+    // The OPFS store reports the memoized repeat like the IndexedDB one, so its cached column
+    // (the last of the four Minnow columns here) renders real timings rather than dashes.
+    await expect(
+      page.getByRole("columnheader", { name: "Minnow (OPFS, cached)" }).first(),
+    ).toBeVisible();
+    const cachedOpfsCells = await page
+      .locator("table")
+      .first()
+      .locator("tbody tr td:nth-child(5)")
+      .allInnerTexts();
+    expect(cachedOpfsCells.some((value) => /ms|µs/.test(value))).toBe(true);
+
+    // Storage is reported per engine from each engine's own accounting — including the OPFS
+    // column's own sentence, which proves that copy really materialized through its own store.
+    await expect(page.getByRole("heading", { name: "Storage" })).toBeVisible();
+    await expect(page.getByText("as each engine stored them just now")).toBeVisible();
+    await expect(page.getByText("OPFS · immutable compressed column blocks")).toBeVisible();
+  },
+);
 
 test("the benchmarks route is cross-origin isolated", async ({ page }) => {
   await page.goto("/benchmarks/");

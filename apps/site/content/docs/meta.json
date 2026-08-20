@@ -2,6 +2,7 @@
   "title": "Documentation",
   "pages": [
     "index",
+    "comparison",
     "installation",
     "first-query",
     "sql",

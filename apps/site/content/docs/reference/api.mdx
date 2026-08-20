@@ -6,17 +6,18 @@ description: Every public export of @minnowdb/core and @minnowdb/client, by entr
 Everything ships in one package, `@minnowdb/core`. The root export is the everyday surface; the
 subpaths expose the layers it's built from.
 
-| Entry point                              | Contents                                                    |
-| ---------------------------------------- | ----------------------------------------------------------- |
-| `@minnowdb/core`                         | Schema DSL, typed facade and builders, engine, live queries |
-| `@minnowdb/core/client`                  | Main-thread worker client                                   |
-| `@minnowdb/core/worker`                  | Ready-made worker entry (side-effect import)                |
-| `@minnowdb/core/storage`                 | Block stores: IndexedDB, in-memory, the storage interface   |
-| `@minnowdb/core/transactions`            | Snapshots, transactions, recovery (lower level)             |
-| `@minnowdb/core/block-format`            | Binary block containers and codecs (lower level)            |
-| `@minnowdb/core/worker-protocol`         | Versioned RPC frames (lower level)                          |
-| `@minnowdb/core/testing`                 | Deterministic fault injection                               |
-| `@minnowdb/core/sql-feature-matrix.json` | The checked-in SQL conformance matrix                       |
+| Entry point                              | Contents                                                        |
+| ---------------------------------------- | --------------------------------------------------------------- |
+| `@minnowdb/core`                         | Schema DSL, typed facade and builders, engine, live queries     |
+| `@minnowdb/core/client`                  | Main-thread worker client                                       |
+| `@minnowdb/core/worker`                  | Ready-made worker entry (side-effect import)                    |
+| `@minnowdb/core/storage`                 | Block stores: IndexedDB, OPFS, in-memory, the storage interface |
+| `@minnowdb/core/storage/toolkit`         | Building blocks for writing storage adapters                    |
+| `@minnowdb/core/transactions`            | Snapshots, transactions, recovery (lower level)                 |
+| `@minnowdb/core/block-format`            | Binary block containers and codecs (lower level)                |
+| `@minnowdb/core/worker-protocol`         | Versioned RPC frames (lower level)                              |
+| `@minnowdb/core/testing`                 | Fault injection and the block-store conformance kit             |
+| `@minnowdb/core/sql-feature-matrix.json` | The checked-in SQL conformance matrix                           |
 
 ---
 
@@ -195,13 +196,13 @@ All are rehydrated across the worker channel — `instanceof` works on the clien
 
 From `@minnowdb/core`. See [Workers & multi-tab](/docs/engine/workers).
 
-| Export                                                          | Description                                                                                           |
-| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `exposeDatabase(database, scope, options?)`                     | Serves the full client protocol for a database you constructed — the custom-entry hook.               |
-| `attachDatabaseWorker(scope)`                                   | What the stock `@minnowdb/core/worker` entry calls: builds the database from the client's init frame. |
-| `StoreDescriptor`                                               | `{ kind: "indexeddb", name, … } \| { kind: "memory" }` — the cloneable store config.                  |
-| `WireDatabaseOptions, DatabaseInitPayload`                      | The cloneable subset of `MinnowDatabaseOptions` and the init frame shape.                             |
-| `serializeSchema / deserializeSchema / serializeMigrationSteps` | Schema DSL ⇄ wire form (used automatically by `client.migrate`).                                      |
+| Export                                                          | Description                                                                                                       |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `exposeDatabase(database, scope, options?)`                     | Serves the full client protocol for a database you constructed — the custom-entry hook.                           |
+| `attachDatabaseWorker(scope)`                                   | What the stock `@minnowdb/core/worker` entry calls: builds the database from the client's init frame.             |
+| `StoreDescriptor`                                               | `{ kind: "indexeddb", name, … } \| { kind: "opfs", name, … } \| { kind: "memory" }` — the cloneable store config. |
+| `WireDatabaseOptions, DatabaseInitPayload`                      | The cloneable subset of `MinnowDatabaseOptions` and the init frame shape.                                         |
+| `serializeSchema / deserializeSchema / serializeMigrationSteps` | Schema DSL ⇄ wire form (used automatically by `client.migrate`).                                                  |
 
 ## `@minnowdb/core/client`
 
@@ -241,17 +242,36 @@ The optional typed query builder. Installed separately: `npm install @minnowdb/c
 
 ## `@minnowdb/core/storage`
 
-| Export                                                                               | Description                                                                                           |
-| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `class IndexedDbBlockStore`                                                          | The production store. `IndexedDbBlockStore.open({ name, durability?, … })`; `close()`.                |
-| `class MemoryBlockStore`                                                             | Same interface, in memory — the unit-test store.                                                      |
-| `BlockStore`                                                                         | The storage interface both implement (blocks, manifests, tables, segments, leases, jobs, temp pages). |
-| `Manifest, TableRecord, TableColumnRecord, SegmentRecord, RowIdSpan, LeaseRecord, …` | The persistent record types.                                                                          |
-| `WriteConflictError, TableRecordConflictError`                                       | Storage-level conflicts surfaced through the engine.                                                  |
-| `SimpleDataType, simpleDataTypes`                                                    | The four logical types as a value and union.                                                          |
+| Export                                                                               | Description                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class IndexedDbBlockStore`                                                          | The IndexedDB store. `IndexedDbBlockStore.open({ name, durability?, … })`; `close()`.                                                                                                                                                               |
+| `class OpfsBlockStore`                                                               | The OPFS store, worker-only. `OpfsBlockStore.open({ name, durability?, … })`; `close()`.                                                                                                                                                            |
+| `deleteOpfsDatabase({ name })`                                                       | Removes an OPFS database's directory entirely.                                                                                                                                                                                                      |
+| `class MemoryBlockStore`                                                             | Same interface, in memory — the unit-test store.                                                                                                                                                                                                    |
+| `class OpfsTree`                                                                     | The OPFS adapter's file helper: cached directory handles, whole-file reads and writes, and the retry and locked-file semantics three browsers disagree on. Satisfies the toolkit's `ExtentFiles`.                                                   |
+| `BlockStore`                                                                         | The full storage contract all three implement; composed of `BlockPayloadStore`, `CatalogStore`, `TransactionStore`, `LeaseStore`, `MaintenanceStore`, `FtsIndexStore`, and `TempSpillStore`. See [Writing a storage adapter](/docs/storage/custom). |
+| `Manifest, TableRecord, TableColumnRecord, SegmentRecord, RowIdSpan, LeaseRecord, …` | The persistent record types.                                                                                                                                                                                                                        |
+| `WriteConflictError, TableRecordConflictError`                                       | Storage-level conflicts surfaced through the engine.                                                                                                                                                                                                |
+| `SimpleDataType, simpleDataTypes`                                                    | The four logical types as a value and union.                                                                                                                                                                                                        |
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
 tooling but are storage internals — the version-zero format carries no compatibility promise.
+
+## `@minnowdb/core/storage/toolkit`
+
+The [adapter toolkit](/docs/storage/custom#the-adapter-toolkit): the building blocks the memory
+and OPFS adapters are assembled from, published for writing new adapters. Deliberately separate
+from the contract — the engine never references it, and no adapter is required to use it.
+
+| Export                                                                                              | Description                                                                                                                                                                                |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `class RecordCore`                                                                                  | The synchronous record-state machine: the contract's record semantics as one method per operation, with `dump()`/`load()` for checkpoints and the `PhysicalBlocks` seam for byte presence. |
+| `class WalWriter` / `replayWalFrames(handle)`                                                       | Checksummed write-ahead-log frames over a held `SyncFileHandle`; replay stops at the first torn frame.                                                                                     |
+| `class ExtentPool`                                                                                  | Packed append-only extent files for bulk bytes, addressed by `Placement`; sealing, live-byte accounting, and a read-handle cache. Opens files through `ExtentFiles`.                       |
+| `encodeRecordJson` / `decodeRecordJson`                                                             | JSON with bigints (`{"$n":"…"}`) — the codec frames and checkpoints use.                                                                                                                   |
+| `encodeSyncCheckpoint` / `decodeSyncCheckpoint`, `encodeChunk` / `decodeChunk`                      | Checksummed, versioned envelopes for checkpoint payloads and immutable artifact chunks; torn bytes decode as "not written".                                                                |
+| `SyncFileHandle`                                                                                    | The substrate seam: positioned synchronous read/write/truncate/flush/close. `FileSystemSyncAccessHandle` satisfies it structurally.                                                        |
+| `RecordCoreState`, `PhysicalBlocks`, `ExtentFiles`, `ExtentMeta`, `Placement`, `LOG_FORMAT_VERSION` | Supporting types and the on-disk envelope version.                                                                                                                                         |
 
 ## `@minnowdb/core/transactions`
 
@@ -281,11 +301,13 @@ worker never dispatches arbitrary property access.
 
 ## `@minnowdb/core/testing`
 
-| Export                           | Description                                                                                                                                                                                       |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class FaultInjectingBlockStore` | Wraps any `BlockStore`; `new FaultInjectingBlockStore(inner, inject)` calls `inject(point)` around storage operations.                                                                            |
-| `faultPoints, FaultPoint`        | The named points: `beforeBlockWrite`, `afterBlockWrite`, `beforeBlockRead`, `afterBlockRead`, `beforeManifestCommit`, `afterManifestCommit`, `beforeTransactionCommit`, `afterTransactionCommit`. |
-| `FaultInjector`                  | `(point: FaultPoint) => void \| Promise<void>` — throw to simulate the crash.                                                                                                                     |
+| Export                                                              | Description                                                                                                                                                                                       |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class FaultInjectingBlockStore`                                    | Wraps any `BlockStore`; `new FaultInjectingBlockStore(inner, inject)` calls `inject(point)` around storage operations.                                                                            |
+| `blockStoreConformanceCases()` / `runBlockStoreConformance(target)` | The [storage-contract conformance kit](/docs/storage/custom#the-conformance-kit): framework-agnostic cases any `BlockStore` implementation must pass.                                             |
+| `faultPoints, FaultPoint`                                           | The named points: `beforeBlockWrite`, `afterBlockWrite`, `beforeBlockRead`, `afterBlockRead`, `beforeManifestCommit`, `afterManifestCommit`, `beforeTransactionCommit`, `afterTransactionCommit`. |
+| `FaultInjector`                                                     | `(point: FaultPoint) => void \| Promise<void>` — throw to simulate the crash.                                                                                                                     |
+| `class MemoryOpfs`                                                  | An in-memory origin-private file system for Node tests: exclusive sync-access locks with real `DOMException` identities, plus `setWriteFault` for quota and crash injection.                      |
 
 ## `@minnowdb/core/sql-feature-matrix.json`
 

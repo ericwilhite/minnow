@@ -25,8 +25,10 @@ import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import { MinnowDatabase } from "../engine/database.js";
 import { FaultInjectingBlockStore } from "../testing/index.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MemoryBlockStore } from "./memory.js";
+import { OpfsBlockStore } from "./opfs/index.js";
 import type { BlockStore } from "./types.js";
 
 /**
@@ -77,6 +79,10 @@ const stores: Array<{ name: string; create: () => Promise<BlockStore> }> = [
     name: "indexeddb",
     create: () =>
       IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
+  },
+  {
+    name: "opfs",
+    create: () => OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
   },
 ];
 
@@ -196,5 +202,56 @@ describe.each(stores)("running out of storage quota ($name)", ({ create }) => {
       (_, index) => index % 4 !== 1,
     );
     expect(survivors.map((row) => row.id)).toEqual(expected);
+  });
+});
+
+/**
+ * The wrapper-level injection above cannot reach the OPFS store's write-ahead log: a quota
+ * failure on the WAL append lands after the in-memory record state has advanced, and the
+ * leader must reload from its own handles instead of acknowledging state the disk never got.
+ * This pins that path — the four quota clauses, with the failure at the exact byte boundary.
+ */
+describe("running out of storage quota on the OPFS write-ahead log", () => {
+  it("discards unacknowledged state and recovers without a reopen", async () => {
+    const shim = new MemoryOpfs();
+    const store = await OpfsBlockStore.open({ name: "quota", root: shim.root });
+    const database = new MinnowDatabase(store, { rowsPerBlock: 16, autoCompact: false });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "region", type: "string" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    await database.insertBatch("items", ROWS);
+
+    shim.setWriteFault((path) => {
+      if (path.endsWith("/wal")) throw quotaExceeded();
+    });
+    const error = await database
+      .insertBatch("items", [{ id: 5_000, region: "north", amount: 1 }])
+      .then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+    expect(error, "the write should have failed").toBeDefined();
+    expect(error).toBeInstanceOf(DOMException);
+    expect((error as DOMException).name).toBe("QuotaExceededError");
+
+    shim.setWriteFault(null);
+    // Nothing from the refused write is visible, everything before it still is...
+    expect(
+      (await database.query("SELECT id FROM items WHERE id = 5000", { memoize: false })).rows,
+    ).toEqual([]);
+    expect(
+      (await database.query("SELECT COUNT(*) AS n FROM items", { memoize: false })).rows,
+    ).toEqual([{ n: ROWS.length }]);
+    // ...and the same write succeeds once space frees, with no reopen and no repair step.
+    await database.insertBatch("items", [{ id: 5_000, region: "north", amount: 1 }]);
+    expect(
+      (await database.query("SELECT id FROM items WHERE id = 5000", { memoize: false })).rows,
+    ).toEqual([{ id: 5_000 }]);
   });
 });

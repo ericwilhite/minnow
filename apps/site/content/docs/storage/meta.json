@@ -1,4 +1,4 @@
 {
   "title": "Storage",
-  "pages": ["index", "indexeddb", "memory", "snapshots", "maintenance"]
+  "pages": ["index", "indexeddb", "opfs", "memory", "snapshots", "maintenance", "custom"]
 }

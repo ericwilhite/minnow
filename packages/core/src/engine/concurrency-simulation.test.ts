@@ -38,7 +38,13 @@
  */
 import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
-import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import {
+  IndexedDbBlockStore,
+  MemoryBlockStore,
+  OpfsBlockStore,
+  type BlockStore,
+} from "../storage/index.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
 import { seedsFor } from "../testing/seeds.js";
 
@@ -154,6 +160,11 @@ async function simulate(
 
 const stores: Array<{ name: string; create: () => Promise<BlockStore> }> = [
   { name: "memory", create: async () => new MemoryBlockStore() },
+  {
+    name: "opfs",
+    create: async () =>
+      OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
+  },
   {
     name: "indexeddb",
     create: () =>

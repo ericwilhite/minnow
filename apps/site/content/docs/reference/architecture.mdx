@@ -6,7 +6,7 @@ description: How Minnow works and why it's built this way.
 Minnow is built for how browsers actually behave: tabs close without warning, storage is slow, and
 the same app may be open in five tabs at once. Everything below follows from that.
 
-The short version: data lives in compressed columnar blocks inside IndexedDB, reads see consistent
+The short version: data lives in compressed columnar blocks inside IndexedDB or OPFS, reads see consistent
 snapshots (MVCC), and queries run through a vectorized executor. The full design document is
 `ARCHITECTURE.md` in the repository. This page covers the choices and the reasons.
 
@@ -14,10 +14,11 @@ snapshots (MVCC), and queries run through a vectorized executor. The full design
 
 These are fixed. Everything else is built around them.
 
-- **IndexedDB is the source of truth.** BroadcastChannel, Web Locks, and page lifecycle events can
-  all fail silently. Minnow uses them to speed things up, never for correctness. Correct behavior
-  always rests on a committed IndexedDB transaction.
-- **Durability ends at a committed transaction.** A committed write is safe. A write still in
+- **The durable store is the source of truth.** BroadcastChannel, Web Locks, and page lifecycle
+  events can all fail silently. Minnow uses them to speed things up, never for correctness.
+  Correct behavior always rests on a committed storage write — an IndexedDB transaction, or a
+  checksummed entry in the OPFS store's command log.
+- **Durability ends at a committed write.** A committed write is safe. A write still in
   flight when the tab closes is not. Minnow flushes early when the page hides, but treats that as
   a bonus, not a guarantee.
 - **Where the engine runs is your choice.** Put it in a worker and hold an async proxy in the
@@ -33,12 +34,12 @@ These are fixed. Everything else is built around them.
 
 ## Why columns, why immutable
 
-IndexedDB charges a lot per operation and little per byte. So Minnow stores a few large values
-instead of many small ones:
+Browser storage charges a lot per operation and little per byte — IndexedDB per transaction,
+OPFS per file open. So Minnow stores a few large values instead of many small ones:
 
 - Data is packed into **compressed columnar blocks** — one column for a group of rows, roughly a
   megabyte before compression.
-- No row is ever its own IndexedDB entry, and no table is one giant entry.
+- No row is ever its own storage entry, and no table is one giant entry.
 - Each block carries **checksums** (one over the payload, one over the header and its statistics)
   and min/max stats, so queries can skip blocks that can't match a filter without even
   decompressing them. There are no user-managed indexes.
@@ -93,11 +94,12 @@ without making the committed layout depend on completion timing.
 
 Minnow assumes several tabs, unaware of each other, some frozen or already gone.
 
-- **One writer wins.** IndexedDB serializes the manifest flip. Two tabs can prepare writes at the
-  same time; only one publishes, the other retries.
+- **One writer wins.** The store serializes the manifest flip — IndexedDB in a transaction, the
+  OPFS store through the browser's own exclusive lock on its log. Two tabs can prepare writes at
+  the same time; only one publishes, the other retries.
 - **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
-  reconciles against IndexedDB. A missed message costs a little latency, never a stale result.
-  [Live queries](/docs/sql) are built on this.
+  reconciles against the durable store. A missed message costs a little latency, never a stale
+  result. [Live queries](/docs/sql) are built on this.
 - **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
   expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
   pinned becomes reclaimable. No heartbeats, no guessing.
@@ -148,7 +150,7 @@ Page (UI thread)       async proxy: requests, cancellation, results
         |
 Coordinator worker     catalog, snapshots, transactions, planning, live queries
         |
-Storage                IndexedDB, block codecs, manifests, leases, GC
+Storage                IndexedDB or OPFS, block codecs, manifests, leases, GC
 ```
 
 - Each tab owns its own coordinator worker.

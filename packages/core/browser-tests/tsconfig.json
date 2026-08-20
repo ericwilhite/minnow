@@ -4,5 +4,5 @@
     "noEmit": true,
     "composite": false
   },
-  "include": ["transactions.spec.ts", "worker.spec.ts"]
+  "include": ["transactions.spec.ts", "worker.spec.ts", "opfs.spec.ts"]
 }

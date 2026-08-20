@@ -15,11 +15,11 @@ These are constraints, not preferences:
 | Cross-origin isolation | No COOP/COEP requirement                                                                                     |
 | Shared memory          | No `SharedArrayBuffer` or `Atomics` dependency                                                               |
 | Baseline persistence   | IndexedDB                                                                                                    |
-| Optional persistence   | OPFS may be added later behind the storage interface                                                         |
+| Optional persistence   | OPFS, behind the same storage interface (`OpfsBlockStore`)                                                   |
 | Published data         | Immutable compressed columnar blocks                                                                         |
 | Writes                 | Append-only delta segments, compacted asynchronously                                                         |
 | Transactions           | Snapshot isolation through versioned MVCC manifests                                                          |
-| Default durability     | IndexedDB `relaxed` durability                                                                               |
+| Default durability     | `relaxed` durability on both durable stores                                                                  |
 | Query execution        | Vectorized; streaming inputs, explicit memory budgets, and spill remain required exit gates                  |
 | Physical optimization  | Automatic statistics and data skipping; no user-managed indexes                                              |
 | Concurrency            | Concurrent readers and write preparation; serialized metadata commits                                        |
@@ -637,7 +637,10 @@ Core invariants under faults:
 - No full SQL surface, ORM, schema DSL, migrations, or live-query API yet; the current SQL subset is
   deliberately limited, and its Phase 7A executor does not claim the bounded-memory exit gate.
 - No claim of multi-gigabyte performance until browser measurements support it.
-- No required OPFS, Web Locks, BroadcastChannel, SharedWorker, WASM, or SharedArrayBuffer.
+- No required OPFS, Web Locks, BroadcastChannel, SharedWorker, WASM, or SharedArrayBuffer. (The
+  OPFS block store is an optional adapter; when several tabs share one OPFS database it uses
+  BroadcastChannel to route work to the leader tab — for responsiveness, never for correctness,
+  which rests on the browser's own file locks and the checksummed write-ahead log.)
 - No user-facing index DDL.
 - No compatibility promise for the experimental version-zero block format.
 

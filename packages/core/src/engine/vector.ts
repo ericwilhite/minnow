@@ -126,9 +126,37 @@ export interface PreparedVectorQuery {
 
 export interface QuerySpillStore {
   putPage(ownerId: string, runId: string, pageIndex: number, bytes: Uint8Array): Promise<void>;
+  /**
+   * Optional: several pages in one storage round trip. The executor batches only pages it has
+   * already materialized (chunked, so the batch never grows the spill's own memory footprint)
+   * and falls back to per-page writes when this is absent.
+   */
+  putPages?(
+    pages: ReadonlyArray<{ ownerId: string; runId: string; pageIndex: number; bytes: Uint8Array }>,
+  ): Promise<void>;
   getPage(ownerId: string, runId: string, pageIndex: number): Promise<Uint8Array | undefined>;
   removeRun(ownerId: string, runId: string): Promise<void>;
   removeOwner(ownerId: string): Promise<void>;
+}
+
+/** Pages per batched spill write: bounds the transient encoded copies a batch holds. */
+const SPILL_WRITE_BATCH_PAGES = 8;
+
+/** Writes already-materialized pages through the batch method when the store offers one. */
+async function writeSpillPages(
+  store: QuerySpillStore,
+  pages: Array<{ ownerId: string; runId: string; pageIndex: number; bytes: Uint8Array }>,
+): Promise<void> {
+  const batched = store.putPages?.bind(store);
+  if (batched === undefined) {
+    for (const page of pages) {
+      await store.putPage(page.ownerId, page.runId, page.pageIndex, page.bytes);
+    }
+    return;
+  }
+  for (let start = 0; start < pages.length; start += SPILL_WRITE_BATCH_PAGES) {
+    await batched(pages.slice(start, start + SPILL_WRITE_BATCH_PAGES));
+  }
 }
 
 export interface AsyncQueryExecutionOptions {
@@ -1780,16 +1808,23 @@ async function executeBoundPlanWithHashSpill(
             }
           },
         );
+        const flush: Array<{
+          ownerId: string;
+          runId: string;
+          pageIndex: number;
+          bytes: Uint8Array;
+        }> = [];
         for (const [partition, rows] of partitionBuffers) {
           const pageIndex = partitionPages[partition] ?? 0;
-          await store.putPage(
+          flush.push({
             ownerId,
-            `partition-${String(partition)}`,
+            runId: `partition-${String(partition)}`,
             pageIndex,
-            encodeSpillRows(spillColumns, rows),
-          );
+            bytes: encodeSpillRows(spillColumns, rows),
+          });
           partitionPages[partition] = pageIndex + 1;
         }
+        await writeSpillPages(store, flush);
       } finally {
         batchMemory.close();
       }
@@ -1848,15 +1883,26 @@ async function executeBoundPlanWithHashSpill(
         }
         const runId = `group-${String(runSequence++)}`;
         let outputPage = 0;
+        let pending: Array<{
+          ownerId: string;
+          runId: string;
+          pageIndex: number;
+          bytes: Uint8Array;
+        }> = [];
         for (let start = 0; start < rows.length; start += pageRows) {
-          await store.putPage(
+          pending.push({
             ownerId,
             runId,
-            outputPage,
-            encodeSpillRows(columns, rows.slice(start, start + pageRows)),
-          );
+            pageIndex: outputPage,
+            bytes: encodeSpillRows(columns, rows.slice(start, start + pageRows)),
+          });
           outputPage += 1;
+          if (pending.length >= SPILL_WRITE_BATCH_PAGES) {
+            await writeSpillPages(store, pending);
+            pending = [];
+          }
         }
+        await writeSpillPages(store, pending);
         runs.push({ id: runId, pageCount: outputPage });
       } finally {
         partitionMemory.close();

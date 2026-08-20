@@ -77,6 +77,9 @@ export default tseslint.config(
       // Reads the checked-in format fixtures off disk; they are the databases earlier builds
       // wrote, and there is nowhere else to keep them.
       "packages/core/src/storage/format-compatibility.test.ts",
+      // Reads the package's own sources off disk to assert the layering rules between the
+      // storage contract, the adapter toolkit, and the engine.
+      "packages/core/src/storage/contract-boundaries.test.ts",
       "scripts/*.mts",
     ],
     rules: { "no-restricted-imports": "off" },

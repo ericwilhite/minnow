@@ -339,7 +339,6 @@ export class DatabaseTransaction {
       keyTokens: [...new Set(changes.keyTokens)].sort(),
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
-      ...(changes.storageMode === undefined ? {} : { storageMode: changes.storageMode }),
     });
   }
 

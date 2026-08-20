@@ -113,7 +113,11 @@ export async function runFeatureSuite(
     for (const runner of runners.values()) await runner.close();
   }
   const driftFailures = reports.filter((report) =>
-    report.engines.some((outcome) => outcome.engine === "minnow" && outcome.outcome === "fail"),
+    report.engines.some(
+      (outcome) =>
+        (outcome.engine === "minnow" || outcome.engine === "minnow-opfs") &&
+        outcome.outcome === "fail",
+    ),
   ).length;
   progress(requestId, {
     phase: "complete",
@@ -145,7 +149,7 @@ async function measureFeature(
   }
   const ms = performance.now() - started;
   const accepted = error === undefined;
-  if (engine === "minnow") {
+  if (engine === "minnow" || engine === "minnow-opfs") {
     if (feature.status === "supported") {
       return accepted
         ? { engine, outcome: "pass", accepted, ms }
@@ -190,7 +194,10 @@ interface FeatureRunner {
 
 async function createRunner(engine: EngineId): Promise<FeatureRunner> {
   switch (engine) {
+    // Conformance is about SQL semantics, which no block store changes; both Minnow columns
+    // share the in-process runner.
     case "minnow":
+    case "minnow-opfs":
       return Promise.resolve(minnowRunner());
     case "sqlite":
       return sqliteRunner();

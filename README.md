@@ -1,7 +1,7 @@
 # Minnow `><(((('>`
 
 **A columnar SQL engine that runs entirely in the browser.** Real SQL over immutable snapshots,
-durable on IndexedDB — no server, no WebAssembly to download, no build step.
+durable on IndexedDB or OPFS — no server, no WebAssembly to download, no build step.
 
 **[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
 run yourself.
@@ -28,15 +28,19 @@ npm install @minnowdb/core
   PostgreSQL; deliberate omissions are documented with reasons.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background once a table is large enough to want one.
-- **Columnar and durable** — immutable compressed column blocks on IndexedDB. Writes publish
+- **Columnar and durable** — immutable compressed column blocks on IndexedDB or OPFS. Writes publish
   atomically; another tab sees the old version or the new one, never half of one.
+- **Pluggable storage** — the storage contract is a public, documented interface with a
+  [conformance kit](https://minnowdb.com/docs/storage/custom/) and an adapter toolkit, so a
+  store for another substrate — the Node filesystem, React Native, an object store — is an
+  adapter away, with no engine changes.
 - **Snapshot reads** — every query executes against one version, reads never block writes, and
   stale reads are unrepresentable. Multi-statement consistency is an explicit scope that releases
   itself.
 - **Bounded memory** — execution works in batches under a budget you set and spills to storage
   rather than failing. A whole table is never required to be resident.
-- **Small** — about 159 KB gzipped, and no Wasm blob: roughly a third of SQLite's WebAssembly
-  build and a thirty-fifth of PGlite's, both of which download and compile a module before answering
+- **Small** — about 172 KB gzipped, and no Wasm blob: just over a third of SQLite's WebAssembly
+  build and a thirty-second of PGlite's, both of which download and compile a module before answering
   anything.
 - **Workers first** — a shipped worker entry and a main-thread client with an identical API.
 - **Snapshots** — copy one committed version out as a portable file and load it into any store.
@@ -55,6 +59,10 @@ npm install @minnowdb/core
 Everything else — installation, running SQL, the language surface, the client API, transactions,
 workers, storage adapters, and the API reference — lives on the
 [docs site](https://minnowdb.com/docs/).
+
+[Comparison](https://minnowdb.com/docs/comparison/) is the page to read first if you are choosing
+between Minnow, IndexedDB, Dexie, SQLite Wasm, PGlite, and DuckDB-Wasm; it says where each of the
+others is the better answer.
 
 Two things there are worth knowing about specifically:
 

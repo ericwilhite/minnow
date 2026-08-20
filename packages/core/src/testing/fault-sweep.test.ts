@@ -17,7 +17,13 @@
  */
 import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
-import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import {
+  IndexedDbBlockStore,
+  MemoryBlockStore,
+  OpfsBlockStore,
+  type BlockStore,
+} from "../storage/index.js";
+import { MemoryOpfs } from "./opfs-shim.js";
 import { MinnowDatabase } from "../engine/database.js";
 import { FaultInjectingBlockStore, faultPoints, type FaultPoint } from "./index.js";
 
@@ -107,6 +113,23 @@ const storeKinds: StoreKind[] = [
         reopen: async () => {
           store.close();
           return IndexedDbBlockStore.open({ name, indexedDB });
+        },
+      };
+    },
+  },
+  {
+    name: "opfs",
+    create: async () => {
+      // One shim shared across open and reopen, so the reopen replays the command log the
+      // interrupted run actually left behind.
+      const shim = new MemoryOpfs();
+      const name = crypto.randomUUID();
+      const store = await OpfsBlockStore.open({ name, root: shim.root });
+      return {
+        store,
+        reopen: async () => {
+          store.close();
+          return OpfsBlockStore.open({ name, root: shim.root });
         },
       };
     },

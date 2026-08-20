@@ -91,7 +91,6 @@ import {
   type SimpleDataType,
   decodeSnapshot,
   encodeSnapshot,
-  type DatabaseSnapshot,
   type SnapshotExportProgress,
   type SnapshotLoadProgress,
   type TableColumnRecord,
@@ -842,33 +841,24 @@ export interface VisibleSegment {
 }
 
 /**
- * The snapshot methods a block store may have. Neither belongs to `BlockStore`: a store can be a
- * complete database backend without being able to copy itself out, so the database checks for
- * them at the call and says plainly when they are absent rather than failing as a missing
- * property.
+ * Snapshots are optional members of `BlockStore` — a store can be a complete database backend
+ * without being able to copy itself out — so the database checks at the call and says plainly
+ * when the capability is absent rather than failing as a missing property.
  */
-interface SnapshotCapableStore {
-  exportSnapshot(): Promise<DatabaseSnapshot>;
-  importSnapshot(
-    snapshot: DatabaseSnapshot,
-    options?: { onProgress?: (progress: SnapshotLoadProgress) => void },
-  ): Promise<void>;
-}
-
-function exportingStore(store: BlockStore): Pick<SnapshotCapableStore, "exportSnapshot"> {
-  const candidate = store as Partial<SnapshotCapableStore>;
-  if (typeof candidate.exportSnapshot !== "function") {
+function exportingStore(store: BlockStore): Required<Pick<BlockStore, "exportSnapshot">> {
+  const exportSnapshot = store.exportSnapshot?.bind(store);
+  if (exportSnapshot === undefined) {
     throw new Error("This database's block store cannot export snapshots");
   }
-  return candidate as SnapshotCapableStore;
+  return { exportSnapshot };
 }
 
-function importingStore(store: BlockStore): Pick<SnapshotCapableStore, "importSnapshot"> {
-  const candidate = store as Partial<SnapshotCapableStore>;
-  if (typeof candidate.importSnapshot !== "function") {
+function importingStore(store: BlockStore): Required<Pick<BlockStore, "importSnapshot">> {
+  const importSnapshot = store.importSnapshot?.bind(store);
+  if (importSnapshot === undefined) {
     throw new Error("This database's block store cannot load snapshots");
   }
-  return candidate as SnapshotCapableStore;
+  return { importSnapshot };
 }
 
 export interface SnapshotExportOptions {
@@ -1093,7 +1083,6 @@ export class MinnowDatabase {
       ...(input.managed === true ? { managed: true } : {}),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
-      ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyStorage: "chunks-v2" as const }),
       createdAt: this.#now().toISOString(),
     });
   }
@@ -1440,7 +1429,6 @@ export class MinnowDatabase {
       keyTokens: [...keys.keys()],
       requireAbsent: false,
       remove: true,
-      ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
     });
     let deletedRowCount: number;
     let storedBytes = 0;
@@ -1846,7 +1834,6 @@ export class MinnowDatabase {
           tableId: table.id,
           keyTokens: [...resolvedKeys.keys()],
           requireAbsent: kind === "insert",
-          ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
         });
       }
       counts =
@@ -2783,11 +2770,22 @@ export class MinnowDatabase {
       );
       leases.set(ownerId, { revision: renewed.revision, expiresAtMs });
     };
+    const batched = this.store.putTempRunPages?.bind(this.store);
     return {
       putPage: async (ownerId, runId, pageIndex, bytes) => {
         await ensureLease(ownerId);
         await this.store.putTempRunPage({ ownerId, runId, pageIndex, bytes });
       },
+      ...(batched === undefined
+        ? {}
+        : {
+            putPages: async (pages) => {
+              for (const owner of new Set(pages.map((page) => page.ownerId))) {
+                await ensureLease(owner);
+              }
+              await batched(pages);
+            },
+          }),
       getPage: async (ownerId, runId, pageIndex) => {
         await ensureLease(ownerId);
         return this.store.getTempRunPage(ownerId, runId, pageIndex);
@@ -3958,7 +3956,6 @@ export class MinnowDatabase {
         tableId: table.id,
         keyTokens: [...keys.keys()],
         requireAbsent: kind === "insert",
-        ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
       });
     }
     const rowIds = await this.store.reserveRowIds(table.id, rowCount);
@@ -4202,7 +4199,6 @@ export class MinnowDatabase {
       keyTokens: [...keys.keys()],
       requireAbsent: false,
       remove: true,
-      ...(table.uniqueKeyStorage === undefined ? {} : { storageMode: table.uniqueKeyStorage }),
     });
     // Fire only per existing row (session-visible state included): missing keys must not
     // produce phantom all-null OLD images.

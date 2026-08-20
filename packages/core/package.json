@@ -1,7 +1,7 @@
 {
   "name": "@minnowdb/core",
   "version": "0.1.1",
-  "description": "A columnar SQL engine that runs entirely in the browser: real SQL over immutable snapshots, durable on IndexedDB, with no WebAssembly to download.",
+  "description": "A columnar SQL engine that runs entirely in the browser: real SQL over immutable snapshots, durable on IndexedDB or OPFS, with no WebAssembly to download.",
   "license": "MIT",
   "author": "Eric Wilhite",
   "homepage": "https://minnowdb.com/docs/",
@@ -16,6 +16,7 @@
     "database",
     "browser",
     "indexeddb",
+    "opfs",
     "columnar",
     "olap",
     "in-browser",
@@ -44,6 +45,10 @@
     "./storage": {
       "types": "./dist/storage/index.d.ts",
       "default": "./dist/storage/index.js"
+    },
+    "./storage/toolkit": {
+      "types": "./dist/storage/toolkit/index.d.ts",
+      "default": "./dist/storage/toolkit/index.js"
     },
     "./block-format": {
       "types": "./dist/block-format/index.d.ts",

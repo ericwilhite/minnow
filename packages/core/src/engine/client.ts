@@ -91,7 +91,11 @@ export interface ClientTransport {
 }
 
 export interface MinnowDatabaseClientOptions {
-  /** Defaults to `{ kind: "indexeddb", name: "minnow" }`. */
+  /**
+   * Defaults to `{ kind: "indexeddb", name: "minnow" }`. The `opfs` kind selects
+   * `OpfsBlockStore`, which needs the worker to be a dedicated worker (it always is with
+   * `@minnowdb/core/worker`) and OPFS to exist — notably absent in Safari private browsing.
+   */
   store?: StoreDescriptor;
   /** Cloneable database options applied when the worker constructs the database. */
   databaseOptions?: WireDatabaseOptions;
@@ -192,6 +196,7 @@ export class MinnowDatabaseClient {
   readonly #ready: Promise<void>;
   #fatal: Error | undefined;
   #closed = false;
+  #onVisibilityChange: (() => void) | undefined;
 
   constructor(transport: ClientTransport, options: MinnowDatabaseClientOptions = {}) {
     this.#transport = transport;
@@ -211,6 +216,21 @@ export class MinnowDatabaseClient {
     this.#ready = this.#post("rpc-init", null, "init", [payload]).then(() => undefined);
     // Callers may rely on call ordering instead of awaiting ready(); keep its rejection observed.
     this.#ready.catch(() => undefined);
+
+    // Report page visibility so a store that cares (the OPFS store's leadership preference)
+    // can follow the tab the user is looking at. Best-effort: a worker-side host that predates
+    // the frame rejects it, and nothing here depends on the answer.
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      const report = (): void => {
+        if (this.#closed) return;
+        this.#post("rpc-call", null, "setVisibility", [
+          document.visibilityState === "visible",
+        ]).catch(() => undefined);
+      };
+      this.#onVisibilityChange = report;
+      document.addEventListener("visibilitychange", report);
+      report();
+    }
   }
 
   /** Resolves once the worker has opened the store and constructed the database. */
@@ -571,6 +591,9 @@ export class MinnowDatabaseClient {
   async close(options: CloseClientOptions = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#onVisibilityChange !== undefined && typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.#onVisibilityChange);
+    }
     try {
       await this.#post("rpc-call", null, "dispose", []);
     } finally {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   IndexedDbBlockStore,
   MemoryBlockStore,
+  OpfsBlockStore,
   SnapshotManifestMissingError,
   WriteConflictError,
   type BlockStore,
@@ -12,6 +13,7 @@ import {
   type TransactionRecordUpdate,
 } from "../storage/index.js";
 import { FaultInjectingBlockStore } from "../testing/index.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { TransactionClosedError, TransactionManager } from "./index.js";
 
 function implementations(): Array<{ name: string; create: () => Promise<BlockStore> }> {
@@ -21,6 +23,11 @@ function implementations(): Array<{ name: string; create: () => Promise<BlockSto
       name: "indexeddb",
       create: async () =>
         IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
+    },
+    {
+      name: "opfs",
+      create: async () =>
+        OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
     },
   ];
 }
@@ -513,6 +520,27 @@ it("coordinates competing commits across two IndexedDB connections", async () =>
   const name = crypto.randomUUID();
   const firstStore = await IndexedDbBlockStore.open({ name, indexedDB: factory });
   const secondStore = await IndexedDbBlockStore.open({ name, indexedDB: factory });
+  const first = await new TransactionManager(firstStore).begin();
+  const second = await new TransactionManager(secondStore).begin();
+  await first.stageBlock("first", Uint8Array.of(1));
+  await second.stageBlock("second", Uint8Array.of(2));
+
+  const results = await Promise.allSettled([first.commit(), second.commit()]);
+  expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+  expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  expect((await firstStore.getCurrentManifest())?.version).toBe(0);
+  expect((await secondStore.getCurrentManifest())?.version).toBe(0);
+  firstStore.close();
+  secondStore.close();
+});
+
+it("coordinates competing commits across two OPFS instances on one directory", async () => {
+  // The same shape as the IndexedDB two-connection test: two independent store instances over
+  // one storage root, racing commits — this exercises the command log's sequence-handle CAS.
+  const shim = new MemoryOpfs();
+  const name = crypto.randomUUID();
+  const firstStore = await OpfsBlockStore.open({ name, root: shim.root });
+  const secondStore = await OpfsBlockStore.open({ name, root: shim.root });
   const first = await new TransactionManager(firstStore).begin();
   const second = await new TransactionManager(secondStore).begin();
   await first.stageBlock("first", Uint8Array.of(1));

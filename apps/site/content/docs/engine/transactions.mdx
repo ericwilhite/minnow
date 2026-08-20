@@ -87,10 +87,10 @@ a read-modify-write inside it re-reads.
 
 ## Durability
 
-Durability ends at a committed IndexedDB transaction. Nothing depends on a page-close handler
+Durability ends at a committed write in the durable store. Nothing depends on a page-close handler
 firing, because they do not reliably fire — a tab that vanishes loses only writes that had not
 committed.
 
-The IndexedDB store defaults to `relaxed` durability, which lets the browser batch flushes to
+The IndexedDB and OPFS stores default to `relaxed` durability, which lets the browser batch flushes to
 disk. For data that must survive a power loss rather than a tab closing, open the store with
 `durability: "strict"` and pay the flush per commit.

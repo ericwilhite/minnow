@@ -5,13 +5,14 @@
  */
 import type { DurabilityMode } from "./benchmark";
 
-export type EngineId = "minnow" | "sqlite" | "pglite";
+export type EngineId = "minnow" | "minnow-opfs" | "sqlite" | "pglite";
 export type WorkloadKind = "oltp" | "olap";
 
-export const engineIds: readonly EngineId[] = ["minnow", "sqlite", "pglite"];
+export const engineIds: readonly EngineId[] = ["minnow", "minnow-opfs", "sqlite", "pglite"];
 
 export const engineNames: Record<EngineId, string> = {
   minnow: "MinnowDatabase",
+  "minnow-opfs": "MinnowDatabase (OPFS)",
   sqlite: "SQLite Wasm",
   pglite: "PGlite",
 };
@@ -23,9 +24,10 @@ export interface EngineMaterialization {
   engine: EngineId;
   status: "ready" | "failed";
   /**
-   * Where the copy physically lives: an IndexedDB database name for minnow, an
-   * OPFS file path for sqlite, and for pglite the IndexedDB database name observed after
-   * creation (Emscripten names it after the mount path, not the dataDir label).
+   * Where the copy physically lives: an IndexedDB database name for minnow, an OPFS
+   * directory name for minnow-opfs, an OPFS file path for sqlite, and for pglite the
+   * IndexedDB database name observed after creation (Emscripten names it after the mount
+   * path, not the dataDir label).
    */
   storageName: string;
   /** sqlite only — the copy is reachable only through the VFS that wrote it. */
@@ -125,8 +127,9 @@ export interface ReferenceEngineMeasurement {
    */
   batchSize?: number;
   /**
-   * minnow only: median of the same statement with its result memo left on — the default an
-   * application gets. Absent for engines with no result cache, which re-execute every call.
+   * Minnow engines only: median of the same statement with its result memo left on — the
+   * default an application gets. Absent for engines with no result cache, which re-execute
+   * every call.
    */
   cachedMedianMs?: number;
   cachedBatchSize?: number;

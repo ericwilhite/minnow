@@ -1,3 +1,5 @@
+import type { DatabaseSnapshot, SnapshotLoadProgress } from "./snapshot.js";
+
 export const storeNames = [
   "catalog",
   "manifests",
@@ -216,7 +218,6 @@ export interface TableRecord {
   columns: TableColumnRecord[];
   uniqueKeyColumnId?: string;
   uniqueKeyLookupReady?: boolean;
-  uniqueKeyStorage?: "chunks-v1" | "chunks-v2";
   /** Full-text index state per column ID. Writers that see this emit commit deltas. */
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
   /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
@@ -778,7 +779,6 @@ export interface UniqueKeyChanges {
   keyTokens: readonly string[];
   requireAbsent: boolean;
   remove?: boolean;
-  storageMode?: "chunks-v1" | "chunks-v2";
 }
 
 /** One term's postings within a commit delta or base chunk: parallel rowId/tf arrays. */
@@ -976,16 +976,48 @@ export interface CatalogProbe {
   catalogEpoch: number;
 }
 
-export interface BlockStore {
+/**
+ * Bulk payload storage: immutable, opaque byte blobs keyed by structured ids.
+ *
+ * Blocks are write-once. `addBlock`/`addBlocks` MUST reject an id that already exists, and a
+ * batch containing any duplicate MUST write nothing at all. Ids contain `/` separators
+ * (`table/<uuid>/segment/<uuid>/part/000001`) and sort lexically; treat them as opaque keys.
+ * Reads MUST return bytes the caller may mutate freely (a fresh copy or freshly deserialized
+ * buffer), and writes MUST NOT alias the caller's buffer — the engine may reuse it.
+ *
+ * Published blocks are retired by superseding them in a commit, never by `removeBlock`; the
+ * lease-aware collector deletes the bytes once no reader can be pinned to them.
+ */
+export interface BlockPayloadStore {
   addBlock(id: string, bytes: Uint8Array): Promise<void>;
+  /** All or nothing: an internal or existing duplicate id fails the whole batch unwritten. */
   addBlocks(blocks: readonly BlockWrite[]): Promise<void>;
   getBlock(id: string): Promise<Uint8Array | undefined>;
+  /** Positional per requested id; undefined where a block does not exist. */
   getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>>;
+  /** Deleting a missing block is not an error. */
   removeBlock(id: string): Promise<void>;
+  /** Every stored block id, sorted lexically. A cold path — tools and tests, not queries. */
   listBlockIds(): Promise<string[]>;
+}
+
+/**
+ * The table catalog: schema records, the counters that keep writes collision-free, and
+ * unique-key membership.
+ *
+ * Table mutations are compare-and-swap on the record's `revision` and MUST fail with
+ * `TableRecordConflictError` — the exact exported class — on a mismatch. Catalog mutations
+ * advance the catalog epoch (see `CatalogProbe`). Counter reservations (`reserveRowIds`,
+ * `reserveAutoIncrement`) MUST be atomic and durable: two racing callers may never receive
+ * overlapping ranges, across connections and across crashes. Reservations are never returned;
+ * aborted transactions leave gaps.
+ */
+export interface CatalogStore {
+  /** Fails on a duplicate id or name. Advances the catalog epoch. */
   addTable(record: TableRecord): Promise<void>;
   getTable(id: string): Promise<TableRecord | undefined>;
   getTableByName(name: string): Promise<TableRecord | undefined>;
+  /** Sorted by table name. */
   listTables(): Promise<TableRecord[]>;
   updateTable(
     id: string,
@@ -1010,6 +1042,163 @@ export interface BlockStore {
    * pinned reader may still be reading.
    */
   removeTable(id: string, expectedRevision: number): Promise<void>;
+  reserveRowIds(tableId: string, count: number): Promise<RowIdRange>;
+  /**
+   * Atomically reserves `count` auto-increment values for the column, first bumping the
+   * counter to at least `atLeast`. `count` may be 0 for a pure bump past explicit values.
+   */
+  reserveAutoIncrement(
+    tableId: string,
+    columnId: string,
+    count: number,
+    atLeast?: bigint,
+  ): Promise<RowIdRange>;
+  /** Which of the given key tokens already exist for the table, deduplicated and sorted. */
+  getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]>;
+}
+
+/**
+ * Versions and visibility: manifests (the set of live block ids at each version), segments
+ * (which blocks belong to which table and rows), and the transaction records that stage and
+ * publish them.
+ *
+ * This is where the whole consistency story lives. `commitTransaction` is THE atomic step of
+ * the database: in one durable, all-or-nothing action it validates the transaction record's
+ * revision and active status, compare-and-swaps the current manifest version, publishes the
+ * next manifest, finalizes the transaction's segments, applies unique-key changes (failing
+ * with `UniqueKeyConflictError` on a `requireAbsent` violation), applies full-text deltas,
+ * and flips the transaction record to committed. No intermediate state may ever be
+ * observable, including after a crash at any moment. Version conflicts MUST be
+ * `WriteConflictError` and revision conflicts `TransactionRecordConflictError` — the exact
+ * exported classes; the engine's retry and rebase loops match on them, and the worker client
+ * rehydrates them by name across the thread boundary.
+ */
+export interface TransactionStore {
+  getCurrentManifest(): Promise<Manifest | undefined>;
+  /** The current version alone, without materializing the manifest's block list. */
+  getCurrentManifestVersion(): Promise<number | null>;
+  getManifest(version: number): Promise<Manifest | undefined>;
+  listManifests(): Promise<Manifest[]>;
+  listManifestPage(
+    afterVersion: number | null,
+    limit: number,
+  ): Promise<StoragePage<Manifest, number>>;
+  /**
+   * Publishes the next version directly from a full block-id list, compare-and-swapping on
+   * `expectedVersion` (`WriteConflictError` on a mismatch). Every id must exist. The engine
+   * commits through transactions instead; this is the lower-level tool underneath.
+   */
+  publishManifest(input: PublishManifestInput): Promise<Manifest>;
+  /** Fails on a duplicate id; the record's snapshot version and pending ids must be valid. */
+  createTransaction(record: TransactionRecord): Promise<void>;
+  getTransaction(id: string): Promise<TransactionRecord | undefined>;
+  /** Positional per requested id; undefined where a record does not exist. */
+  getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>>;
+  /** Sorted by startedAt, then id. */
+  listTransactions(): Promise<TransactionRecord[]>;
+  listTransactionPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<TransactionRecord, string>>;
+  /**
+   * Compare-and-swap on `expectedRevision` (`TransactionRecordConflictError` on a mismatch).
+   * Only active transactions may be updated, and only `commitTransaction` may mark one
+   * committed.
+   */
+  updateTransaction(
+    id: string,
+    expectedRevision: number,
+    update: TransactionRecordUpdate,
+  ): Promise<TransactionRecord>;
+  /** Publishes the next version; the summary omits the block list, which commits never need. */
+  commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary>;
+  addSegment(record: SegmentRecord): Promise<void>;
+  getSegment(id: string): Promise<SegmentRecord | undefined>;
+  /** Sorted by id; `tableId` filters. */
+  listSegments(tableId?: string): Promise<SegmentRecord[]>;
+  removeSegment(id: string): Promise<void>;
+}
+
+/**
+ * Reader pins. A lease is a stored record with an expiry that protects one manifest version
+ * (and every block it references) from garbage collection while a reader may still be using
+ * it. Renewals are compare-and-swap on `revision` and fail with `LeaseConflictError`; an
+ * expired lease simply stops protecting — there is no callback, which is what makes dead
+ * tabs safe.
+ */
+export interface LeaseStore {
+  /** Fails on a duplicate id, or when the pinned version's manifest is unavailable. */
+  createLease(record: LeaseRecord): Promise<void>;
+  getLease(id: string): Promise<LeaseRecord | undefined>;
+  /** Sorted by id. */
+  listLeases(): Promise<LeaseRecord[]>;
+  renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord>;
+  /** True when removed; false (without removing) when the lease has not yet expired. */
+  removeLeaseIfExpired(
+    id: string,
+    expectedRevision: number,
+    expiresAtCutoff: string,
+  ): Promise<boolean>;
+  removeLease(id: string): Promise<void>;
+}
+
+/**
+ * Background-maintenance bookkeeping: the resumable job records that let compaction and
+ * garbage collection survive a tab being closed, throttled, or killed mid-step. Job updates
+ * are compare-and-swap on `revision` and fail with `CompactionJobConflictError` /
+ * `GarbageCollectionJobConflictError`.
+ *
+ * `runGarbageCollectionStep` does real deletion and MUST be atomic: it re-verifies lease and
+ * transaction pins inside the same storage transaction that prunes manifests and deletes
+ * segments and blocks, advancing the job's cursors so an interrupted collection resumes
+ * rather than restarts. Reclaimed manifests are tombstoned (`prunedAt`), never physically
+ * deleted, so delta chains below any readable version always resolve.
+ */
+export interface MaintenanceStore {
+  createCompactionJob(record: CompactionJobRecord): Promise<void>;
+  getCompactionJob(id: string): Promise<CompactionJobRecord | undefined>;
+  /** Sorted by createdAt, then id; `tableId` filters. */
+  listCompactionJobs(tableId?: string): Promise<CompactionJobRecord[]>;
+  listCompactionJobPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<CompactionJobRecord, string>>;
+  updateCompactionJob(
+    id: string,
+    expectedRevision: number,
+    update: CompactionJobRecordUpdate,
+  ): Promise<CompactionJobRecord>;
+  /**
+   * Resolves a job that may be racing its own publication: already-terminal jobs return
+   * unchanged, a job whose transaction committed is marked published, anything else is
+   * cancelled and its active transaction aborted — atomically.
+   */
+  cancelCompactionJob(
+    id: string,
+    expectedRevision: number,
+    cancelledAt: string,
+  ): Promise<CompactionJobRecord>;
+  removeCompactionJob(id: string): Promise<void>;
+  /** Validates candidate provenance against persisted records before accepting the job. */
+  createGarbageCollectionJob(
+    input: CreateGarbageCollectionJobInput,
+  ): Promise<GarbageCollectionJobRecord>;
+  getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined>;
+  /** Sorted by createdAt, then id. */
+  listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;
+  runGarbageCollectionStep(
+    input: RunGarbageCollectionStepInput,
+  ): Promise<GarbageCollectionStepResult>;
+  removeGarbageCollectionJob(id: string): Promise<void>;
+}
+
+/**
+ * Full-text index persistence: per-column base chunks plus the per-commit deltas that
+ * `commitTransaction` applies. The index is a pruning accelerator the scan re-verifies, so
+ * losing a base costs a rebuild, never a wrong answer — which is why snapshots may restore
+ * indexed columns as `invalid`.
+ */
+export interface FtsIndexStore {
   /**
    * Replaces one column's full-text base chunks (term-range partitioned, term-sorted within
    * each chunk) and deletes commit deltas the new base covers. The caller flips the catalog
@@ -1024,8 +1213,8 @@ export interface BlockStore {
   /**
    * Per-term candidate row IDs from the base chunks plus every commit delta at or below
    * `upToVersion`, with the column's merged token total for exact BM25 statistics. Prefix
-   * terms match the term range [term, term + "￿"). Reports the merged delta-chunk count so
-   * callers can schedule a rebuild when the tail grows, and the base's covered version —
+   * terms match the term range [term, term + "\uffff"). Reports the merged delta-chunk count
+   * so callers can schedule a rebuild when the tail grows, and the base's covered version —
    * a concurrent rebuild can publish a base ahead of a reader's snapshot, and a caller
    * needing snapshot-exact statistics must detect `coversVersion > upToVersion` and fall
    * back (candidates stay a safe superset either way).
@@ -1038,26 +1227,98 @@ export interface BlockStore {
   ): Promise<
     FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
   >;
-  addSegment(record: SegmentRecord): Promise<void>;
-  getSegment(id: string): Promise<SegmentRecord | undefined>;
-  listSegments(tableId?: string): Promise<SegmentRecord[]>;
-  removeSegment(id: string): Promise<void>;
-  reserveRowIds(tableId: string, count: number): Promise<RowIdRange>;
+}
+
+/**
+ * Query spill: scratch pages a bounded-memory query writes when it exceeds its budget, plus
+ * the owner leases that let any connection reclaim a dead owner's pages. Pages carry no
+ * durability requirement whatsoever — losing them costs a query, never data — but owner
+ * records are real records with the usual compare-and-swap (`TempOwnerConflictError`).
+ */
+export interface TempSpillStore {
+  putTempRunPage(page: TempRunPage): Promise<void>;
   /**
-   * Atomically reserves `count` auto-increment values for the column, first bumping the
-   * counter to at least `atLeast`. `count` may be 0 for a pure bump past explicit values.
-   * Reservations are never returned; aborted transactions leave gaps.
+   * Optional: writes a batch of pages in one storage round trip. Callers fall back to
+   * per-page writes when absent; implement it where per-call overhead is real (the IndexedDB
+   * adapter pays one transaction per page otherwise).
    */
-  reserveAutoIncrement(
-    tableId: string,
-    columnId: string,
-    count: number,
-    atLeast?: bigint,
-  ): Promise<RowIdRange>;
-  getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]>;
-  getCurrentManifest(): Promise<Manifest | undefined>;
-  /** The current version alone, without materializing the manifest's block list. */
-  getCurrentManifestVersion(): Promise<number | null>;
+  putTempRunPages?(pages: readonly TempRunPage[]): Promise<void>;
+  getTempRunPage(
+    ownerId: string,
+    runId: string,
+    pageIndex: number,
+  ): Promise<Uint8Array | undefined>;
+  removeTempRun(ownerId: string, runId: string): Promise<void>;
+  /** Removes the owner record and every page under the owner. */
+  removeTempOwner(ownerId: string): Promise<void>;
+  createTempOwner(record: TempOwnerRecord): Promise<void>;
+  getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined>;
+  renewTempOwner(
+    ownerId: string,
+    expectedRevision: number,
+    expiresAt: string,
+  ): Promise<TempOwnerRecord>;
+  /** Sweeps pages too when it removes; owners found only via orphaned pages count as expired. */
+  removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean>;
+  /** Owner ids from records and from orphaned pages alike, deduplicated, sorted, paged. */
+  listTempOwnerIdsPage(
+    afterOwnerId: string | null,
+    limit: number,
+  ): Promise<StoragePage<string, string>>;
+}
+
+/**
+ * The complete storage contract: a database is `MinnowDatabase` plus one implementation of
+ * this interface. The engine holds exactly one and talks to nothing else persistent, so
+ * implementing it against a new substrate — React Native storage, an object store like R2,
+ * the Node filesystem — yields a working database with no engine changes. The capability
+ * interfaces above split the surface by concern; implement all of them (this type), and see
+ * `/docs/storage/custom` for the guide and `runBlockStoreConformance` from
+ * `@minnowdb/core/testing` for the referee.
+ *
+ * The rules every implementation must honor — the conformance kit checks each of them:
+ *
+ * - **Atomicity.** Every method is all-or-nothing, including after a crash at any moment.
+ *   `commitTransaction` and `runGarbageCollectionStep` mutate several record families in one
+ *   durable step. A method that resolves has happened; a method that rejects has not
+ *   (observably) happened.
+ * - **Conflicts are typed, by exact class.** Compare-and-swap failures throw the exported
+ *   error classes (`WriteConflictError`, `TransactionRecordConflictError`,
+ *   `TableRecordConflictError`, `LeaseConflictError`, `CompactionJobConflictError`,
+ *   `GarbageCollectionJobConflictError`, `TempOwnerConflictError`, `UniqueKeyConflictError`,
+ *   `SnapshotManifestMissingError`) — not subclasses, not wrappers. The engine's rebase loops
+ *   match on them and the worker client rehydrates them by constructor name.
+ * - **Platform errors pass through.** A quota refusal must escape as the browser's own
+ *   `QuotaExceededError` `DOMException`, unwrapped, with everything committed beforehand
+ *   intact and the same write succeeding once space frees — no reopen, no repair step.
+ * - **Nothing is shared.** Returned records and bytes must be safe for the caller to mutate;
+ *   received records and bytes must be copied or serialized before the call resolves.
+ * - **Deterministic ordering.** List methods sort as documented on each capability interface;
+ *   pagination cursors are stable under concurrent writes.
+ * - **Optional means atomic.** The optional methods exist so an adapter that can do something
+ *   in one atomic step may say so; callers trust a present method completely and fall back to
+ *   the sequential calls when it is absent. Never implement one as the sequential calls in a
+ *   trench coat.
+ * - **Multiple connections are normal.** Several instances (tabs) may open one database.
+ *   Readers must never block writers; competing writers must resolve through the typed
+ *   conflicts. How is the adapter's business — storage transactions, a write-ahead log behind
+ *   a leader, anything that keeps these rules true.
+ * - **Records carry no adapter fields.** These types are the whole vocabulary between engine
+ *   and store. Anything an adapter needs to remember about its own layout — key partitioning,
+ *   format generations, file placements — lives in the adapter's own storage space, keyed
+ *   however it likes, never as extra fields on the records it hands back.
+ * - **Bigints are data.** Row ids, counters, and full-text posting ids are `bigint`; an
+ *   adapter that serializes records needs an encoding for them.
+ */
+export interface BlockStore
+  extends
+    BlockPayloadStore,
+    CatalogStore,
+    TransactionStore,
+    LeaseStore,
+    MaintenanceStore,
+    FtsIndexStore,
+    TempSpillStore {
   /**
    * Optional: the current manifest version and catalog epoch in one atomic read. This is the
    * freshness probe: an unchanged pair proves any cached catalog state is still exactly what
@@ -1070,32 +1331,12 @@ export interface BlockStore {
    * would; callers fall back to those calls when this is absent.
    */
   getQueryCatalogState?(tableNames: readonly string[]): Promise<QueryCatalogState>;
-  getManifest(version: number): Promise<Manifest | undefined>;
-  listManifests(): Promise<Manifest[]>;
-  listManifestPage(
-    afterVersion: number | null,
-    limit: number,
-  ): Promise<StoragePage<Manifest, number>>;
-  publishManifest(input: PublishManifestInput): Promise<Manifest>;
-  createTransaction(record: TransactionRecord): Promise<void>;
   /**
    * Optional: reads the current manifest version, creates the transaction record pinned to it,
    * and optionally reserves row ids, all in one atomic storage transaction — one round trip
    * instead of three. Callers fall back to the individual calls when this is absent.
    */
   beginTransaction?(input: BeginTransactionInput): Promise<BeginTransactionResult>;
-  getTransaction(id: string): Promise<TransactionRecord | undefined>;
-  getTransactions(ids: readonly string[]): Promise<Array<TransactionRecord | undefined>>;
-  listTransactions(): Promise<TransactionRecord[]>;
-  listTransactionPage(
-    afterId: string | null,
-    limit: number,
-  ): Promise<StoragePage<TransactionRecord, string>>;
-  updateTransaction(
-    id: string,
-    expectedRevision: number,
-    update: TransactionRecordUpdate,
-  ): Promise<TransactionRecord>;
   /**
    * Optional: stages blocks and segments and journals them on the transaction record in one
    * atomic storage transaction. Must be equivalent to addBlocks + addSegment(s) + one
@@ -1103,65 +1344,30 @@ export interface BlockStore {
    * crash. Callers fall back to those calls when this is absent.
    */
   stageTransactionArtifacts?(input: StageTransactionArtifactsInput): Promise<TransactionRecord>;
-  /** Publishes the next version; the summary omits the block list, which commits never need. */
-  commitTransaction(input: CommitTransactionInput): Promise<ManifestSummary>;
-  createLease(record: LeaseRecord): Promise<void>;
-  getLease(id: string): Promise<LeaseRecord | undefined>;
-  listLeases(): Promise<LeaseRecord[]>;
-  renewLease(id: string, expectedRevision: number, expiresAt: string): Promise<LeaseRecord>;
-  removeLeaseIfExpired(
-    id: string,
-    expectedRevision: number,
-    expiresAtCutoff: string,
-  ): Promise<boolean>;
-  removeLease(id: string): Promise<void>;
-  createCompactionJob(record: CompactionJobRecord): Promise<void>;
-  getCompactionJob(id: string): Promise<CompactionJobRecord | undefined>;
-  listCompactionJobs(tableId?: string): Promise<CompactionJobRecord[]>;
-  listCompactionJobPage(
-    afterId: string | null,
-    limit: number,
-  ): Promise<StoragePage<CompactionJobRecord, string>>;
-  updateCompactionJob(
-    id: string,
-    expectedRevision: number,
-    update: CompactionJobRecordUpdate,
-  ): Promise<CompactionJobRecord>;
-  cancelCompactionJob(
-    id: string,
-    expectedRevision: number,
-    cancelledAt: string,
-  ): Promise<CompactionJobRecord>;
-  removeCompactionJob(id: string): Promise<void>;
-  createGarbageCollectionJob(
-    input: CreateGarbageCollectionJobInput,
-  ): Promise<GarbageCollectionJobRecord>;
-  getGarbageCollectionJob(id: string): Promise<GarbageCollectionJobRecord | undefined>;
-  listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;
-  runGarbageCollectionStep(
-    input: RunGarbageCollectionStepInput,
-  ): Promise<GarbageCollectionStepResult>;
-  removeGarbageCollectionJob(id: string): Promise<void>;
-  putTempRunPage(page: TempRunPage): Promise<void>;
-  getTempRunPage(
-    ownerId: string,
-    runId: string,
-    pageIndex: number,
-  ): Promise<Uint8Array | undefined>;
-  removeTempRun(ownerId: string, runId: string): Promise<void>;
-  removeTempOwner(ownerId: string): Promise<void>;
-  createTempOwner(record: TempOwnerRecord): Promise<void>;
-  getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined>;
-  renewTempOwner(
-    ownerId: string,
-    expectedRevision: number,
-    expiresAt: string,
-  ): Promise<TempOwnerRecord>;
-  removeTempOwnerIfExpired(ownerId: string, expiresAtCutoff: string): Promise<boolean>;
-  listTempOwnerIdsPage(
-    afterOwnerId: string | null,
-    limit: number,
-  ): Promise<StoragePage<string, string>>;
+  /**
+   * Optional: one committed version copied out as a portable snapshot — see
+   * `/docs/storage/snapshots` for what it carries, drops, and guarantees. A store without it
+   * still works; `MinnowDatabase` reports the capability as missing rather than failing.
+   */
+  exportSnapshot?(): Promise<DatabaseSnapshot>;
+  /**
+   * Optional: loads a snapshot into this store, which must be empty. Pairs with
+   * `exportSnapshot` — implement both or neither.
+   */
+  importSnapshot?(
+    snapshot: DatabaseSnapshot,
+    options?: { onProgress?: (progress: SnapshotLoadProgress) => void },
+  ): Promise<void>;
+  /**
+   * Optional: what this database's data occupies in its substrate, in bytes — the number an
+   * application shows a user next to the quota, and what the benchmarks report.
+   */
+  getLogicalStorageBytes?(): Promise<number>;
+  /**
+   * Releases whatever the connection holds (open handles, channels, timers) without flushing
+   * or deleting anything. Synchronous; safe to call twice. Data durability must never depend
+   * on close being called — tabs die without warning.
+   */
   close(): void;
 }
 

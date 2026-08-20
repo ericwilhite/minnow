@@ -1,19 +1,23 @@
 ---
 title: Storage adapters
-description: The block store contract, and choosing between IndexedDB and memory.
+description: The block store contract, and choosing between IndexedDB, OPFS, and memory.
 ---
 
 A database is an engine plus a store. The engine decides what to write; the store decides where it
-goes. Two adapters ship today, both implementing the same `BlockStore` contract, so swapping one
-for the other changes nothing else about your code.
+goes. Three adapters ship today, all implementing the same `BlockStore` contract, so swapping one
+for another changes nothing else about your code.
 
-| Adapter                                          | Import                   | Survives a reload | Use it for                               |
-| ------------------------------------------------ | ------------------------ | ----------------- | ---------------------------------------- |
-| [`IndexedDbBlockStore`](/docs/storage/indexeddb) | `@minnowdb/core/storage` | Yes               | Applications.                            |
-| [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage` | No                | Tests, scratch work, throwaway analysis. |
+| Adapter                                          | Import                   | Survives a reload | Use it for                                         |
+| ------------------------------------------------ | ------------------------ | ----------------- | -------------------------------------------------- |
+| [`IndexedDbBlockStore`](/docs/storage/indexeddb) | `@minnowdb/core/storage` | Yes               | Applications.                                      |
+| [`OpfsBlockStore`](/docs/storage/opfs)           | `@minnowdb/core/storage` | Yes               | Applications, where OPFS exists (worker required). |
+| [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage` | No                | Tests, scratch work, throwaway analysis.           |
 
-OPFS is a likely third: it is a better fit for large sequential writes than IndexedDB, at the cost
-of needing cross-origin isolation to use its fast synchronous handles.
+The two durable adapters hold the same block format, and a [snapshot](/docs/storage/snapshots)
+moves a database between them. Speed is measured live on the [benchmarks page](/benchmarks)
+rather than asserted here — on current engines the OPFS adapter's small reads and writes
+measure several times faster. Where OPFS is unavailable — notably Safari private browsing —
+IndexedDB is the fallback, and it remains the default.
 
 ## What a store holds
 
@@ -35,24 +39,14 @@ property of this layout rather than of any locking.
 
 ## Writing your own
 
-`BlockStore` is a public interface. Implementing it against another substrate — OPFS, a remote
-object store, an encrypted wrapper — gives you a working database with no engine changes.
-
-Several methods are optional (`getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
-`stageTransactionArtifacts`). They exist so an adapter that can do something atomically may say
-so; callers fall back to the individual calls when they are absent. Be honest about which you
-implement — the engine trusts a present method to be atomic.
-
-`FaultInjectingBlockStore` from `@minnowdb/core/testing` wraps any store and fails at named points,
-which is how the engine's own crash-recovery behaviour is tested:
-
-```ts
-import { FaultInjectingBlockStore } from "@minnowdb/core/testing";
-
-const store = new FaultInjectingBlockStore(new MemoryBlockStore(), (point) =>
-  point === "beforeManifestCommit" ? new Error("boom") : undefined,
-);
-```
+`BlockStore` is a public, documented contract — seven capability interfaces, a rulebook in
+their TSDoc, and a conformance kit (`blockStoreConformanceCases` from `@minnowdb/core/testing`)
+that checks an implementation against every rule the shipped adapters answer to. Implementing
+it against another substrate — React Native storage, an object store, the Node filesystem, an
+encrypted wrapper — gives you a working database with no engine changes. You do not start from
+a blank interface either: `@minnowdb/core/storage/toolkit` publishes the record-semantics core
+and the write-ahead-log machinery the shipped adapters themselves are assembled from.
+[Writing a storage adapter](/docs/storage/custom) is the guide.
 
 ## Moving data between stores
 

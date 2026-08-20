@@ -25,7 +25,13 @@
  */
 import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
-import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import {
+  IndexedDbBlockStore,
+  MemoryBlockStore,
+  OpfsBlockStore,
+  type BlockStore,
+} from "../storage/index.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
 
 const RETRIES = 8;
@@ -152,5 +158,63 @@ describe("concurrent writes to one table", () => {
     expect(
       (await database.query("SELECT COUNT(*) AS n FROM items", { memoize: false })).rows,
     ).toEqual([{ n: 24 }]);
+  });
+
+  it("lets every writer through on one OPFS instance", async () => {
+    // One instance serializes its own appends, so a retrying writer replays to the fresh tail
+    // before recommitting and the loop makes progress like the memory store's queue. (On a real
+    // disk, slower appends shift this toward the IndexedDB ceiling; the shim pins the shape,
+    // not a latency-dependent number.)
+    for (const writers of [16, 64]) {
+      const store = await OpfsBlockStore.open({
+        name: crypto.randomUUID(),
+        root: new MemoryOpfs().root,
+      });
+      const { accepted, persisted } = await contend(store, writers);
+      expect(accepted, `${String(writers)} writers`).toBe(writers);
+      expect(persisted, `${String(writers)} writers`).toBe(writers);
+    }
+  });
+
+  it("loses cleanly across two OPFS instances racing on one directory", async () => {
+    // Two store instances over one root are two real tabs: the only arbiter between them is the
+    // exclusive handle on the command log's next sequence file. Winners must persist exactly,
+    // losers must vanish exactly, and both instances must converge on one database.
+    const shim = new MemoryOpfs();
+    const name = crypto.randomUUID();
+    const firstStore = await OpfsBlockStore.open({ name, root: shim.root });
+    const secondStore = await OpfsBlockStore.open({ name, root: shim.root });
+    const first = new MinnowDatabase(firstStore, { maxCommitRetries: RETRIES });
+    const second = new MinnowDatabase(secondStore, { maxCommitRetries: RETRIES });
+    await first.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "value", type: "number" },
+      ],
+    });
+
+    const accepted: number[] = [];
+    await Promise.all(
+      Array.from({ length: 24 }, (_, index) =>
+        (index % 2 === 0 ? first : second)
+          .insertBatch("items", [{ id: index, value: index * 10 }])
+          .then(
+            () => accepted.push(index),
+            () => undefined,
+          ),
+      ),
+    );
+    accepted.sort((left, right) => left - right);
+    expect(accepted.length).toBeGreaterThan(0);
+
+    for (const database of [first, second]) {
+      const rows = (
+        await database.query("SELECT id, value FROM items ORDER BY id", { memoize: false })
+      ).rows as Array<{ id: number; value: number }>;
+      expect(rows.map((row) => row.id)).toEqual(accepted);
+      for (const row of rows) expect(row.value).toBe(row.id * 10);
+    }
   });
 });

@@ -44,7 +44,7 @@ import { MemoryBlockStore } from "@minnowdb/core/storage";
 const db = new MinnowDatabase(MemoryBlockStore.fromSnapshot(await decodeSnapshot(bytes)));
 ```
 
-Or into IndexedDB, where it is durable and available on the next visit:
+Or into IndexedDB or OPFS, where it is durable and available on the next visit:
 
 ```ts
 const store = await IndexedDbBlockStore.open({ name: "seeded" });
@@ -105,6 +105,11 @@ consistent version.
 `IndexedDbBlockStore#exportSnapshot` reads across several transactions, so a concurrent commit
 could move the version underneath it. Hold a backup lease across the call when another writer is
 possible; a build script that is the only writer in its process does not need one.
+
+`OpfsBlockStore#exportSnapshot` runs as a single operation on the leader's queue, so no commit
+or garbage collection can interleave with it — always consistent, like the memory store, with no
+lease needed. Full-text bases export as rebuilds — a cost in speed on the restored database,
+never in answers.
 
 `MinnowDatabase#exportSnapshot` delegates to whichever of those the database was built on, so it
 inherits the same rule. A store that implements neither method says so rather than failing as a

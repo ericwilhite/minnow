@@ -5,8 +5,8 @@ import { validateDatasetSuitePayload } from "./worker/support";
 import { writeCaseDefinitions } from "./worker/write-suite";
 
 describe("benchmark suite contracts", () => {
-  it("limits benchmark comparisons to the three storage peers", () => {
-    expect(engineIds).toEqual(["minnow", "sqlite", "pglite"]);
+  it("limits benchmark comparisons to the storage peers", () => {
+    expect(engineIds).toEqual(["minnow", "minnow-opfs", "sqlite", "pglite"]);
   });
 
   it("keeps OLTP and OLAP coverage explicit for reads and writes", () => {

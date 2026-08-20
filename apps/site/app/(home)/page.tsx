@@ -9,11 +9,11 @@ const FACTS = [
   },
   {
     title: "No WebAssembly to download",
-    body: "Plain JavaScript, around 159 KB gzipped. Nothing is fetched and compiled before the first query answers.",
+    body: "Plain JavaScript, around 172 KB gzipped. Nothing is fetched and compiled before the first query answers.",
   },
   {
     title: "Columnar and durable",
-    body: "Immutable compressed column blocks on IndexedDB, read through snapshots. Writes publish atomically; another tab sees the old version or the new one, never half of one.",
+    body: "Immutable compressed column blocks on IndexedDB or OPFS, read through snapshots. Writes publish atomically; another tab sees the old version or the new one, never half of one.",
   },
   {
     title: "Bounded memory",
@@ -34,7 +34,8 @@ export default function HomePage() {
         </h1>
         <p className="mx-auto mt-4 max-w-2xl text-balance text-lg text-fd-muted-foreground">
           Minnow is a columnar SQL database for the browser. Real queries over immutable snapshots,
-          durable on IndexedDB, with no server and nothing to compile before the first answer.
+          durable on IndexedDB or OPFS, with no server and nothing to compile before the first
+          answer.
         </p>
         <div className="mt-7 flex flex-wrap items-center justify-center gap-3">
           <Link

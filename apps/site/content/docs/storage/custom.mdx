@@ -1,0 +1,168 @@
+---
+title: Writing a storage adapter
+description: The block store contract, the rules an implementation must honor, the conformance kit that checks them, and the toolkit the shipped adapters are built from.
+---
+
+Minnow's engine holds exactly one `BlockStore` and talks to nothing else persistent. That is
+the whole coupling: implement the interface against a new substrate and you have a working
+database with no engine changes. The three shipped adapters were built against precisely this
+contract — the same door is open to a React Native storage layer, an object store like R2, the
+Node filesystem, or an encrypted wrapper around any of them.
+
+```ts
+import type { BlockStore } from "@minnowdb/core/storage";
+
+class MyBlockStore implements BlockStore {
+  // ...
+}
+
+const db = new MinnowDatabase(new MyBlockStore());
+```
+
+## The shape of the contract
+
+`BlockStore` is composed of seven capability interfaces, each one concern:
+
+| Interface           | Owns                                                                   |
+| ------------------- | ---------------------------------------------------------------------- |
+| `BlockPayloadStore` | Immutable byte blobs — the columnar data itself.                       |
+| `CatalogStore`      | Table records, row-id and auto-increment counters, unique-key lookups. |
+| `TransactionStore`  | Manifests, segments, transaction records, and the atomic commit.       |
+| `LeaseStore`        | Reader pins that protect versions from garbage collection.             |
+| `MaintenanceStore`  | Resumable compaction and garbage-collection job records.               |
+| `FtsIndexStore`     | Full-text base chunks and candidate reads.                             |
+| `TempSpillStore`    | Query spill pages and their owner leases.                              |
+
+Every method's exact semantics — ordering, conflict classes, what must be atomic — are
+documented on the interfaces themselves in `@minnowdb/core/storage`; that TSDoc is the
+normative text. What follows is the shape of the rules.
+
+## The rules
+
+**A store holds records and blobs, not rows.** The engine hands you immutable compressed
+blocks plus small structured records: manifests saying which blocks are live at each version,
+segments mapping blocks to tables, transactions, leases, jobs, counters, keys. Because
+published blocks never change and a version is just a set of block ids, readers hold versions
+open while writers commit — the concurrency story is the data model, not locks you invent.
+
+**Everything is atomic, always.** A method that resolves has happened; one that rejects has
+observably not. `commitTransaction` is the heart: manifest CAS, publication, segment
+finalization, unique keys, full-text deltas, and the record flip — one durable all-or-nothing
+step, including against a crash at any moment.
+
+**Conflicts are typed, by exact class.** Compare-and-swap failures throw the exported error
+classes (`WriteConflictError`, `TransactionRecordConflictError`, and the rest) — not wrappers,
+not subclasses. The engine's retry and rebase loops match on them, and the worker client
+rehydrates them by constructor name across the thread boundary.
+
+**Platform failures pass through.** A quota refusal escapes as the environment's own
+`QuotaExceededError`, unwrapped, with prior data intact and the same write succeeding once
+space frees.
+
+**Nothing is shared.** Copy bytes and records in both directions; the engine may reuse the
+buffers it hands you and mutate the records you return.
+
+**Optional means atomic.** `getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
+`stageTransactionArtifacts`, `putTempRunPages`, and the snapshot pair are optional so an
+adapter that can do something in one atomic step may say so. Callers trust a present method
+completely and fall back to sequential calls otherwise — never implement one as the sequential
+calls in a trench coat.
+
+**Tabs are plural and mortal.** Several connections may open one database; readers never block
+writers; a connection can die between any two operations without corrupting anything. How you
+achieve that is yours: the IndexedDB adapter leans on storage transactions, the OPFS adapter
+on a write-ahead log behind a browser-arbitrated leader. (An adapter for a single-process
+environment — Node, React Native — has an easier version of this problem, not a different
+contract.)
+
+## The conformance kit
+
+The kit is the executable half of this page. It runs under any test framework and checks the
+rules above — atomicity, exact conflict classes, defensive copies, ordering, durability across
+a reopen:
+
+```ts
+import { blockStoreConformanceCases } from "@minnowdb/core/testing";
+
+for (const conformanceCase of blockStoreConformanceCases()) {
+  it(conformanceCase.name, () =>
+    conformanceCase.run({
+      create: () => MyBlockStore.open({ name: crypto.randomUUID() }),
+      reopen: async (store) => {
+        store.close();
+        return MyBlockStore.open(/* the same database */);
+      },
+    }),
+  );
+}
+```
+
+Provide `reopen` — without it the durability half of the contract goes unchecked. The kit is a
+floor, not a ceiling: Minnow's own adapters additionally run fault sweeps that interrupt every
+storage operation, concurrency soaks, and quota injection, and the kit itself runs against all
+three shipped adapters in CI so it cannot drift from what they do. `FaultInjectingBlockStore`
+from the same entry point wraps any store to fail at named points when you want to test your
+own crash handling.
+
+## Two architectures that work
+
+**Direct** — map each record family onto your substrate's own transactional primitives, the
+way the IndexedDB adapter maps them onto object stores and `commitTransaction` onto one
+read-write transaction. Right when the substrate has real multi-key atomic transactions.
+
+**Log-structured, single writer** — the OPFS adapter's shape, and the natural one for
+substrates that only offer files or blobs: keep every record in memory, append each mutation
+as a checksummed frame to a write-ahead log, fold into checkpoints, pack blobs into extent
+files, and let one connection own the writes. Recovery is checkpoint-plus-tail; a torn tail
+frame reads as "not written". This maps directly onto the Node filesystem (`fs` handles in
+place of sync access handles), React Native storage, or an object store like R2 — where the
+log grows by conditional puts and the single-writer election uses the store's own
+precondition primitives. Multi-client coordination is the part you own; everything above the
+persistence layer behaves identically — and ships as reusable pieces in the toolkit below.
+
+Either way, [snapshots](/docs/storage/snapshots) come almost free — one committed version as a
+portable file — and are also the migration path between your store and the shipped ones.
+
+## The adapter toolkit
+
+`@minnowdb/core/storage/toolkit` is the library the shipped adapters are assembled from,
+published so a new adapter can start from working parts instead of a blank interface. It is
+deliberately **not** part of the contract: the engine never references it, the conformance kit
+never requires it, and an adapter that stores records some entirely different way is just as
+conformant. It exists because the hardest thousand lines of an adapter are the same for
+everyone.
+
+| Export                         | What it is                                                                                                                                                                                                                                   |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RecordCore`                   | The record-state machine behind the memory and OPFS adapters: every record family, validation order, typed conflict, and defensive copy the contract requires, one synchronous method per operation, plus `dump()`/`load()` for checkpoints. |
+| `WalWriter`, `replayWalFrames` | Checksummed write-ahead-log frames over one held file handle. Replay stops at the first torn frame, which is exactly what a crash can leave.                                                                                                 |
+| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length }`, with sealing and a read-handle cache.                                                                                                          |
+| `encodeRecordJson` and friends | The JSON codec (bigints included) and the checksummed, versioned envelopes for checkpoints and immutable chunks.                                                                                                                             |
+| `SyncFileHandle`               | The only substrate assumption the file-shaped pieces make: positioned synchronous read/write/truncate/flush. The browser's `FileSystemSyncAccessHandle` satisfies it as-is; a Node file descriptor wrapper is a dozen lines.                 |
+
+Wrapping `RecordCore` obligates you to two things. **One writer at a time** — its methods
+validate and then mutate synchronously, so calls must never interleave (a promise-chain queue,
+a leader, or a process-wide lock all work). **Durability is yours** — the core is memory:
+log each mutation, checkpoint with `dump()` (serialize the result immediately; its arrays
+alias live state), and replay on open. One ordering rule is load-bearing for any single-log
+design: write the checkpoint, flush it, and only then reset the log — never the other way.
+
+The proof all of this composes is checked in as a test:
+[`toolkit-example.test.ts`](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/storage/toolkit/toolkit-example.test.ts)
+builds a complete, persistent, log-structured `BlockStore` from these exports alone — record
+semantics from `RecordCore`, one WAL, blobs in extents, a checkpoint at open — and passes the
+same conformance suite the shipped adapters pass. Reading it top to bottom is the fastest way
+to see where your substrate slots in.
+
+For running your adapter in plain Node tests, `MemoryOpfs` from `@minnowdb/core/testing` is an
+in-memory origin-private file system with the semantics that make storage interesting to test:
+exclusive sync-access locks that throw the real `DOMException`s, and injectable write faults
+for quota and crash suites.
+
+## What the optional methods buy
+
+The engine works over the required surface alone, at a cost: without `getCatalogProbe` it
+cannot cache catalog state at all, and without `beginTransaction` /
+`stageTransactionArtifacts` every commit spends extra round trips. Implement the probe first
+(it is the single most valuable), then the batched pair; add `putTempRunPages` when your
+substrate charges per call, and the snapshot pair when your store should be exportable.

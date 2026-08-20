@@ -10,19 +10,19 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 
 ## Choose the smallest runner that proves the change
 
-| Command                        | What it runs                                                          | Use it for                         |
-| ------------------------------ | --------------------------------------------------------------------- | ---------------------------------- |
-| `npm test`                     | Vitest unit, conformance, differential, and harness tests             | Normal implementation work         |
-| `npm run test:coverage`        | The same suite, with the coverage floors enforced                     | Before pushing                     |
-| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures     | Hunting bugs rather than pinning   |
-| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture       | Before changing a format version   |
-| `npm run test:browser:library` | Core IndexedDB and transaction tests in Chromium, Firefox, and WebKit | Storage or browser-runtime changes |
-| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                 | Docs, examples, and site changes   |
-| `npm run test:browser`         | Both browser runners, in sequence                                     | Cross-browser regression checks    |
-| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline        | Query-executor performance changes |
-| `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages | Dependency or public-entry changes |
-| `npm run check`                | Formatting, types, lint, build, and unit tests with coverage floors   | The local merge gate               |
-| `npm run check:release`        | The local gate, performance gate, and all browser runners             | Release candidates                 |
+| Command                        | What it runs                                                                 | Use it for                         |
+| ------------------------------ | ---------------------------------------------------------------------------- | ---------------------------------- |
+| `npm test`                     | Vitest unit, conformance, differential, and harness tests                    | Normal implementation work         |
+| `npm run test:coverage`        | The same suite, with the coverage floors enforced                            | Before pushing                     |
+| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures            | Hunting bugs rather than pinning   |
+| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture              | Before changing a format version   |
+| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit | Storage or browser-runtime changes |
+| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                        | Docs, examples, and site changes   |
+| `npm run test:browser`         | Both browser runners, in sequence                                            | Cross-browser regression checks    |
+| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline               | Query-executor performance changes |
+| `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages        | Dependency or public-entry changes |
+| `npm run check`                | Formatting, types, lint, build, and unit tests with coverage floors          | The local merge gate               |
+| `npm run check:release`        | The local gate, performance gate, and all browser runners                    | Release candidates                 |
 
 Install the browser binaries once before using a browser runner:
 
@@ -47,7 +47,7 @@ application it starts.
   benchmark generator/oracle contracts. `npm test` picks up `apps/site/bench` alongside
   `packages/**`, so the dataset generator, the oracles, and the suite definitions are checked on
   every unit run.
-- **Library browser tests** exercise IndexedDB and transaction behavior that a Node substitute
+- **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
   cannot prove, and drive a database through a real module worker: the published entry booting,
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.
 - **Site browser tests** execute the public examples and drive the benchmarks page itself: one

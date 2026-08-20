@@ -178,7 +178,8 @@ const bundle = {
     "Each engine's browser entry bundled with esbuild (ESM, minified, production), plus the Wasm and data files it fetches at run time. Gzip is level 9.",
   engines,
 };
-writeFileSync(OUTPUT, JSON.stringify(bundle, null, 1) + "\n");
+// Two-space indent so the generated file is already in Prettier style.
+writeFileSync(OUTPUT, JSON.stringify(bundle, null, 2) + "\n");
 
 const kb = (bytes: number): string => `${(bytes / 1024).toFixed(1)} KB`;
 for (const engine of engines) {

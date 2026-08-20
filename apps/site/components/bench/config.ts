@@ -22,7 +22,8 @@ export interface EngineChoice {
   download?: string;
 }
 
-export type ColumnId = "minnow" | "minnow-cached" | "sqlite" | "pglite";
+export type ColumnId =
+  "minnow" | "minnow-cached" | "minnow-opfs" | "minnow-opfs-cached" | "sqlite" | "pglite";
 
 export const ENGINES: readonly EngineChoice[] = [
   {
@@ -30,7 +31,7 @@ export const ENGINES: readonly EngineChoice[] = [
     engine: "minnow",
     label: "Minnow",
     note: "This engine. Columnar blocks on IndexedDB, plain JavaScript.",
-    download: "159 KB",
+    download: "172 KB",
   },
   {
     id: "minnow-cached",
@@ -40,18 +41,31 @@ export const ENGINES: readonly EngineChoice[] = [
     note: "The same statement repeated with the probe-validated result memo left on, which is the default an application gets. It measures the cache, not execution.",
   },
   {
+    id: "minnow-opfs",
+    engine: "minnow-opfs",
+    label: "Minnow (OPFS)",
+    note: "The same engine over the Origin Private File System: a leader tab holds the file handles and commits through a write-ahead log at synchronous-I/O speed. Same download as Minnow.",
+  },
+  {
+    id: "minnow-opfs-cached",
+    engine: "minnow-opfs",
+    cached: true,
+    label: "Minnow (OPFS, cached)",
+    note: "The OPFS store's repeat with the probe-validated result memo left on, which is the default an application gets. It measures the cache, not execution.",
+  },
+  {
     id: "sqlite",
     engine: "sqlite",
     label: "SQLite Wasm",
     note: "The official build, persisting through an OPFS VFS.",
-    download: "1.2 MB",
+    download: "457 KB",
   },
   {
     id: "pglite",
     engine: "pglite",
     label: "PGlite",
     note: "Postgres compiled to WebAssembly, persisting through IndexedDB.",
-    download: "6.0 MB",
+    download: "5.6 MB",
   },
 ];
 
@@ -84,6 +98,8 @@ export function storageLabel(choice: EngineChoice, observed?: string): string {
   switch (choice.engine) {
     case "minnow":
       return choice.cached === true ? "IndexedDB · result memo on" : "IndexedDB";
+    case "minnow-opfs":
+      return choice.cached === true ? "OPFS · result memo on" : "OPFS";
     case "sqlite":
       return "OPFS";
     case "pglite":
@@ -141,6 +157,8 @@ export const SCALES: readonly ScaleChoice[] = [0.1, 0.5, 1, 2, 5].map((scale) =>
 /** Rough stored bytes per engine at a scale, for the warning before a run starts. */
 const BYTES_PER_ROW: Record<EngineId, number> = {
   minnow: 19,
+  // The identical block format; the command log and checkpoints add low single-digit percent.
+  "minnow-opfs": 20,
   sqlite: 80,
   pglite: 150,
 };

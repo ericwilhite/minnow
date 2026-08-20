@@ -135,8 +135,8 @@ const client = new MinnowDatabaseClient(
 
 ## Custom worker entries
 
-The stock entry covers everything a message can carry: the store descriptor (`indexeddb` or
-`memory`) plus `compression`, `rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and
+The stock entry covers everything a message can carry: the store descriptor (`indexeddb`,
+`opfs`, or `memory`) plus `compression`, `rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and
 `bufferPoolBytes`. For anything a message can't carry — a custom `BlockStore`, deterministic
 `now`/`createId` — write your own entry:
 
@@ -155,5 +155,5 @@ exposeDatabase(new MinnowDatabase(store, { compression: "gzip" }), self, {
 change. Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe
 RPC where each handle answers a fixed list of methods — never arbitrary property access.
 
-> The worker changes where work runs, not the rules: IndexedDB stays authoritative, and
-> durability still ends at a committed transaction. See [Architecture](/docs/reference/architecture).
+> The worker changes where work runs, not the rules: the durable store stays authoritative, and
+> durability still ends at a committed storage write. See [Architecture](/docs/reference/architecture).

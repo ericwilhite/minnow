@@ -125,6 +125,8 @@ export async function loadDriver(engine: EngineId): Promise<EngineDriver> {
   switch (engine) {
     case "minnow":
       return (await import("./minnow")).minnowDriver;
+    case "minnow-opfs":
+      return (await import("./minnow-opfs")).minnowOpfsDriver;
     case "sqlite":
       return (await import("./sqlite")).sqliteDriver;
     case "pglite":

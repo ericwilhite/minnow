@@ -1,4 +1,9 @@
-import { IndexedDbBlockStore, MemoryBlockStore, type BlockStore } from "../storage/index.js";
+import {
+  IndexedDbBlockStore,
+  MemoryBlockStore,
+  OpfsBlockStore,
+  type BlockStore,
+} from "../storage/index.js";
 import {
   parseRpcRequest,
   rpcEvent,
@@ -29,7 +34,9 @@ import { deserializeSchema, serializeMigrationSteps, type WireSchema } from "./s
  */
 
 export type StoreDescriptor =
-  { kind: "memory" } | { kind: "indexeddb"; name: string; durability?: IDBTransactionDurability };
+  | { kind: "memory" }
+  | { kind: "indexeddb"; name: string; durability?: IDBTransactionDurability }
+  | { kind: "opfs"; name: string; durability?: "relaxed" | "strict" };
 
 /** The cloneable subset of MinnowDatabaseOptions; function-valued seams stay worker-side. */
 export type WireDatabaseOptions = Pick<
@@ -71,6 +78,12 @@ export interface RpcScope {
 export interface ExposeDatabaseOptions {
   /** Called when the client sends its dispose frame, after every handle has been closed. */
   onDispose?: () => void | Promise<void>;
+  /**
+   * Called when the main thread reports its page visibility. The stock entry forwards this to
+   * the store's `setForeground` when it has one — the OPFS store uses it to keep leadership
+   * on the tab the user is looking at.
+   */
+  onVisibility?: (visible: boolean) => void;
 }
 
 export interface AttachDatabaseWorkerOptions {
@@ -258,6 +271,10 @@ class DatabaseRpcServer {
       case "dispose": {
         await this.#dispose();
         return { disposed: true };
+      }
+      case "setVisibility": {
+        this.options.onVisibility?.(args[0] === true);
+        return { acknowledged: true };
       }
       default:
         throw new Error(`Unsupported database method: ${method}`);
@@ -583,7 +600,12 @@ async function createServer(
 ): Promise<DatabaseRpcServer> {
   const store = await createStore(payload.store, options);
   const database = new MinnowDatabase(store, payload.options ?? {});
-  return new DatabaseRpcServer(database, scope, { onDispose: () => store.close() });
+  return new DatabaseRpcServer(database, scope, {
+    onDispose: () => store.close(),
+    onVisibility: (visible) => {
+      (store as { setForeground?: (foreground: boolean) => void }).setForeground?.(visible);
+    },
+  });
 }
 
 async function createStore(
@@ -591,6 +613,12 @@ async function createStore(
   options: AttachDatabaseWorkerOptions,
 ): Promise<BlockStore> {
   if (descriptor.kind === "memory") return new MemoryBlockStore();
+  if (descriptor.kind === "opfs") {
+    return OpfsBlockStore.open({
+      name: descriptor.name,
+      ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
+    });
+  }
   return IndexedDbBlockStore.open({
     name: descriptor.name,
     ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),

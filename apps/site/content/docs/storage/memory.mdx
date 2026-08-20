@@ -35,8 +35,8 @@ portable artifact.
 ## What it costs
 
 Everything lives in JavaScript memory: block payloads stay compressed, but they stay resident.
-Budget roughly what the same data would occupy in IndexedDB, plus the catalog.
+Budget roughly what the same data would occupy in a durable store, plus the catalog.
 
 Nothing survives a reload, and nothing is shared between tabs — two tabs each get their own
-database. Where the IndexedDB adapter's cross-tab behaviour needs testing, that has to be a
+database. Where a durable adapter's cross-tab behaviour needs testing, that has to be a
 browser test against the real store.

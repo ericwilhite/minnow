@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "kind": "library-sizes",
+  "measuredAt": "2026-08-20T01:50:09.359Z",
+  "method": "Each engine's browser entry bundled with esbuild (ESM, minified, production), plus the Wasm and data files it fetches at run time. Gzip is level 9.",
+  "engines": [
+    {
+      "id": "minnow",
+      "name": "Minnow",
+      "package": "@minnowdb/core",
+      "version": "0.1.1",
+      "note": "Plain JavaScript. Nothing else to fetch.",
+      "assets": [
+        {
+          "name": "JavaScript (bundled, minified)",
+          "bytes": 642736,
+          "gzipBytes": 176145
+        }
+      ],
+      "totalBytes": 642736,
+      "totalGzipBytes": 176145
+    },
+    {
+      "id": "sqlite",
+      "name": "SQLite Wasm",
+      "package": "@sqlite.org/sqlite-wasm",
+      "version": "3.53.0-build1",
+      "note": "The loader plus the SQLite Wasm build it instantiates.",
+      "assets": [
+        {
+          "name": "JavaScript (bundled, minified)",
+          "bytes": 215929,
+          "gzipBytes": 66370
+        },
+        {
+          "name": "sqlite3.wasm",
+          "bytes": 864752,
+          "gzipBytes": 401758
+        }
+      ],
+      "totalBytes": 1080681,
+      "totalGzipBytes": 468128
+    },
+    {
+      "id": "pglite",
+      "name": "PGlite",
+      "package": "@electric-sql/pglite",
+      "version": "0.5.5",
+      "note": "The loader, the PostgreSQL Wasm build, and the packed data directory it unpacks on first run.",
+      "assets": [
+        {
+          "name": "JavaScript (bundled, minified)",
+          "bytes": 604282,
+          "gzipBytes": 141365
+        },
+        {
+          "name": "pglite.wasm",
+          "bytes": 10087563,
+          "gzipBytes": 3439412
+        },
+        {
+          "name": "pglite.data",
+          "bytes": 6293225,
+          "gzipBytes": 2139915
+        }
+      ],
+      "totalBytes": 16985070,
+      "totalGzipBytes": 5720692
+    }
+  ]
+}

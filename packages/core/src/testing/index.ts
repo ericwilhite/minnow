@@ -371,3 +371,12 @@ export class FaultInjectingBlockStore implements BlockStore {
     this.inner.close();
   }
 }
+
+export {
+  blockStoreConformanceCases,
+  runBlockStoreConformance,
+  type BlockStoreConformanceCase,
+  type BlockStoreConformanceTarget,
+} from "./block-store-conformance.js";
+
+export { MemoryOpfs, type WriteFault } from "./opfs-shim.js";

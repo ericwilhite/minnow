@@ -7,7 +7,7 @@ description: Install the package and open a database.
 npm install @minnowdb/core
 ```
 
-Plain JavaScript, no post-install step and no binary to fetch. It is around 159 KB gzipped —
+Plain JavaScript, no post-install step and no binary to fetch. It is around 172 KB gzipped —
 roughly a third of SQLite's WebAssembly build, which also has to download and compile its module
 before it can answer anything.
 
@@ -25,16 +25,17 @@ mixed-major pair on its own. See [Versioning](/docs/reference/versioning).
 
 ## Entry points
 
-| Import                        | What it is                                                                              |
-| ----------------------------- | --------------------------------------------------------------------------------------- |
-| `@minnowdb/core`              | The engine: `MinnowDatabase` and everything for running SQL in the current thread.      |
-| `@minnowdb/core/storage`      | Block stores: `IndexedDbBlockStore`, `MemoryBlockStore`, and the `BlockStore` contract. |
-| `@minnowdb/core/worker`       | A ready-made worker entry. Point a module worker at it.                                 |
-| `@minnowdb/core/client`       | `MinnowDatabaseClient`, the main-thread half of the worker pair.                        |
-| `@minnowdb/core/plan`         | Plan-construction primitives, for building a typed layer over the engine.               |
-| `@minnowdb/core/testing`      | `FaultInjectingBlockStore`, for testing behaviour under storage failure.                |
-| `@minnowdb/core/block-format` | The on-disk block encoding, for tools that read blocks directly.                        |
-| `@minnowdb/client`            | Optional typed query builder: `createMinnow`, `InferDatabase`.                          |
+| Import                           | What it is                                                                                                        |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `@minnowdb/core`                 | The engine: `MinnowDatabase` and everything for running SQL in the current thread.                                |
+| `@minnowdb/core/storage`         | Block stores: `IndexedDbBlockStore`, `OpfsBlockStore`, `MemoryBlockStore`, and the `BlockStore` contract.         |
+| `@minnowdb/core/storage/toolkit` | Building blocks for [writing storage adapters](/docs/storage/custom): `RecordCore`, the WAL and extent machinery. |
+| `@minnowdb/core/worker`          | A ready-made worker entry. Point a module worker at it.                                                           |
+| `@minnowdb/core/client`          | `MinnowDatabaseClient`, the main-thread half of the worker pair.                                                  |
+| `@minnowdb/core/plan`            | Plan-construction primitives, for building a typed layer over the engine.                                         |
+| `@minnowdb/core/testing`         | `FaultInjectingBlockStore` and the block-store conformance kit, for testing stores and storage failure.           |
+| `@minnowdb/core/block-format`    | The on-disk block encoding, for tools that read blocks directly.                                                  |
+| `@minnowdb/client`               | Optional typed query builder: `createMinnow`, `InferDatabase`.                                                    |
 
 ## Opening a database
 
@@ -47,6 +48,15 @@ import { IndexedDbBlockStore } from "@minnowdb/core/storage";
 
 const store = await IndexedDbBlockStore.open({ name: "shop" });
 const db = new MinnowDatabase(store);
+```
+
+Inside a worker, [OPFS](/docs/storage/opfs) is the other durable choice — the same call against
+a different floor:
+
+```ts
+import { OpfsBlockStore } from "@minnowdb/core/storage";
+
+const db = new MinnowDatabase(await OpfsBlockStore.open({ name: "shop" }));
 ```
 
 For tests and for data that should not outlive the page, swap in the in-memory store — it
@@ -62,9 +72,10 @@ See [Storage](/docs/storage) for what each adapter costs and guarantees.
 
 ## Where it runs
 
-Anything with IndexedDB and `CompressionStream`: current Chrome, Firefox, Safari, and Edge, in a
-window or a worker. There is no Node build — the engine targets browsers, and the tests run it in
-real ones.
+Anything with `CompressionStream` and a durable store: current Chrome, Firefox, Safari, and
+Edge, in a window or a worker. [IndexedDB](/docs/storage/indexeddb) works everywhere;
+[OPFS](/docs/storage/opfs) needs a worker and does not exist in Safari private browsing. There is
+no Node build — the engine targets browsers, and the tests run it in real ones.
 
 Most applications should [run the engine in a worker](/docs/engine/workers). The API is identical
 on either side of the boundary, and query execution then never competes with rendering.

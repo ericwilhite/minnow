@@ -1,0 +1,127 @@
+---
+title: OPFS
+description: The file-based durable adapter — how leadership, the write-ahead log, and speed work.
+---
+
+```ts
+import { OpfsBlockStore } from "@minnowdb/core/storage";
+
+const store = await OpfsBlockStore.open({
+  name: "shop",
+  durability: "relaxed",
+});
+```
+
+| Option       | Default      | Effect                                                                            |
+| ------------ | ------------ | --------------------------------------------------------------------------------- |
+| `name`       | —            | The database directory name. Two stores with the same name are the same database. |
+| `durability` | `"relaxed"`  | `"strict"` flushes to disk per commit.                                            |
+| `root`       | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                          |
+
+The store lives in the [Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
+and is built around its one genuinely fast primitive: a synchronous access handle that stays
+open, where reads and writes cost microseconds. Those handles need no special headers and no
+cross-origin isolation — only a dedicated worker, which is where the engine
+[already runs](/docs/engine/workers). Pages with embedded payment or third-party components
+keep working unchanged.
+
+## Where it runs
+
+Anything with OPFS synchronous access handles: current Chrome, Firefox, Safari 16.4+, and Edge.
+Two gaps to know about: Safari's private browsing has no OPFS at all, and the store must live in
+a worker (`{ kind: "opfs", name }` through the worker client just works; the main thread cannot
+hold synchronous handles). Where OPFS is unavailable, [IndexedDB](/docs/storage/indexeddb) is the
+durable fallback:
+
+```ts
+const supported = "storage" in navigator && "getDirectory" in navigator.storage;
+const store = { kind: supported ? ("opfs" as const) : ("indexeddb" as const), name: "shop" };
+```
+
+## One leader, held handles
+
+At any moment, exactly one connection — the **leader** — holds the database's file handles: the
+write-ahead log, two checkpoint slots, and the packed data files. Leadership _is_ the log file's
+own exclusive handle, a lock the browser enforces against the actual resource and releases the
+instant its holder dies. There is no lease to time out and no election protocol to trust:
+becoming leader is opening the file, and failover is the next connection's open succeeding.
+
+The leader does every operation at held-handle speed. A commit validates in memory and appends
+one checksummed frame to the log — a synchronous write, microseconds. Reads answer from memory
+and from synchronous reads of the data files. And because the leader is provably the only
+writer, it never checks anything for freshness: the probes and version checks other designs pay
+per operation simply do not exist. This is why the store is fast: on the
+[benchmarks page](/benchmarks) the Minnow columns run the identical engine and workload, and
+the OPFS column's small operations run several times faster than IndexedDB's.
+
+Other tabs are **followers**: their operations travel a `BroadcastChannel` to the leader and are
+acknowledged only after the leader's log holds them. A lost message costs a retry — request ids
+keep a retried operation from applying twice — and a dead leader costs a failover. Correctness
+never rides on a message; the channel affects how fast multi-tab work moves, never whether it is
+right. Followers' query spill stays in their own local files and never crosses the channel.
+
+The store also prefers to put leadership where the work is: the worker client reports page
+visibility, and a background leader yields to a foreground tab that asks. The tab the user is
+looking at is normally the tab holding the fast path.
+
+The pieces the leader is assembled from — the record-semantics core, the write-ahead-log
+framing, the packed extent files, the checkpoint codecs — are published as
+[`@minnowdb/core/storage/toolkit`](/docs/storage/custom#the-adapter-toolkit), so an adapter for
+another file-shaped substrate can be built from the same parts.
+
+## What it creates
+
+One directory per database under `minnowdb/` in the origin's private file system: `wal` (the
+write-ahead log), `checkpoint-a` and `checkpoint-b` (alternating full-state snapshots),
+`extents/` (packed, append-only files holding block and full-text payloads), and `temp/` (query
+spill). Deleting the directory deletes the database — `deleteOpfsDatabase({ name })` does
+exactly that.
+
+The log is folded into a checkpoint slot at a size bound, always in the order write → flush →
+reset, so a crash at any moment leaves either a torn tail frame — detectably invalid, invisible
+— or a torn slot with the other slot and the un-reset log still holding everything. Opening the
+database is the recovery; there is no repair step.
+
+## Durability
+
+`relaxed` leaves the final flush to the operating system. A commit is still atomic and still
+ordered — a tab that closes, crashes, or is killed loses nothing acknowledged — but a power loss
+can lose the most recent commits. `strict` flushes the log frame (and payload writes) before the
+operation resolves; on held handles that costs fractions of a millisecond rather than the
+milliseconds it costs elsewhere.
+
+## Quota
+
+The same origin quota as everything else, and the same two calls to watch it:
+
+```ts
+const { quota, usage } = await navigator.storage.estimate();
+await navigator.storage.persist(); // ask to be exempt from eviction
+```
+
+A refused write escapes as the browser's own `QuotaExceededError`, with everything committed
+before it intact and the same write succeeding once space frees. `getLogicalStorageBytes()`
+reports what this database occupies.
+
+## Multiple tabs
+
+Several tabs may open the same database at once; every operation from every tab lands in one
+ordered log, so readers never see half of anything and competing writers conflict, rebase, and
+retry exactly as they do on IndexedDB. The moving parts differ from the IndexedDB adapter in one
+honest way: multi-tab _responsiveness_ uses `BroadcastChannel` (universal since 2022), while
+correctness rests entirely on the storage lock and the checksummed log. A browser with no
+channel at all would still be safe — one tab at a time would hold the database.
+
+The background-tab caveat is the same as IndexedDB's: browsers throttle hidden tabs, so a long
+compaction there stops until it is foregrounded — which is why
+[maintenance](/docs/storage/maintenance) is stepped and resumable. The foreground-leadership
+preference makes this mostly moot: the visible tab does its own storage work directly.
+
+## Choosing between OPFS and IndexedDB
+
+Both are durable, both are safe across tabs, and both hold the same block format — a
+[snapshot](/docs/storage/snapshots) moves a database between them. The
+[benchmarks page](/benchmarks) measures both live in your browser; on current engines the OPFS
+store's small reads and writes are several times faster, and bulk loads are comparable. Prefer
+IndexedDB where OPFS does not exist (older browsers, Safari private windows); otherwise OPFS is
+the faster floor.

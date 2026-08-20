@@ -45,10 +45,14 @@ curl -o AGENTS-minnow.md https://minnowdb.com/agent-rules.md
 Minnow (`@minnowdb/core`) is a columnar SQL database that runs in the browser. Documentation for
 machines: https://minnowdb.com/llms.txt
 
-- Browser only. It needs IndexedDB and `CompressionStream`, and there is no Node build. In Node
-  tests, use `MemoryBlockStore` from `@minnowdb/core/storage`, or `fake-indexeddb`.
+- Browser only. It needs `CompressionStream` plus one durable store — IndexedDB, or OPFS in a
+  worker — and there is no Node build. In Node tests, use `MemoryBlockStore` from
+  `@minnowdb/core/storage`, or `fake-indexeddb`.
 - Open a database with `new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }))` —
   `MinnowDatabase` from `@minnowdb/core`, `IndexedDbBlockStore` from `@minnowdb/core/storage`.
+  `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
+  exist in Safari private browsing, so fall back to IndexedDB when
+  `navigator.storage?.getDirectory` is missing or rejects.
 - `@minnowdb/core`, `@minnowdb/client`, and `@minnowdb/devtools` share a major version and move
   independently inside it. Install them on the same major; npm refuses a mixed-major set.
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
@@ -64,6 +68,7 @@ machines: https://minnowdb.com/llms.txt
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
 - For anything interactive, run the engine in a worker:
   `new MinnowDatabaseClient(new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }), { store: { kind: "indexeddb", name: "app-db" } })`,
+  or `{ kind: "opfs", name: "app-db" }` for the OPFS store,
   importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Its API matches `MinnowDatabase`
   call for call.
 - Full-text search is `MATCH(column) AGAINST 'terms'`, ranked with `BM25(column) AGAINST 'terms'`.
@@ -101,6 +106,10 @@ it needs to be.
 - **The SQL surface.** It is large but not complete, and the rejections are deliberate and
   documented. An agent that checks the matrix writes a supported form the first time instead of
   discovering the gap through an error.
+- **The store choice.** Both durable stores implement one contract and hold one format, so this
+  is a deployment decision, not an architecture one. The OPFS store's synchronous handles exist
+  only in workers, and OPFS itself is absent in Safari private browsing — which is why the rule
+  says worker-only and names the fallback.
 
 ## Verifying what an agent wrote
 

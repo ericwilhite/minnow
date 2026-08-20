@@ -1,6 +1,7 @@
 # @minnowdb/core
 
-Columnar SQL engine for the browser: real SQL over immutable snapshots, durable on IndexedDB, with
+Columnar SQL engine for the browser: real SQL over immutable snapshots, durable on IndexedDB or
+OPFS, with
 no WebAssembly to download. It runs in the thread that constructs it (`MinnowDatabase`), or in a
 worker with a main-thread client that mirrors it call for call (`MinnowDatabaseClient`).
 
@@ -19,12 +20,13 @@ npm install @minnowdb/core
 - **Full-text search** — `MATCH` / BM25 on any column, with no index DDL to write.
 - **Live queries** — `liveQueries()` hands back a set whose subscribers get a fresh result after
   any commit that could have changed it, across tabs.
-- **Durable browser storage** — compressed columnar blocks on IndexedDB, atomic multi-tab commits,
+- **Durable browser storage** — compressed columnar blocks on IndexedDB or OPFS, atomic
+  multi-tab commits,
   snapshot reads, compaction and GC.
 - **Bounded memory** — execution works in batches under a budget you set and spills to storage
   rather than failing.
-- **Subpath exports** — `/storage`, `/client`, `/worker`, `/worker-protocol`, `/transactions`,
-  `/plan`, `/block-format`, `/testing`.
+- **Subpath exports** — `/storage`, `/storage/toolkit`, `/client`, `/worker`,
+  `/worker-protocol`, `/transactions`, `/plan`, `/block-format`, `/testing`.
 
 Guides, the API reference, and the SQL feature matrix live in the
 [docs](https://minnowdb.com/docs/), which are the single source of truth. Building with an agent?

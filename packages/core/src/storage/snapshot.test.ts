@@ -4,6 +4,8 @@ import { MinnowDatabase } from "../engine/database.js";
 import { UniqueConstraintError } from "../engine/errors.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MemoryBlockStore } from "./memory.js";
+import { OpfsBlockStore } from "./opfs/index.js";
+import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { decodeSnapshot, encodeSnapshot, readSnapshotSummary } from "./snapshot.js";
 
 /**
@@ -169,6 +171,42 @@ describe("database snapshots", () => {
     });
     await store.importSnapshot(snapshot);
     await expect(store.importSnapshot(snapshot)).rejects.toThrow(/already holds/);
+  });
+
+  it("loads into OPFS, reads back identically, and round-trips back out", async () => {
+    const { database: source, store: sourceStore } = await seededDatabase();
+    const before = await source.query(REPORT);
+    const bytes = await encodeSnapshot(await sourceStore.exportSnapshot());
+
+    const shim = new MemoryOpfs();
+    const name = crypto.randomUUID();
+    const store = await OpfsBlockStore.open({ name, root: shim.root });
+    await store.importSnapshot(await decodeSnapshot(bytes));
+    expect((await new MinnowDatabase(store).query(REPORT)).rows).toEqual(before.rows);
+    await expect(store.importSnapshot(await decodeSnapshot(bytes))).rejects.toThrow(
+      /already holds/,
+    );
+    store.close();
+
+    // Reopening proves the load is durable rather than living in the loading instance's caches.
+    const reopened = await OpfsBlockStore.open({ name, root: shim.root });
+    const database = new MinnowDatabase(reopened);
+    expect((await database.query(REPORT)).rows).toEqual(before.rows);
+    await expect(
+      database.execute("INSERT INTO authors (handle, name) VALUES ('grace', 'Impostor')"),
+    ).rejects.toThrow(UniqueConstraintError);
+    // Full-text bases restore as rebuilds on this store; the answer must still be right.
+    expect(
+      (await database.query("SELECT handle FROM authors WHERE MATCH(name) AGAINST 'lovelace'"))
+        .rows,
+    ).toEqual([{ handle: "ada" }]);
+
+    // And the restored store can itself export: the snapshot contract is symmetric.
+    const again = MemoryBlockStore.fromSnapshot(
+      await decodeSnapshot(await encodeSnapshot(await reopened.exportSnapshot())),
+    );
+    expect((await new MinnowDatabase(again).query(REPORT)).rows).toEqual(before.rows);
+    reopened.close();
   });
 
   it("rejects a damaged container instead of loading half a database", async () => {

@@ -11,7 +11,7 @@ export const metadata: Metadata = {
     template: "%s · Minnow",
   },
   description:
-    "A columnar SQL engine that runs entirely in the browser. Real SQL over immutable snapshots, durable on IndexedDB, with no WebAssembly to download.",
+    "A columnar SQL engine that runs entirely in the browser. Real SQL over immutable snapshots, durable on IndexedDB or OPFS, with no WebAssembly to download.",
   icons: { icon: "/favicon.svg" },
   // An archived release documents a version that is no longer the one npm installs. It stays
   // reachable and linkable, but it should never be the result a search engine offers first.

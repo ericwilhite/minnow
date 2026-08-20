@@ -364,6 +364,33 @@ describe("MinnowDatabaseClient", () => {
     await expect(client.listTables()).rejects.toThrow(/closed/);
   });
 
+  it("forwards page-visibility reports to the host's onVisibility seam", async () => {
+    const { clientSide, workerSide } = createBoundary();
+    const reports: boolean[] = [];
+    exposeDatabase(new MinnowDatabase(new MemoryBlockStore()), workerSide, {
+      onVisibility: (visible) => {
+        reports.push(visible);
+      },
+    });
+    const client = new MinnowDatabaseClient(clientSide);
+    await client.ready();
+    // Node has no document, so the client sends nothing on its own; drive the frame the way
+    // the browser listener does. This is the store's leadership-preference channel — the OPFS
+    // store's setForeground rides on it.
+    await (
+      client as unknown as {
+        _invoke(handleId: string | null, method: string, args: unknown[]): Promise<unknown>;
+      }
+    )._invoke(null, "setVisibility", [true]);
+    await (
+      client as unknown as {
+        _invoke(handleId: string | null, method: string, args: unknown[]): Promise<unknown>;
+      }
+    )._invoke(null, "setVisibility", [false]);
+    expect(reports).toEqual([true, false]);
+    await client.close();
+  });
+
   it("rejects wire-supplied stage ops outside the whitelist", async () => {
     // Raw frames stand in for a hostile or buggy client: the real client only ever names the
     // four staged-mutation ops, so anything else (including Object.prototype members) must get
