@@ -209,9 +209,9 @@ describe("OPFS leadership", () => {
       root: shim.root,
       rpcTimeoutMs: 200,
     });
-    // Eavesdrop on the store's channel and replay the follower's frame verbatim — exactly what
+    // Eavesdrop on the leader's inbox and replay the follower's frame verbatim — exactly what
     // a retry whose acknowledgement was lost looks like to the leader.
-    const spy = new BroadcastChannel("minnowdb-store:dup");
+    const spy = new BroadcastChannel(`minnowdb-store:dup:${leader._instanceIdForTests()}`);
     const captured: unknown[] = [];
     spy.onmessage = (event: MessageEvent<unknown>) => {
       const message = event.data as { kind?: string; method?: string };

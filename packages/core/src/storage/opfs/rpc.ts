@@ -11,15 +11,22 @@ import {
 } from "../types.js";
 
 /**
- * The follower↔leader message vocabulary, carried over a `BroadcastChannel` named for the
- * database. Correctness never rides on delivery: an operation is acknowledged only after the
+ * The follower↔leader message vocabulary. Leadership traffic (`leader`, `ping`, `bid`, `yield`,
+ * `released`) travels a `BroadcastChannel` named for the database, which every connection
+ * hears. Request traffic is addressed: an `op` is posted into the leader's own channel (named
+ * for the database plus the leader's instance id) and its `result` or `busy` into the
+ * requester's, so block bytes are cloned once, into the tab that asked, rather than into every
+ * tab. Correctness never rides on delivery: an operation is acknowledged only after the
  * leader's write-ahead log holds it, a lost message costs a retry, and a dead leader costs a
  * failover arbitrated by the storage lock, not by these messages.
  */
 
 export type StoreRpcMessage =
-  /** A follower's operation request. `requestId` doubles as the retry-dedupe key. */
-  | { kind: "op"; requestId: string; method: string; args: unknown[] }
+  /**
+   * A follower's operation request. `requestId` doubles as the retry-dedupe key; `from` is the
+   * requester's instance id, naming the channel its answer goes to.
+   */
+  | { kind: "op"; requestId: string; from: string; method: string; args: unknown[] }
   | { kind: "result"; requestId: string; ok: true; value: unknown }
   | { kind: "result"; requestId: string; ok: false; error: SerializedStoreError }
   /** The leader is still executing this request — reset the caller's patience. */

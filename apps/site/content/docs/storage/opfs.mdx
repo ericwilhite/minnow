@@ -55,10 +55,13 @@ per operation simply do not exist. This is why the store is fast: on the
 the OPFS column's small operations run several times faster than IndexedDB's.
 
 Other tabs are **followers**: their operations travel a `BroadcastChannel` to the leader and are
-acknowledged only after the leader's log holds them. A lost message costs a retry — request ids
-keep a retried operation from applying twice — and a dead leader costs a failover. Correctness
-never rides on a message; the channel affects how fast multi-tab work moves, never whether it is
-right. Followers' query spill stays in their own local files and never crosses the channel.
+acknowledged only after the leader's log holds them. Requests and answers are addressed — an
+operation goes to the leader's own channel and its answer to the asking tab's — so a block read's
+bytes are copied into the tab that asked and no other; only leadership traffic is heard by every
+tab. A lost message costs a retry — request ids keep a retried operation from applying twice —
+and a dead leader costs a failover. Correctness never rides on a message; the channel affects how
+fast multi-tab work moves, never whether it is right. Followers' query spill stays in their own
+local files and never crosses the channel.
 
 The store also prefers to put leadership where the work is: the worker client reports page
 visibility, and a background leader yields to a foreground tab that asks. The tab the user is

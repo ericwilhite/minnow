@@ -57,6 +57,8 @@ const DISPATCH_ATTEMPTS = 10;
 const YIELD_COOLDOWN_MS = 3_000;
 /** Results remembered for retried requests whose acknowledgement was lost. */
 const DEDUPE_CACHE_SIZE = 512;
+/** Channels into requesters' inboxes a leader keeps open between answers. */
+const ANSWER_CHANNEL_CACHE_SIZE = 64;
 
 export interface OpfsBlockStoreOptions {
   /** Databases live under `minnowdb/<name>` in the origin's private file system. */
@@ -190,8 +192,10 @@ interface ServedOutcome {
   error?: SerializedStoreError;
 }
 
+type OpMessage = Extract<StoreRpcMessage, { kind: "op" }>;
+
 interface PendingRpc {
-  message: Extract<StoreRpcMessage, { kind: "op" }>;
+  message: OpMessage;
   /** Which leader this request was last posted to, so announces only trigger real re-sends. */
   sentTo: string | undefined;
   resolve: (value: unknown) => void;
@@ -203,6 +207,13 @@ interface PendingRpc {
  * The OPFS block store: one leader per database holds every file handle and does all storage
  * work at held-handle speed; other connections are thin followers whose operations travel a
  * `BroadcastChannel` to it.
+ *
+ * Two kinds of channel carry the protocol. One shared channel per database carries what every
+ * connection must hear: leader announcements, pings, bids, yields, releases. Every connection
+ * also owns an inbox — a channel named for its instance id — where the messages meant for it
+ * alone arrive: operations at the leader, results and busy notices at the requester. A block
+ * read's bytes are therefore structured-cloned once, into the tab that asked, rather than into
+ * every tab of the origin.
  *
  * Leadership is the write-ahead log's own exclusive sync-access handle — enforced by the
  * browser against the actual resource, released the instant its holder dies. Elections are
@@ -225,7 +236,13 @@ export class OpfsBlockStore implements BlockStore {
   readonly #checkpointEntries: number | undefined;
   readonly #rpcTimeoutMs: number;
   readonly #instanceId = crypto.randomUUID();
+  readonly #channelName: string;
+  /** The database-wide channel: leadership traffic every connection listens to. */
   #channel: BroadcastChannel | undefined;
+  /** This connection's own channel: operations when leading, results when following. */
+  #inbox: BroadcastChannel | undefined;
+  /** While leading: open channels into requesters' inboxes, by instance id. */
+  readonly #answerChannels = new Map<string, BroadcastChannel>();
   #leader: OpfsLeader | undefined;
   #knownLeader: string | undefined;
   #foreground = false;
@@ -241,6 +258,7 @@ export class OpfsBlockStore implements BlockStore {
     this.#durability = options.durability ?? "relaxed";
     this.#checkpointEntries = options.checkpointEntries;
     this.#rpcTimeoutMs = options.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
+    this.#channelName = `minnowdb-store:${options.name}`;
   }
 
   static async open(options: OpfsBlockStoreOptions): Promise<OpfsBlockStore> {
@@ -248,11 +266,15 @@ export class OpfsBlockStore implements BlockStore {
     const store = new OpfsBlockStore(tree, options);
     await store.#ensureFormatMarker();
     if (typeof BroadcastChannel === "function") {
-      const channel = new BroadcastChannel(`minnowdb-store:${options.name}`);
-      channel.onmessage = (event: MessageEvent<unknown>) => {
+      const onMessage = (event: MessageEvent<unknown>) => {
         store.#onMessage(event.data as StoreRpcMessage);
       };
+      const channel = new BroadcastChannel(store.#channelName);
+      channel.onmessage = onMessage;
+      const inbox = new BroadcastChannel(store.#inboxName(store.#instanceId));
+      inbox.onmessage = onMessage;
       store.#channel = channel;
+      store.#inbox = inbox;
     }
     await store.#tryBecomeLeader();
     return store;
@@ -353,6 +375,8 @@ export class OpfsBlockStore implements BlockStore {
       // idempotent and releases them.
       leader.crash();
     }
+    // An open channel into a follower's inbox would hear the next leader's answers to it.
+    this.#closeAnswerChannels();
     this.#post({ kind: "yield", to });
     // If the bidder loses the race or vanishes, someone must still hold the database.
     if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
@@ -399,7 +423,7 @@ export class OpfsBlockStore implements BlockStore {
         for (const pending of this.#pending.values()) {
           if (pending.sentTo === message.leaderId) continue;
           pending.sentTo = message.leaderId;
-          this.#post(pending.message);
+          this.#send(message.leaderId, pending.message);
         }
         // The freshly announced leader may be background while we are what the user sees.
         if (this.#foreground && this.#leader === undefined) {
@@ -436,7 +460,7 @@ export class OpfsBlockStore implements BlockStore {
     }
   }
 
-  async #serveOp(message: Extract<StoreRpcMessage, { kind: "op" }>): Promise<void> {
+  async #serveOp(message: OpMessage): Promise<void> {
     const leader = this.#leader;
     if (leader === undefined || !RPC_METHODS.has(message.method)) return;
     let outcome = this.#dedupe.get(message.requestId);
@@ -455,10 +479,11 @@ export class OpfsBlockStore implements BlockStore {
       // A duplicate of a request that is still running (or already remembered): attach to it
       // rather than executing twice, and reset the caller's patience meanwhile — the original
       // may legitimately take longer than one timeout (a snapshot import, a checkpoint pause).
-      this.#post({ kind: "busy", requestId: message.requestId });
+      this.#answer(message.from, { kind: "busy", requestId: message.requestId });
     }
     const settled = await outcome;
-    this.#post(
+    this.#answer(
+      message.from,
       settled.ok
         ? { kind: "result", requestId: message.requestId, ok: true, value: settled.value }
         : {
@@ -470,10 +495,7 @@ export class OpfsBlockStore implements BlockStore {
     );
   }
 
-  async #executeServedOp(
-    leader: OpfsLeader,
-    message: Extract<StoreRpcMessage, { kind: "op" }>,
-  ): Promise<ServedOutcome> {
+  async #executeServedOp(leader: OpfsLeader, message: OpMessage): Promise<ServedOutcome> {
     try {
       const method = (
         leader as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
@@ -487,8 +509,75 @@ export class OpfsBlockStore implements BlockStore {
     }
   }
 
+  /** Posts on the shared channel: leadership traffic, heard by every connection. */
   #post(message: StoreRpcMessage): void {
     this.#channel?.postMessage(message);
+  }
+
+  /**
+   * Posts an operation into the leader's inbox through a channel opened for this one message.
+   * Every follower posts into the same inbox, and a `BroadcastChannel` hears whatever any other
+   * object of its name posts — an outbound channel kept open would deliver every other
+   * follower's operation (block bytes included) to this tab. Opened and closed around a single
+   * message, nothing but the leader's inbox is ever listening on that name.
+   */
+  #send(leaderId: string, message: OpMessage): void {
+    // Once the channels are torn down nothing may be posted.
+    if (this.#channel === undefined) return;
+    this.#postOnce(leaderId, message);
+  }
+
+  /**
+   * Posts an answer into the requester's inbox. Only the leader posts there, so the leader
+   * keeps these channels open across requests and hears nothing through them. They close on
+   * demotion: an ex-leader's open channel would hear the next leader's answers to that tab.
+   */
+  #answer(requesterId: string, message: StoreRpcMessage): void {
+    if (this.#channel === undefined) return;
+    if (this.#leader === undefined) {
+      // An answer finishing after demotion; do not reopen a channel that demotion just closed.
+      this.#postOnce(requesterId, message);
+      return;
+    }
+    let outbound = this.#answerChannels.get(requesterId);
+    if (outbound === undefined) {
+      outbound = new BroadcastChannel(this.#inboxName(requesterId));
+      this.#answerChannels.set(requesterId, outbound);
+      if (this.#answerChannels.size > ANSWER_CHANNEL_CACHE_SIZE) {
+        // Followers leave without a goodbye; the oldest entry is the likeliest to be gone.
+        const [oldest] = this.#answerChannels;
+        if (oldest !== undefined) {
+          this.#answerChannels.delete(oldest[0]);
+          oldest[1].close();
+        }
+      }
+    }
+    outbound.postMessage(message);
+  }
+
+  #closeAnswerChannels(): void {
+    for (const outbound of this.#answerChannels.values()) outbound.close();
+    this.#answerChannels.clear();
+  }
+
+  /** Posts one message into an inbox through a channel that lives only for that message. */
+  #postOnce(instanceId: string, message: StoreRpcMessage): void {
+    const outbound = new BroadcastChannel(this.#inboxName(instanceId));
+    outbound.postMessage(message);
+    outbound.close();
+  }
+
+  #inboxName(instanceId: string): string {
+    return `${this.#channelName}:${instanceId}`;
+  }
+
+  /** Closes every channel; nothing is posted or delivered after this. */
+  #closeChannels(): void {
+    this.#channel?.close();
+    this.#channel = undefined;
+    this.#inbox?.close();
+    this.#inbox = undefined;
+    this.#closeAnswerChannels();
   }
 
   // ---------------------------------------------------------------------------------------
@@ -549,18 +638,16 @@ export class OpfsBlockStore implements BlockStore {
 
   #rpc(requestId: string, method: string, args: unknown[]): Promise<unknown> {
     return new Promise<unknown>((resolve, reject) => {
-      const message: Extract<StoreRpcMessage, { kind: "op" }> = {
-        kind: "op",
-        requestId,
-        method,
-        args,
-      };
+      const message: OpMessage = { kind: "op", requestId, from: this.#instanceId, method, args };
       const timer = setTimeout(() => {
         this.#pending.delete(requestId);
         reject(RPC_TIMED_OUT);
       }, this.#rpcTimeoutMs);
-      this.#pending.set(requestId, { message, sentTo: this.#knownLeader, resolve, reject, timer });
-      this.#post(message);
+      const leaderId = this.#knownLeader;
+      this.#pending.set(requestId, { message, sentTo: leaderId, resolve, reject, timer });
+      // The dispatch loop only gets here with a leader known; should it have slipped away in
+      // between, the timeout (or the next leader's announcement, which re-sends) takes over.
+      if (leaderId !== undefined) this.#send(leaderId, message);
     });
   }
 
@@ -1006,18 +1093,21 @@ export class OpfsBlockStore implements BlockStore {
         })
         .then(() => {
           this.#post({ kind: "released", leaderId: this.#instanceId });
-          this.#channel?.close();
-          this.#channel = undefined;
+          this.#closeChannels();
         });
       return;
     }
-    this.#channel?.close();
-    this.#channel = undefined;
+    this.#closeChannels();
   }
 
   /** Test-only: whether this connection currently holds the database's handles. */
   _isLeaderForTests(): boolean {
     return this.#leader !== undefined;
+  }
+
+  /** Test-only: the id that names this connection's inbox channel. */
+  _instanceIdForTests(): string {
+    return this.#instanceId;
   }
 
   /** Test-only: what tab death looks like — locks release, nothing flushes, no goodbyes. */
@@ -1028,8 +1118,7 @@ export class OpfsBlockStore implements BlockStore {
     this.#pending.clear();
     this.#leader?.crash();
     this.#leader = undefined;
-    this.#channel?.close();
-    this.#channel = undefined;
+    this.#closeChannels();
   }
 
   async #ensureFormatMarker(): Promise<void> {
