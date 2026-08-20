@@ -316,10 +316,12 @@ export class MinnowDatabaseClient {
     tableName: string,
     versionOrOptions?: number | ReadTableOptions,
   ): Promise<DatabaseRow[]> {
-    return (await this.#call(
-      "readTable",
-      versionOrOptions === undefined ? [tableName] : [tableName, versionOrOptions],
-    )) as DatabaseRow[];
+    return decodeQueryResult(
+      await this.#call(
+        "readTable",
+        versionOrOptions === undefined ? [tableName] : [tableName, versionOrOptions],
+      ),
+    ).rows;
   }
 
   /**

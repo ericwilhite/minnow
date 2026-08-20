@@ -452,8 +452,15 @@ export interface WriteMetrics {
   logicalBytes: number;
   storedBytes: number;
   writeAmplification: number;
+  /** Encoding the batch into blocks. */
   encodeMs: number;
+  /**
+   * Staging the blocks and segments as a step of its own: trigger-derived rows, and stores
+   * without a single-shot commit. On a store that commits a simple write in one storage
+   * transaction the staging happens inside the commit, this is 0, and `commitMs` covers both.
+   */
   stageMs: number;
+  /** Committing — including the staging, on the single-shot path — and any rebase retries. */
   commitMs: number;
   totalMs: number;
   retries: number;
@@ -2709,7 +2716,9 @@ export class MinnowDatabase {
           typedSchemas,
           cacheResults,
         );
-        const windowed = applyWindowFunctions(inner, source.windowed.windows);
+        const windowed = applyWindowFunctions(inner, source.windowed.windows, {
+          copyRows: cacheResults,
+        });
         const schema = [
           ...innerSchema,
           ...source.windowed.windows.map((window) => ({

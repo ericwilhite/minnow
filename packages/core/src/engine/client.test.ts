@@ -282,6 +282,37 @@ describe("MinnowDatabaseClient", () => {
     await client.close();
   });
 
+  it("reads a table back through the columnar frame, every value type intact", async () => {
+    const client = connect();
+    await client.ready();
+    await createPeopleTable(client);
+    await client.insertBatch("people", [
+      { id: 1, name: "Ada", joined: new Date("2024-01-02T03:04:05.678Z") },
+      { id: 2, name: "Grace", joined: new Date("1999-12-31T23:59:59.999Z") },
+    ]);
+    const rows = await client.readTable("people");
+    expect(rows).toEqual([
+      { id: 1, name: "Ada", joined: new Date("2024-01-02T03:04:05.678Z") },
+      { id: 2, name: "Grace", joined: new Date("1999-12-31T23:59:59.999Z") },
+    ]);
+    expect(rows[0]?.joined).toBeInstanceOf(Date);
+    // A column subset and an explicit version take the same path.
+    const version = (
+      await client.insertBatch("people", [{ id: 3, name: "Linus", joined: new Date(0) }])
+    ).version;
+    expect(await client.readTable("people", { columns: ["name"] })).toEqual([
+      { name: "Ada" },
+      { name: "Grace" },
+      { name: "Linus" },
+    ]);
+    expect((await client.readTable("people", version)).length).toBe(3);
+    expect(await client.readTable("people", { version: version - 1, columns: ["id"] })).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    await client.close();
+  });
+
   it("rebuilds a `__proto__` result column as an own property", async () => {
     const client = connect();
     await client.createTable({

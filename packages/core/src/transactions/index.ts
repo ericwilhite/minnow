@@ -458,7 +458,9 @@ export class DatabaseTransaction {
     this.#assertActive();
     this.#uniqueKeyChanges.push({
       tableId: changes.tableId,
-      keyTokens: [...new Set(changes.keyTokens)].sort(),
+      // Deduplicated, not sorted: membership is all a store reads from these, and sorting fifty
+      // thousand tokens cost a bulk delete a fifth of its time.
+      keyTokens: [...new Set(changes.keyTokens)],
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
     });

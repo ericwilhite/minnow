@@ -11,6 +11,9 @@ import {
   executeQuery,
   executeRowQuery,
   topLevelFtsMatchConjuncts,
+  clonePlanTree,
+  applyWindowFunctions,
+  bindPlanParameters,
 } from "./query.js";
 
 interface QueryStoreHarness {
@@ -1398,5 +1401,138 @@ describe("compile error positions", () => {
     })();
     expect(error).toBeInstanceOf(TypeError);
     expect(error).toBeInstanceOf(SqlCompileError);
+  });
+});
+
+describe("plan copies", () => {
+  const corpus = [
+    "SELECT 1 AS one",
+    "SELECT id, amount FROM data WHERE amount > ? AND region = ? ORDER BY id LIMIT ? OFFSET ?",
+    "SELECT region, COUNT(*) AS c, SUM(amount) AS s FROM data GROUP BY region HAVING COUNT(*) > ?",
+    "SELECT d.id FROM data d JOIN dims m ON m.region = d.region WHERE d.joined > ?",
+    "SELECT id FROM data WHERE id IN (SELECT id FROM data WHERE amount < ?) AND label LIKE ?",
+    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?) SELECT x FROM n",
+    "SELECT id, SUM(amount) OVER (PARTITION BY region ORDER BY id) AS running FROM data WHERE id <= ?",
+    "SELECT CASE WHEN amount > ? THEN 'big' ELSE 'small' END AS size, DATE_TRUNC('day', joined) AS day FROM data",
+  ];
+
+  it("copies a compiled plan exactly, and shares nothing with the original", () => {
+    for (const sql of corpus) {
+      const plan = compileQuery(sql);
+      const copy = clonePlanTree(plan);
+      expect(copy).toEqual(structuredClone(plan));
+      expect(copy).not.toBe(plan);
+      expect(copy.select).not.toBe(plan.select);
+      expect(copy.base).not.toBe(plan.base);
+    }
+  });
+
+  it("leaves the original plan untouched by binding, and copies Date literals as new instances", () => {
+    const plan = compileQuery("SELECT id FROM data WHERE joined > ? AND amount > ?");
+    const before = structuredClone(plan);
+    const when = new Date("2024-05-06T07:08:09.010Z");
+    const bound = bindPlanParameters(plan, [when, 5]);
+    expect(plan).toEqual(before);
+    expect(bound.predicates[0]?.right).toEqual({ kind: "literal", value: when });
+    // Binding again from the same cached plan yields an equal but distinct bound plan, and a
+    // copy of a bound plan owns its Date literals.
+    const again = bindPlanParameters(plan, [when, 5]);
+    expect(again).toEqual(bound);
+    expect(again).not.toBe(bound);
+    const copy = clonePlanTree(bound);
+    const literal = copy.predicates[0]?.right as { value: Date };
+    expect(literal.value).toEqual(when);
+    expect(literal.value).not.toBe(when);
+  });
+
+  it("falls back to structuredClone for values a plan is not expected to hold", () => {
+    const odd = {
+      items: new Map([["a", 1]]),
+      bytes: new Uint8Array([1, 2, 3]),
+      nested: [{ d: new Date(0) }],
+    };
+    const copy = clonePlanTree(odd);
+    expect(copy).toEqual(odd);
+    expect(copy.items).not.toBe(odd.items);
+    expect(copy.bytes).not.toBe(odd.bytes);
+    expect(copy.nested[0]?.d).not.toBe(odd.nested[0]?.d);
+  });
+});
+
+describe("window functions over shared and private rows", () => {
+  it("answers a windowed query the same whether its inner rows were cached or not", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "w",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "region", type: "string" },
+        { name: "amount", type: "number" },
+      ],
+    });
+    await database.insertBatch("w", [
+      { id: 1, region: "west", amount: 5 },
+      { id: 2, region: "west", amount: 7 },
+      { id: 3, region: "east", amount: 1 },
+    ]);
+    const sql =
+      "SELECT id, SUM(amount) OVER (PARTITION BY region ORDER BY id) AS running FROM w ORDER BY id";
+    const expected = [
+      { id: 1, running: 5 },
+      { id: 2, running: 12 },
+      { id: 3, running: 1 },
+    ];
+    // Twice without the memo: the second run reads the inner block from the block cache, which
+    // the window step must not have written its aliases into the first time.
+    expect((await database.query(sql, { memoize: false })).rows).toEqual(expected);
+    expect((await database.query(sql, { memoize: false })).rows).toEqual(expected);
+    expect((await database.query(sql)).rows).toEqual(expected);
+    expect((await database.query(sql)).rows).toEqual(expected);
+  });
+
+  it("copies rows it may share and writes in place rows it owns", () => {
+    const plan = compileQuery(
+      "SELECT id, SUM(amount) OVER (PARTITION BY region ORDER BY id) AS running FROM w",
+    );
+    const windowed = plan.base.windowed;
+    if (windowed === undefined) throw new Error("Expected a windowed source");
+    // The inner block's rows carry the hidden partition/order aliases the window reads.
+    const inner = windowed.block;
+    const aliasOf = (index: number): string => inner.select[index]?.alias ?? "";
+    const make = () => ({
+      columns: inner.select.map((item) => item.alias),
+      rows: [
+        { [aliasOf(0)]: 1, [aliasOf(1)]: "west", [aliasOf(2)]: 5 },
+        { [aliasOf(0)]: 2, [aliasOf(1)]: "west", [aliasOf(2)]: 7 },
+        { [aliasOf(0)]: 3, [aliasOf(1)]: "east", [aliasOf(2)]: 1 },
+      ].map((row) => {
+        // Every alias the window names, from whichever select item it came from.
+        const full: Record<string, unknown> = { ...row };
+        for (const item of inner.select) {
+          if (!(item.alias in full)) {
+            const ref = item.expression;
+            const name = ref.kind === "column" ? ref.reference.split(".").pop() : undefined;
+            full[item.alias] =
+              name === "id"
+                ? row[aliasOf(0)]
+                : name === "region"
+                  ? row[aliasOf(1)]
+                  : name === "amount"
+                    ? row[aliasOf(2)]
+                    : null;
+          }
+        }
+        return full as Record<string, number | string | null>;
+      }),
+    });
+    const shared = make();
+    const before = structuredClone(shared.rows[0]);
+    const windowedCopy = applyWindowFunctions(shared, windowed.windows);
+    expect(windowedCopy.rows.map((row) => row.running)).toEqual([5, 12, 1]);
+    expect(shared.rows[0]).toEqual(before);
+    const owned = make();
+    const windowedInPlace = applyWindowFunctions(owned, windowed.windows, { copyRows: false });
+    expect(windowedInPlace.rows.map((row) => row.running)).toEqual([5, 12, 1]);
+    expect(owned.rows[0]?.running).toBe(5);
   });
 });

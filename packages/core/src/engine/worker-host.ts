@@ -15,6 +15,7 @@ import {
   type BatchValue,
   type BufferedWriterOptions,
   type QueryOptions,
+  type ReadTableOptions,
 } from "./database.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
 import type { CompiledQuery, QueryRow } from "./query.js";
@@ -165,7 +166,6 @@ class DatabaseRpcServer {
       case "updateBatch":
       case "update":
       case "deleteBatch":
-      case "readTable":
       case "runStatement":
       case "explain":
       case "execute":
@@ -189,6 +189,16 @@ class DatabaseRpcServer {
       case "run": {
         const query = args[0] as { kind: "typed-query"; plan: CompiledQuery; __row?: QueryRow };
         return new ColumnarResult(encodeQueryRows(await this.database.run(query)));
+      }
+      case "readTable": {
+        // A table's rows are uniform — every row carries every read column — so they take the
+        // same columnar frame a query result does.
+        const [tableName, versionOrOptions] = args as [
+          string,
+          number | ReadTableOptions | undefined,
+        ];
+        const rows = await this.database.readTable(tableName, versionOrOptions);
+        return new ColumnarResult(encodeQueryRows(rows));
       }
       case "migrate": {
         const result = await this.database.migrate(

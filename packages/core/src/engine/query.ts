@@ -1498,7 +1498,7 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
   steps: SubqueryResolutionStep[];
 } {
   if (!blockHasSubqueries(plan)) return { plan, steps: [] };
-  const clone = structuredClone(plan);
+  const clone = clonePlanTree(plan);
   const steps: SubqueryResolutionStep[] = [];
   const rewrite = (expression: Expression, replace: (next: Expression) => void): void => {
     if (expression.kind === "subquery") {
@@ -1814,6 +1814,35 @@ function bindBlock(block: CompiledQuery, values: readonly QueryValue[]): void {
 }
 
 /**
+ * A deep copy of a compiled plan, statement, or expression tree. Plans are plain data — objects,
+ * arrays, primitives, and Date literals — so a direct recursive copy does what structuredClone
+ * does at a fraction of its cost (structuredClone was a seventh of a point lookup). Anything the
+ * plan is not expected to hold — a typed array, a Map, a class instance — falls back to
+ * structuredClone for that value, so the copy is exact whatever arrives.
+ */
+export function clonePlanTree<T>(value: T): T {
+  return cloneTreeValue(value) as T;
+}
+
+function cloneTreeValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (value instanceof Date) return new Date(value.getTime());
+  if (Array.isArray(value)) {
+    const copy = new Array<unknown>(value.length);
+    for (let index = 0; index < value.length; index += 1)
+      copy[index] = cloneTreeValue(value[index]);
+    return copy;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return structuredClone(value);
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
+  }
+  return copy;
+}
+
+/**
  * Replaces every placeholder with its parameter value as a literal. The input plan is never
  * modified — plans come from the compile cache, so binding is copy-on-write. The parameter list
  * must match the statement's placeholder count exactly; a plan without placeholders passes
@@ -1826,7 +1855,7 @@ export function bindPlanParameters(
   const count = plan.parameterCount ?? 0;
   validateParameters(count, params);
   if (count === 0) return plan;
-  const clone = structuredClone(plan);
+  const clone = clonePlanTree(plan);
   bindBlock(clone, params ?? []);
   delete clone.parameterCount;
   return clone;
@@ -1855,7 +1884,7 @@ export function bindStatementParameters(
     throw new TypeError("DDL statements take no parameters");
   }
   const values = params ?? [];
-  const clone = structuredClone(statement);
+  const clone = clonePlanTree(statement);
   delete clone.parameterCount;
   if (clone.kind === "insert") {
     if (clone.query !== undefined) bindBlock(clone.query, values);
@@ -2719,7 +2748,7 @@ export function resolveStatementDatetimes(
     ["CURRENT_TIMESTAMP", new Date(now.getTime())],
     ["LOCALTIME", iso.slice(11, 19)],
   ]);
-  const resolved = structuredClone(plan);
+  const resolved = clonePlanTree(plan);
   const substitute = (expression: Expression): Expression => {
     if (expression.kind === "subquery" || expression.kind === "exists") {
       resolveBlock(expression.block);
@@ -2832,7 +2861,7 @@ export function expandFtsColumns(
   searchableColumnsFor: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (!planContainsFts(plan)) return plan;
-  plan = structuredClone(plan);
+  plan = clonePlanTree(plan);
   const expand = (expression: Expression, block: CompiledQuery): void => {
     if (expression.kind === "subquery" || expression.kind === "exists") {
       expandBlock(expression.block);
@@ -3217,8 +3246,11 @@ function containsFtsExpression(expression: Expression): boolean {
 export function applyWindowFunctions(
   result: QueryResult,
   windows: readonly WindowSpec[],
+  options: { copyRows?: boolean } = {},
 ): QueryResult {
-  const rows = result.rows.map((row) => ({ ...row }));
+  // The window aliases are written onto the rows. A result that may be shared — one a block
+  // cache also holds — is copied first; one computed for this call alone is written in place.
+  const rows = options.copyRows === false ? result.rows : result.rows.map((row) => ({ ...row }));
   for (const window of windows) {
     // Decorate before sorting: `comparable` was being re-run inside the comparator, so every
     // key was converted O(n log n) times per alias instead of once per row. Precomputing the
