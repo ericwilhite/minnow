@@ -1259,7 +1259,11 @@ export interface MaintenanceStore {
   runGarbageCollectionStep(
     input: RunGarbageCollectionStepInput,
   ): Promise<GarbageCollectionStepResult>;
-  /** Deletes obsolete tombstones while retaining the checkpoint prefix readable deltas need. */
+  /**
+   * Deletes obsolete tombstones only after their garbage blocks are gone, while retaining the
+   * checkpoint prefix readable deltas need. A tombstone is the collector's durable discovery
+   * record between bounded passes.
+   */
   removePrunedManifestRecords(): Promise<number>;
   removeGarbageCollectionJob(id: string): Promise<void>;
 }

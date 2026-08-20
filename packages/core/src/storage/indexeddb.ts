@@ -2344,8 +2344,9 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   async removePrunedManifestRecords(): Promise<number> {
-    const transaction = this.#transaction("manifests", "readwrite");
+    const transaction = this.#transaction(["catalog", "manifests", "blocks"], "readwrite");
     const store = transaction.objectStore("manifests");
+    const blockStore = transaction.objectStore("blocks");
     try {
       const values: unknown[] = await requestResult(store.getAll());
       const records = values.map(asStoredManifestRecord);
@@ -2356,10 +2357,31 @@ export class IndexedDbBlockStore implements BlockStore {
         earliestReadable === undefined
           ? Number.POSITIVE_INFINITY
           : earliestReadable.version - (earliestReadable.deltaDepth ?? 0);
-      let removed = 0;
+      const currentVersionValue: unknown = await requestResult(
+        transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY),
+      );
+      let currentBlockIds = new Set<string>();
+      if (typeof currentVersionValue === "number") {
+        const currentValue: unknown = await requestResult(store.get(currentVersionValue));
+        if (currentValue === undefined) throw new Error("Current manifest is missing");
+        currentBlockIds = await resolveManifestBlockSetInTransaction(
+          store,
+          asStoredManifestRecord(currentValue),
+        );
+      }
+      const removable: number[] = [];
+      // Resolve every candidate before issuing deletes: a later candidate may still use an
+      // earlier checkpoint even though both sit below the readable chain's safe boundary.
       for (const record of records) {
         if (record.prunedAt === undefined || record.version >= safeBelow) continue;
-        store.delete(record.version);
+        const blockIds = await resolveManifestBlockSetInTransaction(store, record);
+        const garbageIds = [...blockIds].filter((id) => !currentBlockIds.has(id));
+        if (await anyObjectStoreKeyExists(blockStore, garbageIds)) continue;
+        removable.push(record.version);
+      }
+      let removed = 0;
+      for (const version of removable) {
+        store.delete(version);
         removed += 1;
       }
       await transactionDone(transaction);

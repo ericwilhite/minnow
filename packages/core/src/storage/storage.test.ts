@@ -174,6 +174,53 @@ for (const implementation of stores()) {
     store.close();
   });
 
+  it(`${implementation.name} retains a pruned manifest until its garbage blocks are gone`, async () => {
+    const store = await implementation.create();
+    await store.addBlock("garbage-from-pruned-manifest", Uint8Array.of(1, 2, 3));
+    await store.publishManifest({
+      expectedVersion: null,
+      blockIds: ["garbage-from-pruned-manifest"],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    await store.publishManifest({
+      expectedVersion: 0,
+      blockIds: [],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const collection = await store.createGarbageCollectionJob({
+      id: "prune-before-block-reclaim",
+      candidateManifestVersions: [0],
+      candidateSegmentIds: [],
+      candidateBlockIds: ["garbage-from-pruned-manifest"],
+      leaseCutoff: "2027-01-01T00:00:00.000Z",
+      createdAt: "2027-01-01T00:00:00.000Z",
+    });
+    const pruned = await store.runGarbageCollectionStep({
+      jobId: collection.id,
+      expectedRevision: collection.revision,
+      maxItems: 1,
+      updatedAt: "2027-01-01T00:00:01.000Z",
+    });
+
+    expect(await store.removePrunedManifestRecords()).toBe(0);
+    expect(await store.getManifest(0)).toMatchObject({
+      version: 0,
+      blockIds: ["garbage-from-pruned-manifest"],
+    });
+
+    await store.runGarbageCollectionStep({
+      jobId: collection.id,
+      expectedRevision: pruned.job.revision,
+      maxItems: 1,
+      updatedAt: "2027-01-01T00:00:03.000Z",
+    });
+
+    expect(await store.removePrunedManifestRecords()).toBe(1);
+    expect(await store.getManifest(0)).toBeUndefined();
+    expect(await store.getBlock("garbage-from-pruned-manifest")).toBeUndefined();
+    store.close();
+  });
+
   it(`${implementation.name} isolates, clones, and removes temp run pages`, async () => {
     const store = await implementation.create();
     const bytes = Uint8Array.of(1, 2, 3);

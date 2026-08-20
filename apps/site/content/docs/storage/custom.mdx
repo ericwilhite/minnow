@@ -54,9 +54,11 @@ step, including against a crash at any moment.
 manifests, segments, blocks, then terminal transactions; a committed transaction can disappear
 only after its manifest is pruned and no segment or unfinished compaction names it, while an
 aborted one waits for every pending artifact to disappear. Adapters must apply that whole step
-atomically. `removePrunedManifestRecords` then deletes only the tombstone prefix no readable delta
-chain needs. A file-backed adapter may delete immutable block payloads after logging the resolved
-step, as the toolkit example does.
+atomically. `removePrunedManifestRecords` then deletes only tombstones no readable delta chain
+needs **and whose garbage blocks are all gone**. The tombstone is the durable discovery record
+between bounded collection passes, so deleting it early can orphan the rest of a large backlog. A
+file-backed adapter may delete immutable block payloads after logging the resolved step, as the
+toolkit example does.
 
 **Conflicts are typed, by exact class.** Compare-and-swap failures throw the exported error
 classes (`WriteConflictError`, `TransactionRecordConflictError`, and the rest) — not wrappers,

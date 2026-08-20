@@ -102,10 +102,12 @@ non-terminal job still roots it. That is what makes collection safe while a repo
 everything that version needs.
 
 The completed pass also removes expired reader leases, abandoned query-spill owners and pages,
-old manifest tombstones below the earliest readable checkpoint, and finished maintenance-job
-records beyond the small diagnostic tail. These are record bounds, not just block-byte bounds:
-normal commits, cancelled folds, and crashed readers do not leave one permanent metadata record
-per event.
+old manifest tombstones below the earliest readable checkpoint once every garbage block they name
+is gone, and finished maintenance-job records beyond the small diagnostic tail. Keeping that
+tombstone until its last block disappears lets bounded passes resume a large backlog without
+losing its durable block list. These are record bounds, not just block-byte bounds: normal
+commits, cancelled folds, and crashed readers do not leave one permanent metadata record per
+event.
 
 It runs automatically by default (`autoCollect`, which follows `autoCompact`): a pass after every
 background fold, whose superseded blocks are what a pass reclaims; a pass every 64 commits, since

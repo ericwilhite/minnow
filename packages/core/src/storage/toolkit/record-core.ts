@@ -566,7 +566,12 @@ export class RecordCore {
     };
   }
 
-  /** RecordCore keeps resolved manifests, so every tombstone before the first readable one is safe. */
+  /**
+   * RecordCore keeps resolved manifests. A tombstone below the first readable manifest is no
+   * longer needed for delta resolution, but its narrowed block list remains the collector's
+   * durable discovery record until every named payload has actually gone. Deleting it sooner
+   * loses garbage left behind by a bounded planning pass.
+   */
   removePrunedManifestRecords(): number[] {
     const earliestReadable = [...this.#manifests.values()]
       .filter((manifest) => manifest.prunedAt === undefined)
@@ -578,6 +583,7 @@ export class RecordCore {
     const removed: number[] = [];
     for (const [version, manifest] of this.#manifests) {
       if (manifest.prunedAt === undefined || version >= safeBelow) continue;
+      if (manifest.blockIds.some((id) => this.#physical.hasBlock(id))) continue;
       this.#manifests.delete(version);
       removed.push(version);
     }
