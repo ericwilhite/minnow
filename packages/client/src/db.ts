@@ -1,11 +1,17 @@
 import {
   type CompiledQuery,
-  type CompiledStatement,
   type QueryResult,
   type QueryRow,
   type QueryValue,
 } from "@minnowdb/core/plan";
-import { type AnyTable, type AnyView, type SchemaDefinition } from "@minnowdb/core";
+import {
+  type AnyTable,
+  type AnyView,
+  type Catalog,
+  type ExecuteResult,
+  type QueryOptions,
+  type SchemaDefinition,
+} from "@minnowdb/core";
 import { type LiveQueryServices, type LiveSubscriptionHandle } from "./live-query.js";
 import {
   DeleteQueryBuilder,
@@ -26,11 +32,12 @@ import {
   type BlockCompilable,
   type ContextWithTable,
   type InferDatabase,
+  type SelectRowOf,
   type TableExpression,
-  type TypedQueryEnvelope,
   type ViewShape,
   type WritableTable,
 } from "./types.js";
+import { type RawSqlFragment, type RenderedSql } from "./sql-tag.js";
 
 /**
  * The Kysely-style facade. `Minnow<DB>` wraps either the in-worker `MinnowDatabase` or the
@@ -42,7 +49,10 @@ import {
 
 export interface DriverLiveSet {
   subscribe(
-    query: string | { kind: "typed-query"; plan: CompiledQuery },
+    query:
+      | string
+      | { kind: "sql-query"; sql: string; params: readonly QueryValue[] }
+      | { kind: "typed-query"; plan: CompiledQuery },
     options: {
       onChange(result: QueryResult): void;
       onError?(error: unknown): void;
@@ -58,9 +68,9 @@ export interface DslLiveOptions {
   pollIntervalMs?: number;
 }
 
-/** The slice of MinnowDatabase / MinnowDatabaseClient the facade drives. */
-export interface DslDriver {
-  run<TRow>(query: { kind: "typed-query"; plan: CompiledQuery; __row?: TRow }): Promise<TRow[]>;
+export interface DslWriteSession {
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
+  execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
@@ -69,22 +79,32 @@ export interface DslDriver {
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
   ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
-  runStatement(
-    statement: CompiledStatement,
-    options?: { returning?: readonly string[] | "*" },
-  ): Promise<{ kind: string; rowCount?: number; returnedRows?: QueryRow[] }>;
-  execute(
-    sql: string,
-    params?: readonly QueryValue[],
-  ): Promise<{ kind: string; result?: { rows: QueryRow[] } }>;
-  liveQueries(options?: DslLiveOptions): DriverLiveSet;
+}
+
+/** The slice of MinnowDatabase / MinnowDatabaseClient the facade drives. */
+export interface DslDriver {
+  introspect?(): Promise<Catalog>;
+  query(sql: string, options?: QueryOptions): Promise<QueryResult>;
+  insertBatch(
+    tableName: string,
+    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
+  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
+  upsertBatch(
+    tableName: string,
+    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
+  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
+  execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
+  write?<T>(
+    action: (session: DslWriteSession) => Promise<T>,
+  ): Promise<{ result: T; version: number | null }>;
+  liveQueries?(options?: DslLiveOptions): DriverLiveSet;
 }
 
 export interface MinnowOptions {
   /**
-   * The runtime schema the database was migrated with. Inserts then pad omitted nullable
-   * columns with null (the engine's batch API takes every column); without it, an insert must
-   * list every column itself.
+   * The runtime schema the database was migrated with. Passing it avoids a catalog lookup and
+   * lets inserts run user-defined default functions. Without it, column names come from the
+   * driver's live catalog.
    */
   schema?: SchemaDefinition<readonly AnyTable[]>;
   /** Options for the shared live-query set behind `.live()`; created lazily on first use. */
@@ -92,6 +112,25 @@ export interface MinnowOptions {
 }
 
 type EmptyContext = Record<never, AnyRow>;
+
+async function mapWithConcurrency<TValue, TResult>(
+  values: readonly TValue[],
+  concurrency: number,
+  action: (value: TValue) => Promise<TResult>,
+): Promise<TResult[]> {
+  const results = new Array<TResult>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      results[index] = await action(values[index] as TValue);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 /**
  * Creates the typed facade. The recommended form names the database type once, so every hover,
@@ -126,29 +165,35 @@ interface SharedLiveSet {
   set?: DriverLiveSet | undefined;
 }
 
-/** One db.search hit: the owning table, the row (without the score alias), and its BM25 score. */
-export interface SearchHit<DB> {
-  table: keyof DB & string;
-  row: Record<string, QueryValue>;
-  score: number;
+interface SharedCatalog {
+  promise?: Promise<Catalog> | undefined;
 }
+
+/** One db.search hit: the owning table, the row (without the score alias), and its BM25 score. */
+export type SearchHit<DB, TTable extends WritableTable<DB> = WritableTable<DB>> =
+  TTable extends WritableTable<DB>
+    ? { table: TTable; row: SelectRowOf<DB[TTable]>; score: number }
+    : never;
 
 export class Minnow<in out DB> {
   readonly #driver: DslDriver;
   readonly #options: MinnowOptions;
   readonly #ctes: readonly CteDefinition[];
   readonly #liveBox: SharedLiveSet;
+  readonly #catalogBox: SharedCatalog;
 
   constructor(
     driver: DslDriver,
     options: MinnowOptions = {},
     ctes: readonly CteDefinition[] = [],
     liveBox: SharedLiveSet = {},
+    catalogBox: SharedCatalog = {},
   ) {
     this.#driver = driver;
     this.#options = options;
     this.#ctes = ctes;
     this.#liveBox = liveBox;
+    this.#catalogBox = catalogBox;
   }
 
   /**
@@ -161,10 +206,12 @@ export class Minnow<in out DB> {
     return this.#driver;
   }
 
-  #liveServices(): LiveQueryServices {
+  #liveServices(): LiveQueryServices | undefined {
+    const createLiveSet = this.#driver.liveQueries?.bind(this.#driver);
+    if (createLiveSet === undefined) return undefined;
     return {
-      subscribe: async (query: TypedQueryEnvelope<unknown>, handlers) => {
-        this.#liveBox.set ??= this.#driver.liveQueries(this.#options.live ?? {});
+      subscribe: async (query, handlers) => {
+        this.#liveBox.set ??= createLiveSet(this.#options.live ?? {});
         return this.#liveBox.set.subscribe(query, handlers);
       },
     };
@@ -172,9 +219,19 @@ export class Minnow<in out DB> {
 
   #services(): ExecuteServices {
     return {
-      run: (query) => this.#driver.run(query),
+      query: async <TRow>(rendered: RenderedSql) =>
+        (await this.#driver.query(rendered.sql, { params: rendered.params })).rows as TRow[],
       live: this.#liveServices(),
     };
+  }
+
+  async #catalog(): Promise<Catalog> {
+    const introspect = this.#driver.introspect?.bind(this.#driver);
+    if (introspect === undefined) {
+      throw new TypeError("This operation needs schema options or a driver with introspect()");
+    }
+    this.#catalogBox.promise ??= introspect();
+    return this.#catalogBox.promise;
   }
 
   selectFrom<TE extends TableExpression<DB>>(
@@ -209,10 +266,13 @@ export class Minnow<in out DB> {
     return {
       insertBatch: (tableName, rows) => this.#driver.insertBatch(tableName, rows),
       upsertBatch: (tableName, rows) => this.#driver.upsertBatch(tableName, rows),
-      runStatement: (statement, options) => this.#driver.runStatement(statement, options),
-      tableColumns: (tableName) => {
+      execute: (sqlText, params) => this.#driver.execute(sqlText, params),
+      tableColumns: async (tableName) => {
         const definition = schemaTables?.find(({ name }) => name === tableName);
-        return definition === undefined ? undefined : Object.keys(definition.columns);
+        if (definition !== undefined) return Object.keys(definition.columns);
+        return (await this.#catalog()).tables
+          .find(({ name }) => name === tableName)
+          ?.columns.map(({ name }) => name);
       },
       columnDefaultFns: (tableName) => {
         const definition = schemaTables?.find(({ name }) => name === tableName);
@@ -239,6 +299,31 @@ export class Minnow<in out DB> {
     return new DeleteQueryBuilder(this.#mutationServices(), table);
   }
 
+  /** Runs typed builders and SQL together as one atomic write. A thrown error rolls it all back. */
+  async transaction<TResult>(
+    action: (transaction: Minnow<DB>) => Promise<TResult>,
+  ): Promise<TResult> {
+    const write = this.#driver.write?.bind(this.#driver);
+    if (write === undefined) throw new TypeError("This driver does not support transactions");
+    const introspect = this.#driver.introspect?.bind(this.#driver);
+    const { result } = await write(async (session) => {
+      const transactionDriver: DslDriver = {
+        ...(introspect === undefined ? {} : { introspect }),
+        query: (sqlText, options) => session.query(sqlText, options),
+        execute: (sqlText, params) => session.execute(sqlText, params),
+        insertBatch: (tableName, rows) => session.insertBatch(tableName, rows),
+        upsertBatch: (tableName, rows) => session.upsertBatch(tableName, rows),
+        write: async () => {
+          throw new TypeError("Nested transactions are not supported");
+        },
+      };
+      return action(
+        new Minnow<DB>(transactionDriver, this.#options, this.#ctes, {}, this.#catalogBox),
+      );
+    });
+    return result;
+  }
+
   /**
    * Declares a common table expression usable in `selectFrom`/joins of queries created from the
    * returned facade, exactly as SQL `WITH name AS (...)`.
@@ -253,80 +338,117 @@ export class Minnow<in out DB> {
       this.#options,
       [...this.#ctes, { name, builder }],
       this.#liveBox,
+      this.#catalogBox,
     );
   }
 
   /**
-   * Zero-ceremony document search across tables: every searched table (all schema tables by
+   * Zero-ceremony document search across tables: every searched table (all catalog tables by
    * default; `options.tables` narrows the set) runs a MATCH(*)-filtered, BM25-ordered scan,
-   * and the per-table hits merge into one relevance-ranked list. The facade must be created
-   * with `{ schema }` — the per-table column lists come from it.
+   * and the per-table hits merge into one relevance-ranked list. Work is bounded across tables
+   * so a large catalog does not start every query at once.
    */
-  async search(
+  async search<TTable extends WritableTable<DB> = WritableTable<DB>>(
     query: string,
-    options: { tables?: ReadonlyArray<keyof DB & string>; limit?: number } = {},
-  ): Promise<Array<SearchHit<DB>>> {
+    options: {
+      tables?: readonly TTable[];
+      limit?: number;
+      concurrency?: number;
+    } = {},
+  ): Promise<Array<SearchHit<DB, TTable>>> {
     const schemaTables = this.#options.schema?.tables;
-    if (schemaTables === undefined) {
-      throw new TypeError("search() needs the table columns: create the facade with { schema }");
-    }
-    const tableNames = options.tables ?? schemaTables.map(({ name }) => name as keyof DB & string);
+    const columnEntries =
+      schemaTables === undefined
+        ? (await this.#catalog()).tables.map(
+            (table) => [table.name, table.columns.map(({ name }) => name)] as const,
+          )
+        : schemaTables.map((table) => [table.name, Object.keys(table.columns)] as const);
+    const columnsByTable = new Map(columnEntries);
+    const tableNames = options.tables ?? ([...columnsByTable.keys()] as TTable[]);
     const limit = options.limit ?? 10;
-    const perTable = await Promise.all(
-      tableNames.map(async (tableName) => {
-        const definition = schemaTables.find(({ name }) => name === tableName);
-        if (definition === undefined) {
-          throw new TypeError(`search() needs the table's schema: ${tableName}`);
-        }
-        /* eslint-disable-next-line @typescript-eslint/no-explicit-any --
+    const concurrency = options.concurrency ?? 4;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+      throw new TypeError("search() concurrency must be a positive whole number");
+    }
+    const perTable = await mapWithConcurrency(tableNames, concurrency, async (tableName) => {
+      const columnNames = columnsByTable.get(tableName);
+      if (columnNames === undefined) throw new TypeError(`Unknown search table: ${tableName}`);
+      /* eslint-disable-next-line @typescript-eslint/no-explicit-any --
            per-table column lists are only known at runtime; hits erase the row type anyway. */
-        const builder = this.selectFrom(tableName as any) as unknown as SelectQueryBuilder<
-          DB,
-          Record<string, AnyRow>,
-          Record<string, QueryValue>
-        >;
-        // The score is selected under an internal alias so hits can rank across tables, then
-        // stripped from the row; user-facing rows never carry a synthetic column. The alias
-        // grows parentheses until it collides with no real column name.
-        const columnNames = Object.keys(definition.columns);
-        let scoreAlias = "(search score)";
-        while (columnNames.includes(scoreAlias)) scoreAlias = `(${scoreAlias})`;
-        let rows: Array<Record<string, QueryValue>>;
-        try {
-          rows = await builder
-            .select((eb) => [...columnNames, eb.fn.bm25("*", query).as(scoreAlias)])
-            .search(query)
-            .limit(limit)
-            .execute();
-        } catch (error) {
-          // A schema can list tables that don't exist yet or hold nothing searchable; those
-          // tables simply contribute no hits. Anything else is a real failure.
-          const message = error instanceof Error ? error.message : "";
-          if (
-            message.startsWith("Table not found:") ||
-            message.startsWith("Unknown table:") ||
-            message.includes("no searchable columns")
-          ) {
-            return [];
-          }
-          throw error;
+      const builder = this.selectFrom(tableName as any) as unknown as SelectQueryBuilder<
+        DB,
+        Record<string, AnyRow>,
+        Record<string, QueryValue>
+      >;
+      // The score is selected under an internal alias so hits can rank across tables, then
+      // stripped from the row; user-facing rows never carry a synthetic column. The alias
+      // grows parentheses until it collides with no real column name.
+      let scoreAlias = "(search score)";
+      while (columnNames.includes(scoreAlias)) scoreAlias = `(${scoreAlias})`;
+      let rows: Array<Record<string, QueryValue>>;
+      try {
+        rows = await builder
+          .select((eb) => [...columnNames, eb.fn.bm25("*", query).as(scoreAlias)])
+          .search(query)
+          .limit(limit)
+          .execute();
+      } catch (error) {
+        // A schema can list tables that don't exist yet or hold nothing searchable; those
+        // tables simply contribute no hits. Anything else is a real failure.
+        const message = error instanceof Error ? error.message : "";
+        if (
+          message.startsWith("Table not found:") ||
+          message.startsWith("Unknown table:") ||
+          message.includes("no searchable columns")
+        ) {
+          return [];
         }
-        return rows.map((row) => {
-          const { [scoreAlias]: score, ...rest } = row;
-          return { table: tableName, row: rest, score: typeof score === "number" ? score : 0 };
-        });
-      }),
-    );
+        throw error;
+      }
+      return rows.map((row) => {
+        const { [scoreAlias]: score, ...rest } = row;
+        return { table: tableName, row: rest, score: typeof score === "number" ? score : 0 };
+      });
+    });
     return perTable
       .flat()
       .sort((left, right) => right.score - left.score)
-      .slice(0, limit);
+      .slice(0, limit) as Array<SearchHit<DB, TTable>>;
+  }
+
+  /** Runs a SELECT fragment through the SQL parser, plan cache, and query executor. */
+  async query<TRow = QueryRow>(
+    input: string | RawSqlFragment<TRow>,
+    options: QueryOptions = {},
+  ): Promise<TRow[]> {
+    if (typeof input === "string") {
+      return (await this.#driver.query(input, options)).rows as TRow[];
+    }
+    if (options.params !== undefined) {
+      throw new TypeError("A sql fragment already owns its parameters; do not pass options.params");
+    }
+    const rendered = input.render();
+    return (await this.#driver.query(rendered.sql, { ...options, params: rendered.params }))
+      .rows as TRow[];
+  }
+
+  /** Runs one SQL statement and returns the engine's tagged result. */
+  async execute(
+    input: string | RawSqlFragment<unknown>,
+    params?: readonly QueryValue[],
+  ): Promise<ExecuteResult> {
+    if (typeof input === "string") return this.#driver.execute(input, params);
+    if (params !== undefined) {
+      throw new TypeError("A sql fragment already owns its parameters; do not pass params");
+    }
+    const rendered = input.render();
+    return this.#driver.execute(rendered.sql, rendered.params);
   }
 
   /** @internal Raw-SQL escape hatch used by the `sql` template tag. */
   async $executeRaw(sqlText: string, params?: readonly QueryValue[]): Promise<QueryRow[]> {
-    const result = await this.#driver.execute(sqlText, params);
-    return result.result?.rows ?? [];
+    const result = await this.#driver.query(sqlText, params === undefined ? undefined : { params });
+    return result.rows;
   }
 
   /** Closes the shared live-query set, if one was created. */

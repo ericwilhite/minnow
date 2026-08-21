@@ -1,8 +1,8 @@
 import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
 import { compileQuery } from "@minnowdb/core";
-import { type CompiledQuery } from "@minnowdb/core/plan";
+import { type CompiledQuery, type QueryValue } from "@minnowdb/core/plan";
 import { column, schema, table } from "@minnowdb/core";
 import { Minnow } from "./db.js";
 import { sql } from "./sql-tag.js";
@@ -73,6 +73,7 @@ interface Equivalence {
   label: string;
   builder: (db: Minnow<DB>) => {
     compile: () => { plan: CompiledQuery };
+    toSQL: () => { sql: string; params: readonly QueryValue[] };
     execute: () => Promise<unknown[]>;
   };
   sql: string;
@@ -293,6 +294,11 @@ describe("plan and result equivalence", () => {
       const rows = await query.execute();
       const reference = await database.query(sqlText);
       expect(rows).toEqual(reference.rows);
+      const rendered = query.toSQL();
+      const throughSql = await database.query(rendered.sql, {
+        params: rendered.params,
+      });
+      expect(throughSql.rows).toEqual(reference.rows);
       // Executing again returns the same rows — shared expression subtrees stay unmutated.
       expect(await query.execute()).toEqual(reference.rows);
     });
@@ -324,6 +330,17 @@ describe("builder semantics", () => {
       .select(["name"])
       .execute();
     expect(negated).toHaveLength(5);
+  });
+
+  it("lets the SQL engine reject ambiguous bare columns after a join", async () => {
+    const { db } = await seeded();
+    await expect(
+      db
+        .selectFrom("people as first")
+        .innerJoin("people as second", "second.name", "first.name")
+        .select(["name"])
+        .execute(),
+    ).rejects.toThrow("Ambiguous or missing column: name");
   });
 
   it("shares one subquery builder across two outer queries without interference", async () => {
@@ -428,15 +445,40 @@ describe("mutation semantics", () => {
     expect(row.city).toBeNull(); // schema padding filled the omitted nullable column
   });
 
+  it("adds a one-row limit for executeTakeFirst instead of fetching the full result", async () => {
+    const { db, database } = await seeded();
+    const query = vi.spyOn(database, "query");
+    expect(await db.selectFrom("people").select(["name"]).executeTakeFirst()).toBeDefined();
+    expect(query.mock.calls.at(-1)?.[0]).toContain("LIMIT $1");
+    expect(query.mock.calls.at(-1)?.[1]?.params).toEqual([1]);
+  });
+
+  it("pads omitted nullable columns from the live catalog when schema options are absent", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(appSchema);
+    const db = new Minnow<DB>(database);
+    const inserted = await db
+      .insertInto("people")
+      .values({ name: "Annie", score: 1 })
+      .returningAll()
+      .executeTakeFirstOrThrow();
+    expect(inserted).toEqual({ name: "Annie", score: 1, city: null, joined: null });
+  });
+
   it("matches SQL mutation results for the same statements", async () => {
     const first = await seeded();
     const second = await seeded();
-    await first.db
+    const mutation = first.db
       .updateTable("people")
       .set((eb) => ({ score: eb("score", "+", 5) }))
-      .where("city", "=", "London")
-      .execute();
-    await second.database.execute("UPDATE people SET score = score + 5 WHERE city = 'London'");
+      .where("city", "=", "London");
+    const execute = vi.spyOn(first.database, "execute");
+    await mutation.execute();
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining("UPDATE"), [5, "London"]);
+    const rendered = mutation.toSQL();
+    expect(rendered.sql).not.toContain("London");
+    expect(rendered.params).toEqual([5, "London"]);
+    await second.database.execute(rendered.sql, rendered.params);
     const checkSql = "SELECT name, score FROM people ORDER BY name";
     expect((await first.database.query(checkSql)).rows).toEqual(
       (await second.database.query(checkSql)).rows,
@@ -494,6 +536,30 @@ describe("live query selectivity", () => {
 });
 
 describe("compile cost guardrail", () => {
+  it("renders an immutable builder once and reuses its stable SQL", async () => {
+    const { db } = await seeded();
+    const builder = db.selectFrom("people").where("score", ">", 10).select(["name"]);
+    const compile = vi.spyOn(builder, "compile");
+    const first = builder.toSQL();
+    (first.params as QueryValue[])[0] = 999;
+    expect(builder.toSQL().params).toEqual([10]);
+    await builder.execute();
+    await builder.execute();
+    expect(compile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps long chains of values calls cheap", () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const db = new Minnow<DB>(database, { schema: appSchema });
+    let insert = db.insertInto("people");
+    const started = performance.now();
+    for (let index = 0; index < 25_000; index += 1) {
+      insert = insert.values({ name: `person-${String(index)}`, score: index });
+    }
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(insert).toBeDefined();
+  });
+
   it("keeps builder compilation within a small constant factor of SQL parsing", () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     const db = new Minnow<DB>(database, { schema: appSchema });
@@ -529,6 +595,18 @@ describe("compile cost guardrail", () => {
 });
 
 describe("returning", () => {
+  it("keeps chained values calls in insertion order", async () => {
+    const { db } = await seeded();
+    const rows = await db
+      .insertInto("people")
+      .values({ name: "Annie", score: 1 })
+      .values({ name: "Frances", score: 2 })
+      .values([{ name: "Jean", score: 3 }])
+      .returning(["name"])
+      .execute();
+    expect(rows).toEqual([{ name: "Annie" }, { name: "Frances" }, { name: "Jean" }]);
+  });
+
   it("echoes inserted rows, including padded nullable columns, in insertion order", async () => {
     const { db } = await seeded();
     const rows = await db
@@ -625,7 +703,73 @@ describe("update set hygiene", () => {
   });
 });
 
+describe("typed transactions", () => {
+  it("mixes builders and SQL with read-your-writes, then commits once", async () => {
+    const { db, database } = await seeded();
+    const result = await db.transaction(async (tx) => {
+      await tx.insertInto("people").values({ name: "Annie", score: 1 }).execute();
+      await tx
+        .updateTable("people")
+        .set((eb) => ({ score: eb("score", "+", 4) }))
+        .where("name", "=", "Annie")
+        .execute();
+      await tx.execute(
+        sql`INSERT INTO orders (order_id, person, total) VALUES (${20}, ${"Annie"}, ${8})`,
+      );
+      return tx
+        .selectFrom("people")
+        .where("name", "=", "Annie")
+        .select(["score", "city"])
+        .executeTakeFirstOrThrow();
+    });
+    expect(result).toEqual({ score: 5, city: null });
+    expect((await database.query("SELECT total FROM orders WHERE person = 'Annie'")).rows).toEqual([
+      { total: 8 },
+    ]);
+  });
+
+  it("rolls every staged change back when the callback throws", async () => {
+    const { db } = await seeded();
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.insertInto("people").values({ name: "Annie", score: 1 }).execute();
+        throw new Error("stop");
+      }),
+    ).rejects.toThrow("stop");
+    expect(
+      await db.selectFrom("people").where("name", "=", "Annie").select(["name"]).execute(),
+    ).toEqual([]);
+  });
+});
+
 describe("live query lifecycle", () => {
+  it("serves concurrent next calls in order without stranding either waiter", async () => {
+    const { db } = await seeded();
+    const live = db.selectFrom("people").select(["name"]).orderBy("name").live();
+    const iterator = live[Symbol.asyncIterator]();
+    expect((await iterator.next()).done).toBe(false);
+    const firstPending = iterator.next();
+    const secondPending = iterator.next();
+
+    await db.insertInto("people").values({ name: "Margaret", score: 40 }).execute();
+    const first = await Promise.race([
+      firstPending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("hung")), 500)),
+    ]);
+    expect(first.done).toBe(false);
+    expect(first.value?.some((row) => row.name === "Margaret")).toBe(true);
+
+    await db.insertInto("people").values({ name: "Radia", score: 50 }).execute();
+    const second = await Promise.race([
+      secondPending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("hung")), 500)),
+    ]);
+    expect(second.done).toBe(false);
+    expect(second.value?.some((row) => row.name === "Radia")).toBe(true);
+    await iterator.return?.();
+    await db.close();
+  });
+
   it("resolves a cancelled iterator promptly instead of waiting for the next commit", async () => {
     const { db } = await seeded();
     const iterator = db.selectFrom("people").select(["name"]).live()[Symbol.asyncIterator]();

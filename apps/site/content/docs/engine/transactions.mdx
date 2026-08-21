@@ -5,8 +5,8 @@ description: Making several writes atomic, holding one version across several re
 
 ## Atomic writes
 
-You can group writes with SQL `BEGIN` / `COMMIT`, or use a callback when you are working with the
-batch APIs.
+You can group writes with SQL `BEGIN` / `COMMIT`, use a callback with the engine APIs, or call
+`transaction()` on the typed client.
 
 ### Batch write scopes
 
@@ -20,6 +20,10 @@ const { result, version } = await db.write(async (tx) => {
   return sku;
 });
 ```
+
+The callback can mix batch calls with parameterized SQL through `tx.execute(...)`. If you use
+`@minnowdb/client`, its `db.transaction(async (tx) => ...)` form accepts the usual typed builders
+and SQL fragments and returns your callback's result.
 
 Everything inside becomes visible at once, including to other tabs: nobody observes the stock
 decremented without the shipment. If the callback throws, nothing is published.
@@ -45,9 +49,9 @@ saved outside the transaction. Savepoints and nested transactions are not suppor
 
 ### A failed scope stays failed
 
-A statement that fails _after_ registering part of its work — key membership, full-text deltas,
-staged blocks — cannot be undone statement by statement. The scope is poisoned: even if your code
-catches the error and carries on, the commit refuses rather than publishing a fragment.
+A statement that fails _after_ staging part of its work cannot be undone one statement at a time.
+Even if your code catches the error and carries on, the scope refuses to commit rather than saving
+only part of the change.
 
 A statement that fails validation _before_ registering anything — updating a key that does not
 exist, say — leaves the scope clean and usable.

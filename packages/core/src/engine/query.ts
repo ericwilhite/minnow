@@ -651,6 +651,8 @@ export type Expression =
        */
       columns: Expression[] | "*";
       query: string;
+      /** Placeholder used by parameterized SQL; replaced with `query` before execution. */
+      queryParameter?: number;
       /**
        * Corpus statistics for BM25, annotated by the executor onto its cloned plan before
        * evaluation; never set by compilation.
@@ -1730,6 +1732,16 @@ function validateParameters(count: number, params: readonly QueryValue[] | undef
 function bindExpression(expression: Expression, values: readonly QueryValue[]): Expression {
   if (expression.kind === "parameter") {
     return { kind: "literal", value: values[expression.index] ?? null };
+  }
+  if (expression.kind === "fts" && expression.queryParameter !== undefined) {
+    const value = values[expression.queryParameter] ?? null;
+    if (typeof value !== "string") {
+      throw new TypeError("A full-text search query parameter must be a string");
+    }
+    validateFtsQuery(value);
+    expression.query = value;
+    delete expression.queryParameter;
+    return expression;
   }
   if (expression.kind === "subquery" || expression.kind === "exists") {
     bindBlock(expression.block, values);
@@ -5363,7 +5375,7 @@ class Parser {
       this.#keyword("LIMIT");
       if (this.#peek().kind === "parameter") {
         const parameter = this.#parameterExpression();
-        return parameter.kind === "parameter" ? { limitParameter: parameter.index } : {};
+        return { limitParameter: parameter.index };
       }
       return { limit: validateLimit(Number(this.#take("number").text)) };
     }
@@ -5379,7 +5391,7 @@ class Parser {
     let result: { limit?: number; limitParameter?: number; limitWithTies?: boolean } = { limit: 1 };
     if (this.#peek().kind === "parameter") {
       const parameter = this.#parameterExpression();
-      if (parameter.kind === "parameter") result = { limitParameter: parameter.index };
+      result = { limitParameter: parameter.index };
     } else if (this.#peek().kind === "number") {
       result = { limit: validateLimit(Number(this.#take("number").text)) };
     }
@@ -5401,7 +5413,7 @@ class Parser {
     let result: { offset?: number; offsetParameter?: number };
     if (this.#peek().kind === "parameter") {
       const parameter = this.#parameterExpression();
-      result = parameter.kind === "parameter" ? { offsetParameter: parameter.index } : {};
+      result = { offsetParameter: parameter.index };
     } else {
       result = { offset: validateOffset(Number(this.#take("number").text)) };
     }
@@ -6386,7 +6398,7 @@ class Parser {
     return left;
   }
 
-  #parameterExpression(): Expression {
+  #parameterExpression(): Extract<Expression, { kind: "parameter" }> {
     const token = this.#take("parameter");
     if (token.text === "") {
       if (this.#highestNumberedParameter > 0) {
@@ -6502,8 +6514,18 @@ class Parser {
       const columns = this.#ftsColumns();
       this.#keyword("AGAINST");
       const queryToken = this.#peek();
+      if (queryToken.kind === "parameter") {
+        const parameter = this.#parameterExpression();
+        return {
+          kind: "fts",
+          op: upper === "MATCH" ? "match" : "bm25",
+          columns,
+          query: "",
+          queryParameter: parameter.index,
+        };
+      }
       if (queryToken.kind !== "string") {
-        throw new TypeError(`${upper} ... AGAINST requires a string literal query`);
+        throw new TypeError(`${upper} ... AGAINST requires a string literal or parameter query`);
       }
       this.#index += 1;
       validateFtsQuery(queryToken.text);

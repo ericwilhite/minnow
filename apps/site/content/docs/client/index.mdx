@@ -7,12 +7,13 @@ description: A schema-aware query builder with inferred row types, shipped as it
 npm install @minnowdb/client
 ```
 
-`@minnowdb/client` is optional. The engine runs SQL on its own; this package adds a typed way to
-build the same queries.
+`@minnowdb/client` is optional. SQL remains the engine's full language; this package gives it a
+typed builder and a parameter-safe SQL entry point. Use whichever reads more naturally for the
+job, and mix them in one application.
 
-It ships separately so it can move at its own pace without requiring an engine release. It uses
-only the [public plan-building API](/docs/reference/extending), which is also available to anyone
-building a client of their own.
+It ships separately so it can move at its own pace without requiring an engine release. Builders
+produce parameterized SQL, then the SQL engine checks and runs it. That means SQL and the typed
+client share the same rules, cache, and execution path.
 
 ## What you get
 
@@ -44,6 +45,24 @@ const rows = await db
   .execute();
 // Array<{ name: string; city: string | null }>
 ```
+
+The facade also runs the full SQL suite without leaving the client:
+
+```ts
+import { sql } from "@minnowdb/client";
+
+const rows = await db.query<{ name: string }>(
+  sql`SELECT name FROM customers WHERE city = ${"London"}`,
+);
+const result = await db.execute(sql`UPDATE customers SET city = ${"Paris"} WHERE name = ${"Ada"}`);
+```
+
+Interpolated values stay parameters, so the engine can reuse one compiled plan when the values
+change. `sql.identifier("table", "column")` safely quotes a dynamic identifier; ordinary values
+should always use regular interpolation.
+
+Builders use that same path. Call `toSQL()` when you want to inspect or log the statement a builder
+will run.
 
 The named `interface DB extends InferDatabase<...> {}` is the standard form: it keeps hovers,
 errors, and emitted declarations printing `Minnow<DB>` instead of the fully expanded schema, which

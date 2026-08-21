@@ -34,7 +34,7 @@ export class RawSqlFragment<out TRow> {
     this.#parts = parts;
   }
 
-  /** Phantom row type; never materialized at runtime. */
+  /** Type-only row shape; this property does not exist at runtime. */
   declare readonly __row?: TRow;
 
   /** Type-only: the fragment's row, e.g. `type Row = typeof fragment.$inferRow`. Undefined at runtime. */
@@ -112,7 +112,13 @@ function valueParts(value: RawSqlValue): FragmentPart[] {
   return [{ kind: "value", value: validateValue(value as QueryValue) }];
 }
 
-export function sql<TRow = QueryRow>(
+export interface SqlTag {
+  <TRow = QueryRow>(strings: TemplateStringsArray, ...values: RawSqlValue[]): RawSqlFragment<TRow>;
+  /** Quotes one identifier path, for the rare case where a table or column name is dynamic. */
+  identifier(...parts: string[]): RawSqlFragment<never>;
+}
+
+function createFragment<TRow = QueryRow>(
   strings: TemplateStringsArray,
   ...values: RawSqlValue[]
 ): RawSqlFragment<TRow> {
@@ -123,3 +129,17 @@ export function sql<TRow = QueryRow>(
   });
   return new RawSqlFragment<TRow>(parts);
 }
+
+export const sql: SqlTag = Object.assign(createFragment, {
+  identifier: (...parts: string[]): RawSqlFragment<never> => {
+    if (parts.length === 0 || parts.some((part) => part.length === 0)) {
+      throw new TypeError("sql.identifier() requires one or more non-empty names");
+    }
+    return new RawSqlFragment([
+      {
+        kind: "text",
+        text: parts.map((part) => `"${part.replaceAll('"', '""')}"`).join("."),
+      },
+    ]);
+  },
+});

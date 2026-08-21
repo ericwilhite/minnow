@@ -28,9 +28,11 @@ const db = createMinnow<DB>(database, { schema: appSchema });
 const rows = await db.selectFrom("orders").select(["order_id", "total"]).execute();
 ```
 
-This package is optional. `@minnowdb/core` runs SQL on its own; the client adds a friendly, typed
-way to build those same queries. It uses only the public tools in `@minnowdb/core/plan`, which are
-also available for anyone building a client of their own.
+This package is optional. SQL remains Minnow's full language; the client adds a friendly typed
+builder plus parameter-safe `db.query(...)` and `db.execute(...)` entry points. Builders can also
+expose their parameterized form with `toSQL()`. `db.transaction(...)` groups typed builders and SQL
+into one atomic write, and cross-table search uses the live catalog when no schema option is
+present.
 
 Full documentation: [minnowdb.com/docs/client](https://minnowdb.com/docs/client/).
 

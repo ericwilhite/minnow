@@ -3,9 +3,9 @@ import {
   splitCondition,
   type CompiledStatement,
   type Predicate,
-  type QueryRow,
   type QueryValue,
 } from "@minnowdb/core/plan";
+import { type ExecuteResult } from "@minnowdb/core";
 import {
   buildBinaryCondition,
   createExpressionBuilder,
@@ -21,6 +21,8 @@ import {
   type ValueOperand,
 } from "./expression.js";
 import { NoResultError } from "./select-query-builder.js";
+import { renderMutationSql } from "./plan-sql.js";
+import { type RenderedSql } from "./sql-tag.js";
 import {
   materialize,
   type ColumnReference,
@@ -40,8 +42,7 @@ import {
  * (`orReplace()` routes to the upsert path)
  * and `returning` echoes the written rows: the padded inputs overlaid with the engine's
  * generated columns (defaults and auto-increment keys), so callers get generated ids back.
- * Updates and deletes compile to the same mutation statements SQL produces and
- * run through the engine's read-keys-then-apply pipeline; their `returning` rows come back from
+ * Updates and deletes run as parameterized SQL; their `returning` rows come back from
  * the statement's own snapshot (post-update values for updates, the deleted rows for deletes).
  */
 
@@ -66,12 +67,9 @@ export interface MutationServices {
     tableName: string,
     rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
   ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
-  runStatement(
-    statement: CompiledStatement,
-    options?: { returning?: readonly string[] | "*" },
-  ): Promise<{ kind: string; rowCount?: number; returnedRows?: QueryRow[] }>;
-  /** The table's full column list when the facade knows the schema; inserts pad from it. */
-  tableColumns?(tableName: string): readonly string[] | undefined;
+  execute(sql: string, params: readonly QueryValue[]): Promise<ExecuteResult>;
+  /** The table's full column list; inserts use it to pad omitted nullable columns. */
+  tableColumns?(tableName: string): Promise<readonly string[] | undefined>;
   /**
    * Userland default generators by column name, when the facade knows the schema. Inserts call
    * them for omitted-or-null slots before the batch is sent — the engine never sees the
@@ -101,6 +99,20 @@ async function takeFirstOrThrow<TReturn>(results: Promise<TReturn[]>): Promise<T
 
 // --- INSERT -------------------------------------------------------------------------------------
 
+interface InsertRows {
+  readonly previous: InsertRows | undefined;
+  readonly rows: ReadonlyArray<Readonly<Record<string, unknown>>>;
+}
+
+function collectInsertRows(
+  tail: InsertRows | undefined,
+): ReadonlyArray<Readonly<Record<string, unknown>>> {
+  const chunks: Array<InsertRows["rows"]> = [];
+  for (let node = tail; node !== undefined; node = node.previous) chunks.push(node.rows);
+  chunks.reverse();
+  return chunks.flat();
+}
+
 export class InsertQueryBuilder<
   in out DB,
   in out TTable extends keyof DB & string,
@@ -112,7 +124,7 @@ export class InsertQueryBuilder<
   constructor(
     private readonly services: MutationServices,
     private readonly table: TTable,
-    private readonly rows: ReadonlyArray<Readonly<Record<string, unknown>>> = [],
+    private readonly rowList?: InsertRows,
     private readonly replaceOnConflict = false,
     private readonly returningColumns?: ReturningState,
   ) {}
@@ -126,7 +138,7 @@ export class InsertQueryBuilder<
     return new InsertQueryBuilder(
       this.services,
       this.table,
-      [...this.rows, ...additions],
+      { previous: this.rowList, rows: additions },
       this.replaceOnConflict,
       this.returningColumns,
     );
@@ -137,7 +149,7 @@ export class InsertQueryBuilder<
     return new InsertQueryBuilder(
       this.services,
       this.table,
-      this.rows,
+      this.rowList,
       true,
       this.returningColumns,
     );
@@ -150,7 +162,7 @@ export class InsertQueryBuilder<
     return new InsertQueryBuilder(
       this.services,
       this.table,
-      this.rows,
+      this.rowList,
       this.replaceOnConflict,
       columns,
     );
@@ -161,24 +173,25 @@ export class InsertQueryBuilder<
     return new InsertQueryBuilder(
       this.services,
       this.table,
-      this.rows,
+      this.rowList,
       this.replaceOnConflict,
       "*",
     );
   }
 
   async execute(): Promise<TReturn[]> {
-    if (this.rows.length === 0) throw new TypeError("insertInto() requires values()");
+    const rows = collectInsertRows(this.rowList);
+    if (rows.length === 0) throw new TypeError("insertInto() requires values()");
     // With the schema known, omitted nullable columns pad with null (the batch API takes every
     // column) and function defaults fill their omitted-or-null slots; unknown extra keys still
     // surface as engine errors.
-    const columns = new Set<string>(this.services.tableColumns?.(this.table) ?? []);
-    for (const row of this.rows) {
+    const columns = new Set<string>((await this.services.tableColumns?.(this.table)) ?? []);
+    for (const row of rows) {
       for (const key of Object.keys(row)) columns.add(key);
     }
     const names = [...columns];
     const defaults = this.services.columnDefaultFns?.(this.table);
-    const padded = this.rows.map((row) =>
+    const padded = rows.map((row) =>
       Object.fromEntries(
         names.map((name) => {
           const value = (row[name] ?? null) as QueryValue;
@@ -260,10 +273,12 @@ function compileMutationPredicates(wheres: readonly ExpressionSource[]): Predica
 
 async function runReturning<TReturn>(
   services: MutationServices,
-  statement: CompiledStatement,
-  returning: readonly string[] | "*",
+  rendered: RenderedSql,
 ): Promise<TReturn[]> {
-  const result = await services.runStatement(statement, { returning });
+  const result = await services.execute(rendered.sql, rendered.params);
+  if (result.kind !== "update" && result.kind !== "delete") {
+    throw new TypeError(`Expected a row mutation result, received ${result.kind}`);
+  }
   return (result.returnedRows ?? []) as TReturn[];
 }
 
@@ -373,7 +388,7 @@ export class UpdateQueryBuilder<
     return new UpdateQueryBuilder(this.services, this.table, this.wheres, this.assignments, "*");
   }
 
-  compile(): CompiledStatement {
+  compile(): Extract<CompiledStatement, { kind: "update" }> {
     if (this.assignments.length === 0) throw new TypeError("updateTable() requires set()");
     const compiled = this.assignments.map(({ column, source }) => {
       const expression = materialize(source, mutationCompileContext);
@@ -393,12 +408,21 @@ export class UpdateQueryBuilder<
     };
   }
 
+  /** Renders this immutable update as parameterized SQL. */
+  toSQL(): RenderedSql {
+    return renderMutationSql(this.compile(), this.returningColumns);
+  }
+
   async execute(): Promise<TReturn[]> {
+    const rendered = this.toSQL();
     if (this.returningColumns !== undefined) {
-      return runReturning(this.services, this.compile(), this.returningColumns);
+      return runReturning(this.services, rendered);
     }
-    const result = await this.services.runStatement(this.compile());
-    return [{ numUpdatedRows: result.rowCount ?? 0 } as TReturn];
+    const result = await this.services.execute(rendered.sql, rendered.params);
+    if (result.kind !== "update") {
+      throw new TypeError(`Expected an update result, received ${result.kind}`);
+    }
+    return [{ numUpdatedRows: result.rowCount } as TReturn];
   }
 
   async executeTakeFirst(): Promise<TReturn | undefined> {
@@ -465,7 +489,7 @@ export class DeleteQueryBuilder<
     return new DeleteQueryBuilder(this.services, this.table, this.wheres, "*");
   }
 
-  compile(): CompiledStatement {
+  compile(): Extract<CompiledStatement, { kind: "delete" }> {
     return {
       kind: "delete",
       table: this.table,
@@ -473,12 +497,21 @@ export class DeleteQueryBuilder<
     };
   }
 
+  /** Renders this immutable delete as parameterized SQL. */
+  toSQL(): RenderedSql {
+    return renderMutationSql(this.compile(), this.returningColumns);
+  }
+
   async execute(): Promise<TReturn[]> {
+    const rendered = this.toSQL();
     if (this.returningColumns !== undefined) {
-      return runReturning(this.services, this.compile(), this.returningColumns);
+      return runReturning(this.services, rendered);
     }
-    const result = await this.services.runStatement(this.compile());
-    return [{ numDeletedRows: result.rowCount ?? 0 } as TReturn];
+    const result = await this.services.execute(rendered.sql, rendered.params);
+    if (result.kind !== "delete") {
+      throw new TypeError(`Expected a delete result, received ${result.kind}`);
+    }
+    return [{ numDeletedRows: result.rowCount } as TReturn];
   }
 
   async executeTakeFirst(): Promise<TReturn | undefined> {

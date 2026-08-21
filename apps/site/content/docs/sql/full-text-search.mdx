@@ -39,6 +39,14 @@ LIMIT 20
 Scores use the whole column's term statistics, so they are comparable across rows in a way a
 naive term count is not.
 
+Search text can be a parameter, which keeps one statement reusable as the user types:
+
+```ts
+const sql =
+  "SELECT name FROM products WHERE MATCH(name) AGAINST $1 ORDER BY BM25(name) AGAINST $1 DESC";
+const result = await db.query(sql, { params: [searchText] });
+```
+
 ## Prefix matching
 
 A trailing `*` matches by prefix, which is what a search-as-you-type box needs:

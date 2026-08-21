@@ -408,6 +408,12 @@ export class MinnowDatabaseClient {
     const session: ClientWriteSession = {
       query: async (sql, options) =>
         decodeQueryResult(await this._invoke(opened.handleId, "query", [sql, options])),
+      execute: (sql, params) =>
+        this._invoke(
+          opened.handleId,
+          "execute",
+          params === undefined ? [sql] : [sql, params],
+        ) as Promise<ExecuteResult>,
       insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
       upsertBatch: (tableName, input) => stage("upsertBatch", tableName, input),
       updateBatch: (tableName, input) => stage("updateBatch", tableName, input),
@@ -687,6 +693,7 @@ export class MinnowDatabaseClient {
 export interface ClientWriteSession {
   /** Read-your-writes: observes the pre-scope snapshot plus everything staged so far. */
   query(sql: string, options?: { params?: QueryValue[] }): Promise<QueryResult>;
+  execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;

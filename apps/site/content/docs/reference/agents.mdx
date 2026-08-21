@@ -72,8 +72,8 @@ machines: https://minnowdb.com/llms.txt
   or `{ kind: "opfs", name: "app-db" }` for the OPFS store,
   importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Queries, writes, migrations,
   live queries, snapshots, and maintenance use the same calls as `MinnowDatabase`.
-- Full-text search is `MATCH(column) AGAINST 'terms'`, ranked with `BM25(column) AGAINST 'terms'`.
-  There is no index DDL to write; the index builds itself.
+- Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
+  search text as a parameter. There is no index DDL to write; the index builds itself.
 - `db.explain(sql)` returns the optimized plan as text.
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form. It
   lists every supported and rejected form with an example.

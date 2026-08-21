@@ -136,6 +136,15 @@ describe("parameter execution", () => {
     expect(result.rows).toEqual([{ name: "Ada" }]);
   });
 
+  it("binds full-text search queries while reusing the SQL plan", async () => {
+    const database = await seeded();
+    const sql =
+      "SELECT name, BM25(name) AGAINST $1 AS score FROM people WHERE MATCH(name) AGAINST $1 ORDER BY score DESC";
+    expect((await database.query(sql, { params: ["ada"] })).rows[0]?.name).toBe("Ada");
+    expect((await database.query(sql, { params: ["grace"] })).rows[0]?.name).toBe("Grace");
+    await expect(database.query(sql, { params: [1] })).rejects.toThrow("must be a string");
+  });
+
   it("requires parameters when the statement has placeholders", async () => {
     const database = await seeded();
     await expect(database.query("SELECT name FROM people WHERE score > ?")).rejects.toThrow(

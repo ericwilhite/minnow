@@ -131,6 +131,22 @@ describe("Minnow over the worker client", () => {
     await client.close();
   });
 
+  it("runs typed transactions across the worker boundary", async () => {
+    const { db, client } = await connect();
+    const row = await db.transaction(async (tx) => {
+      await tx.insertInto("people").values({ name: "Ada", score: 10 }).execute();
+      await tx.updateTable("people").set({ score: 11 }).where("name", "=", "Ada").execute();
+      return tx
+        .selectFrom("people")
+        .where("name", "=", "Ada")
+        .select(["name", "score"])
+        .executeTakeFirstOrThrow();
+    });
+    expect(row).toEqual({ name: "Ada", score: 11 });
+    await db.close();
+    await client.close();
+  });
+
   it("ends a live iterator when the facade closes, across the channel", async () => {
     const { db, client } = await connect();
     await db.insertInto("people").values({ name: "Ada", score: 10 }).execute();

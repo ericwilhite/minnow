@@ -5,6 +5,7 @@ export {
   type DriverLiveSet,
   type DslDriver,
   type DslLiveOptions,
+  type SearchHit,
 } from "./db.js";
 export {
   AggregateExpressionWrapper,
@@ -48,7 +49,14 @@ export {
   type AliasedSelectQuery,
   type ExecuteServices,
 } from "./select-query-builder.js";
-export { RawSqlFragment, sql, type RawSqlValue, type SqlExecutable } from "./sql-tag.js";
+export {
+  RawSqlFragment,
+  sql,
+  type RawSqlValue,
+  type RenderedSql,
+  type SqlExecutable,
+  type SqlTag,
+} from "./sql-tag.js";
 export type {
   AliasedExpression,
   AllColumnsRow,

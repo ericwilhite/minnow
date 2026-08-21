@@ -18,7 +18,7 @@ import {
   type ReadTableOptions,
 } from "./database.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
-import type { CompiledQuery, QueryRow } from "./query.js";
+import type { CompiledQuery, QueryRow, QueryValue } from "./query.js";
 import { encodeQueryResult, encodeQueryRows, type EncodedQueryResult } from "./result-wire.js";
 import { deserializeSchema, serializeMigrationSteps, type WireSchema } from "./schema-wire.js";
 
@@ -330,6 +330,10 @@ class DatabaseRpcServer {
           return new ColumnarResult(
             encodeQueryResult(await handle.session.query(sql, options as never)),
           );
+        }
+        if (method === "execute") {
+          const [sql, params] = args as [string, readonly QueryValue[] | undefined];
+          return handle.session.execute(sql, params);
         }
         if (method === "stage") {
           const [op, tableName, input] = args as [unknown, string, never];

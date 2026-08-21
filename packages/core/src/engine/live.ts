@@ -58,8 +58,11 @@ export interface LiveQueryStats {
   lastSweepMs: number;
 }
 
-/** A live query: SQL text or a compiled-plan envelope from the typed builder. */
-export type LiveQueryInput = string | { kind: "typed-query"; plan: CompiledQuery };
+/** A live query: plain SQL, parameterized SQL, or a compiled-plan envelope. */
+export type LiveQueryInput =
+  | string
+  | { kind: "sql-query"; sql: string; params: readonly QueryValue[] }
+  | { kind: "typed-query"; plan: CompiledQuery };
 
 interface LiveQueryHost {
   currentVersion(): Promise<number | null>;

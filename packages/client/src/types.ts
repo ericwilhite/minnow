@@ -174,7 +174,7 @@ export interface AliasedExpression<out TValue, out TAlias extends string> {
   readonly alias: TAlias;
   /** Materializes at compile time so subquery sources number under the shared sequence. */
   readonly source: ExpressionSource;
-  /** Phantom output type; never materialized at runtime. */
+  /** Type-only output shape; this property does not exist at runtime. */
   readonly __value?: TValue;
 }
 
@@ -284,7 +284,7 @@ export function isBlockCompilable(value: unknown): value is BlockCompilable {
   );
 }
 
-/** The `{ kind: "typed-query" }` envelope the engine's `run()` executes. */
+/** The typed plan returned by `compile()` for tools that inspect queries. */
 export interface TypedQueryEnvelope<out TRow> {
   readonly kind: "typed-query";
   readonly plan: CompiledQuery;

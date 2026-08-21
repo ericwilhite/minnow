@@ -1258,6 +1258,10 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     "predicate.match-star",
     { oracles: ["sqlite", "pglite"], reason: "MATCH(*) is a Minnow extension" },
   ],
+  [
+    "predicate.match-parameter",
+    { oracles: ["sqlite", "pglite"], reason: "MATCH is a Minnow extension" },
+  ],
   ["function.bm25", { oracles: ["sqlite", "pglite"], reason: "BM25 is a Minnow extension" }],
   [
     "expression.date-trunc",

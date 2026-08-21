@@ -30,6 +30,8 @@ import {
   type ValueOperand,
 } from "./expression.js";
 import { LiveQuery, type LiveQueryServices } from "./live-query.js";
+import { renderPlanSql } from "./plan-sql.js";
+import { type RenderedSql } from "./sql-tag.js";
 import {
   materialize,
   type AliasedExpression,
@@ -52,9 +54,8 @@ import {
 
 /**
  * Kysely-style immutable select builder. Every method returns a new builder; `compile()` runs the
- * exact assembly pipeline the SQL parser ends in (`assembleSelectBlock` and friends with a shared
- * derived-source sequence), so a builder query and its equivalent SQL produce identical optimized
- * plans — same validation errors, same desugars, same execution strategy.
+ * same query-building rules as the SQL parser. Execution renders parameterized SQL, so the engine
+ * checks and runs both forms through its SQL path.
  */
 
 /** Thrown by `executeTakeFirstOrThrow` when the query returned no rows. */
@@ -66,7 +67,7 @@ export class NoResultError extends Error {
 }
 
 export interface ExecuteServices {
-  run<TRow>(query: TypedQueryEnvelope<TRow>): Promise<TRow[]>;
+  query<TRow>(rendered: RenderedSql): Promise<TRow[]>;
   live: LiveQueryServices | undefined;
 }
 
@@ -190,6 +191,8 @@ export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements Blo
 
   /** Type-only: the output row, e.g. `type Row = typeof query.$inferRow`. Undefined at runtime. */
   declare readonly $inferRow: TRow;
+
+  private renderedSql: RenderedSql | undefined;
 
   constructor(
     private readonly state: SelectState,
@@ -517,7 +520,7 @@ export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements Blo
 
   // --- Compilation ------------------------------------------------------------------------------
 
-  /** Compiles to the optimized plan envelope `run()` executes. */
+  /** Compiles to an optimized plan for tools that need to inspect the query. */
   compile(): TypedQueryEnvelope<TRow> {
     let sequence = 0;
     const cteBlocks = new Map<string, CompiledQuery>();
@@ -536,6 +539,16 @@ export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements Blo
       cteBlocks.set(cte.name, cte.builder.compileBlock(context, "(cte)"));
     }
     return { kind: "typed-query", plan: optimizePlan(this.compileBlock(context, "(dsl)")) };
+  }
+
+  /** Renders this immutable builder as parameterized SQL for the engine's SQL entry point. */
+  toSQL(): RenderedSql {
+    const rendered = this.#renderSql();
+    return { sql: rendered.sql, params: [...rendered.params] };
+  }
+
+  #renderSql(): RenderedSql {
+    return (this.renderedSql ??= renderPlanSql(this.compile().plan));
   }
 
   /** @internal Compiles this builder as one block under the caller's compile context. */
@@ -651,11 +664,15 @@ export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements Blo
   }
 
   async execute(): Promise<TRow[]> {
-    return this.#services().run(this.compile());
+    return this.#services().query(this.#renderSql());
   }
 
   async executeTakeFirst(): Promise<TRow | undefined> {
-    const rows = await this.execute();
+    const limit = Math.min(this.state.limit ?? 1, 1);
+    const rows = await new SelectQueryBuilder<DB, TCtx, TRow>(
+      this.#with({ limit }),
+      this.services,
+    ).execute();
     return rows[0];
   }
 
@@ -674,6 +691,6 @@ export class SelectQueryBuilder<in out DB, in out TCtx, out TRow> implements Blo
     if (services.live === undefined) {
       throw new TypeError("Live queries need a database with live query support");
     }
-    return new LiveQuery<TRow>(services.live, this.compile());
+    return new LiveQuery<TRow>(services.live, this.#renderSql());
   }
 }

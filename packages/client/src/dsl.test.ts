@@ -1,5 +1,5 @@
 import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
 import { compileQuery, compileStatement } from "@minnowdb/core";
 import { type CompiledQuery } from "@minnowdb/core/plan";
@@ -575,10 +575,15 @@ describe("mutation builders", () => {
       .orderBy((eb) => eb("score", "*", -1))
       .executeTakeFirstOrThrow();
     expect(arithmetic).toEqual({ name: "Katherine" });
+
+    const adaSql = db.selectFrom("people").select(["name"]).search("ada").toSQL();
+    const graceSql = db.selectFrom("people").select(["name"]).search("grace").toSQL();
+    expect(adaSql.sql).toBe(graceSql.sql);
+    expect(adaSql.params).not.toEqual(graceSql.params);
   });
 
   it("merges ranked hits across tables through db.search()", async () => {
-    const { db } = await seededDb();
+    const { db, database } = await seededDb();
     // "ada" appears in people.name and in orders.person — hits merge ranked across both tables.
     const hits = await db.search("ada");
     expect(hits.length).toBeGreaterThanOrEqual(3);
@@ -593,6 +598,27 @@ describe("mutation builders", () => {
     expect(limited).toHaveLength(1);
     expect(limited[0]?.table).toBe("people");
     expect(limited[0]?.row.name).toBe("Ada");
+
+    const catalogBacked = new Minnow<DB>(database);
+    const originalQuery = database.query.bind(database);
+    let active = 0;
+    let peak = 0;
+    const query = vi.spyOn(database, "query").mockImplementation(async (sqlText, options) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await Promise.resolve();
+      try {
+        return await originalQuery(sqlText, options);
+      } finally {
+        active -= 1;
+      }
+    });
+    expect((await catalogBacked.search("ada", { concurrency: 1 })).length).toBeGreaterThan(0);
+    expect(peak).toBe(1);
+    query.mockRestore();
+    await expect(catalogBacked.search("ada", { concurrency: 0 })).rejects.toThrow(
+      "positive whole number",
+    );
   });
 
   it("keeps generated columns omissible in hand-declared DB interfaces via Generated<T>", async () => {
@@ -686,6 +712,30 @@ describe("mutation builders", () => {
 });
 
 describe("sql template tag", () => {
+  it("runs parameterized query and statement fragments through the facade", async () => {
+    const { db } = await seededDb();
+    const minimum = 20;
+    const rows = await db.query<{ name: string }>(
+      sql`SELECT name FROM people WHERE score >= ${minimum} ORDER BY name`,
+    );
+    expect(rows).toEqual([{ name: "Grace" }, { name: "Katherine" }]);
+
+    const result = await db.execute(
+      sql`UPDATE people SET score = score + ${5} WHERE name = ${"Ada"} RETURNING name, score`,
+    );
+    expect(result).toMatchObject({
+      kind: "update",
+      rowCount: 1,
+      returnedRows: [{ name: "Ada", score: 15 }],
+    });
+    await expect(db.query(sql`SELECT name FROM people`, { params: [1] })).rejects.toThrow(
+      "already owns its parameters",
+    );
+    await expect(db.execute(sql`DELETE FROM people`, [1])).rejects.toThrow(
+      "already owns its parameters",
+    );
+  });
+
   it("escapes interpolated values into literals", async () => {
     const { db } = await seededDb();
     const name = "A'da".replace("'", "'"); // literal quote survives escaping
@@ -707,6 +757,31 @@ describe("sql template tag", () => {
     const timed = sql`SELECT ${1e21}, ${new Date("2024-01-02T03:04:05Z")}`;
     expect(timed.sql).toBe("SELECT $1, $2");
     expect(timed.params).toEqual([1e21, new Date("2024-01-02T03:04:05.000Z")]);
+  });
+
+  it("quotes dynamic identifier paths without turning values into SQL text", () => {
+    const reference = sql.identifier("odd table", 'say "hi"');
+    const query = sql`SELECT ${reference} WHERE value = ${"user text"}`;
+    expect(query.sql).toBe('SELECT "odd table"."say ""hi""" WHERE value = $1');
+    expect(query.params).toEqual(["user text"]);
+    expect(() => sql.identifier()).toThrow("one or more non-empty names");
+  });
+});
+
+describe("builder SQL rendering", () => {
+  it("keeps statement text stable while values move into parameters", () => {
+    const { db } = createDb();
+    const first = db.selectFrom("people").select(["name"]).where("score", ">", 10).limit(5).toSQL();
+    const second = db
+      .selectFrom("people")
+      .select(["name"])
+      .where("score", ">", 20)
+      .limit(8)
+      .toSQL();
+    expect(first.sql).toBe(second.sql);
+    expect(first.params).toEqual([10, 5]);
+    expect(second.params).toEqual([20, 8]);
+    expect(first.sql).not.toContain("10");
   });
 });
 

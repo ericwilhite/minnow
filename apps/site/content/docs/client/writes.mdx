@@ -43,7 +43,7 @@ not thousands of parsed statements.
 
 ## Update and delete
 
-Both choose rows with a filter and compile to the same update and delete statements as SQL:
+Both choose rows with a filter and run parameterized SQL:
 
 ```ts
 await db.updateTable("orders").set({ status: "shipped" }).where("order_id", "=", 1).execute();
@@ -101,7 +101,8 @@ post-update values; deletes return the rows as they were read.
 | `execute()`                 | An array: the `returning` rows, or one result object with a count. |
 | `executeTakeFirst()`        | The first element, or `undefined`.                                 |
 | `executeTakeFirstOrThrow()` | The first element, or throws `NoResultError`.                      |
-| `compile()`                 | The compiled statement, without running it.                        |
+| `compile()`                 | The internal statement, useful for tooling.                        |
+| `toSQL()`                   | Parameterized SQL for an update or delete.                         |
 
 Without `returning`, `execute()` resolves to a single-element array carrying the count —
 `numInsertedRows`, `numUpdatedRows`, or `numDeletedRows` — so `executeTakeFirstOrThrow()` is the
@@ -109,9 +110,21 @@ idiomatic call either way.
 
 ## Atomicity
 
-One builder call is one commit. To make several land together, run them inside a
-[write scope](/docs/engine/transactions#atomic-writes) on the driver — every staged mutation
-publishes as one atomic commit, and a throw aborts the scope with nothing published.
+One builder call is one commit. Use `db.transaction()` when several typed or SQL operations must
+land together:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.updateTable("stock").set({ on_hand: nextOnHand }).where("sku", "=", sku).execute();
+  await tx.insertInto("shipments").values({ sku, qty, shipped_at: new Date() }).execute();
+
+  // Reads here see both staged changes.
+  return tx.selectFrom("stock").where("sku", "=", sku).select(["on_hand"]).executeTakeFirst();
+});
+```
+
+The changes become visible together. If the callback throws, none of them are saved. Nested
+transactions and live queries inside a transaction are not supported.
 
 Constraints declared in your schema are enforced on every one of these paths: a
 [foreign key](/docs/schema#relations-and-row-conditions) with no matching parent row, or a `CHECK`

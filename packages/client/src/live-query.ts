@@ -1,5 +1,5 @@
-import { type QueryResult } from "@minnowdb/core/plan";
-import { type TypedQueryEnvelope } from "./types.js";
+import { type QueryResult, type QueryValue } from "@minnowdb/core/plan";
+import { type RenderedSql } from "./sql-tag.js";
 
 /**
  * The `.live()` terminal of a select builder: one query, typed rows, push delivery. Subscribing
@@ -18,7 +18,11 @@ export interface LiveSubscriptionHandle {
 /** The slice of a live-query set the DSL needs; Database and the worker client both provide it. */
 export interface LiveQueryServices {
   subscribe(
-    query: TypedQueryEnvelope<unknown>,
+    query: {
+      kind: "sql-query";
+      sql: string;
+      params: readonly QueryValue[];
+    },
     handlers: {
       onChange(result: QueryResult): void;
       onError?(error: unknown): void;
@@ -40,20 +44,23 @@ export class LiveQuery<out TRow> implements AsyncIterable<TRow[]> {
 
   constructor(
     private readonly services: LiveQueryServices,
-    private readonly query: TypedQueryEnvelope<TRow>,
+    private readonly query: RenderedSql,
   ) {}
 
   /** Delivers the initial result, then every changed result, until the handle is closed. */
   async subscribe(handlers: LiveQueryHandlers<TRow>): Promise<LiveSubscriptionHandle> {
-    return this.services.subscribe(this.query, {
-      onChange: (result) => {
-        handlers.onChange(result.rows as TRow[]);
+    return this.services.subscribe(
+      { kind: "sql-query", ...this.query },
+      {
+        onChange: (result) => {
+          handlers.onChange(result.rows as TRow[]);
+        },
+        ...(handlers.onError === undefined ? {} : { onError: handlers.onError.bind(handlers) }),
+        ...(handlers.onComplete === undefined
+          ? {}
+          : { onComplete: handlers.onComplete.bind(handlers) }),
       },
-      ...(handlers.onError === undefined ? {} : { onError: handlers.onError.bind(handlers) }),
-      ...(handlers.onComplete === undefined
-        ? {}
-        : { onComplete: handlers.onComplete.bind(handlers) }),
-    });
+    );
   }
 
   /**
@@ -92,45 +99,57 @@ export class LiveQuery<out TRow> implements AsyncIterable<TRow[]> {
       }
     };
     const done = { done: true as const, value: undefined };
-    return {
-      next: async (): Promise<IteratorResult<TRow[], undefined>> => {
-        subscription ??= this.subscribe({
-          onChange: (rows) => {
-            inbox.latest = rows;
-            inbox.hasLatest = true;
-            wake();
-          },
-          onError: (error) => {
-            inbox.failure = { error };
-            wake();
-          },
-          onComplete: () => {
-            inbox.completed = true;
-            wake();
-          },
-        });
-        await subscription;
-        for (;;) {
-          if (inbox.stopped) return done;
-          if (inbox.failure !== undefined) {
-            const { error } = inbox.failure;
-            inbox.stopped = true;
-            await closeOnce();
-            throw error;
-          }
-          if (inbox.hasLatest) {
-            inbox.hasLatest = false;
-            return { done: false, value: inbox.latest };
-          }
-          if (inbox.completed) {
-            inbox.stopped = true;
-            await closeOnce();
-            return done;
-          }
-          await new Promise<void>((resolve) => {
-            inbox.notify = resolve;
-          });
+    const readNext = async (): Promise<IteratorResult<TRow[], undefined>> => {
+      subscription ??= this.subscribe({
+        onChange: (rows) => {
+          inbox.latest = rows;
+          inbox.hasLatest = true;
+          wake();
+        },
+        onError: (error) => {
+          inbox.failure = { error };
+          wake();
+        },
+        onComplete: () => {
+          inbox.completed = true;
+          wake();
+        },
+      });
+      await subscription;
+      for (;;) {
+        if (inbox.stopped) return done;
+        if (inbox.failure !== undefined) {
+          const { error } = inbox.failure;
+          inbox.stopped = true;
+          await closeOnce();
+          throw error;
         }
+        if (inbox.hasLatest) {
+          inbox.hasLatest = false;
+          return { done: false, value: inbox.latest };
+        }
+        if (inbox.completed) {
+          inbox.stopped = true;
+          await closeOnce();
+          return done;
+        }
+        await new Promise<void>((resolve) => {
+          inbox.notify = resolve;
+        });
+      }
+    };
+    // AsyncIterator callers are allowed to request more than one value at once. Queue those
+    // reads so each has one waiter; a single shared waiter lets a later next() strand an earlier
+    // one forever.
+    let readQueue = Promise.resolve();
+    return {
+      next: (): Promise<IteratorResult<TRow[], undefined>> => {
+        const queued = readQueue.then(readNext, readNext);
+        readQueue = queued.then(
+          () => undefined,
+          () => undefined,
+        );
+        return queued;
       },
       return: async (): Promise<IteratorResult<TRow[], undefined>> => {
         inbox.stopped = true;

@@ -97,7 +97,7 @@ db.selectFrom("orders as o").where((eb) =>
 | ------------------------------------------- | ------------------------------------------------------------- |
 | `eb.and([...])` / `eb.or([...])`            | Conditions folded left to right.                              |
 | `eb.not(condition)`                         | Negation.                                                     |
-| `eb.between(ref, lo, hi)` / `notBetween`    | A range, desugared exactly as the parser does.                |
+| `eb.between(ref, lo, hi)` / `notBetween`    | A range check, with an optional `not`.                        |
 | `eb.exists(subquery)`                       | `EXISTS (...)`, capped at one row.                            |
 | `eb.ref("c.name")`                          | A column in value position, for column-to-column comparisons. |
 | `eb.val(42)`                                | A literal as an expression.                                   |
@@ -229,16 +229,30 @@ index declaration — see [Full-text search](/docs/sql/full-text-search).
 | `execute()`                 | Every row.                                |
 | `executeTakeFirst()`        | The first row, or `undefined`.            |
 | `executeTakeFirstOrThrow()` | The first row, or throws `NoResultError`. |
-| `compile()`                 | The plan envelope, without running it.    |
+| `compile()`                 | The internal plan, useful for tooling.    |
+| `toSQL()`                   | Parameterized SQL and its bound values.   |
 | `live()`                    | A [live query](/docs/client/live).        |
 
 ## Escaping to SQL
 
-The `sql` template tag runs a statement the builder cannot express, with values bound as parameters
-rather than interpolated:
+The `sql` template tag reaches the engine's complete SQL language, with values bound as parameters
+rather than pasted into the statement:
 
 ```ts
 import { sql } from "@minnowdb/client";
 
-const rows = await sql`SELECT * FROM orders WHERE total > ${threshold}`.execute(db);
+const rows = await db.query<{ order_id: number; total: number }>(
+  sql`SELECT order_id, total FROM orders WHERE total > ${threshold}`,
+);
+
+const result = await db.execute(
+  sql`UPDATE orders SET status = ${"review"} WHERE total > ${threshold}`,
+);
 ```
+
+`fragment.execute(db)` remains a short row-query form. Prefer `db.query(fragment)` when you want
+query options, and `db.execute(fragment)` for mutations, schema changes, triggers, or transaction
+statements because its tagged result tells you exactly what happened.
+
+`executeTakeFirst()` adds a one-row limit before it runs, so it does not fetch a full result only
+to discard all but the first row.

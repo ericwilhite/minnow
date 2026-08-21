@@ -579,7 +579,7 @@ export interface ExpressionBuilder<in out DB, in out TCtx> {
   /** ORs conditions left to right. */
   or(conditions: ReadonlyArray<ExpressionWrapper<SqlBool>>): ExpressionWrapper<SqlBool>;
   not(condition: ExpressionWrapper<SqlBool>): ExpressionWrapper<SqlBool>;
-  /** `lhs BETWEEN lower AND upper`, desugared exactly as the parser does. */
+  /** `lhs BETWEEN lower AND upper`. */
   between<TRef extends ColumnReference<TCtx>>(
     reference: TRef | ExpressionWrapper<unknown>,
     lower: ValueOperand<ReferencedValue<TCtx, TRef & string>>,

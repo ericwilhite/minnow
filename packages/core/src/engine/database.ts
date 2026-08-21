@@ -499,6 +499,8 @@ export interface StagedWriteResult {
   tableName: string;
   segmentId: string | null;
   rowCount: number;
+  /** Values filled by defaults or auto-increment while the rows were staged. */
+  generatedColumns?: Record<string, QueryValue[]>;
 }
 
 /**
@@ -518,6 +520,8 @@ export interface WriteSession {
    * has staged so far, ordered after all committed data — without publishing anything.
    */
   query(sql: string, options?: { params?: QueryOptions["params"] }): Promise<QueryResult>;
+  /** Runs a SELECT, INSERT, UPDATE, or DELETE inside this write scope. */
+  execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   insertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   upsertBatch(tableName: string, input: InsertBatchInput): Promise<StagedWriteResult>;
   updateBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
@@ -3134,19 +3138,27 @@ export class MinnowDatabase {
    * refresh but never produce a stale result. Subscriptions retain a result digest, not rows.
    */
   liveQueries(options: LiveQuerySetOptions = {}): LiveQuerySet {
+    const compileLiveQuery = (query: LiveQueryInput): CompiledQuery => {
+      if (typeof query === "string") return this.#compileCached(query);
+      if (query.kind === "typed-query") return query.plan;
+      return bindPlanParameters(this.#compileCached(query.sql), query.params);
+    };
     const set = new LiveQuerySet(
       {
         currentVersion: () => this.store.getCurrentManifestVersion(),
         manifestPage: (afterVersion, limit) => this.store.listManifestPage(afterVersion, limit),
         dependencyTableIds: async (query) => {
-          const compiled = typeof query === "string" ? this.#compileCached(query) : query.plan;
+          const compiled = compileLiveQuery(query);
           // A live query over a view depends on the tables behind it, not on the view's name.
           const plan = await this.#applyCatalogRewrites(compiled);
           const tables = await this.#findRealBlockTables(plan);
           return new Set([...tables.values()].map((record) => record.id));
         },
-        execute: async (query) =>
-          typeof query === "string" ? this.query(query) : this.#queryCompiled(query.plan),
+        execute: async (query) => {
+          if (typeof query === "string") return this.query(query);
+          if (query.kind === "typed-query") return this.#queryCompiled(query.plan);
+          return this.query(query.sql, { params: query.params });
+        },
         changeCanAffect: (query, tableIds, after, until) =>
           this.#liveChangeCanAffect(query, tableIds, after, until),
       },
@@ -3177,7 +3189,12 @@ export class MinnowDatabase {
     after: number | null,
     until: number,
   ): Promise<boolean> {
-    const plan = typeof query === "string" ? this.#compileCached(query) : query.plan;
+    const plan =
+      typeof query === "string"
+        ? this.#compileCached(query)
+        : query.kind === "typed-query"
+          ? query.plan
+          : bindPlanParameters(this.#compileCached(query.sql), query.params);
     if (planContainsFts(plan)) return true;
     // Base-scan zone proofs are unsound when the plan reads the table anywhere else — a
     // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
@@ -4176,6 +4193,27 @@ export class MinnowDatabase {
         open();
         return this.#sessionQuery(transaction, sql, options);
       },
+      execute: async (sql, params) => {
+        open();
+        const compiled = compileStatement(sql);
+        if (compiled.kind === "select") {
+          return {
+            kind: "rows",
+            result: await this.#sessionQuery(
+              transaction,
+              compiled.sql,
+              params === undefined ? {} : { params },
+            ),
+          };
+        }
+        const statement = bindStatementParameters(compiled, params);
+        if (!isTransactionalStatement(statement)) {
+          throw new TypeError(
+            `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a write scope`,
+          );
+        }
+        return this.runStatement(statement, { writer });
+      },
       insertBatch: async (tableName, input) => {
         open();
         staged += 1;
@@ -4196,6 +4234,10 @@ export class MinnowDatabase {
         staged += 1;
         return guarded(() => this.#sessionDelete(transaction, tableName, input));
       },
+    };
+    const writer: StatementWriter = {
+      ...session,
+      queryPlan: (plan) => this.#sessionQueryPlan(transaction, plan),
     };
     try {
       const result = await action(session, transaction);
@@ -4409,7 +4451,7 @@ export class MinnowDatabase {
     cascadeBudget = 1,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
-    const { batch, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
     await this.#assertForeignKeysPresent(
       table,
       (column) => batch.columns[column] ?? [],
@@ -4507,7 +4549,13 @@ export class MinnowDatabase {
         cascadeBudget,
       );
     }
-    return { tableName: table.name, segmentId, rowCount };
+    collectAutoIncrementGenerated(batch, generated, autoIncrement);
+    return {
+      tableName: table.name,
+      segmentId,
+      rowCount,
+      ...(generated.size === 0 ? {} : { generatedColumns: Object.fromEntries(generated) }),
+    };
   }
 
   async #sessionUpdate(

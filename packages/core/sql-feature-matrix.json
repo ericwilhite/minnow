@@ -372,6 +372,14 @@
       "example": "SELECT region FROM rows WHERE MATCH(*) AGAINST 'wes*'"
     },
     {
+      "id": "predicate.match-parameter",
+      "feature": "minnow",
+      "status": "supported",
+      "example": "SELECT region FROM rows WHERE MATCH(region) AGAINST $1 ORDER BY BM25(region) AGAINST $1 DESC",
+      "params": ["west"],
+      "notes": "Search text binds like any other value, so search-as-you-type can reuse one planned statement."
+    },
+    {
       "id": "function.bm25",
       "feature": "minnow",
       "status": "supported",
