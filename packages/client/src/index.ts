@@ -5,6 +5,7 @@ export {
   type DriverLiveSet,
   type DslDriver,
   type DslLiveOptions,
+  type DslWriteSession,
   type SearchHit,
 } from "./db.js";
 export {

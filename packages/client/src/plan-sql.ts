@@ -191,10 +191,12 @@ class PlanSqlWriter {
     } else if (source.union !== undefined) {
       const [first, ...rest] = source.union.blocks;
       if (first === undefined) throw new TypeError("A set operation needs a first query");
-      body = `(${this.query(first)}${rest
+      // Each compiled member owns its own ORDER BY, LIMIT, and OFFSET. Parentheses keep those
+      // tails attached to that member when the SQL parser builds the set operation again.
+      body = `((${this.query(first)})${rest
         .map(
           (block, index) =>
-            ` ${(source.union?.ops[index] ?? "union").toUpperCase()} ${this.query(block)}`,
+            ` ${(source.union?.ops[index] ?? "union").toUpperCase()} (${this.query(block)})`,
         )
         .join("")})`;
     } else if (source.windowed !== undefined) {

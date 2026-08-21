@@ -23,7 +23,7 @@ A launcher appears in the corner; click it or press `Cmd/Ctrl + Shift + D`.
   sortable headers and typed filters. Rows load as you scroll, by cursor rather than offset
   wherever the table allows it, so reading deep into a table stays as fast as reading the start.
 - **Attaches to what you already have** — a `MinnowDatabase`, a `MinnowDatabaseClient`, or the
-  `Minnow` facade over either.
+  typed `Minnow` client over either.
 - **Framework-agnostic** — also ships as `<minnow-devtools>`, a custom element with a shadow root,
   so it works unchanged in React, Vue, Svelte, Solid, Astro, and plain HTML.
 - **A window, not a modal** — no backdrop, no focus trap; the page underneath stays interactive.

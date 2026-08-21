@@ -13,8 +13,8 @@ INSERT INTO customers (customer_id, name, city, signed_up_on)
 VALUES (?, ?, ?, ?)
 ```
 
-Multiple row tuples in one statement are fine. `INSERT … SELECT` also works: Minnow reads the
-query from one stable version, then writes the result:
+You can add several rows in one statement. `INSERT … SELECT` also works: Minnow reads from the
+current transaction, including rows written earlier in it, then adds the result:
 
 ```sql
 INSERT INTO archived_orders (order_id, customer_id, total, placed_at)
@@ -33,9 +33,8 @@ UPDATE orders SET status = 'refunded', total = total - ? WHERE order_id = ?
 DELETE FROM orders WHERE placed_at < ?
 ```
 
-Any `WHERE` clause works — the engine resolves it to the affected rows and writes a mutation
-segment addressing them. `SET` expressions can read the row's current values, as `total - ?` does
-above.
+Any `WHERE` clause works. Minnow finds the matching rows and records the change. `SET` expressions
+can read the row's current values, as `total - ?` does above.
 
 <Callout title="The table needs a unique key">
   `UPDATE` and `DELETE` are rejected on a table with no `PRIMARY KEY`:

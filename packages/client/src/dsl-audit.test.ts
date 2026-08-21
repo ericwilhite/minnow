@@ -332,6 +332,24 @@ describe("builder semantics", () => {
     expect(negated).toHaveLength(5);
   });
 
+  it("preserves a final set member's local ordering, limit, and offset", async () => {
+    const { db, database } = await seeded();
+    const union = db
+      .selectFrom("people")
+      .where("score", "=", 5)
+      .select(["score"])
+      .unionAll(
+        db.selectFrom("people").select(["score"]).orderBy("score", "desc").limit(2).offset(1),
+      );
+    const intersection = db
+      .selectFrom("people")
+      .select(["score"])
+      .intersect(db.selectFrom("people").where("score", ">=", 20).select(["score"]).limit(1));
+
+    expect(await union.execute()).toEqual(await database.run(union.compile()));
+    expect(await intersection.execute()).toEqual(await database.run(intersection.compile()));
+  });
+
   it("lets the SQL engine reject ambiguous bare columns after a join", async () => {
     const { db } = await seeded();
     await expect(
@@ -465,6 +483,25 @@ describe("mutation semantics", () => {
     expect(inserted).toEqual({ name: "Annie", score: 1, city: null, joined: null });
   });
 
+  it("refreshes the live catalog after schema changes", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(appSchema);
+    const db = new Minnow<DB>(database);
+
+    // The first insert reads the original catalog. Later operations must not keep that copy.
+    await db.insertInto("people").values({ name: "Annie", score: 1 }).execute();
+    await db.execute("ALTER TABLE people ADD COLUMN note TEXT");
+    await db.insertInto("people").values({ name: "Frances", score: 2 }).execute();
+    expect(
+      (await database.query("SELECT name, note FROM people WHERE name = 'Frances'")).rows,
+    ).toEqual([{ name: "Frances", note: null }]);
+
+    await db.execute("CREATE TABLE later (id REAL UNIQUE, body TEXT)");
+    await db.execute("INSERT INTO later (id, body) VALUES (1, 'needle')");
+    const hits = await db.search("needle");
+    expect(hits.some((hit) => (hit as { table: string }).table === "later")).toBe(true);
+  });
+
   it("matches SQL mutation results for the same statements", async () => {
     const first = await seeded();
     const second = await seeded();
@@ -546,6 +583,24 @@ describe("compile cost guardrail", () => {
     await builder.execute();
     await builder.execute();
     expect(compile).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders immutable update and delete builders once", async () => {
+    const { db } = await seeded();
+    const update = db.updateTable("people").set({ score: 1 }).where("name", "=", "Nobody");
+    const deletion = db.deleteFrom("people").where("name", "=", "Nobody");
+    const updateCompile = vi.spyOn(update, "compile");
+    const deleteCompile = vi.spyOn(deletion, "compile");
+
+    const updateSql = update.toSQL();
+    (updateSql.params as QueryValue[])[0] = 999;
+    expect(update.toSQL().params).toEqual([1, "Nobody"]);
+    deletion.toSQL();
+    await update.execute();
+    await deletion.execute();
+
+    expect(updateCompile).toHaveBeenCalledTimes(1);
+    expect(deleteCompile).toHaveBeenCalledTimes(1);
   });
 
   it("keeps long chains of values calls cheap", () => {

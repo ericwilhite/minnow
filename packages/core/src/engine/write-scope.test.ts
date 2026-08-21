@@ -121,6 +121,88 @@ describe("atomic write scopes", () => {
       expect((await database.query("SELECT COUNT(*) AS n FROM accounts")).rows).toEqual([{ n: 2 }]);
     });
 
+    it(`${implementation.name} keeps partial conflict updates inside the scope`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+      await database.createTable({
+        name: "items",
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "score", type: "number" },
+          { name: "note", type: "string", nullable: true },
+        ],
+      });
+      await database.insertBatch("items", [{ id: 1, score: 1, note: "kept" }]);
+
+      await expect(
+        database.write(async (tx) => {
+          const result = await tx.execute(
+            "INSERT INTO items (id, score, note) VALUES (?, ?, ?) " +
+              "ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score",
+            [1, 9, "ignored"],
+          );
+          expect(result).toMatchObject({ kind: "insert", rowCount: 1 });
+          expect(result).not.toHaveProperty("version");
+          expect((await tx.query("SELECT score, note FROM items WHERE id = 1")).rows).toEqual([
+            { score: 9, note: "kept" },
+          ]);
+          throw new Error("roll back the scope");
+        }),
+      ).rejects.toThrow("roll back the scope");
+
+      expect((await database.query("SELECT score, note FROM items WHERE id = 1")).rows).toEqual([
+        { score: 1, note: "kept" },
+      ]);
+    });
+
+    it(`${implementation.name} lets INSERT SELECT read rows staged earlier in the scope`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 8, compression: "raw" });
+      for (const name of ["source_rows", "copied_rows"]) {
+        await database.createTable({
+          name,
+          uniqueKey: "id",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "value", type: "string" },
+          ],
+        });
+      }
+
+      const { version } = await database.write(async (tx) => {
+        await tx.execute("INSERT INTO source_rows (id, value) VALUES (?, ?)", [1, "staged"]);
+        const copied = await tx.execute(
+          "INSERT INTO copied_rows (id, value) SELECT id, value FROM source_rows",
+        );
+        expect(copied).toMatchObject({ kind: "insert", rowCount: 1 });
+        expect((await tx.query("SELECT * FROM copied_rows")).rows).toEqual([
+          { id: 1, value: "staged" },
+        ]);
+      });
+
+      expect(version).not.toBeNull();
+      expect((await database.query("SELECT * FROM copied_rows")).rows).toEqual([
+        { id: 1, value: "staged" },
+      ]);
+    });
+
+    it(`${implementation.name} applies DO NOTHING to a key staged earlier in the scope`, async () => {
+      const store = await implementation.create();
+      const database = await bank(store);
+      await database.write(async (tx) => {
+        await tx.execute("INSERT INTO accounts (id, balance) VALUES (?, ?)", [3, 30]);
+        const ignored = await tx.execute(
+          "INSERT INTO accounts (id, balance) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+          [3, 99],
+        );
+        expect(ignored).toMatchObject({ kind: "insert", rowCount: 0 });
+      });
+      expect((await database.query("SELECT balance FROM accounts WHERE id = 3")).rows).toEqual([
+        { balance: 30 },
+      ]);
+    });
+
     it(`${implementation.name} enforces unique keys across and inside scopes`, async () => {
       const store = await implementation.create();
       const database = await bank(store);
@@ -562,6 +644,65 @@ describe("atomic write scopes", () => {
     });
     expect((await database.query(sql)).rows).toEqual([{ total: 450 }]);
     live.close();
+  });
+
+  it("rolls a partial conflict update back through SQL BEGIN and ROLLBACK", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "score", type: "number" },
+        { name: "note", type: "string", nullable: true },
+      ],
+    });
+    await database.insertBatch("items", [{ id: 1, score: 1, note: "kept" }]);
+
+    await database.execute("BEGIN");
+    const updated = await database.execute(
+      "INSERT INTO items (id, score, note) VALUES (1, 9, 'ignored') " +
+        "ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score",
+    );
+    expect(updated).not.toHaveProperty("version");
+    expect((await database.query("SELECT score FROM items WHERE id = 1")).rows).toEqual([
+      { score: 9 },
+    ]);
+    await database.execute("ROLLBACK");
+
+    expect((await database.query("SELECT score FROM items WHERE id = 1")).rows).toEqual([
+      { score: 1 },
+    ]);
+  });
+
+  it("poisons a caught multi-stage SQL failure instead of committing its first half", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "required", type: "string" },
+        { name: "score", type: "number" },
+        { name: "note", type: "string", nullable: true },
+      ],
+    });
+    await database.insertBatch("items", [{ id: 1, required: "kept", score: 1, note: null }]);
+
+    await expect(
+      database.write(async (tx) => {
+        await tx
+          .execute(
+            "INSERT INTO items (id, score, note) VALUES (1, 9, 'changed'), (2, 3, 'new') " +
+              "ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score",
+          )
+          .catch(() => undefined);
+      }),
+    ).rejects.toThrow("rolled back");
+
+    expect((await database.query("SELECT id, score, note FROM items")).rows).toEqual([
+      { id: 1, score: 1, note: null },
+    ]);
   });
 
   it("stages nothing, publishes nothing", async () => {

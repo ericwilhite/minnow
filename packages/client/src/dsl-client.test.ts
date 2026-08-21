@@ -147,6 +147,48 @@ describe("Minnow over the worker client", () => {
     await client.close();
   });
 
+  it("rolls back a partial conflict update across the worker boundary", async () => {
+    const { db, client } = await connect();
+    await db.insertInto("people").values({ name: "Ada", score: 10, city: "London" }).execute();
+
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.execute(
+          "INSERT INTO people (name, score, city) VALUES (?, ?, ?) " +
+            "ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
+          ["Ada", 99, "ignored"],
+        );
+        throw new Error("roll back");
+      }),
+    ).rejects.toThrow("roll back");
+
+    await expect(
+      db.selectFrom("people").where("name", "=", "Ada").selectAll().executeTakeFirstOrThrow(),
+    ).resolves.toEqual({ name: "Ada", score: 10, city: "London" });
+    await db.close();
+    await client.close();
+  });
+
+  it("lets INSERT SELECT read rows staged earlier across the worker boundary", async () => {
+    const { db, client } = await connect();
+
+    await db.transaction(async (tx) => {
+      await tx.insertInto("people").values({ name: "Ada", score: 10, city: "London" }).execute();
+      await tx.execute(
+        "INSERT INTO people (name, score, city) " +
+          "SELECT ?, score, city FROM people WHERE name = ?",
+        ["Grace", "Ada"],
+      );
+    });
+
+    await expect(db.selectFrom("people").selectAll().orderBy("name").execute()).resolves.toEqual([
+      { name: "Ada", score: 10, city: "London" },
+      { name: "Grace", score: 10, city: "London" },
+    ]);
+    await db.close();
+    await client.close();
+  });
+
   it("ends a live iterator when the facade closes, across the channel", async () => {
     const { db, client } = await connect();
     await db.insertInto("people").values({ name: "Ada", score: 10 }).execute();

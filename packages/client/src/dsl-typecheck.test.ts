@@ -5,6 +5,7 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
 import { column, schema, table, view } from "@minnowdb/core";
 import { Minnow, createMinnow } from "./db.js";
+import { type DslWriteSession } from "./index.js";
 import { type FromRow, type InferDatabase, type WritableTable } from "./types.js";
 
 /**
@@ -132,6 +133,11 @@ describe("rejects invalid queries at compile time", () => {
 });
 
 describe("infers precise row types", () => {
+  it("exports the custom-driver write session from the package entry point", () => {
+    expectTypeOf<DslWriteSession["query"]>().toBeFunction();
+    expectTypeOf<DslWriteSession["execute"]>().toBeFunction();
+  });
+
   it("carries aliases, qualification, and nullability into the row type", () => {
     const db = createDb();
 

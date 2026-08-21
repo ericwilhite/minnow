@@ -171,7 +171,7 @@ const big = db.selectFrom("orders").select(["customer_id", "total"]).where("tota
 db.selectFrom(big.as("b")).select(["b.customer_id"]);
 ```
 
-`db.with(name, factory)` declares a common table expression, returning a facade that knows about it:
+`db.with(name, factory)` declares a common table expression and returns a client that knows about it:
 
 ```ts
 const scoped = db.with("recent", (qb) =>
@@ -252,7 +252,7 @@ const result = await db.execute(
 
 `fragment.execute(db)` remains a short row-query form. Prefer `db.query(fragment)` when you want
 query options, and `db.execute(fragment)` for mutations, schema changes, triggers, or transaction
-statements because its tagged result tells you exactly what happened.
+statements. Its result has a `kind` field that tells you exactly what happened.
 
 `executeTakeFirst()` adds a one-row limit before it runs, so it does not fetch a full result only
 to discard all but the first row.

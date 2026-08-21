@@ -6,12 +6,12 @@ description: The four calls that execute statements, how parameters bind, and wh
 Every statement goes through one of four methods. They differ in what they return, not in what
 they can run.
 
-| Call                               | Use it for                                    | Returns                            |
-| ---------------------------------- | --------------------------------------------- | ---------------------------------- |
-| `query(sql, options?)`             | `SELECT`                                      | `{ rows, columns }`                |
-| `execute(sql, params?)`            | Any statement, including DDL and writes       | A tagged result per statement kind |
-| `explain(sql)`                     | Understanding a plan                          | The optimized plan as text         |
-| `runStatement(compiled, options?)` | Re-running a statement compiled ahead of time | Same as `execute`                  |
+| Call                               | Use it for                                    | Returns                                  |
+| ---------------------------------- | --------------------------------------------- | ---------------------------------------- |
+| `query(sql, options?)`             | `SELECT`                                      | `{ rows, columns }`                      |
+| `execute(sql, params?)`            | Any statement, including DDL and writes       | A result whose `kind` says what happened |
+| `explain(sql)`                     | Understanding a plan                          | The optimized plan as text               |
+| `runStatement(compiled, options?)` | Re-running a statement compiled ahead of time | Same as `execute`                        |
 
 ## Reading
 

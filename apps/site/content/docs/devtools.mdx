@@ -28,8 +28,8 @@ npm install @minnowdb/devtools
 
 ## Mount it
 
-The panel attaches to a `MinnowDatabase`, a `MinnowDatabaseClient`, or the `Minnow` facade over
-either — it reaches the database behind a facade through [`db.driver`](/docs/reference/api).
+The panel attaches to a `MinnowDatabase`, a `MinnowDatabaseClient`, or the typed `Minnow` client
+over either — it reaches the database behind that client through [`db.driver`](/docs/reference/api).
 
 ```ts
 import { mountMinnowDevtools } from "@minnowdb/devtools";

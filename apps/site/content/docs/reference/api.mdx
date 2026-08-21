@@ -11,7 +11,7 @@ package.
 
 | Entry point                              | Contents                                                        |
 | ---------------------------------------- | --------------------------------------------------------------- |
-| `@minnowdb/core`                         | Schema DSL, typed facade and builders, engine, live queries     |
+| `@minnowdb/core`                         | Schema DSL, typed client and builders, engine, live queries     |
 | `@minnowdb/core/client`                  | Main-thread worker client                                       |
 | `@minnowdb/core/worker`                  | Ready-made worker entry (side-effect import)                    |
 | `@minnowdb/core/storage`                 | Block stores: IndexedDB, OPFS, in-memory, the storage interface |
@@ -37,8 +37,8 @@ From `@minnowdb/core`. See [Schema & migrations](/docs/schema).
 | `column.enum([...])`                                                                                     | A string column restricted to a closed value set, typed as the literal union and validated on every write. Migrations may add values, never remove.                                                                     |
 | `.unique() / .nullable() / .renamedFrom()`                                                               | Column modifiers: unique key, NULL widening, stable-ID rename.                                                                                                                                                          |
 | `.references(table, column, { onDelete })`                                                               | Declares a FOREIGN KEY onto another table's unique key, created as a real constraint. `onDelete` is `"restrict"` (default), `"cascade"`, or `"set null"`.                                                               |
-| `.autoIncrement() / .default(value \| fn)`                                                               | Generated values: a persistent cross-tab counter for number unique keys; literal / `"now"` defaults filled engine-side on every write path; function defaults called by the typed facade just before the batch is sent. |
-| `schema(tables, { views })`                                                                              | Bundles tables and views into a `SchemaDefinition` for `migrate()` and the facade.                                                                                                                                      |
+| `.autoIncrement() / .default(value \| fn)`                                                               | Generated values: a persistent cross-tab counter for number unique keys; literal / `"now"` defaults filled engine-side on every write path; function defaults called by the typed client just before the batch is sent. |
+| `schema(tables, { views })`                                                                              | Bundles tables and views into a `SchemaDefinition` for `migrate()` and the typed client.                                                                                                                                |
 | `view(name, { sql, columns })`                                                                           | Declares a read-only view. The engine verifies the declared columns against the query's inferred output at migration time.                                                                                              |
 | `typedTable(database, tableDef)`                                                                         | Thin schema-typed handle over the batch APIs.                                                                                                                                                                           |
 | `planMigration(catalog, definition)`                                                                     | Computes the metadata-only `MigrationPlan` that `migrate()` executes.                                                                                                                                                   |
@@ -57,7 +57,7 @@ From `@minnowdb/core`. See [Extending Minnow](/docs/reference/extending).
 | `CatalogForeignKey, CatalogCheck, CatalogTrigger`   | Constraint and trigger entries.                                                                    |
 | `toCatalog(records)`                                | Projects storage table records into a `Catalog`; sorted by name so a diff is stable.               |
 
-## Typed facade
+## Typed client
 
 From `@minnowdb/client`, an optional package installed separately. See
 [Reading data](/docs/client/queries) and [Writing data](/docs/client/writes).
@@ -70,21 +70,21 @@ From `@minnowdb/client`, an optional package installed separately. See
 | `WritableTable<DB>`                                    | The `DB` names that accept writes; views are excluded structurally, so writing to one is a compile error. |
 | `TableShape<S, I, U>` / `ViewShape<S>`                 | The entry types `InferDatabase` produces.                                                                 |
 
-| Export                                              | Description                                                                                                                                                                                                         |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createMinnow<DB>(driver, { schema })`              | Builds the facade. The standard form passes a named `interface DB extends InferDatabase<typeof appSchema> {}` so tooling prints `Minnow<DB>`; omitting the type argument infers `DB` from the schema value instead. |
-| `class Minnow<DB>`                                  | The facade itself; wraps a `MinnowDatabase` or `MinnowDatabaseClient` (any `DslDriver`).                                                                                                                            |
-| `.selectFrom(table \| derived)`                     | Starts a `SelectQueryBuilder`; accepts `"people"`, `"people as p"`, or an aliased subquery.                                                                                                                         |
-| `.insertInto / .updateTable / .deleteFrom`          | Start the mutation builders.                                                                                                                                                                                        |
-| `.with(name, () => query)`                          | Adds a CTE usable as a from/join source in the following query.                                                                                                                                                     |
-| `.search(query, { tables?, limit?, concurrency? })` | Document search across real tables, using the schema or live catalog. Table work is limited to four at once by default, and results are merged into a typed `{ table, row, score }` list.                           |
-| `.query<Row>(sqlOrFragment, options?)`              | Runs a row query through the SQL parser and statement-text plan cache; a fragment contributes its own bound parameters.                                                                                             |
-| `.execute(sqlOrFragment, params?)`                  | Runs one query, mutation, DDL, trigger, or transaction statement and returns the engine's tagged `ExecuteResult`.                                                                                                   |
-| `.transaction(callback)`                            | Runs typed builders and SQL as one atomic write. Reads see earlier work in the callback; a thrown error rolls it all back.                                                                                          |
-| `.close()`                                          | Closes the facade's shared live-query set. Close the driver separately when the application owns it.                                                                                                                |
-| `.driver`                                           | The `MinnowDatabase` or `MinnowDatabaseClient` behind the facade, for tools handed only the facade. Application code should keep its own reference instead.                                                         |
-| `MinnowOptions`                                     | Facade options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`.                                                                                                                  |
-| `DslDriver, DriverLiveSet, DslLiveOptions`          | The small driver interface shared by the database and worker client.                                                                                                                                                |
+| Export                                                      | Description                                                                                                                                                                                                               |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createMinnow<DB>(driver, { schema })`                      | Builds the typed client. The standard form passes a named `interface DB extends InferDatabase<typeof appSchema> {}` so tooling prints `Minnow<DB>`; omitting the type argument infers `DB` from the schema value instead. |
+| `class Minnow<DB>`                                          | The typed client itself; wraps a `MinnowDatabase` or `MinnowDatabaseClient` (any `DslDriver`).                                                                                                                            |
+| `.selectFrom(table \| derived)`                             | Starts a `SelectQueryBuilder`; accepts `"people"`, `"people as p"`, or an aliased subquery.                                                                                                                               |
+| `.insertInto / .updateTable / .deleteFrom`                  | Start the mutation builders.                                                                                                                                                                                              |
+| `.with(name, () => query)`                                  | Adds a CTE usable as a from/join source in the following query.                                                                                                                                                           |
+| `.search(query, { tables?, limit?, concurrency? })`         | Document search across real tables, using the schema or live catalog. Table work is limited to four at once by default, and results are merged into a typed `{ table, row, score }` list.                                 |
+| `.query<Row>(sqlOrFragment, options?)`                      | Runs a row query through the SQL parser and statement-text plan cache; a fragment contributes its own bound parameters.                                                                                                   |
+| `.execute(sqlOrFragment, params?)`                          | Runs one query, mutation, DDL, trigger, or transaction statement. The result's `kind` field says what happened.                                                                                                           |
+| `.transaction(callback)`                                    | Runs typed builders and SQL as one atomic write. Reads see earlier work in the callback; a thrown error rolls it all back.                                                                                                |
+| `.close()`                                                  | Closes the typed client's shared live-query set. Close the driver separately when the application owns it.                                                                                                                |
+| `.driver`                                                   | The `MinnowDatabase` or `MinnowDatabaseClient` behind the typed client. Application code should keep its own reference when it already has one.                                                                           |
+| `MinnowOptions`                                             | Typed client options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`.                                                                                                                  |
+| `DslDriver, DslWriteSession, DriverLiveSet, DslLiveOptions` | The small driver interfaces shared by the database and worker client.                                                                                                                                                     |
 
 ### SelectQueryBuilder
 
@@ -151,7 +151,7 @@ From `@minnowdb/core`. See [Live queries](/docs/client/live).
 
 ## The engine — `MinnowDatabase`
 
-From `@minnowdb/core`. The low-level asynchronous engine the facade drives. See
+From `@minnowdb/core`. The low-level asynchronous engine the typed client drives. See
 [Writes & transactions](/docs/sql/dml).
 
 ```ts
@@ -250,7 +250,7 @@ checks used by the SQL parser, so a hand-built plan is checked just like parsed 
 ## `@minnowdb/client`
 
 The optional typed query builder. Installed separately: `npm install @minnowdb/client`. See
-[Typed facade](#typed-facade) above and [Schema & migrations](/docs/schema).
+[Typed client](#typed-client) above and [Schema & migrations](/docs/schema).
 
 ## `@minnowdb/core/storage`
 

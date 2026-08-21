@@ -40,7 +40,7 @@ import {
 import { type RawSqlFragment, type RenderedSql } from "./sql-tag.js";
 
 /**
- * The Kysely-style facade. `Minnow<DB>` wraps either the in-worker `MinnowDatabase` or the
+ * The Kysely-style client. `Minnow<DB>` wraps either the in-worker `MinnowDatabase` or the
  * main-thread `MinnowDatabaseClient` (both satisfy `DslDriver` structurally) and hands out
  * typed builders: `selectFrom`, `insertInto`, `updateTable`, `deleteFrom`, `with`, and live
  * queries through the builders' `.live()`. `DB` is derived from the runtime schema with
@@ -81,7 +81,7 @@ export interface DslWriteSession {
   ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
 }
 
-/** The slice of MinnowDatabase / MinnowDatabaseClient the facade drives. */
+/** The part of MinnowDatabase / MinnowDatabaseClient used by the typed client. */
 export interface DslDriver {
   introspect?(): Promise<Catalog>;
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
@@ -133,7 +133,7 @@ async function mapWithConcurrency<TValue, TResult>(
 }
 
 /**
- * Creates the typed facade. The recommended form names the database type once, so every hover,
+ * Creates the typed client. The recommended form names the database type once, so every hover,
  * error, and emitted declaration prints `Minnow<DB>` instead of the fully expanded schema —
  * which matters as soon as the schema has more than a table or two:
  *
@@ -165,10 +165,6 @@ interface SharedLiveSet {
   set?: DriverLiveSet | undefined;
 }
 
-interface SharedCatalog {
-  promise?: Promise<Catalog> | undefined;
-}
-
 /** One db.search hit: the owning table, the row (without the score alias), and its BM25 score. */
 export type SearchHit<DB, TTable extends WritableTable<DB> = WritableTable<DB>> =
   TTable extends WritableTable<DB>
@@ -180,27 +176,24 @@ export class Minnow<in out DB> {
   readonly #options: MinnowOptions;
   readonly #ctes: readonly CteDefinition[];
   readonly #liveBox: SharedLiveSet;
-  readonly #catalogBox: SharedCatalog;
 
   constructor(
     driver: DslDriver,
     options: MinnowOptions = {},
     ctes: readonly CteDefinition[] = [],
     liveBox: SharedLiveSet = {},
-    catalogBox: SharedCatalog = {},
   ) {
     this.#driver = driver;
     this.#options = options;
     this.#ctes = ctes;
     this.#liveBox = liveBox;
-    this.#catalogBox = catalogBox;
   }
 
   /**
-   * The driver this facade was created with — the `MinnowDatabase` or `MinnowDatabaseClient`
-   * behind it. Tools handed only the facade (devtools, inspectors, schema browsers) reach the
+   * The driver this client was created with — the `MinnowDatabase` or `MinnowDatabaseClient`
+   * behind it. Tools handed only the client (devtools, inspectors, schema browsers) reach the
    * catalog and the raw SQL entry points through here; application code should keep its own
-   * reference to the driver rather than reaching back through the facade.
+   * reference to the driver rather than reaching back through the client.
    */
   get driver(): DslDriver {
     return this.#driver;
@@ -230,8 +223,9 @@ export class Minnow<in out DB> {
     if (introspect === undefined) {
       throw new TypeError("This operation needs schema options or a driver with introspect()");
     }
-    this.#catalogBox.promise ??= introspect();
-    return this.#catalogBox.promise;
+    // The catalog can change through migrations, raw DDL, or another connection. Read it for
+    // each catalog-backed operation so inserts and search never work from an old schema.
+    return introspect();
   }
 
   selectFrom<TE extends TableExpression<DB>>(
@@ -317,16 +311,14 @@ export class Minnow<in out DB> {
           throw new TypeError("Nested transactions are not supported");
         },
       };
-      return action(
-        new Minnow<DB>(transactionDriver, this.#options, this.#ctes, {}, this.#catalogBox),
-      );
+      return action(new Minnow<DB>(transactionDriver, this.#options, this.#ctes));
     });
     return result;
   }
 
   /**
    * Declares a common table expression usable in `selectFrom`/joins of queries created from the
-   * returned facade, exactly as SQL `WITH name AS (...)`.
+   * returned client, exactly as SQL `WITH name AS (...)`.
    */
   with<TName extends string, TCteCtx, TCteRow extends AnyRow>(
     name: TName,
@@ -338,7 +330,6 @@ export class Minnow<in out DB> {
       this.#options,
       [...this.#ctes, { name, builder }],
       this.#liveBox,
-      this.#catalogBox,
     );
   }
 
@@ -432,7 +423,7 @@ export class Minnow<in out DB> {
       .rows as TRow[];
   }
 
-  /** Runs one SQL statement and returns the engine's tagged result. */
+  /** Runs one SQL statement and returns a result that says what the statement did. */
   async execute(
     input: string | RawSqlFragment<unknown>,
     params?: readonly QueryValue[],

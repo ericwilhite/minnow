@@ -57,7 +57,7 @@ machines: https://minnowdb.com/llms.txt
   independently inside it. Install them on the same major; npm refuses a mixed-major set.
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
   statement that writes, rather than writing.
-- `db.execute(sql, params)` runs any statement and returns a tagged result. Check `result.kind`
+- `db.execute(sql, params)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
   `drop-table`, `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading
   `rowCount`, `version`, or `returnedRows`.

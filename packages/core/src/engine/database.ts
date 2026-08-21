@@ -873,7 +873,14 @@ class TransactionRollback extends Error {
  * into the scope; schema changes do not, because the catalog commits outside it and a rollback
  * could not take them back.
  */
-function isTransactionalStatement(statement: CompiledStatement): boolean {
+type TransactionalStatement = Extract<
+  CompiledStatement,
+  { kind: "insert" | "update" | "delete" | "select" }
+>;
+
+function isTransactionalStatement(
+  statement: CompiledStatement,
+): statement is TransactionalStatement {
   return (
     statement.kind === "insert" ||
     statement.kind === "update" ||
@@ -946,6 +953,11 @@ export interface StatementWriter extends WriteSession {
   queryPlan(plan: CompiledQuery): Promise<QueryResult>;
 }
 
+/** The extra entry point held by BEGIN so already-compiled statements are not parsed twice. */
+interface TransactionStatementWriter extends StatementWriter {
+  executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
+}
+
 export interface VisibleSegment {
   id: string;
   rowCount: number;
@@ -996,7 +1008,7 @@ export class MinnowDatabase {
   /** The scope a statement-level BEGIN opened, held until COMMIT, ROLLBACK, or the idle sweep. */
   #openTransaction:
     | {
-        session: StatementWriter;
+        session: TransactionStatementWriter;
         settle: (outcome: "commit" | "rollback") => void;
         finished: Promise<{ version: number | null | undefined }>;
         timer: ReturnType<typeof setInterval>;
@@ -4158,7 +4170,11 @@ export class MinnowDatabase {
    * paths a statement-level transaction routes through.
    */
   async #openWriteScope<T>(
-    action: (session: WriteSession, transaction: DatabaseTransaction) => Promise<T>,
+    action: (
+      session: WriteSession,
+      transaction: DatabaseTransaction,
+      writer: TransactionStatementWriter,
+    ) => Promise<T>,
   ): Promise<{ result: T; version: number | null }> {
     const transaction = await this.#transactions.begin();
     let closed = false;
@@ -4212,7 +4228,10 @@ export class MinnowDatabase {
             `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a write scope`,
           );
         }
-        return this.runStatement(statement, { writer });
+        // Guard the whole SQL statement as one stage. Some INSERT forms perform more than one
+        // batch operation; if a later step fails after an earlier one staged work, the caller
+        // must not be able to catch the error and commit only part of the statement.
+        return writer.executeStatement(statement);
       },
       insertBatch: async (tableName, input) => {
         open();
@@ -4235,12 +4254,16 @@ export class MinnowDatabase {
         return guarded(() => this.#sessionDelete(transaction, tableName, input));
       },
     };
-    const writer: StatementWriter = {
+    const writer: TransactionStatementWriter = {
       ...session,
       queryPlan: (plan) => this.#sessionQueryPlan(transaction, plan),
+      executeStatement: (statement) => {
+        open();
+        return guarded(() => this.runStatement(statement, { writer }));
+      },
     };
     try {
-      const result = await action(session, transaction);
+      const result = await action(session, transaction, writer);
       closed = true;
       if (poisoned !== undefined) {
         // The outer catch aborts the transaction.
@@ -5248,14 +5271,13 @@ export class MinnowDatabase {
       // together or not at all. Schema changes are refused rather than silently auto-committed:
       // the catalog is not part of the scope, so a DDL statement inside one would land even if
       // the transaction rolled back.
-      if (!isTransactionalStatement(statement)) {
+      const boundStatement = bindStatementParameters(statement, params);
+      if (!isTransactionalStatement(boundStatement)) {
         throw new TypeError(
-          `${statement.kind.toUpperCase().replace("-", " ")} is not allowed inside a transaction`,
+          `${boundStatement.kind.toUpperCase().replace("-", " ")} is not allowed inside a transaction`,
         );
       }
-      return this.#duringTransaction(open, () =>
-        this.runStatement(bindStatementParameters(statement, params), { writer: open.session }),
-      );
+      return this.#duringTransaction(open, () => open.session.executeStatement(boundStatement));
     }
     return this.runStatement(bindStatementParameters(statement, params));
   }
@@ -5444,19 +5466,16 @@ export class MinnowDatabase {
       if (this.#openTransaction !== undefined) {
         throw new TypeError("A transaction is already open; COMMIT or ROLLBACK it first");
       }
-      let start!: (writer: StatementWriter) => void;
-      const opened = new Promise<StatementWriter>((resolve) => {
+      let start!: (writer: TransactionStatementWriter) => void;
+      const opened = new Promise<TransactionStatementWriter>((resolve) => {
         start = resolve;
       });
       let settle!: (outcome: "commit" | "rollback") => void;
       const decided = new Promise<"commit" | "rollback">((resolve) => {
         settle = resolve;
       });
-      const finished = this.#openWriteScope<null>(async (session, transaction) => {
-        start({
-          ...session,
-          queryPlan: (plan) => this.#sessionQueryPlan(transaction, plan),
-        });
+      const finished = this.#openWriteScope<null>(async (_session, _transaction, writer) => {
+        start(writer);
         if ((await decided) === "rollback") throw new TransactionRollback();
         return null;
       });
@@ -5546,7 +5565,7 @@ export class MinnowDatabase {
     const assigned = statement.onConflict.columns ?? [];
     const keyToken = (value: QueryValue): string =>
       value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
-    const { result: returnedRows, version } = await this.write(async (transaction) => {
+    const apply = async (transaction: WriteSession): Promise<QueryRow[] | undefined> => {
       const existing = await this.#existingInsertKeys(table, keyColumn, statement, (sql, params) =>
         transaction.query(sql, { params }),
       );
@@ -5600,12 +5619,21 @@ export class MinnowDatabase {
         const row = rowsByKey.get(keyToken(key)) ?? {};
         return Object.fromEntries(returningColumns.map((name) => [name, row[name] ?? null]));
       });
-    });
+    };
+    let returnedRows: QueryRow[] | undefined;
+    let version: number | null | undefined;
+    if (options.writer === undefined) {
+      const completed = await this.write(apply);
+      returnedRows = completed.result;
+      version = completed.version;
+    } else {
+      returnedRows = await apply(options.writer);
+    }
     return {
       kind: "insert",
       table: statement.table,
       rowCount: statement.rows.length,
-      ...(version === null ? {} : { version }),
+      ...(version === null || version === undefined ? {} : { version }),
       ...(returnedRows === undefined ? {} : { returnedRows }),
     };
   }
@@ -5635,6 +5663,7 @@ export class MinnowDatabase {
   /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
   async #filterConflictingInsertRows(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
+    writer?: StatementWriter,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     const table = await this.#findTable(statement.table);
     const keyColumn = getUniqueKeyColumn(table);
@@ -5664,8 +5693,10 @@ export class MinnowDatabase {
     };
     // The streaming-first pipeline: a keyed IN list narrows to the blocks that can hold the
     // keys, where the prepared path materialized the table's columns first.
+    const existingRows =
+      writer === undefined ? await this.#queryCompiled(plan) : await writer.queryPlan(plan);
     const existing = new Set<QueryValue | string>(
-      (await this.#queryCompiled(plan)).rows.map((row) => {
+      existingRows.rows.map((row) => {
         const value = row.key ?? null;
         return value instanceof Date ? value.toISOString() : value;
       }),
@@ -5772,14 +5803,20 @@ export class MinnowDatabase {
 
   async #materializeInsertSelect(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
+    writer?: StatementWriter,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     if (statement.query === undefined) return statement;
-    const prepared = await this.#prepareCompiledPlan(statement.query);
     let result: QueryResult;
-    try {
-      result = prepared.execute();
-    } finally {
-      prepared.close();
+    if (writer === undefined) {
+      const prepared = await this.#prepareCompiledPlan(statement.query);
+      try {
+        result = prepared.execute();
+      } finally {
+        prepared.close();
+      }
+    } else {
+      const plan = await this.#applyCatalogRewrites(statement.query);
+      result = await writer.queryPlan(plan);
     }
     const { query, ...rest } = statement;
     void query;
@@ -5906,10 +5943,10 @@ export class MinnowDatabase {
       options = { ...options, returning: statement.returning };
     }
     if (statement.kind === "insert" && statement.query !== undefined) {
-      statement = await this.#materializeInsertSelect(statement);
+      statement = await this.#materializeInsertSelect(statement, options.writer);
     }
     if (statement.kind === "insert" && statement.onConflict?.action === "nothing") {
-      statement = await this.#filterConflictingInsertRows(statement);
+      statement = await this.#filterConflictingInsertRows(statement, options.writer);
     }
     if (statement.kind === "insert" && statement.onConflict?.action === "update") {
       return this.#mergeConflictingInsertRows(statement, options);

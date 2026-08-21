@@ -48,9 +48,9 @@ There's a builder per column type — `column.boolean()`, `column.number()`, `co
   plain value persists in the catalog and fills inside the engine, so every write path gets it —
   raw batches, SQL statements, other tabs (datetime columns take only `"now"`, which stamps one
   consistent timestamp per batch). A function is a userland generator — `() => ulid()`, a
-  custom nanoid, anything: the typed facade (`insertInto`, `typedTable`) calls it just before
+  custom nanoid, anything: the typed client (`insertInto`, `typedTable`) calls it just before
   the batch is sent, so it never persists, never crosses the worker boundary, and write paths
-  that skip the facade don't see it. Defaults require non-nullable columns, and `returning`
+  that skip the typed client don't see it. Defaults require non-nullable columns, and `returning`
   echoes the written values either way.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
   rather than a drop-and-add.

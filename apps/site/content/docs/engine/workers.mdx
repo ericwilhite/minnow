@@ -27,7 +27,7 @@ const client = new MinnowDatabaseClient(
 );
 await client.migrate(appSchema);
 
-// The typed facade wraps the client exactly as it wraps an in-worker database.
+// The typed client wraps the worker client exactly as it wraps an in-worker database.
 const db = createMinnow<DB>(client, { schema: appSchema });
 await db
   .insertInto("people")
@@ -82,7 +82,7 @@ starts and stops) and satisfies `worker-src` content-security policies from your
 - **Functions can't cross.** Construction options like `now`, `createId`, or a custom store need
   a custom entry (below).
 
-The typed facade doesn't care about any of this: compiled plans cross the channel by structured
+The typed client doesn't care about any of this: compiled plans cross the channel by structured
 clone, so `selectFrom`, typed [writes](/docs/sql/dml), and `.live()` behave identically.
 
 ## Buffered writers and live queries

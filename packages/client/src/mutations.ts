@@ -71,7 +71,7 @@ export interface MutationServices {
   /** The table's full column list; inserts use it to pad omitted nullable columns. */
   tableColumns?(tableName: string): Promise<readonly string[] | undefined>;
   /**
-   * Userland default generators by column name, when the facade knows the schema. Inserts call
+   * Default generators by column name, when the client knows the schema. Inserts call
    * them for omitted-or-null slots before the batch is sent — the engine never sees the
    * functions, only the generated values.
    */
@@ -291,6 +291,7 @@ export class UpdateQueryBuilder<
 > {
   /** Type-only: the execute() element, e.g. `typeof q.$inferResult`. Undefined at runtime. */
   declare readonly $inferResult: TReturn;
+  private renderedSql: RenderedSql | undefined;
 
   constructor(
     private readonly services: MutationServices,
@@ -410,11 +411,16 @@ export class UpdateQueryBuilder<
 
   /** Renders this immutable update as parameterized SQL. */
   toSQL(): RenderedSql {
-    return renderMutationSql(this.compile(), this.returningColumns);
+    const rendered = this.#renderSql();
+    return { sql: rendered.sql, params: [...rendered.params] };
+  }
+
+  #renderSql(): RenderedSql {
+    return (this.renderedSql ??= renderMutationSql(this.compile(), this.returningColumns));
   }
 
   async execute(): Promise<TReturn[]> {
-    const rendered = this.toSQL();
+    const rendered = this.#renderSql();
     if (this.returningColumns !== undefined) {
       return runReturning(this.services, rendered);
     }
@@ -443,6 +449,7 @@ export class DeleteQueryBuilder<
 > {
   /** Type-only: the execute() element, e.g. `typeof q.$inferResult`. Undefined at runtime. */
   declare readonly $inferResult: TReturn;
+  private renderedSql: RenderedSql | undefined;
 
   constructor(
     private readonly services: MutationServices,
@@ -499,11 +506,16 @@ export class DeleteQueryBuilder<
 
   /** Renders this immutable delete as parameterized SQL. */
   toSQL(): RenderedSql {
-    return renderMutationSql(this.compile(), this.returningColumns);
+    const rendered = this.#renderSql();
+    return { sql: rendered.sql, params: [...rendered.params] };
+  }
+
+  #renderSql(): RenderedSql {
+    return (this.renderedSql ??= renderMutationSql(this.compile(), this.returningColumns));
   }
 
   async execute(): Promise<TReturn[]> {
-    const rendered = this.toSQL();
+    const rendered = this.#renderSql();
     if (this.returningColumns !== undefined) {
       return runReturning(this.services, rendered);
     }
