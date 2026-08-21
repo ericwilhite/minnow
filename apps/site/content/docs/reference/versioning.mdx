@@ -11,8 +11,8 @@ minors the two happen to be on.
 npm install @minnowdb/core @minnowdb/client
 ```
 
-The client and the devtools console are built on the engine's published primitives, and a change
-that breaks that contract is a major change by definition. So each package depends on its siblings
+The client and devtools console use the engine's public APIs. A change that stops those APIs from
+working is a major change, so each package depends on its siblings
 by a range that spans the major and stops at it:
 
 ```json

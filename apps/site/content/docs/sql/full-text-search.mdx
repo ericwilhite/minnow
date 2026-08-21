@@ -3,7 +3,7 @@ title: Full-text search
 description: MATCH and BM25 over any column, with no index DDL.
 ---
 
-Search is a predicate, not a separate subsystem. There is no `CREATE INDEX` and no shadow table:
+Search is part of an ordinary query. There is no `CREATE INDEX` and no shadow table:
 name the columns to search and the engine handles the rest.
 
 ```sql
@@ -19,7 +19,7 @@ SELECT name FROM products WHERE MATCH(name, brand) AGAINST 'copper kettle'
 SELECT name FROM products WHERE MATCH(*) AGAINST 'yirgacheffe'
 ```
 
-`MATCH(*)` searches numbers and datetimes through their canonical rendering, so `MATCH(*) AGAINST
+`MATCH(*)` searches numbers and dates through their standard text form, so `MATCH(*) AGAINST
 '2025'` finds rows by a date column as well as by text.
 
 ## Ranking

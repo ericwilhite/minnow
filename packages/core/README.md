@@ -3,7 +3,8 @@
 Columnar SQL engine for the browser: real SQL over immutable snapshots, durable on IndexedDB or
 OPFS, with
 no WebAssembly to download. It runs in the thread that constructs it (`MinnowDatabase`), or in a
-worker with a main-thread client that mirrors it call for call (`MinnowDatabaseClient`).
+worker through `MinnowDatabaseClient`, which mirrors the everyday query, write, migration,
+live-query, snapshot, and maintenance APIs.
 
 **[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
 run yourself.
@@ -12,7 +13,7 @@ run yourself.
 npm install @minnowdb/core
 ```
 
-- **SQL is the contract** — parser, planner, optimizer, and a vectorized executor written here,
+- **SQL is the foundation** — parser, planner, optimizer, and a batch-based executor written here,
   with no SQLite or DuckDB underneath. The supported surface ships as a checked-in feature matrix
   (`@minnowdb/core/sql-feature-matrix.json`) that the engine is tested against.
 - **One schema, in TypeScript** — `table()`, `column`, and `schema()` declare tables once and
@@ -23,8 +24,8 @@ npm install @minnowdb/core
 - **Durable browser storage** — compressed columnar blocks on IndexedDB or OPFS, atomic
   multi-tab commits,
   snapshot reads, compaction and GC.
-- **Bounded memory** — execution works in batches under a budget you set and spills to storage
-  rather than failing.
+- **Memory-aware queries** — execution works in batches under a budget you set, and sorts and
+  grouped results can spill to storage. The budget is not a hard heap limit yet.
 - **Subpath exports** — `/storage`, `/storage/toolkit`, `/client`, `/worker`,
   `/worker-protocol`, `/transactions`, `/plan`, `/block-format`, `/testing`.
 

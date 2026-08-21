@@ -29,7 +29,7 @@ const { rows } = await db.query(`
 ```
 
 <Callout type="warn" title="Experimental">
-  The version-zero block format carries no compatibility promise, and the SQL surface is a
+  The early block format carries no compatibility promise, and the SQL surface is a
   correctness-first subset of SQL:2023 rather than the whole standard. Everything the engine does
   and deliberately refuses to do is listed, keyed to the standard's own feature identifiers, in the
   [feature matrix](/docs/sql/feature-matrix).
@@ -37,7 +37,7 @@ const { rows } = await db.query(`
 
 ## What is here
 
-The engine is the product. Parser, planner, optimizer, and a vectorized executor are implemented
+The engine is the product. Parser, planner, optimizer, and a batch-based query runner are implemented
 in this repository — there is no SQLite or DuckDB underneath, and no WebAssembly anywhere.
 
 - **[SQL](/docs/sql)** — how to run statements, and what the language surface is: joins, CTEs,
@@ -48,7 +48,7 @@ in this repository — there is no SQLite or DuckDB underneath, and no WebAssemb
   and live queries.
 - **[Engine](/docs/engine)** — the `MinnowDatabase` API, transactions and snapshots, running the
   engine in a worker, and the memory budget.
-- **[Storage](/docs/storage)** — the block store contract and the three adapters that implement it,
+- **[Storage](/docs/storage)** — the shared storage interface and the three included adapters,
   plus snapshots and background maintenance.
 - **[Comparison](/docs/comparison)** — Minnow against IndexedDB, Dexie, SQLite Wasm, PGlite, and
   DuckDB-Wasm, including where each of them is the better answer.
@@ -63,9 +63,9 @@ and a reader never sees half of a write.
 It is not a replacement for a server database. Everything runs on one machine, against one
 browser's storage quota, with one writer's worth of throughput.
 
-## Design commitments
+## What you can count on
 
-Four rules are fixed. The reasoning is in [Architecture](/docs/reference/architecture).
+Four ideas guide the design. [Architecture](/docs/reference/architecture) explains why.
 
 - **The durable store is the source of truth.** Correctness never depends on `BroadcastChannel`,
   Web Locks, or page-close handlers. Durability ends at a committed storage write — an IndexedDB

@@ -106,7 +106,7 @@ values.
 console.log(await db.explain("SELECT * FROM orders WHERE order_id = 1001"));
 ```
 
-The plan shows which access path the optimizer chose, where predicates were pushed, and which
+The plan shows how Minnow will read the data, where filters run, and which
 joins were reordered. [Query plans](/docs/sql/plans) reads one line by line.
 
 </Step>

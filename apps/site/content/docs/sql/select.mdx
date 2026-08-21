@@ -10,7 +10,7 @@ of them into the console there.
 Prefer a typed builder to SQL strings? [Queries](/docs/client/queries) covers the same ground
 through `@minnowdb/client`, and compiles to the same plans.
 
-## Filtering and projection
+## Filtering and choosing columns
 
 ```sql
 SELECT order_id, total, placed_at
@@ -23,7 +23,7 @@ LIMIT 50
 ```
 
 `WHERE` supports comparison, `BETWEEN`, `IN`, `LIKE`, `IS NULL`, `AND` / `OR` / `NOT`, and
-`CASE`. Predicates on columns with block-level zone maps skip whole row groups without decoding
+`CASE`. Filters on columns with recorded value ranges can skip whole groups of rows without decoding
 them — see [Query plans](/docs/sql/plans).
 
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, and ordinals.
@@ -43,8 +43,9 @@ ORDER BY revenue DESC
 ```
 
 `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS` joins are all supported, with `USING` as well as
-`ON`. The optimizer reorders joins by estimated cardinality and builds hash tables on the smaller
-side; equality joins take an index-nested-loop path when one side is a unique key.
+`ON`. Minnow estimates how many rows each side will produce, then orders the joins and builds its
+lookup table from the smaller side. Equality joins can use the unique-key lookup when one side has
+one.
 
 An `ON` clause that carries more than its equality still hashes on that equality — `ON b.order_id
 = a.order_id AND b.product_id > a.product_id` builds on the order and applies the rest to the
@@ -95,7 +96,7 @@ A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXIST
 correlated `EXISTS` decorrelates into a semi-join rather than executing per row.
 
 Two correlated forms are rejected rather than executed slowly: `NOT IN` with a correlated
-subquery, and correlated subqueries joined on a non-equality predicate. Both would need a
+subquery, and correlated subqueries joined with anything other than equality. Both would need a
 per-row nested execution, and the error says so instead of quietly taking minutes.
 
 ## Common table expressions

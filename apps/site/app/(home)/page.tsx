@@ -9,7 +9,7 @@ const FACTS = [
   },
   {
     title: "No WebAssembly to download",
-    body: "Plain JavaScript, around 172 KB gzipped. Nothing is fetched and compiled before the first query answers.",
+    body: "Plain JavaScript, around 185 KB gzipped. Nothing is fetched and compiled before the first query answers.",
   },
   {
     title: "Columnar and durable",

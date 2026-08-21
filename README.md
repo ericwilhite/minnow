@@ -17,7 +17,7 @@ npm install @minnowdb/core
 
 ## Features
 
-- **Our own engine** — parser, planner, optimizer, and vectorized executor implemented here. No
+- **Our own engine** — parser, planner, optimizer, and batch-based query runner implemented here. No
   SQLite or DuckDB underneath, and nothing to compile before the first query answers.
 - **SQL:2023 surface** — joins (including `NATURAL` and `USING`), CTEs including recursive,
   set operations, window functions with `GROUPS` frames and `EXCLUDE`, grouping sets with
@@ -30,26 +30,27 @@ npm install @minnowdb/core
   that builds itself in the background once a table is large enough to want one.
 - **Columnar and durable** — immutable compressed column blocks on IndexedDB or OPFS. Writes publish
   atomically; another tab sees the old version or the new one, never half of one.
-- **Pluggable storage** — the storage contract is a public, documented interface with a
-  [conformance kit](https://minnowdb.com/docs/storage/custom/) and an adapter toolkit, so a
-  store for another substrate — the Node filesystem, React Native, an object store — is an
-  adapter away, with no engine changes.
+- **Pluggable storage** — storage is a public, documented interface with a
+  [shared test kit](https://minnowdb.com/docs/storage/custom/) and reusable adapter tools. You can
+  add a Node filesystem, React Native, or object-store adapter without changing the engine.
 - **Snapshot reads** — every query executes against one version, reads never block writes, and
   stale reads are unrepresentable. Multi-statement consistency is an explicit scope that releases
   itself.
-- **Bounded memory** — execution works in batches under a budget you set and spills to storage
-  rather than failing. A whole table is never required to be resident.
-- **Small** — about 172 KB gzipped with every storage adapter included, and no Wasm blob: just
-  over a third of SQLite's WebAssembly build and a thirty-second of PGlite's, both of which
+- **Memory-aware queries** — execution works in batches under a budget you set, and sorts and
+  grouped results can spill to storage. The budget catches large working sets, though it is not a
+  hard cap on the JavaScript heap yet.
+- **Small** — about 185 KB gzipped with every storage adapter included, and no Wasm blob: about
+  two-fifths of SQLite's WebAssembly build and one-thirtieth of PGlite's, both of which
   download and compile a module before answering anything. The adapters tree-shake, so an app
   that uses one store ships less.
-- **Workers first** — a shipped worker entry and a main-thread client with an identical API.
+- **Workers first** — a shipped worker entry and a main-thread client with the same everyday query,
+  write, migration, live-query, snapshot, and maintenance APIs.
 - **Snapshots** — copy one committed version out as a portable file and load it into any store.
 - **[Typed client](https://minnowdb.com/docs/client/), optional** — `@minnowdb/client` adds a schema-aware query builder with inferred
   row types, declared foreign keys and CHECK constraints, views, and live queries. It ships
-  separately and is built only from the engine's published primitives, so anyone can build their
-  own layer the same way.
-- **Extensible** — a published catalog with stable column IDs, plan-construction primitives, and a
+  separately and uses only the engine's public plan-building API, so anyone can build a layer the
+  same way.
+- **Extensible** — a published catalog with stable column IDs, plan-building tools, and a
   machine-readable SQL feature matrix. See [Extending Minnow](https://minnowdb.com/docs/reference/extending/).
 - **Devtools** — an embeddable SQL console and data browser, shipped as a separate package.
 - **Differentially tested** — a seeded query corpus runs through both executors and two
@@ -99,6 +100,10 @@ suite, in the same order, as CI's first job. A red build is then something you s
 push rather than after it. The hook checks the working tree rather than the commits being pushed,
 so a file another session left broken stops you too; `git push --no-verify` is the way past it
 when that is what you want.
+
+`npm run site:build` uses Next's webpack builder. Next 16's default Turbopack path can stall while
+optimizing the vendored browser engines; the build wrapper still accepts `--turbopack` when you
+want to investigate that path directly.
 
 See [Testing](https://minnowdb.com/docs/reference/testing/) for the full runner map and the
 release gate, and [Versioning](https://minnowdb.com/docs/reference/versioning/) for how a release

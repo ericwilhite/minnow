@@ -19,7 +19,7 @@ const store = await OpfsBlockStore.open({
 | `root`       | the origin's | A `FileSystemDirectoryHandle` to use instead, for tests.                          |
 
 The store lives in the [Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
-and is built around its one genuinely fast primitive: a synchronous access handle that stays
+and is built around one especially fast browser feature: a synchronous access handle that stays
 open, where reads and writes cost microseconds. Those handles need no special headers and no
 cross-origin isolation — only a dedicated worker, which is where the engine
 [already runs](/docs/engine/workers). Pages with embedded payment or third-party components
@@ -67,10 +67,10 @@ The store also prefers to put leadership where the work is: the worker client re
 visibility, and a background leader yields to a foreground tab that asks. The tab the user is
 looking at is normally the tab holding the fast path.
 
-The pieces the leader is assembled from — the record-semantics core, the write-ahead-log
-framing, the packed extent files, the checkpoint codecs — are published as
+The pieces used by the leader — the record engine, write-ahead log, packed data files, and
+checkpoint encoding — are published as
 [`@minnowdb/core/storage/toolkit`](/docs/storage/custom#the-adapter-toolkit), so an adapter for
-another file-shaped substrate can be built from the same parts.
+another file-based store can be built from the same parts.
 
 ## What it creates
 

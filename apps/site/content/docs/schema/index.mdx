@@ -240,8 +240,8 @@ deterministic steps:
 | replace a view               | Nothing is stored under a view, so a body change needs no proof.           |
 | drop a column or table       | Only [with your say-so](#dropping-things).                                 |
 
-- **Each step is atomic**, and the whole run is idempotent — an interrupted migration completes by
-  re-running.
+- **Each step is all or nothing**, and running the same migration again is safe. If a migration is
+  interrupted, the next run completes what remains.
 - **Concurrent migrators can't interleave** — the loser fails with a typed conflict.
 - **Nothing is rewritten.** Not one stored byte changes: a column added later is answered at read
   time, and folding it into the blocks is

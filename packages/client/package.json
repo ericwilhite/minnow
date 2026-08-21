@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/client",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Typed query client for Minnow: a schema-aware builder over @minnowdb/core with inferred row types, constraints, views, and live queries.",
   "license": "MIT",
   "author": "Eric Wilhite",
@@ -34,6 +34,6 @@
     "!dist/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@minnowdb/core": ">=0.1.1 <1.0.0"
+    "@minnowdb/core": ">=0.2.0 <1.0.0"
   }
 }

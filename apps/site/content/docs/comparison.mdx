@@ -31,7 +31,7 @@ and a Wasm engine must also compile its module before answering the first query.
 | ---------------- | --------------- | ------- | ------------ |
 | IndexedDB        | 0               | 0       | No           |
 | Dexie 4.4.5      | 30 KB           | 96 KB   | No           |
-| **Minnow**       | **172 KB**      | 628 KB  | No           |
+| **Minnow**       | **185 KB**      | 675 KB  | No           |
 | SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes          |
 | PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes          |
 | DuckDB-Wasm 1.33 | 8.1 MB          | 36.7 MB | Yes          |
@@ -106,7 +106,7 @@ in existence, running in a browser tab.
   lookups on non-key columns over a large table, the seek is an advantage no scan recovers — and
   when you know the access pattern better than a zone map can infer it, SQLite lets you say so.
 - **Portability.** The same schema, the same statements, and the same file work on a server, on
-  mobile, and in the browser. Minnow's block format is its own, and version zero of it carries no
+  mobile, and in the browser. Minnow's block format is its own, and this early format carries no
   compatibility promise.
 - **Ecosystem.** Extensions, ORMs, tooling, and answers to almost any question you will have.
 
@@ -121,7 +121,7 @@ in existence, running in a browser tab.
   published numbers to take on trust.
 - **Bytes on disk.** Compressed columns store the benchmark dataset in roughly a quarter of the
   bytes SQLite's row pages take — and browser storage is a quota on a device you do not own.
-- **Nothing to compile.** 172 KB of JavaScript against 457 KB and a Wasm instantiation before the
+- **Nothing to compile.** 185 KB of JavaScript against 457 KB and a Wasm instantiation before the
   first statement runs.
 - **Persistence is not a decision that costs you something.** SQLite in a browser has to pick a
   VFS, and the choice is awkward: the `opfs` VFS supports several tabs at once but needs
@@ -131,9 +131,9 @@ in existence, running in a browser tab.
   are atomic across tabs and readers see whole versions.
 - **Scans and bulk loads.** Row storage reads every column of every row it touches. For
   aggregates over a large table, and for loading a large table in the first place, columns win.
-- **Bounded memory.** Minnow executes under a memory budget and spills sorts and grouped
-  aggregations to storage. SQLite in Wasm is bounded by the module's heap, and exceeding it fails
-  the query.
+- **A memory budget.** Minnow can spill sorts and grouped results to storage when they outgrow the
+  execution budget. The budget is not a hard JavaScript heap cap yet. SQLite in Wasm is bounded by
+  the module's heap, and exceeding it fails the query.
 
 **Use it instead when** you need SQLite specifically: its dialect, its file format, its
 extensions, or parity with a server or mobile app that already runs it.
@@ -147,12 +147,12 @@ of it, which is a different durability model from anything else on this page.
 PostgreSQL itself, compiled to WebAssembly, as a single-connection in-process database. It anchors
 ElectricSQL's sync story.
 
-**Where it beats Minnow.** It is PostgreSQL: real Postgres types, real Postgres semantics, and
+**Where it beats Minnow.** It is PostgreSQL: real Postgres types, real Postgres behavior, and
 extensions including `pgvector`. If your server is Postgres, one query works in both places, and
 your migrations are the migrations you already have. It has a first-class sync engine built around
 it.
 
-**Where Minnow beats it.** Size, mostly, and by a factor of thirty-two: 172 KB against 5.6 MB
+**Where Minnow beats it.** Size, mostly, and by a factor of thirty: 185 KB against 5.6 MB
 gzipped, which unpacks to a 9.9 MB Wasm module and a 6.1 MB packed data directory before Postgres
 starts. Beyond that, PGlite allows one instance per data directory, so multiple tabs need
 coordination you write; its durability setting is a real trade (strict flushes its filesystem
@@ -173,7 +173,7 @@ win.
 
 **Where Minnow beats it.**
 
-- **Download.** 172 KB against roughly 8.1 MB gzipped, which is a 36 MB Wasm module unpacked.
+- **Download.** 185 KB against roughly 8.1 MB gzipped, which is a 36 MB Wasm module unpacked.
 - **Durability is the whole design.** DuckDB-Wasm is happiest in memory; its persistent path is
   OPFS, constrained about concurrent access. Minnow's storage model — immutable blocks, an
   atomically published manifest, leases, garbage collection, and crash testing with injected
@@ -196,13 +196,13 @@ These solve different problems, and Minnow does not compete with them directly.
 (Automerge, Yjs) keep a local copy in step with a server and with other users. Minnow has no
 replication and no conflict resolution, so if multi-user or multi-device state is the requirement,
 this is the category. Their local query engine is usually SQLite, PGlite, or a document store, and
-it is rarely where their effort goes; Minnow's `execute` and snapshots are ordinary primitives, so
+it is rarely where their effort goes; Minnow's `execute` and snapshot APIs are ordinary building blocks, so
 a sync layer could be written over them.
 
 **Reactive and document stores** — RxDB, PouchDB, TinyBase, WatermelonDB, LokiJS, and SignalDB add
 schemas, reactive queries, and usually replication over IndexedDB or OPFS. Reactivity and framework
 bindings are their centre, and most have a sync option. None is columnar, none plans a query, and
-the heavy lifting still lands in JavaScript over materialized objects. Minnow has
+the heavy lifting still lands in JavaScript objects created one row at a time. Minnow has
 [live queries](/docs/client/live) too, but as a feature of the typed client rather than the shape
 of the whole system.
 
@@ -224,7 +224,7 @@ no snapshot isolation.
 - **No Node build.** The engine targets browsers, so there is no shared code path with a Node
   server, and tests run in real browsers rather than under a Node shim.
 - **The ecosystem is one repository.** No third-party ORMs, no extensions, no Stack Overflow
-  answers. The published [catalog and plan primitives](/docs/reference/extending) are there so
+  answers. The published [catalog and plan APIs](/docs/reference/extending) are there so
   that layers can be built, but nobody has built them yet.
 
 ## What is actually different
@@ -235,9 +235,9 @@ Five things are hard to get anywhere else:
   `SharedArrayBuffer`, no build step. The first query runs as soon as the JavaScript parses.
 - **Columnar storage inside browser storage.** Compressed column blocks with statistics, so scans and
   aggregates over large tables stay cheap without an index to declare or maintain.
-- **Storage you can swap.** The engine runs over a published adapter contract with a conformance
-  kit and a toolkit of building blocks; IndexedDB and OPFS ship, and
-  [writing a store](/docs/storage/custom) for another substrate needs no engine changes.
+- **Storage you can swap.** The engine runs over a public adapter interface with a shared test kit
+  and reusable building blocks. IndexedDB and OPFS ship, and
+  [writing another store](/docs/storage/custom) needs no engine changes.
 - **A storage model built for tabs that die.** Immutable blocks, atomic manifest publication,
   snapshot reads, leases, and crash tests that kill the engine at every write.
 - **Answers checked against other engines.** A seeded query corpus runs through the executor and

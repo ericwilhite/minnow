@@ -43,7 +43,7 @@ not thousands of parsed statements.
 
 ## Update and delete
 
-Both address rows through a predicate and compile to the same mutation statements SQL produces:
+Both choose rows with a filter and compile to the same update and delete statements as SQL:
 
 ```ts
 await db.updateTable("orders").set({ status: "shipped" }).where("order_id", "=", 1).execute();

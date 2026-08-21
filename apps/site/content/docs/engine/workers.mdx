@@ -50,7 +50,8 @@ const rows = await db
 - Storage access, decoding, planning, and execution all run in the worker; the main thread holds
   only the proxy.
 - The raw layer is there too: `client.query(sql)`, `client.insertBatch(...)`,
-  `client.createTable(...)` — the full database API.
+  `client.createTable(...)` — the everyday database API. Direct view helpers and manual full-text
+  index building stay on `MinnowDatabase`; migrations manage views and indexes build themselves.
 
 ## Why you construct the Worker
 

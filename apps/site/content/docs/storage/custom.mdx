@@ -1,13 +1,12 @@
 ---
 title: Writing a storage adapter
-description: The block store contract, the rules an implementation must honor, the conformance kit that checks them, and the toolkit the shipped adapters are built from.
+description: The shared storage interface, the rules an adapter follows, its test kit, and reusable tools for building one.
 ---
 
-Minnow's engine holds exactly one `BlockStore` and talks to nothing else persistent. That is
-the whole coupling: implement the interface against a new substrate and you have a working
-database with no engine changes. The three shipped adapters were built against precisely this
-contract — the same door is open to a React Native storage layer, an object store like R2, the
-Node filesystem, or an encrypted wrapper around any of them.
+Minnow's engine holds one `BlockStore` and uses it for all saved data. Implement that interface for
+a new storage system and you have a working database with no engine changes. The three included
+adapters follow the same rules. A React Native store, an object store such as R2, the Node
+filesystem, or an encrypted wrapper can do the same.
 
 ```ts
 import type { BlockStore } from "@minnowdb/core/storage";
@@ -19,9 +18,9 @@ class MyBlockStore implements BlockStore {
 const db = new MinnowDatabase(new MyBlockStore());
 ```
 
-## The shape of the contract
+## What the interface covers
 
-`BlockStore` is composed of seven capability interfaces, each one concern:
+`BlockStore` combines seven smaller interfaces, each responsible for one part of storage:
 
 | Interface           | Owns                                                                   |
 | ------------------- | ---------------------------------------------------------------------- |
@@ -33,37 +32,36 @@ const db = new MinnowDatabase(new MyBlockStore());
 | `FtsIndexStore`     | Full-text base chunks and candidate reads.                             |
 | `TempSpillStore`    | Query spill pages and their owner leases.                              |
 
-Every method's exact semantics — ordering, conflict classes, what must be atomic — are
-documented on the interfaces themselves in `@minnowdb/core/storage`; that TSDoc is the
-normative text. What follows is the shape of the rules.
+The TSDoc in `@minnowdb/core/storage` explains the exact order of operations, the error types, and
+which changes must happen together. The guide below gives the friendlier overview.
 
 ## The rules
 
-**A store holds records and blobs, not rows.** The engine hands you immutable compressed
-blocks plus small structured records: manifests saying which blocks are live at each version,
+**A store holds records and byte blocks, not rows.** The engine hands you compressed blocks that
+never change after publication, plus small structured records: manifests saying which blocks are live at each version,
 segments mapping blocks to tables, transactions, leases, jobs, counters, keys. Because
 published blocks never change and a version is just a set of block ids, readers hold versions
 open while writers commit — the concurrency story is the data model, not locks you invent.
 
-**Everything is atomic, always.** A method that resolves has happened; one that rejects has
-observably not. `commitTransaction` is the heart: manifest CAS, publication, segment
-finalization, unique keys, full-text deltas, and the record flip — one durable all-or-nothing
-step, including against a crash at any moment.
+**Each operation is all or nothing.** A method that resolves has happened; one that rejects has
+not. `commitTransaction` is the heart of the interface: it checks the expected version, publishes
+the new version, finishes its segments, updates keys and full-text data, and marks the transaction
+complete in one saved step. A crash cannot leave half of that change visible.
 
 `runGarbageCollectionStep` owns record reclamation as well as blob reclamation. It processes
 manifests, segments, blocks, then terminal transactions; a committed transaction can disappear
 only after its manifest is pruned and no segment or unfinished compaction names it, while an
 aborted one waits for every pending artifact to disappear. Adapters must apply that whole step
-atomically. `removePrunedManifestRecords` then deletes only tombstones no readable delta chain
-needs **and whose garbage blocks are all gone**. The tombstone is the durable discovery record
-between bounded collection passes, so deleting it early can orphan the rest of a large backlog. A
+as one operation. `removePrunedManifestRecords` then deletes only markers that no readable version
+needs **and whose unused blocks are all gone**. That marker remembers unfinished work between
+small collection passes, so deleting it early can strand part of a large backlog. A
 file-backed adapter may delete immutable block payloads after logging the resolved step, as the
 toolkit example does.
 
-**Conflicts are typed, by exact class.** Compare-and-swap failures throw the exported error
-classes (`WriteConflictError`, `TransactionRecordConflictError`, and the rest) — not wrappers,
-not subclasses. The engine's retry and rebase loops match on them, and the worker client
-rehydrates them by constructor name across the thread boundary.
+**Conflicts use the exported error classes.** Version-check failures throw
+`WriteConflictError`, `TransactionRecordConflictError`, or the matching exported class directly.
+The engine uses those classes to decide when to retry, and the worker client recreates them on the
+main thread.
 
 **Platform failures pass through.** A quota refusal escapes as the environment's own
 `QuotaExceededError`, unwrapped, with prior data intact and the same write succeeding once
@@ -72,7 +70,7 @@ space frees.
 **Nothing is shared.** Copy bytes and records in both directions; the engine may reuse the
 buffers it hands you and mutate the records you return.
 
-**Optional means atomic.** `getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
+**An optional shortcut still has to be all or nothing.** `getCatalogProbe`, `getQueryCatalogState`, `beginTransaction`,
 `stageTransactionArtifacts`, `writeTransaction`, `moveLease`, `putTempRunPages`, and the
 snapshot pair are optional so an adapter that can do something in one atomic step may say so.
 Callers trust a present method completely and fall back to sequential calls otherwise — never
@@ -82,13 +80,13 @@ implement one as the sequential calls in a trench coat.
 writers; a connection can die between any two operations without corrupting anything. How you
 achieve that is yours: the IndexedDB adapter leans on storage transactions, the OPFS adapter
 on a write-ahead log behind a browser-arbitrated leader. (An adapter for a single-process
-environment — Node, React Native — has an easier version of this problem, not a different
-contract.)
+environment — Node, React Native — has an easier version of this problem, but follows the same
+rules.)
 
-## The conformance kit
+## The shared test kit
 
-The kit is the executable half of this page. It runs under any test framework and checks the
-rules above — atomicity, exact conflict classes, defensive copies, ordering, durability across
+The kit is the runnable half of this page. It works with any test framework and checks the rules
+above: all-or-nothing operations, exact conflict classes, safe copies, ordering, and data after
 a reopen:
 
 ```ts
@@ -107,7 +105,7 @@ for (const conformanceCase of blockStoreConformanceCases()) {
 }
 ```
 
-Provide `reopen` — without it the durability half of the contract goes unchecked. The kit is a
+Provide `reopen` so the kit can verify that saved data survives. The kit is a
 floor, not a ceiling: Minnow's own adapters additionally run fault sweeps that interrupt every
 storage operation, concurrency soaks, and quota injection, and the kit itself runs against all
 three shipped adapters in CI so it cannot drift from what they do. `FaultInjectingBlockStore`
@@ -116,18 +114,19 @@ own crash handling.
 
 ## Two architectures that work
 
-**Direct** — map each record family onto your substrate's own transactional primitives, the
+**Direct** — map each record family onto your storage system's own transaction support, the
 way the IndexedDB adapter maps them onto object stores and `commitTransaction` onto one
-read-write transaction. Right when the substrate has real multi-key atomic transactions.
+read-write transaction. This works well when the storage system can update several keys in one
+all-or-nothing transaction.
 
 **Log-structured, single writer** — the OPFS adapter's shape, and the natural one for
-substrates that only offer files or blobs: keep every record in memory, append each mutation
+storage systems that only offer files or blobs: keep every record in memory, append each change
 as a checksummed frame to a write-ahead log, fold into checkpoints, pack blobs into extent
 files, and let one connection own the writes. Recovery is checkpoint-plus-tail; a torn tail
 frame reads as "not written". This maps directly onto the Node filesystem (`fs` handles in
 place of sync access handles), React Native storage, or an object store like R2 — where the
 log grows by conditional puts and the single-writer election uses the store's own
-precondition primitives. Multi-client coordination is the part you own; everything above the
+conditional-write support. Multi-client coordination is the part you own; everything above the
 persistence layer behaves identically — and ships as reusable pieces in the toolkit below.
 
 Either way, [snapshots](/docs/storage/snapshots) come almost free — one committed version as a
@@ -137,35 +136,34 @@ portable file — and are also the migration path between your store and the shi
 
 `@minnowdb/core/storage/toolkit` is the library the shipped adapters are assembled from,
 published so a new adapter can start from working parts instead of a blank interface. It is
-deliberately **not** part of the contract: the engine never references it, the conformance kit
-never requires it, and an adapter that stores records some entirely different way is just as
-conformant. It exists because the hardest thousand lines of an adapter are the same for
-everyone.
+deliberately **not** required by the interface: the engine never imports it, the test kit never
+requires it, and an adapter that stores records another way is equally valid. It exists because
+the hardest parts of an adapter are often the same.
 
-| Export                         | What it is                                                                                                                                                                                                                                   |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RecordCore`                   | The record-state machine behind the memory and OPFS adapters: every record family, validation order, typed conflict, and defensive copy the contract requires, one synchronous method per operation, plus `dump()`/`load()` for checkpoints. |
-| `WalWriter`, `replayWalFrames` | Checksummed write-ahead-log frames over one held file handle. Replay stops at the first torn frame, which is exactly what a crash can leave.                                                                                                 |
-| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length }`, with sealing, live-byte accounting, fragmentation detection, and a read-handle cache.                                                          |
-| `encodeRecordJson` and friends | The JSON codec (bigints included) and the checksummed, versioned envelopes for checkpoints and immutable chunks.                                                                                                                             |
-| `SyncFileHandle`               | The only substrate assumption the file-shaped pieces make: positioned synchronous read/write/truncate/flush. The browser's `FileSystemSyncAccessHandle` satisfies it as-is; a Node file descriptor wrapper is a dozen lines.                 |
+| Export                         | What it is                                                                                                                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `RecordCore`                   | The in-memory record engine behind the memory and OPFS adapters: one synchronous method per operation, with validation, conflict errors, safe copies, and `dump()`/`load()` for checkpoints.                 |
+| `WalWriter`, `replayWalFrames` | Checksummed write-ahead-log frames over one held file handle. Replay stops at the first torn frame, which is exactly what a crash can leave.                                                                 |
+| `ExtentPool`                   | Packed append-only files for bulk bytes, addressed by `Placement { extent, offset, length }`, with sealing, live-byte accounting, fragmentation detection, and a read-handle cache.                          |
+| `encodeRecordJson` and friends | The JSON codec (bigints included) and the checksummed, versioned envelopes for checkpoints and immutable chunks.                                                                                             |
+| `SyncFileHandle`               | The small file interface used by these tools: positioned read, write, truncate, and flush. A browser `FileSystemSyncAccessHandle` already has this shape; a Node file descriptor can be wrapped to match it. |
 
 Wrapping `RecordCore` obligates you to two things. **One writer at a time** — its methods
 validate and then mutate synchronously, so calls must never interleave (a promise-chain queue,
 a leader, or a process-wide lock all work). **Durability is yours** — the core is memory:
-log each mutation, checkpoint with `dump()` (serialize the result immediately; its arrays
-alias live state), and replay on open. One ordering rule is load-bearing for any single-log
-design: write the checkpoint, flush it, and only then reset the log — never the other way.
+log each change, save checkpoints with `dump()` (serialize the result immediately because its
+arrays still refer to the live state), and replay the log on open. For any single-log design,
+write and flush the checkpoint before resetting the log — never the other way around.
 
 The proof all of this composes is checked in as a test:
 [`toolkit-example.test.ts`](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/storage/toolkit/toolkit-example.test.ts)
-builds a complete, persistent, log-structured `BlockStore` from these exports alone — record
-semantics from `RecordCore`, one WAL, blobs in extents, a checkpoint at open — and passes the
-same conformance suite the shipped adapters pass. Reading it top to bottom is the fastest way
-to see where your substrate slots in.
+builds a complete, persistent, log-structured `BlockStore` from these exports alone: record
+handling from `RecordCore`, one log, blocks in packed files, and a checkpoint at open. It passes
+the same test kit as the included adapters. Reading it top to bottom is the fastest way
+to see where your storage system fits.
 
 For running your adapter in plain Node tests, `MemoryOpfs` from `@minnowdb/core/testing` is an
-in-memory origin-private file system with the semantics that make storage interesting to test:
+in-memory origin-private file system with the behaviour that matters in storage tests:
 exclusive sync-access locks that throw the real `DOMException`s, and injectable write faults
 for quota and crash suites.
 
@@ -180,5 +178,5 @@ an insert two (its row ids are reserved by `beginTransaction` first). `moveLease
 engine's shared reader lease to each new version in place, which saves a lease create and a
 later remove on the first read after every commit. Implement the probe first (it is the single
 most valuable), then `writeTransaction` and `beginTransaction`, then `moveLease` and
-`stageTransactionArtifacts`; add `putTempRunPages` when your substrate charges per call, and
+`stageTransactionArtifacts`; add `putTempRunPages` when your storage system charges per call, and
 the snapshot pair when your store should be exportable.

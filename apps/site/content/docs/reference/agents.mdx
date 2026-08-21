@@ -58,8 +58,9 @@ machines: https://minnowdb.com/llms.txt
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
   statement that writes, rather than writing.
 - `db.execute(sql, params)` runs any statement and returns a tagged result. Check `result.kind`
-  (`rows`, `insert`, `update`, `delete`, `create-table`, `create-trigger`, `drop-trigger`) before
-  reading `rowCount`, `version`, or `returnedRows`.
+  (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
+  `drop-table`, `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading
+  `rowCount`, `version`, or `returnedRows`.
 - Bind parameters with `?` in order or `$1` by position. Never concatenate values into SQL:
   compiled plans are cached on the statement text, so a parameterized statement is planned once
   and interpolation throws that work away on every call.
@@ -69,8 +70,8 @@ machines: https://minnowdb.com/llms.txt
 - For anything interactive, run the engine in a worker:
   `new MinnowDatabaseClient(new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }), { store: { kind: "indexeddb", name: "app-db" } })`,
   or `{ kind: "opfs", name: "app-db" }` for the OPFS store,
-  importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Its API matches `MinnowDatabase`
-  call for call.
+  importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Queries, writes, migrations,
+  live queries, snapshots, and maintenance use the same calls as `MinnowDatabase`.
 - Full-text search is `MATCH(column) AGAINST 'terms'`, ranked with `BM25(column) AGAINST 'terms'`.
   There is no index DDL to write; the index builds itself.
 - `db.explain(sql)` returns the optimized plan as text.
@@ -100,13 +101,13 @@ it needs to be.
 - **Batch writes.** `insertBatch` skips the parser entirely and writes columns as columns. A loop
   of `INSERT` statements is the single most common performance mistake. See
   [The database API](/docs/engine).
-- **Workers.** Query execution on the main thread competes with rendering. The API is identical
-  either side of the boundary, so there is no reason to start on the main thread and move later.
+- **Workers.** Query execution on the main thread competes with rendering. Everyday application
+  calls are the same on either side, so there is no reason to start on the main thread and move later.
   See [Workers & multi-tab](/docs/engine/workers).
 - **The SQL surface.** It is large but not complete, and the rejections are deliberate and
   documented. An agent that checks the matrix writes a supported form the first time instead of
   discovering the gap through an error.
-- **The store choice.** Both durable stores implement one contract and hold one format, so this
+- **The store choice.** Both durable stores use the same interface and file format, so this
   is a deployment decision, not an architecture one. The OPFS store's synchronous handles exist
   only in workers, and OPFS itself is absent in Safari private browsing — which is why the rule
   says worker-only and names the fallback.

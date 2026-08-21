@@ -28,15 +28,15 @@ const db = createMinnow<DB>(database, { schema: appSchema });
 const rows = await db.selectFrom("orders").select(["order_id", "total"]).execute();
 ```
 
-This package is optional. SQL is Minnow's contract — `@minnowdb/core` runs every statement on its
-own, and this client is one consumer of the plan primitives published at `@minnowdb/core/plan`.
-Building it only from those published primitives is what proves they are complete enough for
-anyone else to build on.
+This package is optional. `@minnowdb/core` runs SQL on its own; the client adds a friendly, typed
+way to build those same queries. It uses only the public tools in `@minnowdb/core/plan`, which are
+also available for anyone building a client of their own.
 
 Full documentation: [minnowdb.com/docs/client](https://minnowdb.com/docs/client/).
 
-Every `@minnowdb` package shares a major version and moves independently inside it, so any `0.x`
-client works with any `0.x` engine. See
+Every `@minnowdb` package shares a major version and moves independently inside it. Install the
+engine version required by the client's package range; npm chooses a compatible version and
+refuses a mixed-major install. See
 [Versioning](https://minnowdb.com/docs/reference/versioning/).
 
 ## License

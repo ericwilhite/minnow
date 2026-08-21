@@ -13,8 +13,8 @@ INSERT INTO customers (customer_id, name, city, signed_up_on)
 VALUES (?, ?, ?, ?)
 ```
 
-Multiple row tuples in one statement are fine, and so is `INSERT … SELECT`, which materializes
-the query at one version before writing:
+Multiple row tuples in one statement are fine. `INSERT … SELECT` also works: Minnow reads the
+query from one stable version, then writes the result:
 
 ```sql
 INSERT INTO archived_orders (order_id, customer_id, total, placed_at)
@@ -126,8 +126,8 @@ One statement is one commit. Several statements that must land together belong i
 
 ```ts
 const { version } = await db.write(async (tx) => {
-  await tx.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [qty, sku]);
-  await tx.execute("INSERT INTO shipments (sku, qty, at) VALUES (?, ?, ?)", [sku, qty, new Date()]);
+  await tx.updateBatch("stock", { keys: [sku], changes: { on_hand: [nextOnHand] } });
+  await tx.insertBatch("shipments", [{ sku, qty, at: new Date() }]);
 });
 ```
 

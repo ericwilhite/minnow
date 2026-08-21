@@ -1,29 +1,28 @@
 ---
 title: Extending Minnow
-description: The primitives for building a typed layer, schema tool, or adapter on top of the engine.
+description: Public APIs for building a typed layer, schema tool, or adapter on top of the engine.
 ---
 
-SQL is Minnow's contract. The engine runs statements on its own, and every typed layer — including
-the official [`@minnowdb/client`](/docs/engine) — is a consumer of the primitives on this page.
+SQL is the foundation. The engine runs statements on its own, and typed layers — including the
+official [`@minnowdb/client`](/docs/client) — use the public APIs on this page.
 
-That is not an accident of packaging. `@minnowdb/client` ships as a separate package built only
-from what is documented here, so if these primitives were not enough to build a query builder, the
-first thing to break would be ours.
+`@minnowdb/client` ships separately and uses only these APIs. That keeps this page grounded in a
+real client instead of a set of hooks that have never been used outside the engine.
 
-## The primitives
+## The building blocks
 
-| Primitive                 | Import                | What it gives you                                                                      |
+| API                       | Import                | What it gives you                                                                      |
 | ------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
-| `execute(sql, params)`    | `@minnowdb/core`      | The query channel. One entry point, one discriminated result.                          |
+| `execute(sql, params)`    | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                  |
 | `introspect()`            | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                           |
 | Statement transactions    | `@minnowdb/core`      | `BEGIN` / `COMMIT` / `ROLLBACK`, drivable from a layer that owns its own control flow. |
 | Plan construction         | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.          |
-| `sql-feature-matrix.json` | `@minnowdb/core`      | Machine-readable capability discovery.                                                 |
+| `sql-feature-matrix.json` | `@minnowdb/core`      | A machine-readable list of supported and rejected SQL.                                 |
 
 ## Running statements
 
-Everything the engine can do is reachable through one call. The result is a discriminated union, so
-a caller learns what happened without a second query:
+Everything the engine can do is reachable through one call. The result's `kind` tells a caller
+what happened without a second query:
 
 ```ts
 const result = await database.execute(
@@ -103,8 +102,8 @@ need the split, plan with `planMigration` to decide and inspect, then hand the s
 
 ## Transactions
 
-The primitive is imperative, because a layer that owns its own control flow cannot always express
-its work as a callback:
+Statement transactions use explicit `BEGIN`, `COMMIT`, and `ROLLBACK` calls. That fits a layer
+that needs to decide its own control flow:
 
 ```ts
 await database.execute("BEGIN");
@@ -118,31 +117,27 @@ try {
 }
 ```
 
-A scoped API can always be built on top of this. The reverse — recovering imperative control from a
-callback-only API — requires suspending the callback on deferred promises, which is why the
-imperative form is what gets published.
+A layer can wrap these calls in a callback-based helper if that feels better for its users.
 
 Savepoints are not implemented, so transactions do not nest.
 
 ## Building plans directly
 
-`@minnowdb/core/plan` exposes the block-assembly functions the SQL parser itself ends in, plus the
-plan types and the validators that keep a hand-built plan as strict as a parsed one. A builder that
-uses them produces plans the engine cannot distinguish from parsed SQL — same validation errors,
-same desugaring, same execution strategy.
+`@minnowdb/core/plan` exposes the functions the SQL parser uses to assemble and check a query
+plan. A builder that uses them gets the same validation messages and execution path as parsed SQL.
 
 ```ts
 import { assembleSelectBlock, optimizePlan, type CompiledQuery } from "@minnowdb/core/plan";
 ```
 
-This is the lowest-level primitive here, and the one most likely to change shape as the plan types
-move into a module of their own. Most layers should emit SQL and let the engine parse it: parsing
+This is the lowest-level API here, and the one most likely to change shape as the plan types move
+into a module of their own. Most layers should emit SQL and let the engine parse it: parsing
 costs 11–28 µs, which is under 1% of any query that touches real data.
 
 ## Discovering what the engine accepts
 
 A layer that generates SQL will eventually emit something the engine does not support. The answer
-is not a handful of capability flags but the feature matrix, shipped as data:
+is the feature matrix, shipped as data:
 
 ```ts
 import matrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
@@ -151,8 +146,8 @@ const unsupported = matrix.features.filter((entry) => entry.status === "unsuppor
 // each carries: id, the SQL:2023 Annex F feature, an example, and the error it raises
 ```
 
-190 entries, 176 supported. It is the input to the conformance suite, so it cannot drift from the
-engine without failing tests.
+There are 190 entries, with 176 supported. The engine's tests read this same file, so a change to
+the language cannot leave the list quietly out of date.
 
 The gaps most likely to matter to a SQL generator:
 

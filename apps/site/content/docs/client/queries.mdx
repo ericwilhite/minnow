@@ -71,7 +71,7 @@ scope is a compile error naming the collision rather than a silent overwrite.
 
 ## Filtering
 
-The three-argument form covers most predicates:
+The three-argument form covers most filters:
 
 ```ts
 db.selectFrom("orders")
@@ -152,7 +152,7 @@ db.selectFrom("orders as o").select((eb) => [
 A builder used as a value becomes a subquery; `.as(alias)` makes it a derived table.
 
 ```ts
-// Subquery in a predicate: pass the builder itself
+// Subquery in a filter: pass the builder itself
 const bigSpenders = db.selectFrom("orders as o").select("o.customer_id").where("o.total", ">", 500);
 db.selectFrom("customers as c").where("c.customer_id", "in", bigSpenders);
 
@@ -207,7 +207,7 @@ callback.
 ## Full-text search
 
 `.search(query)` filters to rows matching every term and orders by BM25 relevance — sugar for a
-`MATCH` predicate plus a `BM25` ordering, with the score riding as a hidden select item so your row
+`MATCH` filter plus `BM25` ordering. Minnow keeps the score hidden unless you select it, so your row
 shape is exactly what you asked for:
 
 ```ts

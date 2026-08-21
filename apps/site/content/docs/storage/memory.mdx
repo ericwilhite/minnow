@@ -10,7 +10,7 @@ import { MinnowDatabase } from "@minnowdb/core";
 const db = new MinnowDatabase(new MemoryBlockStore());
 ```
 
-No options, nothing to open, nothing to clean up. It implements the same `BlockStore` contract as
+No options, nothing to open, nothing to clean up. It uses the same `BlockStore` interface as
 the IndexedDB adapter, including atomic commits, snapshot reads, leases, and conflict detection —
 so a test against it exercises the same engine paths an application uses, not a simplified
 stand-in.

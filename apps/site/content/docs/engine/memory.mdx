@@ -55,10 +55,9 @@ const db = new MinnowDatabase(store, { bufferPoolBytes: 64 * 1024 * 1024 });
 db.bufferPoolStats(); // what is resident right now
 ```
 
-It holds decoded physical blocks, their vectorized per-block column forms, zone-map descriptions,
-and derived-subquery results. Every entry is keyed by an immutable identity — a block id, or an
-exact visible-segment fingerprint — so a cached entry can never serve stale data. Superseded
-entries simply stop being referenced and age out of the byte-bounded LRU.
+It holds decoded blocks, ready-to-read column batches, recorded value ranges, and reusable
+subquery results. Every entry belongs to an exact block or table version, so the cache cannot serve
+old data as new. Replaced entries simply stop matching and age out of the size-limited cache.
 
 `0` disables it, which is the right setting for a one-shot import that will never re-read what it
 writes.

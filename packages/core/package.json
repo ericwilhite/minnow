@@ -1,6 +1,6 @@
 {
   "name": "@minnowdb/core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A columnar SQL engine that runs entirely in the browser: real SQL over immutable snapshots, durable on IndexedDB or OPFS, with no WebAssembly to download.",
   "license": "MIT",
   "author": "Eric Wilhite",

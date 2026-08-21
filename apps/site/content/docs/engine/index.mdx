@@ -16,8 +16,10 @@ const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }), 
 });
 ```
 
-The same surface is available from the main thread when the engine
-[runs in a worker](/docs/engine/workers) — `MinnowDatabaseClient` mirrors it call for call.
+When the engine [runs in a worker](/docs/engine/workers), `MinnowDatabaseClient` offers the same
+query, write, migration, live-query, snapshot, and maintenance calls on the main thread. The
+direct `createView`, `dropView`, and `buildFtsIndex` helpers stay on `MinnowDatabase`; migrations
+manage views in a worker, and full-text indexes still build automatically.
 
 ## Catalog
 
@@ -35,8 +37,8 @@ await db.createTable({
 await db.listTables();
 ```
 
-`createTable` is the programmatic form of [`CREATE TABLE`](/docs/sql/ddl) and the only place
-column defaults can be declared.
+`createTable` is the direct API form of [`CREATE TABLE`](/docs/sql/ddl). The schema builder and
+SQL can declare defaults too; use whichever form fits the rest of your setup.
 
 ## Bulk writes
 
@@ -81,12 +83,12 @@ One batch is one commit. To make several land together, wrap them in a
 
 ### Buffered writing
 
-For a stream of small writes — telemetry, edits as a user types — a buffered writer coalesces them
+For a stream of small writes — telemetry, edits as a user types — a buffered writer combines them
 into blocks worth committing:
 
 ```ts
-const writer = db.bufferedWriter("events", { maxRows: 5_000, maxDelayMs: 250 });
-writer.add({ event_id: id, kind: "click", at: new Date() });
+const writer = db.bufferedWriter("events", { maxRows: 5_000, maxAgeMs: 250 });
+await writer.add({ event_id: id, kind: "click", at: new Date() });
 await writer.flush();
 ```
 
@@ -95,33 +97,44 @@ follow the tab into the grave.
 
 ## Options
 
-| Option             | Default       | What it does                                                                                                                                                                                           |
-| ------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `compression`      | `"gzip"`      | Block codec. `"raw"` ingests about twice as fast; `gzip` halves stored bytes and reads _faster_ cold, because reading half the bytes out of storage more than pays for decompressing them.             |
-| `rowsPerBlock`     | `65536`       | The scan's row group and the buffer pool's residency unit. Measured flat above ~16k; small blocks cost up to 66% on top-N.                                                                             |
-| `bufferPoolBytes`  | 64 MiB        | Retained decoded blocks and their vectorized forms. `0` disables it. Every entry is keyed by an immutable identity, so a cached entry can never be stale.                                              |
-| `ftsAutoIndexRows` | `4096`        | Rows above which a `MATCH` on an unindexed append-only column schedules a background index build.                                                                                                      |
-| `maxCommitRetries` | `8`           | How many times a losing writer rebases and retries before giving up.                                                                                                                                   |
-| `autoCompact`      | `true`        | Whether fragmented tables and delta histories are folded in the background; see [compaction](/docs/storage/maintenance).                                                                               |
-| `autoCollect`      | `autoCompact` | Whether superseded blocks and old versions are collected in the background; see [garbage collection](/docs/storage/maintenance#garbage-collection).                                                    |
-| `compaction`       | `{}`          | Defaults for every fold this database plans, background ones included: `partitionRows` (16,384) bounds each level-one partition. See [partitioned folds](/docs/storage/maintenance#partitioned-folds). |
+| Option                     | Default       | What it does                                                                                                                                                                        |
+| -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `compression`              | `"gzip"`      | Block encoding. `"raw"` writes faster; `gzip` usually uses about half the storage and can make a cold read faster because the browser fetches fewer bytes.                          |
+| `rowsPerBlock`             | `65536`       | How many rows Minnow aims to put in each block. Smaller blocks can help narrow reads but add more work to broad scans.                                                              |
+| `bufferPoolBytes`          | 64 MiB        | Space kept for decoded blocks and reusable query work. `0` disables the cache. Cached data is tied to the exact block or table version, so an old entry is never used for new data. |
+| `ftsAutoIndexRows`         | `4096`        | Row count above which `MATCH` can schedule a background index build for a column that does not have one yet.                                                                        |
+| `maxCommitRetries`         | `8`           | How many times a write retries after another tab publishes first.                                                                                                                   |
+| `spillOwnerLeaseMs`        | `60000`       | How long temporary query files stay claimed between renewals while a query is running.                                                                                              |
+| `transactionIdleTimeoutMs` | `30000`       | How long an untouched `BEGIN` transaction may remain open before Minnow rolls it back. This prevents an abandoned transaction from keeping storage alive forever.                   |
+| `autoCompact`              | `true`        | Whether Minnow combines fragmented tables in the background; see [compaction](/docs/storage/maintenance).                                                                           |
+| `autoCollect`              | `autoCompact` | Whether Minnow removes replaced blocks and old versions in the background; see [garbage collection](/docs/storage/maintenance#garbage-collection).                                  |
+| `compaction`               | `{}`          | Defaults for every compaction job, including background work. `partitionRows` defaults to 16,384. See [partitioned folds](/docs/storage/maintenance#partitioned-folds).             |
+
+The stock worker accepts the options that can be copied in its startup message: `compression`,
+`rowsPerBlock`, `maxCommitRetries`, `spillOwnerLeaseMs`, and `bufferPoolBytes`. It uses defaults for
+the others. A [custom worker entry](/docs/engine/workers#custom-worker-entries) can construct
+`MinnowDatabase` with the full option set.
 
 ## Errors
 
 Errors are classes, so they can be caught by kind rather than by matching a message:
 
 ```ts
-import { SqlCompileError, UniqueConstraintError, WriteConflictError } from "@minnowdb/core";
+import { SqlCompileError, UniqueConstraintError } from "@minnowdb/core";
+import { WriteConflictError } from "@minnowdb/core/storage";
 ```
 
 `SqlCompileError` carries the `offset` and `length` of the offending span, which is what the
 devtools editor underlines. `WriteConflictError` means a writer in another tab, or a write scope,
 committed first; the engine retries these itself up to `maxCommitRetries` before surfacing one.
 
-## Closing
+## Closing the storage
 
 ```ts
-db.close();
+store.close();
 ```
 
-Closes the underlying store. Any in-flight query rejects rather than hanging.
+`MinnowDatabase` does not take ownership of the store, so close the store you passed to it when
+your application is done. A `MinnowDatabaseClient` does own its worker connection; call
+`await client.close()` there, with `{ terminateWorker: true }` if it should also terminate the
+worker.

@@ -18,19 +18,19 @@ The plan is the optimized one — what will actually run, not the shape you wrot
 
 ## What the optimizer does
 
-**Predicate pushdown.** Filters move as close to their table scan as they can get, so rows are
+**Early filtering.** Filters move as close to their table scan as they can get, so rows are
 discarded before a join builds a hash table out of them.
 
-**Zone-map pruning.** Every block records the minimum and maximum of the column it holds. A
-predicate that cannot be satisfied inside a block's range skips the block without decoding or
+**Skipping by value range.** Every block records the minimum and maximum of the column it holds. A
+comparison that cannot be true inside a block's range skips the block without decoding or
 decompressing it. This is why `WHERE placed_at >= '2025-01-01'` on a table written in date order
 reads a fraction of the bytes.
 
-**Column pruning.** Only the columns a query mentions are read. A `SELECT` of two columns from a
+**Reading only needed columns.** Only the columns a query mentions are read. A `SELECT` of two columns from a
 fourteen-column table reads two columns' worth of blocks.
 
-**Join reordering.** Joins are ordered by estimated cardinality, and the smaller side becomes the
-hash build side. An equality join against a unique key takes an index-nested-loop path instead.
+**Join reordering.** Minnow estimates how many rows each side will produce and builds its lookup
+from the smaller side. An equality join can use a table's unique-key lookup instead.
 
 **Decorrelation.** A correlated `EXISTS` or `IN` subquery is rewritten into a semi-join rather than
 executed once per outer row. The two correlated forms that cannot be rewritten this way are
@@ -47,7 +47,7 @@ is recognized and not sorted again.
 
 ## Execution
 
-The executor is vectorized: it works on batches of column values rather than a row at a time, and
+The query runner works on batches of column values rather than one row at a time, and
 scans stream block by block so a table is never required to be resident. When a hash table,
 sort, or grouping payload would exceed the [memory budget](/docs/engine/memory), the operator
 spills to storage and continues rather than failing.

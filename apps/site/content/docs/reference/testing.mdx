@@ -12,7 +12,7 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 
 | Command                        | What it runs                                                                 | Use it for                         |
 | ------------------------------ | ---------------------------------------------------------------------------- | ---------------------------------- |
-| `npm test`                     | Vitest unit, conformance, differential, and harness tests                    | Normal implementation work         |
+| `npm test`                     | Vitest unit, SQL support, comparison, and harness tests                      | Normal implementation work         |
 | `npm run test:coverage`        | The same suite, with the coverage floors enforced                            | Before pushing                     |
 | `npm run soak`                 | The generative suites on fresh random seeds, to find new failures            | Hunting bugs rather than pinning   |
 | `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture              | Before changing a format version   |
@@ -42,9 +42,9 @@ application it starts.
 
 ## What each layer proves
 
-- **Unit and conformance tests** stay beside the source they exercise. They cover deterministic
-  behavior, SQL and mutation conformance, differential execution, fault injection, and the
-  benchmark generator/oracle contracts. `npm test` picks up `apps/site/bench` alongside
+- **Unit and language tests** stay beside the source they exercise. They cover predictable
+  behavior, supported SQL and mutations, comparisons with other engines, fault injection, and the
+  benchmark generator and answer-checking rules. `npm test` picks up `apps/site/bench` alongside
   `packages/**`, so the dataset generator, the oracles, and the suite definitions are checked on
   every unit run.
 - **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
@@ -65,7 +65,7 @@ HTML.
 
 ## Seeds, and how a soak failure becomes a permanent test
 
-The generative suites — SQL conformance, DML conformance, and the columnar-versus-row differential
+The generated suites — SQL support, write support, and the columnar-versus-row comparison
 — build their corpora from a seeded generator. A committed run is deterministic: it uses the
 checked-in seeds plus every seed that has ever failed, listed in
 `packages/core/regression-seeds.json`. That makes the suite a reliable regression net, and on its
@@ -120,7 +120,7 @@ earlier stays readable, and the same write succeeds once there is room, with no 
 
 ## Property-based tests
 
-`block-format/properties.test.ts` states the format's contract as properties and checks them
+`block-format/properties.test.ts` describes the format as properties and checks them
 against generated inputs rather than chosen ones: a value written and read back is the same value,
 both codecs agree, a zone map contains everything it summarizes, and a flipped byte is detected
 rather than decoded into plausible rows. The generators reach for what breaks encoders — negative
@@ -134,8 +134,8 @@ row or a compactor that stops folding actually shows up:
 
 - `compaction-soak.test.ts` runs 1,500 interleaved mutations against a reference `Map`, compacting
   at checkpoints, and compares the whole table to the reference each time. Compaction is bounded
-  and incremental — one call folds a limited number of blocks — so the contract asserted is
-  monotone progress, not a fixed point reached in one call.
+  and incremental — one call folds a limited number of blocks — so the test expects steady
+  progress, not a finished table after one call.
 - `concurrency-simulation.test.ts` runs twelve independent databases over one shared store, the
   shape of twelve browser tabs on one origin, issuing a seeded random schedule. It checks that the
   outcome is explicable: every visible row was written by some tab, acknowledged writes are
@@ -190,8 +190,8 @@ a different storage operation each time — the first block write, then the seco
 block read, and so on through every operation a clean run performs. After each interruption it
 reopens the store and asks whether what survived is coherent.
 
-The invariant is atomicity, not durability. A write interrupted mid-flight may be present or
-absent; both are correct. What is never correct is a torn state — a row nobody wrote, a duplicated
+The test cares about all-or-nothing writes, not whether an interrupted write survives. A write
+stopped halfway may be present or absent; both are correct. What is never correct is a torn state — a row nobody wrote, a duplicated
 key, a database that will not reopen. Every assertion is phrased as "the surviving state is one a
 caller could have observed", never "the write landed".
 
@@ -235,8 +235,8 @@ suites, and dataset size they pick, and explains the measurement methodology, st
 caching, and memory caveats as it reports them. The suites themselves live in `apps/site/bench`
 and the page that drives them in `apps/site/app/benchmarks`.
 
-To iterate on the harness, run the unit tests (`npm test`) for the generator, oracles, and suite
-contracts, then `npm run test:browser:site` to run a suite in real browsers. To try a change by
+To iterate on the harness, run the unit tests (`npm test`) for the generator, answer checkers, and
+suite rules, then `npm run test:browser:site` to run a suite in real browsers. To try a change by
 hand, `npm run site:dev` and open `/benchmarks`.
 
 ## The settled history

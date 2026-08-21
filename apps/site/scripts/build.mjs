@@ -1,5 +1,5 @@
 /**
- * `next build`, with NODE_ENV pinned to production.
+ * `next build --webpack`, with NODE_ENV pinned to production.
  *
  * A build is a production build by definition, but `next build` takes NODE_ENV from the
  * environment if something already set it — and then compiles successfully while prerendering
@@ -12,6 +12,11 @@
  * through the pre-push hook — a script pushed a tag, the hook ran the gate, and the gate's site
  * build failed for a reason that had nothing to do with the tree.
  *
+ * Next 16's default Turbopack build can stall indefinitely while optimizing this site's vendored
+ * browser engines. The supported webpack builder finishes the same static export reliably, so it
+ * is the release default. Passing `--turbopack` or `--turbo` still opts into Turbopack for local
+ * diagnosis.
+ *
  * The Next CLI is resolved rather than run from PATH, so this works wherever node does.
  */
 import { spawnSync } from "node:child_process";
@@ -19,8 +24,13 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const cli = require.resolve("next/dist/bin/next");
+const forwarded = process.argv.slice(2);
+const choosesBundler = forwarded.some((argument) =>
+  ["--webpack", "--turbopack", "--turbo"].includes(argument),
+);
+const buildArguments = choosesBundler ? forwarded : ["--webpack", ...forwarded];
 
-const result = spawnSync(process.execPath, [cli, "build", ...process.argv.slice(2)], {
+const result = spawnSync(process.execPath, [cli, "build", ...buildArguments], {
   stdio: "inherit",
   env: { ...process.env, NODE_ENV: "production" },
 });

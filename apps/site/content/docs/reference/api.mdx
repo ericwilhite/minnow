@@ -1,10 +1,13 @@
 ---
 title: API reference
-description: Every public export of @minnowdb/core and @minnowdb/client, by entry point.
+description: The public entry points and the APIs you are most likely to use.
 ---
 
-Everything ships in one package, `@minnowdb/core`. The root export is the everyday surface; the
-subpaths expose the layers it's built from.
+Start with `@minnowdb/core` for the database itself. The smaller entry points let you opt into a
+worker, a typed query builder, devtools, or lower-level storage tools. This page groups closely
+related supporting types so you can find the useful surface without reading a list of every type
+parameter. Your editor will show the full signatures from the declarations shipped with each
+package.
 
 | Entry point                              | Contents                                                        |
 | ---------------------------------------- | --------------------------------------------------------------- |
@@ -16,8 +19,10 @@ subpaths expose the layers it's built from.
 | `@minnowdb/core/transactions`            | Snapshots, transactions, recovery (lower level)                 |
 | `@minnowdb/core/block-format`            | Binary block containers and codecs (lower level)                |
 | `@minnowdb/core/worker-protocol`         | Versioned RPC frames (lower level)                              |
-| `@minnowdb/core/testing`                 | Fault injection and the block-store conformance kit             |
-| `@minnowdb/core/sql-feature-matrix.json` | The checked-in SQL conformance matrix                           |
+| `@minnowdb/core/testing`                 | Fault injection and the shared block-store test kit             |
+| `@minnowdb/core/sql-feature-matrix.json` | The checked-in SQL feature list                                 |
+| `@minnowdb/client`                       | Optional typed query builder                                    |
+| `@minnowdb/devtools`                     | Embeddable database console and data browser                    |
 
 ---
 
@@ -76,7 +81,7 @@ From `@minnowdb/client`, an optional package installed separately. See
 | `.close()`                                 | Closes the shared live set (and any driver-owned resources the facade created).                                                                                                                                     |
 | `.driver`                                  | The `MinnowDatabase` or `MinnowDatabaseClient` behind the facade, for tools handed only the facade. Application code should keep its own reference instead.                                                         |
 | `MinnowOptions`                            | Facade options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`.                                                                                                                  |
-| `DslDriver, DriverLiveSet, DslLiveOptions` | The driver contract, implemented by both the database and the worker client.                                                                                                                                        |
+| `DslDriver, DriverLiveSet, DslLiveOptions` | The small driver interface shared by the database and worker client.                                                                                                                                                |
 
 ### SelectQueryBuilder
 
@@ -89,13 +94,13 @@ From `@minnowdb/client`, an optional package installed separately. See
 | `having(...)`                                             | Post-aggregation filter, same forms as `where`.                                                                                                                           |
 | `groupBy(cols)` / `orderBy(col \| expr, dir?)`            | Grouping and ordering; ORDER BY takes a selected column, an output alias, or any expression (desugared to a hidden select item — wildcard selects order by columns only). |
 | `limit(n)` / `offset(n)` / `distinct()`                   | Row-set modifiers.                                                                                                                                                        |
-| `select([...])` / `select((eb) => [...])` / `selectAll()` | Projections; string and expression selections may be mixed across repeated calls.                                                                                         |
+| `select([...])` / `select((eb) => [...])` / `selectAll()` | Chooses the returned columns and expressions. String and expression selections may be mixed across repeated calls.                                                        |
 | `search(query, { columns? })`                             | Filters by `eb.match` and orders by BM25 relevance descending; the row shape is untouched (select `fn.bm25` yourself to read the score). Columns default to `"*"`.        |
 | `union / unionAll / intersect / except(other)`            | Set operations; member row types must match.                                                                                                                              |
 | `as(alias)`                                               | Turns the query into a derived table for `selectFrom` / joins.                                                                                                            |
 | `compile()`                                               | The typed plan envelope — the same object `.execute()` runs and `.live()` subscribes.                                                                                     |
 | `execute / executeTakeFirst / executeTakeFirstOrThrow()`  | Run and return `TRow[]`, the first row or `undefined`, or throw `NoResultError`.                                                                                          |
-| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/sql).                                                                                                       |
+| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/client/live).                                                                                               |
 
 ### Mutation builders
 
@@ -112,7 +117,7 @@ From `@minnowdb/client`, an optional package installed separately. See
 ### Expression builder
 
 The callback argument of `where` / `having` / `select` / `set`. See the
-[expression vocabulary](/docs/sql/select#filtering-and-projection) for the full table: comparisons
+[expression vocabulary](/docs/sql/select#filtering-and-choosing-columns) for the full table: comparisons
 (`eb(lhs, op, rhs)`), `eb.and/or/not`, arithmetic, `eb.between/notBetween`, `eb.ref`, `eb.fn`
 aggregates and scalar functions, window functions with `.over(...)`,
 `eb.case()...end()`, `eb.selectFrom`, and `eb.exists`. Exported supporting types include
@@ -128,15 +133,15 @@ aggregates and scalar functions, window functions with `.over(...)`,
 
 ## Live queries
 
-From `@minnowdb/core`. See [Live queries](/docs/sql).
+From `@minnowdb/core`. See [Live queries](/docs/client/live).
 
-| Export                                                                                                                              | Description                                                                                                                                                  |
-| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `class LiveQuery<TRow>`                                                                                                             | Returned by `.live()`. `subscribe({ onChange, onComplete? })` resolves to a `LiveSubscriptionHandle`; also an async iterable with latest-wins coalescing.    |
-| `class LiveQuerySet`                                                                                                                | The SQL-level mechanism behind the typed layer, from `database.liveQueries(options)`. `subscribe(sqlOrPlan, { onChange })`, `refresh()`, `stats`, `close()`. |
-| `LiveQuerySetOptions`                                                                                                               | `channelName?` (BroadcastChannel hints), `pollIntervalMs?` (fallback polling).                                                                               |
-| `LiveQueryStats`                                                                                                                    | Hints, sweeps, reruns executed/avoided, suppressed notifications, sweep latency.                                                                             |
-| `LiveQuerySubscribeOptions, LiveQuerySubscription, LiveQueryInput, LiveQueryHintChannel, LiveQueryHandlers, LiveSubscriptionHandle` | Supporting types.                                                                                                                                            |
+| Export                                                                                                                              | Description                                                                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class LiveQuery<TRow>`                                                                                                             | Returned by `.live()`. `subscribe({ onChange, onComplete? })` resolves to a `LiveSubscriptionHandle`; it is also an async iterable that keeps the newest result when updates arrive quickly. |
+| `class LiveQuerySet`                                                                                                                | The SQL-level mechanism behind the typed layer, from `database.liveQueries(options)`. `subscribe(sqlOrPlan, { onChange })`, `refresh()`, `stats`, `close()`.                                 |
+| `LiveQuerySetOptions`                                                                                                               | `channelName?` (BroadcastChannel hints), `pollIntervalMs?` (fallback polling).                                                                                                               |
+| `LiveQueryStats`                                                                                                                    | Hints, sweeps, reruns executed/avoided, suppressed notifications, sweep latency.                                                                                                             |
+| `LiveQuerySubscribeOptions, LiveQuerySubscription, LiveQueryInput, LiveQueryHintChannel, LiveQueryHandlers, LiveSubscriptionHandle` | Supporting types.                                                                                                                                                                            |
 
 ## The engine — `MinnowDatabase`
 
@@ -147,22 +152,23 @@ From `@minnowdb/core`. The low-level asynchronous engine the facade drives. See
 new MinnowDatabase(store: BlockStore, options?: MinnowDatabaseOptions)
 ```
 
-`MinnowDatabaseOptions` covers `compression`, `rowsPerBlock`, `maxCommitRetries`,
-`spillOwnerLeaseMs`, `bufferPoolBytes`, and deterministic seams (`now`, `createId`).
-`bufferPoolBytes` (default 64 MiB) bounds one shared LRU holding assembled column vectors,
-decoded blocks, zone-pruned projections, and derived-block results, and `0` disables it; compiled
-SQL plans are cached separately by statement text.
+`MinnowDatabaseOptions` covers compression, block size, write retries, query spilling, idle SQL
+transactions, caching, automatic full-text indexing, and background maintenance. The full option
+table is on [The database API](/docs/engine#options). `bufferPoolBytes` defaults to 64 MiB and
+limits one shared cache of decoded blocks and reusable query work; `0` disables it. Compiled SQL
+plans are cached separately by statement text.
 
-| Group      | Methods                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Catalog    | `createTable`, `listTables`, `introspect()`, `migrate(schema)`, `createView`, `dropView`, `dropTable`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Writes     | `insertBatch`, `insert`, `upsertBatch`, `upsert`, `updateBatch`, `update`, `deleteBatch`, `bufferedWriter(table, options)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| Reads      | `readTable(table, { columns, version? })`, `listVisibleSegments`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| SQL        | `query(sql, options?)`, `snapshot(callback)`, `write(callback)`, `explain(sql)`, `execute(sql, params?)`, `runStatement(statement)`. `write()` publishes every staged mutation as one commit and reads its own staged rows — see [write scopes](/docs/engine/transactions#atomic-writes). `CREATE TRIGGER` / `DROP TRIGGER` persist row triggers fired inside the triggering commit — see [triggers](/docs/sql/dml#triggers). Statements cover `INSERT ... SELECT`, `ON CONFLICT (key) DO NOTHING / DO UPDATE SET col = EXCLUDED.col`, and `RETURNING` on every mutation; placeholders (`?`/`$n`) bind through `options.params` or the `execute` parameter list. |
-| Snapshots  | `exportSnapshot(options?)` returns the encoded file; `importSnapshot(bytes, options?)` loads one into an empty store. Both take `onProgress` — see [snapshots](/docs/storage/snapshots).                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Live       | `liveQueries(options?)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Compaction | `compactTable`, `compactTableStep`, `resumeCompactionJob`, `listCompactionJobs`, `cancelCompactionJob`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| GC         | `collectGarbage`, `collectGarbageStep`, `resumeGarbageCollectionJob`, `listGarbageCollectionJobs`, `cleanupQuerySpill`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Group      | Methods                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Catalog    | `createTable`, `listTables`, `introspect()`, `migrate(schema)`, `createView`, `dropView`, `dropTable`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Writes     | `insertBatch`, `insert`, `upsertBatch`, `upsert`, `updateBatch`, `update`, `deleteBatch`, `bufferedWriter(table, options)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Reads      | `readTable(table, { columns, version? })`, `listVisibleSegments`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| SQL        | `query(sql, options?)`, `snapshot(callback)`, `write(callback)`, `explain(sql)`, `execute(sql, params?)`, `run(typedQuery)`, `runStatement(statement)`. `write()` publishes every staged change as one commit and reads its own staged rows — see [write scopes](/docs/engine/transactions#atomic-writes). `execute()` also accepts `BEGIN`, `COMMIT`, and `ROLLBACK`; idle transactions roll back after `transactionIdleTimeoutMs`. `CREATE TRIGGER` / `DROP TRIGGER` save row triggers that run inside the same commit — see [triggers](/docs/sql/dml#triggers). Statements cover `INSERT ... SELECT`, `ON CONFLICT (key) DO NOTHING / DO UPDATE SET col = EXCLUDED.col`, and `RETURNING` on every mutation; placeholders (`?`/`$n`) bind through `options.params` or the `execute` parameter list. |
+| Snapshots  | `exportSnapshot(options?)` returns the encoded file; `importSnapshot(bytes, options?)` loads one into an empty store. Both take `onProgress` — see [snapshots](/docs/storage/snapshots).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Search     | `buildFtsIndex(table, column)` builds an index now; ordinary `MATCH` queries can also schedule one automatically.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Live       | `liveQueries(options?)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Compaction | `compactTable`, `compactTableStep`, `resumeCompactionJob`, `listCompactionJobs`, `cancelCompactionJob`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| GC         | `collectGarbage`, `collectGarbageStep`, `resumeGarbageCollectionJob`, `listGarbageCollectionJobs`, `cleanupQuerySpill`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 Notable supporting exports:
 
@@ -188,9 +194,9 @@ Notable supporting exports:
 | `SqlCompileError`                                                                             | SQL fails to compile; carries `offset` and `length`.   |
 | `QueryMemoryBudgetError`                                                                      | A reservation exceeds `executionMemoryBudgetBytes`.    |
 | `NoResultError`                                                                               | `executeTakeFirstOrThrow()` finds no row.              |
-| `CompactionMemoryBudgetError, CompactionWriteAmplificationError, CompactionJobCancelledError` | Compaction guardrails.                                 |
+| `CompactionMemoryBudgetError, CompactionWriteAmplificationError, CompactionJobCancelledError` | Compaction limits or cancellation.                     |
 
-All are rehydrated across the worker channel — `instanceof` works on the client.
+The worker client recreates these errors on the main thread, so `instanceof` works there too.
 
 ## Worker hosting
 
@@ -206,14 +212,14 @@ From `@minnowdb/core`. See [Workers & multi-tab](/docs/engine/workers).
 
 ## `@minnowdb/core/client`
 
-| Export                                                                                                        | Description                                                                                                                                              |
-| ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class MinnowDatabaseClient`                                                                                  | Main-thread proxy of the full database API. Construct with a `Worker` (any `ClientTransport`) and `MinnowDatabaseClientOptions` (`store`, wire options). |
-| `.ready()`                                                                                                    | Surfaces store-open failures eagerly; calls may be issued before it resolves.                                                                            |
-| Mirrored API                                                                                                  | Every `MinnowDatabase` group above, promisified: catalog, writes, reads, SQL, live, maintenance.                                                         |
-| `.close({ terminateWorker? })`                                                                                | Tears down handles, optionally terminating the worker.                                                                                                   |
-| `ClientBufferedWriter, ClientLiveQuerySet, ClientLiveSubscription, ClientWriteSession, ClientSnapshotSession` | Handle proxies; synchronous getters become methods (`stats()`, `memoryUsage()`).                                                                         |
-| `ClientTransport, ClientLiveQueryOptions, CloseClientOptions, ClientMigrationResult`                          | Supporting types.                                                                                                                                        |
+| Export                                                                                                        | Description                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class MinnowDatabaseClient`                                                                                  | Main-thread worker proxy. Construct with a `Worker` (any `ClientTransport`) and `MinnowDatabaseClientOptions` (`store`, wire options).                                                                                      |
+| `.ready()`                                                                                                    | Surfaces store-open failures eagerly; calls may be issued before it resolves.                                                                                                                                               |
+| Mirrored API                                                                                                  | Queries, writes, migrations, reads, live queries, snapshots, and maintenance. Direct `createView`, `dropView`, and `buildFtsIndex` helpers are not exposed; migrations manage views and search indexes build automatically. |
+| `.close({ terminateWorker? })`                                                                                | Tears down handles, optionally terminating the worker.                                                                                                                                                                      |
+| `ClientBufferedWriter, ClientLiveQuerySet, ClientLiveSubscription, ClientWriteSession, ClientSnapshotSession` | Handle proxies; synchronous getters become methods (`stats()`, `memoryUsage()`).                                                                                                                                            |
+| `ClientTransport, ClientLiveQueryOptions, CloseClientOptions, ClientMigrationResult`                          | Supporting types.                                                                                                                                                                                                           |
 
 ## `@minnowdb/core/worker`
 
@@ -223,14 +229,14 @@ A side-effect module: importing it inside a module worker attaches the database 
 
 ## `@minnowdb/core/plan`
 
-Plan-construction primitives for building a typed layer over the engine — the block-assembly
-functions the SQL parser itself ends in, plus the plan types and validators that keep a hand-built
-plan as strict as a parsed one. See [Extending Minnow](/docs/reference/extending#building-plans-directly).
+Tools for building a typed layer over the engine. They are the same plan-building functions and
+checks used by the SQL parser, so a hand-built plan is checked just like parsed SQL. See
+[Extending Minnow](/docs/reference/extending#building-plans-directly).
 
 | Export                                                                                    | Description                                             |
 | ----------------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | `assembleSelectBlock, compoundSelectBlock, derivedTableSource`                            | Assemble one select block, a set operation, a subquery. |
-| `splitCondition, validateLimit, validateOffset, hasAggregate`                             | The validators and helpers the parser applies.          |
+| `splitCondition, validateLimit, validateOffset, validateFtsQuery, hasAggregate`           | Checks and helpers used by the parser.                  |
 | `optimizePlan, renderPlan`                                                                | Optimize a plan; render one for display.                |
 | `CompiledQuery, Expression, JoinPlan, Predicate, SelectItem, SetOperator, TableSource`    | Plan types.                                             |
 | `AggregateName, PredicateOperator, WindowFunctionName, QueryValue, QueryRow, QueryResult` | Supporting types.                                       |
@@ -242,36 +248,37 @@ The optional typed query builder. Installed separately: `npm install @minnowdb/c
 
 ## `@minnowdb/core/storage`
 
-| Export                                                                               | Description                                                                                                                                                                                                                                         |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class IndexedDbBlockStore`                                                          | The IndexedDB store. `IndexedDbBlockStore.open({ name, durability?, … })`; `close()`.                                                                                                                                                               |
-| `class OpfsBlockStore`                                                               | The OPFS store, worker-only. `OpfsBlockStore.open({ name, durability?, … })`; `close()`.                                                                                                                                                            |
-| `deleteOpfsDatabase({ name })`                                                       | Removes an OPFS database's directory entirely.                                                                                                                                                                                                      |
-| `class MemoryBlockStore`                                                             | Same interface, in memory — the unit-test store.                                                                                                                                                                                                    |
-| `class OpfsTree`                                                                     | The OPFS adapter's file helper: cached directory handles, whole-file reads and writes, and the retry and locked-file semantics three browsers disagree on. Satisfies the toolkit's `ExtentFiles`.                                                   |
-| `BlockStore`                                                                         | The full storage contract all three implement; composed of `BlockPayloadStore`, `CatalogStore`, `TransactionStore`, `LeaseStore`, `MaintenanceStore`, `FtsIndexStore`, and `TempSpillStore`. See [Writing a storage adapter](/docs/storage/custom). |
-| `Manifest, TableRecord, TableColumnRecord, SegmentRecord, RowIdSpan, LeaseRecord, …` | The persistent record types.                                                                                                                                                                                                                        |
-| `WriteConflictError, TableRecordConflictError`                                       | Storage-level conflicts surfaced through the engine.                                                                                                                                                                                                |
-| `SimpleDataType, simpleDataTypes`                                                    | The four logical types as a value and union.                                                                                                                                                                                                        |
+| Export                                                                               | Description                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class IndexedDbBlockStore`                                                          | The IndexedDB store. `IndexedDbBlockStore.open({ name, durability?, … })`; `close()`.                                                                                                                                      |
+| `class OpfsBlockStore`                                                               | The OPFS store, worker-only. `OpfsBlockStore.open({ name, durability?, … })`; `close()`.                                                                                                                                   |
+| `deleteOpfsDatabase({ name })`                                                       | Removes an OPFS database's directory entirely.                                                                                                                                                                             |
+| `class MemoryBlockStore`                                                             | Same interface, in memory — the unit-test store.                                                                                                                                                                           |
+| `class OpfsTree`                                                                     | The OPFS adapter's file helper: cached directory handles, whole-file reads and writes, plus the browser differences around retries and locked files. It implements the toolkit's `ExtentFiles` interface.                  |
+| `BlockStore`                                                                         | The complete storage interface shared by all three adapters. It combines block, catalog, transaction, lease, maintenance, full-text, and temporary-page operations. See [Writing a storage adapter](/docs/storage/custom). |
+| `Manifest, TableRecord, TableColumnRecord, SegmentRecord, RowIdSpan, LeaseRecord, …` | The persistent record types.                                                                                                                                                                                               |
+| `WriteConflictError, TableRecordConflictError`                                       | Storage-level conflicts surfaced through the engine.                                                                                                                                                                       |
+| `SimpleDataType, simpleDataTypes`                                                    | The four logical types as a value and union.                                                                                                                                                                               |
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
-tooling but are storage internals — the version-zero format carries no compatibility promise.
+tooling but are storage internals — this early format carries no compatibility promise.
 
 ## `@minnowdb/core/storage/toolkit`
 
 The [adapter toolkit](/docs/storage/custom#the-adapter-toolkit): the building blocks the memory
 and OPFS adapters are assembled from, published for writing new adapters. Deliberately separate
-from the contract — the engine never references it, and no adapter is required to use it.
+from the required storage interface. The engine never imports it, and a custom adapter does not
+have to use it.
 
-| Export                                                                                              | Description                                                                                                                                                                                   |
-| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class RecordCore`                                                                                  | The synchronous record-state machine: the contract's record semantics as one method per operation, with `dump()`/`load()` for checkpoints and the `PhysicalBlocks` seam for byte presence.    |
-| `class WalWriter` / `replayWalFrames(handle)`                                                       | Checksummed write-ahead-log frames over a held `SyncFileHandle`; replay stops at the first torn frame.                                                                                        |
-| `class ExtentPool`                                                                                  | Packed append-only extent files for bulk bytes, addressed by `Placement`; sealing, live-byte accounting, fragmentation detection, and a read-handle cache. Opens files through `ExtentFiles`. |
-| `encodeRecordJson` / `decodeRecordJson`                                                             | JSON with bigints (`{"$n":"…"}`) — the codec frames and checkpoints use.                                                                                                                      |
-| `encodeSyncCheckpoint` / `decodeSyncCheckpoint`, `encodeChunk` / `decodeChunk`                      | Checksummed, versioned envelopes for checkpoint payloads and immutable artifact chunks; torn bytes decode as "not written".                                                                   |
-| `SyncFileHandle`                                                                                    | The substrate seam: positioned synchronous read/write/truncate/flush/close. `FileSystemSyncAccessHandle` satisfies it structurally.                                                           |
-| `RecordCoreState`, `PhysicalBlocks`, `ExtentFiles`, `ExtentMeta`, `Placement`, `LOG_FORMAT_VERSION` | Supporting types and the on-disk envelope version.                                                                                                                                            |
+| Export                                                                                              | Description                                                                                                                                                                                       |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class RecordCore`                                                                                  | The in-memory record engine used by the memory and OPFS adapters. It has one method per operation, `dump()`/`load()` for checkpoints, and a `PhysicalBlocks` interface for checking stored bytes. |
+| `class WalWriter` / `replayWalFrames(handle)`                                                       | Checksummed write-ahead-log frames over a held `SyncFileHandle`; replay stops at the first torn frame.                                                                                            |
+| `class ExtentPool`                                                                                  | Packed append-only extent files for bulk bytes, addressed by `Placement`; sealing, live-byte accounting, fragmentation detection, and a read-handle cache. Opens files through `ExtentFiles`.     |
+| `encodeRecordJson` / `decodeRecordJson`                                                             | JSON with bigints (`{"$n":"…"}`) — the codec frames and checkpoints use.                                                                                                                          |
+| `encodeSyncCheckpoint` / `decodeSyncCheckpoint`, `encodeChunk` / `decodeChunk`                      | Checksummed, versioned envelopes for checkpoint payloads and immutable artifact chunks; torn bytes decode as "not written".                                                                       |
+| `SyncFileHandle`                                                                                    | The small file interface used by the toolkit: positioned read, write, truncate, flush, and close. A browser `FileSystemSyncAccessHandle` already has this shape.                                  |
+| `RecordCoreState`, `PhysicalBlocks`, `ExtentFiles`, `ExtentMeta`, `Placement`, `LOG_FORMAT_VERSION` | Supporting types and the on-disk envelope version.                                                                                                                                                |
 
 ## `@minnowdb/core/transactions`
 
@@ -306,13 +313,27 @@ client turns back into `QueryResult` rows; see [Workers](/docs/engine/workers).
 | Export                                                              | Description                                                                                                                                                                                       |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `class FaultInjectingBlockStore`                                    | Wraps any `BlockStore`; `new FaultInjectingBlockStore(inner, inject)` calls `inject(point)` around storage operations.                                                                            |
-| `blockStoreConformanceCases()` / `runBlockStoreConformance(target)` | The [storage-contract conformance kit](/docs/storage/custom#the-conformance-kit): framework-agnostic cases any `BlockStore` implementation must pass.                                             |
+| `blockStoreConformanceCases()` / `runBlockStoreConformance(target)` | The [shared storage test kit](/docs/storage/custom#the-shared-test-kit): cases any `BlockStore` implementation must pass, ready to use with any test framework.                                   |
 | `faultPoints, FaultPoint`                                           | The named points: `beforeBlockWrite`, `afterBlockWrite`, `beforeBlockRead`, `afterBlockRead`, `beforeManifestCommit`, `afterManifestCommit`, `beforeTransactionCommit`, `afterTransactionCommit`. |
 | `FaultInjector`                                                     | `(point: FaultPoint) => void \| Promise<void>` — throw to simulate the crash.                                                                                                                     |
 | `class MemoryOpfs`                                                  | An in-memory origin-private file system for Node tests: exclusive sync-access locks with real `DOMException` identities, plus `setWriteFault` for quota and crash injection.                      |
 
+## `@minnowdb/devtools`
+
+The optional console and data browser. See [Devtools](/docs/devtools) for the complete setup and
+options.
+
+| Export                                                                  | Description                                                                                                                         |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `mountMinnowDevtools(target, options?)`                                 | Mounts a floating launcher or inline panel and returns a `MountedDevtools` handle.                                                  |
+| `createDevtools(root, target, options?)`                                | Builds the panel in an existing shadow root. Useful when your application owns the host element.                                    |
+| `defineMinnowDevtools(name?)`, `MinnowDevtoolsElement`, `elementName`   | Registers or uses the custom element. The default tag is `<minnow-devtools>`.                                                       |
+| `DevtoolsOptions`                                                       | `mode`, `corner`, `hotkey`, `defaultOpen`, `zIndex`, `permissions`, `initialQuery`, `storageKey`, `theme`, and inline `height`.     |
+| `DevtoolsHandle`, `MountedDevtools`                                     | Controls for `open`, `close`, `toggle`, `setQuery`, `setTheme`, `isOpen`, and `destroy`; a mounted handle also exposes its element. |
+| `DevtoolsAttachable`, `DevtoolsTarget`, `DevtoolsPermissions`, and more | Supporting types for accepted databases, worker clients, themes, layout, and permissions.                                           |
+
 ## `@minnowdb/core/sql-feature-matrix.json`
 
-The checked-in conformance matrix rendered at [SQL support](/docs/sql/feature-matrix): every SQL feature the
-engine claims, with per-feature support status. The engine's conformance suite reports drift
+The checked-in feature list rendered at [SQL support](/docs/sql/feature-matrix): every SQL feature the
+engine claims, with per-feature support status. The engine's tests report drift
 against this file, so the docs and the engine cannot silently disagree.

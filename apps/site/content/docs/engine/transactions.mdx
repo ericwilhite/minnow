@@ -5,12 +5,17 @@ description: Making several writes atomic, holding one version across several re
 
 ## Atomic writes
 
+You can group writes with SQL `BEGIN` / `COMMIT`, or use a callback when you are working with the
+batch APIs.
+
+### Batch write scopes
+
 A write scope stages any number of mutations across any number of tables and publishes them as one
 commit:
 
 ```ts
 const { result, version } = await db.write(async (tx) => {
-  await tx.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [qty, sku]);
+  await tx.updateBatch("stock", { keys: [sku], changes: { on_hand: [nextOnHand] } });
   await tx.insertBatch("shipments", [{ sku, qty, shipped_at: new Date() }]);
   return sku;
 });
@@ -19,11 +24,24 @@ const { result, version } = await db.write(async (tx) => {
 Everything inside becomes visible at once, including to other tabs: nobody observes the stock
 decremented without the shipment. If the callback throws, nothing is published.
 
-Scopes are a callback rather than `begin()` / `commit()` calls on purpose. A transaction a caller
-holds is a transaction a caller can drop — through a thrown error, a closed tab, a forgotten
-`await` — and a dropped transaction pins storage that background collection then cannot reclaim.
-A scope ends when its callback does, however it ends. This is also why `BEGIN` as SQL text is
-[rejected](/docs/sql/feature-matrix).
+A scope ends with its callback, so a thrown error or forgotten branch cannot leave it open. SQL
+transactions are available too, with a 30-second idle rollback to protect against a caller that
+opens one and disappears:
+
+```ts
+await db.execute("BEGIN");
+try {
+  await db.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [qty, sku]);
+  await db.execute("INSERT INTO shipments (sku, qty) VALUES (?, ?)", [sku, qty]);
+  await db.execute("COMMIT");
+} catch (error) {
+  await db.execute("ROLLBACK");
+  throw error;
+}
+```
+
+Reads inside the transaction see its earlier writes. Schema changes are refused because they are
+saved outside the transaction. Savepoints and nested transactions are not supported.
 
 ### A failed scope stays failed
 
@@ -72,7 +90,7 @@ onto the winner's version and retries — up to `maxCommitRetries`, eight by def
 get a `WriteConflictError` to handle yourself.
 
 ```ts
-import { WriteConflictError } from "@minnowdb/core";
+import { WriteConflictError } from "@minnowdb/core/storage";
 
 try {
   await db.write(async (tx) => {

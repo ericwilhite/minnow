@@ -6,13 +6,13 @@ description: How Minnow works and why it's built this way.
 Minnow is built for how browsers actually behave: tabs close without warning, storage is slow, and
 the same app may be open in five tabs at once. Everything below follows from that.
 
-The short version: data lives in compressed columnar blocks inside IndexedDB or OPFS, reads see consistent
-snapshots (MVCC), and queries run through a vectorized executor. This page covers the choices and
-the reasons; the code is the full record.
+The short version: data lives in compressed column blocks inside IndexedDB or OPFS. Each read sees
+one stable version, and queries work through the data in batches. This page explains the choices
+and why they matter.
 
-## The ground rules
+## The ideas that guide it
 
-These are fixed. Everything else is built around them.
+Everything else is built around these ideas.
 
 - **The durable store is the source of truth.** BroadcastChannel, Web Locks, and page lifecycle
   events can all fail silently. Minnow uses them to speed things up, never for correctness.
@@ -24,15 +24,15 @@ These are fixed. Everything else is built around them.
 - **Where the engine runs is your choice.** Put it in a worker and hold an async proxy in the
   page, or construct it on the main thread. The API is async everywhere, so your code — and any
   adapter written against it — looks the same either way.
-- **Published data is immutable.** Once written, a block never changes. Most of the design falls
-  out of this one rule.
+- **Published blocks never change.** Once written, a block stays as it is. That makes retries,
+  stable reads, and cleanup much easier to reason about.
 - **Nothing special to deploy.** No COOP/COEP headers, no SharedArrayBuffer, no WASM file to
   host. `npm install` and go.
 - **The engine is our own.** No SQLite or DuckDB underneath — engines built for POSIX files carry
   assumptions browsers don't honor. The trade-off: the SQL surface is a careful subset, tracked in
   the [feature matrix](/docs/sql/feature-matrix).
 
-## Why columns, why immutable
+## Why columns, and why blocks never change
 
 Browser storage charges a lot per operation and little per byte — IndexedDB per transaction,
 OPFS per file open. So Minnow stores a few large values instead of many small ones:
@@ -54,7 +54,7 @@ The configured codec is therefore a preference: each self-describing block recor
 actually used. This keeps repetitive strings compressed without making random numeric data pay a
 compression and decompression pass for single-digit percentage savings.
 
-Immutability is the rule that pays for everything else:
+Keeping published blocks unchanged pays for everything else:
 
 - A crash can strand unused data — it can never corrupt visible data.
 - Retrying a write is always safe.
@@ -86,10 +86,10 @@ publishes version N + 1, in strict order:
 5. publish manifest N + 1
 ```
 
-Data first, pointer last, and the pointer flip is atomic. A crash anywhere in between leaves
-orphaned blocks for the garbage collector — never a manifest pointing at half-written data.
+Data first, version last. The version change is all or nothing. A crash anywhere in between leaves
+unused blocks for the garbage collector — never a version pointing at half-written data.
 
-Step 4 is the concurrency control. If another tab published first, the commit fails cleanly and
+Step 4 handles competing writers. If another tab published first, the commit fails cleanly and
 retries against the new version. Conflicts surface as typed errors, never as silent interleaving.
 
 A simple write — an insert, a point update, a delete, with no triggers staging rows of their own
@@ -113,19 +113,19 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   the same time; only one publishes, the other retries.
 - **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
   reconciles against the durable store. A missed message costs a little latency, never a stale
-  result. [Live queries](/docs/sql) are built on this.
+  result. [Live queries](/docs/client/live) are built on this.
 - **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
   expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
   pinned becomes reclaimable. No heartbeats, no guessing.
 
 ## How queries run
 
-- Data flows through the executor in typed batches of 2,048 rows: numbers and dates in
-  `Float64Array`s, strings dictionary-coded, nulls in packed bitmaps. Tight loops over typed
-  arrays instead of millions of short-lived objects.
-- Grouping on dictionary-coded strings reuses their integer codes. Small compound domains use
-  direct-address slots; high-cardinality sparse domains pack the codes into a numeric key. Both
-  avoid repeatedly encoding and hashing the same strings for every input row.
+- Data moves through the query runner in batches of 2,048 rows. Numbers and dates use
+  `Float64Array`; strings share a small dictionary; null markers are packed into bits. This avoids
+  creating millions of short-lived row objects while a query runs.
+- Grouping reuses the small number assigned to each repeated string. For several grouping columns,
+  Minnow picks a compact lookup based on how many combinations are likely. Either way, it avoids
+  repeatedly encoding and hashing the same strings for every row.
 - Queries accept a **memory budget** (`executionMemoryBudgetBytes`). Memory is reserved before it
   is allocated. Under a budget, sorts and grouped aggregations spill to durable temp pages instead
   of blowing up the tab; past it, you get a typed `QueryMemoryBudgetError`.
@@ -136,7 +136,7 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   default 64 MiB): decoded blocks by immutable block id, assembled column vectors and zone
   descriptions by the same, and computed results — whole-block results, the columnar forms of
   derived and windowed sources, and whole statement results — by exact visible-segment
-  fingerprint. A commit moves the fingerprints, so computed entries stop matching, but
+  version key. A commit changes those keys, so computed entries stop matching, but
   unchanged blocks stay decoded: the next statement pays re-assembly, not re-fetch and
   re-decompression. Passing `memoize: false` to a query bypasses the computed-result entries
   and measures execution, which is what the benchmarks do.
@@ -148,16 +148,14 @@ The budget is a model, not a heap meter, and not every operator can spill yet �
 
 Compaction and garbage collection run for a long time inside a tab that can die at any moment. So:
 
-- **Every job is a durable record.** Plan first, persist the plan, then advance in small
-  checkpointed steps. A dead tab costs one step, not the whole job.
-- **Cancellation is a real outcome.** Cancel and publish settle atomically — exactly one wins.
-- **Garbage collection is reachability.** Whatever the current manifest, unexpired leases, live
-  transactions, and running compactions still reference is kept. Each deletion re-checks liveness
-  atomically, so nothing is revived after it's gone. Once a committed transaction's manifest is
-  pruned and no segment or unfinished compaction names it, its record is collected too. Aborted
-  journals follow their pending artifacts. Expired leases, abandoned spill owners, old manifest
-  tombstones, and finished job history are swept as part of the same maintenance cycle; ordinary
-  use leaves no permanent per-operation metadata residue.
+- **Every job is saved.** Minnow saves the plan, then advances it in small steps with checkpoints.
+  A dead tab loses at most one step, not the whole job.
+- **Cancellation and publication cannot both win.** Whichever finishes first decides the outcome.
+- **Cleanup keeps anything still in use.** The current version, open readers, live transactions,
+  and running compactions protect what they need. Each deletion checks again before it happens.
+  Finished transactions and jobs are removed once nothing refers to them, along with expired
+  reader records and abandoned temporary query files. Ordinary use does not leave one permanent
+  metadata record for every operation.
 - **Compaction has a write budget.** A rewrite that would cost more than a set multiple of the
   data it consolidates is refused up front, not discovered in the quota bill.
 
@@ -197,8 +195,8 @@ so your own tests can crash the engine on purpose too.
 
 ## What we don't claim
 
-- **Bounded memory is a goal, not a guarantee yet.** Projected columns still materialize in full
-  before accounting starts, and some join shapes can't spill. The budget catches whole classes of
+- **A memory budget is useful, but not a hard limit yet.** Some selected columns are still built
+  in full before accounting starts, and some joins cannot spill. The budget catches whole classes of
   blowups; it is not a hard cap on the heap.
 - **No big-dataset performance claims** until real browser measurements back them. The
   [benchmarks](/benchmarks) publish what has been measured, methodology included.

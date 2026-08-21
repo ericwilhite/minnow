@@ -7,14 +7,12 @@ description: A schema-aware query builder with inferred row types, shipped as it
 npm install @minnowdb/client
 ```
 
-`@minnowdb/client` is optional. SQL is Minnow's contract — the engine runs every statement on its
-own — and this package is one consumer of the primitives the engine publishes.
+`@minnowdb/client` is optional. The engine runs SQL on its own; this package adds a typed way to
+build the same queries.
 
-It ships separately for two reasons. It can move at its own pace without a version of the engine
-riding along; and building it only from
-[published primitives](/docs/reference/extending) is what proves those primitives are enough for
-anyone else to build a layer of their own. If the seam were incomplete, this package would be the
-first thing to break.
+It ships separately so it can move at its own pace without requiring an engine release. It uses
+only the [public plan-building API](/docs/reference/extending), which is also available to anyone
+building a client of their own.
 
 ## What you get
 
@@ -68,7 +66,7 @@ that database. It is the same `db` these pages describe.
   relevant commit.
 - **[Schema & migrations](/docs/schema)** — defining tables, constraints, and views. Part of
   `@minnowdb/core`, and usable without this package.
-- **[Extending Minnow](/docs/reference/extending)** — the primitives this package is built on, if
+- **[Extending Minnow](/docs/reference/extending)** — the public APIs this package is built on, if
   you'd rather build your own layer.
 
 ## It wraps either half of the worker pair

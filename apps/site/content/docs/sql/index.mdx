@@ -70,20 +70,21 @@ if (result.kind === "update") {
 }
 ```
 
-The kinds are `rows`, `create-table`, `create-trigger`, `drop-trigger`, `insert`, `update`, and
-`delete`. Write kinds carry `rowCount` and the published `version`; `returnedRows` appears only
-when the statement had a `RETURNING` clause.
+The kinds are `rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`,
+`add-column`, `drop-table`, `create-view`, `drop-view`, `create-trigger`, and `drop-trigger`.
+Row-writing kinds carry `rowCount` and the published `version`; `returnedRows` appears only when
+the statement had a `RETURNING` clause.
 
 ## Compiling once, running many times
 
 When the same statement runs in a loop, compile it once and skip even the plan-cache lookup:
 
 ```ts
-import { compileStatement } from "@minnowdb/core";
+import { bindStatementParameters, compileStatement } from "@minnowdb/core";
 
 const statement = compileStatement("INSERT INTO events (id, kind) VALUES (?, ?)");
 for (const event of batch) {
-  await db.runStatement(statement, { params: [event.id, event.kind] });
+  await db.runStatement(bindStatementParameters(statement, [event.id, event.kind]));
 }
 ```
 
@@ -105,19 +106,26 @@ await db.query(sql, { memoize: false });
 
 ## Multiple statements
 
-One call runs one statement. To make several writes land together — or fail together — use a
-[write scope](/docs/engine/transactions):
+One call runs one statement. To make several SQL statements land together — or fail together —
+open a transaction:
 
 ```ts
-await db.write(async (tx) => {
-  await tx.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [1, sku]);
-  await tx.execute("INSERT INTO shipments (sku, shipped_at) VALUES (?, ?)", [sku, new Date()]);
-});
+await db.execute("BEGIN");
+try {
+  await db.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [1, sku]);
+  await db.execute("INSERT INTO shipments (sku, shipped_at) VALUES (?, ?)", [sku, new Date()]);
+  await db.execute("COMMIT");
+} catch (error) {
+  await db.execute("ROLLBACK");
+  throw error;
+}
 ```
 
-`BEGIN` / `COMMIT` as SQL text are deliberately not supported: a transaction that a statement
-string can open is a transaction a lost reference can leave open forever. Scopes end when their
-callback does.
+Statements inside see earlier writes from the same transaction. `ROLLBACK` discards them all.
+Schema changes are refused inside a transaction, and one left untouched for 30 seconds rolls back
+automatically. When you are using the batch APIs instead of SQL, a
+[`write()` scope](/docs/engine/transactions#batch-write-scopes) gives you the same all-or-nothing
+result and ends with its callback.
 
 ## What the language covers
 
