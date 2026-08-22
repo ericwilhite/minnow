@@ -88,6 +88,8 @@ export interface ClientTransport {
   postMessage(message: unknown): void;
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
   addEventListener(type: "error" | "messageerror", listener: () => void): void;
+  removeEventListener?(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
+  removeEventListener?(type: "error" | "messageerror", listener: () => void): void;
   terminate?(): void;
 }
 
@@ -198,18 +200,21 @@ export class MinnowDatabaseClient {
   #fatal: Error | undefined;
   #closed = false;
   #onVisibilityChange: (() => void) | undefined;
+  readonly #onMessage = (event: MessageEvent<unknown>): void => {
+    this.#receive(event.data);
+  };
+  readonly #onError = (): void => {
+    this.#fail(new Error("The database worker failed; see the worker's own error output"));
+  };
+  readonly #onMessageError = (): void => {
+    this.#fail(new Error("A database worker message could not be deserialized"));
+  };
 
   constructor(transport: ClientTransport, options: MinnowDatabaseClientOptions = {}) {
     this.#transport = transport;
-    transport.addEventListener("message", (event: MessageEvent<unknown>) => {
-      this.#receive(event.data);
-    });
-    transport.addEventListener("error", () => {
-      this.#fail(new Error("The database worker failed; see the worker's own error output"));
-    });
-    transport.addEventListener("messageerror", () => {
-      this.#fail(new Error("A database worker message could not be deserialized"));
-    });
+    transport.addEventListener("message", this.#onMessage);
+    transport.addEventListener("error", this.#onError);
+    transport.addEventListener("messageerror", this.#onMessageError);
     const payload: DatabaseInitPayload = {
       store: options.store ?? { kind: "indexeddb", name: "minnow" },
       ...(options.databaseOptions === undefined ? {} : { options: options.databaseOptions }),
@@ -610,6 +615,9 @@ export class MinnowDatabaseClient {
       await this.#post("rpc-call", null, "dispose", []);
     } finally {
       this.#events.clear();
+      this.#transport.removeEventListener?.("message", this.#onMessage);
+      this.#transport.removeEventListener?.("error", this.#onError);
+      this.#transport.removeEventListener?.("messageerror", this.#onMessageError);
       if (options.terminateWorker === true) this.#transport.terminate?.();
     }
   }
@@ -618,6 +626,7 @@ export class MinnowDatabaseClient {
 
   /** @internal */
   async _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown> {
+    if (this.#closed) throw new Error("Database client is closed");
     return this.#post("rpc-call", handleId, method, args);
   }
 
@@ -681,6 +690,7 @@ export class MinnowDatabaseClient {
     this.#fatal = error;
     const pending = [...this.#pending.values()];
     this.#pending.clear();
+    this.#events.clear();
     for (const call of pending) call.reject(error);
   }
 }

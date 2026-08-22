@@ -10,6 +10,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MinnowDatabase, UniqueConstraintError } from "../engine/database.js";
+import type { TableRecord } from "./types.js";
 
 /**
  * The tail holds 16 chunks, so a fold lands on every 17th commit. Two folds are the minimum
@@ -25,10 +26,14 @@ interface Harness {
   name: string;
 }
 
-async function open(): Promise<Harness> {
+async function open(uniqueKeyCacheBytes?: number): Promise<Harness> {
   const indexedDB = new IDBFactory();
   const name = crypto.randomUUID();
-  const store = await IndexedDbBlockStore.open({ name, indexedDB });
+  const store = await IndexedDbBlockStore.open({
+    name,
+    indexedDB,
+    ...(uniqueKeyCacheBytes === undefined ? {} : { uniqueKeyCacheBytes }),
+  });
   const database = new MinnowDatabase(store, { rowsPerBlock: 512 });
   await database.createTable({
     name: "t",
@@ -129,6 +134,78 @@ async function foldState(
 }
 
 describe("unique-key base fold", () => {
+  it("rejects an invalid complete-membership cache budget", async () => {
+    await expect(
+      IndexedDbBlockStore.open({
+        name: crypto.randomUUID(),
+        indexedDB: new IDBFactory(),
+        uniqueKeyCacheBytes: -1,
+      }),
+    ).rejects.toThrow("Unique-key cache bytes");
+  });
+
+  it("keeps point writes correct with the complete-membership cache disabled", async () => {
+    const { store, database } = await open(0);
+    for (let id = 1; id <= FOLD_BATCHES; id += 1) await insert(database, [id]);
+    await expect(insert(database, [3])).rejects.toBeInstanceOf(UniqueConstraintError);
+    expect(await present(store, database, [1, 3, FOLD_BATCHES, FOLD_BATCHES + 1])).toEqual(
+      new Set([1, 3, FOLD_BATCHES]),
+    );
+    await database.close();
+    store.close();
+  });
+
+  it("never exceeds the resident unique-key budget and clears every cache on close", async () => {
+    const { store, database } = await open(1_024);
+    let populated = false;
+    let droppedAfterPopulation = false;
+    for (let id = 1; id <= 40; id += 1) {
+      await insert(database, [id]);
+      const state = store._residentStateForTests();
+      expect(state.uniqueKeyCacheBytes).toBeLessThanOrEqual(state.uniqueKeyCacheLimitBytes);
+      if (state.uniqueKeyCacheEntries > 0) populated = true;
+      if (populated && state.uniqueKeyCacheEntries === 0) droppedAfterPopulation = true;
+    }
+    expect(populated).toBe(true);
+    expect(droppedAfterPopulation).toBe(true);
+
+    await database.close();
+    const current = await store.getCurrentManifest();
+    if (current === undefined) throw new Error("Expected a current manifest");
+    await store.publishManifest({
+      expectedVersion: current.version,
+      blockIds: current.blockIds,
+      createdAt: "2026-08-21T00:00:00.000Z",
+    });
+    expect(store._residentStateForTests().manifestCacheBlockIds).toBeGreaterThan(0);
+    store.close();
+    expect(store._residentStateForTests()).toMatchObject({
+      tableNameCacheEntries: 0,
+      uniqueKeyCacheEntries: 0,
+      uniqueKeyCacheBytes: 0,
+      manifestCacheBlockIds: 0,
+    });
+  });
+
+  it("caps remembered table names instead of retaining every historical lookup", async () => {
+    const store = await IndexedDbBlockStore.open({
+      name: crypto.randomUUID(),
+      indexedDB: new IDBFactory(),
+    });
+    const records: TableRecord[] = Array.from({ length: 300 }, (_, index) => ({
+      id: `table-${String(index)}`,
+      name: `table_${String(index)}`,
+      columns: [{ id: "value", name: "value", type: "number", nullable: false }],
+      revision: 0,
+      createdAt: "2026-08-21T00:00:00.000Z",
+    }));
+    for (const record of records) await store.addTable(record);
+    for (const record of records) expect(await store.getTableByName(record.name)).toBeDefined();
+    expect(store._residentStateForTests().tableNameCacheEntries).toBe(256);
+    store.close();
+    expect(store._residentStateForTests().tableNameCacheEntries).toBe(0);
+  });
+
   it("keeps every token across repeated folds", async () => {
     const harness = await open();
     const { store, database } = harness;

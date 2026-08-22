@@ -118,6 +118,19 @@ async function seeded(store: MemoryBlockStore): Promise<MinnowDatabase> {
 }
 
 describe("live queries", () => {
+  it("does not register a subscription that finishes opening after the set closes", async () => {
+    const race = createRaceHost();
+    const live = new LiveQuerySet(race.host);
+    const block = race.blockNextExecute("A");
+    const changes: QueryResult[] = [];
+    const subscribing = live.subscribe("A", { onChange: (result) => changes.push(result) });
+    await block.started;
+    live.close();
+    block.release();
+    await expect(subscribing).rejects.toThrow("Live query set is closed");
+    expect(changes).toEqual([]);
+  });
+
   it("re-executes on dependent commits and skips unrelated and content-preserving ones", async () => {
     const store = new MemoryBlockStore();
     const database = await seeded(store);

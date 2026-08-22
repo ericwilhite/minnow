@@ -201,14 +201,20 @@ export class LiveQuerySet {
     return { ...this.#stats };
   }
 
+  #throwIfClosed(): void {
+    if (this.#closed) throw new Error("Live query set is closed");
+  }
+
   /** Registers a query, delivers its initial result, and re-runs it when its tables change. */
   async subscribe(
     query: LiveQueryInput,
     options: LiveQuerySubscribeOptions,
   ): Promise<LiveQuerySubscription> {
-    if (this.#closed) throw new Error("Live query set is closed");
+    this.#throwIfClosed();
     const dependencies = await this.#host.dependencyTableIds(query);
+    this.#throwIfClosed();
     const version = await this.#host.currentVersion();
+    this.#throwIfClosed();
     const subscription: Subscription = {
       query,
       dependencies,
@@ -221,6 +227,9 @@ export class LiveQuerySet {
       this.#lastSeenVersion = version;
     }
     const result = await this.#host.execute(query);
+    // close() can run while any host call above is suspended. Never register or notify a
+    // subscription after its parent set has completed.
+    this.#throwIfClosed();
     subscription.digest = digestResult(result);
     this.#subscriptions.add(subscription);
     try {

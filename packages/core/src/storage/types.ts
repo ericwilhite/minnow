@@ -25,6 +25,12 @@ export interface ManifestSummary {
   changedTableIds?: string[];
   /** A pruned descriptor remains readable for commit reconciliation but cannot be pinned. */
   prunedAt?: string;
+  /**
+   * Commit-local maintenance hints, not persisted in manifest history. A ready full-text
+   * column reports its durable delta-tail length so the committing engine can rebuild before
+   * metadata grows with every later commit, even when nobody searches the column again.
+   */
+  ftsDeltaCounts?: Array<{ tableId: string; columnId: string; count: number }>;
 }
 
 export interface Manifest extends ManifestSummary {

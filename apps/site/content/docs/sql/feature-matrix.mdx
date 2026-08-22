@@ -36,9 +36,10 @@ There are no array, `UUID`, or `INTERVAL` column types. Each would need an encod
 order, and a set of operators that the columnar format would carry forever, for a gain an
 application can get today by storing text and parsing it. There is no `JSON` column type either,
 for the same reason — but the SQL/JSON functions read documents out of ordinary text columns, the
-way SQLite does: `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON_ARRAY`, and the
-`IS JSON` check. `JSON_TABLE` is missing because it produces rows rather than a value, which
-the executors have no operator for.
+way SQLite does: `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON_ARRAY`,
+`JSON_ARRAYAGG`, and the `IS JSON` check. JSON constructors and `JSON_ARRAYAGG` use SQL's default
+`NULL ON NULL` behavior and return JSON text. `JSON_TABLE` is missing because it produces rows
+rather than a value, which the executors have no operator for.
 
 `FOREIGN KEY` supports one column pointing to another table's unique key. Every write path checks
 the parent exists. `ON DELETE` supports `RESTRICT`, `CASCADE`, and `SET NULL`, and those follow-up

@@ -12,11 +12,12 @@ const store = await IndexedDbBlockStore.open({
 });
 ```
 
-| Option       | Default     | Effect                                                                            |
-| ------------ | ----------- | --------------------------------------------------------------------------------- |
-| `name`       | —           | The IndexedDB database name. Two stores with the same name are the same database. |
-| `durability` | `"relaxed"` | `"strict"` flushes to disk per commit.                                            |
-| `indexedDB`  | the global  | An `IDBFactory` to use instead, for tests.                                        |
+| Option                | Default     | Effect                                                                                                               |
+| --------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------- |
+| `name`                | —           | The IndexedDB database name. Two stores with the same name are the same database.                                    |
+| `durability`          | `"relaxed"` | `"strict"` flushes to disk per commit.                                                                               |
+| `uniqueKeyCacheBytes` | 8 MiB       | Maximum modeled memory for the optional complete key-membership cache. `0` disables it; point probes remain correct. |
+| `indexedDB`           | the global  | An `IDBFactory` to use instead, for tests.                                                                           |
 
 ## Durability
 
@@ -56,6 +57,15 @@ values keyed by block id; everything else is small structured records.
 Manifests are stored as a checkpoint every 32 commits with deltas in between, so publishing a
 commit writes work proportional to the blocks that changed rather than to the database's total
 size. Reads resolve a version by walking back to the nearest checkpoint.
+
+Unique keys use a hash-partitioned base plus a bounded tail of recent changes. Small and bulk-loaded
+tables can keep complete membership in memory to avoid repeated reads; the cache drops itself at
+`uniqueKeyCacheBytes`, after which writes probe only the relevant persistent partitions. The limit
+also works in a worker store descriptor:
+
+```ts
+{ store: { kind: "indexeddb", name: "shop", uniqueKeyCacheBytes: 4 * 1024 * 1024 } }
+```
 
 ## Multiple tabs
 

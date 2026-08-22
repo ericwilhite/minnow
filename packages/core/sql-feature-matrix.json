@@ -1122,13 +1122,15 @@
       "id": "json.object",
       "feature": "T811",
       "status": "supported",
-      "example": "SELECT JSON_OBJECT('a' VALUE 1) AS document"
+      "example": "SELECT JSON_OBJECT('a' VALUE 1, 'missing' VALUE NULL) AS document",
+      "notes": "The omitted clauses are NULL ON NULL and WITHOUT UNIQUE KEYS: a SQL NULL becomes a JSON null and duplicate keys remain in the JSON text. Scalar keys are converted to text; a NULL key is rejected. The explicit null-handling and unique-key clauses are not supported. Constructors return JSON text because Minnow has no JSON storage type."
     },
     {
       "id": "json.array",
       "feature": "T812",
       "status": "supported",
-      "example": "SELECT JSON_ARRAY(1, 2) AS document"
+      "example": "SELECT JSON_ARRAY(1, NULL, 2) AS document",
+      "notes": "The omitted null-handling clause is NULL ON NULL, so a SQL NULL becomes a JSON null. The explicit NULL/ABSENT ON NULL clause is not supported. Constructors return JSON text because Minnow has no JSON storage type."
     },
     {
       "id": "ddl.create-table-if-not-exists",
@@ -1213,10 +1215,9 @@
     {
       "id": "aggregate.json",
       "feature": "T826",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT JSON_ARRAYAGG(region) AS regions FROM rows",
-      "error": "Unsupported function: JSON_ARRAYAGG",
-      "notes": "Aggregating into a document needs the same ordered accumulator LISTAGG does; JSON_ARRAY builds one from scalars today."
+      "notes": "Accepts one value expression, including DISTINCT. The omitted null-handling clause is NULL ON NULL, an empty input returns NULL, and the result is JSON text. FILTER, window use, an aggregate-local ORDER BY, and explicit NULL/ABSENT ON NULL clauses are not supported. Without an aggregate-local ORDER BY, member order is unspecified."
     },
     {
       "id": "type.array",

@@ -37,4 +37,12 @@ describe("artifact cache", () => {
     const cache = new ArtifactCache(8);
     expect(() => cache.put("bad", null, 1.5)).toThrow(RangeError);
   });
+
+  it("releases retained entries on clear without erasing lifetime counters", () => {
+    const cache = new ArtifactCache(8);
+    cache.put("a", 1, 3);
+    expect(cache.get("a")).toBe(1);
+    cache.clear();
+    expect(cache.stats()).toMatchObject({ usedBytes: 0, entries: 0, hits: 1 });
+  });
 });

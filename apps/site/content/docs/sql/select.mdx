@@ -68,8 +68,12 @@ HAVING SUM(i.line_total) > 10000
 ORDER BY revenue DESC
 ```
 
-`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, and `COUNT(DISTINCT …)` are available, with `FILTER (WHERE …)`
-for conditional aggregates. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`, and `CUBE`.
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `JSON_ARRAYAGG`, and `COUNT(DISTINCT …)` are available.
+The numeric and counting aggregates accept `FILTER (WHERE …)` for conditional aggregation.
+`JSON_ARRAYAGG(value)` returns JSON text, keeps SQL nulls as JSON nulls by default, and returns
+SQL `NULL` for an empty input. Filter its input in `WHERE`; aggregate-local ordering and
+`FILTER` are not supported for this aggregate. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`,
+and `CUBE`.
 
 `DISTINCT` is per aggregate, not per query: each one keeps its own set of values, so a select can
 carry several of them beside ordinary aggregates, inside expressions, and in `HAVING` —

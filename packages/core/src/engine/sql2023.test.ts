@@ -564,6 +564,28 @@ describe("E151 statement transactions", () => {
     await database.execute("ROLLBACK");
   });
 
+  it("rolls back an open transaction and releases resident state when the database closes", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await database.execute("INSERT INTO t (id, n) VALUES (0, 5)");
+    await database.query("SELECT * FROM t");
+    expect(database.bufferPoolStats().usedBytes).toBeGreaterThan(0);
+    await database.execute("BEGIN");
+    await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
+    const closing = database.close();
+    expect(database.close()).toBe(closing);
+    await closing;
+    expect(database.bufferPoolStats()).toMatchObject({ usedBytes: 0, entries: 0 });
+
+    const reopened = new MinnowDatabase(store);
+    expect((await reopened.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 1 }]);
+    expect((await store.listTransactions()).every((record) => record.status !== "active")).toBe(
+      true,
+    );
+    await reopened.close();
+  });
+
   it("stays open while its statements are slow, however long they take", async () => {
     /** A store whose reads are slow, so one statement outlives several idle sweeps. */
     class SlowStore extends MemoryBlockStore {
@@ -983,12 +1005,50 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     expect(json("SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 'two') AS v")).toBe('{"a":1,"b":"two"}');
     expect(json("SELECT JSON_OBJECT(KEY 'a' VALUE 1) AS v")).toBe('{"a":1}');
     expect(json("SELECT JSON_OBJECT('a', 1) AS v")).toBe('{"a":1}');
-    // NULL members are absent, which is the standard's default for objects.
-    expect(json("SELECT JSON_OBJECT('a', 1, 'b', NULL) AS v")).toBe('{"a":1}');
-    expect(json("SELECT JSON_ARRAY(1, 'two', TRUE, NULL) AS v")).toBe('[1,"two",true]');
+    // With no null-handling clause, SQL's default is NULL ON NULL for both constructors.
+    expect(json("SELECT JSON_OBJECT('a', 1, 'b', NULL) AS v")).toBe('{"a":1,"b":null}');
+    // WITHOUT UNIQUE KEYS is the default, so the JSON text retains duplicate names. Keys are
+    // scalar expressions converted to text; special JavaScript property names stay ordinary.
+    expect(json("SELECT JSON_OBJECT('a', 1, 'a', 2) AS v")).toBe('{"a":1,"a":2}');
+    expect(json("SELECT JSON_OBJECT(7, 'seven', '__proto__', TRUE) AS v")).toBe(
+      '{"7":"seven","__proto__":true}',
+    );
+    expect(() => run("SELECT JSON_OBJECT(NULL, 1) AS v")).toThrow("keys cannot be NULL");
+    expect(json("SELECT JSON_ARRAY(1, 'two', TRUE, NULL) AS v")).toBe('[1,"two",true,null]');
     expect(json("SELECT JSON_ARRAY() AS v")).toBe("[]");
     expect(json("SELECT JSON_OBJECT('n' VALUE JSON_VALUE(doc, '$.name')) AS v FROM docs")).toBe(
       '{"n":"ada"}',
+    );
+  });
+
+  it("aggregates values into JSON arrays with SQL null semantics (T826)", () => {
+    expect(value("SELECT JSON_ARRAYAGG(region) AS v FROM rows")).toBe(
+      '["west","west","east",null]',
+    );
+    expect(value("SELECT JSON_ARRAYAGG(DISTINCT region) AS v FROM rows")).toBe(
+      '["west","east",null]',
+    );
+    expect(value("SELECT JSON_ARRAYAGG(region) AS v FROM rows WHERE amount < 0")).toBeNull();
+    expect(
+      run(
+        "SELECT region, JSON_ARRAYAGG(amount) AS amounts FROM rows GROUP BY region ORDER BY region",
+      ),
+    ).toEqual([
+      { region: null, amounts: "[8]" },
+      { region: "east", amounts: "[3]" },
+      { region: "west", amounts: "[10,6]" },
+    ]);
+  });
+
+  it("rejects JSON_ARRAYAGG extensions that are not implemented", () => {
+    expect(() => compileQuery("SELECT JSON_ARRAYAGG(*) FROM rows")).toThrow(
+      "requires a scalar value expression",
+    );
+    expect(() =>
+      compileQuery("SELECT JSON_ARRAYAGG(region) FILTER (WHERE amount > 5) FROM rows"),
+    ).toThrow("filter rows in WHERE");
+    expect(() => compileQuery("SELECT JSON_ARRAYAGG(region) OVER () FROM rows")).toThrow(
+      "window use is not supported",
     );
   });
 

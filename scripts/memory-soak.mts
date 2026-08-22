@@ -164,6 +164,7 @@ const WORKLOADS: readonly Workload[] = [
         }
         await database.insertBatch("t", [{ id: round * 100 + index, v: index }]);
         await database.query("SELECT COUNT(*) AS n FROM t");
+        await database.close();
       }
     },
   },
@@ -207,5 +208,6 @@ for (const workload of selected) {
       `     heap after gc per round (MB): ${samples.map(megabytes).join(" ")}\n` +
       `     post-warmup floor ${megabytes(floor)} MB, last ${megabytes(last)} MB, limit ${megabytes(limit)} MB`,
   );
+  await database.close();
 }
 process.exit(failed ? 1 : 0);

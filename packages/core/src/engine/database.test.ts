@@ -1414,6 +1414,37 @@ for (const implementation of implementations()) {
       store.close();
     });
 
+    it("folds a full-text delta tail after bounded writes even without another search", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });
+      await database.createTable({
+        name: "articles",
+        columns: [{ name: "title", type: "string" }],
+      });
+      await database.insertBatch("articles", [{ title: "seed document" }]);
+      await database.buildFtsIndex("articles", "title");
+
+      // One delta record per commit used to grow forever unless a later MATCH observed the
+      // tail. Cross the fold threshold without issuing any search at all.
+      for (let commit = 0; commit <= 16; commit += 1) {
+        await database.insertBatch("articles", [{ title: `later document ${String(commit)}` }]);
+      }
+      // close() joins an already-scheduled rebuild, making the persistent shape deterministic.
+      await database.close();
+      const table = (await store.listTables())[0];
+      const column = table?.columns[0];
+      if (table === undefined || column === undefined) throw new Error("FTS table is missing");
+      const version = (await store.getCurrentManifestVersion()) ?? -1;
+      const candidates = await store.readFtsCandidates(
+        table.id,
+        column.id,
+        [{ term: "later", prefix: false }],
+        version,
+      );
+      expect(candidates.deltaChunkCount).toBeLessThanOrEqual(16);
+      store.close();
+    });
+
     it("invalidates the full-text index on keyed mutations and stays correct via scan", async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { rowsPerBlock: 2, compression: "raw" });

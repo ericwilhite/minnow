@@ -70,6 +70,11 @@ To build one explicitly, before a user's first search rather than during it:
 await db.buildFtsIndex("products", "name");
 ```
 
+Later inserts land as small index deltas so commits stay proportional to the rows they add. When
+the tail exceeds 16 delta-bearing commits, the committing engine schedules a rebuild even if nobody
+searches the column again. The persistent tail and the work of the next search therefore do not
+grow with an all-day write session.
+
 <Callout title="Append-only columns only">
   A full-text index can only cover a table that has not been updated or deleted from:
 
@@ -95,5 +100,6 @@ here is one a caller can predict and pre-process around.
 const db = new MinnowDatabase(store, { ftsAutoIndexRows: 20_000 });
 ```
 
-Raise it when tables are small and searches rare; lower it to zero to disable background building
-entirely and manage indexes yourself.
+Raise it when tables are small and searches rare. Set it to `0` to build on the first search at
+any table size; set it above the largest expected table to keep searches scan-only and manage
+indexes yourself.

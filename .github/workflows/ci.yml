@@ -50,6 +50,21 @@ jobs:
           path: coverage/
           retention-days: 14
 
+  memory:
+    name: Heap plateau
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Forced-GC samples across repeated queries, writes, live subscriptions, and database
+      # lifecycles. Caches may warm once; a continuing post-warmup climb fails the merge gate.
+      - run: npm run soak:memory
+
   browser:
     name: Real browsers
     runs-on: ubuntu-latest

@@ -67,6 +67,10 @@ machines: https://minnowdb.com/llms.txt
 - `UPDATE` and `DELETE` require a table with a `PRIMARY KEY`. A table without one can only be
   appended to. Give a table a key if its rows will ever be edited.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
+- On teardown, `await db.close()` before `store.close()` for a direct engine. For a worker,
+  `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
+  This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
+  releases reader leases, and drops resident caches.
 - For anything interactive, run the engine in a worker:
   `new MinnowDatabaseClient(new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }), { store: { kind: "indexeddb", name: "app-db" } })`,
   or `{ kind: "opfs", name: "app-db" }` for the OPFS store,
@@ -77,8 +81,8 @@ machines: https://minnowdb.com/llms.txt
 - `db.explain(sql)` returns the optimized plan as text.
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form. It
   lists every supported and rejected form with an example.
-- Not supported, and what to write instead: `LATERAL` (rewrite as a join), `LISTAGG` and
-  `JSON_ARRAYAGG` (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
+- Not supported, and what to write instead: `LATERAL` (rewrite as a join), `LISTAGG`
+  (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
   (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
   `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
   `SET TRANSACTION`, correlated `NOT IN` (use `NOT EXISTS`), and correlated subqueries whose

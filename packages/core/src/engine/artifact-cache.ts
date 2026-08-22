@@ -65,6 +65,12 @@ export class ArtifactCache {
     }
   }
 
+  /** Releases every retained payload while preserving lifetime counters for final diagnostics. */
+  clear(): void {
+    this.#entries.clear();
+    this.#usedBytes = 0;
+  }
+
   stats(): ArtifactCacheStats {
     return {
       limitBytes: this.#limitBytes,

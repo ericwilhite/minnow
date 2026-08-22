@@ -61,6 +61,38 @@ describe("OPFS write-ahead log crash shapes", () => {
     reopened.close();
   });
 
+  it("bounds mutation deduplication and releases connection state on close", async () => {
+    const shim = new MemoryOpfs();
+    const leader = await OpfsBlockStore.open({ name: "bounded-rpc", root: shim.root });
+    const follower = await OpfsBlockStore.open({
+      name: "bounded-rpc",
+      root: shim.root,
+      rpcTimeoutMs: 200,
+    });
+    expect(leader._isLeaderForTests()).toBe(true);
+    for (let index = 0; index < 530; index += 1) {
+      await follower.addTable(table(`bounded-${String(index)}`));
+      expect(leader._residentStateForTests().dedupeEntries).toBeLessThanOrEqual(512);
+    }
+    expect(leader._residentStateForTests()).toMatchObject({
+      answerChannels: 1,
+      dedupeEntries: 512,
+      pendingRequests: 0,
+    });
+
+    follower.close();
+    leader.close();
+    expect(leader._residentStateForTests()).toMatchObject({
+      dedupeEntries: 0,
+      pendingRequests: 0,
+      closed: true,
+    });
+    await waitFor(
+      () => leader._residentStateForTests().answerChannels === 0,
+      "leader answer channels to close",
+    );
+  });
+
   it("checkpoints into alternating slots and resets the WAL", async () => {
     const shim = new MemoryOpfs();
     const store = await OpfsBlockStore.open({ name: "db", root: shim.root, checkpointEntries: 8 });

@@ -107,26 +107,33 @@ export function jsonValueOf(value: unknown): unknown {
 }
 
 /**
- * JSON_ARRAY(v, ...) and JSON_OBJECT(k, v, ...) (T811/T812). Both skip NULL members, which is
- * the standard's default (ABSENT ON NULL for objects, NULL ON NULL for arrays is the other
- * spelling), and both return JSON text.
+ * JSON_ARRAY(v, ...) and JSON_OBJECT(k, v, ...) (T811/T812). The omitted null-handling clause is
+ * `NULL ON NULL`: SQL NULL becomes a JSON null. `ABSENT ON NULL` is a separate spelling rather
+ * than the default. Both constructors return JSON text because Minnow has no JSON storage type.
  */
 export function jsonConstructor(
   name: "JSON_ARRAY" | "JSON_OBJECT",
   values: readonly unknown[],
 ): string {
   if (name === "JSON_ARRAY") {
-    return JSON.stringify(
-      values.filter((value) => value !== null && value !== undefined).map(jsonValueOf),
-    );
+    return JSON.stringify(values.map((value) => jsonValueOf(value ?? null)));
   }
-  const entries: Record<string, unknown> = {};
+  const members: string[] = [];
   for (let index = 0; index + 1 < values.length; index += 2) {
-    const key = values[index];
-    if (typeof key !== "string") throw new TypeError("JSON_OBJECT keys must be strings");
+    const rawKey = values[index];
+    if (rawKey === null || rawKey === undefined) {
+      throw new TypeError("JSON_OBJECT keys cannot be NULL");
+    }
+    let key: string;
+    if (rawKey instanceof Date) key = rawKey.toISOString();
+    else if (typeof rawKey === "string") key = rawKey;
+    else if (typeof rawKey === "number" || typeof rawKey === "boolean") key = String(rawKey);
+    else throw new TypeError("JSON_OBJECT keys must be scalar values");
     const member = values[index + 1];
-    if (member === null || member === undefined) continue;
-    entries[key] = jsonValueOf(member);
+    // Build JSON text directly. WITHOUT UNIQUE KEYS is the default, so duplicate names must be
+    // preserved; assigning through a JavaScript object would collapse them and mishandle
+    // special names such as "__proto__".
+    members.push(`${JSON.stringify(key)}:${JSON.stringify(jsonValueOf(member ?? null))}`);
   }
-  return JSON.stringify(entries);
+  return `{${members.join(",")}}`;
 }

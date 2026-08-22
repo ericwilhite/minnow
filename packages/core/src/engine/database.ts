@@ -996,6 +996,8 @@ export interface SnapshotImportOptions {
 }
 
 export class MinnowDatabase {
+  #closed = false;
+  #closePromise: Promise<void> | undefined;
   readonly #transactions: TransactionManager;
   /**
    * How long a statement-level transaction may sit untouched before it rolls itself back. The
@@ -1055,9 +1057,9 @@ export class MinnowDatabase {
   /** The garbage-collection step in flight, so steps run one at a time: see #serializedCollectionStep. */
   #collectionSteps: Promise<unknown> = Promise.resolve();
   /** One background build attempt per (table, column) per session; misses just stay scans. */
-  readonly #ftsBuildsInFlight = new Set<string>();
+  readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
   /** Tables with a fire-and-forget compaction step already running. */
-  readonly #autoCompactionsInFlight = new Set<string>();
+  readonly #autoCompactionsInFlight = new Map<string, Promise<void>>();
   /** Tables whose maintenance threshold was observed again while their fold was still running. */
   readonly #autoCompactionsRequested = new Set<string>();
   /** Changed tables awaiting the debounced check that closes a write burst. */
@@ -1073,6 +1075,8 @@ export class MinnowDatabase {
   readonly #compactionSteps = new Map<string, Promise<unknown>>();
   /** The simple writes in flight, chained so they commit one after another: see #runWrite. */
   #writeChain: Promise<unknown> = Promise.resolve();
+  /** The complete automatic collection loop, retained so close() can join it before the store. */
+  #autoCollectionTask: Promise<void> | undefined;
   /**
    * SQL text to optimized plan, LRU by insertion order. Compiled plans are never mutated after
    * optimization — subquery resolution and CTE expansion clone before rewriting and join
@@ -1140,6 +1144,70 @@ export class MinnowDatabase {
       now: this.#now,
       createId: this.#createId,
     });
+  }
+
+  /**
+   * Stops timers and background scheduling, rolls back an abandoned statement transaction,
+   * closes live-query resources, releases the engine's reader lease, and drops resident caches.
+   * The injected block store remains caller-owned and must be closed separately.
+   */
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    this.#closed = true;
+    const closing = this.#closeResources();
+    this.#closePromise = closing;
+    return closing;
+  }
+
+  async #closeResources(): Promise<void> {
+    if (this.#idleCompactionTimer !== undefined) {
+      clearTimeout(this.#idleCompactionTimer);
+      this.#idleCompactionTimer = undefined;
+    }
+    if (this.#idleCollectionTimer !== undefined) {
+      clearTimeout(this.#idleCollectionTimer);
+      this.#idleCollectionTimer = undefined;
+    }
+
+    const open = this.#openTransaction;
+    this.#openTransaction = undefined;
+    if (open !== undefined) {
+      clearInterval(open.timer);
+      open.settle("rollback");
+    }
+
+    for (const set of [...this.#liveSets]) set.close();
+    this.#liveSets.clear();
+
+    // No new background task can start after #closed flips. Join the tasks that already own
+    // store work before releasing leases or allowing the caller to close the injected store.
+    await Promise.allSettled([
+      ...this.#autoCompactionsInFlight.values(),
+      ...this.#ftsBuildsInFlight.values(),
+      ...(this.#autoCollectionTask === undefined ? [] : [this.#autoCollectionTask]),
+    ]);
+
+    // A move or renewal owns the lease while suspended. Let it settle before detaching the
+    // final entry, otherwise it could install a fresh persistent lease after close returned.
+    await Promise.allSettled(
+      [this.#sharedLeaseMove, this.#sharedLeaseRenewal].filter(
+        (pending): pending is Promise<void> => pending !== undefined,
+      ),
+    );
+    const shared = this.#sharedLease;
+    this.#sharedLease = undefined;
+    if (shared?.refCount === 0) await shared.lease.release().catch(() => undefined);
+    if (open !== undefined) await open.finished.catch(() => undefined);
+
+    this.#planCache.clear();
+    this.#catalogStateCache.clear();
+    this.#liveProofContexts.clear();
+    this.#gzipVerdicts.clear();
+    this.#autoCompactionsRequested.clear();
+    this.#idleCompactionTableIds.clear();
+    this.#autoCompactionBackoff.clear();
+    this.#commitsSinceCompactionCheck.clear();
+    this.#artifactCache.clear();
   }
 
   async createTable(input: CreateTableInput): Promise<void> {
@@ -3150,6 +3218,7 @@ export class MinnowDatabase {
    * refresh but never produce a stale result. Subscriptions retain a result digest, not rows.
    */
   liveQueries(options: LiveQuerySetOptions = {}): LiveQuerySet {
+    if (this.#closed) throw new Error("Database is closed");
     const compileLiveQuery = (query: LiveQueryInput): CompiledQuery => {
       if (typeof query === "string") return this.#compileCached(query);
       if (query.kind === "typed-query") return query.plan;
@@ -3400,6 +3469,7 @@ export class MinnowDatabase {
    * one, so a table that cannot be compacted today costs one attempt, not one per query.
    */
   #maybeScheduleAutoCompaction(table: TableRecord, segments: readonly SegmentRecord[]): void {
+    if (this.#closed) return;
     if (!this.#autoCompact) return;
     if (this.#droppingTables.has(table.id)) return;
     if (!autoCompactionDue(segments)) return;
@@ -3411,8 +3481,7 @@ export class MinnowDatabase {
       this.#autoCompactionsRequested.add(table.id);
       return;
     }
-    this.#autoCompactionsInFlight.add(table.id);
-    void this.#runAutoCompaction(table)
+    const run = this.#runAutoCompaction(table)
       .then((folded) => {
         if (folded) this.#autoCompactionBackoff.delete(table.id);
         else {
@@ -3432,11 +3501,15 @@ export class MinnowDatabase {
         );
       })
       .finally(() => {
-        this.#autoCompactionsInFlight.delete(table.id);
+        if (this.#autoCompactionsInFlight.get(table.id) === run) {
+          this.#autoCompactionsInFlight.delete(table.id);
+        }
         if (this.#autoCompactionsRequested.delete(table.id)) {
           void yieldToEventLoop().then(() => this.#checkAutoCompaction(table.id));
         }
       });
+    this.#autoCompactionsInFlight.set(table.id, run);
+    void run;
   }
 
   /**
@@ -3456,6 +3529,7 @@ export class MinnowDatabase {
     };
     let folded = false;
     for (;;) {
+      if (this.#closed) return folded;
       if (this.#droppingTables.has(table.id)) return folded;
       let progress = await this.compactTableStep(table.name, options);
       while (progress.result === null) {
@@ -3506,7 +3580,13 @@ export class MinnowDatabase {
    * toward their next write-path auto-compaction check.
    */
   #afterCommit(manifest: ManifestSummary): void {
+    if (this.#closed) return;
     this.#notifyLiveCommit();
+    for (const hint of manifest.ftsDeltaCounts ?? []) {
+      if (hint.count > FTS_FOLD_DELTA_CHUNKS) {
+        this.#scheduleFtsDeltaFold(hint.tableId, hint.columnId);
+      }
+    }
     this.#commitsSinceCollection += 1;
     const now = this.#now().getTime();
     if (
@@ -3538,6 +3618,7 @@ export class MinnowDatabase {
    * scan arrives to notice it.
    */
   #armIdleCompactionCheck(): void {
+    if (this.#closed) return;
     if (this.#idleCompactionTableIds.size === 0) return;
     if (this.#idleCompactionTimer !== undefined) clearTimeout(this.#idleCompactionTimer);
     const timer = setTimeout(() => {
@@ -7900,6 +7981,7 @@ export class MinnowDatabase {
    * write or a scan; a failed pass backs off for an interval of commits.
    */
   #maybeScheduleAutoCollection(): void {
+    if (this.#closed) return;
     if (!this.#autoCollect) return;
     if (this.#autoCollectionInFlight) {
       // A fold finishing or a quiet minute passing while a run is under way is a reason for
@@ -7913,7 +7995,7 @@ export class MinnowDatabase {
     this.#autoCollectionRequested = false;
     this.#commitsSinceCollection = 0;
     this.#lastCollectionAt = this.#now().getTime();
-    void this.#runAutoCollection()
+    const run = this.#runAutoCollection()
       .then(() => {
         this.#autoCollectionBackoffUntilCommit = 0;
       })
@@ -7921,6 +8003,7 @@ export class MinnowDatabase {
         this.#autoCollectionBackoffUntilCommit = AUTO_COLLECT_COMMIT_INTERVAL * 2;
       })
       .finally(() => {
+        if (this.#autoCollectionTask === run) this.#autoCollectionTask = undefined;
         this.#autoCollectionInFlight = false;
         if (this.#autoCollectionRequested) {
           this.#autoCollectionRequested = false;
@@ -7929,6 +8012,8 @@ export class MinnowDatabase {
           });
         }
       });
+    this.#autoCollectionTask = run;
+    void run;
   }
 
   /**
@@ -7938,6 +8023,7 @@ export class MinnowDatabase {
    * keeps a process alive.
    */
   #armIdleCollection(): void {
+    if (this.#closed) return;
     if (!this.#autoCollect) return;
     if (this.#idleCollectionTimer !== undefined) clearTimeout(this.#idleCollectionTimer);
     const timer = setTimeout(() => {
@@ -7953,6 +8039,7 @@ export class MinnowDatabase {
     // outran the passes between them — takes several. Keep passing while a pass still finds
     // something, up to a ceiling that keeps a pathological store from pinning the loop.
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
+      if (this.#closed) break;
       this.#releaseIdleSharedLease();
       let progress = await this.#collectGarbageStep(
         {
@@ -11155,16 +11242,49 @@ export class MinnowDatabase {
     segments: readonly SegmentRecord[],
     rebuild = false,
   ): void {
+    if (this.#closed) return;
     const rowCount = segments.reduce((total, segment) => total + segment.rowCount, 0);
     if (!rebuild && rowCount < this.#ftsAutoIndexRows) return;
     for (const column of columns) {
       const key = `${table.id}/${column.id}`;
       if (this.#ftsBuildsInFlight.has(key)) continue;
-      this.#ftsBuildsInFlight.add(key);
-      void this.buildFtsIndex(table.name, column.name)
+      const build = this.buildFtsIndex(table.name, column.name)
         .catch(() => undefined)
-        .finally(() => this.#ftsBuildsInFlight.delete(key));
+        .finally(() => {
+          if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
+        });
+      this.#ftsBuildsInFlight.set(key, build);
+      void build;
     }
+  }
+
+  /**
+   * A commit can grow a ready index's persistent delta tail without any later search to notice.
+   * Storage returns the authoritative tail length with the commit, so whichever tab crosses the
+   * bound rebuilds it. This keeps both the record count and per-read merge work bounded without
+   * adding a catalog probe to ordinary writes.
+   */
+  #scheduleFtsDeltaFold(tableId: string, columnId: string): void {
+    if (this.#closed) return;
+    const key = `${tableId}/${columnId}`;
+    if (this.#ftsBuildsInFlight.has(key)) return;
+    const build = (async () => {
+      const table = await this.store.getTable(tableId);
+      // Once scheduled, finish even if close() starts: close joins this promise specifically so
+      // the durable tail reaches its bound before the caller closes the store.
+      if (table === undefined) return;
+      const state = table.ftsColumns?.[columnId];
+      if (state === undefined || state.state === "invalid") return;
+      const column = table.columns.find((candidate) => candidate.id === columnId);
+      if (column === undefined) return;
+      await this.buildFtsIndex(table.name, column.name);
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
+      });
+    this.#ftsBuildsInFlight.set(key, build);
+    void build;
   }
 
   async #materializeColumnarTableAtSnapshot(

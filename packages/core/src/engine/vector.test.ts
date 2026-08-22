@@ -12,8 +12,10 @@ import { createColumnarTable, type QuerySpillStore } from "./vector.js";
 
 class TestSpillStore implements QuerySpillStore {
   readonly pages = new Map<string, Uint8Array>();
+  putCount = 0;
 
   async putPage(ownerId: string, runId: string, pageIndex: number, bytes: Uint8Array) {
+    this.putCount += 1;
     this.pages.set(`${ownerId}/${runId}/${String(pageIndex)}`, bytes.slice());
   }
 
@@ -174,6 +176,49 @@ describe("vector query execution", () => {
     expect(spill.pages.size).toBe(0);
     expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(100_000);
     prepared.close();
+  });
+
+  it("spills JSON_ARRAYAGG groups without dropping values or SQL nulls", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, id) => ({
+      bucket: id % 400,
+      value: id % 17 === 0 ? null : id,
+    }));
+    const tables = new Map([["rows", rows]]);
+    const plan = compileQuery(
+      "SELECT bucket, JSON_ARRAYAGG(value) AS values FROM rows GROUP BY bucket ORDER BY bucket",
+    );
+    const prepared = createPreparedQuery(plan, tables, {
+      executionMemoryBudgetBytes: 100_000,
+    });
+    expect(() => prepared.execute()).toThrow(QueryMemoryBudgetError);
+    const spill = new TestSpillStore();
+    expect(await prepared.executeAsync({ spillStore: spill, spillPageRows: 64 })).toEqual(
+      executeRowQuery(plan, tables),
+    );
+    expect(spill.putCount).toBeGreaterThan(0);
+    expect(spill.pages.size).toBe(0);
+    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(100_000);
+    prepared.close();
+  });
+
+  it("accounts every retained JSON_ARRAYAGG member against the query budget", () => {
+    const tables = new Map<string, DatabaseRow[]>([
+      ["rows", [{ value: "alpha" }, { value: null }, { value: "charlie" }]],
+    ]);
+    const plan = compileQuery("SELECT JSON_ARRAYAGG(value) AS values FROM rows");
+    const measured = createPreparedQuery(plan, tables, {});
+    const expected = measured.execute();
+    expect(expected.rows).toEqual([{ values: '["alpha",null,"charlie"]' }]);
+    const peak = measured.memoryUsage.peakBytes;
+    measured.close();
+
+    const exact = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: peak });
+    expect(exact.execute()).toEqual(expected);
+    exact.close();
+
+    const below = createPreparedQuery(plan, tables, { executionMemoryBudgetBytes: peak - 1 });
+    expect(() => below.execute()).toThrow(QueryMemoryBudgetError);
+    below.close();
   });
   it("accounts retained vectors, scan batches, results, and ordering at an exact budget", () => {
     const plan = compileQuery("SELECT id FROM rows ORDER BY id");

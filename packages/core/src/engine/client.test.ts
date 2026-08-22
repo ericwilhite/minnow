@@ -12,7 +12,11 @@ import { attachDatabaseWorker, exposeDatabase, type RpcScope } from "./worker-ho
  * An in-process stand-in for the worker boundary: two endpoints whose messages are
  * structured-cloned and delivered asynchronously in order, exactly like postMessage.
  */
-function createBoundary(): { clientSide: ClientTransport; workerSide: RpcScope } {
+function createBoundary(): {
+  clientSide: ClientTransport;
+  workerSide: RpcScope;
+  clientListenerCount(): number;
+} {
   const clientListeners: Array<(event: MessageEvent<unknown>) => void> = [];
   const workerListeners: Array<(event: MessageEvent<unknown>) => void> = [];
   let chain = Promise.resolve();
@@ -33,6 +37,11 @@ function createBoundary(): { clientSide: ClientTransport; workerSide: RpcScope }
       addEventListener: (type: string, listener: (event: MessageEvent<unknown>) => void) => {
         if (type === "message") clientListeners.push(listener);
       },
+      removeEventListener: (type: string, listener: (event: MessageEvent<unknown>) => void) => {
+        if (type !== "message") return;
+        const index = clientListeners.indexOf(listener);
+        if (index >= 0) clientListeners.splice(index, 1);
+      },
     },
     workerSide: {
       postMessage: (message) => {
@@ -42,6 +51,7 @@ function createBoundary(): { clientSide: ClientTransport; workerSide: RpcScope }
         workerListeners.push(listener);
       },
     },
+    clientListenerCount: () => clientListeners.length,
   };
 }
 
@@ -64,6 +74,23 @@ async function createPeopleTable(client: MinnowDatabaseClient): Promise<void> {
 }
 
 describe("MinnowDatabaseClient", () => {
+  it("detaches its transport listener when closed without terminating the worker", async () => {
+    const boundary = createBoundary();
+    exposeDatabase(new MinnowDatabase(new MemoryBlockStore()), boundary.workerSide);
+    const client = new MinnowDatabaseClient(boundary.clientSide);
+    await client.ready();
+    expect(boundary.clientListenerCount()).toBe(1);
+    await client.close();
+    expect(boundary.clientListenerCount()).toBe(0);
+    await expect(
+      (
+        client as unknown as {
+          _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;
+        }
+      )._invoke("closed", "stats", []),
+    ).rejects.toThrow("Database client is closed");
+  });
+
   it("replays a failed init's reason to calls that arrive after it", async () => {
     const { clientSide, workerSide } = createBoundary();
     attachDatabaseWorker(workerSide);
@@ -508,7 +535,14 @@ describe("MinnowDatabaseClient", () => {
 
   it("serves a caller-constructed database through exposeDatabase", async () => {
     const { clientSide, workerSide } = createBoundary();
-    const database = new MinnowDatabase(new MemoryBlockStore());
+    let closeCalls = 0;
+    class TrackingDatabase extends MinnowDatabase {
+      override close(): Promise<void> {
+        closeCalls += 1;
+        return super.close();
+      }
+    }
+    const database = new TrackingDatabase(new MemoryBlockStore());
     let disposed = false;
     exposeDatabase(database, workerSide, {
       onDispose: () => {
@@ -521,6 +555,7 @@ describe("MinnowDatabaseClient", () => {
     await client.insert("people", { id: 1, name: "Ada", joined: new Date() });
     expect((await client.readTable("people")).length).toBe(1);
     await client.close();
+    expect(closeCalls).toBe(1);
     expect(disposed).toBe(true);
     await expect(client.listTables()).rejects.toThrow(/closed/);
   });

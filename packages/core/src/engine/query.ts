@@ -14,7 +14,13 @@ import {
 import { QueryMemoryContext, type QueryMemoryUsage } from "./memory.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 import { stringArgument } from "./sql-semantics.js";
-import { jsonAtPath, jsonConstructor, jsonIsValid, parseJsonPath } from "./sql-json.js";
+import {
+  jsonAtPath,
+  jsonConstructor,
+  jsonIsValid,
+  jsonValueOf,
+  parseJsonPath,
+} from "./sql-json.js";
 import { optimizePlan } from "./optimizer.js";
 import {
   compareSqlValues as compareValues,
@@ -63,7 +69,7 @@ export interface QueryExecutionOptions {
 
 export type BinaryOperator = "+" | "-" | "*" | "/" | "%" | "||";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
-export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG";
 export type ScalarFunctionName =
   | "ROUND"
   | "COALESCE"
@@ -935,7 +941,14 @@ const clauseKeywords = new Set([
   "UNION",
   "RETURNING",
 ]);
-const aggregateNames = new Set<AggregateName>(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
+const aggregateNames = new Set<AggregateName>([
+  "COUNT",
+  "SUM",
+  "AVG",
+  "MIN",
+  "MAX",
+  "JSON_ARRAYAGG",
+]);
 /** Set functions the parser builds from COUNT/SUM rather than from their own accumulator. */
 const statisticalAggregates = new Set([
   "VAR_POP",
@@ -2087,6 +2100,7 @@ export function inferBlockSchema(
       return "number";
     }
     if (
+      expression.name === "JSON_ARRAYAGG" ||
       expression.name === "JSON_VALUE" ||
       expression.name === "JSON_QUERY" ||
       expression.name === "JSON_OBJECT" ||
@@ -3746,9 +3760,10 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         let values =
           argument.kind === "wildcard"
             ? group.map(() => 1)
-            : group
-                .map((row) => evaluate(argument, row))
-                .filter((value) => value !== null && value !== undefined);
+            : group.map((row) => evaluate(argument, row));
+        if (expression.name !== "JSON_ARRAYAGG") {
+          values = values.filter((value) => value !== null && value !== undefined);
+        }
         if (expression.distinct === true) {
           const seen = new Set<unknown>();
           values = values.filter((value) => {
@@ -3767,6 +3782,11 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
           return values.length === 0
             ? null
             : values.reduce<number>((sum, value) => sum + numeric(value), 0) / values.length;
+        if (expression.name === "JSON_ARRAYAGG") {
+          return values.length === 0
+            ? null
+            : JSON.stringify(values.map((value) => jsonValueOf(value ?? null)));
+        }
         if (expression.name === "MIN")
           return values.reduce<unknown>(
             (best, value) => (best === undefined || compareValues(value, best) < 0 ? value : best),
@@ -6823,6 +6843,9 @@ class Parser {
       }
       if (aggregateNames.has(name as AggregateName) && args.length !== 1)
         throw new TypeError(`${name} requires exactly one argument`);
+      if (name === "JSON_ARRAYAGG" && args[0]?.kind === "wildcard") {
+        throw new TypeError("JSON_ARRAYAGG requires a scalar value expression");
+      }
       if (name === "ROUND" && (args.length < 1 || args.length > 2))
         throw new TypeError("ROUND requires one or two arguments");
       if (name === "COALESCE" && args.length < 1)
@@ -6901,6 +6924,9 @@ class Parser {
         }
       }
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("FILTER")) {
+        if (name === "JSON_ARRAYAGG") {
+          throw new TypeError("JSON_ARRAYAGG FILTER is not supported; filter rows in WHERE");
+        }
         // FILTER (WHERE cond) desugars into the aggregate's argument: rows failing the filter
         // contribute NULL, which every aggregate skips — COUNT(*) counts a CASE over 1.
         this.#keyword("FILTER");
@@ -6922,6 +6948,9 @@ class Parser {
         });
       }
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("OVER")) {
+        if (name === "JSON_ARRAYAGG") {
+          throw new TypeError("JSON_ARRAYAGG window use is not supported");
+        }
         if (distinct) throw new TypeError("DISTINCT window aggregates are not supported");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();

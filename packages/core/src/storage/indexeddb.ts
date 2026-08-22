@@ -119,11 +119,21 @@ export interface IndexedDbBlockStoreOptions {
   name: string;
   durability?: IDBTransactionDurability;
   indexedDB?: IDBFactory;
+  /**
+   * Modeled bytes allowed for the optional complete unique-key membership cache. The cache
+   * accelerates bulk loads but is never required for correctness; `0` disables it. Defaults to
+   * 8 MiB so a table's row count cannot silently become an unbounded resident-memory cost.
+   */
+  uniqueKeyCacheBytes?: number;
 }
+
+const DEFAULT_UNIQUE_KEY_CACHE_BYTES = 8 * 1024 * 1024;
+const TABLE_NAME_CACHE_LIMIT = 256;
 
 export class IndexedDbBlockStore implements BlockStore {
   readonly #db: IDBDatabase;
   readonly #durability: IDBTransactionDurability;
+  readonly #uniqueKeyCacheBytes: number;
   /** Remembered name-to-id mappings; see getTableByName for why they need no invalidation. */
   readonly #tableIdsByName = new Map<string, string>();
   /**
@@ -150,12 +160,21 @@ export class IndexedDbBlockStore implements BlockStore {
    */
   #manifestCache: { version: number; blockIds: Set<string> } | undefined;
 
-  private constructor(db: IDBDatabase, durability: IDBTransactionDurability) {
+  private constructor(
+    db: IDBDatabase,
+    durability: IDBTransactionDurability,
+    uniqueKeyCacheBytes: number,
+  ) {
     this.#db = db;
     this.#durability = durability;
+    this.#uniqueKeyCacheBytes = uniqueKeyCacheBytes;
   }
 
   static async open(options: IndexedDbBlockStoreOptions): Promise<IndexedDbBlockStore> {
+    const uniqueKeyCacheBytes = options.uniqueKeyCacheBytes ?? DEFAULT_UNIQUE_KEY_CACHE_BYTES;
+    if (!Number.isSafeInteger(uniqueKeyCacheBytes) || uniqueKeyCacheBytes < 0) {
+      throw new RangeError("Unique-key cache bytes must be a non-negative whole number");
+    }
     const factory = options.indexedDB ?? getGlobalIndexedDb();
     if (factory === undefined) throw new Error("IndexedDB is unavailable");
     const request = factory.open(options.name, SCHEMA_VERSION);
@@ -176,7 +195,7 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     });
     const db = await requestResult(request);
-    return new IndexedDbBlockStore(db, options.durability ?? "relaxed");
+    return new IndexedDbBlockStore(db, options.durability ?? "relaxed", uniqueKeyCacheBytes);
   }
 
   async addBlock(id: string, bytes: Uint8Array): Promise<void> {
@@ -622,6 +641,8 @@ export class IndexedDbBlockStore implements BlockStore {
       if (cached !== undefined) {
         const record = asTableRecord(cached);
         if (record.name === name) {
+          this.#tableIdsByName.delete(name);
+          this.#tableIdsByName.set(name, rememberedId);
           await transactionDone(transaction);
           return record;
         }
@@ -635,7 +656,13 @@ export class IndexedDbBlockStore implements BlockStore {
     await transactionDone(transaction);
     if (value === undefined) return undefined;
     const record = asTableRecord(value);
-    if (record.name === name) this.#tableIdsByName.set(name, record.id);
+    if (record.name === name) {
+      this.#tableIdsByName.set(name, record.id);
+      if (this.#tableIdsByName.size > TABLE_NAME_CACHE_LIMIT) {
+        const oldest = this.#tableIdsByName.keys().next().value;
+        if (oldest !== undefined) this.#tableIdsByName.delete(oldest);
+      }
+    }
     return record;
   }
 
@@ -1692,6 +1719,7 @@ export class IndexedDbBlockStore implements BlockStore {
         catalog.put(structuredClone(invalidated), `${TABLE_ID_PREFIX}${tableId}`);
       }
     }
+    const ftsDeltaCounts: NonNullable<ManifestSummary["ftsDeltaCounts"]> = [];
     for (const ftsEntry of input.ftsChanges ?? []) {
       for (const column of ftsEntry.columns) {
         catalog.put(
@@ -1704,9 +1732,16 @@ export class IndexedDbBlockStore implements BlockStore {
         const indexKey = ftsChunkIndexKey(ftsEntry.tableId, column.columnId);
         const chunkIndex = (await requestResult(catalog.get(indexKey))) as
           { versions: number[] } | undefined;
-        catalog.put({ versions: [...(chunkIndex?.versions ?? []), manifest.version] }, indexKey);
+        const versions = [...(chunkIndex?.versions ?? []), manifest.version];
+        catalog.put({ versions }, indexKey);
+        ftsDeltaCounts.push({
+          tableId: ftsEntry.tableId,
+          columnId: column.columnId,
+          count: versions.length,
+        });
       }
     }
+    if (ftsDeltaCounts.length > 0) manifest.ftsDeltaCounts = ftsDeltaCounts;
     transactionStore.put(committed, committed.id);
     const settle = (): void => {
       if (uniqueKeyEntries.length > 1) {
@@ -1724,14 +1759,24 @@ export class IndexedDbBlockStore implements BlockStore {
           keyCache.chunks.push(keyCachePlan.chunk);
           keyCache.index = keyCachePlan.index;
           keyCache.version = manifest.version;
+          if (
+            uniqueKeyCacheRetainedBytes(keyCache.present, keyCache.chunks) >
+            this.#uniqueKeyCacheBytes
+          ) {
+            this.#uniqueKeyCache = undefined;
+          }
         } else if (keyCachePlan.action === "replace") {
-          this.#uniqueKeyCache = {
-            version: manifest.version,
-            tableId: uniqueKeyChanges.tableId,
-            present: keyCachePlan.present,
-            chunks: keyCachePlan.chunks,
-            index: keyCachePlan.index,
-          };
+          this.#uniqueKeyCache =
+            uniqueKeyCacheRetainedBytes(keyCachePlan.present, keyCachePlan.chunks) <=
+            this.#uniqueKeyCacheBytes
+              ? {
+                  version: manifest.version,
+                  tableId: uniqueKeyChanges.tableId,
+                  present: keyCachePlan.present,
+                  chunks: keyCachePlan.chunks,
+                  index: keyCachePlan.index,
+                }
+              : undefined;
         } else if (this.#uniqueKeyCache?.tableId === uniqueKeyChanges.tableId) {
           this.#uniqueKeyCache = undefined;
         } else if (this.#uniqueKeyCache !== undefined) {
@@ -2626,7 +2671,34 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   close(): void {
+    // close() is a memory boundary too: callers often retain their service graph after tearing
+    // down a database, so do not leave table names, a manifest, or unique-key membership hanging
+    // from the closed adapter.
+    this.#tableIdsByName.clear();
+    this.#uniqueKeyCache = undefined;
+    this.#manifestCache = undefined;
     this.#db.close();
+  }
+
+  /** Test-only counters that make the adapter's retained-state bounds regression-testable. */
+  _residentStateForTests(): {
+    tableNameCacheEntries: number;
+    uniqueKeyCacheEntries: number;
+    uniqueKeyCacheBytes: number;
+    uniqueKeyCacheLimitBytes: number;
+    manifestCacheBlockIds: number;
+  } {
+    const uniqueKeyCache = this.#uniqueKeyCache;
+    return {
+      tableNameCacheEntries: this.#tableIdsByName.size,
+      uniqueKeyCacheEntries: uniqueKeyCache?.present.size ?? 0,
+      uniqueKeyCacheBytes:
+        uniqueKeyCache === undefined
+          ? 0
+          : uniqueKeyCacheRetainedBytes(uniqueKeyCache.present, uniqueKeyCache.chunks),
+      uniqueKeyCacheLimitBytes: this.#uniqueKeyCacheBytes,
+      manifestCacheBlockIds: this.#manifestCache?.blockIds.size ?? 0,
+    };
   }
 
   #transaction(stores: string | string[], mode: IDBTransactionMode): IDBTransaction {
@@ -3627,6 +3699,28 @@ function replayChunks(chunks: readonly UniqueKeyChunk[]): Set<string> {
   const present = new Set<string>();
   for (const chunk of chunks) applyChunk(present, chunk);
   return present;
+}
+
+/**
+ * Conservative retained-size model for the optional complete-membership cache. Strings are the
+ * dominant payload; the fixed allowance covers Set buckets, array slots, and chunk objects.
+ * This is deliberately not the on-disk size — it models the JavaScript graph we keep alive.
+ */
+function uniqueKeyCacheRetainedBytes(
+  present: ReadonlySet<string>,
+  chunks: readonly UniqueKeyChunk[],
+): number {
+  let bytes = 256;
+  for (const token of present) bytes += 32 + token.length * 2;
+  for (const chunk of chunks) {
+    bytes += 64;
+    // Count the strings again even when an added token is also in `present`. Engines may share
+    // the string allocation, but a budget must not depend on that implementation detail; removed
+    // tokens are retained only by these arrays and can be arbitrarily long.
+    for (const token of chunk.addedTokens) bytes += 8 + token.length * 2;
+    for (const token of chunk.removedTokens) bytes += 8 + token.length * 2;
+  }
+  return bytes;
 }
 
 function asBasePartition(value: unknown): string[] {

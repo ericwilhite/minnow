@@ -34,7 +34,12 @@ import { deserializeSchema, serializeMigrationSteps, type WireSchema } from "./s
 
 export type StoreDescriptor =
   | { kind: "memory" }
-  | { kind: "indexeddb"; name: string; durability?: IDBTransactionDurability }
+  | {
+      kind: "indexeddb";
+      name: string;
+      durability?: IDBTransactionDurability;
+      uniqueKeyCacheBytes?: number;
+    }
   | { kind: "opfs"; name: string; durability?: "relaxed" | "strict" };
 
 /** The cloneable subset of MinnowDatabaseOptions; function-valued seams stay worker-side. */
@@ -565,6 +570,7 @@ class DatabaseRpcServer {
         // Dispose every handle even when one close fails; the client is already gone.
       }
     }
+    await this.database.close();
     await this.options.onDispose?.();
   }
 }
@@ -692,6 +698,9 @@ async function createStore(
   return IndexedDbBlockStore.open({
     name: descriptor.name,
     ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
+    ...(descriptor.uniqueKeyCacheBytes === undefined
+      ? {}
+      : { uniqueKeyCacheBytes: descriptor.uniqueKeyCacheBytes }),
     ...(options.indexedDB === undefined ? {} : { indexedDB: options.indexedDB }),
   });
 }

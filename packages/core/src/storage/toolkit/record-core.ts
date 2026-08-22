@@ -985,7 +985,17 @@ export class RecordCore {
     // Match the IndexedDB store's observable commit shape: the summary without blockIds.
     const { blockIds: _resolved, ...summary } = manifest;
     void _resolved;
-    return structuredClone(summary);
+    const ftsDeltaCounts = (plan.ftsChanges ?? []).flatMap((changes) =>
+      changes.columns.map((column) => ({
+        tableId: changes.tableId,
+        columnId: column.columnId,
+        count: this.#ftsDeltas.get(`${changes.tableId}/${column.columnId}`)?.size ?? 0,
+      })),
+    );
+    return structuredClone({
+      ...summary,
+      ...(ftsDeltaCounts.length === 0 ? {} : { ftsDeltaCounts }),
+    });
   }
 
   createLease(record: LeaseRecord): void {

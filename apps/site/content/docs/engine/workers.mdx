@@ -163,7 +163,8 @@ exposeDatabase(new MinnowDatabase(store, { compression: "gzip" }), self, {
 ```
 
 `exposeDatabase()` speaks the same protocol as the stock entry, so the main-thread code doesn't
-change. Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe
+change. On disposal it closes the engine before calling `onDispose`, so the hook only owns the
+injected store. Underneath both sits `@minnowdb/core/worker-protocol`: versioned, structured-clone-safe
 RPC where each handle answers a fixed list of methods — never arbitrary property access.
 
 > The worker changes where work runs, not the rules: the durable store stays authoritative, and

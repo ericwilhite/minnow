@@ -1109,6 +1109,7 @@ export class OpfsBlockStore implements BlockStore {
       pending.reject(new Error("This OPFS store connection is closed"));
     }
     this.#pending.clear();
+    this.#dedupe.clear();
     const leader = this.#leader;
     this.#leader = undefined;
     if (leader !== undefined) {
@@ -1136,12 +1137,28 @@ export class OpfsBlockStore implements BlockStore {
     return this.#instanceId;
   }
 
+  /** Test-only counters that pin the connection's bounded RPC state and close-time cleanup. */
+  _residentStateForTests(): {
+    answerChannels: number;
+    dedupeEntries: number;
+    pendingRequests: number;
+    closed: boolean;
+  } {
+    return {
+      answerChannels: this.#answerChannels.size,
+      dedupeEntries: this.#dedupe.size,
+      pendingRequests: this.#pending.size,
+      closed: this.#closed,
+    };
+  }
+
   /** Test-only: what tab death looks like — locks release, nothing flushes, no goodbyes. */
   _crashForTests(): void {
     this.#closed = true;
     if (this.#reacquireTimer !== undefined) clearTimeout(this.#reacquireTimer);
     for (const pending of this.#pending.values()) clearTimeout(pending.timer);
     this.#pending.clear();
+    this.#dedupe.clear();
     this.#leader?.crash();
     this.#leader = undefined;
     this.#closeChannels();

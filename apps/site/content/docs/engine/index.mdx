@@ -10,7 +10,8 @@ else — SQL, batch writes, the catalog, and maintenance.
 import { MinnowDatabase } from "@minnowdb/core";
 import { IndexedDbBlockStore } from "@minnowdb/core/storage";
 
-const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }), {
+const store = await IndexedDbBlockStore.open({ name: "shop" });
+const db = new MinnowDatabase(store, {
   compression: "gzip",
   bufferPoolBytes: 64 * 1024 * 1024,
 });
@@ -128,13 +129,15 @@ import { WriteConflictError } from "@minnowdb/core/storage";
 devtools editor underlines. `WriteConflictError` means a writer in another tab, or a write scope,
 committed first; the engine retries these itself up to `maxCommitRetries` before surfacing one.
 
-## Closing the storage
+## Closing
 
 ```ts
+await db.close();
 store.close();
 ```
 
-`MinnowDatabase` does not take ownership of the store, so close the store you passed to it when
-your application is done. A `MinnowDatabaseClient` does own its worker connection; call
-`await client.close()` there, with `{ terminateWorker: true }` if it should also terminate the
-worker.
+`db.close()` rolls back an open `BEGIN`, stops live-query polling and background scheduling,
+releases the engine's reader lease, and drops resident caches. `MinnowDatabase` does not take
+ownership of the injected store, so close it second. A `MinnowDatabaseClient` performs both steps
+when you call `await client.close()`; pass `{ terminateWorker: true }` when its dedicated worker
+has no other job.

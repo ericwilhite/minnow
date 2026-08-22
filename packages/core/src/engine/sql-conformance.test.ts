@@ -1228,6 +1228,14 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
   ["aggregate.variance", { oracles: ["sqlite"], reason: "SQLite has no VAR_POP" }],
   ["aggregate.stddev", { oracles: ["sqlite"], reason: "SQLite has no STDDEV_POP" }],
   ["aggregate.boolean", { oracles: ["sqlite"], reason: "SQLite has no EVERY" }],
+  [
+    "aggregate.json",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "SQLite spells it JSON_GROUP_ARRAY; PGlite returns a native JSON array while Minnow intentionally returns JSON text, and member order is unspecified without aggregate-local ORDER BY",
+    },
+  ],
   // --- SQL/JSON --------------------------------------------------------------------------
   ["json.value", { oracles: ["sqlite"], reason: "SQLite spells it json_extract" }],
   [

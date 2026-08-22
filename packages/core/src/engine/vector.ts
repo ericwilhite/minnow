@@ -22,6 +22,7 @@ import {
   quantifiedComparison,
   scalarFunctionValue,
 } from "./query.js";
+import { jsonValueOf } from "./sql-json.js";
 import {
   bm25DocumentScore,
   cachedQueryTerms,
@@ -373,6 +374,8 @@ interface GroupState {
   readonly counts: Float64Array;
   readonly sums: Float64Array;
   readonly values: Array<QueryValue | undefined>;
+  /** Present only when this plan has JSON_ARRAYAGG; member arrays remain lazy per slot. */
+  readonly lists?: Array<QueryValue[] | undefined>;
   readonly valueReservations: Array<QueryMemoryReservation | undefined>;
   readonly valueReservationBytes: Float64Array;
   /**
@@ -394,6 +397,7 @@ interface BoundPlan {
   readonly groupBy: readonly BoundExpression[];
   readonly groupIndexBySignature: ReadonlyMap<string, number>;
   readonly aggregates: readonly AggregateSpec[];
+  readonly hasListAggregate: boolean;
   readonly select: readonly BoundSelectItem[];
   readonly orderBy: ReadonlyArray<{
     outputName: string;
@@ -864,6 +868,7 @@ function bindPlan(
     groupBy,
     groupIndexBySignature,
     aggregates: aggregateSpecs,
+    hasListAggregate: aggregateSpecs.some((aggregate) => aggregate.name === "JSON_ARRAYAGG"),
     select,
     orderBy,
     grouped,
@@ -1135,7 +1140,9 @@ function bindExpression(
         ? { source: argument.source, vector: argument.vector }
         : undefined;
     const rawNumber =
-      argument.kind === "column" && argument.vector.kind === "number"
+      expression.name !== "JSON_ARRAYAGG" &&
+      argument.kind === "column" &&
+      argument.vector.kind === "number"
         ? { source: argument.source, vector: argument.vector }
         : undefined;
     aggregateSpecs.push({
@@ -3717,7 +3724,7 @@ class GroupAccumulator {
    * COUNT/SUM/AVG aggregates: one pass with unboxed reads and no per-row dispatch. Returns false
    * when the plan shape needs the generic per-row path.
    */
-  consumeFast(batch: BatchRows, passes: (row: number) => boolean, hasPredicates: boolean): boolean {
+  consumeFast(batch: BatchRows): boolean {
     const plan = this.#plan;
     const codeGrouping = plan.codeGrouping;
     const globalGroup = plan.groupBy.length === 0;
@@ -3727,7 +3734,7 @@ class GroupAccumulator {
     const specs = this.#fastAggregatesCache;
     if (specs === undefined) return false;
     // The purest shape — global COUNT(*) with no predicates — needs no row loop at all.
-    if (globalGroup && !hasPredicates && specs.every((spec) => spec.kind === "star")) {
+    if (globalGroup && specs.every((spec) => spec.kind === "star")) {
       const state = required(this.#index.getEmpty(), "Grouped query state is missing");
       for (let index = 0; index < specs.length; index += 1) {
         state.counts[index] = (state.counts[index] ?? 0) + batch.length;
@@ -3786,7 +3793,6 @@ class GroupAccumulator {
             slots: groupVector.codes.length,
           };
     for (let row = 0; row < batch.length; row += 1) {
-      if (hasPredicates && !passes(row)) continue;
       let state = globalState;
       if (state === undefined && grouping !== undefined && states !== undefined) {
         const sourceRow = groupRows?.[row] ?? -1;
@@ -4024,7 +4030,7 @@ function consumeBatch(
     }
     return;
   }
-  if (plan.grouped && groups.consumeFast(batch, () => true, false)) return;
+  if (plan.grouped && groups.consumeFast(batch)) return;
   if (!plan.grouped && output.tryAddBatch(batch)) return;
   for (let row = 0; row < batch.length; row += 1) {
     if (plan.grouped) {
@@ -4068,6 +4074,13 @@ function createGroupState(
     ),
     "Group state",
   );
+  if (plan.hasListAggregate) {
+    payloadBytes = safeMemorySum(
+      payloadBytes,
+      safeMemoryProduct(plan.aggregates.length, QUERY_REFERENCE_BYTES, "JSON aggregate list slots"),
+      "Group state",
+    );
+  }
   // tally, not reserve: a group state lives until the context closes and is never released
   // on its own, so a per-group QueryMemoryReservation object — retained in the context's Set
   // for the whole query — is pure overhead at one per distinct group.
@@ -4096,6 +4109,9 @@ function createGroupState(
     counts: new Float64Array(plan.aggregates.length),
     sums: new Float64Array(plan.aggregates.length),
     values: new Array<QueryValue | undefined>(plan.aggregates.length),
+    ...(plan.hasListAggregate
+      ? { lists: new Array<QueryValue[] | undefined>(plan.aggregates.length) }
+      : {}),
     valueReservations: new Array<QueryMemoryReservation | undefined>(plan.aggregates.length),
     valueReservationBytes: new Float64Array(plan.aggregates.length),
     distincts,
@@ -4232,6 +4248,23 @@ function applyAggregateValue(
   value: unknown,
   memory: QueryMemoryContext,
 ): void {
+  if (spec.name === "JSON_ARRAYAGG") {
+    const member = asQueryValue(value ?? null);
+    if (spec.distinct === true && !firstOfItsKind(state, index, member, memory)) return;
+    state.counts[index] = (state.counts[index] ?? 0) + 1;
+    const lists = required(state.lists, "JSON aggregate list state is missing");
+    let list = lists[index];
+    if (list === undefined) {
+      list = [];
+      lists[index] = list;
+    }
+    list.push(member);
+    memory.tally(
+      safeMemorySum(QUERY_REFERENCE_BYTES, queryValuePayloadBytes(member), "JSON_ARRAYAGG member"),
+      "JSON_ARRAYAGG member",
+    );
+    return;
+  }
   if (value === null || value === undefined) return;
   // One gate for every path that accumulates: the generic per-row path, the raw datetime path,
   // and the re-accumulation of spilled rows.
@@ -4357,6 +4390,13 @@ function evaluateFinalExpression(
   if (count === undefined) throw new Error("Aggregate state is missing");
   if (expression.name === "COUNT") return count;
   if (count === 0) return null;
+  if (expression.name === "JSON_ARRAYAGG") {
+    return JSON.stringify(
+      (required(group.lists, "JSON aggregate list state is missing")[aggregateIndex] ?? []).map(
+        jsonValueOf,
+      ),
+    );
+  }
   const sum = group.sums[aggregateIndex] ?? 0;
   if (expression.name === "SUM") return sum;
   if (expression.name === "AVG") return sum / count;
