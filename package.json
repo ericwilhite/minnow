@@ -29,7 +29,7 @@
     "test:sql:fetch": "vite-node scripts/fetch-sqllogictest.mts",
     "test:sql:prepare-standard": "vite-node scripts/prepare-sqllogictest-standard.mts",
     "test:sql:standard": "npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select1.test --file packages/core/testdata/sqllogictest/standard-select2.test --file packages/core/testdata/sqllogictest/standard-select3.test --file packages/core/testdata/sqllogictest/standard-select4.test --file packages/core/testdata/sqllogictest/standard-select5.test",
-    "test:sql:full": "npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select1.test --file packages/core/testdata/sqllogictest/standard-select2.test --file packages/core/testdata/sqllogictest/standard-select3.test --file packages/core/testdata/sqllogictest/full-select4.test --file packages/core/testdata/sqllogictest/full-select5.test",
+    "test:sql:full": "npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select1.test --file packages/core/testdata/sqllogictest/standard-select2.test --file packages/core/testdata/sqllogictest/standard-select3.test --file packages/core/testdata/sqllogictest/full-select4.test --file packages/core/testdata/sqllogictest/full-select5.test --progress-every 500",
     "test:sql:upstream": "vite-node scripts/run-sqllogictest-upstream.mts",
     "simulate": "vite-node scripts/simulate.mts",
     "test:simulator:full": "npm run simulate -- --seed 24301 --rounds 500 --clients 8 --key-space 128 --trace-events 512",

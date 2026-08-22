@@ -30,7 +30,10 @@ reads a fraction of the bytes.
 fourteen-column table reads two columns' worth of blocks.
 
 **Join reordering.** Minnow estimates how many rows each side will produce and builds its lookup
-from the smaller side. An equality join can use a table's unique-key lookup instead.
+from the smaller side. An equality join can use a table's unique-key lookup instead. Pure
+comma/CROSS-join groups keep the streamed base fixed, then choose connected sources from the
+`WHERE` equality graph and turn one safe equality per source into a hash-join key. A permuted
+`FROM` list therefore does not force the executor through disconnected Cartesian products.
 
 **Decorrelation.** A correlated `EXISTS` or `NOT EXISTS` subquery is rewritten into a semi-join or
 anti-join rather than executed once per outer row; both equality and range comparisons take this

@@ -35,6 +35,11 @@ const files = [
 const stopAfterText = argumentValue("--stop-after");
 const stopAfter = stopAfterText === undefined ? undefined : Number(stopAfterText);
 const quiet = arguments_.includes("--quiet");
+const trace = arguments_.includes("--trace");
+const traceFromText = argumentValue("--trace-from");
+const traceFrom = Number(traceFromText ?? 1);
+const progressEveryText = argumentValue("--progress-every");
+const progressEvery = Number(progressEveryText ?? 0);
 const keepGoing = arguments_.includes("--keep-going");
 const maxFailuresText = argumentValue("--max-failures");
 const maxFailures = Number(maxFailuresText ?? 100);
@@ -43,6 +48,14 @@ if (stopAfter !== undefined && (!Number.isSafeInteger(stopAfter) || stopAfter <=
   usageError(`--stop-after must be a positive whole number, got '${stopAfterText ?? ""}'`);
 }
 if (files.length === 0) usageError("pass at least one --file <path> or --directory <path>");
+if (!Number.isSafeInteger(progressEvery) || progressEvery < 0) {
+  usageError(
+    `--progress-every must be a non-negative whole number, got '${progressEveryText ?? ""}'`,
+  );
+}
+if (!Number.isSafeInteger(traceFrom) || traceFrom <= 0) {
+  usageError(`--trace-from must be a positive whole number, got '${traceFromText ?? ""}'`);
+}
 if (!Number.isSafeInteger(maxFailures) || maxFailures <= 0) {
   usageError(`--max-failures must be a positive whole number, got '${maxFailuresText ?? ""}'`);
 }
@@ -65,8 +78,9 @@ const failures: SqlLogicFailure[] = [];
 try {
   for (const file of files) {
     const fileStarted = performance.now();
-    const records =
+    const selectedRecords =
       stopAfter === undefined ? readRecords(file) : takeRecords(readRecords(file), stopAfter);
+    const records = reportRecords(selectedRecords, file);
     const statistics = await runSqlLogicTest(records, createDatabase(), {
       onFailure: keepGoing
         ? (failure) => {
@@ -144,6 +158,26 @@ async function* takeRecords(
   }
 }
 
+async function* reportRecords(
+  records: AsyncIterable<SqlLogicRecord>,
+  file: string,
+): AsyncGenerator<SqlLogicRecord> {
+  let recordNumber = 0;
+  for await (const record of records) {
+    recordNumber++;
+    if (
+      !quiet &&
+      ((trace && recordNumber >= traceFrom) ||
+        (progressEvery > 0 && recordNumber % progressEvery === 0))
+    ) {
+      console.log(
+        `run ${file} — record ${String(recordNumber)} at source line ${String(record.location.line)} (${record.kind})`,
+      );
+    }
+    yield record;
+  }
+}
+
 function sequentialIds(): () => string {
   let next = 0;
   return () => `slt-${String(next++)}`;
@@ -209,7 +243,7 @@ function shellQuote(value: string): string {
 
 function usageError(message: string): never {
   console.error(
-    `${message}\n\nUsage: npm run test:sql:logic -- (--file <path> | --directory <path>) [--stop-after <records>] [--keep-going] [--max-failures <count>] [--quiet]`,
+    `${message}\n\nUsage: npm run test:sql:logic -- (--file <path> | --directory <path>) [--stop-after <records>] [--progress-every <records>] [--trace] [--trace-from <record>] [--keep-going] [--max-failures <count>] [--quiet]`,
   );
   process.exit(2);
 }

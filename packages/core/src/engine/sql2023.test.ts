@@ -178,6 +178,16 @@ describe("F041-07 comma joins", () => {
     ).toEqual([{ id: 1 }, { id: 2 }]);
     expect(run("SELECT COUNT(*) AS v FROM rows a, rows b, dims d")).toEqual([{ v: 16 }]);
   });
+
+  it("keeps multi-way equality graphs correct across a disconnected written order", () => {
+    expect(
+      run(
+        "SELECT a.id AS id FROM rows d, rows b, rows e, rows a, rows c " +
+          "WHERE a.id = b.id AND b.id = c.id AND c.id = d.id AND d.id = e.id " +
+          "AND e.region = 'east'",
+      ),
+    ).toEqual([{ id: 3 }]);
+  });
 });
 
 describe("F401 named-column and natural joins", () => {

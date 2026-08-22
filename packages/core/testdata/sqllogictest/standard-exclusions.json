@@ -45,12 +45,12 @@
       "source": "test/select4.test",
       "sourceSha256": "155ff6bb9bbf7c2dcf1e5659bb1688dec5dab58126f8dc66d23dcae6df43f59e",
       "sourceRecords": 3857,
-      "standardIncludedRecords": 2027,
+      "standardIncludedRecords": 2031,
       "fullIncludedRecords": 3841,
       "allProfileExcludedRecords": 16,
-      "standardOnlyExcludedRecords": 1814,
+      "standardOnlyExcludedRecords": 1810,
       "standardOutput": "standard-select4.test",
-      "standardOutputSha256": "920ab94abdebc47a65adf3b526d5da8dae8a46698168892e5055292a1fcc717f",
+      "standardOutputSha256": "82b9031198918c63d8de956a1276f35d562b1f8c224a488f660d5f1e72b74403",
       "fullOutput": "full-select4.test",
       "fullOutputSha256": "67a627dbea76db12932d55aa146ef7b24f14ed3baea1bf09b7e5c8afb6a880c0"
     },
@@ -58,21 +58,21 @@
       "source": "test/select5.test",
       "sourceSha256": "049a5d0bf90999c56db2d5880ef28febdc88906526f87069cc96af9f84c99869",
       "sourceRecords": 1436,
-      "standardIncludedRecords": 704,
+      "standardIncludedRecords": 707,
       "fullIncludedRecords": 1436,
       "allProfileExcludedRecords": 0,
-      "standardOnlyExcludedRecords": 732,
+      "standardOnlyExcludedRecords": 729,
       "standardOutput": "standard-select5.test",
-      "standardOutputSha256": "dffdf2b1f2abbb11574af0c395b00828cc70b883e6fdf9ee620b9bb65179824a",
+      "standardOutputSha256": "c54d4f4c579c1083f0fd0fb47375457976bdd8ff487c8087be3f7837404f011e",
       "fullOutput": "full-select5.test",
       "fullOutputSha256": "ccfa4a3b4e17dd4711b97a010f0c57d2f8ad0b7feea59bdcbb99711837b93131"
     }
   ],
   "sourceRecords": 10708,
-  "standardIncludedRecords": 6006,
+  "standardIncludedRecords": 6013,
   "fullIncludedRecords": 8552,
   "allProfileExcludedRecords": 2156,
-  "standardOnlyExcludedRecords": 2546,
+  "standardOnlyExcludedRecords": 2539,
   "exclusions": [
     {
       "source": "test/select1.test",
@@ -15252,34 +15252,6 @@
     },
     {
       "source": "test/select4.test",
-      "line": 29188,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 29199,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 29210,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 29221,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select4.test",
       "line": 29232,
       "kind": "query",
       "scope": "standard-only",
@@ -28952,27 +28924,6 @@
     {
       "source": "test/select5.test",
       "line": 5143,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select5.test",
-      "line": 5165,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select5.test",
-      "line": 5188,
-      "kind": "query",
-      "scope": "standard-only",
-      "reason": "exhaustive multi-way join permutations run in the full profile"
-    },
-    {
-      "source": "test/select5.test",
-      "line": 5211,
       "kind": "query",
       "scope": "standard-only",
       "reason": "exhaustive multi-way join permutations run in the full profile"

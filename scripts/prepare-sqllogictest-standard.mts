@@ -43,6 +43,8 @@ const excluded: Array<{
   scope: "all-profiles" | "standard-only";
   reason: string;
 }> = [];
+/** Small, formerly pathological families that make join planning part of every local test run. */
+const STANDARD_JOIN_REGRESSIONS = new Set(["join3", "join-17-1"]);
 for (const sourcePath of sourcePaths) {
   const sourceName = basename(sourcePath);
   const manifestEntry = sqlLogicCorpusManifest.standardSources.find(
@@ -201,7 +203,11 @@ function unsupportedReason(record: SqlLogicRecord): string | undefined {
 }
 
 function standardOnlyReason(record: SqlLogicRecord): string | undefined {
-  if (record.kind === "query" && record.label?.startsWith("join") === true) {
+  if (
+    record.kind === "query" &&
+    record.label?.startsWith("join") === true &&
+    !STANDARD_JOIN_REGRESSIONS.has(record.label)
+  ) {
     return "exhaustive multi-way join permutations run in the full profile";
   }
   return undefined;

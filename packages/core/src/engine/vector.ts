@@ -4,15 +4,19 @@ import type {
   BinaryOperator,
   ComparisonOperator,
   CompiledQuery,
+  JoinPlan,
+  Predicate,
   PredicateOperator,
   Expression,
   QueryResult,
   QueryRow,
   QueryValue,
   ScalarFunctionName,
+  TableSource,
 } from "./query.js";
 import {
   cachedListMembership,
+  childExpressions,
   distinctFromComparison,
   explicitNullOrder,
   isScalarFunctionName,
@@ -720,12 +724,221 @@ function disjunctiveNormalForm(predicate: {
   return visit(predicate.left) && branches.length > 1 ? branches : undefined;
 }
 
+/**
+ * Gives a pure comma/CROSS-join group a connected physical order once schemas can resolve bare
+ * column names. SQLLogicTest deliberately permutes FROM lists; preserving that written order can
+ * otherwise materialize several disconnected Cartesian products before their WHERE equalities
+ * become applicable. The streamed base stays fixed; explicit/outer joins and wildcard projection
+ * keep their complete written order.
+ *
+ * One equality that connects each new source becomes the inner hash-join key. The remaining
+ * conditions stay ordinary predicates, so null and residual-filter semantics do not change.
+ */
+function orderCartesianJoins(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, ColumnarTable>,
+): CompiledQuery {
+  if (
+    plan.joins.length < 2 ||
+    plan.select.some((item) => item.expression.kind === "wildcard") ||
+    plan.joins.some((join) => !isCartesianJoin(join))
+  ) {
+    return plan;
+  }
+  const entries: Array<{ source: TableSource; originalIndex: number }> = [
+    { source: plan.base, originalIndex: 0 },
+    ...plan.joins.map((join, index) => ({
+      source: tableSourceOf(join),
+      originalIndex: index + 1,
+    })),
+  ];
+  const sourceTables = entries.map(({ source }) => tables.get(source.table));
+  if (sourceTables.some((table) => table === undefined)) return plan;
+  const predicateSources = plan.predicates.map((predicate) => ({
+    predicate,
+    sources: rawPredicateSources(predicate, entries, sourceTables),
+  }));
+  // The preparation layer may stream the written base table through a resident window. Keep
+  // that source fixed and order only the fully materialized join sides around it.
+  const remaining = new Set(entries.slice(1).map(({ originalIndex }) => originalIndex));
+  const ordered: number[] = [0];
+  while (remaining.size > 0) {
+    let best: number | undefined;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const candidate of remaining) {
+      const score = cartesianSourceScore(candidate, ordered, predicateSources);
+      if (score > bestScore || (score === bestScore && (best === undefined || candidate < best))) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+    if (best === undefined) return plan;
+    ordered.push(best);
+    remaining.delete(best);
+  }
+  const predicates = [...plan.predicates];
+  const available = new Set<number>([ordered[0] ?? 0]);
+  const joins: JoinPlan[] = [];
+  for (const sourceIndex of ordered.slice(1)) {
+    const source = entries[sourceIndex]?.source;
+    if (source === undefined) return plan;
+    const keyIndex = predicates.findIndex((predicate) =>
+      predicateJoinsSource(predicate, sourceIndex, available, entries, sourceTables),
+    );
+    const key = keyIndex < 0 ? undefined : predicates.splice(keyIndex, 1)[0];
+    joins.push(key === undefined ? cartesianJoin(source) : keyedInnerJoin(source, key));
+    available.add(sourceIndex);
+  }
+  return { ...plan, base: plan.base, joins, predicates };
+}
+
+function isCartesianJoin(join: JoinPlan): boolean {
+  const condition = join.on;
+  return (
+    join.kind === "inner" &&
+    condition?.kind === "condition" &&
+    condition.operator === "=" &&
+    condition.left.kind === "literal" &&
+    condition.left.value === 1 &&
+    condition.right.kind === "literal" &&
+    condition.right.value === 1
+  );
+}
+
+function tableSourceOf(join: JoinPlan): TableSource {
+  const { kind, left, right, on, full, natural, ...source } = join;
+  void kind;
+  void left;
+  void right;
+  void on;
+  void full;
+  void natural;
+  return source;
+}
+
+function cartesianJoin(source: TableSource): JoinPlan {
+  return {
+    ...source,
+    kind: "inner",
+    left: { kind: "literal", value: null },
+    right: { kind: "literal", value: null },
+    on: {
+      kind: "condition",
+      operator: "=",
+      left: { kind: "literal", value: 1 },
+      right: { kind: "literal", value: 1 },
+    },
+  };
+}
+
+function keyedInnerJoin(source: TableSource, predicate: Predicate): JoinPlan {
+  return {
+    ...source,
+    kind: "inner",
+    left: predicate.left,
+    right: predicate.right,
+  };
+}
+
+function cartesianSourceScore(
+  candidate: number,
+  ordered: readonly number[],
+  predicates: ReadonlyArray<{ predicate: Predicate; sources: Set<number> | undefined }>,
+): number {
+  const available = new Set(ordered);
+  let local = 0;
+  let connected = 0;
+  let equality = 0;
+  for (const entry of predicates) {
+    const sources = entry.sources;
+    if (sources?.has(candidate) !== true) continue;
+    if (sources.size === 1) {
+      local++;
+      continue;
+    }
+    if ([...sources].every((source) => source === candidate || available.has(source))) {
+      connected++;
+      if (entry.predicate.operator === "=") equality++;
+    }
+  }
+  // A usable equality dominates a general connection, which dominates a local filter; original
+  // order breaks ties. The empty-order branch keeps the helper correct if base selection is ever
+  // made schema-aware too, though the streaming executor currently fixes that source.
+  return ordered.length === 0 ? local : equality * 100 + connected * 10 + local;
+}
+
+function rawPredicateSources(
+  predicate: Predicate,
+  entries: ReadonlyArray<{ source: TableSource }>,
+  tables: ReadonlyArray<ColumnarTable | undefined>,
+): Set<number> | undefined {
+  const sources = new Set<number>();
+  return rawExpressionSources(predicate.left, entries, tables, sources) &&
+    rawExpressionSources(predicate.right, entries, tables, sources)
+    ? sources
+    : undefined;
+}
+
+function rawExpressionSources(
+  expression: Expression,
+  entries: ReadonlyArray<{ source: TableSource }>,
+  tables: ReadonlyArray<ColumnarTable | undefined>,
+  into: Set<number>,
+): boolean {
+  if (expression.kind === "subquery" || expression.kind === "exists") return false;
+  if (expression.kind === "column") {
+    const parts = expression.reference.split(".");
+    let matches: number[];
+    if (parts.length === 2) {
+      const match = entries.findIndex(({ source }) => source.alias === parts[0]);
+      matches = match < 0 || tables[match]?.columns.has(parts[1] ?? "") !== true ? [] : [match];
+    } else {
+      const column = parts[0] ?? "";
+      matches = tables.flatMap((table, index) =>
+        table?.columns.has(column) === true ? [index] : [],
+      );
+    }
+    if (matches.length !== 1) return false;
+    into.add(matches[0] ?? -1);
+    return true;
+  }
+  return childExpressions(expression).every((child) =>
+    rawExpressionSources(child, entries, tables, into),
+  );
+}
+
+function predicateJoinsSource(
+  predicate: Predicate,
+  candidate: number,
+  available: ReadonlySet<number>,
+  entries: ReadonlyArray<{ source: TableSource }>,
+  tables: ReadonlyArray<ColumnarTable | undefined>,
+): boolean {
+  if (predicate.operator !== "=") return false;
+  const left = new Set<number>();
+  const right = new Set<number>();
+  if (
+    !rawExpressionSources(predicate.left, entries, tables, left) ||
+    !rawExpressionSources(predicate.right, entries, tables, right)
+  ) {
+    return false;
+  }
+  const candidateOnly = (sources: ReadonlySet<number>): boolean =>
+    sources.size === 1 && sources.has(candidate);
+  const availableOnly = (sources: ReadonlySet<number>): boolean =>
+    sources.size > 0 && [...sources].every((source) => available.has(source));
+  return (
+    (candidateOnly(left) && availableOnly(right)) || (candidateOnly(right) && availableOnly(left))
+  );
+}
+
 function bindPlan(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
   memory: QueryMemoryContext,
   ftsStats?: ReadonlyMap<string, FtsStats>,
 ): BoundPlan {
+  plan = orderCartesianJoins(plan, tables);
   const sources = [plan.base, ...plan.joins];
   const sourceTables = sources.map((source) => {
     const table = tables.get(source.table);
@@ -2901,7 +3114,7 @@ function consumeJoinedBatches(
   let working = batch;
   let complete = prefiltered;
   let owned: QueryMemoryContext | undefined;
-  if (joinIndex === 0 && !prefiltered) {
+  if (!prefiltered) {
     const filtered = prefilterBatch(plan, batch, join);
     if (filtered !== undefined) {
       complete = filtered.complete;

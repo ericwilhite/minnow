@@ -14,7 +14,7 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 | ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
 | `npm test`                     | Vitest plus the committed standard SQLLogicTest profile                         | Normal implementation work         |
 | `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                | A focused inner loop               |
-| `npm run test:sql:standard`    | 4,198 result-checked upstream queries; committed, offline, about ten seconds    | Every SQL or optimizer change      |
+| `npm run test:sql:standard`    | 4,205 result-checked upstream queries; committed, offline, about ten seconds    | Every SQL or optimizer change      |
 | `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations    | Before a release                   |
 | `npm run test:coverage`        | Vitest with the coverage floors enforced                                        | Before pushing                     |
 | `npm run soak`                 | The generative suites on fresh random seeds, to find new failures               | Hunting bugs rather than pinning   |
@@ -89,12 +89,18 @@ npm run test:sql:standard
 # Iterate on one source file or its first 200 records.
 npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select3.test
 npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select4.test --stop-after 200
+
+# Show broad-suite progress, or trace every record from an isolated boundary.
+npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select5.test --progress-every 100
+npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select5.test --trace --trace-from 800
 ```
 
-It runs 1,806 statements and 4,198 queries, checking 219,506 scalar results across 6,006 source
-records. On the development machine used to introduce it, the whole profile took about ten
-seconds. That makes the broad suite part of `npm test`, `npm run check`, and every pull request,
-instead of a suite agents discover only after they finish a change.
+It runs 1,806 statements and 4,205 queries, checking 219,677 scalar results across 6,013 source
+records. The standard set includes representative five-table and seventeen-table join-order
+families that previously exposed pathological Cartesian work. On the development machine used to
+introduce it, the whole profile took about ten seconds. That makes the broad suite part of
+`npm test`, `npm run check`, and every pull request, instead of a suite agents discover only after
+they finish a change.
 
 The supported full profile adds the exhaustive multi-way join families:
 
@@ -102,10 +108,12 @@ The supported full profile adds the exhaustive multi-way join families:
 npm run test:sql:full
 ```
 
-It contains 8,552 of the five selected upstream files' 10,708 records. The remaining 2,156 are
+It is fully runnable locally, reports progress every 500 records, and contains 8,552 of the five
+selected upstream files' 10,708 records: 1,806 statements, 6,744 queries, and 4,927,952 checked
+scalar results. The remaining 2,156 are
 not hidden: `standard-exclusions.json` records the source file, source line, scope, and reason for
 every one. They currently cover secondary-index DDL, non-equality correlated scalar aggregates,
-and correlated `EXISTS` below `OR`. A further 2,546 supported exhaustive-join records move from
+and correlated `EXISTS` below `OR`. A further 2,539 supported exhaustive-join records move from
 the standard profile to the full one solely because of runtime.
 
 The corpus is pinned to immutable revision

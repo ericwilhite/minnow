@@ -42,7 +42,7 @@ jobs:
       # Coverage rather than a bare run: the thresholds in vitest.config.ts are a ratchet, and a
       # ratchet nothing turns is just a number in a file.
       - run: npm run test:coverage
-      # The committed portable SQLLogicTest profile adds 4,198 result-checked queries without
+      # The committed portable SQLLogicTest profile adds 4,205 result-checked queries without
       # network access. It is intentionally standard local/PR coverage, not a nightly-only net.
       - run: npm run test:sql:standard
       - name: Upload coverage
