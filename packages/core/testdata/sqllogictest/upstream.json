@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "project": "SQLite SQLLogicTest",
+  "canonicalUrl": "https://www.sqlite.org/sqllogictest/",
+  "mirrorUrl": "https://github.com/duckdb/sqllogictest",
+  "revision": "572273bf5076176e17f47aea75115a225e70fef8",
+  "revisionDate": "2025-01-13T12:24:20Z",
+  "archiveUrl": "https://github.com/duckdb/sqllogictest/archive/572273bf5076176e17f47aea75115a225e70fef8.tar.gz",
+  "archiveSha256": "1320d298045f9a3d3f85cca6a7d7f52c6f1b2b0145b1bacfe91b87750ec381a3",
+  "archiveBytes": 115244234,
+  "archiveRoot": "sqllogictest-572273bf5076176e17f47aea75115a225e70fef8",
+  "testFileCount": 622,
+  "standardSources": [
+    {
+      "path": "test/select1.test",
+      "sha256": "e93b83d64d06f78aee0e690455b6c604e86ad9a339f77d927a782cefb6b0e1d5"
+    },
+    {
+      "path": "test/select2.test",
+      "sha256": "a8ecc3d206c4d4b2cd6a154c18999e558ec97168cd7e327a4369e23aaf31be64"
+    },
+    {
+      "path": "test/select3.test",
+      "sha256": "d5c321683bfe903c9be95ebe80a8d23da4d8f4a39193b2087dbc34cb4e137623"
+    },
+    {
+      "path": "test/select4.test",
+      "sha256": "155ff6bb9bbf7c2dcf1e5659bb1688dec5dab58126f8dc66d23dcae6df43f59e"
+    },
+    {
+      "path": "test/select5.test",
+      "sha256": "049a5d0bf90999c56db2d5880ef28febdc88906526f87069cc96af9f84c99869"
+    }
+  ]
+}

@@ -202,15 +202,20 @@ export class RecordCore {
     extraOwnerIds: Iterable<string>,
   ): StoragePage<string, string> {
     validatePageLimit(limit);
-    const ownerIds = new Set<string>(this.#tempOwners.keys());
-    for (const ownerId of extraOwnerIds) ownerIds.add(ownerId);
-    const sorted = [...ownerIds]
-      .filter((ownerId) => afterOwnerId === null || ownerId > afterOwnerId)
-      .sort();
-    const records = sorted.slice(0, limit);
+    const records: string[] = [];
+    const add = (ownerId: string): void => {
+      if (afterOwnerId !== null && ownerId <= afterOwnerId) return;
+      const index = records.findIndex((existing) => existing >= ownerId);
+      if (records[index] === ownerId) return;
+      if (index < 0) records.push(ownerId);
+      else records.splice(index, 0, ownerId);
+      if (records.length > limit) records.pop();
+    };
+    for (const ownerId of this.#tempOwners.keys()) add(ownerId);
+    for (const ownerId of extraOwnerIds) add(ownerId);
     return {
       records,
-      nextCursor: sorted.length > limit ? (records[records.length - 1] ?? null) : null,
+      nextCursor: records.length === limit ? (records.at(-1) ?? null) : null,
     };
   }
 
@@ -461,6 +466,17 @@ export class RecordCore {
       .map((record) => normalizeSegmentRecord(record));
   }
 
+  listSegmentPage(afterId: string | null, limit: number): StoragePage<SegmentRecord, string> {
+    validatePageLimit(limit);
+    const records = boundedRecordPage(
+      this.#segments.values(),
+      afterId,
+      limit,
+      (record) => record.id,
+    ).map((record) => normalizeSegmentRecord(record));
+    return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
+  }
+
   removeSegment(id: string): void {
     this.#segments.delete(id);
   }
@@ -555,11 +571,12 @@ export class RecordCore {
 
   listManifestPage(afterVersion: number | null, limit: number): StoragePage<Manifest, number> {
     validatePageLimit(limit);
-    const records = [...this.#manifests.values()]
-      .filter((manifest) => afterVersion === null || manifest.version > afterVersion)
-      .sort((left, right) => left.version - right.version)
-      .slice(0, limit)
-      .map((manifest) => structuredClone(manifest));
+    const records = boundedRecordPage(
+      this.#manifests.values(),
+      afterVersion,
+      limit,
+      (manifest) => manifest.version,
+    ).map((manifest) => structuredClone(manifest));
     return {
       records,
       nextCursor: records.length === limit ? (records.at(-1)?.version ?? null) : null,
@@ -671,11 +688,12 @@ export class RecordCore {
     limit: number,
   ): StoragePage<TransactionRecord, string> {
     validatePageLimit(limit);
-    const records = [...this.#transactions.values()]
-      .filter((record) => afterId === null || record.id > afterId)
-      .sort((left, right) => left.id.localeCompare(right.id))
-      .slice(0, limit)
-      .map((record) => structuredClone(record));
+    const records = boundedRecordPage(
+      this.#transactions.values(),
+      afterId,
+      limit,
+      (record) => record.id,
+    ).map((record) => structuredClone(record));
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
 
@@ -1090,11 +1108,12 @@ export class RecordCore {
     limit: number,
   ): StoragePage<CompactionJobRecord, string> {
     validatePageLimit(limit);
-    const records = [...this.#compactionJobs.values()]
-      .filter((record) => afterId === null || record.id > afterId)
-      .sort((left, right) => left.id.localeCompare(right.id))
-      .slice(0, limit)
-      .map((record) => structuredClone(record));
+    const records = boundedRecordPage(
+      this.#compactionJobs.values(),
+      afterId,
+      limit,
+      (record) => record.id,
+    ).map((record) => structuredClone(record));
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
   }
 
@@ -1287,11 +1306,11 @@ export class RecordCore {
     const roots = collectBoundedPhysicalRoots(
       segmentIdsToExamine,
       blockIdsToExamine,
-      this.#manifests.values(),
+      this.#manifests,
       prunedManifestVersionSet,
       this.#segments,
       this.#transactions,
-      this.#compactionJobs.values(),
+      this.#compactionJobs,
     );
     while (
       remaining > 0 &&
@@ -1849,8 +1868,12 @@ function assertGarbageCollectionCandidateProvenance(
     }
   }
   const blockHasProvenance = (id: string): boolean => {
-    for (const version of job.candidateManifestVersions) {
-      if (manifests.get(version)?.blockIds.includes(id)) return true;
+    // A prior collection pass may already have pruned the manifest that names a leftover block.
+    // Its persisted record is still provenance until the block is reclaimed; requiring that
+    // already-pruned version to appear in candidateManifestVersions is impossible because that
+    // list contains only manifests this job will newly prune.
+    for (const manifest of manifests.values()) {
+      if (manifest.blockIds.includes(id)) return true;
     }
     for (const transaction of transactions.values()) {
       if (transaction.status === "aborted" && transaction.pendingBlockIds.includes(id)) return true;
@@ -1872,22 +1895,10 @@ function assertGarbageCollectionCandidateProvenance(
     );
   }
   const unprovenSegmentId = job.candidateSegmentIds.find((id) => {
-    for (const transaction of transactions.values()) {
-      if (transaction.status === "aborted" && transaction.pendingSegmentIds.includes(id)) {
-        return false;
-      }
-    }
-    for (const compaction of compactionJobs.values()) {
-      if (
-        isTerminalCompactionJob(compaction) &&
-        (compaction.sourceSegmentIds.includes(id) || compaction.outputSegmentId === id)
-      ) {
-        return false;
-      }
-    }
-    const segment = segments.get(id);
-    const blockIds = segment === undefined ? [] : segmentBlockIds(segment);
-    return blockIds.length === 0 || !blockIds.every(blockHasProvenance);
+    // The persisted segment record is sufficient provenance for nominating that exact id.
+    // Its blocks may already have been reclaimed by an earlier bounded pass, and terminal
+    // compaction records are intentionally aged out, so neither is a durable discovery source.
+    return !segments.has(id);
   });
   if (unprovenSegmentId !== undefined) {
     throw new Error(
@@ -1937,41 +1948,35 @@ const MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES = 4_096;
 function collectBoundedPhysicalRoots(
   candidateSegmentIds: readonly string[],
   candidateBlockIds: readonly string[],
-  manifests: Iterable<Manifest>,
+  manifests: ReadonlyMap<number, Manifest>,
   newlyPrunedVersions: ReadonlySet<number>,
   segments: ReadonlyMap<string, SegmentRecord>,
   transactions: ReadonlyMap<string, TransactionRecord>,
-  compactionJobs: Iterable<CompactionJobRecord>,
+  compactionJobs: ReadonlyMap<string, CompactionJobRecord>,
 ): { blockIds: Set<string>; segmentIds: Set<string> } {
   const candidateBlocks = new Set(candidateBlockIds);
   const probeBlockIds = new Set(candidateBlockIds);
   const probeSegmentIds = new Set(candidateSegmentIds);
-  const relatedSegments = new Map<string, SegmentRecord>();
-  let dependencyOverflow = false;
+
+  // First discover a bounded working set. A very wide segment can cross the cache ceiling; its
+  // remaining IDs are checked lazily below instead of retaining the whole batch forever.
   for (const segment of segments.values()) {
     const ids = segmentBlockIds(segment);
     if (!candidateSegmentIds.includes(segment.id) && !ids.some((id) => candidateBlocks.has(id))) {
       continue;
     }
-    const newBlockIds = new Set(ids.filter((id) => !probeBlockIds.has(id)));
-    if (
-      relatedSegments.size >= MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES ||
-      probeBlockIds.size + newBlockIds.size > MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES
-    ) {
-      dependencyOverflow = true;
-      break;
+    if (probeSegmentIds.size < MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES) {
+      probeSegmentIds.add(segment.id);
     }
-    relatedSegments.set(segment.id, segment);
-    probeSegmentIds.add(segment.id);
-    ids.forEach((id) => probeBlockIds.add(id));
-  }
-  if (dependencyOverflow) {
-    return { blockIds: new Set(candidateBlockIds), segmentIds: new Set(candidateSegmentIds) };
+    for (const id of ids) {
+      if (probeBlockIds.size >= MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES) break;
+      probeBlockIds.add(id);
+    }
   }
 
   const directBlockRoots = new Set<string>();
   const directSegmentRoots = new Set<string>();
-  for (const manifest of manifests) {
+  for (const manifest of manifests.values()) {
     if (manifest.prunedAt !== undefined || newlyPrunedVersions.has(manifest.version)) continue;
     for (const id of manifest.blockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
   }
@@ -1982,7 +1987,7 @@ function collectBoundedPhysicalRoots(
     for (const id of transaction.pendingSegmentIds)
       if (probeSegmentIds.has(id)) directSegmentRoots.add(id);
   }
-  for (const job of compactionJobs) {
+  for (const job of compactionJobs.values()) {
     if (isTerminalCompactionJob(job)) continue;
     for (const id of job.sourceBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
     for (const id of job.outputBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
@@ -1992,21 +1997,93 @@ function collectBoundedPhysicalRoots(
     }
   }
 
+  const uncachedBlockRoots = new Map<string, boolean>();
+  const isDirectBlockRoot = (id: string): boolean => {
+    if (probeBlockIds.has(id)) return directBlockRoots.has(id);
+    const cached = uncachedBlockRoots.get(id);
+    if (cached !== undefined) return cached;
+    let rooted = false;
+    for (const manifest of manifests.values()) {
+      if (
+        manifest.prunedAt === undefined &&
+        !newlyPrunedVersions.has(manifest.version) &&
+        manifest.blockIds.includes(id)
+      ) {
+        rooted = true;
+        break;
+      }
+    }
+    if (!rooted) {
+      for (const transaction of transactions.values()) {
+        if (transaction.status === "active" && transaction.pendingBlockIds.includes(id)) {
+          rooted = true;
+          break;
+        }
+      }
+    }
+    if (!rooted) {
+      for (const job of compactionJobs.values()) {
+        if (
+          !isTerminalCompactionJob(job) &&
+          (job.sourceBlockIds.includes(id) || job.outputBlockIds.includes(id))
+        ) {
+          rooted = true;
+          break;
+        }
+      }
+    }
+    if (uncachedBlockRoots.size < MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES) {
+      uncachedBlockRoots.set(id, rooted);
+    }
+    return rooted;
+  };
+  const uncachedSegmentRoots = new Map<string, boolean>();
+  const isDirectSegmentRoot = (id: string): boolean => {
+    if (probeSegmentIds.has(id)) return directSegmentRoots.has(id);
+    const cached = uncachedSegmentRoots.get(id);
+    if (cached !== undefined) return cached;
+    let rooted = false;
+    for (const transaction of transactions.values()) {
+      if (transaction.status === "active" && transaction.pendingSegmentIds.includes(id)) {
+        rooted = true;
+        break;
+      }
+    }
+    if (!rooted) {
+      for (const job of compactionJobs.values()) {
+        if (
+          !isTerminalCompactionJob(job) &&
+          (job.sourceSegmentIds.includes(id) || job.outputSegmentId === id)
+        ) {
+          rooted = true;
+          break;
+        }
+      }
+    }
+    if (uncachedSegmentRoots.size < MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES) {
+      uncachedSegmentRoots.set(id, rooted);
+    }
+    return rooted;
+  };
+
   const rootedBlockIds = new Set<string>();
   const rootedSegmentIds = new Set<string>();
-  for (const segment of relatedSegments.values()) {
+  for (const segment of segments.values()) {
     const ids = segmentBlockIds(segment);
+    if (!candidateSegmentIds.includes(segment.id) && !ids.some((id) => candidateBlocks.has(id))) {
+      continue;
+    }
     if (
-      directSegmentRoots.has(segment.id) ||
+      isDirectSegmentRoot(segment.id) ||
       transactions.get(segment.transactionId)?.status === "active" ||
-      (ids.length > 0 && ids.every((id) => directBlockRoots.has(id)))
+      (ids.length > 0 && ids.every(isDirectBlockRoot))
     ) {
       if (candidateSegmentIds.includes(segment.id)) rootedSegmentIds.add(segment.id);
       for (const id of ids) if (candidateBlocks.has(id)) rootedBlockIds.add(id);
     }
   }
-  for (const id of candidateBlockIds) if (directBlockRoots.has(id)) rootedBlockIds.add(id);
-  for (const id of candidateSegmentIds) if (directSegmentRoots.has(id)) rootedSegmentIds.add(id);
+  for (const id of candidateBlockIds) if (isDirectBlockRoot(id)) rootedBlockIds.add(id);
+  for (const id of candidateSegmentIds) if (isDirectSegmentRoot(id)) rootedSegmentIds.add(id);
   return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
 }
 
@@ -2033,6 +2110,25 @@ function validatePageLimit(limit: number): void {
   if (!Number.isSafeInteger(limit) || limit <= 0) {
     throw new RangeError("Storage page limit must be a positive whole number");
   }
+}
+
+/** Selects the next sorted page without copying or sorting the complete backing map. */
+function boundedRecordPage<T, Key extends string | number>(
+  values: Iterable<T>,
+  after: Key | null,
+  limit: number,
+  keyOf: (value: T) => Key,
+): T[] {
+  const selected: Array<{ key: Key; value: T }> = [];
+  for (const value of values) {
+    const key = keyOf(value);
+    if (after !== null && key <= after) continue;
+    const index = selected.findIndex((entry) => entry.key >= key);
+    if (index < 0) selected.push({ key, value });
+    else selected.splice(index, 0, { key, value });
+    if (selected.length > limit) selected.pop();
+  }
+  return selected.map(({ value }) => value);
 }
 
 function validateTableColumns(columns: readonly TableColumnRecord[]): void {

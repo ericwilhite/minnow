@@ -10,19 +10,24 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 
 ## Choose the smallest runner that proves the change
 
-| Command                        | What it runs                                                                 | Use it for                         |
-| ------------------------------ | ---------------------------------------------------------------------------- | ---------------------------------- |
-| `npm test`                     | Vitest unit, SQL support, comparison, and harness tests                      | Normal implementation work         |
-| `npm run test:coverage`        | The same suite, with the coverage floors enforced                            | Before pushing                     |
-| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures            | Hunting bugs rather than pinning   |
-| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture              | Before changing a format version   |
-| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit | Storage or browser-runtime changes |
-| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                        | Docs, examples, and site changes   |
-| `npm run test:browser`         | Both browser runners, in sequence                                            | Cross-browser regression checks    |
-| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline               | Query-executor performance changes |
-| `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages        | Dependency or public-entry changes |
-| `npm run check`                | Formatting, types, lint, build, and unit tests with coverage floors          | The local merge gate               |
-| `npm run check:release`        | The local gate, performance gate, and all browser runners                    | Release candidates                 |
+| Command                        | What it runs                                                                    | Use it for                         |
+| ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
+| `npm test`                     | Vitest plus the committed standard SQLLogicTest profile                         | Normal implementation work         |
+| `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                | A focused inner loop               |
+| `npm run test:sql:standard`    | 4,198 result-checked upstream queries; committed, offline, about ten seconds    | Every SQL or optimizer change      |
+| `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations    | Before a release                   |
+| `npm run test:coverage`        | Vitest with the coverage floors enforced                                        | Before pushing                     |
+| `npm run soak`                 | The generative suites on fresh random seeds, to find new failures               | Hunting bugs rather than pinning   |
+| `npm run simulate`             | One replayable deterministic concurrency, fault, and storage simulation         | Storage and transaction changes    |
+| `npm run test:simulator:full`  | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints | Before a release                   |
+| `npm run fixture:format`       | Freezes a database this build wrote, as a compatibility fixture                 | Before changing a format version   |
+| `npm run test:browser:library` | Core IndexedDB, OPFS, and transaction tests in Chromium, Firefox, and WebKit    | Storage or browser-runtime changes |
+| `npm run test:browser:site`    | Public-site examples in Chromium, Firefox, and WebKit                           | Docs, examples, and site changes   |
+| `npm run test:browser`         | Both browser runners, in sequence                                               | Cross-browser regression checks    |
+| `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                  | Query-executor performance changes |
+| `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages           | Dependency or public-entry changes |
+| `npm run check`                | Format, types, lint, build, coverage, and standard SQLLogicTest                 | The local merge gate               |
+| `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners            | Release candidates                 |
 
 Install the browser binaries once before using a browser runner:
 
@@ -30,10 +35,13 @@ Install the browser binaries once before using a browser runner:
 npx playwright install chromium firefox webkit
 ```
 
-Everything above also runs in CI: `.github/workflows/ci.yml` on every push and pull request, and
-`.github/workflows/performance.yml` nightly. The performance gate is deliberately kept off the
-merge path — it measures a machine as much as it measures the code, and a merge gate that fails
-on a noisy runner is one people learn to re-run rather than read.
+The merge gate and standard SQL profile run in `.github/workflows/ci.yml` on every push and pull
+request. `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
+nightly and on demand. The release workflow repeats both against the exact CI-tested commit and
+will not publish until they pass. `.github/workflows/performance.yml` runs the performance gate
+nightly. The performance gate is deliberately kept off the merge path — it measures a machine as
+much as it measures the code, and a merge gate that fails on a noisy runner is one people learn to
+re-run rather than read.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
@@ -59,13 +67,77 @@ application it starts.
   without indexes, which is fine for noticing that Minnow got slower and useless as a fair
   cross-engine claim.
 
+## SQLLogicTest: broad, strict SQL correctness
+
+Minnow ships a native runner for SQLite's database-neutral
+[SQLLogicTest format](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki). The parser and
+answer checker live in `@minnowdb/core/testing`; the command-line runner streams one record at a
+time and creates one empty database per file. A large corpus therefore does not become an equally
+large in-memory syntax tree.
+
+The runner implements the original format's `statement ok/error`, typed `query`, `nosort`,
+`rowsort`, `valuesort`, result labels, MD5 result hashes, `hash-threshold`, `skipif`, `onlyif`, and
+`halt` directives. Malformed records, wrong value counts, wrong types, duplicate labels with
+different answers, and unknown directives are failures with exact source lines. Conditions are
+reported as skips; they are never silently discarded.
+
+The ordinary local profile is committed and needs no network:
+
+```bash
+npm run test:sql:standard
+
+# Iterate on one source file or its first 200 records.
+npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select3.test
+npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/standard-select4.test --stop-after 200
+```
+
+It runs 1,806 statements and 4,198 queries, checking 219,506 scalar results across 6,006 source
+records. On the development machine used to introduce it, the whole profile took about ten
+seconds. That makes the broad suite part of `npm test`, `npm run check`, and every pull request,
+instead of a suite agents discover only after they finish a change.
+
+The supported full profile adds the exhaustive multi-way join families:
+
+```bash
+npm run test:sql:full
+```
+
+It contains 8,552 of the five selected upstream files' 10,708 records. The remaining 2,156 are
+not hidden: `standard-exclusions.json` records the source file, source line, scope, and reason for
+every one. They currently cover secondary-index DDL, non-equality correlated scalar aggregates,
+and correlated `EXISTS` below `OR`. A further 2,546 supported exhaustive-join records move from
+the standard profile to the full one solely because of runtime.
+
+The corpus is pinned to immutable revision
+`572273bf5076176e17f47aea75115a225e70fef8`. `upstream.json` records its URL, date, 115,244,234-byte
+archive size, archive SHA-256, five source hashes, and expected 622 test files. Regeneration first
+verifies all of those inputs:
+
+```bash
+npm run test:sql:fetch
+npm run test:sql:prepare-standard
+```
+
+The raw 622-file corpus remains locally runnable for boundary discovery. It is expected to expose
+unsupported SQL; use `--keep-going` when auditing rather than treating it as a release profile:
+
+```bash
+npm run test:sql:upstream -- --stop-after 500
+npm run test:sql:upstream -- --keep-going --max-failures 25
+```
+
+Adding support means removing its exact exclusion, regenerating the committed files, and adding
+a focused regression test. Adding an exclusion without a concrete reason makes the ledger diff
+visible in review; there is no wildcard skip list.
+
 When adding a runner, give it one responsibility and make it independently runnable. When adding a
 suite case, derive smoke-test counts from the suite itself instead of copying totals into tests or
 HTML.
 
 ## Seeds, and how a soak failure becomes a permanent test
 
-The generated suites — SQL support, write support, and the columnar-versus-row comparison
+The generated suites — SQL support, write support, the deterministic simulator, and the
+columnar-versus-row comparison
 — build their corpora from a seeded generator. A committed run is deterministic: it uses the
 checked-in seeds plus every seed that has ever failed, listed in
 `packages/core/regression-seeds.json`. That makes the suite a reliable regression net, and on its
@@ -127,10 +199,10 @@ rather than decoded into plausible rows. The generators reach for what breaks en
 zero, the extremes of the double range, subnormals, empty and astral-plane strings, all-null and
 empty columns. A failure shrinks to a minimal case and prints the seed.
 
-## Soaks
+## Soaks and deterministic simulation
 
-Two suites cover accumulation rather than a single operation, which is where a fold that loses a
-row or a compactor that stops folding actually shows up:
+Four suites cover accumulation rather than a single operation, which is where a fold that loses a
+row, a scheduler interleaving, or a compactor that stops folding actually shows up:
 
 - `compaction-soak.test.ts` runs 1,500 interleaved mutations against a reference `Map`, compacting
   at checkpoints, and compares the whole table to the reference each time. Compaction is bounded
@@ -147,6 +219,25 @@ row or a compactor that stops folding actually shows up:
   held to convergence bounds — a scan reads the bounded folded partitions and only a level-zero
   tail below both background fold thresholds, and the store holds the data rather than the
   history.
+- `simulator.test.ts` controls the completion order of every asynchronous `BlockStore` call across
+  independent database clients. A reference `Map` checks commuting concurrent mutations at each
+  checkpoint; scheduled crash points must reopen to exactly the state before or after the write;
+  compaction and garbage collection run throughout. The final quiescent store is bounded by the
+  key space rather than the number of rounds across blocks, segment records, transaction records,
+  and manifests, and must have no leaked leases. The diagnostic trace is a fixed-size tail, so the
+  simulator itself does not grow with the run.
+
+Run or save an exact plan directly:
+
+```bash
+npm run simulate -- --seed 24301 --rounds 500 --clients 8 --key-space 128
+npm run simulate -- --seed 24301 --write-plan /tmp/minnow-plan.json
+npm run simulate -- --plan /tmp/minnow-plan.json
+```
+
+The seed fixes both workload generation and storage completion choices. A failure prints its
+replay command. `npm run soak -- --suite deterministic-simulator` explores fresh seeds, and a
+failure joins `packages/core/regression-seeds.json` so every future unit run replays it.
 
 ## Background maintenance, size, and memory
 

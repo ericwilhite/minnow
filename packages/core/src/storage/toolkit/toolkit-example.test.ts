@@ -466,6 +466,10 @@ class MiniLogStore implements BlockStore {
     return this.#core.listSegments(tableId);
   }
 
+  async listSegmentPage(afterId: string | null, limit: number) {
+    return this.#core.listSegmentPage(afterId, limit);
+  }
+
   async removeSegment(id: string): Promise<void> {
     return this.#run(() =>
       this.#logged({ op: "removeSegment", id }, () => {

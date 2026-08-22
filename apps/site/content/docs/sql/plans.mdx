@@ -32,10 +32,11 @@ fourteen-column table reads two columns' worth of blocks.
 **Join reordering.** Minnow estimates how many rows each side will produce and builds its lookup
 from the smaller side. An equality join can use a table's unique-key lookup instead.
 
-**Decorrelation.** A correlated `EXISTS` or `IN` subquery is rewritten into a semi-join rather than
-executed once per outer row. The two correlated forms that cannot be rewritten this way are
-rejected rather than run row-by-row — see the
-[feature matrix](/docs/sql/feature-matrix).
+**Decorrelation.** A correlated `EXISTS` or `NOT EXISTS` subquery is rewritten into a semi-join or
+anti-join rather than executed once per outer row; both equality and range comparisons take this
+path. Correlated scalar aggregates and `IN` use equality-key joins. Forms whose `NULL` semantics
+cannot be preserved, such as correlated `NOT IN`, are rejected rather than run row by row — see
+the [feature matrix](/docs/sql/feature-matrix).
 
 **Top-N.** `ORDER BY … LIMIT n` keeps only the best `n` rows as it scans instead of sorting the
 whole input, while `n` is under a tenth of the rows scanned. A page deeper than that keeps every

@@ -96,12 +96,14 @@ FROM (
 WHERE rank <= 3
 ```
 
-A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXISTS` all work, and
-correlated `EXISTS` decorrelates into a semi-join rather than executing per row.
+A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXISTS` all work.
+Correlated `EXISTS` and `NOT EXISTS`, including range comparisons such as `inner.amount <
+outer.amount`, decorrelate into semi-joins and anti-joins rather than executing per row.
 
-Two correlated forms are rejected rather than executed slowly: `NOT IN` with a correlated
-subquery, and correlated subqueries joined with anything other than equality. Both would need a
-per-row nested execution, and the error says so instead of quietly taking minutes.
+Correlated scalar aggregates and `IN` require equality correlation. Correlated `NOT IN` is
+rejected because its `NULL` semantics cannot be preserved by that rewrite; use `NOT EXISTS`.
+Minnow reports these boundaries explicitly instead of quietly running a nested query for every
+outer row.
 
 ## Common table expressions
 

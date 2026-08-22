@@ -107,7 +107,8 @@ is gone, and finished maintenance-job records beyond the small diagnostic tail. 
 marker until its last block disappears lets small passes resume a large backlog without
 losing its durable block list. These are record bounds, not just block-byte bounds: normal
 commits, cancelled folds, and crashed readers do not leave one permanent metadata record per
-event.
+event. Segment discovery reads bounded `listSegmentPage()` windows directly, so reclaiming old
+segment and transaction records does not depend on keeping an unbounded compaction-job history.
 
 It runs automatically by default (`autoCollect`, which follows `autoCompact`): a pass after every
 background fold, whose superseded blocks are what a pass reclaims; a pass every 64 commits, since

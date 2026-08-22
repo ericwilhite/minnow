@@ -324,6 +324,10 @@ client turns back into `QueryResult` rows; see [Workers](/docs/engine/workers).
 | `faultPoints, FaultPoint`                                           | The named points: `beforeBlockWrite`, `afterBlockWrite`, `beforeBlockRead`, `afterBlockRead`, `beforeManifestCommit`, `afterManifestCommit`, `beforeTransactionCommit`, `afterTransactionCommit`. |
 | `FaultInjector`                                                     | `(point: FaultPoint) => void \| Promise<void>` — throw to simulate the crash.                                                                                                                     |
 | `class MemoryOpfs`                                                  | An in-memory origin-private file system for Node tests: exclusive sync-access locks with real `DOMException` identities, plus `setWriteFault` for quota and crash injection.                      |
+| `parseSqlLogicTest()` / `parseSqlLogicTestLines()`                  | Strict in-memory and streaming parsers for the original SQLite SQLLogicTest format, with source locations on every record.                                                                        |
+| `runSqlLogicTest()`                                                 | Runs SQLLogicTest records against an adapter and checks types, sorting, hashes, labels, expected errors, and conditional directives.                                                              |
+| `generateSimulationPlan()` / `parseSimulationPlan()`                | Creates or validates a bounded, JSON-serializable deterministic concurrency and fault plan.                                                                                                       |
+| `runSimulation()` / `DeterministicScheduler`                        | Replays the plan through real `MinnowDatabase` clients while choosing storage completions from the seed and checking a reference model plus final storage bounds.                                 |
 
 ## `@minnowdb/devtools`
 

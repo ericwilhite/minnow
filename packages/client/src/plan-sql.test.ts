@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { type CompiledQuery, type Expression, type TableSource } from "@minnowdb/core/plan";
+import {
+  type CompiledQuery,
+  type Expression,
+  type JoinPlan,
+  type TableSource,
+} from "@minnowdb/core/plan";
 import { renderMutationSql, renderPlanSql } from "./plan-sql.js";
 
 function plan(overrides: Partial<CompiledQuery> = {}): CompiledQuery {
@@ -170,6 +175,19 @@ describe("plan to parameterized SQL", () => {
     expect(rendered.sql).toContain("NULLS FIRST");
     expect(rendered.sql).toContain("OFFSET $2 ROWS FETCH FIRST $3 ROWS WITH TIES");
     expect(rendered.params).toEqual([1, 2, 5]);
+  });
+
+  it("refuses to render internal existence joins as ordinary joins", () => {
+    const semiJoin: JoinPlan = {
+      table: "matches",
+      alias: "m",
+      kind: "semi",
+      left: { kind: "column", reference: "i.id" },
+      right: { kind: "column", reference: "m.id" },
+    };
+    expect(() => renderPlanSql(plan({ joins: [semiJoin] }))).toThrow(
+      "Cannot render the optimizer's internal semi-join as equivalent SQL",
+    );
   });
 
   it("renders lowered set and window sources", () => {

@@ -87,7 +87,10 @@ a `.md` twin of every page, the SQL surface as
 
 ```bash
 npm install
-npm run check          # format, typecheck, lint, build, unit tests with coverage floors
+npm test               # unit/generative tests plus 4,198 committed SQLLogicTest queries
+npm run check          # format, types, lint, build, coverage, standard SQLLogicTest
+npm run test:sql:full  # slow exhaustive supported SQL profile; also runs in the release gate
+npm run simulate       # replayable deterministic concurrency, fault, and storage simulation
 npm run site:dev       # the docs site, the console and the benchmarks
 npm run test:browser   # library and site tests in real browsers
 npm run soak           # generative suites on fresh random seeds, to find new failures

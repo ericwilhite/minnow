@@ -1028,7 +1028,7 @@ export class MinnowDatabase {
   readonly #now: () => Date;
   readonly #spillOwnerLeaseMs: number;
   readonly #createId: () => string;
-  readonly #internalLeaseOwnerId = `minnow/${crypto.randomUUID()}`;
+  readonly #internalLeaseOwnerId: string;
   readonly #liveSets = new Set<LiveQuerySet>();
   /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
   readonly #liveProofContexts = new Map<string, Promise<LiveProofContext>>();
@@ -1122,6 +1122,7 @@ export class MinnowDatabase {
     }
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? (() => crypto.randomUUID());
+    this.#internalLeaseOwnerId = `minnow/${this.#createId()}`;
     this.#spillOwnerLeaseMs = options.spillOwnerLeaseMs ?? 60_000;
     if (!Number.isSafeInteger(this.#spillOwnerLeaseMs) || this.#spillOwnerLeaseMs <= 0) {
       throw new RangeError("Spill owner lease lifetime must be a positive whole number");
@@ -6019,6 +6020,18 @@ export class MinnowDatabase {
       return { kind: "drop-trigger", name: statement.name };
     }
     if (statement.kind === "transaction") return this.#runTransactionStatement(statement.action);
+    if (statement.kind === "insert" && statement.columns.length === 0) {
+      const table = await this.#findTable(statement.table);
+      const columns = table.columns.map((column) => column.name);
+      const producedColumns = statement.query?.select.length;
+      if (producedColumns !== undefined && producedColumns !== columns.length) {
+        throw new TypeError("INSERT ... SELECT must produce exactly the table column count");
+      }
+      if (statement.rows.some((row) => row.length !== columns.length)) {
+        throw new TypeError("Each INSERT row must match the table column count");
+      }
+      statement = { ...statement, columns };
+    }
     // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
     if (statement.returning !== undefined && options.returning === undefined) {
       options = { ...options, returning: statement.returning };
@@ -8176,39 +8189,68 @@ export class MinnowDatabase {
           prefixContiguous = false;
           continue;
         }
+        const candidateCapacity = remaining();
         const existing = await this.#existingGarbageBlockCandidates(
           manifest.blockIds,
           currentBlockIds,
-          remaining(),
+          candidateCapacity,
         );
         if (manifest.prunedAt === undefined) {
           // Only an unpruned manifest is a pruning candidate: one already pruned would spend a
           // step's capacity confirming it, and with enough of them in front, the unpruned ones
           // behind them were never reached at all. Their leftover blocks still count.
-          if (candidateManifestVersions.length < 64)
-            candidateManifestVersions.push(manifest.version);
+          // A block candidate must carry persisted provenance in this same job. Once the bounded
+          // manifest list is full, continuing to add blocks from later manifests would make an
+          // unsafe, unreplayable plan; the next pass resumes with those manifests still unpruned.
+          if (candidateManifestVersions.length >= 64) {
+            break walk;
+          }
+          candidateManifestVersions.push(manifest.version);
           prefixContiguous = false;
-        } else if (prefixContiguous && existing.length === 0) {
+        } else if (prefixContiguous && candidateCapacity > 0 && existing.length === 0) {
           deadPrefixEnd = manifest.version;
         } else {
           prefixContiguous = false;
         }
         addBlocks(existing);
-        if (remaining() <= 0) break walk;
+        // A full payload budget must not stop manifest discovery. Earlier pruned tombstones can
+        // name blocks that a later unpruned manifest still roots; stopping here would select the
+        // same retained blocks forever and never reach the manifest whose pruning unlocks them.
+        // existingGarbageBlockCandidates receives a zero limit from here on, so the scan adds no
+        // more payload memory and still stops at the separate 64-manifest bound above.
       }
       manifestCursor = page.nextCursor;
     } while (manifestCursor !== null);
     this.#collectionWatermark = deadPrefixEnd;
 
     if (remaining() > 0) {
-      const segmentOwnerIds = new Set(
-        (await this.store.listSegments()).map((segment) => segment.transactionId),
-      );
+      // Segment records are durable metadata, not reachability roots by themselves. Discover
+      // every record whose blocks are absent from the current manifest, including records left
+      // by terminal compactions whose diagnostic job record has already aged out. The atomic
+      // collection step rechecks older readable manifests, active transactions, and unfinished
+      // compactions before deleting one. Paging keeps recovery from an old backlog bounded.
+      let segmentCursor: string | null = null;
+      do {
+        const page = await this.store.listSegmentPage(segmentCursor, 64);
+        for (const segment of page.records) {
+          const touchesCurrentManifest = Object.values(segment.columnBlockIds).some((ids) =>
+            ids.some((id) => currentBlockIds.has(id)),
+          );
+          if (!touchesCurrentManifest) addSegments([segment.id]);
+          if (remaining() <= 0) break;
+        }
+        if (remaining() <= 0) break;
+        segmentCursor = page.nextCursor;
+      } while (segmentCursor !== null);
+    }
+
+    if (remaining() > 0) {
       const manifestEligibility = new Map<number, boolean>();
       const candidateManifestSet = new Set(candidateManifestVersions);
       let transactionCursor: string | null = null;
       do {
         const page = await this.store.listTransactionPage(transactionCursor, 64);
+        const possiblyUnownedCommittedIds: string[] = [];
         for (const transaction of page.records) {
           if (transaction.status === "aborted") {
             const pendingBlocks = await this.#existingGarbageBlockCandidates(
@@ -8230,7 +8272,6 @@ export class MinnowDatabase {
           } else if (
             transaction.status === "committed" &&
             transaction.committedVersion !== null &&
-            !segmentOwnerIds.has(transaction.id) &&
             remaining() > 0
           ) {
             let eligible = manifestEligibility.get(transaction.committedVersion);
@@ -8240,11 +8281,32 @@ export class MinnowDatabase {
                 manifest === undefined ||
                 manifest.prunedAt !== undefined ||
                 candidateManifestSet.has(transaction.committedVersion);
-              manifestEligibility.set(transaction.committedVersion, eligible);
+              if (manifestEligibility.size < 4_096) {
+                manifestEligibility.set(transaction.committedVersion, eligible);
+              }
             }
-            if (eligible) candidateTransactionIds.push(transaction.id);
+            if (eligible) possiblyUnownedCommittedIds.push(transaction.id);
           }
           if (remaining() <= 0) break;
+        }
+        if (remaining() > 0 && possiblyUnownedCommittedIds.length > 0) {
+          // Do not build an owner set for the whole database. For this bounded transaction
+          // page, stream bounded segment pages and remember only matching owner ids.
+          const owners = new Set<string>();
+          const possibleOwners = new Set(possiblyUnownedCommittedIds);
+          let segmentCursor: string | null = null;
+          do {
+            const segmentPage = await this.store.listSegmentPage(segmentCursor, 64);
+            for (const segment of segmentPage.records) {
+              if (possibleOwners.has(segment.transactionId)) owners.add(segment.transactionId);
+            }
+            if (owners.size === possibleOwners.size) break;
+            segmentCursor = segmentPage.nextCursor;
+          } while (segmentCursor !== null);
+          for (const id of possiblyUnownedCommittedIds) {
+            if (!owners.has(id)) candidateTransactionIds.push(id);
+            if (remaining() <= 0) break;
+          }
         }
         if (remaining() <= 0) break;
         transactionCursor = page.nextCursor;

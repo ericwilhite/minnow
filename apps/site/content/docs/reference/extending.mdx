@@ -146,18 +146,19 @@ const unsupported = matrix.features.filter((entry) => entry.status === "unsuppor
 // each carries: id, the SQL:2023 Annex F feature, an example, and the error it raises
 ```
 
-There are 190 entries, with 176 supported. The engine's tests read this same file, so a change to
+There are 192 entries, with 180 supported. The engine's tests read this same file, so a change to
 the language cannot leave the list quietly out of date.
 
 The gaps most likely to matter to a SQL generator:
 
-| Gap                           | Note                                                                        |
-| ----------------------------- | --------------------------------------------------------------------------- |
-| correlated non-equi `EXISTS`  | correlation must be a plain equality between one inner and one outer column |
-| correlated `NOT IN`           | use `NOT EXISTS`                                                            |
-| `LATERAL` sources             | no operator re-executes a source per row of its left side                   |
-| `ON CONFLICT DO UPDATE SET`   | supported only as `column = EXCLUDED.column`                                |
-| `COLLATE`, sequences, `ARRAY` | absent; the matrix records each with its error                              |
+| Gap                             | Note                                                      |
+| ------------------------------- | --------------------------------------------------------- |
+| correlated non-equi scalar/`IN` | range correlation is currently for `EXISTS`/`NOT EXISTS`  |
+| correlated `NOT IN`             | use `NOT EXISTS`                                          |
+| correlated `EXISTS` below `OR`  | keep it as a top-level `WHERE` conjunct                   |
+| `LATERAL` sources               | no operator re-executes a source per row of its left side |
+| `ON CONFLICT DO UPDATE SET`     | supported only as `column = EXCLUDED.column`              |
+| `COLLATE`, sequences, `ARRAY`   | absent; the matrix records each with its error            |
 
 Every one of these raises an explicit error naming the constraint, so a generator can surface a
 useful message rather than a failure deep in execution.

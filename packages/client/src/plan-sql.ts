@@ -237,6 +237,11 @@ class PlanSqlWriter {
   }
 
   join(join: JoinPlan): string {
+    if (join.kind === "semi" || join.kind === "anti") {
+      throw new TypeError(
+        `Cannot render the optimizer's internal ${join.kind}-join as equivalent SQL`,
+      );
+    }
     const condition =
       join.on === undefined
         ? `(${this.expression(join.left)} = ${this.expression(join.right)})`

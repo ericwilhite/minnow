@@ -54,10 +54,10 @@ for every write path.
 
 ### Not yet, rather than never
 
-Correlated `NOT IN` and correlated subqueries joined with anything other than equality are
-rejected because Minnow cannot rewrite them without changing their meaning. Running them once per
-outer row could also turn an ordinary-looking query into one that takes minutes. `NOT EXISTS` expresses the
-first correctly today.
+Correlated `EXISTS` and `NOT EXISTS` support equality and range comparisons by lowering them to
+semi-joins and anti-joins. Correlated scalar aggregates and `IN` still require equality.
+Correlated `NOT IN` is rejected because its three-valued `NULL` behavior cannot be preserved by
+the available join rewrite; `NOT EXISTS` expresses that intent without a hidden per-row query.
 
 ## Supported
 

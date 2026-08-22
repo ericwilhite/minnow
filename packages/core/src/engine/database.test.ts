@@ -7228,7 +7228,7 @@ for (const implementation of implementations()) {
     store.close();
   });
 
-  it(`${implementation.name} reclaims committed transaction records after their segments and manifests`, async () => {
+  it(`${implementation.name} reclaims segment and transaction metadata after diagnostic compaction history expires`, async () => {
     const store = await implementation.create();
     const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
     await database.createTable({
@@ -7258,6 +7258,10 @@ for (const implementation of implementations()) {
       outputSummary === undefined ? undefined : await store.getSegment(outputSummary.id);
     if (output === undefined) throw new Error("Expected a folded output segment");
 
+    // Segment discovery must not depend on terminal compaction records. Production retains only
+    // a bounded diagnostic tail, which can expire long before an old metadata backlog is swept.
+    for (const job of await store.listCompactionJobs()) await store.removeCompactionJob(job.id);
+
     // The first pass removes the superseded segments. Their owners were structural roots when
     // that pass was planned, so the next pass is the one allowed to nominate the records.
     await database.collectGarbage();
@@ -7265,6 +7269,10 @@ for (const implementation of implementations()) {
     expect(reclaimed.reclaimedTransactionCount).toBeGreaterThanOrEqual(sourceTransactionIds.length);
     for (const id of sourceTransactionIds) expect(await store.getTransaction(id)).toBeUndefined();
     expect(await store.getTransaction(output.transactionId)).toMatchObject({ status: "committed" });
+    expect(await store.listSegments()).toEqual([output]);
+    expect(await store.listTransactions()).toEqual([
+      expect.objectContaining({ id: output.transactionId, status: "committed" }),
+    ]);
     expect(await database.readTable("gc_transaction_records")).toEqual(
       Array.from({ length: 6 }, (_, value) => ({ value })),
     );

@@ -97,6 +97,7 @@ const RPC_METHODS = new Set([
   "addSegment",
   "getSegment",
   "listSegments",
+  "listSegmentPage",
   "removeSegment",
   "reserveRowIds",
   "reserveAutoIncrement",
@@ -165,6 +166,7 @@ const READ_METHODS = new Set([
   "readFtsCandidates",
   "getSegment",
   "listSegments",
+  "listSegmentPage",
   "getExistingUniqueKeys",
   "getCurrentManifest",
   "getCurrentManifestVersion",
@@ -826,6 +828,16 @@ export class OpfsBlockStore implements BlockStore {
 
   async listSegments(tableId?: string): Promise<SegmentRecord[]> {
     return (await this.#dispatch("listSegments", [tableId])) as SegmentRecord[];
+  }
+
+  async listSegmentPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<SegmentRecord, string>> {
+    return (await this.#dispatch("listSegmentPage", [afterId, limit])) as StoragePage<
+      SegmentRecord,
+      string
+    >;
   }
 
   async removeSegment(id: string): Promise<void> {

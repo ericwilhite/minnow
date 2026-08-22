@@ -5,8 +5,9 @@
 # already have, then tags each one. A push that changes no version publishes nothing, and a rerun
 # after a failure is safe, because the registry is what decides — not this workflow's history.
 #
-# It waits for CI rather than repeating it: `workflow_run` fires when the whole gate finishes, and
-# the `conclusion` check means a red build never reaches the registry.
+# It waits for CI rather than repeating the merge gate, then adds the exhaustive SQL and long
+# deterministic-simulator profiles. `workflow_run` fires when CI finishes, and no red or skipped
+# gate can reach the registry.
 name: Release
 
 on:
@@ -28,9 +29,27 @@ permissions:
 concurrency: release
 
 jobs:
+  conformance:
+    name: Release SQL and simulator gate
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:sql:full
+      - run: npm run test:simulator:full
+
   publish:
     name: Publish new versions to npm
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    needs: conformance
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

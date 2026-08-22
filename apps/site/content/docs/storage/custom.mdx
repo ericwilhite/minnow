@@ -58,6 +58,11 @@ small collection passes, so deleting it early can strand part of a large backlog
 file-backed adapter may delete immutable block payloads after logging the resolved step, as the
 toolkit example does.
 
+Maintenance discovery must also stay bounded. `listManifestPage`, `listSegmentPage`,
+`listTransactionPage`, and `listCompactionJobPage` use exclusive cursors so the engine can sweep
+old metadata without materializing the database's complete history. Return records sorted by the
+cursor field and reject a non-positive page limit, matching the interface contract.
+
 **Conflicts use the exported error classes.** Version-check failures throw
 `WriteConflictError`, `TransactionRecordConflictError`, or the matching exported class directly.
 The engine uses those classes to decide when to retry, and the worker client recreates them on the

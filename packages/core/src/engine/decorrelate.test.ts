@@ -96,12 +96,37 @@ describe("correlated subquery decorrelation", () => {
     ).toEqual([{ amount: 10 }, { amount: 6 }, { amount: 3 }]);
   });
 
-  it("rejects non-equality correlation explicitly", () => {
-    expect(() =>
-      compileQuery(
-        "SELECT r.region FROM rows r WHERE EXISTS (SELECT d.region FROM dims d WHERE d.amount > r.amount)",
+  it("answers non-equality correlated EXISTS without multiplying outer rows", () => {
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE EXISTS (SELECT q.amount FROM rows q WHERE q.amount < r.amount)",
       ),
-    ).toThrow("support only equality conditions");
+    ).toEqual([{ amount: 10 }, { amount: 6 }, { amount: 8 }]);
+    expect(
+      run(
+        "SELECT r.amount FROM rows r WHERE NOT EXISTS (SELECT q.amount FROM rows q WHERE r.amount > q.amount)",
+      ),
+    ).toEqual([{ amount: 3 }]);
+  });
+
+  it("combines equality and range correlation in a semi-join", () => {
+    const plan = compileQuery(
+      "SELECT r.amount FROM rows r WHERE EXISTS " +
+        "(SELECT q.amount FROM rows q WHERE q.region = r.region AND q.amount < r.amount)",
+    );
+    expect(plan.joins.at(-1)?.kind).toBe("semi");
+    expect(executeQuery(plan, tables).rows).toEqual([{ amount: 10 }]);
+    expect(executeRowQuery(plan, tables).rows).toEqual([{ amount: 10 }]);
+  });
+
+  it("uses an anti-join for non-equality NOT EXISTS", () => {
+    const plan = compileQuery(
+      "SELECT r.amount FROM rows r WHERE NOT EXISTS " +
+        "(SELECT q.amount FROM rows q WHERE q.amount < r.amount)",
+    );
+    expect(plan.joins.at(-1)?.kind).toBe("anti");
+    expect(executeQuery(plan, tables).rows).toEqual([{ amount: 3 }]);
+    expect(executeRowQuery(plan, tables).rows).toEqual([{ amount: 3 }]);
   });
 
   it("rejects correlated NOT IN with a pointer to NOT EXISTS", () => {

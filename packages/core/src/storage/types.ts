@@ -1191,6 +1191,11 @@ export interface TransactionStore {
   getSegment(id: string): Promise<SegmentRecord | undefined>;
   /** Sorted by id; `tableId` filters. */
   listSegments(tableId?: string): Promise<SegmentRecord[]>;
+  /** Sorted by id, after the exclusive cursor; bounded for maintenance scans. */
+  listSegmentPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<SegmentRecord, string>>;
   removeSegment(id: string): Promise<void>;
 }
 

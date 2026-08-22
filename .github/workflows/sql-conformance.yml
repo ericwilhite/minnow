@@ -1,0 +1,39 @@
+# The slow, exhaustive multi-way join permutations are useful precisely because they are too
+# expensive for every edit. They remain locally runnable and are required by check:release; this
+# schedule catches drift even between releases.
+name: Full SQL conformance
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sqllogictest:
+    name: Full pinned SQLLogicTest profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:sql:full
+
+  simulator:
+    name: Long deterministic simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:simulator:full

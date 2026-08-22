@@ -53,7 +53,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["*.js", "*.ts", "**/*.mjs", "scripts/**/*.mts"],
+    files: ["*.js", "*.ts", "**/*.mjs", "scripts/**/*.{ts,mts}"],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: { globals: { ...globals.node } },
   },
@@ -84,7 +84,7 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // Bundles the built package with esbuild to prove the storage adapters tree-shake.
       "packages/core/src/tree-shaking.test.ts",
-      "scripts/*.mts",
+      "scripts/**/*.{ts,mts}",
     ],
     rules: { "no-restricted-imports": "off" },
   },

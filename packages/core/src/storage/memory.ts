@@ -244,6 +244,10 @@ export class MemoryBlockStore implements BlockStore {
     return this.#core.listSegments(tableId);
   }
 
+  async listSegmentPage(afterId: string | null, limit: number) {
+    return this.#core.listSegmentPage(afterId, limit);
+  }
+
   async removeSegment(id: string): Promise<void> {
     this.#core.removeSegment(id);
   }

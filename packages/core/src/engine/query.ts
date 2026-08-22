@@ -755,7 +755,7 @@ export interface TableSource {
 }
 
 export interface JoinPlan extends TableSource {
-  kind: "inner" | "left";
+  kind: "inner" | "left" | "semi" | "anti";
   left: Expression;
   right: Expression;
   /** General ON condition for non-equi or multi-key joins; left/right are inert placeholders. */
@@ -3621,10 +3621,13 @@ function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]
           evaluateBooleanExpression(condition, (nested) => evaluate(nested, candidate)) === true
         ) {
           matched = true;
-          joined.push(candidate);
+          if (join.kind !== "anti") joined.push(join.kind === "semi" ? context : candidate);
+          if (join.kind === "semi" || join.kind === "anti") break;
         }
       }
-      if (!matched && join.kind === "left") joined.push({ ...context, [join.alias]: undefined });
+      if (!matched && (join.kind === "left" || join.kind === "anti")) {
+        joined.push(join.kind === "anti" ? context : { ...context, [join.alias]: undefined });
+      }
     }
     return joined;
   }
@@ -3650,9 +3653,13 @@ function executeJoin(contexts: RowContext[], join: JoinPlan, rows: DatabaseRow[]
   for (const context of contexts) {
     const leftKey = comparable(evaluate(leftExpression, context));
     const matches = isSqlJoinKey(leftKey) ? (index.get(leftKey) ?? []) : [];
-    if (matches.length === 0 && join.kind === "left")
-      joined.push({ ...context, [join.alias]: undefined });
-    else for (const row of matches) joined.push({ ...context, [join.alias]: row });
+    if (matches.length === 0 && (join.kind === "left" || join.kind === "anti")) {
+      joined.push(join.kind === "anti" ? context : { ...context, [join.alias]: undefined });
+    } else if (matches.length > 0 && join.kind === "semi") {
+      joined.push(context);
+    } else if (join.kind !== "anti") {
+      for (const row of matches) joined.push({ ...context, [join.alias]: row });
+    }
   }
   return joined;
 }
@@ -5038,13 +5045,14 @@ class Parser {
     this.#keyword("INSERT");
     this.#keyword("INTO");
     const table = this.#identifier();
-    this.#expectPunctuation("(");
     const columns: string[] = [];
-    for (;;) {
-      columns.push(this.#identifier());
-      if (!this.#punctuation(",")) break;
+    if (this.#punctuation("(")) {
+      for (;;) {
+        columns.push(this.#identifier());
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
     }
-    this.#expectPunctuation(")");
     if (new Set(columns).size !== columns.length) {
       throw new TypeError("INSERT columns must be unique");
     }
@@ -5053,7 +5061,7 @@ class Parser {
       if (query.select.some((item) => item.expression.kind === "wildcard")) {
         throw new TypeError("INSERT ... SELECT requires an explicit select list");
       }
-      if (query.select.length !== columns.length) {
+      if (columns.length > 0 && query.select.length !== columns.length) {
         throw new TypeError("INSERT ... SELECT must produce exactly the insert column count");
       }
       return {
@@ -5075,7 +5083,7 @@ class Parser {
         if (!this.#punctuation(",")) break;
       }
       this.#expectPunctuation(")");
-      if (values.length !== columns.length) {
+      if (columns.length > 0 && values.length !== columns.length) {
         throw new TypeError("Each INSERT row must match the column list length");
       }
       rows.push(values);
@@ -5765,14 +5773,18 @@ class Parser {
 
   #selectList(): SelectItem[] {
     const items: SelectItem[] = [];
+    const explicitAliases: boolean[] = [];
     for (;;) {
       const expression = this.#expression();
       let alias = defaultAlias(expression);
+      let explicitAlias = false;
       if (this.#isKeyword("AS")) {
         this.#keyword("AS");
         alias = this.#identifier();
+        explicitAlias = true;
       }
       items.push({ expression, alias });
+      explicitAliases.push(explicitAlias);
       if (!this.#punctuation(",")) break;
     }
     if (
@@ -5784,13 +5796,21 @@ class Parser {
       throw new TypeError("SELECT * cannot be mixed with other expressions");
     }
     const aliases = new Set<string>();
-    for (const item of items) {
+    for (const [index, item] of items.entries()) {
       if (item.expression.kind === "list") {
         throw new TypeError("A row constructor is only allowed in a comparison or IN list");
       }
       // A qualified wildcard has no single output name until expansion resolves its columns.
       if (item.expression.kind === "wildcard" && item.expression.table !== undefined) continue;
-      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
+      if (aliases.has(item.alias)) {
+        if (explicitAliases[index] === true) {
+          throw new TypeError(`Duplicate output column: ${item.alias}`);
+        }
+        const base = item.alias;
+        let suffix = 2;
+        while (aliases.has(`${base}_${String(suffix)}`)) suffix++;
+        item.alias = `${base}_${String(suffix)}`;
+      }
       aliases.add(item.alias);
     }
     return items;

@@ -85,8 +85,8 @@ machines: https://minnowdb.com/llms.txt
   (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
   (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
   `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
-  `SET TRANSACTION`, correlated `NOT IN` (use `NOT EXISTS`), and correlated subqueries whose
-  condition is not an equality.
+  `SET TRANSACTION`, correlated `NOT IN` (use `NOT EXISTS`), non-equality correlation in scalar
+  subqueries or `IN`, and correlated `EXISTS` nested below `OR`.
 ```
 
 ## Why those rules

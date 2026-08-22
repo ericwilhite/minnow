@@ -33,6 +33,7 @@ const SUITES: Suite[] = [
     file: "packages/core/src/engine/sql-mutation-conformance.test.ts",
   },
   { name: "differential", file: "packages/core/src/engine/differential.test.ts" },
+  { name: "deterministic-simulator", file: "packages/core/src/testing/simulator.test.ts" },
   { name: "compaction-soak", file: "packages/core/src/engine/compaction-soak.test.ts" },
   {
     name: "auto-compaction-soak",

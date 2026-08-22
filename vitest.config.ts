@@ -8,7 +8,11 @@ export default defineConfig({
     alias: { "@/": `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
   },
   test: {
-    include: ["packages/**/*.test.ts", "apps/site/{lib,bench,components}/**/*.test.ts"],
+    include: [
+      "packages/**/*.test.ts",
+      "scripts/**/*.test.ts",
+      "apps/site/{lib,bench,components}/**/*.test.ts",
+    ],
     /**
      * The heavy tests here drive whole databases over a simulated IndexedDB, and the slowest
      * takes about nine seconds on a developer machine. A hosted runner has two cores, so several

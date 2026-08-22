@@ -132,6 +132,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.listSegments(tableId);
   }
 
+  listSegmentPage(afterId: string | null, limit: number) {
+    return this.inner.listSegmentPage(afterId, limit);
+  }
+
   removeSegment(id: string): Promise<void> {
     return this.inner.removeSegment(id);
   }
@@ -384,3 +388,44 @@ export {
 } from "./block-store-conformance.js";
 
 export { MemoryOpfs, type WriteFault } from "./opfs-shim.js";
+
+export {
+  DeterministicScheduler,
+  generateSimulationPlan,
+  parseSimulationPlan,
+  runSimulation,
+  scheduledBlockStore,
+  type CollectionPassSummary,
+  type SimulationDelete,
+  type SimulationMutation,
+  type SimulationOptions,
+  type SimulationPlan,
+  type SimulationPut,
+  type SimulationResult,
+  type SimulationStep,
+  type SimulationTraceEvent,
+} from "./simulator.js";
+
+export {
+  SqlLogicFailure,
+  SqlLogicParseError,
+  md5Hex,
+  parseSqlLogicTest,
+  parseSqlLogicTestLines,
+  renderSqlLogicValue,
+  runSqlLogicTest,
+  type SqlLogicCondition,
+  type SqlLogicDatabase,
+  type SqlLogicExpectedHash,
+  type SqlLogicExpectedValues,
+  type SqlLogicHalt,
+  type SqlLogicHashThreshold,
+  type SqlLogicLocation,
+  type SqlLogicQuery,
+  type SqlLogicRecord,
+  type SqlLogicRunStatistics,
+  type SqlLogicRunOptions,
+  type SqlLogicSortMode,
+  type SqlLogicStatement,
+  type SqlLogicType,
+} from "./sqllogictest.js";

@@ -8,8 +8,10 @@ import {
   scalarFunctionValue,
   splitCondition,
   type BinaryOperator,
+  type ComparisonOperator,
   type CompiledQuery,
   type Expression,
+  type JoinPlan,
   type Predicate,
   type PredicateOperator,
   type QueryValue,
@@ -345,6 +347,7 @@ function coalesceOrEqualityLists(block: CompiledQuery): void {
 interface CorrelationKey {
   inner: Expression;
   outer: Expression;
+  operator: ComparisonOperator;
 }
 
 const comparisonOperators = new Set(["=", "!=", "<>", ">", ">=", "<", "<="]);
@@ -463,7 +466,7 @@ function decorrelatePredicate(
     if (!blockReferencesOutside(inner)) return undefined;
     rejectGroupedInner(inner, "EXISTS");
     guardWildcard(block);
-    const keys = extractCorrelation(inner, scope, "EXISTS");
+    const keys = extractCorrelation(inner, scope, "EXISTS", true);
     const alias = nextAlias();
     const derived: CompiledQuery = {
       sql: "(correlated exists)",
@@ -477,7 +480,15 @@ function decorrelatePredicate(
       having: [],
       orderBy: [],
     };
-    pushCorrelationJoin(block, alias, derived, keys, negated ? "left" : "inner");
+    const general = keys.some((key) => key.operator !== "=");
+    pushCorrelationJoin(
+      block,
+      alias,
+      derived,
+      keys,
+      general ? (negated ? "anti" : "semi") : negated ? "left" : "inner",
+    );
+    if (general) return "consumed";
     if (!negated) return "consumed";
     return {
       left: { kind: "column", reference: `${alias}.k0` },
@@ -600,7 +611,7 @@ function pushCorrelationJoin(
   alias: string,
   derived: CompiledQuery,
   keys: CorrelationKey[],
-  kind: "inner" | "left",
+  kind: JoinPlan["kind"],
 ): void {
   const source = { table: alias, alias, derived };
   const keyReference = (index: number): Expression => ({
@@ -608,20 +619,22 @@ function pushCorrelationJoin(
     reference: `${alias}.k${String(index)}`,
   });
   const first = keys[0];
-  if (keys.length === 1 && first !== undefined) {
+  if (keys.length === 1 && first?.operator === "=") {
     block.joins.push({ ...source, kind, left: first.outer, right: keyReference(0) });
     return;
   }
   let on: Expression | undefined;
   keys.forEach((key, index) => {
-    const equality: Expression = {
+    const comparison: Expression = {
       kind: "condition",
-      operator: "=",
-      left: key.outer,
-      right: keyReference(index),
+      operator: key.operator,
+      left: keyReference(index),
+      right: key.outer,
     };
     on =
-      on === undefined ? equality : { kind: "logical", operator: "and", left: on, right: equality };
+      on === undefined
+        ? comparison
+        : { kind: "logical", operator: "and", left: on, right: comparison };
   });
   block.joins.push({
     ...source,
@@ -670,12 +683,13 @@ function extractCorrelation(
   inner: CompiledQuery,
   outerScope: ReadonlySet<string>,
   label: string,
+  comparisons = false,
 ): CorrelationKey[] {
   const innerScope = new Set([inner.base.alias, ...inner.joins.map((join) => join.alias)]);
   const keys: CorrelationKey[] = [];
   const kept: Predicate[] = [];
   for (const predicate of inner.predicates) {
-    const key = correlationEquality(predicate, innerScope, outerScope);
+    const key = correlationComparison(predicate, innerScope, outerScope, comparisons);
     if (key === undefined) kept.push(predicate);
     else keys.push(key);
   }
@@ -693,12 +707,19 @@ function extractCorrelation(
   return keys;
 }
 
-function correlationEquality(
+function correlationComparison(
   predicate: Predicate,
   innerScope: ReadonlySet<string>,
   outerScope: ReadonlySet<string>,
+  comparisons: boolean,
 ): CorrelationKey | undefined {
-  if (predicate.operator !== "=") return undefined;
+  if (
+    predicate.operator !== "=" &&
+    (!comparisons || !comparisonOperators.has(predicate.operator))
+  ) {
+    return undefined;
+  }
+  const operator = predicate.operator as ComparisonOperator;
   const { left, right } = predicate;
   if (left.kind !== "column" || right.kind !== "column") return undefined;
   const sideOf = (reference: string): "inner" | "outer" | undefined => {
@@ -712,9 +733,26 @@ function correlationEquality(
   };
   const leftSide = sideOf(left.reference);
   const rightSide = sideOf(right.reference);
-  if (leftSide === "inner" && rightSide === "outer") return { inner: left, outer: right };
-  if (leftSide === "outer" && rightSide === "inner") return { inner: right, outer: left };
+  if (leftSide === "inner" && rightSide === "outer") return { inner: left, outer: right, operator };
+  if (leftSide === "outer" && rightSide === "inner") {
+    return { inner: right, outer: left, operator: reverseComparison(operator) };
+  }
   return undefined;
+}
+
+function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
+  switch (operator) {
+    case ">":
+      return "<";
+    case ">=":
+      return "<=";
+    case "<":
+      return ">";
+    case "<=":
+      return ">=";
+    default:
+      return operator;
+  }
 }
 
 function rejectGroupedInner(inner: CompiledQuery, label: string): void {

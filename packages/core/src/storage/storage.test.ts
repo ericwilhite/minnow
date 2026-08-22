@@ -1076,7 +1076,7 @@ for (const implementation of stores()) {
       store.close();
     });
 
-    it("pages manifests and transactions with stable exclusive cursors", async () => {
+    it("pages manifests, segments, and transactions with stable exclusive cursors", async () => {
       const store = await implementation.create();
       await store.addBlock("page-block", Uint8Array.of(1));
       await store.publishManifest({ expectedVersion: null, blockIds: ["page-block"] });
@@ -1085,6 +1085,18 @@ for (const implementation of stores()) {
       for (const id of ["transaction-c", "transaction-a", "transaction-b"]) {
         await store.createTransaction({ ...activeTransaction(id), snapshotVersion: 2 });
       }
+      for (const id of ["segment-c", "segment-a", "segment-b"]) {
+        await store.addSegment({
+          id,
+          tableId: "page-table",
+          transactionId: "transaction-a",
+          rowCount: 1,
+          rowIdStart: 1n,
+          rowIdEndExclusive: 2n,
+          columnBlockIds: { value: ["page-block"] },
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+      }
 
       const firstManifests = await store.listManifestPage(null, 2);
       expect(firstManifests.records.map((manifest) => manifest.version)).toEqual([0, 1]);
@@ -1092,6 +1104,16 @@ for (const implementation of stores()) {
       const finalManifests = await store.listManifestPage(firstManifests.nextCursor, 2);
       expect(finalManifests.records.map((manifest) => manifest.version)).toEqual([2]);
       expect(finalManifests.nextCursor).toBeNull();
+
+      const firstSegments = await store.listSegmentPage(null, 2);
+      expect(firstSegments.records.map((segment) => segment.id)).toEqual([
+        "segment-a",
+        "segment-b",
+      ]);
+      expect(firstSegments.nextCursor).toBe("segment-b");
+      const finalSegments = await store.listSegmentPage(firstSegments.nextCursor, 2);
+      expect(finalSegments.records.map((segment) => segment.id)).toEqual(["segment-c"]);
+      expect(finalSegments.nextCursor).toBeNull();
 
       const firstTransactions = await store.listTransactionPage(null, 2);
       expect(firstTransactions.records.map((transaction) => transaction.id)).toEqual([
@@ -1105,6 +1127,7 @@ for (const implementation of stores()) {
       ]);
       expect(finalTransactions.nextCursor).toBeNull();
       await expect(store.listManifestPage(null, 0)).rejects.toThrow("positive whole number");
+      await expect(store.listSegmentPage(null, 0)).rejects.toThrow("positive whole number");
       store.close();
     });
 
@@ -3063,6 +3086,42 @@ for (const implementation of stores()) {
       expect(result.retainedBlockIds).toEqual([`${prefix}/old-block`]);
       expect(await store.getSegment(`${prefix}/uncheckpointed-segment`)).toBeDefined();
       expect(await store.getBlock(`${prefix}/old-block`)).toBeDefined();
+      store.close();
+    });
+
+    it("does not turn a wide segment dependency set into a permanent garbage root", async () => {
+      const store = await implementation.create();
+      const segmentId = "wide-orphan-segment";
+      await store.addSegment({
+        id: segmentId,
+        tableId: "events",
+        transactionId: "finished-owner",
+        rowCount: 1,
+        rowIdStart: 1n,
+        rowIdEndExclusive: 2n,
+        columnBlockIds: {
+          value: Array.from({ length: 4_097 }, (_, index) => `gone-${String(index)}`),
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const job = await store.createGarbageCollectionJob({
+        id: "wide-orphan-gc",
+        candidateManifestVersions: [],
+        candidateSegmentIds: [segmentId],
+        candidateBlockIds: [],
+        leaseCutoff: "2026-01-01T00:10:00.000Z",
+        createdAt: "2026-01-01T00:02:00.000Z",
+      });
+
+      const result = await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: job.revision,
+        maxItems: 1,
+        updatedAt: "2026-01-01T00:03:00.000Z",
+      });
+
+      expect(result.reclaimedSegmentIds).toEqual([segmentId]);
+      expect(await store.getSegment(segmentId)).toBeUndefined();
       store.close();
     });
 

@@ -23,6 +23,15 @@ FROM orders
 WHERE placed_at < TIMESTAMP '2024-01-01'
 ```
 
+The column list may be omitted when every table column is supplied in declaration order:
+
+```sql
+INSERT INTO shipments VALUES ('A-1', 1, CURRENT_TIMESTAMP)
+```
+
+The value count must then equal the table's full column count. Prefer an explicit list in
+application code so a later schema change cannot silently change the positional meaning.
+
 Columns you leave out are written as `NULL`, so a nullable column can simply be omitted. A
 `NOT NULL` column without a value or a default is an error.
 

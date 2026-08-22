@@ -845,6 +845,14 @@ export class OpfsLeader {
     return this.#core.listSegments(tableId);
   }
 
+  async listSegmentPage(
+    afterId: string | null,
+    limit: number,
+  ): Promise<StoragePage<SegmentRecord, string>> {
+    await this.#healthy();
+    return this.#core.listSegmentPage(afterId, limit);
+  }
+
   async getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]> {
     await this.#healthy();
     return this.#core.getExistingUniqueKeys(tableId, keyTokens);

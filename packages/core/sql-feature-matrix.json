@@ -270,6 +270,13 @@
       "notes": "Through execute(); query() stays read-only."
     },
     {
+      "id": "mutation.insert-values-implicit-columns",
+      "feature": "E101-01",
+      "status": "supported",
+      "example": "INSERT INTO keyed VALUES ('z', 2, NULL)",
+      "notes": "When the column list is omitted, VALUES must supply every table column in declaration order."
+    },
+    {
       "id": "mutation.update-keyed",
       "feature": "E101-03",
       "status": "supported",
@@ -421,7 +428,7 @@
       "feature": "E061-08",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE EXISTS (SELECT 1 FROM dims)",
-      "notes": "Uncorrelated EXISTS only; correlated references still fail as unknown aliases."
+      "notes": "Both uncorrelated and correlated EXISTS are supported. Correlated forms are decorrelated into joins rather than executed once per outer row."
     },
     {
       "id": "expression.case",
@@ -453,10 +460,9 @@
     {
       "id": "subquery.correlated-non-equi",
       "feature": "E061-13",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows r WHERE EXISTS (SELECT region FROM dims d WHERE d.amount > r.amount)",
-      "error": "support only equality conditions",
-      "notes": "Correlation must be a plain equality between one inner and one outer qualified column."
+      "status": "supported",
+      "example": "SELECT r.amount FROM rows r WHERE EXISTS (SELECT q.amount FROM rows q WHERE q.amount < r.amount)",
+      "notes": "Non-equality EXISTS and NOT EXISTS correlations lower to semi-joins and anti-joins; correlated scalar aggregates and IN remain equality-only."
     },
     {
       "id": "subquery.correlated-not-in",

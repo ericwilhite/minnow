@@ -711,6 +711,20 @@ export class IndexedDbBlockStore implements BlockStore {
     return records.sort((left, right) => left.id.localeCompare(right.id));
   }
 
+  async listSegmentPage(afterId: string | null, limit: number) {
+    validatePageLimit(limit);
+    const transaction = this.#transaction("segments", "readonly");
+    const records = await readCursorPage(
+      transaction.objectStore("segments"),
+      limit,
+      asSegmentRecord,
+      (key) => typeof key === "string" && (afterId === null || key > afterId),
+      afterId ?? undefined,
+    );
+    await transactionDone(transaction);
+    return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
+  }
+
   async removeSegment(id: string): Promise<void> {
     const transaction = this.#transaction("segments", "readwrite");
     transaction.objectStore("segments").delete(id);
@@ -903,6 +917,7 @@ export class IndexedDbBlockStore implements BlockStore {
       limit,
       asStoredManifestRecord,
       (key) => typeof key === "number" && (afterVersion === null || key > afterVersion),
+      afterVersion ?? undefined,
     );
     // Resolve the first record by chain walk, then advance the same set across the page.
     const records: Manifest[] = [];
@@ -1059,6 +1074,7 @@ export class IndexedDbBlockStore implements BlockStore {
       limit,
       asTransactionRecord,
       (key) => typeof key === "string" && (afterId === null || key > afterId),
+      afterId ?? undefined,
     );
     await transactionDone(transaction);
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
@@ -1971,6 +1987,7 @@ export class IndexedDbBlockStore implements BlockStore {
         typeof key === "string" &&
         key.startsWith(COMPACTION_JOB_KEY_PREFIX) &&
         (afterId === null || key > compactionJobKey(afterId)),
+      afterId === null ? COMPACTION_JOB_KEY_PREFIX : compactionJobKey(afterId),
     );
     await transactionDone(transaction);
     return { records, nextCursor: records.length === limit ? (records.at(-1)?.id ?? null) : null };
@@ -2724,10 +2741,12 @@ function readCursorPage<T>(
   limit: number,
   decode: (value: unknown) => T,
   acceptKey: (key: IDBValidKey) => boolean,
+  seekKey?: string | number,
 ): Promise<T[]> {
   return new Promise((resolve, reject) => {
     const records: T[] = [];
     const request = store.openCursor();
+    let seekPending = seekKey !== undefined;
     request.onerror = () => reject(request.error ?? new Error("IndexedDB cursor failed"));
     request.onsuccess = () => {
       const cursor = request.result;
@@ -2736,6 +2755,13 @@ function readCursorPage<T>(
         return;
       }
       try {
+        if (seekPending) {
+          seekPending = false;
+          if (cursor.key < (seekKey ?? cursor.key)) {
+            cursor.continue(seekKey);
+            return;
+          }
+        }
         if (acceptKey(cursor.key)) records.push(decode(cursor.value));
         if (records.length === limit) resolve(records);
         else cursor.continue();
@@ -3159,15 +3185,11 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
   job: GarbageCollectionJobRecord,
 ): Promise<void> {
   const manifestStore = transaction.objectStore("manifests");
-  const candidateManifestBlockIds: Array<Set<string>> = [];
   for (const version of job.candidateManifestVersions) {
     const value: unknown = await requestResult(manifestStore.get(version));
     if (value === undefined) {
       throw new Error(`Garbage collection candidate manifest is missing: ${String(version)}`);
     }
-    candidateManifestBlockIds.push(
-      await resolveManifestBlockSetInTransaction(manifestStore, asStoredManifestRecord(value)),
-    );
   }
   for (const id of job.candidateTransactionIds) {
     const value: unknown = await requestResult(transaction.objectStore("transactions").get(id));
@@ -3180,8 +3202,20 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
       throw new Error(`Garbage collection transaction candidate is not terminal: ${id}`);
     }
   }
+  const candidateBlockIds = new Set(job.candidateBlockIds);
+  const manifestProvenBlockIds = new Set<string>();
+  await visitObjectStoreSequentially(manifestStore, (value) => {
+    const record = asStoredManifestRecord(value);
+    for (const id of record.blockIds ?? []) {
+      if (candidateBlockIds.has(id)) manifestProvenBlockIds.add(id);
+    }
+    for (const id of record.addedBlockIds ?? []) {
+      if (candidateBlockIds.has(id)) manifestProvenBlockIds.add(id);
+    }
+    return manifestProvenBlockIds.size === candidateBlockIds.size;
+  });
   const blockHasProvenance = async (id: string): Promise<boolean> => {
-    if (candidateManifestBlockIds.some((blockIds) => blockIds.has(id))) return true;
+    if (manifestProvenBlockIds.has(id)) return true;
     const transactionProven = await visitObjectStoreSequentially(
       transaction.objectStore("transactions"),
       (value) => {
@@ -3204,39 +3238,8 @@ async function assertGarbageCollectionCandidateProvenanceInTransaction(
     throw new Error(`Garbage collection block candidate has no persisted provenance: ${id}`);
   }
   for (const id of job.candidateSegmentIds) {
-    let proven = await visitObjectStoreSequentially(
-      transaction.objectStore("transactions"),
-      (value) => {
-        const record = asTransactionRecord(value);
-        return record.status === "aborted" && record.pendingSegmentIds.includes(id);
-      },
-    );
-    if (!proven) {
-      proven = await visitObjectStoreSequentially(transaction.objectStore("gc"), (value) => {
-        if (!isCompactionJobEnvelope(value)) return false;
-        const record = asCompactionJobEnvelope(value);
-        return (
-          isTerminalCompactionJob(record) &&
-          (record.sourceSegmentIds.includes(id) || record.outputSegmentId === id)
-        );
-      });
-    }
-    if (!proven) {
-      const segmentValue: unknown = await requestResult(
-        transaction.objectStore("segments").get(id),
-      );
-      if (segmentValue !== undefined) {
-        const blockIds = segmentBlockIds(asSegmentRecord(segmentValue));
-        proven = blockIds.length > 0;
-        for (const blockId of blockIds) {
-          if (!(await blockHasProvenance(blockId))) {
-            proven = false;
-            break;
-          }
-        }
-      }
-    }
-    if (proven) continue;
+    const segmentValue: unknown = await requestResult(transaction.objectStore("segments").get(id));
+    if (segmentValue !== undefined) continue;
     throw new Error(`Garbage collection segment candidate has no persisted provenance: ${id}`);
   }
 }
@@ -3287,8 +3290,6 @@ async function isManifestVersionPinnedInTransaction(
   });
 }
 
-const MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES = 4_096;
-
 async function collectBoundedPhysicalRootsInTransaction(
   transaction: IDBTransaction,
   candidateSegmentIds: readonly string[],
@@ -3297,94 +3298,88 @@ async function collectBoundedPhysicalRootsInTransaction(
 ): Promise<{ blockIds: Set<string>; segmentIds: Set<string> }> {
   const candidateSegments = new Set(candidateSegmentIds);
   const candidateBlocks = new Set(candidateBlockIds);
-  const probeBlockIds = new Set(candidateBlockIds);
-  const probeSegmentIds = new Set(candidateSegmentIds);
-  const relatedSegments = new Map<string, SegmentRecord>();
-  const dependencyOverflow = await visitObjectStoreSequentially(
-    transaction.objectStore("segments"),
-    (value) => {
-      const segment = asSegmentRecord(value);
-      const ids = segmentBlockIds(segment);
-      if (!candidateSegments.has(segment.id) && !ids.some((id) => candidateBlocks.has(id))) return;
-      const newBlockIds = new Set(ids.filter((id) => !probeBlockIds.has(id)));
-      if (
-        relatedSegments.size >= MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES ||
-        probeBlockIds.size + newBlockIds.size > MAX_GARBAGE_COLLECTION_ROOT_DEPENDENCIES
-      ) {
-        return true;
-      }
-      relatedSegments.set(segment.id, segment);
-      probeSegmentIds.add(segment.id);
-      ids.forEach((id) => probeBlockIds.add(id));
-      return false;
-    },
-  );
-  if (dependencyOverflow) {
-    return { blockIds: new Set(candidateBlockIds), segmentIds: new Set(candidateSegmentIds) };
-  }
-
-  const directBlockRoots = new Set<string>();
   const directSegmentRoots = new Set<string>();
-  // One ascending pass resolves every manifest with a running set (pruned records still apply
-  // their deltas so the chain stays coherent); a probed block roots when it is a member at any
-  // version that still counts.
-  {
-    const running = new Set<string>();
-    const unrooted = new Set(probeBlockIds);
-    await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value) => {
-      const record = asStoredManifestRecord(value);
-      applyManifestRecord(running, record);
-      if (record.prunedAt !== undefined || newlyPrunedVersions.has(record.version)) return;
-      if (unrooted.size === 0) return true;
-      for (const id of unrooted) {
-        if (running.has(id)) {
-          directBlockRoots.add(id);
-          unrooted.delete(id);
-        }
-      }
-      return false;
-    });
-  }
-
-  const ownerTransactionIds = new Set(
-    [...relatedSegments.values()].map((segment) => segment.transactionId),
-  );
-  const activeOwnerTransactionIds = new Set<string>();
   await visitObjectStoreSequentially(transaction.objectStore("transactions"), (value) => {
     const record = asTransactionRecord(value);
     if (record.status !== "active") return;
-    if (ownerTransactionIds.has(record.id)) activeOwnerTransactionIds.add(record.id);
-    for (const id of record.pendingBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
     for (const id of record.pendingSegmentIds)
-      if (probeSegmentIds.has(id)) directSegmentRoots.add(id);
+      if (candidateSegments.has(id)) directSegmentRoots.add(id);
   });
   await visitObjectStoreSequentially(transaction.objectStore("gc"), (value) => {
     if (!isCompactionJobEnvelope(value)) return;
     const job = asCompactionJobEnvelope(value);
     if (isTerminalCompactionJob(job)) return;
-    for (const id of job.sourceBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
-    for (const id of job.outputBlockIds) if (probeBlockIds.has(id)) directBlockRoots.add(id);
-    for (const id of job.sourceSegmentIds) if (probeSegmentIds.has(id)) directSegmentRoots.add(id);
-    if (job.outputSegmentId !== null && probeSegmentIds.has(job.outputSegmentId)) {
+    for (const id of job.sourceSegmentIds)
+      if (candidateSegments.has(id)) directSegmentRoots.add(id);
+    if (job.outputSegmentId !== null && candidateSegments.has(job.outputSegmentId)) {
       directSegmentRoots.add(job.outputSegmentId);
     }
   });
 
+  // A dependency fan-out must never become a permanent root. Probe one id at a time after a
+  // small bounded cache fills: this trades extra IndexedDB cursor work for fixed working memory
+  // on unusually wide segments while preserving exact reachability.
+  const directBlockRootCache = new Map<string, boolean>();
+  const isDirectBlockRoot = async (id: string): Promise<boolean> => {
+    const cached = directBlockRootCache.get(id);
+    if (cached !== undefined) return cached;
+    let rooted = await visitObjectStoreSequentially(
+      transaction.objectStore("transactions"),
+      (value) => {
+        const record = asTransactionRecord(value);
+        return record.status === "active" && record.pendingBlockIds.includes(id);
+      },
+    );
+    if (!rooted) {
+      rooted = await visitObjectStoreSequentially(transaction.objectStore("gc"), (value) => {
+        if (!isCompactionJobEnvelope(value)) return false;
+        const job = asCompactionJobEnvelope(value);
+        return (
+          !isTerminalCompactionJob(job) &&
+          (job.sourceBlockIds.includes(id) || job.outputBlockIds.includes(id))
+        );
+      });
+    }
+    if (!rooted) {
+      let present = false;
+      rooted = await visitObjectStoreSequentially(transaction.objectStore("manifests"), (value) => {
+        const record = asStoredManifestRecord(value);
+        if (record.blockIds !== undefined) present = record.blockIds.includes(id);
+        else {
+          if (record.removedBlockIds?.includes(id) === true) present = false;
+          if (record.addedBlockIds?.includes(id) === true) present = true;
+        }
+        return present && record.prunedAt === undefined && !newlyPrunedVersions.has(record.version);
+      });
+    }
+    if (directBlockRootCache.size < 4_096) directBlockRootCache.set(id, rooted);
+    return rooted;
+  };
+
   const rootedBlockIds = new Set<string>();
   const rootedSegmentIds = new Set<string>();
-  for (const segment of relatedSegments.values()) {
+  const segmentStore = transaction.objectStore("segments");
+  const transactionStore = transaction.objectStore("transactions");
+  for (const id of candidateSegmentIds) {
+    const value: unknown = await requestResult(segmentStore.get(id));
+    if (value === undefined) continue;
+    const segment = asSegmentRecord(value);
     const ids = segmentBlockIds(segment);
-    if (
-      directSegmentRoots.has(segment.id) ||
-      activeOwnerTransactionIds.has(segment.transactionId) ||
-      (ids.length > 0 && ids.every((id) => directBlockRoots.has(id)))
-    ) {
-      if (candidateSegments.has(segment.id)) rootedSegmentIds.add(segment.id);
-      for (const id of ids) if (candidateBlocks.has(id)) rootedBlockIds.add(id);
+    const ownerValue: unknown = await requestResult(transactionStore.get(segment.transactionId));
+    const owner = ownerValue === undefined ? undefined : asTransactionRecord(ownerValue);
+    let allBlocksRooted = ids.length > 0;
+    for (const blockId of ids) {
+      if (await isDirectBlockRoot(blockId)) continue;
+      allBlocksRooted = false;
+      break;
+    }
+    if (directSegmentRoots.has(segment.id) || owner?.status === "active" || allBlocksRooted) {
+      rootedSegmentIds.add(segment.id);
+      for (const blockId of ids) if (candidateBlocks.has(blockId)) rootedBlockIds.add(blockId);
     }
   }
-  for (const id of candidateBlockIds) if (directBlockRoots.has(id)) rootedBlockIds.add(id);
-  for (const id of candidateSegmentIds) if (directSegmentRoots.has(id)) rootedSegmentIds.add(id);
+  for (const id of candidateBlockIds) if (await isDirectBlockRoot(id)) rootedBlockIds.add(id);
+  for (const id of directSegmentRoots) rootedSegmentIds.add(id);
   return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
 }
 

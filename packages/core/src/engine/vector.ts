@@ -339,7 +339,7 @@ interface DictionaryLike {
 }
 
 interface BoundJoin {
-  readonly kind: "inner" | "left";
+  readonly kind: "inner" | "left" | "semi" | "anti";
   readonly buildSource: number;
   readonly probe: BoundExpression;
   readonly build: BoundExpression;
@@ -1387,7 +1387,7 @@ function expressionSources(expression: BoundExpression): Set<number> {
 }
 
 function createBoundJoin(
-  kind: "inner" | "left",
+  kind: BoundJoin["kind"],
   buildSource: number,
   probe: BoundExpression,
   build: BoundExpression,
@@ -2992,10 +2992,15 @@ function* joinBatches(
       const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
       let buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
       if (buildRow < 0) {
-        if (join.kind === "left") {
+        if (join.kind === "left" || join.kind === "anti") {
           appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, -1);
           outputLength += 1;
         }
+      } else if (join.kind === "semi") {
+        appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, buildRow);
+        outputLength += 1;
+      } else if (join.kind === "anti") {
+        // A match excludes the probe row.
       } else {
         while (buildRow >= 0) {
           appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, buildRow);
@@ -3079,11 +3084,14 @@ function* loopJoinBatches(
           booleanTruth(loop.condition, (nested) => evaluateExpression(nested, scratch)) === true;
         if (!holds) continue;
         matched = true;
-        appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, buildRow);
-        outputLength += 1;
-        if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
+        if (join.kind !== "anti") {
+          appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, buildRow);
+          outputLength += 1;
+          if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
+        }
+        if (join.kind === "semi" || join.kind === "anti") break;
       }
-      if (!matched && join.kind === "left") {
+      if (!matched && (join.kind === "left" || join.kind === "anti")) {
         appendJoinedRow(ensureOutput(), outputLength, input, row, join.buildSource, -1);
         outputLength += 1;
         if (outputLength === DEFAULT_BATCH_ROWS) yield* emit();
@@ -3144,18 +3152,28 @@ function joinUniqueBatch(
             cache[code] = buildRow;
           }
         }
-        if (buildRow < 0 && join.kind === "inner") continue;
+        if (
+          (buildRow < 0 && (join.kind === "inner" || join.kind === "semi")) ||
+          (buildRow >= 0 && join.kind === "anti")
+        ) {
+          continue;
+        }
         selectedRows[outputLength] = row;
-        buildRows[outputLength] = buildRow;
+        buildRows[outputLength] = join.kind === "anti" ? -1 : buildRow;
         outputLength += 1;
       }
     } else {
       for (let row = 0; row < input.length; row += 1) {
         const probeKey = evaluateBatchExpression(plan, join.probe, input, row);
         const buildRow = probeKey === null ? -1 : join.lookup.firstRow(probeKey);
-        if (buildRow < 0 && join.kind === "inner") continue;
+        if (
+          (buildRow < 0 && (join.kind === "inner" || join.kind === "semi")) ||
+          (buildRow >= 0 && join.kind === "anti")
+        ) {
+          continue;
+        }
         selectedRows[outputLength] = row;
-        buildRows[outputLength] = buildRow;
+        buildRows[outputLength] = join.kind === "anti" ? -1 : buildRow;
         outputLength += 1;
       }
     }
