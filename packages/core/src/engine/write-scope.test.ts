@@ -678,6 +678,12 @@ describe("atomic write scopes", () => {
   it("poisons a caught multi-stage SQL failure instead of committing its first half", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.createTable({
+      name: "allowed_required",
+      uniqueKey: "value",
+      columns: [{ name: "value", type: "string" }],
+    });
+    await database.insertBatch("allowed_required", [{ value: "kept" }]);
+    await database.createTable({
       name: "items",
       uniqueKey: "id",
       columns: [
@@ -686,6 +692,15 @@ describe("atomic write scopes", () => {
         { name: "score", type: "number" },
         { name: "note", type: "string", nullable: true },
       ],
+      foreignKeys: [
+        {
+          name: "items_required_fkey",
+          column: "required",
+          parentTable: "allowed_required",
+          parentColumn: "value",
+          onDelete: "restrict",
+        },
+      ],
     });
     await database.insertBatch("items", [{ id: 1, required: "kept", score: 1, note: null }]);
 
@@ -693,7 +708,8 @@ describe("atomic write scopes", () => {
       database.write(async (tx) => {
         await tx
           .execute(
-            "INSERT INTO items (id, score, note) VALUES (1, 9, 'changed'), (2, 3, 'new') " +
+            "INSERT INTO items (id, required, score, note) VALUES " +
+              "(1, 'kept', 9, 'changed'), (2, 'missing-parent', 3, 'new') " +
               "ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score",
           )
           .catch(() => undefined);

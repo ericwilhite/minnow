@@ -161,6 +161,10 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.writeFtsBase(tableId, columnId, input);
   }
 
+  removeFtsColumn(tableId: string, columnId: string): Promise<void> {
+    return this.inner.removeFtsColumn(tableId, columnId);
+  }
+
   readFtsCandidates(
     tableId: string,
     columnId: string,

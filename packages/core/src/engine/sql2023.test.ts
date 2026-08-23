@@ -1109,6 +1109,50 @@ describe("E141/F031 schema statements", () => {
     });
   });
 
+  it("rejects values an SQL integer domain cannot represent exactly", async () => {
+    const database = await fresh();
+    await database.execute(
+      "CREATE TABLE exact_ids (id BIGINT PRIMARY KEY, qty INTEGER NOT NULL, ratio REAL NOT NULL)",
+    );
+    await database.execute("INSERT INTO exact_ids VALUES (9007199254740991, 2, 1.5)");
+    await expect(
+      database.insertBatch("exact_ids", [{ id: Number.MAX_SAFE_INTEGER + 1, qty: 2, ratio: 1.5 }]),
+    ).rejects.toThrow("id[0] must be a safe integer");
+    await expect(
+      database.insertBatch("exact_ids", [{ id: 2, qty: 1.25, ratio: 1.5 }]),
+    ).rejects.toThrow("qty[0] must be a safe integer");
+    await expect(database.query("SELECT 9007199254740993 AS rounded")).rejects.toThrow(
+      "Integer literal is outside the exact safe range",
+    );
+    await expect(database.query("SELECT CAST('9007199254740993' AS BIGINT)")).rejects.toThrow(
+      "Integer cast is outside the exact safe range",
+    );
+    expect((await database.introspect()).tables[0]?.columns).toMatchObject([
+      { name: "id", type: "number", integer: true },
+      { name: "qty", type: "number", integer: true },
+      { name: "ratio", type: "number" },
+    ]);
+    await database.execute("CREATE TABLE copied_ids AS SELECT id FROM exact_ids");
+    await database.execute("CREATE VIEW visible_ids AS SELECT id FROM exact_ids");
+    const records = await database.listTables();
+    expect(records.find(({ name }) => name === "copied_ids")?.columns[0]?.integer).toBe(true);
+    expect(records.find(({ name }) => name === "visible_ids")?.columns[0]?.integer).toBe(true);
+    await expect(
+      database.insertBatch("copied_ids", [{ id: Number.MAX_SAFE_INTEGER + 1 }]),
+    ).rejects.toThrow("id[0] must be a safe integer");
+  });
+
+  it("rejects exact numeric declarations until they have exact storage semantics", async () => {
+    const database = await fresh();
+    const error = "Exact NUMERIC and DECIMAL are not supported yet";
+    await expect(
+      database.execute("CREATE TABLE money (id INTEGER PRIMARY KEY, amount DECIMAL(12, 2))"),
+    ).rejects.toThrow(error);
+    await expect(database.query("SELECT CAST(1.25 AS NUMERIC(12, 2)) AS amount")).rejects.toThrow(
+      error,
+    );
+  });
+
   it("adds a column to an existing table (F031-04)", async () => {
     const database = await fresh();
     await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)");
@@ -1127,6 +1171,78 @@ describe("E141/F031 schema statements", () => {
     await expect(
       database.execute("ALTER TABLE t ADD COLUMN flag BOOLEAN NOT NULL"),
     ).rejects.toThrow("adds a nullable column");
+  });
+
+  it("drops an independent column without rewriting surviving rows (F031)", async () => {
+    const database = await fresh();
+    await database.execute(
+      "CREATE TABLE receipts (id INTEGER PRIMARY KEY, total INTEGER NOT NULL, note TEXT)",
+    );
+    await database.execute("INSERT INTO receipts VALUES (1, 25, 'cash')");
+    await expect(
+      database.execute("ALTER TABLE receipts DROP COLUMN note RESTRICT"),
+    ).resolves.toEqual({ kind: "drop-column", table: "receipts", column: "note", dropped: true });
+    expect((await database.query("SELECT id, total FROM receipts")).rows).toEqual([
+      { id: 1, total: 25 },
+    ]);
+    await expect(database.query("SELECT note FROM receipts")).rejects.toThrow(
+      "Ambiguous or missing column: note",
+    );
+    await expect(
+      database.execute("ALTER TABLE receipts DROP COLUMN IF EXISTS note"),
+    ).resolves.toMatchObject({ kind: "drop-column", dropped: false });
+    await expect(
+      database.execute("ALTER TABLE receipts DROP COLUMN total CASCADE"),
+    ).rejects.toThrow("DROP COLUMN CASCADE is not supported");
+  });
+
+  it("refuses to drop a column while any catalog object still depends on it", async () => {
+    const database = await fresh();
+    await database.execute(
+      "CREATE TABLE guarded (id INTEGER PRIMARY KEY, qty INTEGER CHECK (qty > 0), note TEXT)",
+    );
+    await database.execute("CREATE VIEW guarded_notes AS SELECT note FROM guarded");
+    await expect(database.execute("ALTER TABLE guarded DROP COLUMN id")).rejects.toThrow(
+      "The unique key cannot be dropped",
+    );
+    await expect(database.execute("ALTER TABLE guarded DROP COLUMN qty")).rejects.toThrow(
+      "CHECK guarded_qty_check still uses this column",
+    );
+    await expect(database.execute("ALTER TABLE guarded DROP COLUMN note")).rejects.toThrow(
+      "view guarded_notes reads it",
+    );
+    await database.execute("DROP VIEW guarded_notes");
+    await database.execute("CREATE TABLE audit (message TEXT)");
+    await database.execute(
+      "CREATE TRIGGER copy_guarded AFTER INSERT ON guarded BEGIN INSERT INTO audit (message) VALUES (NEW.note); END",
+    );
+    await expect(database.execute("ALTER TABLE guarded DROP COLUMN note")).rejects.toThrow(
+      "trigger copy_guarded references it",
+    );
+    await database.execute("CREATE TABLE one_column (only_value TEXT)");
+    await expect(database.execute("ALTER TABLE one_column DROP COLUMN only_value")).rejects.toThrow(
+      "last column cannot be dropped",
+    );
+  });
+
+  it("removes a dropped column's persisted full-text data", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.execute("CREATE TABLE articles (title TEXT, body TEXT)");
+    await database.execute("INSERT INTO articles VALUES ('alpha', 'kept')");
+    await database.buildFtsIndex("articles", "title");
+    const table = await store.getTableByName("articles");
+    const title = table?.columns.find(({ name }) => name === "title");
+    expect(table?.ftsColumns?.[title?.id ?? ""]?.state).toBe("ready");
+    await database.execute("ALTER TABLE articles DROP COLUMN title");
+    expect(
+      await store.readFtsCandidates(
+        table?.id ?? "",
+        title?.id ?? "",
+        [{ term: "alpha", prefix: false }],
+        Number.MAX_SAFE_INTEGER,
+      ),
+    ).toMatchObject({ rowIdsByTerm: [[]], deltaChunkCount: 0, coversVersion: -1 });
   });
 
   it("creates a table from a query (T172)", async () => {

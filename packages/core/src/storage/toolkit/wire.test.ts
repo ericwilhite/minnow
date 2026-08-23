@@ -84,6 +84,15 @@ describe("synchronous checkpoint slots", () => {
       start: 45n,
       endExclusive: 46n,
     });
+
+    const beforeInvalidLoad = reloaded.dump();
+    const invalid = structuredClone(dumped);
+    const column = invalid.tables[0]?.columns[0];
+    if (column === undefined) throw new Error("Missing test column");
+    column.type = "string";
+    column.integer = true;
+    expect(() => reloaded.load(invalid)).toThrow(/Integer domain requires a number column: id/);
+    expect(reloaded.dump()).toEqual(beforeInvalidLoad);
   });
 
   it("rejects a corrupted or torn slot", () => {

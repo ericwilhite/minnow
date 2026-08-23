@@ -212,6 +212,12 @@ export class MemoryBlockStore implements BlockStore {
     });
   }
 
+  async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
+    return this.#runAtomic(() => {
+      this.#core.removeFtsColumn(tableId, columnId);
+    });
+  }
+
   async readFtsCandidates(
     tableId: string,
     columnId: string,

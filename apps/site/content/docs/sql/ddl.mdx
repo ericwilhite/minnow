@@ -71,19 +71,28 @@ table.
 
 ## Column types
 
-Four logical types, chosen because they are what a browser can store and compare without
-ambiguity. The usual SQL spellings map onto them:
+Four physical types, chosen because they are what a browser can store and compare without
+ambiguity. SQL integer columns retain an additional exact-domain guard in the catalog:
 
-| Type       | SQL spellings                                                                     | JavaScript |
-| ---------- | --------------------------------------------------------------------------------- | ---------- |
-| `number`   | `INTEGER`, `BIGINT`, `SMALLINT`, `DOUBLE PRECISION`, `REAL`, `NUMERIC`, `DECIMAL` | `number`   |
-| `string`   | `VARCHAR(n)`, `TEXT`, `CHAR(n)`                                                   | `string`   |
-| `boolean`  | `BOOLEAN`                                                                         | `boolean`  |
-| `datetime` | `TIMESTAMP`, `DATE`                                                               | `Date`     |
+| Domain             | SQL spellings                       | JavaScript |
+| ------------------ | ----------------------------------- | ---------- |
+| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`     | `number`   |
+| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT` | `number`   |
+| string             | `VARCHAR(n)`, `TEXT`, `CHAR(n)`     | `string`   |
+| boolean            | `BOOLEAN`                           | `boolean`  |
+| datetime           | `TIMESTAMP`, `DATE`                 | `Date`     |
 
 Widths in `VARCHAR(80)` are accepted and ignored — they document intent, and nothing truncates.
-`NUMERIC` is IEEE-754 double precision, not arbitrary precision: money is safe to the cent in the
-ranges an application deals with, but this is not the engine to settle accounts in.
+An integer write, literal, default, or cast must be inside JavaScript's exact safe-integer range,
+−9,007,199,254,740,991 through 9,007,199,254,740,991. Minnow rejects a value outside that range
+instead of rounding an ID or quantity before it reaches disk. SQL declarations set this guard
+automatically; the low-level `createTable` API can request the same domain with `integer: true` on
+a number column.
+
+`NUMERIC(p, s)` and `DECIMAL(p, s)` are rejected. They promise exact fixed-point arithmetic, which
+the current Float64 number blocks cannot provide. Use an integer minor unit such as cents when the
+safe-integer range is sufficient, or store a canonical decimal string and do arithmetic in a
+decimal library. `DOUBLE PRECISION`, `REAL`, and `FLOAT` are the explicit approximate choices.
 
 Types the engine deliberately does not have — `JSON`/`JSONB`, arrays, `UUID`, `INTERVAL` as a
 stored type, enums as a database type — are rejected at `CREATE TABLE` rather than silently
@@ -137,6 +146,13 @@ changes: no blocks are rewritten, so they are effectively instant however large 
 column added to a table with rows in it is always nullable — the rows already stored have no value
 for it — though a `DEFAULT` fills the rows written afterwards.
 
+`ALTER TABLE orders DROP COLUMN channel` performs the same guarded metadata step as an explicitly
+authorized schema migration. It refuses the unique key, the last column, and anything a check,
+foreign key, trigger, or view still reads. Old column blocks remain until compaction rewrites their
+segments, while persisted full-text data for the column is removed with the catalog change.
+`RESTRICT` is the default; `CASCADE` is deliberately rejected so a typo cannot silently remove
+dependent objects.
+
 `DROP TABLE` takes the table's rows, its catalog record, its full-text index, and its triggers.
 The blocks are retired through the commit rather than deleted, so a reader pinned to an older
 version keeps resolving the bytes it already holds and the collector reclaims them once nobody
@@ -150,9 +166,10 @@ What a pinned reader does lose is the table itself — the catalog has one prese
 snapshot open across a drop sees the table disappear rather than a frozen copy of it. A table
 another table's trigger writes to cannot be dropped; the trigger would fail at every firing.
 
-Narrowing a column, changing its type, dropping it, or adding a `NOT NULL` column to a table with
-rows in it are all refused — each would need a rewrite of every block, and doing that silently
-behind a DDL statement is how a browser tab freezes.
+Narrowing a column, changing its type, or adding a `NOT NULL` column to a table with rows in it are
+refused — each would need a rewrite of every block, and doing that silently behind a DDL statement
+is how a browser tab freezes. Dropping an independent column is the guarded catalog-only operation
+described above.
 
 The [schema DSL](/docs/schema) plans those changes for you from a declared schema, with
 `migrate()` applying only the steps that are safe.
@@ -161,7 +178,7 @@ The [schema DSL](/docs/schema) plans those changes for you from a declared schem
 
 ```ts
 const tables = await db.listTables();
-// [{ name: "orders", columns: [{ name: "order_id", type: "number", nullable: false }, …] }]
+// [{ name: "orders", columns: [{ name: "order_id", type: "number", integer: true, nullable: false }, …] }]
 ```
 
 This is what the devtools schema rail and the SQL editor's autocompletion are built on.

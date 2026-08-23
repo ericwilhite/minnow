@@ -16,6 +16,8 @@ export interface CatalogColumn {
   readonly id: string;
   readonly name: string;
   readonly type: SimpleDataType;
+  /** True for SQL INTEGER/SMALLINT/BIGINT columns, whose values must stay exactly representable. */
+  readonly integer?: true;
   readonly nullable: boolean;
   /** Filled at insert time for null-or-absent slots; never applied at read time. */
   readonly defaultValue?: ColumnDefault;
@@ -91,6 +93,7 @@ function toCatalogColumn(column: TableRecord["columns"][number]): CatalogColumn 
     id: column.id,
     name: column.name,
     type: column.type,
+    ...(column.integer === true ? { integer: true } : {}),
     nullable: column.nullable,
     ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
     ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),

@@ -47,6 +47,7 @@ import {
   normalizeSegmentRecord,
   updateCompactionJobRecord,
   updateTransactionRecord,
+  validateTableColumns,
   WriteConflictError,
 } from "../types.js";
 import { selectLiveRecords, type DatabaseSnapshot, type SnapshotFtsIndex } from "../snapshot.js";
@@ -220,6 +221,7 @@ export class RecordCore {
   }
 
   addTable(record: TableRecord): void {
+    validateTableColumns(record.columns);
     if (this.#tables.has(record.id)) throw new Error(`Table already exists: ${record.id}`);
     if (this.#tableIdsByName.has(record.name))
       throw new Error(`Table name already exists: ${record.name}`);
@@ -249,7 +251,17 @@ export class RecordCore {
     }
     if (update.columns !== undefined) validateTableColumns(update.columns);
     const { ftsColumns: previousFts, triggers: previousTriggers, ...base } = record;
-    const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    const retainedColumnIds =
+      update.columns === undefined
+        ? undefined
+        : new Set(update.columns.map(({ id: columnId }) => columnId));
+    if (nextFts !== null && nextFts !== undefined && retainedColumnIds !== undefined) {
+      nextFts = Object.fromEntries(
+        Object.entries(nextFts).filter(([columnId]) => retainedColumnIds.has(columnId)),
+      );
+      if (Object.keys(nextFts).length === 0) nextFts = null;
+    }
     const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
     const updated: TableRecord = {
       ...base,
@@ -262,6 +274,11 @@ export class RecordCore {
         : { triggers: structuredClone(nextTriggers) }),
       revision: expectedRevision + 1,
     };
+    if (retainedColumnIds !== undefined) {
+      for (const column of record.columns) {
+        if (!retainedColumnIds.has(column.id)) this.removeFtsColumn(record.id, column.id);
+      }
+    }
     this.#tables.set(id, updated);
     this.#catalogEpoch += 1;
     return structuredClone(updated);
@@ -306,6 +323,12 @@ export class RecordCore {
         if (version <= input.coversVersion) deltas.delete(version);
       }
     }
+  }
+
+  removeFtsColumn(tableId: string, columnId: string): void {
+    const key = `${tableId}/${columnId}`;
+    this.#ftsBases.delete(key);
+    this.#ftsDeltas.delete(key);
   }
 
   readFtsCandidates(
@@ -1567,6 +1590,7 @@ export class RecordCore {
     snapshot: DatabaseSnapshot,
     storeBlockBytes: (id: string, bytes: Uint8Array) => void,
   ): void {
+    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
     for (const block of snapshot.blocks) storeBlockBytes(block.id, block.bytes);
     this.loadSnapshotRecords(
       { ...snapshot, blocks: undefined },
@@ -1579,6 +1603,7 @@ export class RecordCore {
     snapshot: Omit<DatabaseSnapshot, "blocks"> & { blocks?: undefined },
     blockIds: readonly string[],
   ): void {
+    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
     for (const segment of snapshot.segments) {
       this.#segments.set(segment.id, normalizeSegmentRecord(segment));
     }
@@ -1655,6 +1680,7 @@ export class RecordCore {
   /** Replaces the whole record state with a dump's content. */
   load(state: RecordCoreState): void {
     const cloned = structuredClone(state);
+    for (const table of cloned.tables) validateTableColumns(table.columns);
     for (const map of [
       this.#manifests,
       this.#transactions,
@@ -2129,15 +2155,6 @@ function boundedRecordPage<T, Key extends string | number>(
     if (selected.length > limit) selected.pop();
   }
   return selected.map(({ value }) => value);
-}
-
-function validateTableColumns(columns: readonly TableColumnRecord[]): void {
-  if (columns.length === 0) throw new TypeError("A table needs at least one column");
-  const ids = new Set(columns.map(({ id }) => id));
-  const names = new Set(columns.map(({ name }) => name));
-  if (ids.size !== columns.length || names.size !== columns.length) {
-    throw new TypeError("Table columns must have unique IDs and names");
-  }
 }
 
 function validateTempOwnerRecord(record: TempOwnerRecord): void {

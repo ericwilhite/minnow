@@ -41,6 +41,12 @@ way SQLite does: `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON
 `NULL ON NULL` behavior and return JSON text. `JSON_TABLE` is missing because it produces rows
 rather than a value, which the executors have no operator for.
 
+Exact `NUMERIC` and `DECIMAL` are also rejected: treating them as the existing Float64 number type
+would silently violate their defining guarantee. SQL integer columns accept only values in
+JavaScript's exact safe-integer range. Approximate work must opt into `DOUBLE PRECISION`, `REAL`, or
+`FLOAT`; money can use safe integer minor units until Minnow has an exact fixed-point type end to
+end.
+
 `FOREIGN KEY` supports one column pointing to another table's unique key. Every write path checks
 the parent exists. `ON DELETE` supports `RESTRICT`, `CASCADE`, and `SET NULL`, and those follow-up
 changes happen in the same transaction as the delete. `ON UPDATE` is unnecessary because Minnow's
@@ -53,6 +59,10 @@ key; a table without one can only be appended to. This is not a SQL-layer restri
 for every write path.
 
 ### Not yet, rather than never
+
+General secondary indexes, multiple unique constraints, composite primary and foreign keys, and
+savepoints are explicit entries in the rejected matrix. These are production-facing gaps, not
+forms omitted from the denominator.
 
 Correlated `EXISTS` and `NOT EXISTS` support equality and range comparisons by lowering them to
 semi-joins and anti-joins. Correlated scalar aggregates and `IN` still require equality.

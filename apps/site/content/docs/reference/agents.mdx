@@ -59,13 +59,16 @@ machines: https://minnowdb.com/llms.txt
   statement that writes, rather than writing.
 - `db.execute(sql, params)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
-  `drop-table`, `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading
+  `drop-column`, `drop-table`, `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading
   `rowCount`, `version`, or `returnedRows`.
 - Bind parameters with `?` in order or `$1` by position. Never concatenate values into SQL:
   compiled plans are cached on the statement text, so a parameterized statement is planned once
   and interpolation throws that work away on every call.
 - `UPDATE` and `DELETE` require a table with a `PRIMARY KEY`. A table without one can only be
   appended to. Give a table a key if its rows will ever be edited.
+- `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers. `NUMERIC` and
+  `DECIMAL` are rejected because exact fixed-point storage is not implemented; use integer minor
+  units or canonical decimal text, and use `DOUBLE PRECISION` only when approximation is intended.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
 - On teardown, `await db.close()` before `store.close()` for a direct engine. For a worker,
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
@@ -85,8 +88,9 @@ machines: https://minnowdb.com/llms.txt
   (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
   (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
   `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
-  `SET TRANSACTION`, correlated `NOT IN` (use `NOT EXISTS`), non-equality correlation in scalar
-  subqueries or `IN`, and correlated `EXISTS` nested below `OR`.
+  `SET TRANSACTION`, `CREATE INDEX`, multiple or composite unique keys, composite foreign keys,
+  savepoints, correlated `NOT IN` (use `NOT EXISTS`), non-equality correlation in scalar subqueries
+  or `IN`, and correlated `EXISTS` nested below `OR`.
 ```
 
 ## Why those rules

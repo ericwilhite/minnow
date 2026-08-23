@@ -743,7 +743,7 @@ export function isDestructiveStep(
  * the catalog still points at it. Each of these would leave a constraint or key referring to a
  * column no longer there, so the drop is refused rather than silently invalidating them.
  */
-function assertColumnDroppable(record: CatalogTable, column: CatalogColumn): void {
+export function assertColumnDroppable(record: CatalogTable, column: CatalogColumn): void {
   const where = `${record.name}.${column.name}`;
   if (record.uniqueKeyColumnId === column.id) {
     throw new TypeError(

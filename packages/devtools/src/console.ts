@@ -51,6 +51,11 @@ function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "drop-table") {
     return result.dropped ? `dropped table ${result.table}` : `no table ${result.table}`;
   }
+  if (result.kind === "drop-column") {
+    return result.dropped
+      ? `dropped column ${result.table}.${result.column}`
+      : `no column ${result.table}.${result.column}`;
+  }
   if (result.kind === "transaction") return `${result.action} transaction`;
   const rows = result.rowCount === 1 ? "1 row" : `${String(result.rowCount)} rows`;
   return `${result.kind}: ${rows} in ${result.table}`;

@@ -299,24 +299,24 @@
     },
     {
       "id": "mutation.upsert",
-      "feature": "F312",
+      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
-      "notes": "Whole-row upsert: DO UPDATE must set every inserted column from EXCLUDED, and the conflict target is the unique key."
+      "notes": "PostgreSQL-compatible extension rather than SQL:2023 F312 (MERGE). The conflict target is the unique key and assigned values may read the target row or EXCLUDED proposal."
     },
     {
       "id": "mutation.insert-do-nothing",
-      "feature": "F312",
+      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 9), ('z', 1) ON CONFLICT (name) DO NOTHING",
-      "notes": "Rows whose key already exists at the statement's snapshot are skipped."
+      "notes": "Rows whose key already exists at the statement's snapshot are skipped. Each proposed row is considered in order, so later duplicates of a key retained earlier in the same statement are skipped too."
     },
     {
       "id": "mutation.upsert-partial",
-      "feature": "F312",
+      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score, bonus) VALUES ('x', 50, 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
-      "notes": "Assigning a subset of inserted columns merges only those into existing rows; unassigned columns keep their stored values. Mixed update/insert batches publish atomically or roll back together."
+      "notes": "Assigning a subset of target columns changes only those columns; unassigned columns keep their stored values. Assignment targets need not appear in the INSERT column list. Mixed update/insert batches publish atomically or roll back together."
     },
     {
       "id": "where.or",
@@ -1169,6 +1169,76 @@
       "feature": "T172",
       "status": "supported",
       "example": "CREATE TABLE copied AS SELECT region FROM rows"
+    },
+    {
+      "id": "type.exact-numeric",
+      "feature": "E011-03",
+      "status": "unsupported",
+      "example": "SELECT CAST(1.25 AS DECIMAL(12, 2)) AS amount",
+      "error": "Exact NUMERIC and DECIMAL are not supported yet",
+      "notes": "Mapping a fixed-point declaration onto binary Float64 silently changes money and other exact values. Minnow rejects the declaration until the catalog, blocks, expressions, and aggregates can preserve its precision and scale end to end."
+    },
+    {
+      "id": "ddl.secondary-index",
+      "feature": "minnow",
+      "status": "unsupported",
+      "example": "CREATE INDEX keyed_score_idx ON keyed(score)",
+      "error": "Expected TABLE, found INDEX",
+      "notes": "SQL does not standardize physical index DDL. Minnow currently has its unique-key lookup and full-text indexes, but no general secondary B-tree or ordered index for application predicates and sorts."
+    },
+    {
+      "id": "ddl.multiple-unique-constraints",
+      "feature": "E141-08",
+      "status": "unsupported",
+      "example": "CREATE TABLE multi_unique (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+      "error": "CREATE TABLE supports one unique key column",
+      "notes": "The current keyed table model addresses rows through one unique column. A second candidate key needs independent uniqueness enforcement and conflict-target selection."
+    },
+    {
+      "id": "ddl.composite-primary-key",
+      "feature": "E141-08",
+      "status": "unsupported",
+      "example": "CREATE TABLE composite_key (shop INTEGER, receipt INTEGER, PRIMARY KEY (shop, receipt))",
+      "error": "CREATE TABLE supports one unique key column",
+      "notes": "Composite identity needs a canonical tuple encoding across lookup, conflict detection, updates, deletes, foreign keys, and snapshot import rather than lossy string concatenation."
+    },
+    {
+      "id": "ddl.composite-foreign-key",
+      "feature": "E141-04",
+      "status": "unsupported",
+      "example": "CREATE TABLE composite_child (shop INTEGER, receipt INTEGER, FOREIGN KEY (shop, receipt) REFERENCES composite_key(shop, receipt))",
+      "error": "FOREIGN KEY supports one column",
+      "notes": "Foreign-key probes currently target one parent unique-key column. Composite references depend on the same tuple-key representation and indexing as composite primary keys."
+    },
+    {
+      "id": "ddl.alter-table-drop-column",
+      "feature": "F031",
+      "status": "supported",
+      "example": "ALTER TABLE keyed DROP COLUMN bonus",
+      "notes": "A metadata-only drop refuses unique keys, checks, foreign keys, triggers, views, and the last column. Stored column blocks remain until compaction rewrites their segments; persisted full-text data for the column is removed atomically with the catalog update. RESTRICT is the default and CASCADE is rejected."
+    },
+    {
+      "id": "mutation.upsert-expression",
+      "feature": "minnow",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('x', 2) ON CONFLICT (name) DO UPDATE SET score = score + EXCLUDED.score",
+      "notes": "Assignments may read the stored target row, the proposed EXCLUDED row, parameters, constants, CASE, and scalar functions. All conflicting updates and fresh inserts execute in one write scope; one statement cannot affect the same existing key twice. Aggregates, windows, subqueries, and conflict-key reassignment are rejected."
+    },
+    {
+      "id": "mutation.upsert-update-where",
+      "feature": "minnow",
+      "status": "unsupported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('x', 2) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score WHERE EXCLUDED.score > keyed.score",
+      "error": "Expected eof, found WHERE",
+      "notes": "The optional PostgreSQL-compatible predicate that can turn a conflicting update into a no-op is not implemented yet. Use CASE in the assignment when retaining the existing value has the same effect."
+    },
+    {
+      "id": "transaction.savepoint",
+      "feature": "E151",
+      "status": "unsupported",
+      "example": "SAVEPOINT line_item",
+      "error": "Expected SELECT, found SAVEPOINT",
+      "notes": "A write scope is atomic at its outer boundary but has no nested rollback marker. Savepoints need bounded staged-state checkpoints that can release or rewind blocks, mutations, and trigger effects without publishing them."
     },
     {
       "id": "privileges.grant",

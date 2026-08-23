@@ -49,7 +49,7 @@ const catalog = await database.introspect();
 for (const table of catalog.tables) {
   table.name;
   table.uniqueKeyColumnId; // identity, not a name
-  table.columns; // { id, name, type, nullable, defaultValue?, enumValues?, isAutoIncrementing }
+  table.columns; // { id, name, type, integer?, nullable, defaultValue?, enumValues?, isAutoIncrementing }
   table.foreignKeys; // { name, column, parentTable, parentColumn, onDelete }
   table.checks; // { name, sql }
   table.triggers; // { name, event, timing }
@@ -143,10 +143,10 @@ is the feature matrix, shipped as data:
 import matrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
 
 const unsupported = matrix.features.filter((entry) => entry.status === "unsupported");
-// each carries: id, the SQL:2023 Annex F feature, an example, and the error it raises
+// each carries: id, an Annex F feature or "minnow", an example, and the error it raises
 ```
 
-There are 192 entries, with 180 supported. The engine's tests read this same file, so a change to
+There are 201 entries, with 182 supported. The engine's tests read this same file, so a change to
 the language cannot leave the list quietly out of date.
 
 The gaps most likely to matter to a SQL generator:
@@ -157,7 +157,10 @@ The gaps most likely to matter to a SQL generator:
 | correlated `NOT IN`             | use `NOT EXISTS`                                          |
 | correlated `EXISTS` below `OR`  | keep it as a top-level `WHERE` conjunct                   |
 | `LATERAL` sources               | no operator re-executes a source per row of its left side |
-| `ON CONFLICT DO UPDATE SET`     | supported only as `column = EXCLUDED.column`              |
+| exact `NUMERIC` / `DECIMAL`     | use safe integer minor units or canonical decimal text    |
+| secondary and composite keys    | one unique key column is the only keyed address today     |
+| savepoints                      | only the outer transaction can roll back                  |
+| upsert `DO UPDATE ... WHERE`    | use `CASE` when retaining the old value is equivalent     |
 | `COLLATE`, sequences, `ARRAY`   | absent; the matrix records each with its error            |
 
 Every one of these raises an explicit error naming the constraint, so a generator can surface a

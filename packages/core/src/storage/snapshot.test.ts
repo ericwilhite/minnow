@@ -241,6 +241,34 @@ describe("database snapshots", () => {
     await expect(decodeSnapshot(damagedBlock)).rejects.toThrow(/checksum mismatch|encoding/);
   });
 
+  it("rejects malformed catalog metadata before any store writes snapshot blocks", async () => {
+    const { store: sourceStore } = await seededDatabase();
+    const snapshot = await sourceStore.exportSnapshot();
+    const invalid = structuredClone(snapshot);
+    const handle = invalid.tables
+      .find(({ record }) => record.name === "authors")
+      ?.record.columns.find(({ name }) => name === "handle");
+    if (handle === undefined) throw new Error("Missing test column");
+    handle.integer = true;
+
+    await expect(decodeSnapshot(await encodeSnapshot(invalid))).rejects.toThrow(
+      /Integer domain requires a number column: handle/,
+    );
+
+    const stores = [
+      new MemoryBlockStore(),
+      await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
+      await OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
+    ];
+    for (const store of stores) {
+      await expect(store.importSnapshot(invalid)).rejects.toThrow(
+        /Integer domain requires a number column: handle/,
+      );
+      expect(await store.listBlockIds()).toEqual([]);
+      store.close();
+    }
+  });
+
   it("refuses to snapshot a database with nothing committed", async () => {
     await expect(new MemoryBlockStore().exportSnapshot()).rejects.toThrow(/no committed version/);
   });

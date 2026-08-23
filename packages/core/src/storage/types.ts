@@ -92,6 +92,13 @@ export interface TableColumnRecord {
   id: string;
   name: string;
   type: SimpleDataType;
+  /**
+   * SQL INTEGER/SMALLINT/BIGINT columns use the number physical type, but only accept exact
+   * JavaScript safe integers. Absent for the public `number` type and SQL floating-point types.
+   * Keeping the domain in catalog metadata prevents a declared integer from silently rounding
+   * before it reaches storage while preserving the released Float64 block encoding.
+   */
+  integer?: true;
   nullable: boolean;
   /** Fills null-or-absent slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
@@ -140,6 +147,26 @@ export function validateEnumValues(values: readonly string[], context: string): 
 }
 
 /**
+ * Validates the catalog invariants owned by a table's column list. Storage adapters call this
+ * for ordinary catalog writes and before restoring snapshots or checkpoints, so malformed
+ * metadata cannot enter through a less common persistence path.
+ */
+export function validateTableColumns(columns: readonly TableColumnRecord[]): void {
+  if (columns.length === 0) throw new TypeError("A table needs at least one column");
+  for (const column of columns) {
+    const integer: unknown = column.integer;
+    if (integer !== undefined && (integer !== true || column.type !== "number")) {
+      throw new TypeError(`Integer domain requires a number column: ${column.name}`);
+    }
+  }
+  const ids = new Set(columns.map(({ id }) => id));
+  const names = new Set(columns.map(({ name }) => name));
+  if (ids.size !== columns.length || names.size !== columns.length) {
+    throw new TypeError("Table columns must have unique IDs and names");
+  }
+}
+
+/**
  * The single authority on which default declarations are legal, shared by the schema DSL's
  * `table()` and the engine's `createTable` so the two entry points (and the wire path between
  * them) can never drift: defaults require non-nullable columns, "now" is datetime-only,
@@ -149,6 +176,7 @@ export function validateColumnDefault(
   column: {
     name: string;
     type: SimpleDataType;
+    integer?: true;
     nullable: boolean;
     isUniqueKey: boolean;
     enumValues?: readonly string[];
@@ -182,6 +210,9 @@ export function validateColumnDefault(
       }
       if (typeof value === "number" && !Number.isFinite(value)) {
         throw new TypeError(`Default literal must be finite: ${column.name}`);
+      }
+      if (column.integer === true && !Number.isSafeInteger(value)) {
+        throw new TypeError(`Default literal must be a safe integer: ${column.name}`);
       }
       if (
         column.enumValues !== undefined &&
@@ -1094,6 +1125,10 @@ export interface CatalogStore {
   getTableByName(name: string): Promise<TableRecord | undefined>;
   /** Sorted by table name. */
   listTables(): Promise<TableRecord[]>;
+  /**
+   * Replaces catalog metadata atomically. When `columns` removes a column, the same operation
+   * must also discard that column's full-text catalog entry, base chunks, and commit deltas.
+   */
   updateTable(
     id: string,
     expectedRevision: number,
@@ -1286,6 +1321,8 @@ export interface MaintenanceStore {
  * indexed columns as `invalid`.
  */
 export interface FtsIndexStore {
+  /** Removes every base chunk and commit delta owned by one column. */
+  removeFtsColumn(tableId: string, columnId: string): Promise<void>;
   /**
    * Replaces one column's full-text base chunks (term-range partitioned, term-sorted within
    * each chunk) and deletes commit deltas the new base covers. The caller flips the catalog

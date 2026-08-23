@@ -903,6 +903,40 @@ for (const implementation of stores()) {
       store.close();
     });
 
+    it("preserves and validates SQL integer-domain catalog metadata", async () => {
+      const store = await implementation.create();
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      await store.addTable({
+        id: "integer-table",
+        name: "integers",
+        columns: [
+          { id: "integer-column", name: "value", type: "number", integer: true, nullable: false },
+        ],
+        createdAt: timestamp,
+      });
+      expect((await store.getTable("integer-table"))?.columns[0]).toMatchObject({
+        type: "number",
+        integer: true,
+      });
+      await expect(
+        store.addTable({
+          id: "invalid-integer-table",
+          name: "invalid-integers",
+          columns: [
+            {
+              id: "invalid-integer-column",
+              name: "value",
+              type: "string",
+              integer: true,
+              nullable: false,
+            },
+          ],
+          createdAt: timestamp,
+        }),
+      ).rejects.toThrow("Integer domain requires a number column");
+      store.close();
+    });
+
     it("returns one coherent query catalog state matching the individual reads", async () => {
       const store = await implementation.create();
       const timestamp = "2026-01-01T00:00:00.000Z";
@@ -1590,6 +1624,45 @@ for (const implementation of stores()) {
         10,
       );
       expect(prefix.rowIdsByTerm).toEqual([[2n], [3n]]);
+      store.close();
+    });
+
+    it("removes full-text state atomically when its column leaves the catalog", async () => {
+      const store = await implementation.create();
+      await store.addTable({
+        id: "drop-index-table",
+        name: "drop_index",
+        columns: [
+          { id: "drop-index-title", name: "title", type: "string", nullable: false },
+          { id: "drop-index-body", name: "body", type: "string", nullable: false },
+        ],
+        ftsColumns: {
+          "drop-index-title": {
+            storage: "fts-chunks-v1",
+            tokenizerVersion: 1,
+            state: "ready",
+            buildFromVersion: 0,
+          },
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.writeFtsBase("drop-index-table", "drop-index-title", {
+        coversVersion: 0,
+        chunks: [[{ term: "alpha", rowIds: [1n], tf: [1] }]],
+        totalTokens: 1,
+      });
+      await store.updateTable("drop-index-table", 0, {
+        columns: [{ id: "drop-index-body", name: "body", type: "string", nullable: false }],
+      });
+      expect((await store.getTable("drop-index-table"))?.ftsColumns).toBeUndefined();
+      expect(
+        await store.readFtsCandidates(
+          "drop-index-table",
+          "drop-index-title",
+          [{ term: "alpha", prefix: false }],
+          1,
+        ),
+      ).toMatchObject({ rowIdsByTerm: [[]], deltaChunkCount: 0, coversVersion: -1 });
       store.close();
     });
 

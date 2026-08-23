@@ -92,6 +92,7 @@ const RPC_METHODS = new Set([
   "listTables",
   "updateTable",
   "removeTable",
+  "removeFtsColumn",
   "writeFtsBase",
   "readFtsCandidates",
   "addSegment",
@@ -800,6 +801,10 @@ export class OpfsBlockStore implements BlockStore {
     input: { coversVersion: number; chunks: FtsPosting[][]; totalTokens: number },
   ): Promise<void> {
     await this.#dispatch("writeFtsBase", [tableId, columnId, input]);
+  }
+
+  async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
+    await this.#dispatch("removeFtsColumn", [tableId, columnId]);
   }
 
   async readFtsCandidates(

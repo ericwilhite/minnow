@@ -65,14 +65,30 @@ await db.deleteBatch("orders", { keys: [1001, 1002, 1003] });
 
 ## Upsert
 
+`ON CONFLICT` is a PostgreSQL-compatible extension; SQL:2023 standardizes `MERGE` instead.
+
 ```sql
 INSERT INTO customers (customer_id, name, city, signed_up_on)
 VALUES (?, ?, ?, ?)
 ON CONFLICT (customer_id) DO UPDATE SET name = EXCLUDED.name, city = EXCLUDED.city
 ```
 
-`DO NOTHING` is also available. `EXCLUDED` refers to the row that would have been inserted, which
-is how you write "keep the newer value" without reading first.
+`DO NOTHING` is also available; a later duplicate key in the same `VALUES` list is skipped after
+the first proposal is retained. `EXCLUDED` refers to the row that would have been inserted,
+including its defaults; a bare column refers to the stored row. Assignments can combine both with
+parameters, constants, `CASE`, arithmetic, and scalar functions:
+
+```sql
+INSERT INTO inventory (sku, received)
+VALUES (?, ?)
+ON CONFLICT (sku) DO UPDATE SET on_hand = on_hand + EXCLUDED.received
+```
+
+Conflict updates and fresh inserts from one statement publish atomically. One statement cannot
+update the same existing key twice. The conflict key itself cannot be reassigned, and aggregates,
+windows, and subqueries are not allowed in the assignment. A `WHERE` predicate after the
+`DO UPDATE SET` list is not supported yet; use `CASE` to retain the stored value when that is
+equivalent.
 
 ## RETURNING
 

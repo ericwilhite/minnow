@@ -109,6 +109,7 @@ type Frame =
   | { op: "renewTempOwner"; ownerId: string; expectedRevision: number; expiresAt: string }
   | { op: "removeTempOwnerIfExpired"; ownerId: string; expiresAtCutoff: string }
   | { op: "removeTempOwner"; ownerId: string }
+  | { op: "removeFtsColumn"; tableId: string; columnId: string }
   | { op: "writeFtsBase"; tableId: string; columnId: string; input: FtsBaseInput };
 
 interface Checkpoint {
@@ -319,6 +320,9 @@ class MiniLogStore implements BlockStore {
         break;
       case "writeFtsBase":
         this.#core.writeFtsBase(frame.tableId, frame.columnId, frame.input);
+        break;
+      case "removeFtsColumn":
+        this.#core.removeFtsColumn(frame.tableId, frame.columnId);
         break;
     }
   }
@@ -740,6 +744,14 @@ class MiniLogStore implements BlockStore {
     return this.#run(() =>
       this.#logged({ op: "writeFtsBase", tableId, columnId, input }, () => {
         this.#core.writeFtsBase(tableId, columnId, input);
+      }),
+    );
+  }
+
+  async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
+    return this.#run(() =>
+      this.#logged({ op: "removeFtsColumn", tableId, columnId }, () => {
+        this.#core.removeFtsColumn(tableId, columnId);
       }),
     );
   }

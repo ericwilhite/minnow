@@ -53,6 +53,7 @@ import {
   normalizeSegmentRecord,
   updateCompactionJobRecord,
   updateTransactionRecord,
+  validateTableColumns,
   WriteConflictError,
   type WriteTransactionInput,
 } from "./types.js";
@@ -393,6 +394,7 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   async addTable(record: TableRecord): Promise<void> {
+    validateTableColumns(record.columns);
     const transaction = this.#transaction("catalog", "readwrite");
     const store = transaction.objectStore("catalog");
     const idKey = `${TABLE_ID_PREFIX}${record.id}`;
@@ -447,7 +449,17 @@ export class IndexedDbBlockStore implements BlockStore {
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
     }
     const { ftsColumns: previousFts, triggers: previousTriggers, ...base } = record;
-    const nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    const retainedColumnIds =
+      update.columns === undefined
+        ? undefined
+        : new Set(update.columns.map(({ id: columnId }) => columnId));
+    if (nextFts !== null && nextFts !== undefined && retainedColumnIds !== undefined) {
+      nextFts = Object.fromEntries(
+        Object.entries(nextFts).filter(([columnId]) => retainedColumnIds.has(columnId)),
+      );
+      if (Object.keys(nextFts).length === 0) nextFts = null;
+    }
     const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
     const updated: TableRecord = {
       ...base,
@@ -460,6 +472,13 @@ export class IndexedDbBlockStore implements BlockStore {
         : { triggers: structuredClone(nextTriggers) }),
       revision: expectedRevision + 1,
     };
+    if (retainedColumnIds !== undefined) {
+      for (const column of record.columns) {
+        if (!retainedColumnIds.has(column.id)) {
+          await deleteFtsColumnRecords(store, record.id, column.id);
+        }
+      }
+    }
     store.put(structuredClone(updated), idKey);
     await bumpCatalogEpoch(store);
     await transactionDone(transaction);
@@ -558,6 +577,13 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
     store.put({ versions: surviving }, deltaIndexKey);
+    await transactionDone(transaction);
+  }
+
+  async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    await deleteFtsColumnRecords(store, tableId, columnId);
     await transactionDone(transaction);
   }
 
@@ -2578,6 +2604,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if ((await this.listTables()).length > 0) {
       throw new Error("This store already holds a catalog");
     }
+    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
 
     const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
     let writtenBytes = 0;
@@ -3475,6 +3502,28 @@ function ftsChunkIndexKey(tableId: string, columnId: string): string {
   return `${FTS_CHUNK_PREFIX}index/${tableId}/${columnId}`;
 }
 
+async function deleteFtsColumnRecords(
+  store: IDBObjectStore,
+  tableId: string,
+  columnId: string,
+): Promise<void> {
+  const tocKey = `${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`;
+  const deltaIndexKey = ftsChunkIndexKey(tableId, columnId);
+  const [toc, deltaIndex] = (await Promise.all([
+    requestResult(store.get(tocKey)),
+    requestResult(store.get(deltaIndexKey)),
+  ])) as [FtsBaseToc | undefined, { versions: number[] } | undefined];
+  const chunkPrefix = `${FTS_BASE_PREFIX}${tableId}/${columnId}/`;
+  for (let ordinal = 0; ordinal < (toc?.boundaries.length ?? 0); ordinal += 1) {
+    store.delete(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`);
+  }
+  for (const version of deltaIndex?.versions ?? []) {
+    store.delete(ftsChunkKey(tableId, columnId, version));
+  }
+  store.delete(tocKey);
+  store.delete(deltaIndexKey);
+}
+
 function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {
   if (!Number.isSafeInteger(count) || count < 0) {
     throw new RangeError("Auto-increment reservation count must be a non-negative whole number");
@@ -3520,15 +3569,6 @@ function isTempRunPageKey(key: IDBValidKey, ownerId: string, runId?: string): bo
 
 function tempOwnerKey(ownerId: string): IDBValidKey {
   return ["owner", ownerId];
-}
-
-function validateTableColumns(columns: readonly TableColumnRecord[]): void {
-  if (columns.length === 0) throw new TypeError("A table needs at least one column");
-  const ids = new Set(columns.map(({ id }) => id));
-  const names = new Set(columns.map(({ name }) => name));
-  if (ids.size !== columns.length || names.size !== columns.length) {
-    throw new TypeError("Table columns must have unique IDs and names");
-  }
 }
 
 function validateTempOwnerRecord(record: TempOwnerRecord): void {

@@ -175,6 +175,7 @@ import { chooseJoinOrder, renderPlan } from "./optimizer.js";
 import { toCatalog, type Catalog } from "./catalog.js";
 import {
   applyColumnSteps,
+  assertColumnDroppable,
   declaredForeignKeys,
   isDestructiveStep,
   planMigration,
@@ -375,6 +376,8 @@ interface SelectedAppendSegment {
 export interface ColumnDefinition {
   name: string;
   type: SimpleDataType;
+  /** SQL integer-domain guard; ordinary API number columns remain finite Float64 values. */
+  integer?: true;
   nullable?: boolean;
   /** Fills null-or-absent slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
@@ -893,6 +896,7 @@ export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
   | { kind: "create-table"; table: string }
   | { kind: "add-column"; table: string; column: string }
+  | { kind: "drop-column"; table: string; column: string; dropped: boolean }
   | { kind: "drop-table"; table: string; dropped: boolean }
   | { kind: "merge"; table: string; rowCount: number; version?: number }
   | { kind: "transaction"; action: "begin" | "commit" | "rollback"; version?: number }
@@ -1058,6 +1062,7 @@ export class MinnowDatabase {
   #collectionSteps: Promise<unknown> = Promise.resolve();
   /** One background build attempt per (table, column) per session; misses just stay scans. */
   readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
+  readonly #droppingFtsColumns = new Set<string>();
   /** Tables with a fire-and-forget compaction step already running. */
   readonly #autoCompactionsInFlight = new Map<string, Promise<void>>();
   /** Tables whose maintenance threshold was observed again while their fold was still running. */
@@ -1229,6 +1234,7 @@ export class MinnowDatabase {
         id: this.#createId(),
         name: columnName,
         type: column.type,
+        ...(column.integer === true ? { integer: true } : {}),
         nullable: column.nullable ?? false,
         ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
         ...(column.enumValues === undefined
@@ -1291,6 +1297,11 @@ export class MinnowDatabase {
             `FOREIGN KEY ${key.name} compares ${child.type} with ${parentKey.type}`,
           );
         }
+        if ((child.integer === true) !== (parentKey.integer === true)) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} compares an integer domain with an approximate number domain`,
+          );
+        }
         if (key.onDelete === "set null" && !child.nullable) {
           throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
         }
@@ -1339,6 +1350,7 @@ export class MinnowDatabase {
         columns: table.columns.map((column) => ({
           name: column.name,
           type: column.type,
+          ...(column.integer === true ? { integer: true } : {}),
           nullable: column.nullable,
           ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
           ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
@@ -1411,7 +1423,11 @@ export class MinnowDatabase {
     const schemas = new Map(
       (await this.store.listTables()).map((table) => [
         table.name,
-        table.columns.map(({ name: column, type }) => ({ name: column, type })),
+        table.columns.map(({ name: column, type, integer }) => ({
+          name: column,
+          type,
+          ...(integer === true ? { integer: true as const } : {}),
+        })),
       ]),
     );
     const inferred = inferBlockSchema(plan, schemas);
@@ -1424,6 +1440,7 @@ export class MinnowDatabase {
         id: this.#createId(),
         name: column.name,
         type: column.type,
+        ...(column.integer === true ? { integer: true as const } : {}),
         nullable: true,
       })),
       view: { sql, ...(options.managed === true ? { managed: true } : {}) },
@@ -1443,6 +1460,106 @@ export class MinnowDatabase {
     await this.store.removeTable(record.id, record.revision ?? 0);
     this.#planCache.clear();
     return true;
+  }
+
+  /**
+   * Drops one non-key column as a metadata-only operation. Stored bytes remain reachable until
+   * compaction rewrites their segments; storage removes any persisted full-text accelerator in
+   * the same catalog mutation, so repeated schema evolution cannot accumulate orphan indexes.
+   */
+  async dropColumn(
+    tableName: string,
+    columnName: string,
+    options: { ifExists?: boolean } = {},
+  ): Promise<boolean> {
+    for (let attempt = 0; ; attempt += 1) {
+      const records = await this.store.listTables();
+      const table = records.find((record) => record.name === tableName);
+      if (table === undefined || table.view !== undefined) {
+        if (table?.view !== undefined) throw new TypeError(`${tableName} is a view, not a table`);
+        if (options.ifExists === true) return false;
+        throw new Error(`Table not found: ${tableName}`);
+      }
+      const column = table.columns.find((candidate) => candidate.name === columnName);
+      if (column === undefined) {
+        if (options.ifExists === true) return false;
+        throw new TypeError(`Column not found: ${tableName}.${columnName}`);
+      }
+      this.#assertColumnDropSafe(records, table, column);
+      const buildKey = `${table.id}/${column.id}`;
+      this.#droppingFtsColumns.add(buildKey);
+      try {
+        await this.store.updateTable(table.id, table.revision ?? 0, {
+          columns: table.columns.filter((candidate) => candidate.id !== column.id),
+        });
+        this.#gzipVerdicts.delete(column.id);
+        this.#planCache.clear();
+        return true;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt >= 2) throw error;
+      } finally {
+        this.#droppingFtsColumns.delete(buildKey);
+      }
+    }
+  }
+
+  /** Refuses every catalog edge a dropped column would leave dangling. */
+  #assertColumnDropSafe(
+    records: readonly TableRecord[],
+    table: TableRecord,
+    column: TableColumnRecord,
+  ): void {
+    if (table.columns.length === 1) {
+      throw new TypeError(`The last column cannot be dropped: ${table.name}.${column.name}`);
+    }
+    const catalogTable = toCatalog(records).tables.find(
+      (candidate) => candidate.name === table.name,
+    );
+    const catalogColumn = catalogTable?.columns.find((candidate) => candidate.id === column.id);
+    if (catalogTable === undefined || catalogColumn === undefined) {
+      throw new Error(`Catalog column disappeared while dropping: ${table.name}.${column.name}`);
+    }
+    assertColumnDroppable(catalogTable, catalogColumn);
+
+    for (const owner of records) {
+      if (owner.view !== undefined && viewReadsTable(owner.view.sql, table.name)) {
+        const schemas = new Map(
+          records.map((record) => [
+            record.name,
+            (record.id === table.id
+              ? record.columns.filter((candidate) => candidate.id !== column.id)
+              : record.columns
+            ).map(({ name, type, integer }) => ({
+              name,
+              type,
+              ...(integer === true ? { integer: true as const } : {}),
+            })),
+          ]),
+        );
+        try {
+          const inferred = inferBlockSchema(compileQuery(owner.view.sql), schemas);
+          const stored = owner.columns.map(({ name, type, integer }) => ({
+            name,
+            type,
+            ...(integer === true ? { integer: true as const } : {}),
+          }));
+          if (JSON.stringify(inferred) !== JSON.stringify(stored)) {
+            throw new TypeError("view output would change");
+          }
+        } catch {
+          throw new TypeError(
+            `Cannot drop ${table.name}.${column.name}: view ${owner.name} reads it`,
+          );
+        }
+      }
+      for (const trigger of owner.triggers ?? []) {
+        if (triggerReferencesColumn(owner, trigger, table, column.name)) {
+          throw new TypeError(
+            `Cannot drop ${table.name}.${column.name}: trigger ${trigger.name} references it`,
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -2401,7 +2518,11 @@ export class MinnowDatabase {
         const typedSchemas = new Map<string, SqlColumnSchema[]>(
           [...realTables.values()].map((table) => [
             table.name,
-            table.columns.map(({ name, type }) => ({ name, type })),
+            table.columns.map(({ name, type, integer }) => ({
+              name,
+              type,
+              ...(integer === true ? { integer: true as const } : {}),
+            })),
           ]),
         );
         // MATCH(*)/BM25(*) expand against the catalog first — copy-on-write, so the compile
@@ -4475,7 +4596,11 @@ export class MinnowDatabase {
     const typedSchemas = new Map<string, SqlColumnSchema[]>(
       [...realTables.values()].map((table) => [
         table.name,
-        table.columns.map(({ name, type }) => ({ name, type })),
+        table.columns.map(({ name, type, integer }) => ({
+          name,
+          type,
+          ...(integer === true ? { integer: true as const } : {}),
+        })),
       ]),
     );
     const memory = new QueryMemoryContext();
@@ -5178,6 +5303,16 @@ export class MinnowDatabase {
       if (record === undefined) {
         throw new Error(`Migration target table is missing: ${tableName}`);
       }
+      const droppedColumnNames = new Set(
+        steps.flatMap((step) => (step.kind === "drop-column" ? [step.columnName] : [])),
+      );
+      if (droppedColumnNames.size >= record.columns.length) {
+        throw new TypeError(`A table must retain at least one column: ${tableName}`);
+      }
+      for (const columnName of droppedColumnNames) {
+        const column = record.columns.find((candidate) => candidate.name === columnName);
+        if (column !== undefined) this.#assertColumnDropSafe(records, record, column);
+      }
       // Tightening to NOT NULL is the one step that has to be earned rather than declared: the
       // catalog cannot promise what the stored rows contain, so prove it from block headers
       // before the batched compare-and-swap makes it durable.
@@ -5606,9 +5741,9 @@ export class MinnowDatabase {
   }
 
   /**
-   * ON CONFLICT (key) DO UPDATE SET with a column subset: rows whose key exists merge only the
-   * assigned EXCLUDED columns through the keyed update path, and the rest insert. Classification,
-   * update, insert, and RETURNING all run in one write scope, so any failure aborts the statement.
+   * ON CONFLICT (key) DO UPDATE SET: expressions see the statement-start target row plus the
+   * default-filled EXCLUDED row. Classification, evaluation, update, insert, and RETURNING all
+   * run in one write scope, so any failure aborts the statement.
    */
   async #mergeConflictingInsertRows(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
@@ -5628,6 +5763,20 @@ export class MinnowDatabase {
       void onConflict;
       return this.runStatement(plain, options);
     }
+    const keyToken = (value: QueryValue): string =>
+      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+    const proposedKeys = new Set<string>();
+    for (const row of statement.rows) {
+      const key = boundInsertValue(row[keyIndex] ?? null);
+      if (key === null) continue;
+      const token = keyToken(key);
+      if (proposedKeys.has(token)) {
+        throw new TypeError(
+          `ON CONFLICT DO UPDATE cannot affect ${keyColumn.name} ${String(key)} twice`,
+        );
+      }
+      proposedKeys.add(token);
+    }
     for (const name of statement.columns) {
       if (!table.columns.some((column) => column.name === name)) {
         throw new TypeError(`INSERT column does not exist: ${name}`);
@@ -5644,42 +5793,135 @@ export class MinnowDatabase {
         throw new TypeError(`RETURNING column does not exist: ${name}`);
       }
     }
-    const assigned = statement.onConflict.columns ?? [];
-    const keyToken = (value: QueryValue): string =>
-      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+    const assignments = statement.onConflict.assignments ?? [];
+    for (const assignment of assignments) {
+      const targetColumn = table.columns.find(({ name }) => name === assignment.column);
+      if (targetColumn === undefined) {
+        throw new TypeError(`ON CONFLICT DO UPDATE column does not exist: ${assignment.column}`);
+      }
+      if (targetColumn.id === keyColumn.id) {
+        throw new TypeError("ON CONFLICT DO UPDATE cannot reassign the conflict key");
+      }
+      for (const reference of expressionColumnNames(assignment.expression)) {
+        const [alias, name, extra] = reference.split(".");
+        if (alias === undefined || extra !== undefined || name === undefined) {
+          throw new TypeError(`Invalid ON CONFLICT column reference: ${reference}`);
+        }
+        if (alias !== table.name && alias.toUpperCase() !== "EXCLUDED") {
+          throw new TypeError(`Unknown ON CONFLICT row alias: ${alias}`);
+        }
+        if (!table.columns.some((column) => column.name === name)) {
+          throw new TypeError(`ON CONFLICT column does not exist: ${reference}`);
+        }
+      }
+    }
+    const replacementColumns = table.columns.filter((column) => column.id !== keyColumn.id);
+    const wholeRowReplacement =
+      assignments.length === replacementColumns.length &&
+      replacementColumns.every((column) =>
+        assignments.some(
+          (assignment) =>
+            assignment.column === column.name &&
+            assignment.expression.kind === "column" &&
+            assignment.expression.reference === `EXCLUDED.${column.name}`,
+        ),
+      );
+    if (wholeRowReplacement) {
+      // The established upsert path writes the same post-image with fewer read/commit rounds and
+      // retains its bounded retry behavior under many-tab contention. More general expressions
+      // stay on the read-evaluate-update path below.
+      return this.runStatement(
+        {
+          ...statement,
+          onConflict: { column: keyColumn.name, action: "replace" },
+        },
+        options,
+      );
+    }
+    const proposedColumns: Record<string, BatchValue[]> = {};
+    for (const [position, name] of statement.columns.entries()) {
+      proposedColumns[name] = statement.rows.map((row) => boundInsertValue(row[position] ?? null));
+    }
+    for (const column of table.columns) {
+      proposedColumns[column.name] ??= statement.rows.map(() => null);
+    }
+    const filledProposed = fillColumnDefaults(
+      table,
+      { columns: proposedColumns },
+      this.#now,
+      statement.rows.length,
+    );
+    const proposed = filledProposed.batch;
+    // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
+    // even when every proposed row happens to find an existing key.
+    validateBatch(table, proposed, filledProposed.autoIncrement?.column.name);
+    const proposedRow = (index: number): DatabaseRow =>
+      Object.fromEntries(
+        table.columns.map(({ name }) => [name, proposed.columns[name]?.[index] ?? null]),
+      );
     const apply = async (transaction: WriteSession): Promise<QueryRow[] | undefined> => {
       const existing = await this.#existingInsertKeys(table, keyColumn, statement, (sql, params) =>
         transaction.query(sql, { params }),
       );
-      const freshRows: InsertValue[][] = [];
-      const conflictingRows: InsertValue[][] = [];
-      for (const row of statement.rows) {
+      const freshRows: number[] = [];
+      const conflictingRows: number[] = [];
+      const seenConflicts = new Set<string>();
+      for (const [rowIndex, row] of statement.rows.entries()) {
         const key = boundInsertValue(row[keyIndex] ?? null);
-        if (key !== null && existing.has(keyToken(key))) conflictingRows.push(row);
-        else freshRows.push(row);
+        if (key !== null && existing.has(keyToken(key))) {
+          const token = keyToken(key);
+          if (seenConflicts.has(token)) {
+            throw new TypeError(
+              `ON CONFLICT DO UPDATE cannot affect ${keyColumn.name} ${String(key)} twice`,
+            );
+          }
+          seenConflicts.add(token);
+          conflictingRows.push(rowIndex);
+        } else freshRows.push(rowIndex);
       }
       if (conflictingRows.length > 0) {
-        const changes: Record<string, BatchValue[]> = {};
-        for (const name of assigned) {
-          const columnIndex = statement.columns.indexOf(name);
-          changes[name] = conflictingRows.map((row) => boundInsertValue(row[columnIndex] ?? null));
-        }
-        const keys = conflictingRows.map((row) => {
-          const value = boundInsertValue(row[keyIndex] ?? null);
+        const keys = conflictingRows.map((rowIndex) => {
+          const value = boundInsertValue(statement.rows[rowIndex]?.[keyIndex] ?? null);
           if (value === null) {
             throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
           }
           return value;
         });
+        const selected = await transaction.query(
+          `SELECT * FROM ${quoteSqlIdentifier(table.name)} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keys.map(() => "?").join(", ")})`,
+          { params: keys },
+        );
+        const currentByKey = new Map(
+          selected.rows.map((row) => [keyToken(row[keyColumn.name] ?? null), row] as const),
+        );
+        const changes: Record<string, BatchValue[]> = Object.fromEntries(
+          assignments.map(({ column }) => [column, []]),
+        );
+        for (const [position, rowIndex] of conflictingRows.entries()) {
+          const key = keys[position];
+          if (key === undefined) throw new Error("ON CONFLICT key is missing");
+          const current = currentByKey.get(keyToken(key));
+          if (current === undefined) {
+            throw new Error(`ON CONFLICT row disappeared before update: ${String(key)}`);
+          }
+          const excluded = proposedRow(rowIndex);
+          for (const assignment of assignments) {
+            changes[assignment.column]?.push(
+              evaluateJoinedRowExpression(assignment.expression, {
+                [table.name]: current,
+                EXCLUDED: excluded,
+              }),
+            );
+          }
+        }
         await transaction.updateBatch(table.name, { keys, changes });
       }
       if (freshRows.length > 0) {
         const columns: Record<string, BatchValue[]> = {};
-        statement.columns.forEach((column, index) => {
-          columns[column] = freshRows.map((row) => boundInsertValue(row[index] ?? null));
-        });
         for (const column of table.columns) {
-          if (!(column.name in columns)) columns[column.name] = freshRows.map(() => null);
+          columns[column.name] = freshRows.map(
+            (rowIndex) => proposed.columns[column.name]?.[rowIndex] ?? null,
+          );
         }
         await transaction.insertBatch(table.name, { columns });
       }
@@ -5787,7 +6029,13 @@ export class MinnowDatabase {
       ...statement,
       rows: statement.rows.filter((row) => {
         const value = boundInsertValue(row[keyIndex] ?? null);
-        return !existing.has(value instanceof Date ? value.toISOString() : value);
+        if (value === null) return true;
+        const normalized = value instanceof Date ? value.toISOString() : value;
+        if (existing.has(normalized)) return false;
+        // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
+        // therefore conflicts with the first retained proposal and takes DO NOTHING too.
+        existing.add(normalized);
+        return true;
       }),
     };
   }
@@ -5950,12 +6198,17 @@ export class MinnowDatabase {
       const schemas = new Map(
         records.map((record) => [
           record.name,
-          record.columns.map(({ name, type }) => ({ name, type })),
+          record.columns.map(({ name, type, integer }) => ({
+            name,
+            type,
+            ...(integer === true ? { integer: true as const } : {}),
+          })),
         ]),
       );
-      const columns = inferBlockSchema(statement.query, schemas).map(({ name, type }) => ({
+      const columns = inferBlockSchema(statement.query, schemas).map(({ name, type, integer }) => ({
         name,
         type,
+        ...(integer === true ? { integer: true as const } : {}),
         nullable: true,
       }));
       const result = await this.#queryCompiled(statement.query);
@@ -5985,12 +6238,24 @@ export class MinnowDatabase {
           id: this.#createId(),
           name: added.name,
           type: added.type,
+          ...(added.integer === true ? { integer: true as const } : {}),
           nullable: true,
           ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
         },
       ];
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
       return { kind: "add-column", table: statement.table, column: added.name };
+    }
+    if (statement.kind === "drop-column") {
+      const dropped = await this.dropColumn(statement.table, statement.column, {
+        ...(statement.ifExists === true ? { ifExists: true } : {}),
+      });
+      return {
+        kind: "drop-column",
+        table: statement.table,
+        column: statement.column,
+        dropped,
+      };
     }
     if (statement.kind === "merge") return this.#runMerge(statement);
     if (statement.kind === "create-view") {
@@ -10998,6 +11263,27 @@ export class MinnowDatabase {
     const table = await this.#findTable(tableName);
     const column = table.columns.find((candidate) => candidate.name === columnName);
     if (column === undefined) throw new TypeError(`Unknown column: ${columnName}`);
+    const key = `${table.id}/${column.id}`;
+    if (this.#droppingFtsColumns.has(key)) {
+      throw new TypeError(`Column is being dropped: ${tableName}.${columnName}`);
+    }
+    const existing = this.#ftsBuildsInFlight.get(key);
+    if (existing !== undefined) return existing;
+    const build = this.#buildFtsIndex(table, column);
+    this.#ftsBuildsInFlight.set(key, build);
+    try {
+      await build;
+    } finally {
+      if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
+    }
+  }
+
+  async #buildFtsIndex(table: TableRecord, column: TableColumnRecord): Promise<void> {
+    const tableName = table.name;
+    const columnName = column.name;
+    if (this.#droppingFtsColumns.has(`${table.id}/${column.id}`)) {
+      throw new TypeError(`Column is being dropped: ${tableName}.${columnName}`);
+    }
     if (column.type === "boolean") {
       throw new TypeError(`Full-text indexes cannot cover boolean columns: ${columnName}`);
     }
@@ -11057,7 +11343,13 @@ export class MinnowDatabase {
       });
       const fresh = await this.store.getTable(table.id);
       const current = fresh?.ftsColumns?.[column.id];
-      if (fresh !== undefined && current?.state === "building") {
+      if (fresh?.columns.some((candidate) => candidate.id === column.id) !== true) {
+        // A concurrent DROP COLUMN won after this build took its snapshot. The catalog update
+        // already removed any older index; remove the base this stale builder just wrote too.
+        await this.store.removeFtsColumn(table.id, column.id);
+        return;
+      }
+      if (current?.state === "building") {
         await this.store.updateTable(fresh.id, fresh.revision ?? 0, {
           ftsColumns: {
             ...fresh.ftsColumns,
@@ -11310,7 +11602,7 @@ export class MinnowDatabase {
     for (const column of columns) {
       const key = `${table.id}/${column.id}`;
       if (this.#ftsBuildsInFlight.has(key)) continue;
-      const build = this.buildFtsIndex(table.name, column.name)
+      const build = this.#buildFtsIndex(table, column)
         .catch(() => undefined)
         .finally(() => {
           if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
@@ -11339,7 +11631,7 @@ export class MinnowDatabase {
       if (state === undefined || state.state === "invalid") return;
       const column = table.columns.find((candidate) => candidate.id === columnId);
       if (column === undefined) return;
-      await this.buildFtsIndex(table.name, column.name);
+      await this.#buildFtsIndex(table, column);
     })()
       .catch(() => undefined)
       .finally(() => {
@@ -12487,6 +12779,57 @@ function viewReadsTable(sql: string, table: string): boolean {
   }
 }
 
+function triggerReferencesColumn(
+  owner: TableRecord,
+  trigger: NonNullable<TableRecord["triggers"]>[number],
+  target: TableRecord,
+  columnName: string,
+): boolean {
+  for (const statement of trigger.statements) {
+    if (
+      owner.id === target.id &&
+      statement.bindings.some((binding) => binding.column === columnName)
+    ) {
+      return true;
+    }
+    let compiled: CompiledStatement;
+    try {
+      compiled = compileStatement(statement.sql);
+    } catch {
+      // A body that cannot be re-read cannot prove it is independent of the dropped column.
+      return true;
+    }
+    if (
+      (compiled.kind !== "insert" && compiled.kind !== "update" && compiled.kind !== "delete") ||
+      compiled.table !== target.name
+    ) {
+      continue;
+    }
+    if (compiled.kind === "insert") {
+      if (compiled.columns.length === 0 || compiled.columns.includes(columnName)) return true;
+      continue;
+    }
+    const references = new Set<string>();
+    for (const predicate of compiled.predicates) {
+      for (const expression of [predicate.left, predicate.right]) {
+        for (const name of expressionColumnNames(expression)) {
+          references.add(name.split(".").at(-1) ?? name);
+        }
+      }
+    }
+    if (compiled.kind === "update") {
+      for (const assignment of compiled.assignments) {
+        references.add(assignment.column);
+        for (const name of expressionColumnNames(assignment.expression)) {
+          references.add(name.split(".").at(-1) ?? name);
+        }
+      }
+    }
+    if (references.has(columnName)) return true;
+  }
+  return false;
+}
+
 /**
  * The source-side expression a MERGE matches on. The condition has to be an equality naming the
  * target's unique key on one side, because that is the address the keyed write paths use; the
@@ -12701,11 +13044,16 @@ function validateValue(column: TableColumnRecord, value: BatchValue, index: numb
   }
   const valid =
     (column.type === "boolean" && typeof value === "boolean") ||
-    (column.type === "number" && typeof value === "number" && Number.isFinite(value)) ||
+    (column.type === "number" &&
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      (column.integer !== true || Number.isSafeInteger(value))) ||
     (column.type === "string" && typeof value === "string") ||
     (column.type === "datetime" && value instanceof Date && Number.isFinite(value.getTime()));
   if (!valid) {
-    throw new TypeError(`${column.name}[${String(index)}] must be ${column.type}`);
+    throw new TypeError(
+      `${column.name}[${String(index)}] must be ${column.integer === true ? "a safe integer" : column.type}`,
+    );
   }
   if (
     column.enumValues !== undefined &&

@@ -243,7 +243,14 @@ function castValue(value: unknown, target: string): unknown {
       }
       parsed = candidate;
     }
-    if (parsed !== undefined) return target === "number-integer" ? Math.trunc(parsed) : parsed;
+    if (parsed !== undefined) {
+      if (target !== "number-integer") return parsed;
+      const integer = Math.trunc(parsed);
+      if (!Number.isSafeInteger(integer)) {
+        throw new RangeError(`Integer cast is outside the exact safe range: ${String(value)}`);
+      }
+      return integer;
+    }
   }
   if (target === "boolean") {
     if (typeof value === "boolean") return value;
@@ -906,8 +913,6 @@ const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
   ["SMALLINT", "number"],
   ["REAL", "number"],
   ["FLOAT", "number"],
-  ["NUMERIC", "number"],
-  ["DECIMAL", "number"],
   ["TEXT", "string"],
   ["VARCHAR", "string"],
   ["CHAR", "string"],
@@ -1098,8 +1103,8 @@ export type CompiledStatement =
       onConflict?: {
         column: string;
         action: "nothing" | "replace" | "update";
-        /** The EXCLUDED columns a partial DO UPDATE merges; present only for "update". */
-        columns?: string[];
+        /** Expressions evaluated against the stored target row and the proposed EXCLUDED row. */
+        assignments?: Array<{ column: string; expression: Expression }>;
       };
       returning?: string[] | "*";
       parameterCount?: number;
@@ -1125,6 +1130,7 @@ export type CompiledStatement =
       columns: Array<{
         name: string;
         type: SqlColumnType;
+        integer?: true;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
       }>;
@@ -1194,9 +1200,17 @@ export type CompiledStatement =
       column: {
         name: string;
         type: SqlColumnType;
+        integer?: true;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
       };
+      parameterCount?: number;
+    }
+  | {
+      kind: "drop-column";
+      table: string;
+      column: string;
+      ifExists?: true;
       parameterCount?: number;
     };
 
@@ -1916,6 +1930,11 @@ export function bindStatementParameters(
     clone.rows = clone.rows.map((row) =>
       row.map((value) => (isParameterSlot(value) ? (values[value.parameter] ?? null) : value)),
     );
+    if (clone.onConflict?.assignments !== undefined) {
+      for (const assignment of clone.onConflict.assignments) {
+        assignment.expression = bindExpression(assignment.expression, values);
+      }
+    }
     return clone;
   }
   if (
@@ -1963,6 +1982,8 @@ export type SqlColumnType = "boolean" | "number" | "string" | "datetime";
 export interface SqlColumnSchema {
   name: string;
   type: SqlColumnType;
+  /** Exact SQL whole-number domain, physically stored as a safe JavaScript number. */
+  integer?: true;
 }
 
 /**
@@ -1980,6 +2001,7 @@ export function inferBlockSchema(
     (schemas.get(source.table) ?? []).map((column) => ({
       name: multipleSources ? `${source.alias}.${column.name}` : column.name,
       type: column.type,
+      ...(column.integer === true ? { integer: true } : {}),
     }));
   if (
     plan.select[0]?.expression.kind === "wildcard" &&
@@ -2002,6 +2024,20 @@ export function inferBlockSchema(
     );
     if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
     return matches[0] ?? "string";
+  };
+  const resolveColumnInteger = (reference: string): boolean => {
+    const parts = reference.split(".");
+    if (parts.length === 2) {
+      const source = sources.find(({ alias }) => alias === parts[0]);
+      return (
+        source !== undefined &&
+        (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1])?.integer === true
+      );
+    }
+    const matches = sources.flatMap((source) =>
+      (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[0]),
+    );
+    return matches.length === 1 && matches[0]?.integer === true;
   };
   const infer = (expression: Expression): SqlColumnType | "null" => {
     if (expression.kind === "subquery" || expression.kind === "list") {
@@ -2190,7 +2226,14 @@ export function inferBlockSchema(
     if (type === "null") {
       throw new TypeError(`Cannot infer a column type for output ${item.alias}`);
     }
-    return [{ name: item.alias, type }];
+    const integer =
+      (item.expression.kind === "column" && resolveColumnInteger(item.expression.reference)) ||
+      (item.expression.kind === "call" &&
+        item.expression.name === "CAST" &&
+        item.expression.arguments[1]?.kind === "literal" &&
+        item.expression.arguments[1].value === "number-integer") ||
+      (item.expression.kind === "call" && item.expression.name === "COUNT");
+    return [{ name: item.alias, type, ...(integer ? { integer: true } : {}) }];
   });
 }
 
@@ -4424,6 +4467,39 @@ function asQueryValue(value: unknown): QueryValue {
   throw new TypeError("Query produced an unsupported value");
 }
 
+/** Gives bare conflict-update columns the target-row meaning SQL assigns them. */
+function rewriteUpsertExpression(expression: Expression, table: string): Expression {
+  if (hasAggregate(expression)) {
+    throw new TypeError("ON CONFLICT DO UPDATE expressions cannot contain aggregates");
+  }
+  const rewrite = (node: Expression): Expression => {
+    if (node.kind === "column") {
+      const parts = node.reference.split(".");
+      if (parts.length === 1) return { ...node, reference: `${table}.${node.reference}` };
+      if (parts.length === 2 && parts[0]?.toUpperCase() === "EXCLUDED") {
+        return { ...node, reference: `EXCLUDED.${parts[1] ?? ""}` };
+      }
+      if (parts.length === 2 && parts[0]?.toUpperCase() === table.toUpperCase()) {
+        return { ...node, reference: `${table}.${parts[1] ?? ""}` };
+      }
+      return node;
+    }
+    if (
+      node.kind === "subquery" ||
+      node.kind === "exists" ||
+      node.kind === "window" ||
+      node.kind === "fts" ||
+      node.kind === "wildcard"
+    ) {
+      throw new TypeError(
+        "ON CONFLICT DO UPDATE expressions use target and EXCLUDED scalar values only",
+      );
+    }
+    return mapChildExpressions(node, rewrite);
+  };
+  return rewrite(expression);
+}
+
 class Parser {
   /** The statement text the tokens came from, for the clauses stored verbatim (CHECK bodies). */
   readonly text: string;
@@ -4642,8 +4718,8 @@ class Parser {
 
   /**
    * CREATE TABLE name (col TYPE [PRIMARY KEY | UNIQUE] [NOT NULL | NULL], ...). Standard type
-   * names map onto the engine's four logical types; widths in parentheses parse and are
-   * ignored, because numeric widths and encodings are the engine's job, not schema choices.
+   * names map onto the engine's four logical types. Integer spellings retain an exact-domain
+   * catalog guard; exact NUMERIC/DECIMAL is rejected until it has a distinct physical type.
    */
   parseCreateTable(): CompiledStatement {
     this.#keyword("CREATE");
@@ -4672,6 +4748,7 @@ class Parser {
     const columns: Array<{
       name: string;
       type: SqlColumnType;
+      integer?: true;
       nullable?: boolean;
       defaultValue?: ColumnDefault;
     }> = [];
@@ -4728,7 +4805,7 @@ class Parser {
         continue;
       }
       const name = this.#identifier();
-      const type = this.#columnType();
+      const columnType = this.#columnType();
       let nullable = true;
       let explicitlyNullable = false;
       let defaultValue: ColumnDefault | undefined;
@@ -4787,7 +4864,7 @@ class Parser {
       if (defaultValue !== undefined && !explicitlyNullable) nullable = false;
       columns.push({
         name,
-        type,
+        ...columnType,
         ...(nullable ? { nullable: true } : {}),
         ...(defaultValue === undefined ? {} : { defaultValue }),
       });
@@ -4951,15 +5028,39 @@ class Parser {
     return { kind: "drop-table", table, ...(ifExists ? { ifExists: true } : {}) };
   }
 
-  /** ALTER TABLE name ADD [COLUMN] col TYPE [NOT NULL] [DEFAULT v] (F031-04). */
+  /** ALTER TABLE name ADD/DROP [COLUMN] (F031). */
   parseAlterTable(): CompiledStatement {
     this.#keyword("ALTER");
     this.#keyword("TABLE");
     const table = this.#identifier();
+    if (this.#isKeyword("DROP")) {
+      this.#keyword("DROP");
+      if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
+      let ifExists = false;
+      if (this.#isKeyword("IF")) {
+        this.#keyword("IF");
+        this.#keyword("EXISTS");
+        ifExists = true;
+      }
+      const column = this.#identifier();
+      if (this.#isKeyword("RESTRICT")) this.#keyword("RESTRICT");
+      else if (this.#isKeyword("CASCADE")) {
+        throw new TypeError(
+          "ALTER TABLE DROP COLUMN CASCADE is not supported; drop dependents explicitly",
+        );
+      }
+      this.#take("eof");
+      return {
+        kind: "drop-column",
+        table,
+        column,
+        ...(ifExists ? { ifExists: true } : {}),
+      };
+    }
     this.#keyword("ADD");
     if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
     const name = this.#identifier();
-    const type = this.#columnType();
+    const columnType = this.#columnType();
     let nullable = true;
     let defaultValue: ColumnDefault | undefined;
     for (;;) {
@@ -4987,7 +5088,7 @@ class Parser {
       table,
       column: {
         name,
-        type,
+        ...columnType,
         ...(nullable ? { nullable: true } : {}),
         ...(defaultValue === undefined ? {} : { defaultValue }),
       },
@@ -4997,6 +5098,11 @@ class Parser {
   /** A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names. */
   #castTarget(): string {
     const word = this.#identifier().toUpperCase();
+    if (word === "NUMERIC" || word === "DECIMAL") {
+      throw new TypeError(
+        "Exact NUMERIC and DECIMAL are not supported yet; use INTEGER for exact whole values or DOUBLE PRECISION for approximate values",
+      );
+    }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
       return "number";
@@ -5013,21 +5119,30 @@ class Parser {
     return integer ? "number-integer" : mapped;
   }
 
-  #columnType(): SqlColumnType {
+  #columnType(): { type: SqlColumnType; integer?: true } {
     const word = this.#identifier().toUpperCase();
+    if (word === "NUMERIC" || word === "DECIMAL") {
+      throw new TypeError(
+        "Exact NUMERIC and DECIMAL are not supported yet; use INTEGER for exact whole values or DOUBLE PRECISION for approximate values",
+      );
+    }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
-      return "number";
+      return { type: "number" };
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) throw new TypeError(`Unsupported column type: ${word}`);
-    // A width like VARCHAR(80) or NUMERIC(10, 2) parses and is discarded.
+    // Character widths document intent and do not truncate values.
     if (this.#punctuation("(")) {
       this.#take("number");
-      if (this.#punctuation(",")) this.#take("number");
+      if (this.#punctuation(",")) {
+        throw new TypeError(`${word} takes one width`);
+      }
       this.#expectPunctuation(")");
     }
-    return mapped;
+    const integer =
+      word === "INTEGER" || word === "INT" || word === "BIGINT" || word === "SMALLINT";
+    return { type: mapped, ...(integer ? { integer: true } : {}) };
   }
 
   parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {
@@ -5094,16 +5209,16 @@ class Parser {
       table,
       columns,
       rows,
-      ...this.#onConflictClause(columns),
+      ...this.#onConflictClause(table),
       ...this.#returningClause(),
     };
   }
 
-  #onConflictClause(columns: readonly string[]): {
+  #onConflictClause(table: string): {
     onConflict?: {
       column: string;
       action: "nothing" | "replace" | "update";
-      columns?: string[];
+      assignments?: Array<{ column: string; expression: Expression }>;
     };
   } {
     if (!this.#isKeyword("ON")) return {};
@@ -5120,16 +5235,10 @@ class Parser {
     this.#keyword("UPDATE");
     this.#keyword("SET");
     const assigned = new Set<string>();
+    const assignments: Array<{ column: string; expression: Expression }> = [];
     for (;;) {
       const target = this.#identifier();
       this.#operator("=");
-      const value = this.#expression();
-      const parts = value.kind === "column" ? value.reference.split(".") : [];
-      if (parts.length !== 2 || parts[0]?.toUpperCase() !== "EXCLUDED" || parts[1] !== target) {
-        throw new TypeError(
-          "ON CONFLICT DO UPDATE supports assignments of the form column = EXCLUDED.column",
-        );
-      }
       if (assigned.has(target)) {
         throw new TypeError(`ON CONFLICT DO UPDATE sets a column twice: ${target}`);
       }
@@ -5137,20 +5246,13 @@ class Parser {
         throw new TypeError("ON CONFLICT DO UPDATE cannot reassign the conflict key");
       }
       assigned.add(target);
+      assignments.push({
+        column: target,
+        expression: rewriteUpsertExpression(this.#expression(), table),
+      });
       if (!this.#punctuation(",")) break;
     }
-    for (const name of assigned) {
-      if (!columns.includes(name)) {
-        throw new TypeError(`ON CONFLICT DO UPDATE sets a column that is not inserted: ${name}`);
-      }
-    }
-    // Every inserted column assigned is a whole-row upsert; a subset merges into existing rows.
-    const complete = columns.every((name) => name === column || assigned.has(name));
-    return {
-      onConflict: complete
-        ? { column, action: "replace" }
-        : { column, action: "update", columns: [...assigned] },
-    };
+    return { onConflict: { column, action: "update", assignments } };
   }
 
   /** RETURNING * or RETURNING col, ... — the engine's runStatement implements the semantics. */
@@ -6463,7 +6565,15 @@ class Parser {
     if (token.kind === "parameter") return this.#parameterExpression();
     if (token.kind === "number") {
       this.#index += 1;
-      return { kind: "literal", value: Number(token.text) };
+      const value = Number(token.text);
+      if (!token.text.includes(".") && !Number.isSafeInteger(value)) {
+        throw new SqlCompileError(
+          `Integer literal is outside the exact safe range: ${token.text}`,
+          token.start,
+          token.end - token.start,
+        );
+      }
+      return { kind: "literal", value };
     }
     if (token.kind === "string") {
       this.#index += 1;

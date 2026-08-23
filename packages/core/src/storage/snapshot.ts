@@ -16,6 +16,7 @@
  * payload without decompressing any of them.
  */
 import { crc32, gzipCodec, inspectBlock } from "../block-format/index.js";
+import { validateTableColumns } from "./types.js";
 import type {
   FtsPosting,
   RowIdSpan,
@@ -336,6 +337,7 @@ export async function decodeSnapshot(bytes: Uint8Array): Promise<DatabaseSnapsho
   }
 
   const present = new Set(blocks.map((block) => block.id));
+  for (const table of header.tables) validateTableColumns(table.record.columns);
   const segments = header.segments.map(decodeSegment);
   for (const segment of segments) {
     for (const ids of Object.values(segment.columnBlockIds)) {

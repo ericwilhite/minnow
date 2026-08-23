@@ -31,6 +31,7 @@ import {
   type TriggerRecord,
   type WriteTransactionInput,
   collectFtsCandidates,
+  validateTableColumns,
 } from "../types.js";
 import type { DatabaseSnapshot, SnapshotLoadProgress } from "../snapshot.js";
 import {
@@ -110,6 +111,7 @@ type WalEntryBody =
       };
     }
   | { op: "removeTable"; id: string; expectedRevision: number }
+  | { op: "removeFtsColumn"; tableId: string; columnId: string }
   | { op: "addSegment"; record: SegmentRecord }
   | { op: "removeSegment"; id: string }
   | { op: "reserveRowIds"; tableId: string; count: number }
@@ -462,8 +464,23 @@ export class OpfsLeader {
       }
       case "addTable":
         return this.#core.addTable(body.record);
-      case "updateTable":
-        return this.#core.updateTable(body.id, body.expectedRevision, body.update);
+      case "updateTable": {
+        const before = this.#core.getTable(body.id);
+        const updated = this.#core.updateTable(body.id, body.expectedRevision, body.update);
+        if (before !== undefined && body.update.columns !== undefined) {
+          const retained = new Set(body.update.columns.map(({ id }) => id));
+          for (const column of before.columns) {
+            if (retained.has(column.id)) continue;
+            const key = `${before.id}/${column.id}`;
+            const pointer = this.#ftsBases.get(key);
+            if (pointer === undefined) continue;
+            this.#ftsBases.delete(key);
+            this.#dropFtsChunkCache(key);
+            this.#pool.release(pointer.chunks);
+          }
+        }
+        return updated;
+      }
       case "removeTable": {
         this.#core.removeTable(body.id, body.expectedRevision);
         const owned = `${body.id}/`;
@@ -473,6 +490,17 @@ export class OpfsLeader {
           this.#dropFtsChunkCache(key);
           this.#pool.release(pointer.chunks);
         }
+        return undefined;
+      }
+      case "removeFtsColumn": {
+        const key = `${body.tableId}/${body.columnId}`;
+        const pointer = this.#ftsBases.get(key);
+        if (pointer !== undefined) {
+          this.#ftsBases.delete(key);
+          this.#dropFtsChunkCache(key);
+          this.#pool.release(pointer.chunks);
+        }
+        this.#core.removeFtsColumn(body.tableId, body.columnId);
         return undefined;
       }
       case "addSegment":
@@ -974,14 +1002,34 @@ export class OpfsLeader {
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
-    return this.#run(
-      () => this.#logged({ op: "updateTable", id, expectedRevision, update }) as TableRecord,
-    );
+    return this.#run(async () => {
+      const updated = this.#logged({
+        op: "updateTable",
+        id,
+        expectedRevision,
+        update,
+      }) as TableRecord;
+      if (update.columns !== undefined) {
+        // DROP COLUMN may have released full-text chunks. Reclaim their extents before this
+        // mutation resolves so repeated schema evolution cannot grow the live process's disk.
+        await this.#deleteDrainedExtents();
+        await this.#compactFragmentedExtents();
+      }
+      return updated;
+    });
   }
 
   async removeTable(id: string, expectedRevision: number): Promise<void> {
     await this.#run(async () => {
       this.#logged({ op: "removeTable", id, expectedRevision });
+      await this.#deleteDrainedExtents();
+      await this.#compactFragmentedExtents();
+    });
+  }
+
+  async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
+    await this.#run(async () => {
+      this.#logged({ op: "removeFtsColumn", tableId, columnId });
       await this.#deleteDrainedExtents();
       await this.#compactFragmentedExtents();
     });
@@ -1366,6 +1414,7 @@ export class OpfsLeader {
     snapshot: DatabaseSnapshot,
     options: { onProgress?: (progress: SnapshotLoadProgress) => void } = {},
   ): Promise<void> {
+    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
     const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
     options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
     await this.#run(async () => {
