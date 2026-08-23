@@ -702,8 +702,10 @@ describe("partitioned rechunk folds of a keyless table", () => {
 });
 
 describe("partitioned folds under the background loop", () => {
-  // The settle loop deliberately permits 40 seconds under slow instrumentation. Whole-suite V8
-  // coverage also contends for CPU, so the test timeout must exceed its own correctness deadline.
+  // The settle loop deliberately permits 40 seconds under slow instrumentation. On shared CI
+  // runners the 36k-row workload can consume another minute while other Vitest files contend for
+  // CPU, so the outer timeout leaves room for both without changing the settle deadline or any
+  // correctness assertion.
   it("keeps a large keyed table equal to a reference while auto-compaction folds it", async () => {
     const seed = seedFor("partitioned-compaction-soak", 0x7a11);
     const random = mulberry32(seed);
@@ -846,7 +848,7 @@ describe("partitioned folds under the background loop", () => {
     expect(layout.partitions.length).toBeGreaterThanOrEqual(10);
     expect(layout.level0.length).toBeLessThan(48);
     store.close();
-  }, 60_000);
+  }, 180_000);
 });
 
 async function storedBytes(
