@@ -101,6 +101,7 @@ const RPC_METHODS = new Set([
   "finishFtsBaseBuild",
   "abortFtsBaseBuild",
   "readFtsCandidates",
+  "readFtsPostings",
   "addSegment",
   "getSegment",
   "listSegments",
@@ -171,6 +172,7 @@ const READ_METHODS = new Set([
   "getTableByName",
   "listTables",
   "readFtsCandidates",
+  "readFtsPostings",
   "getSegment",
   "listSegments",
   "listSegmentPage",
@@ -792,6 +794,8 @@ export class OpfsBlockStore implements BlockStore {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
       secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+      expectedManifestVersion?: { value: number | null };
+      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -865,6 +869,12 @@ export class OpfsBlockStore implements BlockStore {
       coversVersion: number;
       hasBase: boolean;
     };
+  }
+
+  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
+    return this.#dispatch("readFtsPostings", [tableId, columnId, upToVersion]) as Promise<
+      Awaited<ReturnType<BlockStore["readFtsPostings"]>>
+    >;
   }
 
   async addSegment(record: SegmentRecord): Promise<void> {

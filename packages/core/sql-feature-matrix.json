@@ -1190,7 +1190,7 @@
       "feature": "minnow",
       "status": "supported",
       "example": "CREATE INDEX keyed_score_idx ON keyed(score)",
-      "notes": "SQL does not standardize physical index DDL. Minnow supports durable, non-unique, single-column indexes that prune equality, range, and IN predicates; the predicate is always rechecked."
+      "notes": "SQL does not standardize physical index DDL. Minnow supports durable scalar and composite indexes. Leftmost equality and IN prefixes plus the next range column prune candidates; every predicate is rechecked."
     },
     {
       "id": "ddl.drop-secondary-index",
@@ -1203,18 +1203,16 @@
     {
       "id": "ddl.composite-secondary-index",
       "feature": "minnow",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE INDEX keyed_score_bonus_idx ON keyed(score, bonus)",
-      "error": "CREATE INDEX supports one column",
-      "notes": "The current postings layout prunes one column at a time. Composite key ordering and left-prefix planning need an explicit tuple encoding rather than concatenated scalar values."
+      "notes": "Composite keys use a prefix-free, type-preserving tuple encoding with ASC or DESC per component. Planning follows the SQL leftmost-prefix rule."
     },
     {
       "id": "ddl.unique-secondary-index",
       "feature": "minnow",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE UNIQUE INDEX keyed_bonus_idx ON keyed(bonus)",
-      "error": "declare the table's unique key constraint",
-      "notes": "A secondary accelerator must never silently claim uniqueness. Minnow enforces the table's one declared primary or unique key on every write; additional unique constraints need independent atomic conflict enforcement."
+      "notes": "UNIQUE membership is enforced atomically across inserts, updates, deletes, upserts, triggers, write scopes, snapshots, and concurrent tabs. As in standard SQL, any NULL component does not conflict."
     },
     {
       "id": "ddl.multiple-unique-constraints",
@@ -1222,7 +1220,7 @@
       "status": "unsupported",
       "example": "CREATE TABLE multi_unique (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
       "error": "CREATE TABLE supports one unique key column",
-      "notes": "The current keyed table model addresses rows through one unique column. A second candidate key needs independent uniqueness enforcement and conflict-target selection."
+      "notes": "CREATE TABLE still accepts one primary or unique row-addressing key. Add independently enforced candidate keys after creation with CREATE UNIQUE INDEX; ON CONFLICT continues to target the row-addressing key."
     },
     {
       "id": "ddl.composite-primary-key",

@@ -16,7 +16,7 @@
  * payload without decompressing any of them.
  */
 import { crc32, gzipCodec, inspectBlock } from "../block-format/index.js";
-import { validateTableColumns } from "./types.js";
+import { validateSecondaryIndexes, validateTableColumns } from "./types.js";
 import type {
   FtsPosting,
   RowIdSpan,
@@ -53,6 +53,8 @@ export interface SnapshotTable {
   autoIncrement: Array<{ columnId: string; next: bigint }>;
   /** Complete unique-key membership, so a write after loading still conflicts correctly. */
   uniqueKeyTokens: string[];
+  /** Complete membership for every durable UNIQUE secondary index. */
+  secondaryUniqueKeys?: Array<{ indexId: string; keyTokens: string[] }>;
   fts: SnapshotFtsIndex[];
 }
 
@@ -65,6 +67,48 @@ export interface DatabaseSnapshot {
   /** Committed transactions only; segment visibility resolves through `committedVersion`. */
   transactions: TransactionRecord[];
   blocks: Array<{ id: string; bytes: Uint8Array }>;
+}
+
+/** Validates catalog identities and complete uniqueness membership before a snapshot is loaded. */
+export function validateSnapshotCatalog(
+  tables: ReadonlyArray<{
+    record: TableRecord;
+    uniqueKeyTokens: readonly string[];
+    secondaryUniqueKeys?: ReadonlyArray<{ indexId: string; keyTokens: readonly string[] }>;
+  }>,
+): void {
+  const indexNames = new Set<string>();
+  for (const table of tables) {
+    validateTableColumns(table.record.columns);
+    validateSecondaryIndexes(table.record);
+    if (new Set(table.uniqueKeyTokens).size !== table.uniqueKeyTokens.length) {
+      throw new Error(`Snapshot repeats a table unique key: ${table.record.name}`);
+    }
+    if (table.record.uniqueKeyColumnId === undefined && table.uniqueKeyTokens.length > 0) {
+      throw new Error(`Snapshot has orphaned table unique keys: ${table.record.name}`);
+    }
+    const memberships = new Set<string>();
+    for (const entry of table.secondaryUniqueKeys ?? []) {
+      if (memberships.has(entry.indexId)) {
+        throw new Error(`Snapshot repeats UNIQUE-index membership: ${entry.indexId}`);
+      }
+      memberships.add(entry.indexId);
+      const index = table.record.secondaryIndexes?.[entry.indexId];
+      if (index?.unique !== true || index.uniqueEnforced !== true) {
+        throw new Error(`Snapshot has orphaned UNIQUE-index membership: ${entry.indexId}`);
+      }
+      if (new Set(entry.keyTokens).size !== entry.keyTokens.length) {
+        throw new Error(`Snapshot repeats a UNIQUE-index key: ${index.name}`);
+      }
+    }
+    for (const [indexId, index] of Object.entries(table.record.secondaryIndexes ?? {})) {
+      if (indexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
+      indexNames.add(index.name);
+      if (index.uniqueEnforced === true && !memberships.has(indexId)) {
+        throw new Error(`Snapshot is missing UNIQUE-index membership: ${index.name}`);
+      }
+    }
+  }
 }
 
 /** Where a snapshot load has got to, for a progress bar over a multi-megabyte file. */
@@ -128,6 +172,7 @@ interface WireTable {
   nextRowId: string;
   autoIncrement: Array<{ columnId: string; next: string }>;
   uniqueKeyTokens: string[];
+  secondaryUniqueKeys?: Array<{ indexId: string; keyTokens: string[] }>;
   fts: Array<{
     columnId: string;
     coversVersion: number;
@@ -233,6 +278,9 @@ export async function encodeSnapshot(snapshot: DatabaseSnapshot): Promise<Uint8A
         next: entry.next.toString(),
       })),
       uniqueKeyTokens: table.uniqueKeyTokens,
+      ...(table.secondaryUniqueKeys === undefined
+        ? {}
+        : { secondaryUniqueKeys: table.secondaryUniqueKeys }),
       fts: table.fts.map((index) => ({
         columnId: index.columnId,
         coversVersion: index.coversVersion,
@@ -337,7 +385,7 @@ export async function decodeSnapshot(bytes: Uint8Array): Promise<DatabaseSnapsho
   }
 
   const present = new Set(blocks.map((block) => block.id));
-  for (const table of header.tables) validateTableColumns(table.record.columns);
+  validateSnapshotCatalog(header.tables);
   const segments = header.segments.map(decodeSegment);
   for (const segment of segments) {
     for (const ids of Object.values(segment.columnBlockIds)) {
@@ -358,6 +406,9 @@ export async function decodeSnapshot(bytes: Uint8Array): Promise<DatabaseSnapsho
         next: parseBigInt(entry.next, "auto-increment counter"),
       })),
       uniqueKeyTokens: table.uniqueKeyTokens,
+      ...(table.secondaryUniqueKeys === undefined
+        ? {}
+        : { secondaryUniqueKeys: table.secondaryUniqueKeys }),
       fts: table.fts.map((index) => ({
         columnId: index.columnId,
         coversVersion: index.coversVersion,

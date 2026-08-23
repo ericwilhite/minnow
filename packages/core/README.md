@@ -19,8 +19,8 @@ npm install @minnowdb/core
 - **One schema, in TypeScript** — `table()`, `column`, and `schema()` declare tables once and
   `migrate()` evolves them without rewriting stored data.
 - **Full-text search** — `MATCH` / BM25 on any column, with no full-text index DDL to write.
-- **Secondary indexes** — durable single-column `CREATE INDEX` / `DROP INDEX` accelerators for
-  equality, range, and `IN` filters, maintained across every mutation path.
+- **Secondary indexes** — durable scalar/composite and `UNIQUE` indexes for left-prefix equality,
+  `IN`, and range pruning, plus exact ordered and covering scans where the table shape permits.
 - **Live queries** — `liveQueries()` hands back a set whose subscribers get a fresh result after
   any commit that could have changed it, across tabs.
 - **Durable browser storage** — compressed columnar blocks on IndexedDB or OPFS, atomic

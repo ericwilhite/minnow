@@ -816,6 +816,10 @@ class MiniLogStore implements BlockStore {
     return this.#core.readFtsCandidates(tableId, columnId, terms, upToVersion);
   }
 
+  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
+    return this.#core.readFtsPostings(tableId, columnId, upToVersion);
+  }
+
   // ---- temp spill: owner records are durable records; page bytes are instance scratch ----
 
   async createTempOwner(record: TempOwnerRecord): Promise<void> {

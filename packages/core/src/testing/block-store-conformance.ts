@@ -6,6 +6,7 @@ import {
   TempOwnerConflictError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
+  secondaryUniqueKeyNamespace,
   WriteConflictError,
   type BlockStore,
   type SegmentRecord,
@@ -327,6 +328,35 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         );
         const updated = await store.updateTable("table-alpha", 0, {});
         check(updated.revision === 1, "updateTable must advance the revision");
+        store.close();
+      },
+    },
+    {
+      name: "secondary-index metadata cannot claim ordering its term encoding does not provide",
+      async run(target) {
+        const store = await target.create();
+        const record = table("bad-secondary");
+        try {
+          await store.addTable({
+            ...record,
+            secondaryIndexes: {
+              bad: {
+                name: "bad_descending_legacy_index",
+                columnId: "col-v",
+                directions: ["desc"],
+                storage: "postings-v1",
+                storageColumnId: "secondary-index:bad",
+                locator: "row-id",
+                state: "ready",
+                buildFromVersion: 0,
+              },
+            },
+          });
+          throw new Error("a descending legacy term encoding was accepted");
+        } catch (error) {
+          check(error instanceof TypeError, "invalid secondary-index metadata must be rejected");
+        }
+        checkEqual(await store.listTables(), [], "a rejected catalog record must leave no table");
         store.close();
       },
     },
@@ -718,6 +748,16 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           [[1n, 2n, 3n]],
           "prefix terms must match the term range, row ids ascending and unique",
         );
+        const ordered = await store.readFtsPostings("table-t", "col-v", 10);
+        checkEqual(
+          ordered.postings,
+          [
+            { term: "minnow", rowIds: [1n, 3n], tf: [1, 2] },
+            { term: "minnows", rowIds: [2n], tf: [1] },
+            { term: "shark", rowIds: [4n], tf: [1] },
+          ],
+          "ordered postings must merge into canonical term and row-ID order",
+        );
         store.close();
       },
     },
@@ -788,6 +828,86 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         );
         checkEqual(candidates.rowIdsByTerm, [[]], "removing an index must remove its candidates");
         check(!candidates.hasBase, "a removed base must be distinguishable from an empty base");
+        store.close();
+      },
+    },
+    {
+      name: "UNIQUE-index membership seeds and drops atomically with its catalog record",
+      async run(target) {
+        const store = await target.create();
+        const record = table("unique-secondary");
+        const indexId = "unique-v";
+        const namespaceId = secondaryUniqueKeyNamespace(record.id, indexId);
+        const building = {
+          name: "unique_secondary_v",
+          columnId: "col-v",
+          columnIds: ["col-v"],
+          directions: ["asc" as const],
+          unique: true as const,
+          termEncoding: "tuple-v1" as const,
+          storage: "postings-v1" as const,
+          storageColumnId: "secondary-index:unique-v",
+          locator: "row-id" as const,
+          state: "building" as const,
+          buildId: "builder",
+          buildFromVersion: -1,
+        };
+        const { buildId: _buildId, ...withoutBuilder } = building;
+        void _buildId;
+        const ready = {
+          ...withoutBuilder,
+          state: "ready" as const,
+          uniqueEnforced: true as const,
+        };
+        await store.addTable({ ...record, secondaryIndexes: { [indexId]: building } });
+        try {
+          await store.updateTable(record.id, 0, {
+            secondaryIndexes: { [indexId]: ready },
+            expectedManifestVersion: { value: null },
+            uniqueKeySeed: { namespaceId: `${namespaceId}-wrong`, keyTokens: ["x"] },
+          });
+          throw new Error("a seed for the wrong namespace was accepted");
+        } catch (error) {
+          check(error instanceof TypeError, "a mismatched UNIQUE seed must be rejected");
+        }
+        check(
+          (await store.getTable(record.id))?.revision === 0,
+          "a mismatched seed must not mutate the catalog",
+        );
+        await checkThrows(
+          () =>
+            store.updateTable(record.id, 0, {
+              secondaryIndexes: {
+                [indexId]: ready,
+              },
+              expectedManifestVersion: { value: null },
+              uniqueKeySeed: { namespaceId, keyTokens: ["x", "x"] },
+            }),
+          UniqueKeyConflictError,
+          "a duplicate UNIQUE seed",
+        );
+        check(
+          (await store.getTable(record.id))?.secondaryIndexes?.[indexId]?.state === "building",
+          "a refused seed must not publish the ready catalog state",
+        );
+        await store.updateTable(record.id, 0, {
+          secondaryIndexes: {
+            [indexId]: ready,
+          },
+          expectedManifestVersion: { value: null },
+          uniqueKeySeed: { namespaceId, keyTokens: ["x", "y"] },
+        });
+        checkEqual(
+          await store.getExistingUniqueKeys(namespaceId, ["x", "z"]),
+          ["x"],
+          "the ready catalog and membership must publish together",
+        );
+        await store.updateTable(record.id, 1, { secondaryIndexes: null });
+        checkEqual(
+          await store.getExistingUniqueKeys(namespaceId, ["x", "y"]),
+          [],
+          "dropping the index must reclaim its membership namespace",
+        );
         store.close();
       },
     },

@@ -120,6 +120,10 @@ export interface ColumnarTable {
   readonly rowCount: number;
   readonly columns: ReadonlyMap<string, ColumnVector>;
   readonly uniqueKey?: string;
+  /** Optional physical-row permutation supplied by an exact index-ordered materialization. */
+  readonly scanOrder?: Uint32Array;
+  /** True only when that permutation satisfies this prepared plan's complete ORDER BY. */
+  readonly orderedForPlan?: true;
 }
 
 export interface PreparedVectorQuery {
@@ -409,6 +413,7 @@ interface BoundPlan {
     nulls?: "first" | "last";
   }>;
   readonly grouped: boolean;
+  readonly sourceOrdered: boolean;
   readonly codeGrouping?: { source: number; vector: StringVector };
   readonly wildcard: boolean;
   readonly limit?: number;
@@ -502,7 +507,7 @@ export function prepareVectorQuery(
       },
       async executeAsync(executionOptions = {}) {
         if (closed) throw new Error("Prepared vector query is closed");
-        const canSpillSort = bound.orderBy.length > 0 && !bound.grouped;
+        const canSpillSort = bound.orderBy.length > 0 && !bound.grouped && !bound.sourceOrdered;
         // An unordered grouped plan spills too: the empty ordering makes the pairwise merge a
         // stable concatenation, and partition-wise accumulation bounds peak group state.
         const canSpillHash = bound.grouped && bound.groupBy.length > 0;
@@ -642,7 +647,7 @@ export function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue 
 }
 
 function columnarTablePayloadBytes(table: ColumnarTable): number {
-  let total = 0;
+  let total = table.scanOrder?.byteLength ?? 0;
   for (const vector of table.columns.values()) {
     total = safeMemorySum(total, vector.validity.byteLength, "Column vector payload");
     if (vector.kind === "string") {
@@ -1062,6 +1067,8 @@ function bindPlan(
     ...(nulls === undefined ? {} : { nulls }),
   }));
   const grouped = groupBy.length > 0 || aggregateSpecs.length > 0;
+  const sourceOrdered =
+    sourceTables[0]?.orderedForPlan === true && standardJoins.length === 0 && !grouped;
   // A single bare string-column GROUP BY can group on dictionary codes: identical values share a
   // code within one vector, so a code-indexed slot table replaces per-row hashing. Streamed
   // vectors swap dictionaries per window; the accumulator remaps its slot table by value on
@@ -1085,6 +1092,7 @@ function bindPlan(
     select,
     orderBy,
     grouped,
+    sourceOrdered,
     ...(codeGrouping === undefined ? {} : { codeGrouping }),
     wildcard: plan.select[0]?.expression.kind === "wildcard",
     ...(plan.limit === undefined ? {} : { limit: plan.limit }),
@@ -1721,7 +1729,10 @@ function runScanBatch(
     const sourceRows = plan.sourceTables.map(() => new Int32Array(length).fill(-1));
     const scan = sourceRows[plan.scanSource];
     if (scan === undefined) return false;
-    for (let index = 0; index < length; index += 1) scan[index] = start + index;
+    const order = plan.sourceTables[plan.scanSource]?.scanOrder;
+    for (let index = 0; index < length; index += 1) {
+      scan[index] = order?.[start + index] ?? start + index;
+    }
     const batch: BatchRows = { length, rowsBySource: sourceRows, memory: batchMemory };
     return consumeJoinedBatches(plan, batch, 0, groups, output, memory);
   } finally {
@@ -1735,7 +1746,7 @@ function executeBoundPlan(plan: BoundPlan, memory: QueryMemoryContext): QueryRes
   const groups = new GroupAccumulator(plan, memory);
   const output = new ResultSink(plan, memory, true);
   const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
-  const narrowed = ascendingScanRange(plan, 0, scanRows);
+  const narrowed = plan.sourceOrdered ? undefined : ascendingScanRange(plan, 0, scanRows);
   const ranges = narrowed?.ranges ?? [
     { begin: narrowed?.begin ?? 0, end: narrowed?.end ?? scanRows },
   ];
@@ -1773,7 +1784,7 @@ async function executeBoundPlanAsync(
     // stopped, which is the block boundary — exactly the span the ordering check covers.
     const windowEnd =
       typeof residentEnd === "number" && residentEnd > start ? residentEnd : start + length;
-    const narrowed = ascendingScanRange(plan, start, windowEnd);
+    const narrowed = plan.sourceOrdered ? undefined : ascendingScanRange(plan, start, windowEnd);
     if (narrowed === undefined) {
       if (runScanBatch(plan, start, length, groups, output, memory)) break;
       start += length;
@@ -2492,7 +2503,7 @@ function finishResult(
   memory: QueryMemoryContext,
 ): QueryResult {
   const rows = inputRows;
-  if (plan.orderBy.length > 0) {
+  if (plan.orderBy.length > 0 && !plan.sourceOrdered) {
     const ordering = memory.reserve(
       safeMemoryProduct(
         rows.length,
@@ -3147,7 +3158,7 @@ function reachedEarlyLimit(plan: BoundPlan, outputRows: number): boolean {
   // Early termination must still produce the rows the trailing OFFSET will discard.
   return (
     !plan.grouped &&
-    plan.orderBy.length === 0 &&
+    (plan.orderBy.length === 0 || plan.sourceOrdered) &&
     plan.limit !== undefined &&
     outputRows >= plan.limit + (plan.offset ?? 0)
   );
@@ -3508,6 +3519,7 @@ class ResultSink {
     const scanRows = plan.sourceTables[plan.scanSource]?.rowCount ?? 0;
     const bounded =
       !plan.grouped &&
+      !plan.sourceOrdered &&
       plan.orderBy.length > 0 &&
       plan.limit !== undefined &&
       (plan.joins.length > 0 || capacity < scanRows * BOUNDED_SINK_MAX_SHARE);

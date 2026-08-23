@@ -13,6 +13,7 @@
  * request goes through.
  */
 import { MinnowDatabaseClient } from "../src/engine/client.js";
+import { UniqueConstraintError } from "../src/engine/errors.js";
 
 interface WorkerTestResult {
   /** The worker booted, answered, and reported the rows it was given. */
@@ -28,8 +29,11 @@ interface WorkerTestResult {
   /** A durable secondary index built and mutated in one worker, then reused by the next. */
   secondaryIndex: {
     initialMatches: number;
+    compositeMatches: number;
     mutationMatches: number;
     matchesAfterRestart: number;
+    compositeMatchesAfterRestart: number;
+    uniqueRejectedAfterRestart: boolean;
     usedBeforeRestart: boolean;
     usedAfterRestart: boolean;
   };
@@ -67,12 +71,18 @@ async function run(): Promise<WorkerTestResult> {
   // Build through SQL over the real worker boundary. The selective query and EXPLAIN together
   // prove both correctness and that the browser-backed database actually chose the index.
   await client.execute("CREATE INDEX events_by_region ON events(region)");
+  await client.execute("CREATE INDEX events_by_region_amount ON events(region, amount DESC)");
+  await client.execute("CREATE UNIQUE INDEX events_unique_region_amount ON events(region, amount)");
   const initialIndexed = await client.query(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'west'",
     { memoize: false },
   );
   const initialIndexPlan = await client.explain(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'west'",
+  );
+  const compositeIndexed = await client.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'west' AND amount >= 3990",
+    { memoize: false },
   );
 
   const small = await client.query("SELECT region FROM events WHERE id = 1");
@@ -125,8 +135,11 @@ async function run(): Promise<WorkerTestResult> {
   };
   const secondaryIndex = {
     initialMatches: (initialIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    compositeMatches: (compositeIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
     mutationMatches: concurrentWrites.rowsPersisted,
     matchesAfterRestart: -1,
+    compositeMatchesAfterRestart: -1,
+    uniqueRejectedAfterRestart: false,
     usedBeforeRestart: initialIndexPlan.includes("secondary index prunes"),
     usedAfterRestart: false,
   };
@@ -145,9 +158,22 @@ async function run(): Promise<WorkerTestResult> {
   const reopenedIndexPlan = await reopened.explain(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'central'",
   );
+  const compositeAfter = await reopened.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'west' AND amount >= 3990",
+    { memoize: false },
+  );
   secondaryIndex.matchesAfterRestart =
     (indexedAfter.rows[0] as { n?: number } | undefined)?.n ?? -1;
+  secondaryIndex.compositeMatchesAfterRestart =
+    (compositeAfter.rows[0] as { n?: number } | undefined)?.n ?? -1;
   secondaryIndex.usedAfterRestart = reopenedIndexPlan.includes("secondary index prunes");
+  try {
+    await reopened.insertBatch("events", [{ id: 30_000, region: "west", amount: 0 }]);
+  } catch (error) {
+    // The main-thread client must rehydrate the worker's typed error, not merely preserve a
+    // message. That keeps `instanceof` useful to production callers after a cold restart.
+    secondaryIndex.uniqueRejectedAfterRestart = error instanceof UniqueConstraintError;
+  }
   const tables = await reopened.listTables();
   const survivesTermination = {
     rowsAfterRestart: (after.rows[0] as { n?: number } | undefined)?.n ?? -1,

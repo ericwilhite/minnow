@@ -269,6 +269,67 @@ describe("database snapshots", () => {
     }
   });
 
+  it("rejects missing, duplicate, or orphaned secondary UNIQUE membership", async () => {
+    const { database: source, store: sourceStore } = await seededDatabase();
+    await source.execute("CREATE UNIQUE INDEX unique_author_name ON authors(name)");
+    const snapshot = await sourceStore.exportSnapshot();
+    const authors = snapshot.tables.find(({ record }) => record.name === "authors");
+    const membership = authors?.secondaryUniqueKeys?.[0];
+    if (authors === undefined || membership === undefined) {
+      throw new Error("Missing secondary UNIQUE fixture membership");
+    }
+
+    const missing = structuredClone(snapshot);
+    const missingAuthors = missing.tables.find(({ record }) => record.name === "authors");
+    if (missingAuthors === undefined) throw new Error("Missing authors fixture");
+    missingAuthors.secondaryUniqueKeys = [];
+    await expect(decodeSnapshot(await encodeSnapshot(missing))).rejects.toThrow(
+      /missing UNIQUE-index membership/,
+    );
+
+    const duplicate = structuredClone(snapshot);
+    const duplicateAuthors = duplicate.tables.find(({ record }) => record.name === "authors");
+    if (duplicateAuthors === undefined) throw new Error("Missing authors fixture");
+    duplicateAuthors.secondaryUniqueKeys?.push(structuredClone(membership));
+    await expect(decodeSnapshot(await encodeSnapshot(duplicate))).rejects.toThrow(
+      /repeats UNIQUE-index membership/,
+    );
+
+    const repeatedKey = structuredClone(snapshot);
+    const repeatedMembership = repeatedKey.tables.find(({ record }) => record.name === "authors")
+      ?.secondaryUniqueKeys?.[0];
+    const firstToken = repeatedMembership?.keyTokens[0];
+    if (repeatedMembership === undefined || firstToken === undefined) {
+      throw new Error("Missing UNIQUE key fixture");
+    }
+    repeatedMembership.keyTokens.push(firstToken);
+    await expect(decodeSnapshot(await encodeSnapshot(repeatedKey))).rejects.toThrow(
+      /repeats a UNIQUE-index key/,
+    );
+
+    const orphaned = structuredClone(snapshot);
+    const orphanedMembership = orphaned.tables.find(({ record }) => record.name === "authors")
+      ?.secondaryUniqueKeys?.[0];
+    if (orphanedMembership === undefined) throw new Error("Missing UNIQUE membership fixture");
+    orphanedMembership.indexId = "missing-index";
+    await expect(decodeSnapshot(await encodeSnapshot(orphaned))).rejects.toThrow(
+      /orphaned UNIQUE-index membership/,
+    );
+
+    const stores = [
+      new MemoryBlockStore(),
+      await IndexedDbBlockStore.open({ name: crypto.randomUUID(), indexedDB: new IDBFactory() }),
+      await OpfsBlockStore.open({ name: crypto.randomUUID(), root: new MemoryOpfs().root }),
+    ];
+    for (const store of stores) {
+      await expect(store.importSnapshot(duplicate)).rejects.toThrow(
+        /repeats UNIQUE-index membership/,
+      );
+      expect(await store.listBlockIds()).toEqual([]);
+      store.close();
+    }
+  });
+
   it("refuses to snapshot a database with nothing committed", async () => {
     await expect(new MemoryBlockStore().exportSnapshot()).rejects.toThrow(/no committed version/);
   });

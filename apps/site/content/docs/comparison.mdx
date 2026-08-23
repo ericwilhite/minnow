@@ -101,9 +101,10 @@ in existence, running in a browser tab.
 
 - **The SQL surface is complete.** Minnow implements a documented subset of SQL:2023 and refuses
   the rest by design. SQLite implements SQLite, and there is thirty years of it.
-- **Its indexes are broader.** Minnow can declare a durable single-column pruning index, but a
-  SQLite B-tree can be composite, unique, covering, and deliver `ORDER BY` without a separate
-  sort. For workloads that need those properties, SQLite's mature index model remains stronger.
+- **Its indexes are broader.** Minnow's durable indexes can be composite and unique, and a
+  qualifying keyless-table index can cover a query or deliver `ORDER BY` without a separate
+  sort. SQLite's mature B-tree model still supports more index forms, expressions, collations,
+  partial indexes, and broader covering and ordering plans.
 - **Portability.** The same schema, the same statements, and the same file work on a server, on
   mobile, and in the browser. Minnow's block format is its own, and this early format carries no
   compatibility promise.

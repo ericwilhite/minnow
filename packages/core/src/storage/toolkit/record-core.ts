@@ -12,6 +12,7 @@ import {
   type TriggerRecord,
   advanceGarbageCollectionJobRecord,
   collectFtsCandidates,
+  collectFtsPostings,
   activePostingStorageColumnIds,
   invalidateUncoveredFtsColumns,
   invalidateUncoveredSecondaryIndexes,
@@ -46,6 +47,7 @@ import {
   TransactionRecordConflictError,
   type TransactionRecordUpdate,
   UniqueKeyConflictError,
+  UniqueIndexCoverageError,
   type WriteTransactionInput,
   normalizeCompactionJobRecord,
   normalizeSegmentRecord,
@@ -53,9 +55,16 @@ import {
   updateTransactionRecord,
   validateTableColumns,
   validateSecondaryIndexes,
+  secondaryIndexColumnIds,
+  secondaryUniqueKeyNamespace,
   WriteConflictError,
 } from "../types.js";
-import { selectLiveRecords, type DatabaseSnapshot, type SnapshotFtsIndex } from "../snapshot.js";
+import {
+  selectLiveRecords,
+  validateSnapshotCatalog,
+  type DatabaseSnapshot,
+  type SnapshotFtsIndex,
+} from "../snapshot.js";
 
 /**
  * How the record core sees block bytes it does not hold. The core owns every small record —
@@ -262,6 +271,8 @@ export class RecordCore {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
       secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+      expectedManifestVersion?: { value: number | null };
+      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
       triggers?: TriggerRecord[] | null;
     },
   ): TableRecord {
@@ -269,6 +280,24 @@ export class RecordCore {
     const actualRevision = record === undefined ? null : (record.revision ?? 0);
     if (record === undefined || actualRevision !== expectedRevision) {
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
+    }
+    if (
+      update.expectedManifestVersion !== undefined &&
+      (this.getCurrentManifestVersion() ?? null) !== update.expectedManifestVersion.value
+    ) {
+      throw new WriteConflictError(
+        update.expectedManifestVersion.value,
+        this.getCurrentManifestVersion(),
+      );
+    }
+    let uniqueSeed: Set<string> | undefined;
+    if (update.uniqueKeySeed !== undefined) {
+      uniqueSeed = new Set<string>();
+      for (const token of update.uniqueKeySeed.keyTokens) {
+        if (uniqueSeed.has(token))
+          throw new UniqueKeyConflictError(update.uniqueKeySeed.namespaceId, token);
+        uniqueSeed.add(token);
+      }
     }
     if (update.columns !== undefined) validateTableColumns(update.columns);
     const {
@@ -292,7 +321,9 @@ export class RecordCore {
     }
     if (nextSecondary !== null && nextSecondary !== undefined && retainedColumnIds !== undefined) {
       nextSecondary = Object.fromEntries(
-        Object.entries(nextSecondary).filter(([, index]) => retainedColumnIds.has(index.columnId)),
+        Object.entries(nextSecondary).filter(([, index]) =>
+          secondaryIndexColumnIds(index).every((columnId) => retainedColumnIds.has(columnId)),
+        ),
       );
       if (Object.keys(nextSecondary).length === 0) nextSecondary = null;
     }
@@ -328,6 +359,18 @@ export class RecordCore {
       revision: expectedRevision + 1,
     };
     validateSecondaryIndexes(updated);
+    if (update.uniqueKeySeed !== undefined) {
+      const ownsSeed = Object.entries(updated.secondaryIndexes ?? {}).some(
+        ([indexId, index]) =>
+          index.unique === true &&
+          index.uniqueEnforced === true &&
+          index.state === "ready" &&
+          secondaryUniqueKeyNamespace(updated.id, indexId) === update.uniqueKeySeed?.namespaceId,
+      );
+      if (!ownsSeed) {
+        throw new TypeError("UNIQUE-index seed does not belong to a ready catalog index");
+      }
+    }
     if (retainedColumnIds !== undefined) {
       for (const column of record.columns) {
         if (!retainedColumnIds.has(column.id)) this.removeFtsColumn(record.id, column.id);
@@ -340,6 +383,14 @@ export class RecordCore {
       if (!retainedIndexStorage.has(index.storageColumnId)) {
         this.removeFtsColumn(record.id, index.storageColumnId);
       }
+    }
+    for (const [indexId, previous] of Object.entries(previousSecondary ?? {})) {
+      if (previous.unique === true && nextSecondary?.[indexId]?.unique !== true) {
+        this.#uniqueKeys.delete(secondaryUniqueKeyNamespace(record.id, indexId));
+      }
+    }
+    if (update.uniqueKeySeed !== undefined) {
+      this.#uniqueKeys.set(update.uniqueKeySeed.namespaceId, uniqueSeed ?? new Set());
     }
     this.#tables.set(id, updated);
     this.#catalogEpoch += 1;
@@ -366,6 +417,10 @@ export class RecordCore {
       if (key.startsWith(owned)) this.#nextAutoIncrement.delete(key);
     }
     this.#uniqueKeys.delete(id);
+    const secondaryUniquePrefix = `${id}\u0000secondary-index\u0000`;
+    for (const namespaceId of [...this.#uniqueKeys.keys()]) {
+      if (namespaceId.startsWith(secondaryUniquePrefix)) this.#uniqueKeys.delete(namespaceId);
+    }
     this.#nextRowIds.delete(id);
     this.#tableIdsByName.delete(record.name);
     this.#tables.delete(id);
@@ -497,6 +552,27 @@ export class RecordCore {
       chunkLists.push(structuredClone(delta.postings));
     }
     return { chunkLists, deltaChunkCount, deltaTokens };
+  }
+
+  readFtsPostings(
+    tableId: string,
+    columnId: string,
+    upToVersion: number,
+  ): {
+    postings: FtsPosting[];
+    deltaChunkCount: number;
+    coversVersion: number;
+    hasBase: boolean;
+  } {
+    const base = this.#ftsBases.get(`${tableId}/${columnId}`);
+    const coversVersion = base?.coversVersion ?? -1;
+    const delta = this.readFtsDeltas(tableId, columnId, coversVersion, upToVersion);
+    return {
+      postings: collectFtsPostings([...(base?.chunks ?? []), ...delta.chunkLists]),
+      deltaChunkCount: delta.deltaChunkCount,
+      coversVersion,
+      hasBase: base !== undefined,
+    };
   }
 
   /** The delta-pruning half of `writeFtsBase`, for stores that keep the base itself outside. */
@@ -1032,6 +1108,23 @@ export class RecordCore {
       return segment;
     });
     const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
+    const coveredUniqueNamespaces = new Set(uniqueKeyEntries.map((entry) => entry.tableId));
+    const changedTableIds = new Set([
+      ...(input.changedTableIds ?? []),
+      ...pendingSegments.map((segment) => segment.tableId),
+    ]);
+    for (const tableId of changedTableIds) {
+      const changedTable = this.#tables.get(tableId);
+      if (changedTable === undefined) continue;
+      for (const [indexId, index] of Object.entries(changedTable.secondaryIndexes ?? {})) {
+        if (
+          index.uniqueEnforced === true &&
+          !coveredUniqueNamespaces.has(secondaryUniqueKeyNamespace(tableId, indexId))
+        ) {
+          throw new UniqueIndexCoverageError(tableId, index.name);
+        }
+      }
+    }
     // Entries apply in operation order over per-table deltas against the live membership, so
     // a scope that inserts the same key twice conflicts exactly like two separate commits
     // would. A delta rather than a working copy of the table's whole key set: the copy made
@@ -1657,6 +1750,20 @@ export class RecordCore {
           return next === undefined ? [] : [{ columnId: column.id, next }];
         }),
         uniqueKeyTokens: [...(this.#uniqueKeys.get(table.id) ?? [])],
+        secondaryUniqueKeys: Object.entries(table.secondaryIndexes ?? {}).flatMap(
+          ([indexId, index]) =>
+            index.uniqueEnforced === true
+              ? [
+                  {
+                    indexId,
+                    keyTokens: [
+                      ...(this.#uniqueKeys.get(secondaryUniqueKeyNamespace(table.id, indexId)) ??
+                        []),
+                    ],
+                  },
+                ]
+              : [],
+        ),
         fts,
       };
     });
@@ -1687,10 +1794,7 @@ export class RecordCore {
     snapshot: DatabaseSnapshot,
     storeBlockBytes: (id: string, bytes: Uint8Array) => void,
   ): void {
-    for (const table of snapshot.tables) {
-      validateTableColumns(table.record.columns);
-      validateSecondaryIndexes(table.record);
-    }
+    validateSnapshotCatalog(snapshot.tables);
     for (const block of snapshot.blocks) storeBlockBytes(block.id, block.bytes);
     this.loadSnapshotRecords(
       { ...snapshot, blocks: undefined },
@@ -1703,10 +1807,9 @@ export class RecordCore {
     snapshot: Omit<DatabaseSnapshot, "blocks"> & { blocks?: undefined },
     blockIds: readonly string[],
   ): void {
+    validateSnapshotCatalog(snapshot.tables);
     const indexNames = new Set<string>();
     for (const table of snapshot.tables) {
-      validateTableColumns(table.record.columns);
-      validateSecondaryIndexes(table.record);
       for (const index of Object.values(table.record.secondaryIndexes ?? {})) {
         if (indexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
         indexNames.add(index.name);
@@ -1728,6 +1831,18 @@ export class RecordCore {
       }
       if (table.uniqueKeyTokens.length > 0) {
         this.#uniqueKeys.set(record.id, new Set(table.uniqueKeyTokens));
+      }
+      for (const entry of table.secondaryUniqueKeys ?? []) {
+        const index = record.secondaryIndexes?.[entry.indexId];
+        if (index?.unique !== true) {
+          throw new TypeError(
+            `Snapshot has membership for an unknown UNIQUE index: ${entry.indexId}`,
+          );
+        }
+        this.#uniqueKeys.set(
+          secondaryUniqueKeyNamespace(record.id, entry.indexId),
+          new Set(entry.keyTokens),
+        );
       }
       for (const index of table.fts) {
         this.#ftsBases.set(`${record.id}/${index.columnId}`, {

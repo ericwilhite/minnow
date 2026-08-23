@@ -251,10 +251,13 @@ export interface FtsColumnIndexRecord {
 
 export type SecondaryIndexState = "building" | "ready" | "invalid";
 
+export type SecondaryIndexDirection = "asc" | "desc";
+
 /**
- * One durable, single-column secondary index. The physical postings live in the same bounded,
- * immutable base-plus-delta substrate as full-text postings, under `storageColumnId`; keeping the
- * storage identity separate from the catalog column ID leaves room for future index variants.
+ * One durable secondary index. The physical postings live in the same bounded, immutable
+ * base-plus-delta substrate as full-text postings, under `storageColumnId`; keeping the storage
+ * identity separate from the catalog column IDs lets one postings generation represent a
+ * composite key.
  *
  * Postings are a pruning accelerator, never truth. A keyed table stores a deterministic hash of
  * its immutable unique key (collisions only add false positives); an append-only keyless table
@@ -262,7 +265,18 @@ export type SecondaryIndexState = "building" | "ready" | "invalid";
  */
 export interface SecondaryIndexRecord {
   name: string;
+  /** First indexed column, retained so catalogs written by the single-column release stay valid. */
   columnId: string;
+  /** Ordered key columns. Missing on legacy records, where `columnId` is the complete key. */
+  columnIds?: string[];
+  /** Declared key direction per column. Missing legacy entries are ascending. */
+  directions?: SecondaryIndexDirection[];
+  /** SQL UNIQUE: enforced through an atomic, separately namespaced membership set. */
+  unique?: true;
+  /** The membership set has been seeded and must be enforced, independent of postings state. */
+  uniqueEnforced?: true;
+  /** Legacy scalar terms or the prefix-free composite encoding used by newly created indexes. */
+  termEncoding?: "tuple-v1";
   storage: "postings-v1";
   storageColumnId: string;
   locator: "row-id" | "key-hash-v1";
@@ -281,7 +295,7 @@ export interface TableRecord {
   uniqueKeyLookupReady?: boolean;
   /** Full-text index state per column ID. Writers that see this emit commit deltas. */
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
-  /** Durable single-column secondary indexes keyed by stable index ID. */
+  /** Durable secondary indexes keyed by stable index ID. */
   secondaryIndexes?: Record<string, SecondaryIndexRecord>;
   /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
   triggers?: TriggerRecord[];
@@ -340,8 +354,31 @@ export function validateSecondaryIndexes(record: TableRecord): void {
     if (indexId.length === 0 || index.name.length === 0 || index.storageColumnId.length === 0) {
       throw new TypeError("Secondary-index IDs and names must be non-empty");
     }
-    if (!columnIds.has(index.columnId)) {
+    const indexedColumnIds = index.columnIds ?? [index.columnId];
+    if (
+      indexedColumnIds.length === 0 ||
+      indexedColumnIds[0] !== index.columnId ||
+      new Set(indexedColumnIds).size !== indexedColumnIds.length ||
+      indexedColumnIds.some((columnId) => !columnIds.has(columnId))
+    ) {
       throw new TypeError(`Secondary index ${index.name} references an unknown column`);
+    }
+    const directions: readonly unknown[] =
+      index.directions ?? indexedColumnIds.map(() => "asc" as const);
+    const termEncoding: unknown = index.termEncoding;
+    if (
+      directions.length !== indexedColumnIds.length ||
+      directions.some((direction) => direction !== "asc" && direction !== "desc") ||
+      (termEncoding !== undefined && termEncoding !== "tuple-v1") ||
+      (termEncoding !== "tuple-v1" &&
+        (indexedColumnIds.length > 1 ||
+          directions.some((direction) => direction !== "asc") ||
+          index.unique === true))
+    ) {
+      throw new TypeError(`Secondary index ${index.name} has invalid key metadata`);
+    }
+    if (index.uniqueEnforced === true && index.unique !== true) {
+      throw new TypeError(`Secondary index ${index.name} enforces uniqueness without UNIQUE`);
     }
     if (names.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
     names.add(index.name);
@@ -364,6 +401,23 @@ export function validateSecondaryIndexes(record: TableRecord): void {
       throw new TypeError(`Secondary index ${index.name} has invalid build metadata`);
     }
   }
+}
+
+/** Ordered catalog column IDs for legacy and current secondary-index records. */
+export function secondaryIndexColumnIds(index: SecondaryIndexRecord): readonly string[] {
+  return index.columnIds ?? [index.columnId];
+}
+
+/** Declared directions for legacy and current secondary-index records. */
+export function secondaryIndexDirections(
+  index: SecondaryIndexRecord,
+): readonly SecondaryIndexDirection[] {
+  return index.directions ?? secondaryIndexColumnIds(index).map(() => "asc" as const);
+}
+
+/** Unique-membership namespace owned by one physical secondary index. */
+export function secondaryUniqueKeyNamespace(tableId: string, indexId: string): string {
+  return `${tableId}\u0000secondary-index\u0000${indexId}`;
 }
 
 /**
@@ -1035,6 +1089,93 @@ export function collectFtsCandidates(
 }
 
 /**
+ * K-way merges sorted base/delta chunks into canonical term order. Only one term's row map and
+ * one cursor per chunk stay live beyond the returned postings, avoiding a second index-sized map.
+ */
+export function collectFtsPostings(chunkLists: Iterable<readonly FtsPosting[]>): FtsPosting[] {
+  interface Cursor {
+    postings: readonly FtsPosting[];
+    position: number;
+    ordinal: number;
+  }
+  const heap: Cursor[] = [];
+  const before = (left: Cursor, right: Cursor): boolean => {
+    const leftTerm = left.postings[left.position]?.term ?? "";
+    const rightTerm = right.postings[right.position]?.term ?? "";
+    return leftTerm < rightTerm || (leftTerm === rightTerm && left.ordinal < right.ordinal);
+  };
+  const cursorAt = (position: number): Cursor => {
+    const cursor = heap[position];
+    if (cursor === undefined) throw new Error("Posting merge heap is inconsistent");
+    return cursor;
+  };
+  const push = (cursor: Cursor): void => {
+    heap.push(cursor);
+    let child = heap.length - 1;
+    while (child > 0) {
+      const parent = (child - 1) >>> 1;
+      const childCursor = cursorAt(child);
+      const parentCursor = cursorAt(parent);
+      if (!before(childCursor, parentCursor)) break;
+      heap[parent] = childCursor;
+      heap[child] = parentCursor;
+      child = parent;
+    }
+  };
+  const pop = (): Cursor | undefined => {
+    const first = heap[0];
+    const last = heap.pop();
+    if (first === undefined || last === undefined) return first;
+    if (heap.length === 0) return first;
+    heap[0] = last;
+    let parent = 0;
+    for (;;) {
+      const left = parent * 2 + 1;
+      if (left >= heap.length) break;
+      const right = left + 1;
+      const child = right < heap.length && before(cursorAt(right), cursorAt(left)) ? right : left;
+      const childCursor = cursorAt(child);
+      const parentCursor = cursorAt(parent);
+      if (!before(childCursor, parentCursor)) break;
+      heap[parent] = childCursor;
+      heap[child] = parentCursor;
+      parent = child;
+    }
+    return first;
+  };
+
+  let ordinal = 0;
+  for (const postings of chunkLists) {
+    if (postings.length > 0) push({ postings, position: 0, ordinal });
+    ordinal += 1;
+  }
+  const output: FtsPosting[] = [];
+  while (heap.length > 0) {
+    const term = heap[0]?.postings[heap[0].position]?.term;
+    if (term === undefined) break;
+    const rows = new Map<bigint, number>();
+    while (heap[0]?.postings[heap[0].position]?.term === term) {
+      const cursor = pop();
+      if (cursor === undefined) break;
+      const posting = cursor.postings[cursor.position];
+      if (posting === undefined) continue;
+      posting.rowIds.forEach((rowId, index) => {
+        rows.set(rowId, Math.max(rows.get(rowId) ?? 0, posting.tf[index] ?? 1));
+      });
+      cursor.position += 1;
+      if (cursor.position < cursor.postings.length) push(cursor);
+    }
+    const ordered = [...rows].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    output.push({
+      term,
+      rowIds: ordered.map(([rowId]) => rowId),
+      tf: ordered.map(([, frequency]) => frequency),
+    });
+  }
+  return output;
+}
+
+/**
  * Shared stale-writer policy for both stores' commit steps: a commit that adds segments to a
  * table with active full-text columns but no covering delta flips the uncovered columns to
  * "invalid" (the index self-heals through a rebuild; the data commit itself always proceeds).
@@ -1107,6 +1248,18 @@ export class UniqueKeyConflictError extends Error {
     readonly keyToken: string,
   ) {
     super(`Unique key already exists in table ${tableId}`);
+  }
+}
+
+/** A writer prepared before an enforced UNIQUE index existed and therefore cannot enforce it. */
+export class UniqueIndexCoverageError extends Error {
+  override readonly name = "UniqueIndexCoverageError";
+
+  constructor(
+    readonly tableId: string,
+    readonly indexName: string,
+  ) {
+    super(`Write did not cover enforced UNIQUE index ${indexName} on table ${tableId}`);
   }
 }
 
@@ -1260,6 +1413,13 @@ export interface CatalogStore {
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
       /** Replaces the secondary-index state map; null clears it. */
       secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+      /** Additional manifest CAS used when publishing a UNIQUE build from a stable snapshot. */
+      expectedManifestVersion?: { value: number | null };
+      /**
+       * Atomically seeds one secondary UNIQUE membership namespace while publishing the catalog
+       * record that activates enforcement. Duplicate tokens reject the entire operation.
+       */
+      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
       /** Replaces the trigger list; null clears it. */
       triggers?: TriggerRecord[] | null;
     },
@@ -1481,6 +1641,20 @@ export interface FtsIndexStore {
       hasBase: boolean;
     }
   >;
+  /**
+   * Canonical term/posting order from the same snapshot-bounded base-plus-delta view. This is a
+   * materialized cold path for ordered and covering scans; callers must not retain the result.
+   */
+  readFtsPostings(
+    tableId: string,
+    columnId: string,
+    upToVersion: number,
+  ): Promise<{
+    postings: FtsPosting[];
+    deltaChunkCount: number;
+    coversVersion: number;
+    hasBase: boolean;
+  }>;
 }
 
 /**

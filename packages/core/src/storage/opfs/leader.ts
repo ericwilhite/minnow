@@ -34,9 +34,13 @@ import {
   type WriteTransactionInput,
   activePostingStorageColumnIds,
   collectFtsCandidates,
-  validateTableColumns,
+  collectFtsPostings,
 } from "../types.js";
-import type { DatabaseSnapshot, SnapshotLoadProgress } from "../snapshot.js";
+import {
+  validateSnapshotCatalog,
+  type DatabaseSnapshot,
+  type SnapshotLoadProgress,
+} from "../snapshot.js";
 import {
   RecordCore,
   type RecordCoreState,
@@ -60,6 +64,8 @@ const CHECKPOINT_WAL_BYTES = 4 * 1024 * 1024;
 const CHECKPOINT_ENTRIES = 1024;
 /** Decoded full-text base chunks kept in memory; least recently loaded goes first. */
 const FTS_CHUNK_CACHE_SIZE = 64;
+/** Extent reads in flight for a range or ordered postings scan. */
+const FTS_CHUNK_READ_CONCURRENCY = 8;
 
 interface IdPlacement {
   id: string;
@@ -124,6 +130,8 @@ type WalEntryBody =
         columns?: TableColumnRecord[];
         ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
         secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+        expectedManifestVersion?: { value: number | null };
+        uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
         triggers?: TriggerRecord[] | null;
       };
     }
@@ -1169,6 +1177,8 @@ export class OpfsLeader {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
       secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+      expectedManifestVersion?: { value: number | null };
+      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -1586,11 +1596,7 @@ export class OpfsLeader {
       const baseChunks =
         pointer === undefined
           ? []
-          : await Promise.all(
-              selectFtsChunks(pointer.chunkBounds, terms).map((ordinal) =>
-                this.#loadFtsChunk(key, pointer, ordinal),
-              ),
-            );
+          : await this.#loadFtsChunks(key, pointer, selectFtsChunks(pointer.chunkBounds, terms));
       return {
         ...collectFtsCandidates([...baseChunks, ...deltas.chunkLists], terms),
         deltaChunkCount: deltas.deltaChunkCount,
@@ -1599,6 +1605,47 @@ export class OpfsLeader {
         hasBase: pointer !== undefined,
       };
     });
+  }
+
+  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
+    return this.#run(async () => {
+      const key = `${tableId}/${columnId}`;
+      const pointer = this.#ftsBases.get(key);
+      const coversVersion = pointer?.coversVersion ?? -1;
+      const deltas = this.#core.readFtsDeltas(tableId, columnId, coversVersion, upToVersion);
+      const baseChunks =
+        pointer === undefined
+          ? []
+          : await this.#loadFtsChunks(
+              key,
+              pointer,
+              pointer.chunks.map((_, ordinal) => ordinal),
+            );
+      return {
+        postings: collectFtsPostings([...baseChunks, ...deltas.chunkLists]),
+        deltaChunkCount: deltas.deltaChunkCount,
+        coversVersion,
+        hasBase: pointer !== undefined,
+      };
+    });
+  }
+
+  async #loadFtsChunks(
+    key: string,
+    pointer: FtsBasePointer,
+    ordinals: readonly number[],
+  ): Promise<FtsPosting[][]> {
+    const chunks: FtsPosting[][] = [];
+    for (let start = 0; start < ordinals.length; start += FTS_CHUNK_READ_CONCURRENCY) {
+      chunks.push(
+        ...(await Promise.all(
+          ordinals
+            .slice(start, start + FTS_CHUNK_READ_CONCURRENCY)
+            .map((ordinal) => this.#loadFtsChunk(key, pointer, ordinal)),
+        )),
+      );
+    }
+    return chunks;
   }
 
   async #loadFtsChunk(
@@ -1651,7 +1698,7 @@ export class OpfsLeader {
     snapshot: DatabaseSnapshot,
     options: { onProgress?: (progress: SnapshotLoadProgress) => void } = {},
   ): Promise<void> {
-    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
+    validateSnapshotCatalog(snapshot.tables);
     const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
     options.onProgress?.({ phase: "blocks", writtenBytes: 0, totalBytes });
     await this.#run(async () => {

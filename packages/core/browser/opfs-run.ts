@@ -9,6 +9,7 @@
  * crossed a checkpoint boundary.
  */
 import { MinnowDatabaseClient } from "../src/engine/client.js";
+import { UniqueConstraintError } from "../src/engine/errors.js";
 
 interface OpfsTestResult {
   /** One worker over the OPFS store: create, insert, read back. */
@@ -28,8 +29,10 @@ interface OpfsTestResult {
   /** A persisted index base and mutation tail, selected again after a cold OPFS reopen. */
   secondaryIndex: {
     baseMatches: number;
+    compositeMatches: number;
     tailMatches: number;
     matchesAfterReopen: number;
+    uniqueRejectedAfterReopen: boolean;
     usedBeforeReopen: boolean;
     usedAfterReopen: boolean;
   };
@@ -89,11 +92,17 @@ async function runPhases(): Promise<OpfsTestResult> {
   // The base is written through OPFS's staged generation protocol. The extra row becomes a
   // delta, so reopening below verifies both durable pieces rather than only the initial build.
   await client.execute("CREATE INDEX events_by_region ON events(region)");
+  await client.execute("CREATE INDEX events_by_region_amount ON events(region, amount DESC)");
+  await client.execute("CREATE UNIQUE INDEX events_unique_region_amount ON events(region, amount)");
   const baseIndexed = await client.query(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'north'",
     { memoize: false },
   );
   const indexPlan = await client.explain("SELECT COUNT(*) AS n FROM events WHERE region = 'north'");
+  const compositeIndexed = await client.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'north' AND amount >= 490",
+    { memoize: false },
+  );
   await client.insertBatch("events", [{ id: 501, region: "special", amount: 500 }]);
   const tailIndexed = await client.query(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
@@ -111,10 +120,18 @@ async function runPhases(): Promise<OpfsTestResult> {
   const reopenedIndexPlan = await indexReopen.explain(
     "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
   );
+  let uniqueRejectedAfterReopen = false;
+  try {
+    await indexReopen.insertBatch("events", [{ id: 900, region: "west", amount: 0 }]);
+  } catch (error) {
+    uniqueRejectedAfterReopen = error instanceof UniqueConstraintError;
+  }
   const secondaryIndex = {
     baseMatches: (baseIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    compositeMatches: (compositeIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
     tailMatches: (tailIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
     matchesAfterReopen: (reopenedIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    uniqueRejectedAfterReopen,
     usedBeforeReopen: indexPlan.includes("secondary index prunes"),
     usedAfterReopen: reopenedIndexPlan.includes("secondary index prunes"),
   };

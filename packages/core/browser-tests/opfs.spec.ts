@@ -82,8 +82,10 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
         checkpointCrossing: { rowsAfterReopen: number };
         secondaryIndex: {
           baseMatches: number;
+          compositeMatches: number;
           tailMatches: number;
           matchesAfterReopen: number;
+          uniqueRejectedAfterReopen: boolean;
           usedBeforeReopen: boolean;
           usedAfterReopen: boolean;
         };
@@ -116,8 +118,10 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
   // A staged index base plus a later delta survived a cold OPFS reopen, and EXPLAIN confirms
   // both workers selected the index rather than merely producing the right answer by scanning.
   expect(result.secondaryIndex.baseMatches).toBe(125);
+  expect(result.secondaryIndex.compositeMatches).toBe(3);
   expect(result.secondaryIndex.tailMatches).toBe(1);
   expect(result.secondaryIndex.matchesAfterReopen).toBe(1);
+  expect(result.secondaryIndex.uniqueRejectedAfterReopen).toBe(true);
   expect(result.secondaryIndex.usedBeforeReopen).toBe(true);
   expect(result.secondaryIndex.usedAfterReopen).toBe(true);
 

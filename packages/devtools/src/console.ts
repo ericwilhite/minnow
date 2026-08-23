@@ -42,7 +42,7 @@ function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "rows") return `${String(result.result.rows.length)} rows`;
   if (result.kind === "create-table") return `created table ${result.table}`;
   if (result.kind === "create-index") {
-    return `created index ${result.index} on ${result.table}.${result.column}`;
+    return `created${result.unique ? " unique" : ""} index ${result.index} on ${result.table}(${result.columns.join(", ")})`;
   }
   if (result.kind === "drop-index") {
     return result.dropped ? `dropped index ${result.index}` : `no index ${result.index}`;

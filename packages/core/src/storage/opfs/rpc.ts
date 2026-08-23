@@ -7,6 +7,7 @@ import {
   TempOwnerConflictError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
+  UniqueIndexCoverageError,
   WriteConflictError,
 } from "../types.js";
 
@@ -53,6 +54,7 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>(
   [
     WriteConflictError,
     UniqueKeyConflictError,
+    UniqueIndexCoverageError,
     TableRecordConflictError,
     TransactionRecordConflictError,
     LeaseConflictError,

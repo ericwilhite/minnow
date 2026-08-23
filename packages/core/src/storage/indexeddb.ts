@@ -17,6 +17,7 @@ import {
   type UniqueKeyChanges,
   activePostingStorageColumnIds,
   collectFtsCandidates,
+  collectFtsPostings,
   invalidateUncoveredFtsColumns,
   invalidateUncoveredSecondaryIndexes,
   type FtsCandidates,
@@ -52,6 +53,7 @@ import {
   TransactionRecordConflictError,
   type TransactionRecordUpdate,
   UniqueKeyConflictError,
+  UniqueIndexCoverageError,
   normalizeCompactionJobRecord,
   normalizeGarbageCollectionJobRecord,
   normalizeSegmentRecord,
@@ -59,11 +61,14 @@ import {
   updateTransactionRecord,
   validateTableColumns,
   validateSecondaryIndexes,
+  secondaryIndexColumnIds,
+  secondaryUniqueKeyNamespace,
   WriteConflictError,
   type WriteTransactionInput,
 } from "./types.js";
 import {
   selectLiveRecords,
+  validateSnapshotCatalog,
   type DatabaseSnapshot,
   type SnapshotFtsIndex,
   type SnapshotLoadProgress,
@@ -455,6 +460,8 @@ export class IndexedDbBlockStore implements BlockStore {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
       secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+      expectedManifestVersion?: { value: number | null };
+      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -469,6 +476,26 @@ export class IndexedDbBlockStore implements BlockStore {
       transaction.abort();
       await ignoreAbort(transaction);
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
+    }
+    if (update.expectedManifestVersion !== undefined) {
+      const manifestValue: unknown = await requestResult(store.get(CURRENT_MANIFEST_KEY));
+      const actualManifest = typeof manifestValue === "number" ? manifestValue : null;
+      if (actualManifest !== update.expectedManifestVersion.value) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new WriteConflictError(update.expectedManifestVersion.value, actualManifest);
+      }
+    }
+    if (update.uniqueKeySeed !== undefined) {
+      const seen = new Set<string>();
+      for (const token of update.uniqueKeySeed.keyTokens) {
+        if (seen.has(token)) {
+          transaction.abort();
+          await ignoreAbort(transaction);
+          throw new UniqueKeyConflictError(update.uniqueKeySeed.namespaceId, token);
+        }
+        seen.add(token);
+      }
     }
     const {
       ftsColumns: previousFts,
@@ -491,7 +518,9 @@ export class IndexedDbBlockStore implements BlockStore {
     }
     if (nextSecondary !== null && nextSecondary !== undefined && retainedColumnIds !== undefined) {
       nextSecondary = Object.fromEntries(
-        Object.entries(nextSecondary).filter(([, index]) => retainedColumnIds.has(index.columnId)),
+        Object.entries(nextSecondary).filter(([, index]) =>
+          secondaryIndexColumnIds(index).every((columnId) => retainedColumnIds.has(columnId)),
+        ),
       );
       if (Object.keys(nextSecondary).length === 0) nextSecondary = null;
     }
@@ -535,6 +564,20 @@ export class IndexedDbBlockStore implements BlockStore {
       revision: expectedRevision + 1,
     };
     validateSecondaryIndexes(updated);
+    if (update.uniqueKeySeed !== undefined) {
+      const ownsSeed = Object.entries(updated.secondaryIndexes ?? {}).some(
+        ([indexId, index]) =>
+          index.unique === true &&
+          index.uniqueEnforced === true &&
+          index.state === "ready" &&
+          secondaryUniqueKeyNamespace(updated.id, indexId) === update.uniqueKeySeed?.namespaceId,
+      );
+      if (!ownsSeed) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new TypeError("UNIQUE-index seed does not belong to a ready catalog index");
+      }
+    }
     if (retainedColumnIds !== undefined) {
       for (const column of record.columns) {
         if (!retainedColumnIds.has(column.id)) {
@@ -550,9 +593,36 @@ export class IndexedDbBlockStore implements BlockStore {
         await deleteFtsColumnRecords(store, record.id, index.storageColumnId);
       }
     }
+    for (const [indexId, previous] of Object.entries(previousSecondary ?? {})) {
+      if (previous.unique === true && nextSecondary?.[indexId]?.unique !== true) {
+        await replaceUniqueKeyMembership(
+          store,
+          secondaryUniqueKeyNamespace(record.id, indexId),
+          [],
+          false,
+        );
+      }
+    }
+    if (update.uniqueKeySeed !== undefined) {
+      await replaceUniqueKeyMembership(
+        store,
+        update.uniqueKeySeed.namespaceId,
+        update.uniqueKeySeed.keyTokens,
+        true,
+      );
+    }
     store.put(structuredClone(updated), idKey);
     await bumpCatalogEpoch(store);
     await transactionDone(transaction);
+    if (
+      update.uniqueKeySeed !== undefined ||
+      Object.entries(previousSecondary ?? {}).some(
+        ([indexId, previous]) =>
+          previous.unique === true && nextSecondary?.[indexId]?.unique !== true,
+      )
+    ) {
+      this.#uniqueKeyCache = undefined;
+    }
     return updated;
   }
 
@@ -575,6 +645,14 @@ export class IndexedDbBlockStore implements BlockStore {
       const marker = (await requestResult(catalog.get(markerKey))) as
         { tableId: string; indexId: string } | undefined;
       if (marker?.tableId === id && marker.indexId === indexId) catalog.delete(markerKey);
+      if (index.unique === true) {
+        await replaceUniqueKeyMembership(
+          catalog,
+          secondaryUniqueKeyNamespace(id, indexId),
+          [],
+          false,
+        );
+      }
     }
     // Everything else this table owns is keyed by its id under one of a handful of prefixes,
     // string-keyed or array-keyed. One sequential pass collects them all: a dropped table is
@@ -612,7 +690,12 @@ export class IndexedDbBlockStore implements BlockStore {
     await transactionDone(transaction);
     // The membership cache is keyed by manifest version, which a table drop does not move;
     // without this, a lookup after the drop would answer from the dead table's keys.
-    if (this.#uniqueKeyCache?.tableId === id) this.#uniqueKeyCache = undefined;
+    if (
+      this.#uniqueKeyCache?.tableId === id ||
+      this.#uniqueKeyCache?.tableId.startsWith(`${id}\u0000secondary-index\u0000`) === true
+    ) {
+      this.#uniqueKeyCache = undefined;
+    }
   }
 
   async writeFtsBase(
@@ -855,6 +938,49 @@ export class IndexedDbBlockStore implements BlockStore {
       ...collectFtsCandidates(chunkLists, terms),
       deltaChunkCount: present.length,
       totalTokens,
+      coversVersion,
+      hasBase: toc !== undefined,
+    };
+  }
+
+  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
+    const transaction = this.#transaction("catalog", "readonly");
+    const store = transaction.objectStore("catalog");
+    const [toc, deltaIndex] = (await Promise.all([
+      requestResult(store.get(`${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`)),
+      requestResult(store.get(ftsChunkIndexKey(tableId, columnId))),
+    ])) as [FtsBaseToc | undefined, { versions: number[] } | undefined];
+    const coversVersion = toc?.coversVersion ?? -1;
+    const prefix = ftsBaseChunkPrefix(tableId, columnId, toc?.generation);
+    const versions = (deltaIndex?.versions ?? []).filter(
+      (version) => version > coversVersion && version <= upToVersion,
+    );
+    const [baseChunks, deltaChunks] = await Promise.all([
+      Promise.all(
+        (toc?.boundaries ?? []).map(
+          (_, ordinal) =>
+            requestResult(store.get(`${prefix}${String(ordinal).padStart(6, "0")}`)) as Promise<
+              FtsPosting[] | undefined
+            >,
+        ),
+      ),
+      Promise.all(
+        versions.map(
+          (version) =>
+            requestResult(store.get(ftsChunkKey(tableId, columnId, version))) as Promise<
+              FtsDeltaChunk | undefined
+            >,
+        ),
+      ),
+    ]);
+    await transactionDone(transaction);
+    const present = deltaChunks.filter((chunk) => chunk !== undefined);
+    return {
+      postings: collectFtsPostings([
+        ...baseChunks.filter((chunk) => chunk !== undefined),
+        ...present.map((chunk) => chunk.postings),
+      ]),
+      deltaChunkCount: present.length,
       coversVersion,
       hasBase: toc !== undefined,
     };
@@ -1614,16 +1740,37 @@ export class IndexedDbBlockStore implements BlockStore {
       throw new Error(`Segment ${foreignSegment.id} belongs to another transaction`);
     }
 
-    // The single-entry path below is the hot bulk-load path and keeps the membership cache;
-    // multi-entry commits (atomic write scopes) take the simpler merged path further down and
-    // drop the cache.
+    // The single-entry path below is the hot bulk-load path. Multi-entry commits (write scopes
+    // and tables with secondary UNIQUE indexes) replay per-namespace changes further down; they
+    // retain one complete membership cache when its byte budget allows it.
     const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
+    const coveredUniqueNamespaces = new Set(uniqueKeyEntries.map((entry) => entry.tableId));
+    const changedTableIds = new Set([
+      ...(input.changedTableIds ?? []),
+      ...pendingSegments.map((segment) => segment.tableId),
+    ]);
+    for (const tableId of changedTableIds) {
+      const value: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
+      if (value === undefined) continue;
+      const changedTable = structuredClone(value) as TableRecord;
+      for (const [indexId, index] of Object.entries(changedTable.secondaryIndexes ?? {})) {
+        if (
+          index.uniqueEnforced === true &&
+          !coveredUniqueNamespaces.has(secondaryUniqueKeyNamespace(tableId, indexId))
+        ) {
+          transaction.abort();
+          await ignoreAbort(transaction);
+          throw new UniqueIndexCoverageError(tableId, index.name);
+        }
+      }
+    }
     const uniqueKeyChanges = uniqueKeyEntries.length === 1 ? uniqueKeyEntries[0] : undefined;
     const keyCache = this.#uniqueKeyCache;
+    const keyCacheVersionValid = keyCache?.version === input.expectedManifestVersion;
     const keyCacheValid =
-      keyCache !== undefined &&
-      keyCache.tableId === uniqueKeyChanges?.tableId &&
-      keyCache.version === input.expectedManifestVersion;
+      uniqueKeyChanges !== undefined &&
+      keyCacheVersionValid &&
+      keyCache.tableId === uniqueKeyChanges.tableId;
     let keyState:
       | {
           existing: Set<string>;
@@ -1670,6 +1817,10 @@ export class IndexedDbBlockStore implements BlockStore {
       tableId: string;
       addedTokens: string[];
       removedTokens: string[];
+      index: UniqueKeyChunkIndex;
+      chunks: UniqueKeyChunk[];
+      fullPresent?: Set<string>;
+      usedCache: boolean;
     }> = [];
     if (uniqueKeyEntries.length > 1) {
       const byTable = new Map<string, UniqueKeyChanges[]>();
@@ -1680,7 +1831,15 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       for (const [tableId, entries] of byTable) {
         const unionTokens = [...new Set(entries.flatMap((entry) => entry.keyTokens))];
-        const state = await readChunkedUniqueKeys(catalog, tableId, unionTokens);
+        const usesCache = keyCacheVersionValid && keyCache.tableId === tableId;
+        const state = usesCache
+          ? {
+              existing: new Set(unionTokens.filter((token) => keyCache.present.has(token))),
+              index: keyCache.index,
+              chunks: keyCache.chunks,
+              fullPresent: keyCache.present,
+            }
+          : await readChunkedUniqueKeys(catalog, tableId, unionTokens);
         const present = state.existing;
         const original = new Set(present);
         for (const entry of entries) {
@@ -1699,6 +1858,10 @@ export class IndexedDbBlockStore implements BlockStore {
           tableId,
           addedTokens: unionTokens.filter((token) => present.has(token) && !original.has(token)),
           removedTokens: unionTokens.filter((token) => !present.has(token) && original.has(token)),
+          index: state.index,
+          chunks: state.chunks,
+          ...(state.fullPresent === undefined ? {} : { fullPresent: state.fullPresent }),
+          usedCache: usesCache,
         });
       }
     }
@@ -1930,29 +2093,115 @@ export class IndexedDbBlockStore implements BlockStore {
         }
       }
     }
-    for (const work of multiKeyWork) {
-      {
-        if (work.addedTokens.length > 0 || work.removedTokens.length > 0) {
-          const indexValue = (await requestResult(
-            catalog.get(uniqueKeyChunkIndexKey(work.tableId)),
-          )) as UniqueKeyChunkIndex | undefined;
-          const index = indexValue ?? { versions: [], hasBase: false };
-          catalog.put(
-            { addedTokens: work.addedTokens, removedTokens: work.removedTokens },
-            uniqueKeyChunkKey(work.tableId, manifest.version),
-          );
-          catalog.put(
-            {
-              versions: [...index.versions, manifest.version],
-              hasBase: index.hasBase,
-              ...(index.partitions === undefined ? {} : { partitions: index.partitions }),
-              // Appending a tail chunk leaves the base alone, so its recorded size still holds.
-              ...(index.tokenCount === undefined ? {} : { tokenCount: index.tokenCount }),
-            },
-            uniqueKeyChunkIndexKey(work.tableId),
-          );
+    let multiKeyCachePlan:
+      | {
+          action: "advance";
+          tableId: string;
+          chunk?: UniqueKeyChunk;
+          chunks: UniqueKeyChunk[];
+          index: UniqueKeyChunkIndex;
         }
+      | {
+          action: "replace";
+          tableId: string;
+          present: Set<string>;
+          chunks: UniqueKeyChunk[];
+          index: UniqueKeyChunkIndex;
+        }
+      | undefined;
+    const rememberMultiKeyState = (
+      work: (typeof multiKeyWork)[number],
+      state: { chunks: UniqueKeyChunk[]; index: UniqueKeyChunkIndex },
+      chunk?: UniqueKeyChunk,
+      replacement?: Set<string>,
+    ): void => {
+      if (work.usedCache) {
+        multiKeyCachePlan =
+          replacement === undefined
+            ? { action: "advance", tableId: work.tableId, ...state, ...(chunk ? { chunk } : {}) }
+            : { action: "replace", tableId: work.tableId, present: replacement, ...state };
+        return;
       }
+      if (multiKeyCachePlan !== undefined || work.fullPresent === undefined) return;
+      const present = replacement ?? new Set(work.fullPresent);
+      if (replacement === undefined && chunk !== undefined) applyChunk(present, chunk);
+      multiKeyCachePlan = { action: "replace", tableId: work.tableId, present, ...state };
+    };
+    for (const work of multiKeyWork) {
+      if (work.addedTokens.length === 0 && work.removedTokens.length === 0) {
+        rememberMultiKeyState(work, { chunks: work.chunks, index: work.index });
+        continue;
+      }
+      const chunk: UniqueKeyChunk = {
+        addedTokens: work.addedTokens,
+        removedTokens: work.removedTokens,
+      };
+      if (work.index.versions.length + 1 <= UNIQUE_KEY_TAIL_CHUNK_LIMIT) {
+        const nextIndex: UniqueKeyChunkIndex = {
+          versions: [...work.index.versions, manifest.version],
+          hasBase: work.index.hasBase,
+          ...(work.index.partitions === undefined ? {} : { partitions: work.index.partitions }),
+          ...(work.index.tokenCount === undefined ? {} : { tokenCount: work.index.tokenCount }),
+        };
+        catalog.put(chunk, uniqueKeyChunkKey(work.tableId, manifest.version));
+        // Appending a tail chunk leaves the base alone, so its recorded size still holds.
+        catalog.put(nextIndex, uniqueKeyChunkIndexKey(work.tableId));
+        rememberMultiKeyState(work, { chunks: [...work.chunks, chunk], index: nextIndex }, chunk);
+        continue;
+      }
+
+      const tailChunks = [...work.chunks, chunk];
+      const merged =
+        work.index.hasBase && countTailTokens(tailChunks) < UNIQUE_KEY_PARTITION_TARGET
+          ? mergeTailChunks(tailChunks)
+          : undefined;
+      const incremental =
+        merged === undefined
+          ? await foldTailIntoTouchedPartitions(catalog, work.tableId, work.index, tailChunks)
+          : undefined;
+      for (const version of work.index.versions) {
+        catalog.delete(uniqueKeyChunkKey(work.tableId, version));
+      }
+      if (merged !== undefined) {
+        const nextIndex: UniqueKeyChunkIndex = {
+          versions: [manifest.version],
+          hasBase: true,
+          ...(work.index.partitions === undefined ? {} : { partitions: work.index.partitions }),
+          ...(work.index.tokenCount === undefined ? {} : { tokenCount: work.index.tokenCount }),
+        };
+        catalog.put(merged, uniqueKeyChunkKey(work.tableId, manifest.version));
+        catalog.put(nextIndex, uniqueKeyChunkIndexKey(work.tableId));
+        rememberMultiKeyState(work, { chunks: [merged], index: nextIndex }, chunk);
+        continue;
+      }
+      if (incremental !== undefined) {
+        const nextIndex: UniqueKeyChunkIndex = {
+          versions: [],
+          hasBase: true,
+          partitions: incremental.partitions,
+          tokenCount: incremental.tokenCount,
+        };
+        catalog.put(nextIndex, uniqueKeyChunkIndexKey(work.tableId));
+        rememberMultiKeyState(work, { chunks: [], index: nextIndex }, chunk);
+        continue;
+      }
+
+      let present =
+        work.fullPresent ?? (await readAllV2BaseTokens(catalog, work.tableId, work.index));
+      if (work.fullPresent === undefined) {
+        for (const existing of work.chunks) applyChunk(present, existing);
+      } else if (work.usedCache) {
+        present = new Set(present);
+      }
+      applyChunk(present, chunk);
+      await replaceUniqueKeyMembership(catalog, work.tableId, present, true);
+      const nextIndex: UniqueKeyChunkIndex = {
+        versions: [],
+        hasBase: true,
+        partitions: Math.max(1, Math.ceil(present.size / UNIQUE_KEY_PARTITION_TARGET)),
+        tokenCount: present.size,
+      };
+      rememberMultiKeyState(work, { chunks: [], index: nextIndex }, undefined, present);
     }
     // Full-text deltas apply atomically with the publish; a stale writer (one that committed
     // segments to an indexed table without deltas) flips the affected columns to "invalid"
@@ -2009,9 +2258,42 @@ export class IndexedDbBlockStore implements BlockStore {
     transactionStore.put(committed, committed.id);
     const settle = (): void => {
       if (uniqueKeyEntries.length > 1) {
-        // Multi-entry commits take the merged path above; the single-table membership cache
-        // cannot describe them, so it drops and rebuilds on the next bulk load.
-        this.#uniqueKeyCache = undefined;
+        if (multiKeyCachePlan?.action === "advance") {
+          const retained = this.#uniqueKeyCache;
+          if (
+            retained?.tableId === multiKeyCachePlan.tableId &&
+            retained.version === input.expectedManifestVersion
+          ) {
+            if (multiKeyCachePlan.chunk !== undefined) {
+              applyChunk(retained.present, multiKeyCachePlan.chunk);
+            }
+            retained.chunks = multiKeyCachePlan.chunks;
+            retained.index = multiKeyCachePlan.index;
+            retained.version = manifest.version;
+            if (
+              uniqueKeyCacheRetainedBytes(retained.present, retained.chunks) >
+              this.#uniqueKeyCacheBytes
+            ) {
+              this.#uniqueKeyCache = undefined;
+            }
+          } else {
+            this.#uniqueKeyCache = undefined;
+          }
+        } else if (multiKeyCachePlan?.action === "replace") {
+          this.#uniqueKeyCache =
+            uniqueKeyCacheRetainedBytes(multiKeyCachePlan.present, multiKeyCachePlan.chunks) <=
+            this.#uniqueKeyCacheBytes
+              ? {
+                  version: manifest.version,
+                  tableId: multiKeyCachePlan.tableId,
+                  present: multiKeyCachePlan.present,
+                  chunks: multiKeyCachePlan.chunks,
+                  index: multiKeyCachePlan.index,
+                }
+              : undefined;
+        } else {
+          this.#uniqueKeyCache = undefined;
+        }
       }
       // The unique-key cache follows the same rule as the manifest cache below: advance it only
       // after the durable commit. Commits from this instance cannot silently change another
@@ -2765,6 +3047,18 @@ export class IndexedDbBlockStore implements BlockStore {
         record.uniqueKeyColumnId === undefined
           ? []
           : [...(await readAllUniqueKeyTokens(catalog, record.id))];
+      const secondaryUniqueKeys = await Promise.all(
+        Object.entries(record.secondaryIndexes ?? {}).flatMap(([indexId, index]) =>
+          index.uniqueEnforced === true
+            ? [
+                readAllUniqueKeyTokens(
+                  catalog,
+                  secondaryUniqueKeyNamespace(record.id, indexId),
+                ).then((tokens) => ({ indexId, keyTokens: [...tokens] })),
+              ]
+            : [],
+        ),
+      );
 
       const fts: SnapshotFtsIndex[] = [];
       const ftsColumns = { ...(record.ftsColumns ?? {}) };
@@ -2830,6 +3124,7 @@ export class IndexedDbBlockStore implements BlockStore {
           return next === undefined ? [] : [{ columnId: column.id, next }];
         }),
         uniqueKeyTokens,
+        secondaryUniqueKeys,
         fts,
       });
     }
@@ -2852,15 +3147,7 @@ export class IndexedDbBlockStore implements BlockStore {
     if ((await this.listTables()).length > 0) {
       throw new Error("This store already holds a catalog");
     }
-    const indexNames = new Set<string>();
-    for (const table of snapshot.tables) {
-      validateTableColumns(table.record.columns);
-      validateSecondaryIndexes(table.record);
-      for (const index of Object.values(table.record.secondaryIndexes ?? {})) {
-        if (indexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
-        indexNames.add(index.name);
-      }
-    }
+    validateSnapshotCatalog(snapshot.tables);
 
     const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
     let writtenBytes = 0;
@@ -2953,6 +3240,20 @@ export class IndexedDbBlockStore implements BlockStore {
         tokenCount: table.uniqueKeyTokens.length,
       };
       catalog.put(index, uniqueKeyChunkIndexKey(record.id));
+    }
+    for (const entry of table.secondaryUniqueKeys ?? []) {
+      const index = record.secondaryIndexes?.[entry.indexId];
+      if (index?.unique !== true) {
+        throw new TypeError(
+          `Snapshot has membership for an unknown UNIQUE index: ${entry.indexId}`,
+        );
+      }
+      await replaceUniqueKeyMembership(
+        catalog,
+        secondaryUniqueKeyNamespace(record.id, entry.indexId),
+        entry.keyTokens,
+        true,
+      );
     }
 
     for (const entry of table.fts) {
@@ -3250,13 +3551,6 @@ function asLeaseRecord(value: unknown): LeaseRecord {
   return structuredClone(value) as LeaseRecord;
 }
 
-/**
- * Verifies the snapshot at `version` is readable: the record exists, is not pruned, and its
- * delta chain down to a checkpoint is intact. Block existence is verified inductively — every
- * commit proves its own added blocks exist before publishing, and garbage collection only
- * deletes blocks unreachable from every non-pruned manifest — so this stays O(chain) instead of
- * probing every live block on each transaction and lease creation.
- */
 /**
  * The transaction record a commit needs: present, active, and at the expected revision —
  * otherwise a `TransactionRecordConflictError`, the caller's storage transaction still open for
@@ -3954,6 +4248,40 @@ function uniqueKeyChunkKey(tableId: string, version: number): IDBValidKey {
 
 function uniqueKeyBasePartKey(tableId: string, ordinal: number): IDBValidKey {
   return [UNIQUE_KEY_BASE_PART, tableId, ordinal];
+}
+
+/** Replaces or removes one complete unique-membership namespace inside the caller's transaction. */
+async function replaceUniqueKeyMembership(
+  store: IDBObjectStore,
+  namespaceId: string,
+  keyTokens: readonly string[] | Set<string>,
+  retainEmpty: boolean,
+): Promise<void> {
+  const raw = await requestResult<unknown>(store.get(uniqueKeyChunkIndexKey(namespaceId)));
+  const previous = raw === undefined ? undefined : asUniqueKeyChunkIndex(raw);
+  for (
+    let ordinal = 0;
+    ordinal < (previous?.partitions ?? (previous?.hasBase ? 1 : 0));
+    ordinal += 1
+  ) {
+    store.delete(uniqueKeyBasePartKey(namespaceId, ordinal));
+  }
+  for (const version of previous?.versions ?? []) {
+    store.delete(uniqueKeyChunkKey(namespaceId, version));
+  }
+  const tokenCount = keyTokens instanceof Set ? keyTokens.size : keyTokens.length;
+  if (!retainEmpty && tokenCount === 0) {
+    store.delete(uniqueKeyChunkIndexKey(namespaceId));
+    return;
+  }
+  const partitions = Math.max(1, Math.ceil(tokenCount / UNIQUE_KEY_PARTITION_TARGET));
+  const parts: string[][] = Array.from({ length: partitions }, () => []);
+  for (const token of keyTokens) parts[fnv1a(token) % partitions]?.push(token);
+  parts.forEach((tokens, ordinal) => store.put(tokens, uniqueKeyBasePartKey(namespaceId, ordinal)));
+  store.put(
+    { versions: [], hasBase: true, partitions, tokenCount },
+    uniqueKeyChunkIndexKey(namespaceId),
+  );
 }
 
 /**

@@ -1149,7 +1149,8 @@ export type CompiledStatement =
       kind: "create-index";
       index: string;
       table: string;
-      column: string;
+      columns: Array<{ name: string; direction: "asc" | "desc" }>;
+      unique?: true;
       ifNotExists?: boolean;
       parameterCount?: number;
     }
@@ -4745,17 +4746,11 @@ class Parser {
     );
   }
 
-  /**
-   * CREATE INDEX is intentionally single-column today. The physical index is non-unique;
-   * UNIQUE remains a table constraint until multiple durable uniqueness constraints ship.
-   */
+  /** CREATE [UNIQUE] INDEX name ON table(column [ASC|DESC], ...). */
   parseCreateIndex(): CompiledStatement {
     this.#keyword("CREATE");
-    if (this.#isKeyword("UNIQUE")) {
-      throw new TypeError(
-        "CREATE UNIQUE INDEX is not supported; declare the table's unique key constraint",
-      );
-    }
+    const unique = this.#isKeyword("UNIQUE");
+    if (unique) this.#keyword("UNIQUE");
     this.#keyword("INDEX");
     let ifNotExists = false;
     if (this.#isKeyword("IF")) {
@@ -4768,19 +4763,26 @@ class Parser {
     this.#keyword("ON");
     const table = this.#identifier();
     this.#expectPunctuation("(");
-    const column = this.#identifier();
-    if (this.#isKeyword("ASC")) this.#keyword("ASC");
-    else if (this.#isKeyword("DESC")) this.#keyword("DESC");
-    if (this.#peek().text === ",") {
-      throw new TypeError("CREATE INDEX supports one column");
-    }
+    const columns: Array<{ name: string; direction: "asc" | "desc" }> = [];
+    do {
+      if (columns.length > 0) this.#expectPunctuation(",");
+      const name = this.#identifier();
+      let direction: "asc" | "desc" = "asc";
+      if (this.#isKeyword("ASC")) this.#keyword("ASC");
+      else if (this.#isKeyword("DESC")) {
+        this.#keyword("DESC");
+        direction = "desc";
+      }
+      columns.push({ name, direction });
+    } while (this.#peek().text === ",");
     this.#expectPunctuation(")");
     this.#take("eof");
     return {
       kind: "create-index",
       index,
       table,
-      column,
+      columns,
+      ...(unique ? { unique: true } : {}),
       ...(ifNotExists ? { ifNotExists: true } : {}),
     };
   }

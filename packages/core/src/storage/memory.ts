@@ -198,6 +198,8 @@ export class MemoryBlockStore implements BlockStore {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
       secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
+      expectedManifestVersion?: { value: number | null };
+      uniqueKeySeed?: { namespaceId: string; keyTokens: readonly string[] };
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -303,6 +305,10 @@ export class MemoryBlockStore implements BlockStore {
     }
   > {
     return this.#core.readFtsCandidates(tableId, columnId, terms, upToVersion);
+  }
+
+  async readFtsPostings(tableId: string, columnId: string, upToVersion: number) {
+    return this.#core.readFtsPostings(tableId, columnId, upToVersion);
   }
 
   async getTableByName(name: string): Promise<TableRecord | undefined> {

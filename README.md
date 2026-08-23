@@ -28,9 +28,9 @@ npm install @minnowdb/core
   PostgreSQL; deliberate omissions are documented with reasons.
 - **Full-text search with no index DDL** — `MATCH` / BM25 on any column, with a persisted index
   that builds itself in the background once a table is large enough to want one.
-- **Durable secondary indexes** — `CREATE INDEX` / `DROP INDEX` for selective equality, range,
-  and `IN` filters on one column. Builds are chunked, commit deltas are folded, and every
-  candidate is rechecked for correctness.
+- **Durable secondary indexes** — scalar/composite and `UNIQUE` indexes for selective left-prefix
+  equality, `IN`, and range filters. Builds are chunked, commit deltas are folded, uniqueness is
+  atomic across tabs, and exact append-only shapes can avoid sorts and table-block reads.
 - **Columnar and durable** — immutable compressed column blocks on IndexedDB or OPFS. Writes publish
   atomically; another tab sees the old version or the new one, never half of one.
 - **Pluggable storage** — storage is a public, documented interface with a

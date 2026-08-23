@@ -31,8 +31,11 @@ test("drives a database through a real module worker", async ({ page }) => {
         concurrentWrites: { acknowledged: number; rowsPersisted: number; reasons: string[] };
         secondaryIndex: {
           initialMatches: number;
+          compositeMatches: number;
           mutationMatches: number;
           matchesAfterRestart: number;
+          compositeMatchesAfterRestart: number;
+          uniqueRejectedAfterRestart: boolean;
           usedBeforeRestart: boolean;
           usedAfterRestart: boolean;
         };
@@ -74,8 +77,11 @@ test("drives a database through a real module worker", async ({ page }) => {
   // second worker reopened and selected the same persisted index. This is the browser-native
   // counterpart to the exhaustive mutation and crash suites over the storage test doubles.
   expect(result.secondaryIndex.initialMatches).toBe(1_000);
+  expect(result.secondaryIndex.compositeMatches).toBe(2);
   expect(result.secondaryIndex.mutationMatches).toBe(result.concurrentWrites.acknowledged);
   expect(result.secondaryIndex.matchesAfterRestart).toBe(result.concurrentWrites.acknowledged);
+  expect(result.secondaryIndex.compositeMatchesAfterRestart).toBe(2);
+  expect(result.secondaryIndex.uniqueRejectedAfterRestart).toBe(true);
   expect(result.secondaryIndex.usedBeforeRestart).toBe(true);
   expect(result.secondaryIndex.usedAfterRestart).toBe(true);
 

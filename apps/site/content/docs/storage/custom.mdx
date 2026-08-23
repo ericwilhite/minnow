@@ -50,14 +50,30 @@ complete in one saved step. A crash cannot leave half of that change visible.
 
 Catalog cleanup follows the same rule. When `updateTable` removes a column or secondary index,
 that operation also deletes all of its postings base chunks, staged generations, and commit
-deltas. `removeFtsColumn` provides the same cleanup directly. A dropped column or index must not
-leave storage growing invisibly for the rest of a long-running database's life.
+deltas. A dropped `UNIQUE` index also removes its membership namespace. `removeFtsColumn` provides
+the postings cleanup directly. A dropped column or index must not leave storage growing invisibly
+for the rest of a long-running database's life.
 
-Postings builds are always bounded. `beginFtsBaseBuild`, `writeFtsBaseBuildChunk`,
+Publishing a `UNIQUE` build is one catalog operation: `updateTable` checks
+`expectedManifestVersion`, publishes the ready index, and installs `uniqueKeySeed` together. The
+seed namespace must belong to that ready index, duplicate seed tokens reject the whole update, and
+a writer that changes the table without covering every enforced unique namespace rejects with
+`UniqueIndexCoverageError`. That rejection is how a writer prepared before the DDL is restarted
+instead of slipping through unenforced.
+
+Postings output is always chunked. `beginFtsBaseBuild`, `writeFtsBaseBuildChunk`,
 `finishFtsBaseBuild`, and `abortFtsBaseBuild` stage one small chunk at a time and publish the
-complete generation atomically. Starting a replacement reclaims an abandoned generation. These
-methods are required: an adapter must not fall back to one database-sized value during
+complete generation atomically. Starting a replacement reclaims an abandoned generation. Common
+append/update/delete histories are scanned through bounded row windows. An exact `UNIQUE` build
+over an uncompacted upsert history is the deliberate exception: it materializes the current
+projected key columns, never the historical rows, before writing the same bounded chunks. These
+methods are required: an adapter must not store postings as one database-sized value during
 `CREATE INDEX`.
+
+`readFtsPostings` returns the canonical term-then-row-ID merge of that same snapshot-bounded base
+and delta tail. Ordered and covering secondary-index scans use it; returning a partial generation
+would change row order or omit rows, so `hasBase`, `coversVersion`, and `deltaChunkCount` must match
+`readFtsCandidates` exactly.
 
 `runGarbageCollectionStep` owns record reclamation as well as blob reclamation. It processes
 manifests, segments, blocks, then terminal transactions; a committed transaction can disappear
@@ -75,9 +91,9 @@ old metadata without materializing the database's complete history. Return recor
 cursor field and reject a non-positive page limit, matching the interface contract.
 
 **Conflicts use the exported error classes.** Version-check failures throw
-`WriteConflictError`, `TransactionRecordConflictError`, or the matching exported class directly.
-The engine uses those classes to decide when to retry, and the worker client recreates them on the
-main thread.
+`WriteConflictError`, `TransactionRecordConflictError`, `UniqueKeyConflictError`,
+`UniqueIndexCoverageError`, or the matching exported class directly. The engine uses those classes
+to decide when to retry, and the worker client recreates them on the main thread.
 
 **Platform failures pass through.** A quota refusal escapes as the environment's own
 `QuotaExceededError`, unwrapped, with prior data intact and the same write succeeding once

@@ -201,6 +201,14 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.readFtsCandidates(tableId, columnId, terms, upToVersion);
   }
 
+  readFtsPostings(
+    tableId: string,
+    columnId: string,
+    upToVersion: number,
+  ): ReturnType<BlockStore["readFtsPostings"]> {
+    return this.inner.readFtsPostings(tableId, columnId, upToVersion);
+  }
+
   getExistingUniqueKeys(tableId: string, keyTokens: readonly string[]): Promise<string[]> {
     return this.inner.getExistingUniqueKeys(tableId, keyTokens);
   }

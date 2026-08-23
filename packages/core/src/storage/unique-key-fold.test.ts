@@ -10,7 +10,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import { MinnowDatabase, UniqueConstraintError } from "../engine/database.js";
-import type { TableRecord } from "./types.js";
+import { secondaryUniqueKeyNamespace, type TableRecord } from "./types.js";
 
 /**
  * The tail holds 16 chunks, so a fold lands on every 17th commit. Two folds are the minimum
@@ -119,11 +119,13 @@ async function storedIds(database: MinnowDatabase): Promise<number[]> {
  */
 async function foldState(
   harness: Harness,
+  requestedNamespace?: string,
 ): Promise<{ tokenCount: number | undefined; tailChunks: number }> {
   const tables = await harness.store.listTables();
   const tableId = tables.find((table) => table.name === "t")?.id ?? "";
+  const namespace = requestedNamespace ?? tableId;
   let state = { tokenCount: undefined as number | undefined, tailChunks: 0 };
-  await editCatalogRecord(harness, ["unique-key-chunk-index", tableId], (current) => {
+  await editCatalogRecord(harness, ["unique-key-chunk-index", namespace], (current) => {
     state = {
       tokenCount: typeof current.tokenCount === "number" ? current.tokenCount : undefined,
       tailChunks: Array.isArray(current.versions) ? current.versions.length : 0,
@@ -227,6 +229,40 @@ describe("unique-key base fold", () => {
     const state = await foldState(harness);
     expect(state.tokenCount).toBe(17 * 25);
     expect(state.tailChunks).toBeLessThanOrEqual(16);
+    store.close();
+  });
+
+  it("bounds every membership tail when one commit maintains multiple unique keys", async () => {
+    const harness = await open();
+    const { store, database } = harness;
+    await database.execute("CREATE UNIQUE INDEX t_unique_v ON t(v)");
+    for (let id = 1; id <= FOLD_BATCHES; id += 1) await insert(database, [id]);
+
+    const table = await store.getTableByName("t");
+    const indexEntry = Object.entries(table?.secondaryIndexes ?? {}).find(
+      ([, index]) => index.name === "t_unique_v",
+    );
+    if (table === undefined || indexEntry === undefined) {
+      throw new Error("Missing secondary UNIQUE index fixture");
+    }
+    const secondaryState = await foldState(
+      harness,
+      secondaryUniqueKeyNamespace(table.id, indexEntry[0]),
+    );
+    expect(secondaryState.tailChunks).toBeLessThanOrEqual(16);
+    expect(secondaryState.tokenCount).toBeDefined();
+
+    const primaryState = await foldState(harness);
+    expect(primaryState.tailChunks).toBeLessThanOrEqual(16);
+    expect(primaryState.tokenCount).toBeDefined();
+    expect(store._residentStateForTests().uniqueKeyCacheEntries).toBeGreaterThan(0);
+    await expect(insert(database, [2])).rejects.toBeInstanceOf(UniqueConstraintError);
+    await expect(database.insertBatch("t", [{ id: 100, v: 4 }])).rejects.toBeInstanceOf(
+      UniqueConstraintError,
+    );
+    expect(await storedIds(database)).toEqual(
+      Array.from({ length: FOLD_BATCHES }, (_, index) => index + 1),
+    );
     store.close();
   });
 

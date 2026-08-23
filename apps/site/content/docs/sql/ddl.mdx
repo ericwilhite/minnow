@@ -19,8 +19,8 @@ CREATE TABLE orders (
 
 Columns are nullable unless marked `NOT NULL`. Exactly one column may be `PRIMARY KEY` — written
 on the column or as a table-level `PRIMARY KEY (order_id)` — and it is the table's unique key: the
-column that `UPDATE`, `DELETE`, and `ON CONFLICT` address rows through, and the only uniqueness
-the engine enforces.
+column that `UPDATE`, `DELETE`, and `ON CONFLICT` address rows through. Additional scalar or
+composite candidate keys can be enforced with `CREATE UNIQUE INDEX` after the table exists.
 
 `CREATE TABLE IF NOT EXISTS` leaves an existing table of that name alone, and `CREATE TABLE …
 AS SELECT` takes both its columns and its first rows from a query:
@@ -77,12 +77,22 @@ non-key column:
 ```sql
 CREATE INDEX orders_by_status ON orders (status);
 CREATE INDEX IF NOT EXISTS orders_by_total ON orders (total DESC);
+CREATE INDEX orders_by_customer_status
+  ON orders (customer_id ASC, status ASC, placed_at DESC);
+CREATE UNIQUE INDEX orders_customer_time ON orders (customer_id, placed_at);
 ```
 
-One index covers one column. `ASC` and `DESC` are accepted for schema portability; they do not
-change the physical representation. Ready indexes prune row groups for `=`, `<`, `<=`, `>`, `>=`,
-and `IN` predicates. Minnow still evaluates the SQL predicate on every candidate row, so a stale
-posting or an internal locator collision can cost an extra read but cannot change an answer.
+Composite planning follows the leftmost-prefix rule: equality or `IN` can constrain the leading
+columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. `ASC` and `DESC` are part
+of the physical tuple order. Minnow still evaluates the SQL predicate on every candidate row, so
+a stale posting or an internal locator collision can cost an extra read but cannot change an
+answer.
+
+`UNIQUE` is not an optimizer hint. It owns an independent membership set that commits atomically
+with every insert, update, delete, upsert, trigger-derived write, and multi-statement write scope.
+Concurrent tabs cannot both publish the same key. A key with any `NULL` component does not
+conflict, matching SQL unique-constraint semantics. Failed builds leave no catalog entry, and
+snapshot restore keeps enforcement active even when the accelerator postings need rebuilding.
 
 Indexes are maintained across inserts, updates, deletes, and upserts. Their base is built in
 row-group-sized chunks, new commits append bounded deltas, and background folding prevents a
@@ -95,11 +105,12 @@ accelerator, and the next relevant query rebuilds it while answering correctly f
 DROP INDEX IF EXISTS orders_by_status;
 ```
 
-Index names are global within the database. `CREATE UNIQUE INDEX` and composite indexes are
-rejected: declare the table's one `PRIMARY KEY` for enforced uniqueness, and use separate
-single-column indexes when more than one predicate is selective. `ORDER BY` still uses the
-ordinary bounded sort path; a secondary index currently prunes filters rather than promising
-index order or a covering scan.
+Index names are global within the database. On a keyless append-only table, an exact index whose
+leading columns match the complete `ORDER BY` can deliver forward or reverse order without a
+sort. If every referenced column is in that index, the scan is covering and reads no table blocks.
+All indexed columns must be `NOT NULL` for that optimization; nullable, keyed, mutation-history,
+join, grouping, and unsupported order shapes keep the ordinary correct scan and bounded sort.
+Those restrictions affect speed only, never the accepted SQL or its result.
 
 ## Column types
 

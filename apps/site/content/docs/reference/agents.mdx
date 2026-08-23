@@ -81,9 +81,11 @@ machines: https://minnowdb.com/llms.txt
   live queries, snapshots, and maintenance use the same calls as `MinnowDatabase`.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
-- `CREATE INDEX name ON table(column)` creates a durable non-unique single-column accelerator for
-  equality, range, and `IN` filters; `DROP INDEX name` removes it. Composite and `UNIQUE` indexes
-  are rejected, and an index does not currently satisfy `ORDER BY`.
+- `CREATE INDEX name ON table(a, b DESC)` creates a durable scalar or composite accelerator.
+  Leftmost equality/`IN` prefixes and the next range prune candidates. `CREATE UNIQUE INDEX`
+  enforces additional candidate keys atomically; any NULL component does not conflict.
+  `DROP INDEX name` removes the catalog, postings, and unique membership. A matching non-null index
+  can satisfy `ORDER BY` (and cover the query) on a keyless append-only table; other shapes sort.
 - `db.explain(sql)` returns the optimized plan as text.
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form. It
   lists every supported and rejected form with an example.
@@ -91,8 +93,8 @@ machines: https://minnowdb.com/llms.txt
   (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
   (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
   `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
-  `SET TRANSACTION`, composite or `UNIQUE` secondary indexes, multiple or composite unique keys,
-  composite foreign keys, savepoints, correlated `NOT IN` (use `NOT EXISTS`), non-equality
+  `SET TRANSACTION`, table declarations with multiple or composite unique keys, composite primary
+  or foreign keys, savepoints, correlated `NOT IN` (use `NOT EXISTS`), non-equality
   correlation in scalar subqueries or `IN`, and correlated `EXISTS` nested below `OR`.
 ```
 

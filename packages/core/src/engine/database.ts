@@ -69,6 +69,9 @@ import {
   type FtsPostingQuery,
   type FtsPosting,
   type SecondaryIndexRecord,
+  secondaryIndexColumnIds,
+  secondaryIndexDirections,
+  secondaryUniqueKeyNamespace,
   CompactionJobConflictError,
   type CompactionJobRecord,
   type CompactionJobState,
@@ -104,6 +107,7 @@ import {
   TableRecordConflictError,
   TransactionRecordConflictError,
   UniqueKeyConflictError,
+  UniqueIndexCoverageError,
   WriteConflictError,
 } from "../storage/index.js";
 import {
@@ -370,7 +374,7 @@ interface ZonePredicate {
 }
 
 interface SecondaryIndexPredicate {
-  readonly column: TableColumnRecord;
+  readonly columns: readonly TableColumnRecord[];
   readonly indexId: string;
   readonly index: SecondaryIndexRecord;
   /** Exact members for equality/IN, or one lexicographic range. */
@@ -907,7 +911,15 @@ function isTransactionalStatement(
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
   | { kind: "create-table"; table: string }
-  | { kind: "create-index"; index: string; table: string; column: string }
+  | {
+      kind: "create-index";
+      index: string;
+      table: string;
+      /** First key column, retained for compatibility with the original single-column result. */
+      column: string;
+      columns: string[];
+      unique: boolean;
+    }
   | { kind: "drop-index"; index: string; dropped: boolean }
   | { kind: "add-column"; table: string; column: string }
   | { kind: "drop-column"; table: string; column: string; dropped: boolean }
@@ -1375,13 +1387,9 @@ export class MinnowDatabase {
   }
 
   /**
-   * Re-runs a statement whose staged trigger derivations were invalidated by a commit
-   * conflict: unlike the plain rebase-and-retry, a restart re-reads pre-images and re-runs
-   * trigger bodies at the fresh state, so derivations can never publish stale values.
-   */
-  /**
    * Runs one simple write — insert, upsert, update, or delete — after every simple write this
-   * database already has in flight, restarting it when its trigger derivations went stale.
+   * database already has in flight. A stale trigger derivation restarts the whole statement so
+   * it re-reads pre-images and re-runs trigger bodies at the fresh state.
    *
    * Commits are optimistic: a writer reads the manifest version, stages, and publishes only if
    * the version has not moved, rebasing and retrying otherwise up to `maxCommitRetries`.
@@ -1398,6 +1406,10 @@ export class MinnowDatabase {
         try {
           return await run();
         } catch (error) {
+          if (error instanceof UniqueIndexCoverageError) {
+            if (attempt >= this.#maxCommitRetries) throw error;
+            continue;
+          }
           if (!(error instanceof StaleTriggerDerivationsError)) throw error;
           if (attempt >= this.#maxCommitRetries) throw error.conflict;
         }
@@ -1411,6 +1423,50 @@ export class MinnowDatabase {
     } finally {
       if (this.#writeChain === current) this.#writeChain = Promise.resolve();
     }
+  }
+
+  /** Turns the storage namespace/token of a secondary UNIQUE conflict into a public SQL error. */
+  async #translateSecondaryUniqueConflict(error: unknown): Promise<unknown> {
+    if (!(error instanceof UniqueKeyConflictError)) return error;
+    for (const table of await this.store.listTables()) {
+      for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+        if (
+          index.unique !== true ||
+          secondaryUniqueKeyNamespace(table.id, indexId) !== error.tableId
+        ) {
+          continue;
+        }
+        const columns = secondaryIndexColumnIds(index).map((columnId) =>
+          table.columns.find((column) => column.id === columnId),
+        );
+        if (columns.some((column) => column === undefined)) return error;
+        try {
+          const presentColumns = columns as TableColumnRecord[];
+          const values =
+            index.termEncoding === "tuple-v1"
+              ? decodeSecondaryTupleTerm(index, presentColumns, error.keyToken)
+              : [error.keyToken];
+          const columnName =
+            presentColumns.length === 1
+              ? (presentColumns[0]?.name ?? index.name)
+              : `(${presentColumns.map((column) => column.name).join(", ")})`;
+          const value =
+            values.length === 1
+              ? (values[0] ?? error.keyToken)
+              : `(${values
+                  .map((entry) => (entry === null ? "NULL" : formatValue(entry)))
+                  .join(", ")})`;
+          return new UniqueConstraintError(
+            table.name,
+            columnName,
+            value instanceof Date || typeof value !== "object" ? value : String(value),
+          );
+        } catch {
+          return error;
+        }
+      }
+    }
+    return error;
   }
 
   /**
@@ -1534,8 +1590,8 @@ export class MinnowDatabase {
       throw new Error(`Catalog column disappeared while dropping: ${table.name}.${column.name}`);
     }
     assertColumnDroppable(catalogTable, catalogColumn);
-    const dependentIndex = Object.values(table.secondaryIndexes ?? {}).find(
-      (index) => index.columnId === column.id,
+    const dependentIndex = Object.values(table.secondaryIndexes ?? {}).find((index) =>
+      secondaryIndexColumnIds(index).includes(column.id),
     );
     if (dependentIndex !== undefined) {
       throw new TypeError(
@@ -1696,9 +1752,11 @@ export class MinnowDatabase {
       autoIncrement === undefined || autoIncrement.missingIndexes.length === 0
         ? batchKeys(table, batch)
         : undefined;
-    const result = await this.#runWrite(() =>
-      this.#writeBatch(table, batch, "insert", keys, autoIncrement),
-    );
+    const result = await this.#runWrite(async () => {
+      const current = await this.store.getTable(table.id);
+      if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
+      return this.#writeBatch(current, batch, "insert", keys, autoIncrement);
+    });
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       tableName: result.tableName,
@@ -1740,9 +1798,11 @@ export class MinnowDatabase {
     );
     const deferred = autoIncrement !== undefined && autoIncrement.missingIndexes.length > 0;
     const keys = deferred ? undefined : batchKeys(table, batch);
-    const result = await this.#runWrite(() =>
-      this.#writeBatch(table, batch, "upsert", keys, autoIncrement),
-    );
+    const result = await this.#runWrite(async () => {
+      const current = await this.store.getTable(table.id);
+      if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
+      return this.#writeBatch(current, batch, "upsert", keys, autoIncrement);
+    });
     collectAutoIncrementGenerated(batch, generated, autoIncrement);
     return {
       ...result,
@@ -1767,7 +1827,15 @@ export class MinnowDatabase {
       (column) => input.changes[column] ?? [],
       (sql, params) => this.query(sql, { params, memoize: false }),
     );
-    return this.#runWrite(() => this.#writeUpdateBatch(table, keyColumn, input, keys));
+    return this.#runWrite(async () => {
+      const current = await this.store.getTable(table.id);
+      if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
+      const currentKey = getUniqueKeyColumn(current);
+      if (currentKey?.id !== keyColumn.id) {
+        throw new TypeError(`Table unique key changed during update: ${tableName}`);
+      }
+      return this.#writeUpdateBatch(current, currentKey, input, keys);
+    });
   }
 
   async update(
@@ -1912,8 +1980,16 @@ export class MinnowDatabase {
       // Triggers fire once per row that actually exists: a requested key with no row deletes
       // nothing and must not fire a phantom all-null OLD image.
       const deletePreImages = (
-        await this.#triggerPreImages(table, keyColumn, [...keys.values()], "delete")
+        await this.#triggerPreImages(
+          table,
+          keyColumn,
+          [...keys.values()],
+          "delete",
+          undefined,
+          readyUniqueSecondaryIndexes(table).length > 0,
+        )
       ).filter((row) => row !== undefined);
+      stageSecondaryUniqueMutationChanges(transaction, table, undefined, deletePreImages);
       const deleteValueAt = (
         source: "new" | "old",
         column: string,
@@ -2000,7 +2076,7 @@ export class MinnowDatabase {
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      throw error;
+      throw await this.#translateSecondaryUniqueConflict(error);
     }
   }
 
@@ -2035,10 +2111,6 @@ export class MinnowDatabase {
 
     try {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, keys);
-      const secondaryDeltas = buildSecondaryUpdateDeltas(table, input);
-      if (secondaryDeltas.length > 0) {
-        transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
-      }
       const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
       const batchBlockWrites: Array<{ id: string; bytes: Uint8Array }> = [];
       for (const column of columns) {
@@ -2082,8 +2154,17 @@ export class MinnowDatabase {
         input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
         "update",
         undefined,
-        checks.length > 0,
+        checks.length > 0 ||
+          secondaryIndexUpdateNeedsPreImages(table, input) ||
+          readyUniqueSecondaryIndexes(table).some(({ columns }) =>
+            columns.some((column) => input.changes[column.name] !== undefined),
+          ),
       );
+      stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
+      const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
+      if (secondaryDeltas.length > 0) {
+        transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
+      }
       const updateValueAt = (
         source: "new" | "old",
         column: string,
@@ -2187,7 +2268,7 @@ export class MinnowDatabase {
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      throw error;
+      throw await this.#translateSecondaryUniqueConflict(error);
     }
   }
 
@@ -2366,6 +2447,12 @@ export class MinnowDatabase {
         upsertKeyColumn === undefined
           ? undefined
           : await this.#upsertTriggerFirings(table, upsertKeyColumn, input, rowCount);
+      stageSecondaryUniqueInsertChanges(
+        transaction,
+        table,
+        input,
+        kind === "upsert" ? upsertFirings?.oldImages : undefined,
+      );
       if (kind === "insert") {
         await this.#stageTriggerDerivedInserts(
           transaction,
@@ -2457,7 +2544,7 @@ export class MinnowDatabase {
           throw new UniqueConstraintError(table.name, keyColumn.name, value);
         }
       }
-      throw error;
+      throw await this.#translateSecondaryUniqueConflict(error);
     }
   }
 
@@ -4332,6 +4419,7 @@ export class MinnowDatabase {
     batch: ColumnarBatch,
     rowCount: number,
   ): Promise<void> {
+    stageSecondaryUniqueInsertChanges(transaction, table, batch);
     await this.#stageInsertSegment(transaction, table, batch, rowCount, "insert");
   }
 
@@ -4548,7 +4636,7 @@ export class MinnowDatabase {
     } catch (error) {
       closed = true;
       await transaction.abort().catch(() => undefined);
-      throw error;
+      throw await this.#translateSecondaryUniqueConflict(error);
     }
   }
 
@@ -4769,6 +4857,12 @@ export class MinnowDatabase {
             rowCount,
             (sql, params) => this.#sessionQuery(transaction, sql, { params }),
           );
+    stageSecondaryUniqueInsertChanges(
+      transaction,
+      table,
+      batch,
+      kind === "upsert" ? sessionUpsertFirings?.oldImages : undefined,
+    );
     if (kind === "insert") {
       await this.#stageTriggerDerivedInserts(
         transaction,
@@ -4850,10 +4944,6 @@ export class MinnowDatabase {
     if (committedKeys.size > 0) {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
     }
-    const secondaryDeltas = buildSecondaryUpdateDeltas(table, input);
-    if (secondaryDeltas.length > 0) {
-      transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
-    }
     await this.#assertForeignKeysPresent(
       table,
       (column) => input.changes[column] ?? [],
@@ -4867,8 +4957,17 @@ export class MinnowDatabase {
       input.keys.filter((key): key is Exclude<BatchValue, null> => key !== null),
       "update",
       (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
-      sessionChecks.length > 0,
+      sessionChecks.length > 0 ||
+        secondaryIndexUpdateNeedsPreImages(table, input) ||
+        readyUniqueSecondaryIndexes(table).some(({ columns }) =>
+          columns.some((column) => input.changes[column.name] !== undefined),
+        ),
     );
+    stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
+    const secondaryDeltas = buildSecondaryUpdateDeltas(table, input, preImages);
+    if (secondaryDeltas.length > 0) {
+      transaction.setFtsChanges({ tableId: table.id, columns: secondaryDeltas });
+    }
     const sessionUpdateValueAt = (
       source: "new" | "old",
       column: string,
@@ -5012,8 +5111,10 @@ export class MinnowDatabase {
         [...keys.values()],
         "delete",
         (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
+        readyUniqueSecondaryIndexes(table).length > 0,
       )
     ).filter((row) => row !== undefined);
+    stageSecondaryUniqueMutationChanges(transaction, table, undefined, preImages);
     const sessionDeleteValueAt = (
       source: "new" | "old",
       column: string,
@@ -5475,6 +5576,20 @@ export class MinnowDatabase {
       }
       if (secondaryIndexPredicates(reported, record).length > 0) {
         notes.push("a ready secondary index prunes the scan to candidate row groups");
+      }
+      const referenced = referencedColumns(
+        reported,
+        new Map([[record.name, record.columns.map((column) => column.name)]]),
+      ).get(record.name);
+      const projected =
+        referenced === undefined || referenced.length === 0
+          ? []
+          : resolveReadColumns(record, referenced);
+      if (secondaryIndexOrderForPlan(reported, record, projected, false) !== undefined) {
+        notes.push("a ready secondary index supplies ORDER BY without a sort");
+        if (secondaryIndexOrderForPlan(reported, record, projected) !== undefined) {
+          notes.push("a covering secondary-index scan avoids table blocks");
+        }
       }
     }
     if (blockHasSubqueries(reported))
@@ -6097,7 +6212,6 @@ export class MinnowDatabase {
     };
   }
 
-  /** Runs an INSERT ... SELECT source at one snapshot and materializes it as literal rows. */
   /**
    * MERGE (F312). One pass over the source, joined to the target on the match condition, decides
    * each row's branch; the branches then apply as ordinary batched writes inside a single write
@@ -6288,15 +6402,21 @@ export class MinnowDatabase {
           kind: "create-index",
           index: statement.index,
           table: statement.table,
-          column: statement.column,
+          column: statement.columns[0]?.name ?? "",
+          columns: statement.columns.map((column) => column.name),
+          unique: statement.unique === true,
         };
       }
-      await this.createIndex(statement.index, statement.table, statement.column);
+      await this.createIndex(statement.index, statement.table, statement.columns, {
+        unique: statement.unique === true,
+      });
       return {
         kind: "create-index",
         index: statement.index,
         table: statement.table,
-        column: statement.column,
+        column: statement.columns[0]?.name ?? "",
+        columns: statement.columns.map((column) => column.name),
+        unique: statement.unique === true,
       };
     }
     if (statement.kind === "drop-index") {
@@ -6740,6 +6860,9 @@ export class MinnowDatabase {
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
     const projectedBaseColumns =
       requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
+    if (secondaryIndexOrderForPlan(plan, baseTable, projectedBaseColumns, false) !== undefined) {
+      return undefined;
+    }
     {
       // The fts invalidation flip commits atomically with its segments, so a record fetched
       // after the segment reads above cannot claim "ready" for data those segments miss.
@@ -6911,14 +7034,6 @@ export class MinnowDatabase {
     }
   }
 
-  /**
-   * Checks a table's visible history for streamed-scan eligibility and returns a factory that
-   * builds a fresh forward-only streamed view per attempt or pass. Append/base histories stream
-   * directly; update/delete keyed histories stream through the mutation replay; histories with
-   * upsert segments (which interleave new rows into slot order at their segment position) and
-   * shapes whose blocks cannot back a block-driven loader return undefined so the caller keeps
-   * the materialized path.
-   */
   /**
    * Zone-map row-group pruning for the streamed scan: header-only inspection of the
    * predicate columns' blocks selects the block indexes that can match, and the scan then
@@ -7280,12 +7395,6 @@ export class MinnowDatabase {
     }
   }
 
-  /**
-   * Builds a single-table columnar view whose projected vectors hold one block-aligned resident
-   * window at a time. Each load drops blocks that end before the requested range, decodes forward
-   * as needed, reserves the replacement window before installing it, and releases the superseded
-   * reservation afterward. The scan is forward-only; a backward request is a programming error.
-   */
   /**
    * The vectorized form of one immutable block: validity, typed values, and for strings the
    * per-block dictionary with codes. Cached by block id beside the decoded physical form, so
@@ -11353,12 +11462,23 @@ export class MinnowDatabase {
   }
 
   /**
-   * Creates and fully builds a durable single-column secondary index. The catalog's global
+   * Creates and fully builds a durable secondary index. The catalog's global
    * index-name namespace matches the SQL DDL: a duplicate name is rejected even on another
    * table. The building state makes the operation crash-safe; readers scan until the base and
    * every concurrent commit delta are known to be covered.
    */
-  async createIndex(indexName: string, tableName: string, columnName: string): Promise<void> {
+  async createIndex(
+    indexName: string,
+    tableName: string,
+    requestedColumns: string | ReadonlyArray<{ name: string; direction: "asc" | "desc" }>,
+    options: { unique?: boolean } = {},
+  ): Promise<void> {
+    // Keep the original low-level single-column API source-compatible while SQL and new callers
+    // use the explicit ordered key shape.
+    const indexColumns =
+      typeof requestedColumns === "string"
+        ? [{ name: requestedColumns, direction: "asc" as const }]
+        : requestedColumns;
     const tables = await this.store.listTables();
     if (
       tables.some((table) =>
@@ -11371,8 +11491,19 @@ export class MinnowDatabase {
     if (table === undefined || table.view !== undefined) {
       throw new TypeError(`Unknown table: ${tableName}`);
     }
-    const column = table.columns.find((candidate) => candidate.name === columnName);
-    if (column === undefined) throw new TypeError(`Unknown column: ${columnName}`);
+    if (indexColumns.length === 0) throw new TypeError("An index needs at least one column");
+    const duplicate = indexColumns.find(
+      (column, position) =>
+        indexColumns.findIndex((candidate) => candidate.name === column.name) !== position,
+    );
+    if (duplicate !== undefined) {
+      throw new TypeError(`Index column appears more than once: ${duplicate.name}`);
+    }
+    const columns = indexColumns.map(({ name }) => {
+      const column = table.columns.find((candidate) => candidate.name === name);
+      if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
+      return column;
+    });
     const indexId = this.#createId();
     const storageColumnId = `secondary-index:${indexId}`;
     const buildId = this.#createId();
@@ -11381,7 +11512,11 @@ export class MinnowDatabase {
         ...table.secondaryIndexes,
         [indexId]: {
           name: indexName,
-          columnId: column.id,
+          columnId: columns[0]?.id ?? "",
+          columnIds: columns.map((column) => column.id),
+          directions: indexColumns.map((column) => column.direction),
+          ...(options.unique === true ? { unique: true as const } : {}),
+          termEncoding: "tuple-v1",
           storage: "postings-v1",
           storageColumnId,
           locator: table.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
@@ -11391,7 +11526,52 @@ export class MinnowDatabase {
         },
       },
     });
-    await this.#buildSecondaryIndex(marked, indexId);
+    try {
+      await this.#buildSecondaryIndex(marked, indexId);
+    } catch (error) {
+      // A caller that sees CREATE INDEX fail must not inherit an unusable schema object. An
+      // abandoned tab is different: it never runs this catch, so the durable `building` marker
+      // remains available for another connection to take over.
+      await this.#removeSecondaryIndexIfOwned(marked.id, indexId, indexName, storageColumnId).catch(
+        (cleanupError: unknown) => {
+          throw new AggregateError(
+            [error, cleanupError],
+            `CREATE INDEX ${indexName} failed and its catalog cleanup also failed`,
+          );
+        },
+      );
+      throw error;
+    }
+  }
+
+  /** Removes only the exact failed build this caller created, retrying catalog CAS races. */
+  async #removeSecondaryIndexIfOwned(
+    tableId: string,
+    indexId: string,
+    indexName: string,
+    storageColumnId: string,
+  ): Promise<void> {
+    for (let attempt = 0; attempt <= this.#maxCommitRetries; attempt += 1) {
+      const fresh = await this.store.getTable(tableId);
+      if (fresh === undefined) return;
+      const owned = fresh.secondaryIndexes?.[indexId];
+      if (owned?.name !== indexName || owned.storageColumnId !== storageColumnId) {
+        return;
+      }
+      const secondaryIndexes = Object.fromEntries(
+        Object.entries(fresh.secondaryIndexes ?? {}).filter(([candidate]) => candidate !== indexId),
+      );
+      try {
+        await this.store.updateTable(fresh.id, fresh.revision ?? 0, {
+          secondaryIndexes: Object.keys(secondaryIndexes).length === 0 ? null : secondaryIndexes,
+        });
+        return;
+      } catch (error) {
+        if (!(error instanceof TableRecordConflictError) || attempt === this.#maxCommitRetries) {
+          throw error;
+        }
+      }
+    }
   }
 
   /** Drops one globally named secondary index. */
@@ -11422,7 +11602,27 @@ export class MinnowDatabase {
     const key = `${table.id}/${index.storageColumnId}`;
     const existing = this.#ftsBuildsInFlight.get(key);
     if (existing !== undefined) return existing;
-    const build = this.#buildSecondaryIndexBase(table, indexId, index, index.buildId);
+    const build = (async () => {
+      let currentTable = table;
+      let currentIndex = index;
+      let ownedBuildId = index.buildId;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await this.#buildSecondaryIndexBase(currentTable, indexId, currentIndex, ownedBuildId);
+          return;
+        } catch (error) {
+          if (!(error instanceof WriteConflictError) || attempt >= this.#maxCommitRetries) {
+            throw error;
+          }
+          const fresh = await this.store.getTable(table.id);
+          const freshIndex = fresh?.secondaryIndexes?.[indexId];
+          if (fresh === undefined || freshIndex === undefined) return;
+          currentTable = fresh;
+          currentIndex = freshIndex;
+          ownedBuildId = freshIndex.buildId;
+        }
+      }
+    })();
     this.#ftsBuildsInFlight.set(key, build);
     try {
       await build;
@@ -11454,32 +11654,51 @@ export class MinnowDatabase {
         });
     try {
       await this.#withLeasedSnapshot(undefined, async (snapshot) => {
-        const column = marked.columns.find((candidate) => candidate.id === index.columnId);
-        if (column === undefined) return;
+        const columns = secondaryIndexColumnIds(index).map((columnId) =>
+          marked.columns.find((candidate) => candidate.id === columnId),
+        );
+        if (columns.some((column) => column === undefined)) return;
+        const indexedColumns = columns as TableColumnRecord[];
         const keyColumn = getUniqueKeyColumn(marked);
-        const projected = keyColumn === undefined ? [column] : [column, keyColumn];
+        const projected = keyColumn === undefined ? indexedColumns : [...indexedColumns, keyColumn];
         const coversVersion = snapshot.version ?? -1;
         const projectedColumns = [...new Map(projected.map((entry) => [entry.id, entry])).values()];
+        const uniqueTerms = index.unique === true ? new Set<string>() : undefined;
         const streamed = await this.#writeStreamedSecondaryIndexBase(
           marked,
-          column,
+          indexedColumns,
           keyColumn,
           index,
           projectedColumns,
           snapshot,
           coversVersion,
           buildId,
+          uniqueTerms,
         );
         if (!streamed) {
-          await this.#writeHistoricalSecondaryIndexBase(
-            marked,
-            column,
-            keyColumn,
-            index,
-            snapshot,
-            coversVersion,
-            buildId,
-          );
+          if (index.unique === true) {
+            await this.#writeMaterializedSecondaryIndexBase(
+              marked,
+              indexedColumns,
+              keyColumn,
+              index,
+              projectedColumns,
+              snapshot,
+              coversVersion,
+              buildId,
+              uniqueTerms ?? new Set<string>(),
+            );
+          } else {
+            await this.#writeHistoricalSecondaryIndexBase(
+              marked,
+              indexedColumns,
+              keyColumn,
+              index,
+              snapshot,
+              coversVersion,
+              buildId,
+            );
+          }
         }
         const fresh = await this.store.getTable(marked.id);
         const freshIndex = fresh?.secondaryIndexes?.[indexId];
@@ -11503,8 +11722,20 @@ export class MinnowDatabase {
                 ...readyIndex,
                 state: "ready",
                 buildFromVersion: coversVersion,
+                ...(index.unique === true ? { uniqueEnforced: true as const } : {}),
               },
             },
+            ...(index.unique === true
+              ? {
+                  expectedManifestVersion: {
+                    value: coversVersion < 0 ? null : coversVersion,
+                  },
+                  uniqueKeySeed: {
+                    namespaceId: secondaryUniqueKeyNamespace(fresh.id, indexId),
+                    keyTokens: [...(uniqueTerms ?? [])],
+                  },
+                }
+              : {}),
           });
         }
       });
@@ -11531,15 +11762,82 @@ export class MinnowDatabase {
     }
   }
 
-  async #writeStreamedSecondaryIndexBase(
+  /**
+   * Exact fallback for a UNIQUE build over a history the forward streamer cannot replay (today,
+   * an uncompacted upsert history). The ordinary current-row materializer is the source of truth;
+   * output still lands in row-group chunks, and the common append/update/delete path above stays
+   * window-bounded. This fallback is intentionally unique-only: a non-unique accelerator can use
+   * the bounded historical superset instead.
+   */
+  async #writeMaterializedSecondaryIndexBase(
     table: TableRecord,
-    column: TableColumnRecord,
+    columns: readonly TableColumnRecord[],
     keyColumn: TableColumnRecord | undefined,
     index: SecondaryIndexRecord,
     projectedColumns: readonly TableColumnRecord[],
     snapshot: LeasedSnapshot,
     coversVersion: number,
     buildId: string,
+    uniqueTerms: Set<string>,
+  ): Promise<void> {
+    if (keyColumn === undefined) {
+      throw new Error(`Materialized UNIQUE-index fallback needs a table key: ${table.name}`);
+    }
+    const begin = this.store.beginFtsBaseBuild.bind(this.store);
+    const writeChunk = this.store.writeFtsBaseBuildChunk.bind(this.store);
+    const finish = this.store.finishFtsBaseBuild.bind(this.store);
+    const abort = this.store.abortFtsBaseBuild.bind(this.store);
+    await begin(table.id, index.storageColumnId, buildId);
+    try {
+      const materialized = await this.#materializeColumnarTableAtSnapshot(
+        table,
+        snapshot,
+        projectedColumns,
+      );
+      const valueVectors = columns.map((column) => materialized.columns.get(column.name));
+      const keyVector = materialized.columns.get(keyColumn.name);
+      if (valueVectors.some((vector) => vector === undefined) || keyVector === undefined) {
+        throw new Error(`UNIQUE-index source columns are missing: ${index.name}`);
+      }
+      let ordinal = 0;
+      for (let start = 0; start < materialized.rowCount; start += this.#rowsPerBlock) {
+        const end = Math.min(materialized.rowCount, start + this.#rowsPerBlock);
+        const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
+        for (let row = start; row < end; row += 1) {
+          const values = valueVectors.map((vector) =>
+            vector === undefined ? null : vectorValue(vector, row),
+          );
+          if (values.some((value) => value === null)) continue;
+          const locator = secondaryKeyLocator(keyColumn.type, vectorValue(keyVector, row));
+          addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
+        }
+        const postings = sortedSecondaryPostings(byTerm);
+        if (postings.length > 0) {
+          await writeChunk(table.id, index.storageColumnId, buildId, ordinal, postings);
+          ordinal += 1;
+        }
+      }
+      await finish(table.id, index.storageColumnId, buildId, {
+        coversVersion,
+        chunkCount: ordinal,
+        totalTokens: 0,
+      });
+    } catch (error) {
+      await abort(table.id, index.storageColumnId, buildId).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #writeStreamedSecondaryIndexBase(
+    table: TableRecord,
+    columns: readonly TableColumnRecord[],
+    keyColumn: TableColumnRecord | undefined,
+    index: SecondaryIndexRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    snapshot: LeasedSnapshot,
+    coversVersion: number,
+    buildId: string,
+    uniqueTerms?: Set<string>,
   ): Promise<boolean> {
     const begin = this.store.beginFtsBaseBuild.bind(this.store);
     const writeChunk = this.store.writeFtsBaseBuildChunk.bind(this.store);
@@ -11552,8 +11850,12 @@ export class MinnowDatabase {
     const memory = new QueryMemoryContext(DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES);
     try {
       const streamed = await factory.create(memory);
-      const valueVector = streamed.table.columns.get(column.name);
-      if (valueVector === undefined) throw new Error(`Indexed column is missing: ${column.name}`);
+      const valueVectors = columns.map((column) => streamed.table.columns.get(column.name));
+      if (valueVectors.some((vector) => vector === undefined)) {
+        throw new Error(
+          `Indexed column is missing: ${columns.map((column) => column.name).join(", ")}`,
+        );
+      }
       const keyVector =
         keyColumn === undefined ? undefined : streamed.table.columns.get(keyColumn.name);
       const rowIdAt =
@@ -11566,8 +11868,10 @@ export class MinnowDatabase {
         if (end <= start) throw new Error(`Secondary-index scan made no progress: ${table.name}`);
         const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
         for (let row = start; row < end; row += 1) {
-          const value = vectorValue(valueVector, row);
-          if (value === null) continue;
+          const values = valueVectors.map((vector) =>
+            vector === undefined ? null : vectorValue(vector, row),
+          );
+          if (values.some((value) => value === null)) continue;
           const locator =
             keyColumn === undefined
               ? (rowIdAt?.(row) ?? 0n)
@@ -11575,7 +11879,7 @@ export class MinnowDatabase {
                   keyColumn.type,
                   keyVector === undefined ? null : vectorValue(keyVector, row),
                 );
-          addSecondaryPosting(byTerm, column.type, value, locator);
+          addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
         }
         const postings = sortedSecondaryPostings(byTerm);
         if (postings.length > 0) {
@@ -11608,7 +11912,7 @@ export class MinnowDatabase {
    */
   async #writeHistoricalSecondaryIndexBase(
     table: TableRecord,
-    column: TableColumnRecord,
+    columns: readonly TableColumnRecord[],
     keyColumn: TableColumnRecord | undefined,
     index: SecondaryIndexRecord,
     snapshot: LeasedSnapshot,
@@ -11624,42 +11928,73 @@ export class MinnowDatabase {
     try {
       let ordinal = 0;
       for (const segment of segments) {
-        const valueIds = segment.columnBlockIds[column.id];
-        if (valueIds === undefined || valueIds.length === 0) continue;
+        const anchorIds =
+          (keyColumn === undefined ? undefined : segment.columnBlockIds[keyColumn.id]) ??
+          columns
+            .map((column) => segment.columnBlockIds[column.id])
+            .find((ids) => ids !== undefined) ??
+          Object.values(segment.columnBlockIds)[0] ??
+          [];
+        if (anchorIds.length === 0) {
+          if (segment.rowCount === 0) continue;
+          throw new Error(`Secondary-index segment has no row-group anchor: ${segment.id}`);
+        }
+        for (const column of columns) {
+          const ids = segment.columnBlockIds[column.id];
+          if (ids !== undefined && ids.length !== anchorIds.length) {
+            throw new Error(`Secondary-index blocks differ for ${column.name}`);
+          }
+        }
         const keyIds = keyColumn === undefined ? undefined : segment.columnBlockIds[keyColumn.id];
-        if (keyColumn !== undefined && keyIds?.length !== valueIds.length) {
-          throw new Error(`Secondary-index key blocks differ from ${column.name} blocks`);
+        if (keyColumn !== undefined && keyIds?.length !== anchorIds.length) {
+          throw new Error(`Secondary-index key blocks differ from indexed blocks`);
         }
         const rowIdAt =
           keyColumn === undefined ? appendRowIdLocator([segment], segment.rowCount) : undefined;
         let segmentRow = 0;
-        for (let blockIndex = 0; blockIndex < valueIds.length; blockIndex += 1) {
+        for (let blockIndex = 0; blockIndex < anchorIds.length; blockIndex += 1) {
           await this.#renewInternalLeaseIfNeeded(snapshot);
-          const valueId = valueIds[blockIndex] ?? "";
+          const valueIds = columns.map((column) => segment.columnBlockIds[column.id]?.[blockIndex]);
+          const anchorId = anchorIds[blockIndex] ?? "";
           const keyId = keyIds?.[blockIndex];
-          const ids = keyId === undefined || keyId === valueId ? [valueId] : [valueId, keyId];
+          const ids = [
+            ...new Set(
+              [anchorId, ...valueIds, keyId].filter((id): id is string => id !== undefined),
+            ),
+          ];
           const decoded = await this.#decodedBlocksThroughCache(ids, snapshot);
-          const valueBlock = decoded[0];
-          const keyBlock = keyId === undefined || keyId === valueId ? valueBlock : decoded[1];
-          if (valueBlock?.column.type !== column.type) {
-            throw new Error(`Secondary-index value block is invalid: ${valueId}`);
-          }
+          const byId = new Map(ids.map((id, position) => [id, decoded[position]] as const));
+          const anchorBlock = byId.get(anchorId);
+          if (anchorBlock === undefined)
+            throw new Error(`Secondary-index anchor block is invalid: ${anchorId}`);
+          const rowCount = anchorBlock.column.rowCount;
+          const vectors = columns.map((column, position) => {
+            const id = valueIds[position];
+            if (id === undefined) return undefined;
+            const block = byId.get(id);
+            if (block?.column.type !== column.type || block.column.rowCount !== rowCount) {
+              throw new Error(`Secondary-index value block is invalid: ${id}`);
+            }
+            return this.#blockColumnVector(id, block);
+          });
+          const keyBlock = keyId === undefined ? undefined : byId.get(keyId);
           if (
             keyColumn !== undefined &&
-            (keyBlock?.column.type !== keyColumn.type ||
-              keyBlock.column.rowCount !== valueBlock.column.rowCount)
+            (keyBlock?.column.type !== keyColumn.type || keyBlock.column.rowCount !== rowCount)
           ) {
             throw new Error(`Secondary-index key block is invalid: ${keyId ?? ""}`);
           }
-          const values = this.#blockColumnVector(valueId, valueBlock);
           const keys =
             keyColumn === undefined || keyBlock === undefined || keyId === undefined
               ? undefined
               : this.#blockColumnVector(keyId, keyBlock);
           const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
-          for (let row = 0; row < values.length; row += 1) {
-            const value = vectorValue(values, row);
-            if (value === null) continue;
+          for (let row = 0; row < rowCount; row += 1) {
+            const values = columns.map((column, position) => {
+              const vector = vectors[position];
+              return vector === undefined ? (column.backfill ?? null) : vectorValue(vector, row);
+            });
+            if (values.some((value) => value === null)) continue;
             const locator =
               keyColumn === undefined
                 ? (rowIdAt?.(segmentRow + row) ?? 0n)
@@ -11667,14 +12002,14 @@ export class MinnowDatabase {
                     keyColumn.type,
                     keys === undefined ? null : vectorValue(keys, row),
                   );
-            addSecondaryPosting(byTerm, column.type, value, locator);
+            addSecondaryPosting(byTerm, index, columns, values, locator);
           }
           const postings = sortedSecondaryPostings(byTerm);
           if (postings.length > 0) {
             await writeChunk(table.id, index.storageColumnId, buildId, ordinal, postings);
             ordinal += 1;
           }
-          segmentRow += values.length;
+          segmentRow += rowCount;
         }
         if (segmentRow !== segment.rowCount) {
           throw new Error(`Secondary-index column row count differs in segment ${segment.id}`);
@@ -11799,14 +12134,6 @@ export class MinnowDatabase {
     });
   }
 
-  /**
-   * Segment-level candidate pruning for a top-level MATCH conjunct backed by ready indexes.
-   * Candidates come from per-term postings (union across the document's columns, intersection
-   * across terms); segments whose row-id range contains no candidate cannot satisfy the
-   * conjunct and drop before their blocks are read. The scan still evaluates MATCH on every
-   * surviving row, so false positives are free and false negatives are impossible for
-   * append-only histories (rows never change after their postings are written).
-   */
   /**
    * The top block's BM25 nodes, deduplicated by their compiled signature — the same key the
    * executor's bind step uses, so served statistics land on exactly the nodes that asked.
@@ -12044,7 +12371,13 @@ export class MinnowDatabase {
       // A killed build or a stale-writer invalidation self-heals on the next relevant query.
       for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
         if (index.state === "ready") continue;
-        if (!planReferencesColumn(plan, table, index.columnId)) continue;
+        if (
+          !secondaryIndexColumnIds(index).some((columnId) =>
+            planReferencesColumn(plan, table, columnId),
+          )
+        ) {
+          continue;
+        }
         this.#scheduleSecondaryIndexBuild(table, indexId);
       }
       return { segments, pruned: false };
@@ -12243,6 +12576,16 @@ export class MinnowDatabase {
     plan?: CompiledQuery,
   ): Promise<ColumnarTable> {
     const visibleSegments = await this.#visibleSegmentRecords(table, snapshot, visibility);
+    if (plan !== undefined) {
+      const covering = await this.#secondaryIndexCoveringTable(
+        table,
+        projectedColumns,
+        visibleSegments,
+        plan,
+        snapshot,
+      );
+      if (covering !== undefined) return covering;
+    }
     const ftsSegments =
       plan === undefined
         ? visibleSegments
@@ -12292,12 +12635,21 @@ export class MinnowDatabase {
           await this.#materializeAppendColumnVector(column, segments, snapshot, rowCount),
         );
       }
-      return {
+      const materialized: ColumnarTable = {
         name: table.name,
         rowCount,
         columns,
         ...(projectedKey ? { uniqueKey: projectedKey } : {}),
       };
+      return plan === undefined
+        ? materialized
+        : ((await this.#secondaryIndexOrderedTable(
+            table,
+            materialized,
+            segments,
+            plan,
+            snapshot,
+          )) ?? materialized);
     }
     if (
       keyColumn !== undefined &&
@@ -12476,6 +12828,124 @@ export class MinnowDatabase {
       columns,
       ...(projectedKey ? { uniqueKey: projectedKey } : {}),
     };
+  }
+
+  /**
+   * Exact covering scan for an append-only keyless table. Tuple terms carry every requested
+   * value, and row-ID cardinality/span checks prove the ready index covers this snapshot before
+   * table blocks are skipped. Any uncertainty falls back to the ordinary scan.
+   */
+  async #secondaryIndexCoveringTable(
+    table: TableRecord,
+    projectedColumns: readonly TableColumnRecord[],
+    segments: readonly SegmentRecord[],
+    plan: CompiledQuery,
+    snapshot: LeasedSnapshot,
+  ): Promise<ColumnarTable | undefined> {
+    const ordered = secondaryIndexOrderForPlan(plan, table, projectedColumns);
+    if (ordered === undefined || table.uniqueKeyColumnId !== undefined) return undefined;
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind ?? "insert";
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return undefined;
+    }
+    const result = await this.store.readFtsPostings(
+      table.id,
+      ordered.index.storageColumnId,
+      snapshot.version ?? -1,
+    );
+    const rebuild = (): undefined => {
+      this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
+      return undefined;
+    };
+    if (!result.hasBase) return rebuild();
+    if (result.coversVersion > (snapshot.version ?? -1)) return undefined;
+    if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
+      this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
+    }
+    const indexColumns = secondaryIndexColumnIds(ordered.index).map((columnId) =>
+      table.columns.find((column) => column.id === columnId),
+    );
+    if (indexColumns.some((column) => column === undefined)) return rebuild();
+    const columns = indexColumns as TableColumnRecord[];
+    const postings = ordered.reverse ? [...result.postings].reverse() : result.postings;
+    const expectedRows = segments.reduce((total, segment) => total + segment.rowCount, 0);
+    const rowForLocator = appendRowForLocator(segments, expectedRows);
+    // A byte per visible row is substantially smaller than retaining every bigint locator in a
+    // Set, and the inverse span lookup also proves that each posting names a real current row.
+    const seenRows = new Uint8Array(expectedRows);
+    let seenRowCount = 0;
+    const valuesById = new Map(projectedColumns.map((column) => [column.id, [] as BatchValue[]]));
+    for (const posting of postings) {
+      const values = decodeSecondaryTupleTerm(ordered.index, columns, posting.term);
+      for (const locator of posting.rowIds) {
+        const row = rowForLocator(locator);
+        if (row === undefined || seenRows[row] === 1) return rebuild();
+        seenRows[row] = 1;
+        seenRowCount += 1;
+        for (const [position, column] of columns.entries()) {
+          valuesById.get(column.id)?.push(values[position] ?? null);
+        }
+      }
+    }
+    if (seenRowCount !== expectedRows) return rebuild();
+    const columnInputs = new Map(
+      projectedColumns.map(
+        (column) =>
+          [column.name, { type: column.type, values: valuesById.get(column.id) ?? [] }] as const,
+      ),
+    );
+    return { ...createColumnarTable(table.name, columnInputs), orderedForPlan: true };
+  }
+
+  /** Index order over ordinary table vectors when the projection is not covered by the key. */
+  async #secondaryIndexOrderedTable(
+    table: TableRecord,
+    materialized: ColumnarTable,
+    segments: readonly SegmentRecord[],
+    plan: CompiledQuery,
+    snapshot: LeasedSnapshot,
+  ): Promise<ColumnarTable | undefined> {
+    if (plan.predicates.length > 0 || table.uniqueKeyColumnId !== undefined) return undefined;
+    const projectedColumns = [...materialized.columns.keys()].flatMap((name) => {
+      const column = table.columns.find((candidate) => candidate.name === name);
+      return column === undefined ? [] : [column];
+    });
+    const ordered = secondaryIndexOrderForPlan(plan, table, projectedColumns, false);
+    if (ordered === undefined) return undefined;
+    const result = await this.store.readFtsPostings(
+      table.id,
+      ordered.index.storageColumnId,
+      snapshot.version ?? -1,
+    );
+    const rebuild = (): undefined => {
+      this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
+      return undefined;
+    };
+    if (!result.hasBase) return rebuild();
+    if (result.coversVersion > (snapshot.version ?? -1)) return undefined;
+    if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
+      this.#scheduleSecondaryIndexBuild(table, ordered.indexId);
+    }
+    const rowForLocator = appendRowForLocator(segments, materialized.rowCount);
+    const scanOrder = new Uint32Array(materialized.rowCount);
+    const seen = new Uint8Array(materialized.rowCount);
+    let output = 0;
+    const postings = ordered.reverse ? [...result.postings].reverse() : result.postings;
+    for (const posting of postings) {
+      for (const locator of posting.rowIds) {
+        const row = rowForLocator(locator);
+        if (row === undefined || seen[row] === 1) return rebuild();
+        seen[row] = 1;
+        scanOrder[output] = row;
+        output += 1;
+      }
+    }
+    if (output !== materialized.rowCount) return rebuild();
+    return { ...materialized, scanOrder, orderedForPlan: true };
   }
 
   /**
@@ -13794,6 +14264,123 @@ function secondaryIndexTerm(type: SimpleDataType, value: BatchValue): string {
   return sortable.toString(16).padStart(16, "0");
 }
 
+/** Prefix-free hexadecimal scalar component used by tuple-v1 composite keys. */
+function secondaryTupleComponent(type: SimpleDataType, value: BatchValue): string {
+  if (value === null) throw new TypeError("A NULL has no secondary-index comparison term");
+  if (type === "string") {
+    if (typeof value !== "string") throw new TypeError("Invalid string index value");
+    let encoded = "";
+    for (let index = 0; index < value.length; index += 1) {
+      encoded += (value.charCodeAt(index) + 1).toString(16).padStart(5, "0");
+    }
+    return `${encoded}00000`;
+  }
+  if (type === "boolean") {
+    if (typeof value !== "boolean") throw new TypeError("Invalid boolean index value");
+    return value ? "1" : "0";
+  }
+  return secondaryIndexTerm(type, value);
+}
+
+const reversedHex = new Map(
+  Array.from("0123456789abcdef", (character, index) => [
+    character,
+    "fedcba9876543210"[index] ?? "",
+  ]),
+);
+
+/** Reverses the order of an internal hexadecimal term one UTF-16 code unit at a time. */
+function reverseSecondaryHex(input: string): string {
+  let output = "";
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input.charAt(index);
+    const reversed = reversedHex.get(character);
+    if (reversed === undefined) throw new Error("Secondary index has a non-hexadecimal term");
+    output += reversed;
+  }
+  return output;
+}
+
+function secondaryTupleIndexTerm(
+  index: SecondaryIndexRecord,
+  columns: readonly TableColumnRecord[],
+  values: readonly BatchValue[],
+): string {
+  if (columns.length !== values.length) throw new TypeError("Index key has the wrong arity");
+  const directions = secondaryIndexDirections(index);
+  return columns
+    .map((column, position) => {
+      const component = secondaryTupleComponent(column.type, values[position] ?? null);
+      if (directions[position] !== "desc") return component;
+      return reverseSecondaryHex(component);
+    })
+    .join("");
+}
+
+function secondaryIndexComponentTerm(
+  index: SecondaryIndexRecord,
+  column: TableColumnRecord,
+  position: number,
+  value: BatchValue,
+): string {
+  if (index.termEncoding !== "tuple-v1") {
+    if (position !== 0) throw new TypeError("A legacy index has one key component");
+    return secondaryIndexTerm(column.type, value);
+  }
+  const component = secondaryTupleComponent(column.type, value);
+  if (secondaryIndexDirections(index)[position] !== "desc") return component;
+  return reverseSecondaryHex(component);
+}
+
+function decodeSecondaryTupleTerm(
+  index: SecondaryIndexRecord,
+  columns: readonly TableColumnRecord[],
+  term: string,
+): BatchValue[] {
+  const directions = secondaryIndexDirections(index);
+  let offset = 0;
+  const values = columns.map((column, position) => {
+    const descending = directions[position] === "desc";
+    const restore = (encoded: string): string =>
+      descending ? reverseSecondaryHex(encoded) : encoded;
+    if (column.type === "string") {
+      let value = "";
+      for (;;) {
+        const group = restore(term.slice(offset, offset + 5));
+        if (group.length !== 5) throw new Error(`Secondary index ${index.name} has a bad term`);
+        offset += 5;
+        if (group === "00000") return value;
+        const code = Number.parseInt(group, 16) - 1;
+        if (!Number.isInteger(code) || code < 0 || code > 0xffff) {
+          throw new Error(`Secondary index ${index.name} has a bad string term`);
+        }
+        value += String.fromCharCode(code);
+      }
+    }
+    if (column.type === "boolean") {
+      const encoded = restore(term.slice(offset, offset + 1));
+      offset += 1;
+      if (encoded !== "0" && encoded !== "1") {
+        throw new Error(`Secondary index ${index.name} has a bad boolean term`);
+      }
+      return encoded === "1";
+    }
+    const encoded = restore(term.slice(offset, offset + 16));
+    if (encoded.length !== 16) throw new Error(`Secondary index ${index.name} has a bad term`);
+    offset += 16;
+    const sortable = BigInt(`0x${encoded}`);
+    const bits =
+      (sortable & 0x8000_0000_0000_0000n) === 0n
+        ? ~sortable & 0xffff_ffff_ffff_ffffn
+        : sortable ^ 0x8000_0000_0000_0000n;
+    secondaryNumberBits.setBigUint64(0, bits, false);
+    const value = secondaryNumberBits.getFloat64(0, false);
+    return column.type === "datetime" ? new Date(value) : value;
+  });
+  if (offset !== term.length) throw new Error(`Secondary index ${index.name} has a bad term`);
+  return values;
+}
+
 /** Stable 32-bit key locator. Collisions retain extra candidates and are rechecked by SQL. */
 function secondaryKeyLocator(type: SimpleDataType, value: BatchValue): bigint {
   const token = keyToken(type, value);
@@ -13808,12 +14395,23 @@ function secondaryKeyLocator(type: SimpleDataType, value: BatchValue): bigint {
 
 function addSecondaryPosting(
   byTerm: Map<string, { rowIds: bigint[]; tf: number[] }>,
-  type: SimpleDataType,
-  value: BatchValue,
+  index: SecondaryIndexRecord,
+  columns: readonly TableColumnRecord[],
+  values: readonly BatchValue[],
   locator: bigint,
+  uniqueTerms?: Set<string>,
 ): void {
-  if (value === null) return;
-  const term = secondaryIndexTerm(type, value);
+  if (values.some((value) => value === null)) return;
+  const first = columns[0];
+  if (first === undefined) return;
+  const term =
+    index.termEncoding === "tuple-v1"
+      ? secondaryTupleIndexTerm(index, columns, values)
+      : secondaryIndexTerm(first.type, values[0] ?? null);
+  if (uniqueTerms?.has(term) === true) {
+    throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
+  }
+  uniqueTerms?.add(term);
   const posting = byTerm.get(term) ?? { rowIds: [], tf: [] };
   posting.rowIds.push(locator);
   posting.tf.push(1);
@@ -13838,18 +14436,7 @@ function appendRowIdLocator(
   segments: readonly SegmentRecord[],
   expectedRows: number,
 ): (row: number) => bigint {
-  const spans: RowIdSpan[] = [];
-  let outputStart = 0;
-  for (const segment of segments) {
-    const kind = segment.kind ?? "insert";
-    if (kind !== "insert" && kind !== "base") continue;
-    for (const span of mergeSourceRowIdSpans(segment, kind)) {
-      spans.push({ ...span, rowStart: outputStart + span.rowStart });
-    }
-    outputStart += segment.rowCount;
-  }
-  const rows = spans.reduce((total, span) => total + span.rowCount, 0);
-  if (rows !== expectedRows) throw new Error("Secondary-index row IDs differ from table rows");
+  const spans = appendRowIdSpans(segments, expectedRows);
   let spanIndex = 0;
   return (row) => {
     while (
@@ -13863,6 +14450,47 @@ function appendRowIdLocator(
       throw new Error(`Secondary-index row ID is missing: ${String(row)}`);
     }
     return span.rowIdStart + BigInt(row - span.rowStart);
+  };
+}
+
+/** Visible append/base row-ID spans with their logical output offsets attached. */
+function appendRowIdSpans(segments: readonly SegmentRecord[], expectedRows: number): RowIdSpan[] {
+  const spans: RowIdSpan[] = [];
+  let outputStart = 0;
+  for (const segment of segments) {
+    const kind = segment.kind ?? "insert";
+    if (kind !== "insert" && kind !== "base") continue;
+    for (const span of mergeSourceRowIdSpans(segment, kind)) {
+      spans.push({ ...span, rowStart: outputStart + span.rowStart });
+    }
+    outputStart += segment.rowCount;
+  }
+  const rows = spans.reduce((total, span) => total + span.rowCount, 0);
+  if (rows !== expectedRows) throw new Error("Secondary-index row IDs differ from table rows");
+  return spans;
+}
+
+/** Inverse append locator without allocating a bigint-keyed Map entry for every visible row. */
+function appendRowForLocator(
+  segments: readonly SegmentRecord[],
+  expectedRows: number,
+): (locator: bigint) => number | undefined {
+  const spans = appendRowIdSpans(segments, expectedRows).sort((left, right) =>
+    left.rowIdStart < right.rowIdStart ? -1 : left.rowIdStart > right.rowIdStart ? 1 : 0,
+  );
+  return (locator) => {
+    let low = 0;
+    let high = spans.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((spans[middle]?.rowIdStart ?? 0n) <= locator) low = middle + 1;
+      else high = middle;
+    }
+    const span = spans[low - 1];
+    if (span === undefined) return undefined;
+    const offset = locator - span.rowIdStart;
+    if (offset < 0n || offset >= BigInt(span.rowCount)) return undefined;
+    return span.rowStart + Number(offset);
   };
 }
 
@@ -13911,19 +14539,20 @@ function buildSecondaryInsertDeltas(
   const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
   const keyColumn = getUniqueKeyColumn(table);
   return active.flatMap((index) => {
-    const column = columnsById.get(index.columnId);
-    if (column === undefined) return [];
+    const columns = secondaryIndexColumnIds(index).map((columnId) => columnsById.get(columnId));
+    if (columns.some((column) => column === undefined)) return [];
+    const indexedColumns = columns as TableColumnRecord[];
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
-    const values = input.columns[column.name] ?? [];
     const keys = keyColumn === undefined ? undefined : (input.columns[keyColumn.name] ?? []);
-    for (let row = 0; row < values.length; row += 1) {
-      const value = values[row] ?? null;
-      if (value === null) continue;
+    const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
+    for (let row = 0; row < rowCount; row += 1) {
+      const values = indexedColumns.map((column) => input.columns[column.name]?.[row] ?? null);
+      if (values.some((value) => value === null)) continue;
       const locator =
         keyColumn === undefined
           ? rowIdStart + BigInt(row)
           : secondaryKeyLocator(keyColumn.type, keys?.[row] ?? null);
-      addSecondaryPosting(byTerm, column.type, value, locator);
+      addSecondaryPosting(byTerm, index, indexedColumns, values, locator);
     }
     return [
       {
@@ -13936,7 +14565,11 @@ function buildSecondaryInsertDeltas(
 }
 
 /** Scalar postings for changed indexed values; unchanged indexes still carry stale-writer coverage. */
-function buildSecondaryUpdateDeltas(table: TableRecord, input: UpdateBatchInput): FtsColumnDelta[] {
+function buildSecondaryUpdateDeltas(
+  table: TableRecord,
+  input: UpdateBatchInput,
+  preImages: ReadonlyArray<Record<string, BatchValue> | undefined> = [],
+): FtsColumnDelta[] {
   const active = Object.values(table.secondaryIndexes ?? {}).filter(
     (index) => index.state !== "invalid",
   );
@@ -13945,18 +14578,24 @@ function buildSecondaryUpdateDeltas(table: TableRecord, input: UpdateBatchInput)
   if (keyColumn === undefined) return [];
   const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
   return active.flatMap((index) => {
-    const column = columnsById.get(index.columnId);
-    if (column === undefined) return [];
+    const columns = secondaryIndexColumnIds(index).map((columnId) => columnsById.get(columnId));
+    if (columns.some((column) => column === undefined)) return [];
+    const indexedColumns = columns as TableColumnRecord[];
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
-    const values = input.changes[column.name];
-    if (values !== undefined) {
+    const affected = indexedColumns.some((column) => input.changes[column.name] !== undefined);
+    if (affected) {
       for (let row = 0; row < input.keys.length; row += 1) {
-        const value = values[row] ?? null;
-        if (value === null) continue;
+        const values = indexedColumns.map((column) =>
+          input.changes[column.name] === undefined
+            ? (preImages[row]?.[column.name] ?? null)
+            : (input.changes[column.name]?.[row] ?? null),
+        );
+        if (values.some((value) => value === null)) continue;
         addSecondaryPosting(
           byTerm,
-          column.type,
-          value,
+          index,
+          indexedColumns,
+          values,
           secondaryKeyLocator(keyColumn.type, input.keys[row] ?? null),
         );
       }
@@ -13968,6 +14607,19 @@ function buildSecondaryUpdateDeltas(table: TableRecord, input: UpdateBatchInput)
         totalTokens: 0,
       },
     ];
+  });
+}
+
+function secondaryIndexUpdateNeedsPreImages(table: TableRecord, input: UpdateBatchInput): boolean {
+  const changed = new Set(Object.keys(input.changes));
+  const columnsById = new Map(table.columns.map((column) => [column.id, column.name] as const));
+  return Object.values(table.secondaryIndexes ?? {}).some((index) => {
+    if (index.state === "invalid") return false;
+    const names = secondaryIndexColumnIds(index).map((columnId) => columnsById.get(columnId));
+    return (
+      names.some((name) => name !== undefined && changed.has(name)) &&
+      names.some((name) => name === undefined || !changed.has(name))
+    );
   });
 }
 
@@ -13984,6 +14636,127 @@ function buildSecondaryDeleteCoverage(table: TableRecord): FtsColumnDelta[] {
           },
         ],
   );
+}
+
+function readyUniqueSecondaryIndexes(
+  table: TableRecord,
+): Array<{ indexId: string; index: SecondaryIndexRecord; columns: TableColumnRecord[] }> {
+  const columnsById = new Map(table.columns.map((column) => [column.id, column] as const));
+  return Object.entries(table.secondaryIndexes ?? {}).flatMap(([indexId, index]) => {
+    if (index.unique !== true || index.uniqueEnforced !== true) return [];
+    const columns = secondaryIndexColumnIds(index).map((columnId) => columnsById.get(columnId));
+    return columns.some((column) => column === undefined)
+      ? []
+      : [{ indexId, index, columns: columns as TableColumnRecord[] }];
+  });
+}
+
+function secondaryUniqueTerm(
+  index: SecondaryIndexRecord,
+  columns: readonly TableColumnRecord[],
+  values: readonly BatchValue[],
+): string | undefined {
+  if (values.some((value) => value === null)) return undefined;
+  return index.termEncoding === "tuple-v1"
+    ? secondaryTupleIndexTerm(index, columns, values)
+    : secondaryIndexTerm(columns[0]?.type ?? "string", values[0] ?? null);
+}
+
+function assertNoDuplicateUniqueTerms(index: SecondaryIndexRecord, terms: readonly string[]): void {
+  const seen = new Set<string>();
+  for (const term of terms) {
+    if (seen.has(term)) throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
+    seen.add(term);
+  }
+}
+
+function stageSecondaryUniqueInsertChanges(
+  transaction: DatabaseTransaction,
+  table: TableRecord,
+  input: ColumnarBatch,
+  oldImages?: ReadonlyArray<Record<string, BatchValue> | undefined>,
+): void {
+  const rowCount = input.rowCount ?? Object.values(input.columns)[0]?.length ?? 0;
+  for (const { indexId, index, columns } of readyUniqueSecondaryIndexes(table)) {
+    const namespaceId = secondaryUniqueKeyNamespace(table.id, indexId);
+    const removed = (oldImages ?? []).flatMap((old) => {
+      if (old === undefined) return [];
+      const term = secondaryUniqueTerm(
+        index,
+        columns,
+        columns.map((column) => old[column.name] ?? null),
+      );
+      return term === undefined ? [] : [term];
+    });
+    if (removed.length > 0) {
+      transaction.setUniqueKeyChanges({
+        tableId: namespaceId,
+        keyTokens: removed,
+        requireAbsent: false,
+        remove: true,
+      });
+    }
+    const added: string[] = [];
+    for (let row = 0; row < rowCount; row += 1) {
+      const term = secondaryUniqueTerm(
+        index,
+        columns,
+        columns.map((column) => input.columns[column.name]?.[row] ?? null),
+      );
+      if (term !== undefined) added.push(term);
+    }
+    assertNoDuplicateUniqueTerms(index, added);
+    // The empty entry is deliberate coverage: a stale writer that never saw this enforced unique
+    // index supplies no namespace entry, which the atomic store rejects instead of accepting an
+    // unenforced commit.
+    transaction.setUniqueKeyChanges({
+      tableId: namespaceId,
+      keyTokens: added,
+      requireAbsent: true,
+    });
+  }
+}
+
+function stageSecondaryUniqueMutationChanges(
+  transaction: DatabaseTransaction,
+  table: TableRecord,
+  input: UpdateBatchInput | undefined,
+  oldImages: ReadonlyArray<Record<string, BatchValue> | undefined>,
+): void {
+  for (const { indexId, index, columns } of readyUniqueSecondaryIndexes(table)) {
+    const namespaceId = secondaryUniqueKeyNamespace(table.id, indexId);
+    const removed = oldImages.flatMap((old) => {
+      if (old === undefined) return [];
+      const term = secondaryUniqueTerm(
+        index,
+        columns,
+        columns.map((column) => old[column.name] ?? null),
+      );
+      return term === undefined ? [] : [term];
+    });
+    transaction.setUniqueKeyChanges({
+      tableId: namespaceId,
+      keyTokens: removed,
+      requireAbsent: false,
+      remove: true,
+    });
+    if (input === undefined) continue;
+    const added = oldImages.flatMap((old, row) => {
+      if (old === undefined) return [];
+      const term = secondaryUniqueTerm(
+        index,
+        columns,
+        columns.map((column) => input.changes[column.name]?.[row] ?? old[column.name] ?? null),
+      );
+      return term === undefined ? [] : [term];
+    });
+    assertNoDuplicateUniqueTerms(index, added);
+    transaction.setUniqueKeyChanges({
+      tableId: namespaceId,
+      keyTokens: added,
+      requireAbsent: true,
+    });
+  }
 }
 
 /** One column's postings read: candidates plus the freshness/fold metadata callers gate on. */
@@ -14042,12 +14815,6 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
   }
 }
 
-/**
- * Whether a table's visible segments warrant a background fold: enough segments for a scan to
- * pay per-segment overhead, or enough deltas that every query replays a history. Counted in
- * segments, not rows — a handful of deltas costs little however many rows they hold, and
- * folding rewrites the table's anchor, so it is reserved for when the count has built up.
- */
 /**
  * Whether a table's visible history warrants a background fold: enough level-zero segments to
  * fragment a scan, or enough deltas to cost one. Partitions compaction itself published
@@ -15230,18 +15997,12 @@ function zonePredicates(plan: CompiledQuery, table: TableRecord): ZonePredicate[
   return output;
 }
 
-/** Top-level scalar predicates a ready single-column index can answer without changing truth. */
+/** Top-level scalar predicates a ready index can answer through a leftmost key prefix. */
 function secondaryIndexPredicates(
   plan: CompiledQuery,
   table: TableRecord,
 ): SecondaryIndexPredicate[] {
   if (plan.joins.length > 0 || plan.base.table !== table.name) return [];
-  const byColumnId = new Map<string, Array<[string, SecondaryIndexRecord]>>();
-  for (const entry of Object.entries(table.secondaryIndexes ?? {})) {
-    const list = byColumnId.get(entry[1].columnId) ?? [];
-    list.push(entry);
-    byColumnId.set(entry[1].columnId, list);
-  }
   const resolveColumn = (reference: string): TableColumnRecord | undefined => {
     const parts = reference.split(".");
     if (parts.length === 2 && parts[0] !== plan.base.alias && parts[0] !== table.name) {
@@ -15250,40 +16011,42 @@ function secondaryIndexPredicates(
     const name = parts.length === 2 ? parts[1] : parts[0];
     return table.columns.find((candidate) => candidate.name === name);
   };
-  const literalTerm = (column: TableColumnRecord, expression: Expression): string | undefined => {
+  interface Constraint {
+    members?: BatchValue[];
+    lower?: { value: BatchValue; inclusive: boolean };
+    upper?: { value: BatchValue; inclusive: boolean };
+  }
+  const constraints = new Map<string, Constraint>();
+  const literalValue = (
+    column: TableColumnRecord,
+    expression: Expression,
+  ): BatchValue | undefined => {
     if (expression.kind !== "literal" || expression.value === null) return undefined;
     try {
-      return secondaryIndexTerm(column.type, expression.value);
+      secondaryIndexTerm(column.type, expression.value);
+      return expression.value;
     } catch {
       return undefined;
     }
   };
-  const output: SecondaryIndexPredicate[] = [];
   for (const predicate of plan.predicates) {
     if (predicate.operator === "IN" && predicate.left.kind === "column") {
       const column = resolveColumn(predicate.left.reference);
       if (column === undefined || predicate.right.kind !== "list") continue;
-      const ready = (byColumnId.get(column.id) ?? []).find(([, index]) => index.state === "ready");
-      if (ready === undefined) continue;
-      const queries: FtsPostingQuery[] = [];
+      const members: BatchValue[] = [];
       let usable = true;
       for (const item of predicate.right.items) {
         if (item.kind === "literal" && item.value === null) continue;
-        const term = literalTerm(column, item);
-        if (term === undefined) {
+        const value = literalValue(column, item);
+        if (value === undefined) {
           usable = false;
           break;
         }
-        queries.push({ term, prefix: false });
+        members.push(value);
       }
-      if (!usable || queries.length === 0) continue;
-      output.push({
-        column,
-        indexId: ready[0],
-        index: ready[1],
-        queries,
-        union: true,
-      });
+      if (!usable || members.length === 0) continue;
+      const current = constraints.get(column.id);
+      if (current === undefined) constraints.set(column.id, { members });
       continue;
     }
     const comparison =
@@ -15301,26 +16064,165 @@ function secondaryIndexPredicates(
       predicate.right.kind === "column" ? resolveColumn(predicate.right.reference) : undefined;
     const column = leftColumn ?? rightColumn;
     if (column === undefined) continue;
-    const term = literalTerm(column, leftColumn === undefined ? predicate.left : predicate.right);
-    if (term === undefined) continue;
-    const ready = (byColumnId.get(column.id) ?? []).find(([, index]) => index.state === "ready");
-    if (ready === undefined) continue;
+    const value = literalValue(column, leftColumn === undefined ? predicate.left : predicate.right);
+    if (value === undefined) continue;
     const operator = leftColumn === undefined ? reverseComparison(comparison) : comparison;
-    const query: FtsPostingQuery =
-      operator === "="
-        ? { term, prefix: false }
-        : operator === ">" || operator === ">="
-          ? { lower: term, lowerInclusive: operator === ">=" }
-          : { upper: term, upperInclusive: operator === "<=" };
-    output.push({
-      column,
-      indexId: ready[0],
-      index: ready[1],
-      queries: [query],
-      union: false,
+    const current = constraints.get(column.id) ?? {};
+    if (operator === "=") {
+      current.members ??= [value];
+    } else if (operator === ">" || operator === ">=") {
+      current.lower ??= { value, inclusive: operator === ">=" };
+    } else {
+      current.upper ??= { value, inclusive: operator === "<=" };
+    }
+    constraints.set(column.id, current);
+  }
+  const candidates: Array<SecondaryIndexPredicate & { matchedColumns: number }> = [];
+  for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+    if (index.state !== "ready") continue;
+    const columns = secondaryIndexColumnIds(index).map((columnId) =>
+      table.columns.find((column) => column.id === columnId),
+    );
+    if (columns.some((column) => column === undefined)) continue;
+    const indexedColumns = columns as TableColumnRecord[];
+    let prefixes = [""];
+    let matchedColumns = 0;
+    let queries: FtsPostingQuery[] | undefined;
+    for (let position = 0; position < indexedColumns.length; position += 1) {
+      const column = indexedColumns[position];
+      if (column === undefined) break;
+      const constraint = constraints.get(column.id);
+      if (constraint === undefined) break;
+      if (constraint.members !== undefined) {
+        if (prefixes.length * constraint.members.length > 256) break;
+        prefixes = prefixes.flatMap(
+          (prefix) =>
+            constraint.members?.map(
+              (value) => prefix + secondaryIndexComponentTerm(index, column, position, value),
+            ) ?? [],
+        );
+        matchedColumns += 1;
+        continue;
+      }
+      if (constraint.lower === undefined && constraint.upper === undefined) break;
+      const descending = secondaryIndexDirections(index)[position] === "desc";
+      queries = prefixes.map((prefix) => {
+        const query: FtsPostingQuery = {};
+        const logicalLower = descending ? constraint.upper : constraint.lower;
+        const logicalUpper = descending ? constraint.lower : constraint.upper;
+        if (logicalLower === undefined) {
+          query.lower = prefix;
+          query.lowerInclusive = true;
+        } else {
+          const term =
+            prefix + secondaryIndexComponentTerm(index, column, position, logicalLower.value);
+          query.lower = logicalLower.inclusive ? term : `${term}\uffff`;
+          query.lowerInclusive = logicalLower.inclusive;
+        }
+        if (logicalUpper === undefined) {
+          query.upper = `${prefix}\uffff`;
+          query.upperInclusive = false;
+        } else {
+          const term =
+            prefix + secondaryIndexComponentTerm(index, column, position, logicalUpper.value);
+          query.upper = logicalUpper.inclusive ? `${term}\uffff` : term;
+          query.upperInclusive = logicalUpper.inclusive;
+        }
+        return query;
+      });
+      matchedColumns += 1;
+      break;
+    }
+    if (matchedColumns === 0) continue;
+    if (queries === undefined) {
+      const complete = matchedColumns === indexedColumns.length;
+      queries = prefixes.map((term) => ({ term, prefix: !complete }));
+    }
+    candidates.push({
+      columns: indexedColumns.slice(0, matchedColumns),
+      indexId,
+      index,
+      queries,
+      union: queries.length > 1,
+      matchedColumns,
     });
   }
+  candidates.sort(
+    (left, right) =>
+      right.matchedColumns - left.matchedColumns || left.queries.length - right.queries.length,
+  );
+  const usedColumns = new Set<string>();
+  const output: SecondaryIndexPredicate[] = [];
+  for (const candidate of candidates) {
+    const ids = candidate.columns.map((column) => column.id);
+    if (ids.every((columnId) => usedColumns.has(columnId))) continue;
+    ids.forEach((columnId) => usedColumns.add(columnId));
+    output.push(candidate);
+  }
   return output;
+}
+
+function secondaryIndexOrderForPlan(
+  plan: CompiledQuery,
+  table: TableRecord,
+  projectedColumns: readonly TableColumnRecord[],
+  requireCovering = true,
+): { indexId: string; index: SecondaryIndexRecord; reverse: boolean } | undefined {
+  if (
+    plan.joins.length > 0 ||
+    plan.base.table !== table.name ||
+    plan.orderBy.length === 0 ||
+    projectedColumns.length === 0 ||
+    compiledPlanIsGrouped(plan) ||
+    plan.distinctWildcard === true ||
+    planContainsFts(plan)
+  ) {
+    return undefined;
+  }
+  const resolveOrderColumn = (expression: Expression): TableColumnRecord | undefined => {
+    let resolved = expression;
+    if (resolved.kind === "column") {
+      const reference = resolved.reference;
+      const alias = plan.select.find((item) => item.alias === reference);
+      if (alias !== undefined) resolved = alias.expression;
+    }
+    if (resolved.kind !== "column") return undefined;
+    const parts = resolved.reference.split(".");
+    if (parts.length === 2 && parts[0] !== plan.base.alias && parts[0] !== table.name) {
+      return undefined;
+    }
+    return table.columns.find((column) => column.name === (parts.at(-1) ?? ""));
+  };
+  const orderColumns = plan.orderBy.map((order) => resolveOrderColumn(order.expression));
+  if (orderColumns.some((column) => column === undefined)) return undefined;
+  for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+    if (
+      index.state !== "ready" ||
+      index.termEncoding !== "tuple-v1" ||
+      index.locator !== "row-id"
+    ) {
+      continue;
+    }
+    const ids = secondaryIndexColumnIds(index);
+    const indexColumns = ids.map((columnId) =>
+      table.columns.find((column) => column.id === columnId),
+    );
+    if (
+      indexColumns.some((column) => column === undefined || column.nullable) ||
+      (requireCovering && projectedColumns.some((column) => !ids.includes(column.id))) ||
+      orderColumns.length > ids.length ||
+      orderColumns.some((column, position) => column?.id !== ids[position])
+    ) {
+      continue;
+    }
+    const declared = secondaryIndexDirections(index).slice(0, orderColumns.length);
+    const requested = plan.orderBy.map((order) => order.direction);
+    const forward = requested.every((direction, position) => direction === declared[position]);
+    const reverse = requested.every((direction, position) => direction !== declared[position]);
+    if (!forward && !reverse) continue;
+    return { indexId, index, reverse };
+  }
+  return undefined;
 }
 
 function planReferencesColumn(plan: CompiledQuery, table: TableRecord, columnId: string): boolean {
