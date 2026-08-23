@@ -17,15 +17,16 @@ export default defineConfig({
      * The heavy tests here drive whole databases over a simulated IndexedDB, and the slowest
      * takes about nine seconds on a developer machine. A hosted runner has two cores, so several
      * test files share them and every one of those tests stretches -- the same work has measured
-     * five to seven times slower there. A limit tuned on the machine that wrote the test is
-     * therefore a flake generator on CI, which is what these numbers answer: enough room that
-     * only a genuine hang reaches the ceiling, while a local run still fails fast.
+     * five to ten times slower there, with V8 coverage adding the high end. A limit tuned on the
+     * machine that wrote the test is therefore a flake generator on CI, which is what these
+     * numbers answer: enough room that only a genuine hang reaches the ceiling, while a local
+     * run still fails fast.
      *
      * This is not the performance guard. A test that gets slower still passes here; the
      * benchmark gate is what reports that, and it runs on its own schedule for the same reason
      * these numbers have to be generous.
      */
-    testTimeout: process.env.CI ? 90_000 : 20_000,
+    testTimeout: process.env.CI ? 300_000 : 20_000,
     hookTimeout: process.env.CI ? 90_000 : 20_000,
     coverage: {
       reporter: ["text", "html", "json-summary"],
