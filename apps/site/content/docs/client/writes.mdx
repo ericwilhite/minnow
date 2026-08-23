@@ -30,16 +30,18 @@ await db
 
 Repeated `values()` calls accumulate, so a batch can be assembled in pieces.
 
-`orReplace()` routes the same rows through the upsert path, replacing any row with the same unique
-key instead of throwing:
+`orReplace()` emits `ON CONFLICT (key) DO REPLACE`, replacing any row with the same unique key
+instead of throwing:
 
 ```ts
 await db.insertInto("customers").values(row).orReplace().execute();
 ```
 
-Inserts go through the engine's batch API rather than the SQL parser — the same path
-[bulk loading](/docs/sql/dml#bulk-loading) uses — so a large `values([...])` is a columnar write,
-not thousands of parsed statements.
+The complete `values([...])` call becomes one parameterized `INSERT` statement. The SQL engine is
+therefore the single source of truth for validation, defaults, generated keys, conflicts,
+triggers, transaction visibility, and `RETURNING`; it still pivots the statement to one columnar
+write internally. Use the lower-level [batch API](/docs/sql/dml#bulk-loading) directly when data is
+already columnar and parsing a large VALUES list would only add work.
 
 ## Update and delete
 
@@ -101,8 +103,8 @@ post-update values; deletes return the rows as they were read.
 | `execute()`                 | An array: the `returning` rows, or one result object with a count. |
 | `executeTakeFirst()`        | The first element, or `undefined`.                                 |
 | `executeTakeFirstOrThrow()` | The first element, or throws `NoResultError`.                      |
-| `compile()`                 | The internal statement, useful for tooling.                        |
-| `toSQL()`                   | Parameterized SQL for an update or delete.                         |
+| `compile()`                 | The internal statement, useful for select/update/delete tooling.   |
+| `toSQL()`                   | Parameterized SQL for insert, update, or delete.                   |
 
 Without `returning`, `execute()` resolves to a single-element array carrying the count —
 `numInsertedRows`, `numUpdatedRows`, or `numDeletedRows` — so `executeTakeFirstOrThrow()` is the

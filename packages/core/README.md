@@ -18,7 +18,9 @@ npm install @minnowdb/core
   (`@minnowdb/core/sql-feature-matrix.json`) that the engine is tested against.
 - **One schema, in TypeScript** — `table()`, `column`, and `schema()` declare tables once and
   `migrate()` evolves them without rewriting stored data.
-- **Full-text search** — `MATCH` / BM25 on any column, with no index DDL to write.
+- **Full-text search** — `MATCH` / BM25 on any column, with no full-text index DDL to write.
+- **Secondary indexes** — durable single-column `CREATE INDEX` / `DROP INDEX` accelerators for
+  equality, range, and `IN` filters, maintained across every mutation path.
 - **Live queries** — `liveQueries()` hands back a set whose subscribers get a fresh result after
   any commit that could have changed it, across tabs.
 - **Durable browser storage** — compressed columnar blocks on IndexedDB or OPFS, atomic

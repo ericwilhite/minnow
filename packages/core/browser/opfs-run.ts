@@ -25,6 +25,14 @@ interface OpfsTestResult {
   survivesTermination: { rowsAfterRestart: number };
   /** Enough commits to cross the checkpoint interval, then a cold reopen. */
   checkpointCrossing: { rowsAfterReopen: number };
+  /** A persisted index base and mutation tail, selected again after a cold OPFS reopen. */
+  secondaryIndex: {
+    baseMatches: number;
+    tailMatches: number;
+    matchesAfterReopen: number;
+    usedBeforeReopen: boolean;
+    usedAfterReopen: boolean;
+  };
 }
 
 function spawn(): Worker {
@@ -77,6 +85,40 @@ async function runPhases(): Promise<OpfsTestResult> {
     rows: all.rows.length,
     firstRegion: (small.rows[0] as { region?: string } | undefined)?.region ?? null,
   };
+
+  // The base is written through OPFS's staged generation protocol. The extra row becomes a
+  // delta, so reopening below verifies both durable pieces rather than only the initial build.
+  await client.execute("CREATE INDEX events_by_region ON events(region)");
+  const baseIndexed = await client.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'north'",
+    { memoize: false },
+  );
+  const indexPlan = await client.explain("SELECT COUNT(*) AS n FROM events WHERE region = 'north'");
+  await client.insertBatch("events", [{ id: 501, region: "special", amount: 500 }]);
+  const tailIndexed = await client.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
+    { memoize: false },
+  );
+  await client.close({ terminateWorker: true });
+  const indexReopenWorker = spawn();
+  const indexReopen = new MinnowDatabaseClient(indexReopenWorker, {
+    store: { kind: "opfs", name: roundTripName },
+  });
+  const reopenedIndexed = await indexReopen.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
+    { memoize: false },
+  );
+  const reopenedIndexPlan = await indexReopen.explain(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'special'",
+  );
+  const secondaryIndex = {
+    baseMatches: (baseIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    tailMatches: (tailIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    matchesAfterReopen: (reopenedIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    usedBeforeReopen: indexPlan.includes("secondary index prunes"),
+    usedAfterReopen: reopenedIndexPlan.includes("secondary index prunes"),
+  };
+  await indexReopen.close({ terminateWorker: true });
 
   phase = "competing-commits";
   // --- two workers, one directory: the exclusive-handle CAS for real ---------------------------
@@ -148,7 +190,7 @@ async function runPhases(): Promise<OpfsTestResult> {
     rowsAfterReopen: (reopened.rows[0] as { n: number }).n,
   };
 
-  return { roundTrip, competingCommits, survivesTermination, checkpointCrossing };
+  return { roundTrip, competingCommits, survivesTermination, checkpointCrossing, secondaryIndex };
 }
 
 declare global {

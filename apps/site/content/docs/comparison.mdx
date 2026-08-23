@@ -101,10 +101,9 @@ in existence, running in a browser tab.
 
 - **The SQL surface is complete.** Minnow implements a documented subset of SQL:2023 and refuses
   the rest by design. SQLite implements SQLite, and there is thirty years of it.
-- **You can declare indexes.** Minnow has no `CREATE INDEX`. A B-tree index seeks; Minnow scans
-  blocks and skips the ones its statistics rule out. For a workload dominated by highly selective
-  lookups on non-key columns over a large table, the seek is an advantage no scan recovers — and
-  when you know the access pattern better than a zone map can infer it, SQLite lets you say so.
+- **Its indexes are broader.** Minnow can declare a durable single-column pruning index, but a
+  SQLite B-tree can be composite, unique, covering, and deliver `ORDER BY` without a separate
+  sort. For workloads that need those properties, SQLite's mature index model remains stronger.
 - **Portability.** The same schema, the same statements, and the same file work on a server, on
   mobile, and in the browser. Minnow's block format is its own, and this early format carries no
   compatibility promise.
@@ -218,9 +217,9 @@ no snapshot isolation.
   is deliberately refused is listed in the [feature matrix](/docs/sql/feature-matrix), keyed to the
   standard's feature identifiers, but a statement written for SQLite or Postgres may not run.
 - **No sync, no replication, no server.** One machine, one browser's storage quota.
-- **No `CREATE INDEX`.** Block statistics do the skipping. That is the right default for scans and
-  the wrong one for a workload dominated by selective lookups on non-key columns over large
-  tables, where a B-tree engine will beat it.
+- **Secondary indexes are deliberately narrow.** They cover one column and prune equality, range,
+  and `IN` filters. They do not yet enforce uniqueness, combine columns, cover a query, or deliver
+  sorted output like a B-tree.
 - **No Node build.** The engine targets browsers, so there is no shared code path with a Node
   server, and tests run in real browsers rather than under a Node shim.
 - **The ecosystem is one repository.** No third-party ORMs, no extensions, no Stack Overflow

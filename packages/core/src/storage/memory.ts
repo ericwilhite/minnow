@@ -11,6 +11,7 @@ import {
   type BlockWrite,
   type FtsCandidates,
   type FtsColumnIndexRecord,
+  type FtsPostingQuery,
   type FtsPosting,
   type GarbageCollectionJobRecord,
   type GarbageCollectionStepResult,
@@ -26,11 +27,13 @@ import {
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
+  type SecondaryIndexRecord,
   type TempOwnerRecord,
   type TempRunPage,
   type TransactionRecord,
   type TransactionRecordUpdate,
   type WriteTransactionInput,
+  activePostingStorageColumnIds,
 } from "./types.js";
 import type { DatabaseSnapshot, SnapshotLoadProgress } from "./snapshot.js";
 import {
@@ -49,6 +52,10 @@ import {
 export class MemoryBlockStore implements BlockStore {
   readonly #blocks = new Map<string, Uint8Array>();
   readonly #tempRunPages = new Map<string, Uint8Array>();
+  readonly #ftsBaseBuilds = new Map<
+    string,
+    { buildId: string; chunks: Map<number, FtsPosting[]> }
+  >();
   readonly #core = new RecordCore({
     hasBlock: (id) => this.#blocks.has(id),
     blockByteLength: (id) => this.#blocks.get(id)?.byteLength,
@@ -190,6 +197,7 @@ export class MemoryBlockStore implements BlockStore {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -215,16 +223,84 @@ export class MemoryBlockStore implements BlockStore {
   async removeFtsColumn(tableId: string, columnId: string): Promise<void> {
     return this.#runAtomic(() => {
       this.#core.removeFtsColumn(tableId, columnId);
+      this.#ftsBaseBuilds.delete(`${tableId}/${columnId}`);
+    });
+  }
+
+  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    return this.#runAtomic(() => {
+      const table = this.#core.getTable(tableId);
+      if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
+        throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
+      }
+      this.#ftsBaseBuilds.set(`${tableId}/${columnId}`, { buildId, chunks: new Map() });
+    });
+  }
+
+  async writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: FtsPosting[],
+  ): Promise<void> {
+    return this.#runAtomic(() => {
+      const build = this.#ftsBaseBuilds.get(`${tableId}/${columnId}`);
+      if (build?.buildId !== buildId) throw new Error(`Full-text base build changed: ${buildId}`);
+      build.chunks.set(ordinal, structuredClone(chunk));
+    });
+  }
+
+  async finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: { coversVersion: number; chunkCount: number; totalTokens: number },
+  ): Promise<void> {
+    return this.#runAtomic(() => {
+      const key = `${tableId}/${columnId}`;
+      const build = this.#ftsBaseBuilds.get(key);
+      if (build?.buildId !== buildId) throw new Error(`Full-text base build changed: ${buildId}`);
+      const table = this.#core.getTable(tableId);
+      if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
+        this.#ftsBaseBuilds.delete(key);
+        return;
+      }
+      const chunks = Array.from({ length: input.chunkCount }, (_, ordinal) => {
+        const chunk = build.chunks.get(ordinal);
+        if (chunk === undefined) {
+          throw new Error(`Full-text base chunk is missing: ${String(ordinal)}`);
+        }
+        return chunk;
+      });
+      this.#core.writeFtsBase(tableId, columnId, {
+        coversVersion: input.coversVersion,
+        chunks,
+        totalTokens: input.totalTokens,
+      });
+      this.#ftsBaseBuilds.delete(key);
+    });
+  }
+
+  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    return this.#runAtomic(() => {
+      const key = `${tableId}/${columnId}`;
+      if (this.#ftsBaseBuilds.get(key)?.buildId === buildId) this.#ftsBaseBuilds.delete(key);
     });
   }
 
   async readFtsCandidates(
     tableId: string,
     columnId: string,
-    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    terms: readonly FtsPostingQuery[],
     upToVersion: number,
   ): Promise<
-    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+    FtsCandidates & {
+      deltaChunkCount: number;
+      totalTokens: number;
+      coversVersion: number;
+      hasBase: boolean;
+    }
   > {
     return this.#core.readFtsCandidates(tableId, columnId, terms, upToVersion);
   }

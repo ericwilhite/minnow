@@ -59,8 +59,8 @@ machines: https://minnowdb.com/llms.txt
   statement that writes, rather than writing.
 - `db.execute(sql, params)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
-  `drop-column`, `drop-table`, `create-view`, `drop-view`, `create-trigger`, or `drop-trigger`) before reading
-  `rowCount`, `version`, or `returnedRows`.
+  `drop-column`, `drop-table`, `create-index`, `drop-index`, `create-view`, `drop-view`,
+  `create-trigger`, or `drop-trigger`) before reading `rowCount`, `version`, or `returnedRows`.
 - Bind parameters with `?` in order or `$1` by position. Never concatenate values into SQL:
   compiled plans are cached on the statement text, so a parameterized statement is planned once
   and interpolation throws that work away on every call.
@@ -80,7 +80,10 @@ machines: https://minnowdb.com/llms.txt
   importing `MinnowDatabaseClient` from `@minnowdb/core/client`. Queries, writes, migrations,
   live queries, snapshots, and maintenance use the same calls as `MinnowDatabase`.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
-  search text as a parameter. There is no index DDL to write; the index builds itself.
+  search text as a parameter. There is no full-text index DDL to write; that index builds itself.
+- `CREATE INDEX name ON table(column)` creates a durable non-unique single-column accelerator for
+  equality, range, and `IN` filters; `DROP INDEX name` removes it. Composite and `UNIQUE` indexes
+  are rejected, and an index does not currently satisfy `ORDER BY`.
 - `db.explain(sql)` returns the optimized plan as text.
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form. It
   lists every supported and rejected form with an example.
@@ -88,9 +91,9 @@ machines: https://minnowdb.com/llms.txt
   (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
   (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
   `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
-  `SET TRANSACTION`, `CREATE INDEX`, multiple or composite unique keys, composite foreign keys,
-  savepoints, correlated `NOT IN` (use `NOT EXISTS`), non-equality correlation in scalar subqueries
-  or `IN`, and correlated `EXISTS` nested below `OR`.
+  `SET TRANSACTION`, composite or `UNIQUE` secondary indexes, multiple or composite unique keys,
+  composite foreign keys, savepoints, correlated `NOT IN` (use `NOT EXISTS`), non-equality
+  correlation in scalar subqueries or `IN`, and correlated `EXISTS` nested below `OR`.
 ```
 
 ## Why those rules

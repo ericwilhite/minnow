@@ -71,28 +71,12 @@ export interface DslLiveOptions {
 export interface DslWriteSession {
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
-  insertBatch(
-    tableName: string,
-    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
-  upsertBatch(
-    tableName: string,
-    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
 }
 
 /** The part of MinnowDatabase / MinnowDatabaseClient used by the typed client. */
 export interface DslDriver {
   introspect?(): Promise<Catalog>;
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
-  insertBatch(
-    tableName: string,
-    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
-  upsertBatch(
-    tableName: string,
-    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
   execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
   write?<T>(
     action: (session: DslWriteSession) => Promise<T>,
@@ -257,16 +241,29 @@ export class Minnow<in out DB> {
 
   #mutationServices(): MutationServices {
     const schemaTables = this.#options.schema?.tables;
+    const knownTableMetadata = (tableName: string) => {
+      const definition = schemaTables?.find(({ name }) => name === tableName);
+      if (definition === undefined) return undefined;
+      const entries = Object.entries(definition.columns);
+      const uniqueKey = entries.find(([, columnDefinition]) => columnDefinition.isUnique)?.[0];
+      return {
+        columns: entries.map(([name]) => name),
+        ...(uniqueKey === undefined ? {} : { uniqueKey }),
+      };
+    };
     return {
-      insertBatch: (tableName, rows) => this.#driver.insertBatch(tableName, rows),
-      upsertBatch: (tableName, rows) => this.#driver.upsertBatch(tableName, rows),
       execute: (sqlText, params) => this.#driver.execute(sqlText, params),
-      tableColumns: async (tableName) => {
-        const definition = schemaTables?.find(({ name }) => name === tableName);
-        if (definition !== undefined) return Object.keys(definition.columns);
-        return (await this.#catalog()).tables
-          .find(({ name }) => name === tableName)
-          ?.columns.map(({ name }) => name);
+      knownTableMetadata,
+      tableMetadata: async (tableName) => {
+        const known = knownTableMetadata(tableName);
+        if (known !== undefined) return known;
+        const table = (await this.#catalog()).tables.find(({ name }) => name === tableName);
+        if (table === undefined) return undefined;
+        const uniqueKey = table.columns.find(({ id }) => id === table.uniqueKeyColumnId)?.name;
+        return {
+          columns: table.columns.map(({ name }) => name),
+          ...(uniqueKey === undefined ? {} : { uniqueKey }),
+        };
       },
       columnDefaultFns: (tableName) => {
         const definition = schemaTables?.find(({ name }) => name === tableName);
@@ -305,8 +302,6 @@ export class Minnow<in out DB> {
         ...(introspect === undefined ? {} : { introspect }),
         query: (sqlText, options) => session.query(sqlText, options),
         execute: (sqlText, params) => session.execute(sqlText, params),
-        insertBatch: (tableName, rows) => session.insertBatch(tableName, rows),
-        upsertBatch: (tableName, rows) => session.upsertBatch(tableName, rows),
         write: async () => {
           throw new TypeError("Nested transactions are not supported");
         },

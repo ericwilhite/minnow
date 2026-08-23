@@ -73,6 +73,90 @@ it("OPFS repacks mixed live/dead extents when collection completes", async () =>
   reopened.close();
 });
 
+it("OPFS relocates a staged postings build instead of letting it block extent compaction", async () => {
+  const shim = new MemoryOpfs();
+  const name = crypto.randomUUID();
+  const store = await OpfsBlockStore.open({ name, root: shim.root });
+  await store.addTable({
+    id: "postings-table",
+    name: "postings_table",
+    columns: [{ id: "value", name: "value", type: "string", nullable: false }],
+    ftsColumns: {
+      value: {
+        storage: "fts-chunks-v1",
+        tokenizerVersion: 1,
+        state: "building",
+        buildFromVersion: -1,
+      },
+    },
+    revision: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  const dead = { id: "staged-dead", bytes: new Uint8Array(3 * 1024 * 1024).fill(1) };
+  const live = { id: "staged-live", bytes: new Uint8Array(3 * 1024 * 1024).fill(2) };
+  const filler = { id: "staged-filler", bytes: new Uint8Array(3 * 1024 * 1024).fill(3) };
+  await store.addBlock(dead.id, dead.bytes);
+  await store.beginFtsBaseBuild("postings-table", "value", "moving-build");
+  await store.writeFtsBaseBuildChunk("postings-table", "value", "moving-build", 0, [
+    { term: "survives-relocation", rowIds: [7n], tf: [1] },
+  ]);
+  await store.addBlocks([live, filler]);
+  await store.publishManifest({
+    expectedVersion: null,
+    blockIds: [dead.id, live.id, filler.id],
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  await store.publishManifest({
+    expectedVersion: 0,
+    blockIds: [live.id, filler.id],
+    createdAt: "2026-01-01T00:00:01.000Z",
+  });
+  const job = await store.createGarbageCollectionJob({
+    id: "collect-beside-staged-build",
+    candidateManifestVersions: [0],
+    candidateSegmentIds: [],
+    candidateBlockIds: [dead.id],
+    leaseCutoff: "2026-01-01T00:01:00.000Z",
+    createdAt: "2026-01-01T00:01:00.000Z",
+  });
+  expect(
+    (
+      await store.runGarbageCollectionStep({
+        jobId: job.id,
+        expectedRevision: job.revision,
+        maxItems: 10,
+        updatedAt: "2026-01-01T00:01:01.000Z",
+      })
+    ).job.state,
+  ).toBe("completed");
+  await store.finishFtsBaseBuild("postings-table", "value", "moving-build", {
+    coversVersion: 1,
+    chunkCount: 1,
+    totalTokens: 1,
+  });
+  expect(
+    await store.readFtsCandidates(
+      "postings-table",
+      "value",
+      [{ term: "survives-relocation", prefix: false }],
+      1,
+    ),
+  ).toMatchObject({ rowIdsByTerm: [[7n]], coversVersion: 1 });
+  store.close();
+
+  const reopened = await OpfsBlockStore.open({ name, root: shim.root });
+  expect(await reopened.getBlock(live.id)).toEqual(live.bytes);
+  expect(
+    await reopened.readFtsCandidates(
+      "postings-table",
+      "value",
+      [{ term: "survives-relocation", prefix: false }],
+      1,
+    ),
+  ).toMatchObject({ rowIdsByTerm: [[7n]], coversVersion: 1 });
+  reopened.close();
+});
+
 function stores(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
     { name: "memory", create: async () => new MemoryBlockStore() },
@@ -1624,6 +1708,203 @@ for (const implementation of stores()) {
         10,
       );
       expect(prefix.rowIdsByTerm).toEqual([[2n], [3n]]);
+      const range = await store.readFtsCandidates(
+        "articles",
+        "title",
+        [{ lower: "beta", lowerInclusive: true, upper: "gamma", upperInclusive: false }],
+        10,
+      );
+      expect(range.rowIdsByTerm).toEqual([[2n]]);
+      store.close();
+    });
+
+    it("publishes a chunked postings generation atomically and replaces an abandoned build", async () => {
+      const store = await implementation.create();
+      await store.addTable({
+        id: "bounded",
+        name: "bounded",
+        columns: [{ id: "value", name: "value", type: "string", nullable: false }],
+        ftsColumns: {
+          value: {
+            storage: "fts-chunks-v1",
+            tokenizerVersion: 1,
+            state: "building",
+            buildFromVersion: -1,
+          },
+        },
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.beginFtsBaseBuild("bounded", "value", "abandoned");
+      await store.writeFtsBaseBuildChunk("bounded", "value", "abandoned", 0, [
+        { term: "old", rowIds: [1n], tf: [1] },
+      ]);
+      // Beginning a replacement reclaims the unfinished generation; it never becomes readable.
+      await store.beginFtsBaseBuild("bounded", "value", "replacement");
+      await store.writeFtsBaseBuildChunk("bounded", "value", "replacement", 0, [
+        { term: "alpha", rowIds: [2n], tf: [1] },
+      ]);
+      await store.writeFtsBaseBuildChunk("bounded", "value", "replacement", 1, [
+        { term: "omega", rowIds: [3n], tf: [1] },
+      ]);
+      await store.finishFtsBaseBuild("bounded", "value", "replacement", {
+        coversVersion: 7,
+        chunkCount: 2,
+        totalTokens: 0,
+      });
+      expect(
+        await store.readFtsCandidates(
+          "bounded",
+          "value",
+          [
+            { term: "old", prefix: false },
+            { lower: "alpha", lowerInclusive: true, upper: "omega", upperInclusive: true },
+          ],
+          7,
+        ),
+      ).toMatchObject({ rowIdsByTerm: [[], [2n, 3n]], coversVersion: 7 });
+      store.close();
+    });
+
+    it("cannot publish a staged postings generation after its catalog index is dropped", async () => {
+      const store = await implementation.create();
+      await store.addTable({
+        id: "dropped-build",
+        name: "dropped_build",
+        columns: [{ id: "value", name: "value", type: "string", nullable: false }],
+        ftsColumns: {
+          value: {
+            storage: "fts-chunks-v1",
+            tokenizerVersion: 1,
+            state: "building",
+            buildFromVersion: -1,
+          },
+        },
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.beginFtsBaseBuild("dropped-build", "value", "loser");
+      await store.writeFtsBaseBuildChunk("dropped-build", "value", "loser", 0, [
+        { term: "must-not-publish", rowIds: [1n], tf: [1] },
+      ]);
+      await store.updateTable("dropped-build", 0, { ftsColumns: null });
+      await store
+        .finishFtsBaseBuild("dropped-build", "value", "loser", {
+          coversVersion: 0,
+          chunkCount: 1,
+          totalTokens: 1,
+        })
+        .catch(() => undefined);
+      expect(
+        await store.readFtsCandidates(
+          "dropped-build",
+          "value",
+          [{ term: "must-not-publish", prefix: false }],
+          0,
+        ),
+      ).toMatchObject({ rowIdsByTerm: [[]], coversVersion: -1 });
+      store.close();
+    });
+
+    it("invalidates stale scalar-index writers and cannot resurrect a dropped index", async () => {
+      const store = await implementation.create();
+      await store.addTable({
+        id: "scalar-table",
+        name: "scalar_table",
+        columns: [{ id: "value-id", name: "value", type: "number", nullable: false }],
+        secondaryIndexes: {
+          "index-id": {
+            name: "by_value",
+            columnId: "value-id",
+            storage: "postings-v1",
+            storageColumnId: "scalar-storage-id",
+            locator: "row-id",
+            state: "ready",
+            buildFromVersion: -1,
+          },
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        revision: 0,
+      });
+      await store.writeFtsBase("scalar-table", "scalar-storage-id", {
+        coversVersion: -1,
+        chunks: [[{ term: "one", rowIds: [1n], tf: [1] }]],
+        totalTokens: 0,
+      });
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      const commit = async (
+        transactionId: string,
+        expectedVersion: number | null,
+        withDelta: boolean,
+      ) => {
+        const blockId = `${transactionId}-block`;
+        const segmentId = `${transactionId}-segment`;
+        await store.addBlock(blockId, Uint8Array.of(1));
+        await store.addSegment({
+          id: segmentId,
+          tableId: "scalar-table",
+          transactionId,
+          rowCount: 1,
+          rowIdStart: 2n,
+          rowIdEndExclusive: 3n,
+          columnBlockIds: { "value-id": [blockId] },
+          kind: "insert",
+          createdAt: timestamp,
+        });
+        await store.createTransaction({
+          id: transactionId,
+          snapshotVersion: expectedVersion,
+          pendingBlockIds: [blockId],
+          pendingSegmentIds: [segmentId],
+          status: "active",
+          revision: 0,
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          committedVersion: null,
+        });
+        return store.commitTransaction({
+          transactionId,
+          expectedTransactionRevision: 0,
+          expectedManifestVersion: expectedVersion,
+          changedTableIds: ["scalar-table"],
+          ...(withDelta
+            ? {
+                ftsChanges: [
+                  {
+                    tableId: "scalar-table",
+                    columns: [
+                      {
+                        columnId: "scalar-storage-id",
+                        postings: [{ term: "two", rowIds: [2n], tf: [1] }],
+                        totalTokens: 0,
+                      },
+                    ],
+                  },
+                ],
+              }
+            : {}),
+          committedAt: timestamp,
+        });
+      };
+      const first = await commit("scalar-covered", null, true);
+      expect((await store.getTable("scalar-table"))?.secondaryIndexes?.["index-id"]?.state).toBe(
+        "ready",
+      );
+      await commit("scalar-stale", first.version, false);
+      const invalid = await store.getTable("scalar-table");
+      expect(invalid?.secondaryIndexes?.["index-id"]?.state).toBe("invalid");
+
+      await store.updateTable("scalar-table", invalid?.revision ?? 0, {
+        secondaryIndexes: null,
+      });
+      expect(
+        await store.readFtsCandidates(
+          "scalar-table",
+          "scalar-storage-id",
+          [{ term: "one", prefix: false }],
+          10,
+        ),
+      ).toMatchObject({ rowIdsByTerm: [[]], deltaChunkCount: 0, coversVersion: -1 });
       store.close();
     });
 

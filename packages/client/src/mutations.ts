@@ -38,10 +38,9 @@ import {
 /**
  * Kysely-style mutation builders. `execute()` returns an array (one result object, or the
  * `returning(...)` rows); the idiomatic call is `executeTakeFirst()` / `executeTakeFirstOrThrow()`.
- * Inserts pad their rows against the schema and hand them to the engine's batch APIs
- * (`orReplace()` routes to the upsert path)
- * and `returning` echoes the written rows: the padded inputs overlaid with the engine's
- * generated columns (defaults and auto-increment keys), so callers get generated ids back.
+ * Inserts pad their rows against the schema and render one parameterized SQL statement
+ * (`orReplace()` emits ON CONFLICT DO REPLACE); RETURNING comes from that statement, so callers
+ * get the engine's actual defaults and generated ids back.
  * Updates and deletes run as parameterized SQL; their `returning` rows come back from
  * the statement's own snapshot (post-update values for updates, the deleted rows for deletes).
  */
@@ -59,20 +58,18 @@ export interface DeleteResult {
 }
 
 export interface MutationServices {
-  insertBatch(
-    tableName: string,
-    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
-  upsertBatch(
-    tableName: string,
-    rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
-  ): Promise<{ rowCount: number; generatedColumns?: Record<string, QueryValue[]> }>;
   execute(sql: string, params: readonly QueryValue[]): Promise<ExecuteResult>;
-  /** The table's full column list; inserts use it to pad omitted nullable columns. */
-  tableColumns?(tableName: string): Promise<readonly string[] | undefined>;
+  /** Synchronous metadata when createMinnow received a schema; used by insert toSQL(). */
+  knownTableMetadata?(
+    tableName: string,
+  ): { columns: readonly string[]; uniqueKey?: string } | undefined;
+  /** Live table metadata; inserts use it for stable column order and conflict targets. */
+  tableMetadata?(
+    tableName: string,
+  ): Promise<{ columns: readonly string[]; uniqueKey?: string } | undefined>;
   /**
    * Default generators by column name, when the client knows the schema. Inserts call
-   * them for omitted-or-null slots before the batch is sent — the engine never sees the
+   * them for omitted-or-null slots before the INSERT is sent — the engine never sees the
    * functions, only the generated values.
    */
   columnDefaultFns?(tableName: string): Readonly<Record<string, () => QueryValue>> | undefined;
@@ -104,6 +101,44 @@ interface InsertRows {
   readonly rows: ReadonlyArray<Readonly<Record<string, unknown>>>;
 }
 
+function quoteIdentifier(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+function renderInsertSql(
+  table: string,
+  columns: readonly string[],
+  rows: ReadonlyArray<Readonly<Record<string, QueryValue>>>,
+  uniqueKey: string | undefined,
+  replaceOnConflict: boolean,
+  returning: ReturningState,
+): RenderedSql {
+  const params: QueryValue[] = [];
+  const values = rows
+    .map((row) => {
+      const placeholders = columns.map((column) => {
+        params.push(row[column] ?? null);
+        return `$${String(params.length)}`;
+      });
+      return `(${placeholders.join(", ")})`;
+    })
+    .join(", ");
+  let text = `INSERT INTO ${quoteIdentifier(table)} (${columns.map(quoteIdentifier).join(", ")}) VALUES ${values}`;
+  if (replaceOnConflict) {
+    if (uniqueKey === undefined) {
+      throw new TypeError(`orReplace() requires a unique key: ${table}`);
+    }
+    text += ` ON CONFLICT (${quoteIdentifier(uniqueKey)}) DO REPLACE`;
+  }
+  if (returning !== undefined) {
+    text +=
+      returning === "*"
+        ? " RETURNING *"
+        : ` RETURNING ${returning.map(quoteIdentifier).join(", ")}`;
+  }
+  return { sql: text, params };
+}
+
 function collectInsertRows(
   tail: InsertRows | undefined,
 ): ReadonlyArray<Readonly<Record<string, unknown>>> {
@@ -120,6 +155,7 @@ export class InsertQueryBuilder<
 > {
   /** Type-only: the execute() element, e.g. `typeof q.$inferResult`. Undefined at runtime. */
   declare readonly $inferResult: TReturn;
+  private renderedSql: RenderedSql | undefined;
 
   constructor(
     private readonly services: MutationServices,
@@ -179,13 +215,11 @@ export class InsertQueryBuilder<
     );
   }
 
-  async execute(): Promise<TReturn[]> {
+  #renderSql(metadata?: { columns: readonly string[]; uniqueKey?: string }): RenderedSql {
+    if (this.renderedSql !== undefined) return this.renderedSql;
     const rows = collectInsertRows(this.rowList);
     if (rows.length === 0) throw new TypeError("insertInto() requires values()");
-    // With the schema known, omitted nullable columns pad with null (the batch API takes every
-    // column) and function defaults fill their omitted-or-null slots; unknown extra keys still
-    // surface as engine errors.
-    const columns = new Set<string>((await this.services.tableColumns?.(this.table)) ?? []);
+    const columns = new Set<string>(metadata?.columns ?? []);
     for (const row of rows) {
       for (const key of Object.keys(row)) columns.add(key);
     }
@@ -200,31 +234,43 @@ export class InsertQueryBuilder<
         }),
       ),
     );
-    const result = this.replaceOnConflict
-      ? await this.services.upsertBatch(this.table, padded)
-      : await this.services.insertBatch(this.table, padded);
+    return (this.renderedSql = renderInsertSql(
+      this.table,
+      names,
+      padded,
+      metadata?.uniqueKey,
+      this.replaceOnConflict,
+      this.returningColumns,
+    ));
+  }
+
+  /** Renders this immutable insert as the parameterized SQL the engine will execute. */
+  toSQL(): RenderedSql {
+    const metadata = this.services.knownTableMetadata?.(this.table);
+    if (this.replaceOnConflict && metadata?.uniqueKey === undefined) {
+      throw new TypeError(
+        "orReplace().toSQL() needs createMinnow(..., { schema }) to identify the unique key",
+      );
+    }
+    const rendered = this.#renderSql(metadata);
+    return { sql: rendered.sql, params: [...rendered.params] };
+  }
+
+  async execute(): Promise<TReturn[]> {
+    // One parameterized INSERT is the source of truth for validation, defaults, conflicts,
+    // generated values, RETURNING, triggers, and transaction visibility. Schema metadata only
+    // supplies stable column order and the conflict target; it never performs the write.
+    const known = this.services.knownTableMetadata?.(this.table);
+    const metadata = known ?? (await this.services.tableMetadata?.(this.table));
+    const rendered = this.#renderSql(metadata);
+    const result = await this.services.execute(rendered.sql, rendered.params);
+    if (result.kind !== "insert") {
+      throw new TypeError(`Expected an insert result, received ${result.kind}`);
+    }
     if (this.returningColumns === undefined) {
       return [{ numInsertedRows: result.rowCount } as TReturn];
     }
-    // The written rows are the padded inputs overlaid with the engine's generated columns
-    // (defaults and auto-increment keys), in insertion order.
-    const generated = result.generatedColumns ?? {};
-    const written = padded.map((row, index) => {
-      const overlay = { ...row };
-      for (const [name, values] of Object.entries(generated)) {
-        overlay[name] = values[index] ?? null;
-      }
-      return overlay;
-    });
-    const projected =
-      this.returningColumns === "*"
-        ? written
-        : written.map((row) =>
-            Object.fromEntries(
-              (this.returningColumns as readonly string[]).map((name) => [name, row[name] ?? null]),
-            ),
-          );
-    return projected as TReturn[];
+    return (result.returnedRows ?? []) as TReturn[];
   }
 
   async executeTakeFirst(): Promise<TReturn | undefined> {

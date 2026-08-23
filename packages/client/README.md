@@ -29,8 +29,9 @@ const rows = await db.selectFrom("orders").select(["order_id", "total"]).execute
 ```
 
 This package is optional. SQL remains Minnow's full language; the client adds a friendly typed
-builder plus parameter-safe `db.query(...)` and `db.execute(...)` entry points. Builders can also
-expose their parameterized form with `toSQL()`. `db.transaction(...)` groups typed builders and SQL
+builder plus parameter-safe `db.query(...)` and `db.execute(...)` entry points. Every builder,
+including inserts and upserts, runs as parameterized SQL and exposes that form with `toSQL()`.
+`db.transaction(...)` groups typed builders and SQL
 into one atomic write, and cross-table search uses the live catalog when no schema option is
 present.
 

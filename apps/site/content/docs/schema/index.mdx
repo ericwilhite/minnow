@@ -49,7 +49,7 @@ There's a builder per column type — `column.boolean()`, `column.number()`, `co
   raw batches, SQL statements, other tabs (datetime columns take only `"now"`, which stamps one
   consistent timestamp per batch). A function is a userland generator — `() => ulid()`, a
   custom nanoid, anything: the typed client (`insertInto`, `typedTable`) calls it just before
-  the batch is sent, so it never persists, never crosses the worker boundary, and write paths
+  its parameterized INSERT is sent, so it never persists, never crosses the worker boundary, and write paths
   that skip the typed client don't see it. Defaults require non-nullable columns, and `returning`
   echoes the written values either way.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
@@ -243,6 +243,10 @@ deterministic steps:
 - **Each step is all or nothing**, and running the same migration again is safe. If a migration is
   interrupted, the next run completes what remains.
 - **Concurrent migrators can't interleave** — the loser fails with a typed conflict.
+- **DDL shares the statement executor.** Creating, replacing, and dropping schema objects uses
+  the same engine statements as SQL DDL. A table's metadata-only column edits stay grouped into
+  one catalog compare-and-swap, preserving one write per changed table instead of parsing and
+  committing a separate `ALTER TABLE` for every column.
 - **Nothing is rewritten.** Not one stored byte changes: a column added later is answered at read
   time, and folding it into the blocks is
   [compaction](/docs/storage/maintenance#compaction)'s job, on its own schedule.

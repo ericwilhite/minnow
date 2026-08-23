@@ -15,10 +15,13 @@ import {
   type CatalogProbe,
   type TriggerRecord,
   type UniqueKeyChanges,
+  activePostingStorageColumnIds,
   collectFtsCandidates,
   invalidateUncoveredFtsColumns,
+  invalidateUncoveredSecondaryIndexes,
   type FtsCandidates,
   type FtsColumnIndexRecord,
+  type FtsPostingQuery,
   type FtsPosting,
   type GarbageCollectionJobRecord,
   GarbageCollectionJobConflictError,
@@ -40,6 +43,7 @@ import {
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
+  type SecondaryIndexRecord,
   TableRecordConflictError,
   type TempOwnerRecord,
   TempOwnerConflictError,
@@ -54,6 +58,7 @@ import {
   updateCompactionJobRecord,
   updateTransactionRecord,
   validateTableColumns,
+  validateSecondaryIndexes,
   WriteConflictError,
   type WriteTransactionInput,
 } from "./types.js";
@@ -71,6 +76,7 @@ const CATALOG_EPOCH_KEY = "catalog/epoch";
 const SEGMENT_TABLE_INDEX = "byTable";
 const TABLE_ID_PREFIX = "table/id/";
 const TABLE_NAME_PREFIX = "table/name/";
+const SECONDARY_INDEX_NAME_PREFIX = "secondary-index/name/";
 const ROW_ID_PREFIX = "row-id/";
 const AUTO_INCREMENT_PREFIX = "auto-increment/";
 const UNIQUE_KEY_CHUNK_INDEX = "unique-key-chunk-index";
@@ -91,6 +97,7 @@ const UNIQUE_KEY_BASE_PART = "unique-key-base-part";
 const UNIQUE_KEY_PARTITION_TARGET = 16_384;
 const FTS_BASE_INDEX_PREFIX = "fts-base-index/";
 const FTS_BASE_PREFIX = "fts-base/";
+const FTS_BASE_BUILD_PREFIX = "fts-base-build/";
 const FTS_CHUNK_PREFIX = "fts-chunk/";
 const COMPACTION_JOB_KEY_PREFIX = "compaction-job/";
 const GARBAGE_COLLECTION_JOB_KEY_PREFIX = "garbage-collection-job/";
@@ -395,6 +402,7 @@ export class IndexedDbBlockStore implements BlockStore {
 
   async addTable(record: TableRecord): Promise<void> {
     validateTableColumns(record.columns);
+    validateSecondaryIndexes(record);
     const transaction = this.#transaction("catalog", "readwrite");
     const store = transaction.objectStore("catalog");
     const idKey = `${TABLE_ID_PREFIX}${record.id}`;
@@ -411,6 +419,19 @@ export class IndexedDbBlockStore implements BlockStore {
           ? `Table already exists: ${record.id}`
           : `Table name already exists: ${record.name}`,
       );
+    }
+    const indexNames = new Set<string>();
+    for (const [indexId, index] of Object.entries(record.secondaryIndexes ?? {})) {
+      const markerKey = `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`;
+      const marker = (await requestResult(store.get(markerKey))) as
+        { tableId: string; indexId: string } | undefined;
+      if (indexNames.has(index.name) || marker !== undefined) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new TypeError(`Index already exists: ${index.name}`);
+      }
+      indexNames.add(index.name);
+      store.put({ tableId: record.id, indexId }, markerKey);
     }
     store.add(structuredClone(record), idKey);
     store.add(record.id, nameKey);
@@ -433,6 +454,7 @@ export class IndexedDbBlockStore implements BlockStore {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -448,8 +470,15 @@ export class IndexedDbBlockStore implements BlockStore {
       await ignoreAbort(transaction);
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
     }
-    const { ftsColumns: previousFts, triggers: previousTriggers, ...base } = record;
+    const {
+      ftsColumns: previousFts,
+      secondaryIndexes: previousSecondary,
+      triggers: previousTriggers,
+      ...base
+    } = record;
     let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    let nextSecondary =
+      update.secondaryIndexes === undefined ? previousSecondary : update.secondaryIndexes;
     const retainedColumnIds =
       update.columns === undefined
         ? undefined
@@ -460,6 +489,36 @@ export class IndexedDbBlockStore implements BlockStore {
       );
       if (Object.keys(nextFts).length === 0) nextFts = null;
     }
+    if (nextSecondary !== null && nextSecondary !== undefined && retainedColumnIds !== undefined) {
+      nextSecondary = Object.fromEntries(
+        Object.entries(nextSecondary).filter(([, index]) => retainedColumnIds.has(index.columnId)),
+      );
+      if (Object.keys(nextSecondary).length === 0) nextSecondary = null;
+    }
+    const indexNames = new Set<string>();
+    for (const [indexId, index] of Object.entries(nextSecondary ?? {})) {
+      const markerKey = `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`;
+      const marker = (await requestResult(store.get(markerKey))) as
+        { tableId: string; indexId: string } | undefined;
+      if (
+        indexNames.has(index.name) ||
+        (marker !== undefined && (marker.tableId !== id || marker.indexId !== indexId))
+      ) {
+        transaction.abort();
+        await ignoreAbort(transaction);
+        throw new TypeError(`Index already exists: ${index.name}`);
+      }
+      indexNames.add(index.name);
+      store.put({ tableId: id, indexId }, markerKey);
+    }
+    for (const [indexId, index] of Object.entries(previousSecondary ?? {})) {
+      const retained = nextSecondary?.[indexId];
+      if (retained?.name === index.name) continue;
+      const markerKey = `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`;
+      const marker = (await requestResult(store.get(markerKey))) as
+        { tableId: string; indexId: string } | undefined;
+      if (marker?.tableId === id && marker.indexId === indexId) store.delete(markerKey);
+    }
     const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
     const updated: TableRecord = {
       ...base,
@@ -467,16 +526,28 @@ export class IndexedDbBlockStore implements BlockStore {
       ...(nextFts === null || nextFts === undefined
         ? {}
         : { ftsColumns: structuredClone(nextFts) }),
+      ...(nextSecondary === null || nextSecondary === undefined
+        ? {}
+        : { secondaryIndexes: structuredClone(nextSecondary) }),
       ...(nextTriggers === null || nextTriggers === undefined
         ? {}
         : { triggers: structuredClone(nextTriggers) }),
       revision: expectedRevision + 1,
     };
+    validateSecondaryIndexes(updated);
     if (retainedColumnIds !== undefined) {
       for (const column of record.columns) {
         if (!retainedColumnIds.has(column.id)) {
           await deleteFtsColumnRecords(store, record.id, column.id);
         }
+      }
+    }
+    const retainedIndexStorage = new Set(
+      Object.values(nextSecondary ?? {}).map((index) => index.storageColumnId),
+    );
+    for (const index of Object.values(previousSecondary ?? {})) {
+      if (!retainedIndexStorage.has(index.storageColumnId)) {
+        await deleteFtsColumnRecords(store, record.id, index.storageColumnId);
       }
     }
     store.put(structuredClone(updated), idKey);
@@ -499,6 +570,12 @@ export class IndexedDbBlockStore implements BlockStore {
     catalog.delete(`${TABLE_ID_PREFIX}${id}`);
     catalog.delete(`${TABLE_NAME_PREFIX}${record.name}`);
     catalog.delete(`${ROW_ID_PREFIX}${id}`);
+    for (const [indexId, index] of Object.entries(record.secondaryIndexes ?? {})) {
+      const markerKey = `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`;
+      const marker = (await requestResult(catalog.get(markerKey))) as
+        { tableId: string; indexId: string } | undefined;
+      if (marker?.tableId === id && marker.indexId === indexId) catalog.delete(markerKey);
+    }
     // Everything else this table owns is keyed by its id under one of a handful of prefixes,
     // string-keyed or array-keyed. One sequential pass collects them all: a dropped table is
     // rare and the alternative is a range read per prefix, several of which the injected test
@@ -507,6 +584,7 @@ export class IndexedDbBlockStore implements BlockStore {
       `${AUTO_INCREMENT_PREFIX}${id}/`,
       `${FTS_BASE_INDEX_PREFIX}${id}/`,
       `${FTS_BASE_PREFIX}${id}/`,
+      `${FTS_BASE_BUILD_PREFIX}${id}/`,
       `${FTS_CHUNK_PREFIX}${id}/`,
     ];
     const ownedArrayKinds = new Set([
@@ -546,10 +624,11 @@ export class IndexedDbBlockStore implements BlockStore {
     const store = transaction.objectStore("catalog");
     const tocKey = `${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`;
     const previous = (await requestResult(store.get(tocKey))) as FtsBaseToc | undefined;
-    const chunkPrefix = `${FTS_BASE_PREFIX}${tableId}/${columnId}/`;
+    const chunkPrefix = ftsBaseChunkPrefix(tableId, columnId);
+    const previousPrefix = ftsBaseChunkPrefix(tableId, columnId, previous?.generation);
     const previousCount = previous?.boundaries.length ?? 0;
-    for (let ordinal = input.chunks.length; ordinal < previousCount; ordinal += 1) {
-      store.delete(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`);
+    for (let ordinal = 0; ordinal < previousCount; ordinal += 1) {
+      store.delete(`${previousPrefix}${String(ordinal).padStart(6, "0")}`);
     }
     const boundaries: Array<{ first: string; last: string }> = [];
     input.chunks.forEach((chunk, ordinal) => {
@@ -577,6 +656,126 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
     store.put({ versions: surviving }, deltaIndexKey);
+    await deleteActiveFtsBaseBuild(store, tableId, columnId);
+    await transactionDone(transaction);
+  }
+
+  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const tableValue: unknown = await requestResult(store.get(`${TABLE_ID_PREFIX}${tableId}`));
+    const table =
+      tableValue === undefined ? undefined : (structuredClone(tableValue) as TableRecord);
+    if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
+    }
+    await deleteActiveFtsBaseBuild(store, tableId, columnId);
+    store.put({ buildId, boundaries: [] }, ftsBaseBuildKey(tableId, columnId));
+    await transactionDone(transaction);
+  }
+
+  async writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: FtsPosting[],
+  ): Promise<void> {
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const markerKey = ftsBaseBuildKey(tableId, columnId);
+    const marker = (await requestResult(store.get(markerKey))) as FtsBaseBuildMarker | undefined;
+    if (marker?.buildId !== buildId) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new Error(`Full-text base build changed: ${buildId}`);
+    }
+    if (ordinal !== marker.boundaries.length) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new Error(`Full-text base chunk is out of order: ${String(ordinal)}`);
+    }
+    store.put(
+      structuredClone(chunk),
+      `${ftsBaseChunkPrefix(tableId, columnId, buildId)}${String(ordinal).padStart(6, "0")}`,
+    );
+    store.put(
+      {
+        buildId,
+        boundaries: [
+          ...marker.boundaries,
+          { first: chunk[0]?.term ?? "", last: chunk[chunk.length - 1]?.term ?? "" },
+        ],
+      },
+      markerKey,
+    );
+    await transactionDone(transaction);
+  }
+
+  async finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: { coversVersion: number; chunkCount: number; totalTokens: number },
+  ): Promise<void> {
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const markerKey = ftsBaseBuildKey(tableId, columnId);
+    const [marker, previous, deltaIndex, tableValue] = (await Promise.all([
+      requestResult(store.get(markerKey)),
+      requestResult(store.get(`${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`)),
+      requestResult(store.get(ftsChunkIndexKey(tableId, columnId))),
+      requestResult(store.get(`${TABLE_ID_PREFIX}${tableId}`)),
+    ])) as [
+      FtsBaseBuildMarker | undefined,
+      FtsBaseToc | undefined,
+      { versions: number[] } | undefined,
+      TableRecord | undefined,
+    ];
+    if (marker?.buildId !== buildId || marker.boundaries.length !== input.chunkCount) {
+      transaction.abort();
+      await ignoreAbort(transaction);
+      throw new Error(`Full-text base build is incomplete: ${buildId}`);
+    }
+    if (
+      tableValue === undefined ||
+      !activePostingStorageColumnIds(structuredClone(tableValue)).has(columnId)
+    ) {
+      await deleteActiveFtsBaseBuild(store, tableId, columnId);
+      await transactionDone(transaction);
+      return;
+    }
+    const previousPrefix = ftsBaseChunkPrefix(tableId, columnId, previous?.generation);
+    for (let ordinal = 0; ordinal < (previous?.boundaries.length ?? 0); ordinal += 1) {
+      store.delete(`${previousPrefix}${String(ordinal).padStart(6, "0")}`);
+    }
+    store.put(
+      {
+        coversVersion: input.coversVersion,
+        boundaries: marker.boundaries,
+        totalTokens: input.totalTokens,
+        generation: buildId,
+      } satisfies FtsBaseToc,
+      `${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`,
+    );
+    const surviving: number[] = [];
+    for (const version of deltaIndex?.versions ?? []) {
+      if (version <= input.coversVersion) store.delete(ftsChunkKey(tableId, columnId, version));
+      else surviving.push(version);
+    }
+    store.put({ versions: surviving }, ftsChunkIndexKey(tableId, columnId));
+    store.delete(markerKey);
+    await transactionDone(transaction);
+  }
+
+  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    const transaction = this.#transaction("catalog", "readwrite");
+    const store = transaction.objectStore("catalog");
+    const marker = (await requestResult(store.get(ftsBaseBuildKey(tableId, columnId)))) as
+      FtsBaseBuildMarker | undefined;
+    if (marker?.buildId === buildId) await deleteActiveFtsBaseBuild(store, tableId, columnId);
     await transactionDone(transaction);
   }
 
@@ -590,10 +789,15 @@ export class IndexedDbBlockStore implements BlockStore {
   async readFtsCandidates(
     tableId: string,
     columnId: string,
-    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    terms: readonly FtsPostingQuery[],
     upToVersion: number,
   ): Promise<
-    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+    FtsCandidates & {
+      deltaChunkCount: number;
+      totalTokens: number;
+      coversVersion: number;
+      hasBase: boolean;
+    }
   > {
     const transaction = this.#transaction("catalog", "readonly");
     const store = transaction.objectStore("catalog");
@@ -601,11 +805,16 @@ export class IndexedDbBlockStore implements BlockStore {
       requestResult(store.get(`${FTS_BASE_INDEX_PREFIX}${tableId}/${columnId}`)),
       requestResult(store.get(ftsChunkIndexKey(tableId, columnId))),
     ])) as [FtsBaseToc | undefined, { versions: number[] } | undefined];
-    const chunkPrefix = `${FTS_BASE_PREFIX}${tableId}/${columnId}/`;
+    const chunkPrefix = ftsBaseChunkPrefix(tableId, columnId, toc?.generation);
     const wantedOrdinals = (toc?.boundaries ?? []).flatMap((boundary, ordinal) =>
-      terms.some((term) => {
-        const upper = term.prefix ? `${term.term}￿` : term.term;
-        return term.term <= boundary.last && upper >= boundary.first;
+      terms.some((query) => {
+        const lower = "term" in query ? query.term : query.lower;
+        const upper =
+          "term" in query ? (query.prefix ? `${query.term}￿` : query.term) : query.upper;
+        return (
+          (lower === undefined || lower <= boundary.last) &&
+          (upper === undefined || upper >= boundary.first)
+        );
       })
         ? [ordinal]
         : [],
@@ -647,6 +856,7 @@ export class IndexedDbBlockStore implements BlockStore {
       deltaChunkCount: present.length,
       totalTokens,
       coversVersion,
+      hasBase: toc !== undefined,
     };
   }
 
@@ -1748,6 +1958,8 @@ export class IndexedDbBlockStore implements BlockStore {
     // segments to an indexed table without deltas) flips the affected columns to "invalid"
     // instead of failing the data commit — the index self-heals through a rebuild.
     const changedFtsTableIds = new Set(pendingSegments.map((segment) => segment.tableId));
+    const scalarChangedTableIds =
+      input.changedTableIds === undefined ? changedFtsTableIds : new Set(input.changedTableIds);
     for (const tableId of changedFtsTableIds) {
       const tableValue: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
       if (tableValue === undefined) continue;
@@ -1757,13 +1969,23 @@ export class IndexedDbBlockStore implements BlockStore {
         structuredClone(tableValue) as TableRecord,
         covered,
       );
-      if (invalidated !== undefined) {
-        catalog.put(structuredClone(invalidated), `${TABLE_ID_PREFIX}${tableId}`);
+      const withFts = invalidated ?? (structuredClone(tableValue) as TableRecord);
+      const withSecondary = scalarChangedTableIds.has(tableId)
+        ? invalidateUncoveredSecondaryIndexes(withFts, covered)
+        : undefined;
+      if (withSecondary !== undefined || invalidated !== undefined) {
+        catalog.put(structuredClone(withSecondary ?? invalidated), `${TABLE_ID_PREFIX}${tableId}`);
       }
     }
     const ftsDeltaCounts: NonNullable<ManifestSummary["ftsDeltaCounts"]> = [];
     for (const ftsEntry of input.ftsChanges ?? []) {
+      const tableValue: unknown = await requestResult(
+        catalog.get(`${TABLE_ID_PREFIX}${ftsEntry.tableId}`),
+      );
+      if (tableValue === undefined) continue;
+      const active = activePostingStorageColumnIds(structuredClone(tableValue) as TableRecord);
       for (const column of ftsEntry.columns) {
+        if (!active.has(column.columnId)) continue;
         catalog.put(
           structuredClone({
             postings: column.postings,
@@ -2556,7 +2778,7 @@ export class IndexedDbBlockStore implements BlockStore {
           ftsColumns[columnId] = { ...state, state: "invalid" };
           continue;
         }
-        const prefix = `${FTS_BASE_PREFIX}${record.id}/${columnId}/`;
+        const prefix = ftsBaseChunkPrefix(record.id, columnId, toc.generation);
         const chunks = (await Promise.all(
           toc.boundaries.map((_, ordinal) =>
             requestResult<unknown>(catalog.get(`${prefix}${String(ordinal).padStart(6, "0")}`)),
@@ -2569,12 +2791,38 @@ export class IndexedDbBlockStore implements BlockStore {
           chunks: chunks.map((chunk) => chunk ?? []),
         });
       }
+      const secondaryIndexes = { ...(record.secondaryIndexes ?? {}) };
+      for (const [indexId, state] of Object.entries(secondaryIndexes)) {
+        const storageColumnId = state.storageColumnId;
+        const toc = (await requestResult<unknown>(
+          catalog.get(`${FTS_BASE_INDEX_PREFIX}${record.id}/${storageColumnId}`),
+        )) as FtsBaseToc | undefined;
+        if (state.state !== "ready" || toc?.coversVersion !== version) {
+          const { buildId: _abandonedBuild, ...invalid } = state;
+          void _abandonedBuild;
+          secondaryIndexes[indexId] = { ...invalid, state: "invalid" };
+          continue;
+        }
+        const prefix = ftsBaseChunkPrefix(record.id, storageColumnId, toc.generation);
+        const chunks = (await Promise.all(
+          toc.boundaries.map((_, ordinal) =>
+            requestResult<unknown>(catalog.get(`${prefix}${String(ordinal).padStart(6, "0")}`)),
+          ),
+        )) as Array<FtsPosting[] | undefined>;
+        fts.push({
+          columnId: storageColumnId,
+          coversVersion: toc.coversVersion,
+          totalTokens: 0,
+          chunks: chunks.map((chunk) => chunk ?? []),
+        });
+      }
       await transactionDone(transaction);
 
       tables.push({
         record: {
           ...record,
           ...(Object.keys(ftsColumns).length === 0 ? {} : { ftsColumns }),
+          ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
         },
         nextRowId: (rowIdValue as bigint | undefined) ?? 1n,
         autoIncrement: record.columns.flatMap((column, index) => {
@@ -2604,7 +2852,15 @@ export class IndexedDbBlockStore implements BlockStore {
     if ((await this.listTables()).length > 0) {
       throw new Error("This store already holds a catalog");
     }
-    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
+    const indexNames = new Set<string>();
+    for (const table of snapshot.tables) {
+      validateTableColumns(table.record.columns);
+      validateSecondaryIndexes(table.record);
+      for (const index of Object.values(table.record.secondaryIndexes ?? {})) {
+        if (indexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
+        indexNames.add(index.name);
+      }
+    }
 
     const totalBytes = snapshot.blocks.reduce((total, block) => total + block.bytes.byteLength, 0);
     let writtenBytes = 0;
@@ -2672,6 +2928,9 @@ export class IndexedDbBlockStore implements BlockStore {
     const catalog = transaction.objectStore("catalog");
     catalog.put(structuredClone(record), `${TABLE_ID_PREFIX}${record.id}`);
     catalog.put(record.id, `${TABLE_NAME_PREFIX}${record.name}`);
+    for (const [indexId, index] of Object.entries(record.secondaryIndexes ?? {})) {
+      catalog.put({ tableId: record.id, indexId }, `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`);
+    }
     catalog.put(table.nextRowId, `${ROW_ID_PREFIX}${record.id}`);
     for (const entry of table.autoIncrement) {
       catalog.put(entry.next, `${AUTO_INCREMENT_PREFIX}${record.id}/${entry.columnId}`);
@@ -3487,6 +3746,13 @@ interface FtsBaseToc {
   coversVersion: number;
   boundaries: Array<{ first: string; last: string }>;
   totalTokens: number;
+  /** Missing on bases written before bounded generation builds. */
+  generation?: string;
+}
+
+interface FtsBaseBuildMarker {
+  buildId: string;
+  boundaries: Array<{ first: string; last: string }>;
 }
 
 interface FtsDeltaChunk {
@@ -3502,6 +3768,32 @@ function ftsChunkIndexKey(tableId: string, columnId: string): string {
   return `${FTS_CHUNK_PREFIX}index/${tableId}/${columnId}`;
 }
 
+function ftsBaseBuildKey(tableId: string, columnId: string): string {
+  return `${FTS_BASE_BUILD_PREFIX}${tableId}/${columnId}`;
+}
+
+function ftsBaseChunkPrefix(tableId: string, columnId: string, generation?: string): string {
+  return generation === undefined
+    ? `${FTS_BASE_PREFIX}${tableId}/${columnId}/`
+    : `${FTS_BASE_PREFIX}${tableId}/${columnId}/generation/${encodeURIComponent(generation)}/`;
+}
+
+async function deleteActiveFtsBaseBuild(
+  store: IDBObjectStore,
+  tableId: string,
+  columnId: string,
+): Promise<void> {
+  const key = ftsBaseBuildKey(tableId, columnId);
+  const marker = (await requestResult(store.get(key))) as FtsBaseBuildMarker | undefined;
+  if (marker !== undefined) {
+    const prefix = ftsBaseChunkPrefix(tableId, columnId, marker.buildId);
+    for (let ordinal = 0; ordinal < marker.boundaries.length; ordinal += 1) {
+      store.delete(`${prefix}${String(ordinal).padStart(6, "0")}`);
+    }
+  }
+  store.delete(key);
+}
+
 async function deleteFtsColumnRecords(
   store: IDBObjectStore,
   tableId: string,
@@ -3513,7 +3805,7 @@ async function deleteFtsColumnRecords(
     requestResult(store.get(tocKey)),
     requestResult(store.get(deltaIndexKey)),
   ])) as [FtsBaseToc | undefined, { versions: number[] } | undefined];
-  const chunkPrefix = `${FTS_BASE_PREFIX}${tableId}/${columnId}/`;
+  const chunkPrefix = ftsBaseChunkPrefix(tableId, columnId, toc?.generation);
   for (let ordinal = 0; ordinal < (toc?.boundaries.length ?? 0); ordinal += 1) {
     store.delete(`${chunkPrefix}${String(ordinal).padStart(6, "0")}`);
   }
@@ -3522,6 +3814,7 @@ async function deleteFtsColumnRecords(
   }
   store.delete(tocKey);
   store.delete(deltaIndexKey);
+  await deleteActiveFtsBaseBuild(store, tableId, columnId);
 }
 
 function validateAutoIncrementReservation(count: number, atLeast: bigint | undefined): void {

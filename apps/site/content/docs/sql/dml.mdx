@@ -84,6 +84,19 @@ VALUES (?, ?)
 ON CONFLICT (sku) DO UPDATE SET on_hand = on_hand + EXCLUDED.received
 ```
 
+When every non-key column should be replaced, Minnow also accepts the concise whole-row form used
+by the typed client's `orReplace()`:
+
+```sql
+INSERT INTO customers (customer_id, name, city, signed_up_on)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (customer_id) DO REPLACE
+```
+
+It is not PostgreSQL syntax; it is a Minnow extension with the same result as assigning every
+non-key column from `EXCLUDED`, and it remains well-defined for a table whose key is its only
+column.
+
 Conflict updates and fresh inserts from one statement publish atomically. One statement cannot
 update the same existing key twice. The conflict key itself cannot be reassigned, and aggregates,
 windows, and subqueries are not allowed in the assignment. A `WHERE` predicate after the

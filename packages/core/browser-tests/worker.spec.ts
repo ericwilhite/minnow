@@ -29,6 +29,13 @@ test("drives a database through a real module worker", async ({ page }) => {
         workerError: { rejected: boolean; message: string };
         survivesTermination: { rowsAfterRestart: number; reopenedSameDatabase: boolean };
         concurrentWrites: { acknowledged: number; rowsPersisted: number; reasons: string[] };
+        secondaryIndex: {
+          initialMatches: number;
+          mutationMatches: number;
+          matchesAfterRestart: number;
+          usedBeforeRestart: boolean;
+          usedAfterRestart: boolean;
+        };
       }>;
     };
     return target.runWorkerBoundaryTest();
@@ -62,6 +69,15 @@ test("drives a database through a real module worker", async ({ page }) => {
   expect(result.concurrentWrites.acknowledged).toBeGreaterThan(0);
   expect(result.concurrentWrites.rowsPersisted).toBe(result.concurrentWrites.acknowledged);
   expect(result.concurrentWrites.reasons.join(" | ")).toMatch(/^$|Manifest changed/);
+
+  // The index base was built in IndexedDB, concurrent commits appended index deltas, and a
+  // second worker reopened and selected the same persisted index. This is the browser-native
+  // counterpart to the exhaustive mutation and crash suites over the storage test doubles.
+  expect(result.secondaryIndex.initialMatches).toBe(1_000);
+  expect(result.secondaryIndex.mutationMatches).toBe(result.concurrentWrites.acknowledged);
+  expect(result.secondaryIndex.matchesAfterRestart).toBe(result.concurrentWrites.acknowledged);
+  expect(result.secondaryIndex.usedBeforeRestart).toBe(true);
+  expect(result.secondaryIndex.usedAfterRestart).toBe(true);
 
   // Terminating the worker leaves a database a second worker opens and reads as its own.
   expect(result.survivesTermination.reopenedSameDatabase).toBe(true);

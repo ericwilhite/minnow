@@ -249,6 +249,30 @@ export interface FtsColumnIndexRecord {
   buildFromVersion: number;
 }
 
+export type SecondaryIndexState = "building" | "ready" | "invalid";
+
+/**
+ * One durable, single-column secondary index. The physical postings live in the same bounded,
+ * immutable base-plus-delta substrate as full-text postings, under `storageColumnId`; keeping the
+ * storage identity separate from the catalog column ID leaves room for future index variants.
+ *
+ * Postings are a pruning accelerator, never truth. A keyed table stores a deterministic hash of
+ * its immutable unique key (collisions only add false positives); an append-only keyless table
+ * stores its hidden row ID. Every scan re-evaluates the SQL predicate against the row.
+ */
+export interface SecondaryIndexRecord {
+  name: string;
+  columnId: string;
+  storage: "postings-v1";
+  storageColumnId: string;
+  locator: "row-id" | "key-hash-v1";
+  state: SecondaryIndexState;
+  /** Identifies the builder allowed to publish a `building` record; omitted otherwise. */
+  buildId?: string;
+  /** Manifest version the base build covers; commit deltas above it merge at read time. */
+  buildFromVersion: number;
+}
+
 export interface TableRecord {
   id: string;
   name: string;
@@ -257,6 +281,8 @@ export interface TableRecord {
   uniqueKeyLookupReady?: boolean;
   /** Full-text index state per column ID. Writers that see this emit commit deltas. */
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
+  /** Durable single-column secondary indexes keyed by stable index ID. */
+  secondaryIndexes?: Record<string, SecondaryIndexRecord>;
   /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
   triggers?: TriggerRecord[];
   /**
@@ -303,6 +329,41 @@ export interface TableRecord {
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
   revision?: number;
+}
+
+/** Validates the durable identities and ownership rules of one table's secondary indexes. */
+export function validateSecondaryIndexes(record: TableRecord): void {
+  const columnIds = new Set(record.columns.map((column) => column.id));
+  const names = new Set<string>();
+  const storageIds = new Set(Object.keys(record.ftsColumns ?? {}));
+  for (const [indexId, index] of Object.entries(record.secondaryIndexes ?? {})) {
+    if (indexId.length === 0 || index.name.length === 0 || index.storageColumnId.length === 0) {
+      throw new TypeError("Secondary-index IDs and names must be non-empty");
+    }
+    if (!columnIds.has(index.columnId)) {
+      throw new TypeError(`Secondary index ${index.name} references an unknown column`);
+    }
+    if (names.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
+    names.add(index.name);
+    if (storageIds.has(index.storageColumnId)) {
+      throw new TypeError(`Secondary-index storage ID is already used: ${index.storageColumnId}`);
+    }
+    storageIds.add(index.storageColumnId);
+    const expectedLocator = record.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1";
+    const storage: unknown = index.storage;
+    if (storage !== "postings-v1" || index.locator !== expectedLocator) {
+      throw new TypeError(`Secondary index ${index.name} has incompatible storage metadata`);
+    }
+    const state: unknown = index.state;
+    if (
+      (state !== "building" && state !== "ready" && state !== "invalid") ||
+      !Number.isSafeInteger(index.buildFromVersion) ||
+      index.buildFromVersion < -1 ||
+      (index.state === "building") !== (index.buildId !== undefined)
+    ) {
+      throw new TypeError(`Secondary index ${index.name} has invalid build metadata`);
+    }
+  }
 }
 
 /**
@@ -920,6 +981,30 @@ export interface FtsCandidates {
   rowIdsByTerm: bigint[][];
 }
 
+/** One exact/prefix term lookup or a lexicographic term range over a postings index. */
+export type FtsPostingQuery =
+  | { term: string; prefix: boolean }
+  | {
+      lower?: string;
+      lowerInclusive?: boolean;
+      upper?: string;
+      upperInclusive?: boolean;
+    };
+
+/** Whether a stored term belongs to one exact, prefix, or range lookup. */
+export function ftsPostingQueryMatches(term: string, query: FtsPostingQuery): boolean {
+  if ("term" in query) return query.prefix ? term.startsWith(query.term) : term === query.term;
+  if (query.lower !== undefined) {
+    if (term < query.lower || (term === query.lower && query.lowerInclusive === false))
+      return false;
+  }
+  if (query.upper !== undefined) {
+    if (term > query.upper || (term === query.upper && query.upperInclusive === false))
+      return false;
+  }
+  return true;
+}
+
 /**
  * Shared candidate-merge core for both stores: fetching chunks is store-specific, but the
  * term-match rule (exact, or prefix as a term range) and the sorted-unique row-id shape must
@@ -927,7 +1012,7 @@ export interface FtsCandidates {
  */
 export function collectFtsCandidates(
   chunkLists: Iterable<readonly FtsPosting[]>,
-  terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+  terms: readonly FtsPostingQuery[],
 ): FtsCandidates {
   const sets = terms.map(() => new Set<bigint>());
   for (const postings of chunkLists) {
@@ -935,9 +1020,7 @@ export function collectFtsCandidates(
       for (let index = 0; index < terms.length; index += 1) {
         const term = terms[index];
         if (term === undefined) continue;
-        const matches = term.prefix
-          ? posting.term.startsWith(term.term)
-          : posting.term === term.term;
+        const matches = ftsPostingQueryMatches(posting.term, term);
         if (!matches) continue;
         const set = sets[index];
         if (set !== undefined) for (const rowId of posting.rowIds) set.add(rowId);
@@ -975,6 +1058,45 @@ export function invalidateUncoveredFtsColumns(
   }
   if (!invalidated) return undefined;
   return { ...record, ftsColumns: next, revision: (record.revision ?? 0) + 1 };
+}
+
+/**
+ * Scalar-index half of the stale-writer rule. A writer that staged table data from catalog
+ * metadata older than a newly building/ready index cannot provide its postings, so the commit
+ * invalidates that index atomically. Readers then scan until a rebuild closes the gap.
+ */
+export function invalidateUncoveredSecondaryIndexes(
+  record: TableRecord,
+  coveredStorageColumnIds: ReadonlySet<string>,
+): TableRecord | undefined {
+  const indexes = record.secondaryIndexes;
+  if (indexes === undefined) return undefined;
+  let invalidated = false;
+  const next: Record<string, SecondaryIndexRecord> = {};
+  for (const [indexId, index] of Object.entries(indexes)) {
+    if (index.state !== "invalid" && !coveredStorageColumnIds.has(index.storageColumnId)) {
+      const { buildId: _abandonedBuild, ...invalid } = index;
+      void _abandonedBuild;
+      next[indexId] = { ...invalid, state: "invalid" };
+      invalidated = true;
+    } else {
+      next[indexId] = { ...index };
+    }
+  }
+  if (!invalidated) return undefined;
+  return { ...record, secondaryIndexes: next, revision: (record.revision ?? 0) + 1 };
+}
+
+/** Physical posting IDs a current catalog record authorizes a commit to write. */
+export function activePostingStorageColumnIds(record: TableRecord): Set<string> {
+  return new Set([
+    ...Object.entries(record.ftsColumns ?? {}).flatMap(([columnId, index]) =>
+      index.state === "invalid" ? [] : [columnId],
+    ),
+    ...Object.values(record.secondaryIndexes ?? {}).flatMap((index) =>
+      index.state === "invalid" ? [] : [index.storageColumnId],
+    ),
+  ]);
 }
 
 export class UniqueKeyConflictError extends Error {
@@ -1136,6 +1258,8 @@ export interface CatalogStore {
       columns?: TableColumnRecord[];
       /** Replaces the full-text index state map; null clears it. */
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      /** Replaces the secondary-index state map; null clears it. */
+      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
       /** Replaces the trigger list; null clears it. */
       triggers?: TriggerRecord[] | null;
     },
@@ -1338,7 +1462,8 @@ export interface FtsIndexStore {
    * Per-term candidate row IDs from the base chunks plus every commit delta at or below
    * `upToVersion`, with the column's merged token total for exact BM25 statistics. Prefix
    * terms match the term range [term, term + "\uffff"). Reports the merged delta-chunk count
-   * so callers can schedule a rebuild when the tail grows, and the base's covered version —
+   * so callers can schedule a rebuild when the tail grows, whether a published base exists,
+   * and the base's covered version —
    * a concurrent rebuild can publish a base ahead of a reader's snapshot, and a caller
    * needing snapshot-exact statistics must detect `coversVersion > upToVersion` and fall
    * back (candidates stay a safe superset either way).
@@ -1346,10 +1471,15 @@ export interface FtsIndexStore {
   readFtsCandidates(
     tableId: string,
     columnId: string,
-    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    terms: readonly FtsPostingQuery[],
     upToVersion: number,
   ): Promise<
-    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+    FtsCandidates & {
+      deltaChunkCount: number;
+      totalTokens: number;
+      coversVersion: number;
+      hasBase: boolean;
+    }
   >;
 }
 
@@ -1443,6 +1573,28 @@ export interface BlockStore
     MaintenanceStore,
     FtsIndexStore,
     TempSpillStore {
+  /**
+   * Bounded builder for a postings base. Chunks stage under `buildId`; finish swaps the complete
+   * generation into view atomically and prunes covered deltas. Beginning another build for the
+   * same physical column reclaims an abandoned generation, so tab death cannot leak one
+   * generation per retry. Required because an index build must never materialize one
+   * database-sized storage value as a fallback.
+   */
+  beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void>;
+  writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: FtsPosting[],
+  ): Promise<void>;
+  finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: { coversVersion: number; chunkCount: number; totalTokens: number },
+  ): Promise<void>;
+  abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void>;
   /**
    * Optional: the current manifest version and catalog epoch in one atomic read. This is the
    * freshness probe: an unchanged pair proves any cached catalog state is still exactly what

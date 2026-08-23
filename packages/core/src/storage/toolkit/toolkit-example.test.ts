@@ -56,6 +56,7 @@ type TableUpdate = Parameters<BlockStore["updateTable"]>[2];
 type CompactionUpdate = Parameters<BlockStore["updateCompactionJob"]>[2];
 type FtsBaseInput = Parameters<BlockStore["writeFtsBase"]>[2];
 type FtsTerms = Parameters<BlockStore["readFtsCandidates"]>[2];
+type FtsBuildChunk = Parameters<BlockStore["writeFtsBaseBuildChunk"]>[4];
 
 /** One durable mutation, exactly what replay needs to reproduce it. */
 type Frame =
@@ -154,6 +155,7 @@ class MiniLogStore implements BlockStore {
   readonly #core: RecordCore;
   /** Spill pages are scratch; they live and die with the instance, like the OPFS store's. */
   readonly #tempPages = new Map<string, Uint8Array>();
+  readonly #ftsBuilds = new Map<string, { buildId: string; chunks: Map<number, FtsBuildChunk> }>();
   #queue = Promise.resolve();
 
   private constructor(
@@ -754,6 +756,60 @@ class MiniLogStore implements BlockStore {
         this.#core.removeFtsColumn(tableId, columnId);
       }),
     );
+  }
+
+  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.#run(() => {
+      this.#ftsBuilds.set(`${tableId}/${columnId}`, { buildId, chunks: new Map() });
+    });
+  }
+
+  async writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: FtsBuildChunk,
+  ): Promise<void> {
+    await this.#run(() => {
+      const build = this.#ftsBuilds.get(`${tableId}/${columnId}`);
+      if (build?.buildId !== buildId) throw new Error(`Postings build changed: ${buildId}`);
+      build.chunks.set(ordinal, structuredClone(chunk));
+    });
+  }
+
+  async finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: Parameters<BlockStore["finishFtsBaseBuild"]>[3],
+  ): Promise<void> {
+    await this.#run(() => {
+      const key = `${tableId}/${columnId}`;
+      const build = this.#ftsBuilds.get(key);
+      if (build?.buildId !== buildId) throw new Error(`Postings build changed: ${buildId}`);
+      const chunks = Array.from({ length: input.chunkCount }, (_, ordinal) => {
+        const chunk = build.chunks.get(ordinal);
+        if (chunk === undefined) throw new Error(`Postings chunk is missing: ${String(ordinal)}`);
+        return chunk;
+      });
+      const base = {
+        coversVersion: input.coversVersion,
+        chunks,
+        totalTokens: input.totalTokens,
+      };
+      this.#logged({ op: "writeFtsBase", tableId, columnId, input: base }, () => {
+        this.#core.writeFtsBase(tableId, columnId, base);
+      });
+      this.#ftsBuilds.delete(key);
+    });
+  }
+
+  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.#run(() => {
+      const key = `${tableId}/${columnId}`;
+      if (this.#ftsBuilds.get(key)?.buildId === buildId) this.#ftsBuilds.delete(key);
+    });
   }
 
   async readFtsCandidates(tableId: string, columnId: string, terms: FtsTerms, upToVersion: number) {

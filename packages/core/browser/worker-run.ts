@@ -25,6 +25,14 @@ interface WorkerTestResult {
   survivesTermination: { rowsAfterRestart: number; reopenedSameDatabase: boolean };
   /** Writes issued without awaiting, to prove the protocol keeps them ordered under load. */
   concurrentWrites: { acknowledged: number; rowsPersisted: number; reasons: string[] };
+  /** A durable secondary index built and mutated in one worker, then reused by the next. */
+  secondaryIndex: {
+    initialMatches: number;
+    mutationMatches: number;
+    matchesAfterRestart: number;
+    usedBeforeRestart: boolean;
+    usedAfterRestart: boolean;
+  };
 }
 
 /** A module worker at the published entry — the exact construction the documentation shows. */
@@ -55,6 +63,17 @@ async function run(): Promise<WorkerTestResult> {
     amount: index,
   }));
   await client.insertBatch("events", rows);
+
+  // Build through SQL over the real worker boundary. The selective query and EXPLAIN together
+  // prove both correctness and that the browser-backed database actually chose the index.
+  await client.execute("CREATE INDEX events_by_region ON events(region)");
+  const initialIndexed = await client.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'west'",
+    { memoize: false },
+  );
+  const initialIndexPlan = await client.explain(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'west'",
+  );
 
   const small = await client.query("SELECT region FROM events WHERE id = 1");
   const roundTrip = {
@@ -104,6 +123,13 @@ async function run(): Promise<WorkerTestResult> {
     rowsPersisted: (persisted.rows[0] as { n?: number } | undefined)?.n ?? -1,
     reasons: [...new Set(reasons)],
   };
+  const secondaryIndex = {
+    initialMatches: (initialIndexed.rows[0] as { n?: number } | undefined)?.n ?? -1,
+    mutationMatches: concurrentWrites.rowsPersisted,
+    matchesAfterRestart: -1,
+    usedBeforeRestart: initialIndexPlan.includes("secondary index prunes"),
+    usedAfterRestart: false,
+  };
 
   // --- terminate, then reopen the same store through a second worker --------------------------
   await client.close();
@@ -112,6 +138,16 @@ async function run(): Promise<WorkerTestResult> {
   const second = spawn();
   const reopened = new MinnowDatabaseClient(second, { store });
   const after = await reopened.query("SELECT COUNT(*) AS n FROM events");
+  const indexedAfter = await reopened.query(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'central'",
+    { memoize: false },
+  );
+  const reopenedIndexPlan = await reopened.explain(
+    "SELECT COUNT(*) AS n FROM events WHERE region = 'central'",
+  );
+  secondaryIndex.matchesAfterRestart =
+    (indexedAfter.rows[0] as { n?: number } | undefined)?.n ?? -1;
+  secondaryIndex.usedAfterRestart = reopenedIndexPlan.includes("secondary index prunes");
   const tables = await reopened.listTables();
   const survivesTermination = {
     rowsAfterRestart: (after.rows[0] as { n?: number } | undefined)?.n ?? -1,
@@ -120,7 +156,14 @@ async function run(): Promise<WorkerTestResult> {
   await reopened.close();
   second.terminate();
 
-  return { roundTrip, largeTransfer, workerError, survivesTermination, concurrentWrites };
+  return {
+    roundTrip,
+    largeTransfer,
+    workerError,
+    survivesTermination,
+    concurrentWrites,
+    secondaryIndex,
+  };
 }
 
 declare global {

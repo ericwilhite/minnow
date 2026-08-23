@@ -6,8 +6,7 @@ import {
   type TableRecord,
 } from "../storage/index.js";
 import { type Catalog, type CatalogColumn, type CatalogTable } from "./catalog.js";
-import { compileCheckExpression, expressionColumns } from "./query.js";
-import { type BatchRow } from "./batch.js";
+import { compileCheckExpression, expressionColumns, type QueryValue } from "./query.js";
 
 /**
  * Typed schema DSL and catalog migration planning. Column builders carry compile-time value and
@@ -64,7 +63,7 @@ export type HasDefault<TValue> = TValue & { readonly __minnowHasDefault?: true }
  *
  * ```ts
  * interface DB {
- *   notes: { id: Generated<number>; slug: Generated<string>; body: string };
+ *   notes: FromRow<{ id: Generated<number>; slug: Generated<string>; body: string }>;
  * }
  * ```
  */
@@ -84,8 +83,8 @@ export interface ColumnBuilder<
   readonly defaultSpec?: ColumnDefault;
   /**
    * A userland default generator. Never persisted and never sent to the engine — the typed
-   * facade (`insertInto`, `typedTable`) calls it for omitted-or-null slots before the batch
-   * crosses the boundary, so untyped write paths (raw batches, SQL) do not see it.
+   * facade (`insertInto`, `typedTable`) calls it for omitted-or-null slots before rendering the
+   * parameterized INSERT, so untyped write paths (raw batches, SQL) do not see it.
    */
   readonly defaultFn?: () => TValue;
   /** Present on `column.enum()` builders: the closed set of values writes must draw from. */
@@ -95,9 +94,13 @@ export interface ColumnBuilder<
   readonly renamedFromName?: string;
   readonly reference?: ColumnReferenceSpec;
   /** Marks the column nullable; inserts may omit it and reads may return null. */
-  nullable(): ColumnBuilder<TValue, true, TUnique, THasDefault>;
+  nullable(
+    this: ColumnBuilder<TValue, TNullable>,
+  ): ColumnBuilder<TValue, true, TUnique, THasDefault>;
   /** Marks the table's unique key; exactly one non-nullable column may carry it. */
-  unique(): ColumnBuilder<TValue, TNullable, true, THasDefault>;
+  unique(
+    this: ColumnBuilder<TValue, false, TUnique, THasDefault>,
+  ): ColumnBuilder<TValue, TNullable, true, THasDefault>;
   /** Declares this column as the rename target of an existing catalog column. */
   renamedFrom(name: string): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /**
@@ -109,7 +112,10 @@ export interface ColumnBuilder<
    * catalog — so it can derive a value (a timestamp, a version stamp) without readers ever
    * disagreeing. It cannot derive from other columns; that would need a value per row.
    */
-  backfill(value: TValue | (() => TValue)): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
+  backfill(
+    this: ColumnBuilder<TValue, false, TUnique, THasDefault>,
+    value: TValue | (() => TValue),
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /**
    * Declares a FOREIGN KEY onto another table's unique key. `migrate()` creates it as a real
    * constraint, so a write naming a parent row that does not exist is rejected — the same
@@ -120,7 +126,13 @@ export interface ColumnBuilder<
   references(
     table: string,
     column: string,
-    options?: { onDelete?: ReferentialAction },
+    options?: { onDelete?: Exclude<ReferentialAction, "set null"> },
+  ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
+  references(
+    this: ColumnBuilder<TValue, true, TUnique, THasDefault>,
+    table: string,
+    column: string,
+    options: { onDelete: "set null" },
   ): ColumnBuilder<TValue, TNullable, TUnique, THasDefault>;
   /**
    * Fills null-or-absent slots at insert time. Requires a non-nullable column.
@@ -130,10 +142,11 @@ export interface ColumnBuilder<
    * which stamps one consistent timestamp per batch.
    *
    * A function is a userland generator (`() => ulid()`): the typed facade calls it just
-   * before the batch is sent, so it never persists and never crosses the worker boundary —
+   * before its INSERT is sent, so it never persists and never crosses the worker boundary —
    * and write paths that don't go through the facade don't see it.
    */
   default(
+    this: ColumnBuilder<TValue, false, TUnique, THasDefault>,
     value: (TValue extends Date ? "now" : TValue) | (() => TValue),
   ): ColumnBuilder<TValue, TNullable, TUnique, true>;
   /**
@@ -142,11 +155,32 @@ export interface ColumnBuilder<
    * counter past their maximum. Number unique-key columns only.
    */
   autoIncrement: TValue extends number
-    ? () => ColumnBuilder<TValue, TNullable, TUnique, true>
+    ? (
+        this: ColumnBuilder<TValue, false, true, THasDefault>,
+      ) => ColumnBuilder<TValue, TNullable, TUnique, true>
     : never;
 }
 
-type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean, boolean>;
+type SchemaValue = boolean | number | string | Date;
+
+/**
+ * Metadata shared by every concrete ColumnBuilder. Schema collections need an existential
+ * column type: including fluent methods here would make TValue invariant because those methods
+ * both consume and return it. Public inference still retains each concrete builder in TColumns.
+ */
+interface AnyColumn {
+  readonly kind: "column";
+  readonly type: SchemaColumnType;
+  readonly isNullable: boolean;
+  readonly isUnique: boolean;
+  readonly hasDefault: boolean;
+  readonly defaultSpec?: ColumnDefault;
+  readonly defaultFn?: () => SchemaValue;
+  readonly enumValues?: readonly string[];
+  readonly backfillValue?: SchemaValue | (() => SchemaValue);
+  readonly renamedFromName?: string;
+  readonly reference?: ColumnReferenceSpec;
+}
 
 function defaultSpecFromArg(type: SchemaColumnType, value: unknown): ColumnDefault {
   switch (type) {
@@ -213,22 +247,28 @@ function createColumn<TType extends SchemaColumnType>(
         false,
         true
       >,
-    renamedFrom: (name: string) => createColumn(type, { ...state, renamedFromName: name }),
+    renamedFrom: (name: string) => {
+      validateSchemaName(name, "Rename source");
+      return createColumn(type, { ...state, renamedFromName: name });
+    },
     backfill: (value: unknown) =>
       createColumn(type, { ...state, backfillValue: value as ValueOf<TType> }),
     references: (
       table: string,
       referencedColumn: string,
       options: { onDelete?: ReferentialAction } = {},
-    ) =>
-      createColumn(type, {
+    ) => {
+      validateSchemaName(table, "Referenced table");
+      validateSchemaName(referencedColumn, "Referenced column");
+      return createColumn(type, {
         ...state,
         reference: {
           table,
           column: referencedColumn,
           onDelete: options.onDelete ?? "restrict",
         },
-      }),
+      });
+    },
     default: ((value: unknown) => {
       // A declared default is one thing: a function replaces any spec and vice versa.
       const cleared = { ...state };
@@ -249,6 +289,15 @@ function createColumn<TType extends SchemaColumnType>(
   };
 }
 
+function validateSchemaName(name: string, kind: string): void {
+  if (name.length === 0) throw new TypeError(`${kind} name cannot be empty`);
+  if (name.trim() !== name) {
+    throw new TypeError(
+      `${kind} name cannot start or end with whitespace: ${JSON.stringify(name)}`,
+    );
+  }
+}
+
 /**
  * Rebuilds a column carrying an exact default spec — the wire layer's escape hatch, since the
  * public `.default()` interprets "now" on datetime columns and cannot express auto-increment.
@@ -260,13 +309,41 @@ export function columnWithDefaultSpec(
   >,
   spec: ColumnDefault,
 ): AnyColumn {
-  return createColumn(base.type, {
+  return columnFromState({
+    type: base.type,
     isNullable: base.isNullable,
     isUnique: base.isUnique,
     ...(base.renamedFromName === undefined ? {} : { renamedFromName: base.renamedFromName }),
     ...(base.reference === undefined ? {} : { reference: base.reference }),
     ...(base.enumValues === undefined ? {} : { enumValues: base.enumValues }),
     defaultSpec: spec,
+  });
+}
+
+/** Rebuilds a fluent column from structured-clone-safe metadata. */
+export function columnFromState(
+  state: Pick<AnyColumn, "type" | "isNullable" | "isUnique"> &
+    Partial<
+      Pick<
+        AnyColumn,
+        | "renamedFromName"
+        | "reference"
+        | "defaultSpec"
+        | "defaultFn"
+        | "enumValues"
+        | "backfillValue"
+      >
+    >,
+): AnyColumn {
+  return createColumn(state.type, {
+    isNullable: state.isNullable,
+    isUnique: state.isUnique,
+    ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
+    ...(state.reference === undefined ? {} : { reference: state.reference }),
+    ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
+    ...(state.defaultFn === undefined ? {} : { defaultFn: state.defaultFn }),
+    ...(state.enumValues === undefined ? {} : { enumValues: state.enumValues }),
+    ...(state.backfillValue === undefined ? {} : { backfillValue: state.backfillValue }),
   });
 }
 
@@ -331,6 +408,7 @@ export function table<const TName extends string, TColumns extends Record<string
   columns: TColumns,
   options: TableOptions = {},
 ): TableSchema<TColumns, TName> {
+  validateSchemaName(name, "Table");
   const entries = Object.entries(columns);
   if (entries.length === 0) throw new TypeError(`Table ${name} needs at least one column`);
   const uniqueColumns = entries.filter(([, definition]) => definition.isUnique);
@@ -342,6 +420,7 @@ export function table<const TName extends string, TColumns extends Record<string
     throw new TypeError(`Table ${name} unique column must not be nullable: ${uniqueEntry[0]}`);
   }
   for (const [columnName, definition] of entries) {
+    validateSchemaName(columnName, "Column");
     if (definition.defaultFn !== undefined && definition.isNullable) {
       throw new TypeError(`Defaults require a non-nullable column: ${columnName}`);
     }
@@ -388,7 +467,7 @@ export function table<const TName extends string, TColumns extends Record<string
   const checks = options.checks ?? [];
   const checkNames = new Set<string>();
   for (const check of checks) {
-    if (check.name.length === 0) throw new TypeError(`Table ${name} has an unnamed CHECK`);
+    validateSchemaName(check.name, "CHECK");
     if (checkNames.has(check.name)) {
       throw new TypeError(`Duplicate CHECK in table ${name}: ${check.name}`);
     }
@@ -427,8 +506,10 @@ export function table<const TName extends string, TColumns extends Record<string
           }
           const matches =
             definition.type === "datetime"
-              ? columnValue instanceof Date
-              : typeof columnValue === definition.type;
+              ? columnValue instanceof Date && Number.isFinite(columnValue.getTime())
+              : definition.type === "number"
+                ? typeof columnValue === "number" && Number.isFinite(columnValue)
+                : typeof columnValue === definition.type;
           if (!matches) {
             issues.push({ message: `Expected ${definition.type}`, path: [columnName] });
           } else if (
@@ -514,10 +595,12 @@ export function view<const TName extends string, TColumns extends Record<string,
   name: TName,
   definition: { sql: string; columns: TColumns },
 ): ViewSchema<TColumns, TName> {
+  validateSchemaName(name, "View");
   const entries = Object.entries(definition.columns);
   if (entries.length === 0) throw new TypeError(`View ${name} needs at least one column`);
   if (definition.sql.trim().length === 0) throw new TypeError(`View ${name} has no query`);
   for (const [columnName, columnDefinition] of entries) {
+    validateSchemaName(columnName, "Column");
     if (columnDefinition.isUnique) {
       throw new TypeError(`A view column cannot be a unique key: ${name}.${columnName}`);
     }
@@ -563,6 +646,18 @@ export function schema<TTables extends readonly AnyTable[], TViews extends reado
       if (target === undefined || !(reference.column in target.columns)) {
         throw new TypeError(
           `Relation target does not exist: ${definition.name}.${columnName} -> ${reference.table}.${reference.column}`,
+        );
+      }
+      const targetColumn = target.columns[reference.column];
+      if (targetColumn?.isUnique !== true) {
+        throw new TypeError(
+          `Relation target must be the unique key: ${definition.name}.${columnName} -> ${reference.table}.${reference.column}`,
+        );
+      }
+      if (targetColumn.type !== columnDefinition.type) {
+        throw new TypeError(
+          `Relation types must match: ${definition.name}.${columnName} is ${columnDefinition.type}, ` +
+            `${reference.table}.${reference.column} is ${targetColumn.type}`,
         );
       }
     }
@@ -889,6 +984,11 @@ export function planMigration(
       if (existing === undefined && from !== undefined) {
         const source = recordColumnsByName.get(from);
         if (source !== undefined) {
+          if (renameSources.has(from)) {
+            throw new TypeError(
+              `Rename source is used more than once: ${tableDefinition.name}.${from}`,
+            );
+          }
           if (definedNames.has(from)) {
             throw new TypeError(`Rename source is still defined: ${tableDefinition.name}.${from}`);
           }
@@ -1021,7 +1121,18 @@ export function planMigration(
     }
   }
   planViewSteps(catalog, definition, steps);
-  return { steps };
+  // A managed view can depend on a managed table the same authoritative schema removes. Drop
+  // dependents first; the SQL engine correctly refuses the reverse order. Replacements stay
+  // after table-creation steps so a newly declared body can resolve its sources.
+  const droppedViews = steps.filter((step) => step.kind === "drop-view");
+  const droppedTables = steps.filter((step) => step.kind === "drop-table");
+  return {
+    steps: [
+      ...steps.filter((step) => step.kind !== "drop-view" && step.kind !== "drop-table"),
+      ...droppedViews,
+      ...droppedTables,
+    ],
+  };
 }
 
 // --- Typed table handles ------------------------------------------------------------------------
@@ -1035,25 +1146,18 @@ type UniqueKeyValue<TTable extends AnyTable> = {
 type ColumnArrays<TShape> = { [K in keyof TShape]: ReadonlyArray<TShape[K]> };
 
 interface TypedTableDatabase {
-  insertBatch(tableName: string, rows: readonly BatchRow[]): Promise<unknown>;
-  upsertBatch(tableName: string, rows: readonly BatchRow[]): Promise<unknown>;
-  updateBatch(
-    tableName: string,
-    input: {
-      keys: readonly unknown[];
-      changes: Readonly<Record<string, readonly unknown[]>>;
-    },
-  ): Promise<unknown>;
-  deleteBatch(tableName: string, input: { keys: readonly unknown[] }): Promise<unknown>;
-  readTable(
-    tableName: string,
-    options?: { columns?: readonly string[] },
-  ): Promise<Array<Record<string, unknown>>>;
+  execute(sql: string, params?: readonly QueryValue[]): Promise<unknown>;
+  query(
+    sql: string,
+    options?: { params?: readonly QueryValue[] },
+  ): Promise<{ rows: Array<Record<string, unknown>> }>;
 }
 
 /**
- * A thin, fully typed handle over the existing batch APIs: inserts require every non-nullable
- * column, updates exclude the unique key, and reads return the complete inferred row shape.
+ * A thin, fully typed SQL handle: inserts require every non-nullable column, updates exclude the
+ * unique key, and reads return the complete inferred row shape. Every operation is rendered as
+ * parameterized SQL and goes through the parser/planner/executor; this helper has no private
+ * batch or table-read semantics that can drift from SQL.
  */
 export function typedTable<TTable extends AnyTable>(
   database: TypedTableDatabase,
@@ -1070,31 +1174,138 @@ export function typedTable<TTable extends AnyTable>(
   rows(): Promise<Array<InferRow<TTable>>>;
 } {
   const columnNames = Object.keys(definition.columns);
-  // Pads every schema column, so omitting a nullable one is an explicit null rather than a
-  // "Missing column" error from the engine; function defaults fill their omitted slots here,
-  // before the batch reaches the engine.
-  const pad = (rows: ReadonlyArray<Record<string, unknown>>): BatchRow[] =>
-    rows.map(
-      (row) =>
+  const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+  const uniqueKey = Object.entries(definition.columns).find(
+    ([, columnDefinition]) => columnDefinition.isUnique,
+  )?.[0];
+  const normalizedRows = (
+    rows: ReadonlyArray<Record<string, unknown>>,
+  ): { names: string[]; rows: Array<Record<string, QueryValue>> } => {
+    if (rows.length === 0) throw new TypeError("A batch needs at least one row");
+    // Keep extra runtime keys in the SQL column list. TypeScript normally excludes them, but a
+    // cast or JavaScript caller must still get the engine's "column does not exist" error rather
+    // than having data silently discarded by this facade.
+    const names = new Set(columnNames);
+    for (const row of rows) for (const name of Object.keys(row)) names.add(name);
+    const ordered = [...names];
+    return {
+      names: ordered,
+      rows: rows.map((row) =>
         Object.fromEntries(
-          columnNames.map((name) => {
+          ordered.map((name) => {
             const value = row[name] ?? null;
             const fill = definition.columns[name]?.defaultFn;
-            return [name, value === null && fill !== undefined ? fill() : value];
+            return [name, (value === null && fill !== undefined ? fill() : value) as QueryValue];
           }),
-        ) as BatchRow,
-    );
+        ),
+      ),
+    };
+  };
+  const insert = (
+    rows: ReadonlyArray<Record<string, unknown>>,
+    replace: boolean,
+  ): Promise<unknown> => {
+    const normalized = normalizedRows(rows);
+    const params: QueryValue[] = [];
+    const values = normalized.rows
+      .map((row) => {
+        const placeholders = normalized.names.map((name) => {
+          params.push(row[name] ?? null);
+          return `$${String(params.length)}`;
+        });
+        return `(${placeholders.join(", ")})`;
+      })
+      .join(", ");
+    let sql = `INSERT INTO ${quote(definition.name)} (${normalized.names.map(quote).join(", ")}) VALUES ${values}`;
+    if (replace) {
+      if (uniqueKey === undefined) {
+        throw new TypeError(`Upsert requires a unique key: ${definition.name}`);
+      }
+      sql += ` ON CONFLICT (${quote(uniqueKey)}) DO REPLACE`;
+    }
+    return database.execute(sql, params);
+  };
+  const requireUniqueKey = (operation: string): string => {
+    if (uniqueKey === undefined) {
+      throw new TypeError(`${operation} requires a table with a unique key: ${definition.name}`);
+    }
+    return uniqueKey;
+  };
+  const keyToken = (value: unknown): string =>
+    value instanceof Date ? `date:${String(value.getTime())}` : `${typeof value}:${String(value)}`;
+  const assertKeys = (keys: readonly unknown[], operation: "update" | "delete"): void => {
+    if (keys.length === 0) throw new TypeError(`A ${operation} batch needs at least one key`);
+    const seen = new Set<string>();
+    for (const key of keys) {
+      const token = keyToken(key);
+      if (seen.has(token))
+        throw new TypeError(`Duplicate key in ${operation} batch: ${String(key)}`);
+      seen.add(token);
+    }
+  };
   return {
     definition,
-    insert: (rows) => database.insertBatch(definition.name, pad(rows)),
-    upsert: (rows) => database.upsertBatch(definition.name, pad(rows)),
-    update: (input) =>
-      database.updateBatch(definition.name, {
-        keys: input.keys,
-        changes: input.changes as Readonly<Record<string, readonly unknown[]>>,
-      }),
-    delete: (input) => database.deleteBatch(definition.name, { keys: input.keys }),
-    rows: async () => (await database.readTable(definition.name)) as Array<InferRow<TTable>>,
+    insert: (rows) => insert(rows, false),
+    upsert: (rows) => insert(rows, true),
+    update: (input) => {
+      const key = requireUniqueKey("UPDATE");
+      assertKeys(input.keys, "update");
+      const assignments: string[] = [];
+      const params: QueryValue[] = [];
+      for (const [name, rawValues] of Object.entries(input.changes)) {
+        if (!(name in definition.columns)) {
+          // Render it anyway so SQL owns the public validation error.
+        }
+        const values = rawValues as readonly unknown[];
+        if (values.length !== input.keys.length) {
+          throw new TypeError(
+            `Update column ${name} has ${String(values.length)} values for ${String(input.keys.length)} keys`,
+          );
+        }
+        const branches: string[] = [];
+        values.forEach((value, index) => {
+          if (value === undefined) return;
+          const keyValue = input.keys[index];
+          if (keyValue === undefined) {
+            throw new TypeError(`Missing update key at position ${String(index)}`);
+          }
+          params.push(keyValue, value as QueryValue);
+          branches.push(
+            `WHEN ${quote(key)} = $${String(params.length - 1)} THEN $${String(params.length)}`,
+          );
+        });
+        if (branches.length > 0) {
+          assignments.push(`${quote(name)} = CASE ${branches.join(" ")} ELSE ${quote(name)} END`);
+        }
+      }
+      if (assignments.length === 0)
+        throw new TypeError("An update batch needs at least one change");
+      const keyParams = input.keys.map((value) => value);
+      const placeholders = keyParams.map((value) => {
+        params.push(value);
+        return `$${String(params.length)}`;
+      });
+      return database.execute(
+        `UPDATE ${quote(definition.name)} SET ${assignments.join(", ")} WHERE ${quote(key)} IN (${placeholders.join(", ")})`,
+        params,
+      );
+    },
+    delete: (input) => {
+      const key = requireUniqueKey("DELETE");
+      assertKeys(input.keys, "delete");
+      const params = input.keys.map((value) => value);
+      const placeholders = params.map((_, index) => `$${String(index + 1)}`);
+      return database.execute(
+        `DELETE FROM ${quote(definition.name)} WHERE ${quote(key)} IN (${placeholders.join(", ")})`,
+        params,
+      );
+    },
+    rows: async () =>
+      (
+        await database.query(
+          `SELECT ${columnNames.map(quote).join(", ")} FROM ${quote(definition.name)}`,
+        )
+      ).rows as Array<InferRow<TTable>>,
   };
 }
 
@@ -1121,6 +1332,9 @@ export function applyColumnSteps(
           // written or substituted at read time.
           nullable: step.backfill === undefined ? true : step.definition.isNullable,
           ...(step.backfill === undefined ? {} : { backfill: step.backfill }),
+          ...(step.definition.defaultSpec === undefined
+            ? {}
+            : { defaultValue: step.definition.defaultSpec }),
           ...(step.definition.enumValues === undefined
             ? {}
             : { enumValues: [...step.definition.enumValues] }),

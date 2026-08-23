@@ -1133,14 +1133,27 @@ export type CompiledStatement =
         integer?: true;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
+        enumValues?: readonly string[];
+        backfill?: Exclude<QueryValue, null>;
       }>;
       checks?: Array<{ name: string; sql: string }>;
       foreignKeys?: ForeignKeyDefinition[];
       uniqueKey?: string;
       /** CREATE TABLE IF NOT EXISTS: an existing table of that name is left alone. */
       ifNotExists?: boolean;
+      /** Schema-owned objects carry this bit atomically with creation. */
+      managed?: boolean;
       parameterCount?: number;
     }
+  | {
+      kind: "create-index";
+      index: string;
+      table: string;
+      column: string;
+      ifNotExists?: boolean;
+      parameterCount?: number;
+    }
+  | { kind: "drop-index"; index: string; ifExists?: boolean; parameterCount?: number }
   | {
       kind: "create-trigger";
       table: string;
@@ -1170,6 +1183,8 @@ export type CompiledStatement =
       view: string;
       sql: string;
       orReplace?: boolean;
+      /** Schema-owned objects carry this bit atomically with creation. */
+      managed?: boolean;
       parameterCount?: number;
     }
   | { kind: "drop-view"; view: string; ifExists?: boolean; parameterCount?: number }
@@ -1203,7 +1218,11 @@ export type CompiledStatement =
         integer?: true;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
+        enumValues?: readonly string[];
+        backfill?: Exclude<QueryValue, null>;
       };
+      /** Schema migrations may add a proven non-null column by supplying a backfill. */
+      allowNonNullableWithBackfill?: boolean;
       parameterCount?: number;
     }
   | {
@@ -1446,6 +1465,12 @@ export function compileStatement(sql: string): CompiledStatement {
         return parseCreateView(text, tokens, viewAt === 3);
       }
       parser = new Parser(tokens, text);
+      if (
+        second?.kind === "identifier" &&
+        (second.text.toUpperCase() === "INDEX" || second.text.toUpperCase() === "UNIQUE")
+      ) {
+        return parser.parseCreateIndex();
+      }
       const statement = parser.parseCreateTable();
       if (parser.parameterCount > 0) statement.parameterCount = parser.parameterCount;
       return statement;
@@ -1467,7 +1492,11 @@ export function compileStatement(sql: string): CompiledStatement {
         parser = new Parser(tokens);
         return parser.parseDropTable();
       }
-      throw new TypeError("DROP supports: DROP TABLE name, DROP TRIGGER name");
+      if (second?.kind === "identifier" && second.text.toUpperCase() === "INDEX") {
+        parser = new Parser(tokens);
+        return parser.parseDropIndex();
+      }
+      throw new TypeError("DROP supports: DROP TABLE, DROP VIEW, DROP INDEX, DROP TRIGGER");
     }
     if (keyword === "WITH") {
       parser = new Parser(tokens);
@@ -4717,6 +4746,46 @@ class Parser {
   }
 
   /**
+   * CREATE INDEX is intentionally single-column today. The physical index is non-unique;
+   * UNIQUE remains a table constraint until multiple durable uniqueness constraints ship.
+   */
+  parseCreateIndex(): CompiledStatement {
+    this.#keyword("CREATE");
+    if (this.#isKeyword("UNIQUE")) {
+      throw new TypeError(
+        "CREATE UNIQUE INDEX is not supported; declare the table's unique key constraint",
+      );
+    }
+    this.#keyword("INDEX");
+    let ifNotExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("NOT");
+      this.#keyword("EXISTS");
+      ifNotExists = true;
+    }
+    const index = this.#identifier();
+    this.#keyword("ON");
+    const table = this.#identifier();
+    this.#expectPunctuation("(");
+    const column = this.#identifier();
+    if (this.#isKeyword("ASC")) this.#keyword("ASC");
+    else if (this.#isKeyword("DESC")) this.#keyword("DESC");
+    if (this.#peek().text === ",") {
+      throw new TypeError("CREATE INDEX supports one column");
+    }
+    this.#expectPunctuation(")");
+    this.#take("eof");
+    return {
+      kind: "create-index",
+      index,
+      table,
+      column,
+      ...(ifNotExists ? { ifNotExists: true } : {}),
+    };
+  }
+
+  /**
    * CREATE TABLE name (col TYPE [PRIMARY KEY | UNIQUE] [NOT NULL | NULL], ...). Standard type
    * names map onto the engine's four logical types. Integer spellings retain an exact-domain
    * catalog guard; exact NUMERIC/DECIMAL is rejected until it has a distinct physical type.
@@ -5007,6 +5076,21 @@ class Parser {
     return { kind: "drop-view", view, ...(ifExists ? { ifExists: true } : {}) };
   }
 
+  /** DROP INDEX [IF EXISTS] name. */
+  parseDropIndex(): CompiledStatement {
+    this.#keyword("DROP");
+    this.#keyword("INDEX");
+    let ifExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("EXISTS");
+      ifExists = true;
+    }
+    const index = this.#identifier();
+    this.#take("eof");
+    return { kind: "drop-index", index, ...(ifExists ? { ifExists: true } : {}) };
+  }
+
   /** DROP TABLE [IF EXISTS] name (F031-13). */
   parseDropTable(): CompiledStatement {
     this.#keyword("DROP");
@@ -5231,6 +5315,12 @@ class Parser {
     if (this.#isKeyword("NOTHING")) {
       this.#keyword("NOTHING");
       return { onConflict: { column, action: "nothing" } };
+    }
+    // Minnow's concise whole-row upsert spelling. Unlike DO UPDATE SET, it also has an exact
+    // meaning for a table whose unique key is its only column.
+    if (this.#isKeyword("REPLACE")) {
+      this.#keyword("REPLACE");
+      return { onConflict: { column, action: "replace" } };
     }
     this.#keyword("UPDATE");
     this.#keyword("SET");

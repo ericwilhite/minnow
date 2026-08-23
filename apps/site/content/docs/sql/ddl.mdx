@@ -69,6 +69,38 @@ A table without a `PRIMARY KEY` is append-only. That is a reasonable choice for 
 a mistake for anything a user edits, because it cannot be changed later without recreating the
 table.
 
+## Secondary indexes
+
+Use a durable secondary index when a production query repeatedly filters a large table on a
+non-key column:
+
+```sql
+CREATE INDEX orders_by_status ON orders (status);
+CREATE INDEX IF NOT EXISTS orders_by_total ON orders (total DESC);
+```
+
+One index covers one column. `ASC` and `DESC` are accepted for schema portability; they do not
+change the physical representation. Ready indexes prune row groups for `=`, `<`, `<=`, `>`, `>=`,
+and `IN` predicates. Minnow still evaluates the SQL predicate on every candidate row, so a stale
+posting or an internal locator collision can cost an extra read but cannot change an answer.
+
+Indexes are maintained across inserts, updates, deletes, and upserts. Their base is built in
+row-group-sized chunks, new commits append bounded deltas, and background folding prevents a
+long-running write workload from retaining one index object per transaction. A build is published
+with one atomic pointer change; a crash can leave reclaimable staging bytes but cannot expose a
+partial index. Multi-tab writers that cannot prove they updated an index invalidate the
+accelerator, and the next relevant query rebuilds it while answering correctly from a scan.
+
+```sql
+DROP INDEX IF EXISTS orders_by_status;
+```
+
+Index names are global within the database. `CREATE UNIQUE INDEX` and composite indexes are
+rejected: declare the table's one `PRIMARY KEY` for enforced uniqueness, and use separate
+single-column indexes when more than one predicate is selective. `ORDER BY` still uses the
+ordinary bounded sort path; a secondary index currently prunes filters rather than promising
+index order or a covering scan.
+
 ## Column types
 
 Four physical types, chosen because they are what a browser can store and compare without
@@ -148,12 +180,14 @@ for it — though a `DEFAULT` fills the rows written afterwards.
 
 `ALTER TABLE orders DROP COLUMN channel` performs the same guarded metadata step as an explicitly
 authorized schema migration. It refuses the unique key, the last column, and anything a check,
-foreign key, trigger, or view still reads. Old column blocks remain until compaction rewrites their
-segments, while persisted full-text data for the column is removed with the catalog change.
+foreign key, trigger, view, or secondary index still reads. Drop the index first. Old column blocks
+remain until compaction rewrites their segments, while persisted full-text data for the column is
+removed with the catalog change.
 `RESTRICT` is the default; `CASCADE` is deliberately rejected so a typo cannot silently remove
 dependent objects.
 
-`DROP TABLE` takes the table's rows, its catalog record, its full-text index, and its triggers.
+`DROP TABLE` takes the table's rows, its catalog record, its secondary and full-text indexes, and
+its triggers.
 The blocks are retired through the commit rather than deleted, so a reader pinned to an older
 version keeps resolving the bytes it already holds and the collector reclaims them once nobody
 can reach them:

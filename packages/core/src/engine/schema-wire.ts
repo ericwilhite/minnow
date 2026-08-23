@@ -1,12 +1,10 @@
 import type { ColumnDefault } from "../storage/index.js";
 import {
-  column,
-  columnWithDefaultSpec,
+  columnFromState,
   schema,
   table,
   view,
   type AnyTable,
-  type ColumnBuilder,
   type MigrationStep,
   type AnyView,
   type ReferentialAction,
@@ -71,7 +69,7 @@ export type WireMigrationStep =
   | { kind: "replace-view"; view: WireView }
   | { kind: "drop-view"; viewName: string };
 
-type AnyColumn = ColumnBuilder<boolean | number | string | Date, boolean, boolean, boolean>;
+type AnyColumn = AnyTable["columns"][string];
 
 function serializeColumn(definition: AnyColumn): WireColumn {
   return {
@@ -166,23 +164,18 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
   if (wire.enumValues !== undefined && wire.type !== "string") {
     throw new TypeError(`Enum values require a string column, got ${wire.type}`);
   }
-  let builder: AnyColumn =
-    wire.enumValues === undefined
-      ? column[wire.type]()
-      : column.enum(wire.enumValues as readonly [string, ...string[]]);
-  if (wire.isNullable) builder = builder.nullable();
-  if (wire.isUnique) builder = builder.unique();
-  if (wire.renamedFromName !== undefined) builder = builder.renamedFrom(wire.renamedFromName);
-  if (wire.backfillValue !== undefined) builder = builder.backfill(wire.backfillValue);
-  if (wire.reference !== undefined) {
-    builder = builder.references(wire.reference.table, wire.reference.column, {
-      onDelete: wire.reference.onDelete,
-    });
-  }
-  // Rebuilt from the spec directly rather than through .default(), which would re-interpret the
-  // reserved generator names.
-  if (wire.defaultSpec !== undefined) builder = columnWithDefaultSpec(builder, wire.defaultSpec);
-  return builder;
+  // Rebuild in one step. Chaining dynamic nullable/unique builders is needlessly invariant and
+  // used to discard a backfill when a default spec was applied last.
+  return columnFromState({
+    type: wire.type,
+    isNullable: wire.isNullable,
+    isUnique: wire.isUnique,
+    ...(wire.defaultSpec === undefined ? {} : { defaultSpec: wire.defaultSpec }),
+    ...(wire.renamedFromName === undefined ? {} : { renamedFromName: wire.renamedFromName }),
+    ...(wire.reference === undefined ? {} : { reference: wire.reference }),
+    ...(wire.enumValues === undefined ? {} : { enumValues: wire.enumValues }),
+    ...(wire.backfillValue === undefined ? {} : { backfillValue: wire.backfillValue }),
+  });
 }
 
 function deserializeTable(wire: WireTable): AnyTable {

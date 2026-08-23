@@ -12,10 +12,13 @@ import {
   type TriggerRecord,
   advanceGarbageCollectionJobRecord,
   collectFtsCandidates,
+  activePostingStorageColumnIds,
   invalidateUncoveredFtsColumns,
+  invalidateUncoveredSecondaryIndexes,
   type FtsCandidates,
   type FtsChanges,
   type FtsColumnIndexRecord,
+  type FtsPostingQuery,
   type FtsPosting,
   type GarbageCollectionJobRecord,
   GarbageCollectionJobConflictError,
@@ -34,6 +37,7 @@ import {
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
+  type SecondaryIndexRecord,
   TableRecordConflictError,
   type TempOwnerRecord,
   TempOwnerConflictError,
@@ -48,6 +52,7 @@ import {
   updateCompactionJobRecord,
   updateTransactionRecord,
   validateTableColumns,
+  validateSecondaryIndexes,
   WriteConflictError,
 } from "../types.js";
 import { selectLiveRecords, type DatabaseSnapshot, type SnapshotFtsIndex } from "../snapshot.js";
@@ -222,9 +227,24 @@ export class RecordCore {
 
   addTable(record: TableRecord): void {
     validateTableColumns(record.columns);
+    validateSecondaryIndexes(record);
     if (this.#tables.has(record.id)) throw new Error(`Table already exists: ${record.id}`);
     if (this.#tableIdsByName.has(record.name))
       throw new Error(`Table name already exists: ${record.name}`);
+    const newIndexNames = new Set<string>();
+    for (const index of Object.values(record.secondaryIndexes ?? {})) {
+      if (newIndexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
+      newIndexNames.add(index.name);
+      for (const table of this.#tables.values()) {
+        if (
+          Object.values(table.secondaryIndexes ?? {}).some(
+            (existing) => existing.name === index.name,
+          )
+        ) {
+          throw new TypeError(`Index already exists: ${index.name}`);
+        }
+      }
+    }
     this.#tables.set(record.id, structuredClone(record));
     this.#tableIdsByName.set(record.name, record.id);
     this.#catalogEpoch += 1;
@@ -241,6 +261,7 @@ export class RecordCore {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
       triggers?: TriggerRecord[] | null;
     },
   ): TableRecord {
@@ -250,8 +271,15 @@ export class RecordCore {
       throw new TableRecordConflictError(id, expectedRevision, actualRevision);
     }
     if (update.columns !== undefined) validateTableColumns(update.columns);
-    const { ftsColumns: previousFts, triggers: previousTriggers, ...base } = record;
+    const {
+      ftsColumns: previousFts,
+      secondaryIndexes: previousSecondary,
+      triggers: previousTriggers,
+      ...base
+    } = record;
     let nextFts = update.ftsColumns === undefined ? previousFts : update.ftsColumns;
+    let nextSecondary =
+      update.secondaryIndexes === undefined ? previousSecondary : update.secondaryIndexes;
     const retainedColumnIds =
       update.columns === undefined
         ? undefined
@@ -262,6 +290,28 @@ export class RecordCore {
       );
       if (Object.keys(nextFts).length === 0) nextFts = null;
     }
+    if (nextSecondary !== null && nextSecondary !== undefined && retainedColumnIds !== undefined) {
+      nextSecondary = Object.fromEntries(
+        Object.entries(nextSecondary).filter(([, index]) => retainedColumnIds.has(index.columnId)),
+      );
+      if (Object.keys(nextSecondary).length === 0) nextSecondary = null;
+    }
+    const nextIndexNames = new Set<string>();
+    for (const index of Object.values(nextSecondary ?? {})) {
+      if (nextIndexNames.has(index.name))
+        throw new TypeError(`Index already exists: ${index.name}`);
+      nextIndexNames.add(index.name);
+      for (const [otherTableId, table] of this.#tables) {
+        if (otherTableId === id) continue;
+        if (
+          Object.values(table.secondaryIndexes ?? {}).some(
+            (existing) => existing.name === index.name,
+          )
+        ) {
+          throw new TypeError(`Index already exists: ${index.name}`);
+        }
+      }
+    }
     const nextTriggers = update.triggers === undefined ? previousTriggers : update.triggers;
     const updated: TableRecord = {
       ...base,
@@ -269,14 +319,26 @@ export class RecordCore {
       ...(nextFts === null || nextFts === undefined
         ? {}
         : { ftsColumns: structuredClone(nextFts) }),
+      ...(nextSecondary === null || nextSecondary === undefined
+        ? {}
+        : { secondaryIndexes: structuredClone(nextSecondary) }),
       ...(nextTriggers === null || nextTriggers === undefined
         ? {}
         : { triggers: structuredClone(nextTriggers) }),
       revision: expectedRevision + 1,
     };
+    validateSecondaryIndexes(updated);
     if (retainedColumnIds !== undefined) {
       for (const column of record.columns) {
         if (!retainedColumnIds.has(column.id)) this.removeFtsColumn(record.id, column.id);
+      }
+    }
+    const retainedIndexStorage = new Set(
+      Object.values(nextSecondary ?? {}).map((index) => index.storageColumnId),
+    );
+    for (const index of Object.values(previousSecondary ?? {})) {
+      if (!retainedIndexStorage.has(index.storageColumnId)) {
+        this.removeFtsColumn(record.id, index.storageColumnId);
       }
     }
     this.#tables.set(id, updated);
@@ -334,9 +396,14 @@ export class RecordCore {
   readFtsCandidates(
     tableId: string,
     columnId: string,
-    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    terms: readonly FtsPostingQuery[],
     upToVersion: number,
-  ): FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number } {
+  ): FtsCandidates & {
+    deltaChunkCount: number;
+    totalTokens: number;
+    coversVersion: number;
+    hasBase: boolean;
+  } {
     const key = `${tableId}/${columnId}`;
     const base = this.#ftsBases.get(key);
     const deltas =
@@ -356,6 +423,7 @@ export class RecordCore {
       deltaChunkCount,
       totalTokens,
       coversVersion: base?.coversVersion ?? -1,
+      hasBase: base !== undefined,
     };
   }
 
@@ -368,21 +436,33 @@ export class RecordCore {
     pendingSegments: readonly SegmentRecord[],
     changeList: readonly FtsChanges[] | undefined,
     version: number,
+    logicallyChangedTableIds?: readonly string[],
   ): void {
     const changedTableIds = new Set(pendingSegments.map((segment) => segment.tableId));
+    const scalarChangedTableIds =
+      logicallyChangedTableIds === undefined ? changedTableIds : new Set(logicallyChangedTableIds);
     for (const tableId of changedTableIds) {
       const record = this.#tables.get(tableId);
       if (record === undefined) continue;
       const forTable = (changeList ?? []).find((entry) => entry.tableId === tableId);
       const covered = new Set(forTable?.columns.map((column) => column.columnId) ?? []);
       const invalidated = invalidateUncoveredFtsColumns(record, covered);
-      if (invalidated !== undefined) this.#tables.set(record.id, invalidated);
+      const withFts = invalidated ?? record;
+      const withSecondary = scalarChangedTableIds.has(tableId)
+        ? invalidateUncoveredSecondaryIndexes(withFts, covered)
+        : undefined;
+      if (withSecondary !== undefined) this.#tables.set(record.id, withSecondary);
+      else if (invalidated !== undefined) this.#tables.set(record.id, invalidated);
     }
     for (const changes of changeList ?? []) this.#applyFtsEntry(changes, version);
   }
 
   #applyFtsEntry(changes: FtsChanges, version: number): void {
+    const table = this.#tables.get(changes.tableId);
+    if (table === undefined) return;
+    const active = activePostingStorageColumnIds(table);
     for (const column of changes.columns) {
+      if (!active.has(column.columnId)) continue;
       const key = `${changes.tableId}/${column.columnId}`;
       const deltas =
         this.#ftsDeltas.get(key) ??
@@ -1021,7 +1101,12 @@ export class RecordCore {
       for (const token of delta.removed) tokens.delete(token);
       for (const token of delta.added) tokens.add(token);
     }
-    this.#applyFtsChanges(pendingSegments, plan.ftsChanges, manifest.version);
+    this.#applyFtsChanges(
+      pendingSegments,
+      plan.ftsChanges,
+      manifest.version,
+      manifest.changedTableIds,
+    );
     this.#catalogEpoch += 1;
     // Match the IndexedDB store's observable commit shape: the summary without blockIds.
     const { blockIds: _resolved, ...summary } = manifest;
@@ -1549,10 +1634,22 @@ export class RecordCore {
           ftsColumns[columnId] = { ...state, state: "invalid" };
         }
       }
+      const secondaryIndexes = { ...(table.secondaryIndexes ?? {}) };
+      for (const [indexId, state] of Object.entries(secondaryIndexes)) {
+        const base = this.#ftsBases.get(`${table.id}/${state.storageColumnId}`);
+        if (state.state === "ready" && base?.coversVersion === version) {
+          fts.push({ columnId: state.storageColumnId, ...structuredClone(base) });
+        } else {
+          const { buildId: _abandonedBuild, ...invalid } = state;
+          void _abandonedBuild;
+          secondaryIndexes[indexId] = { ...invalid, state: "invalid" };
+        }
+      }
       return {
         record: {
           ...structuredClone(table),
           ...(Object.keys(ftsColumns).length === 0 ? {} : { ftsColumns }),
+          ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
         },
         nextRowId: this.#nextRowIds.get(table.id) ?? 1n,
         autoIncrement: table.columns.flatMap((column) => {
@@ -1590,7 +1687,10 @@ export class RecordCore {
     snapshot: DatabaseSnapshot,
     storeBlockBytes: (id: string, bytes: Uint8Array) => void,
   ): void {
-    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
+    for (const table of snapshot.tables) {
+      validateTableColumns(table.record.columns);
+      validateSecondaryIndexes(table.record);
+    }
     for (const block of snapshot.blocks) storeBlockBytes(block.id, block.bytes);
     this.loadSnapshotRecords(
       { ...snapshot, blocks: undefined },
@@ -1603,7 +1703,15 @@ export class RecordCore {
     snapshot: Omit<DatabaseSnapshot, "blocks"> & { blocks?: undefined },
     blockIds: readonly string[],
   ): void {
-    for (const table of snapshot.tables) validateTableColumns(table.record.columns);
+    const indexNames = new Set<string>();
+    for (const table of snapshot.tables) {
+      validateTableColumns(table.record.columns);
+      validateSecondaryIndexes(table.record);
+      for (const index of Object.values(table.record.secondaryIndexes ?? {})) {
+        if (indexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
+        indexNames.add(index.name);
+      }
+    }
     for (const segment of snapshot.segments) {
       this.#segments.set(segment.id, normalizeSegmentRecord(segment));
     }
@@ -1680,7 +1788,15 @@ export class RecordCore {
   /** Replaces the whole record state with a dump's content. */
   load(state: RecordCoreState): void {
     const cloned = structuredClone(state);
-    for (const table of cloned.tables) validateTableColumns(table.columns);
+    const indexNames = new Set<string>();
+    for (const table of cloned.tables) {
+      validateTableColumns(table.columns);
+      validateSecondaryIndexes(table);
+      for (const index of Object.values(table.secondaryIndexes ?? {})) {
+        if (indexNames.has(index.name)) throw new TypeError(`Index already exists: ${index.name}`);
+        indexNames.add(index.name);
+      }
+    }
     for (const map of [
       this.#manifests,
       this.#transactions,

@@ -6962,7 +6962,7 @@ for (const implementation of implementations()) {
       "DROP TABLE CASCADE is not supported",
     );
     await expect(database.execute("DROP INDEX whatever")).rejects.toThrow(
-      "DROP supports: DROP TABLE name, DROP TRIGGER name",
+      "Unknown index: whatever",
     );
     await expect(database.query("DELETE FROM sql_people")).rejects.toThrow("Expected SELECT");
     await expect(

@@ -704,7 +704,7 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
         );
         checkEqual(exact.rowIdsByTerm, [[1n, 3n]], "exact terms must match exactly");
         check(
-          exact.coversVersion === 0 && exact.totalTokens === 5,
+          exact.hasBase && exact.coversVersion === 0 && exact.totalTokens === 5,
           "coverage and token totals must report the stored base",
         );
         const prefix = await store.readFtsCandidates(
@@ -718,6 +718,76 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           [[1n, 2n, 3n]],
           "prefix terms must match the term range, row ids ascending and unique",
         );
+        store.close();
+      },
+    },
+    {
+      name: "postings builds publish bounded generations atomically and reclaim replacements",
+      async run(target) {
+        let store = await target.create();
+        await store.addTable({
+          ...table("postings"),
+          ftsColumns: {
+            "col-v": {
+              storage: "fts-chunks-v1",
+              tokenizerVersion: 1,
+              state: "building",
+              buildFromVersion: -1,
+            },
+          },
+        });
+        await store.beginFtsBaseBuild("table-postings", "col-v", "abandoned");
+        await store.writeFtsBaseBuildChunk("table-postings", "col-v", "abandoned", 0, [
+          { term: "old", rowIds: [1n], tf: [1] },
+        ]);
+        await store.beginFtsBaseBuild("table-postings", "col-v", "replacement");
+        await store.writeFtsBaseBuildChunk("table-postings", "col-v", "replacement", 0, [
+          { term: "alpha", rowIds: [2n], tf: [1] },
+        ]);
+        await store.writeFtsBaseBuildChunk("table-postings", "col-v", "replacement", 1, [
+          { term: "omega", rowIds: [3n], tf: [1] },
+        ]);
+        await store.finishFtsBaseBuild("table-postings", "col-v", "replacement", {
+          coversVersion: 4,
+          chunkCount: 2,
+          totalTokens: 2,
+        });
+        let candidates = await store.readFtsCandidates(
+          "table-postings",
+          "col-v",
+          [
+            { term: "old", prefix: false },
+            { lower: "alpha", lowerInclusive: true, upper: "omega", upperInclusive: true },
+          ],
+          4,
+        );
+        checkEqual(
+          candidates.rowIdsByTerm,
+          [[], [2n, 3n]],
+          "only a finished replacement generation may become visible",
+        );
+        check(candidates.hasBase, "a finished generation must report a published base");
+
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          candidates = await store.readFtsCandidates(
+            "table-postings",
+            "col-v",
+            [{ term: "omega", prefix: false }],
+            4,
+          );
+          checkEqual(candidates.rowIdsByTerm, [[3n]], "a finished generation must survive reopen");
+          check(candidates.hasBase, "a reopened generation must still report its base");
+        }
+        await store.removeFtsColumn("table-postings", "col-v");
+        candidates = await store.readFtsCandidates(
+          "table-postings",
+          "col-v",
+          [{ term: "alpha", prefix: false }],
+          4,
+        );
+        checkEqual(candidates.rowIdsByTerm, [[]], "removing an index must remove its candidates");
+        check(!candidates.hasBase, "a removed base must be distinguishable from an empty base");
         store.close();
       },
     },

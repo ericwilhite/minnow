@@ -10,6 +10,7 @@ import {
   type CreateGarbageCollectionJobInput,
   type FtsCandidates,
   type FtsColumnIndexRecord,
+  type FtsPostingQuery,
   type GarbageCollectionJobRecord,
   type GarbageCollectionStepResult,
   type LeaseRecord,
@@ -24,6 +25,7 @@ import {
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
+  type SecondaryIndexRecord,
   type TempOwnerRecord,
   type TempRunPage,
   type TransactionRecord,
@@ -94,6 +96,10 @@ const RPC_METHODS = new Set([
   "removeTable",
   "removeFtsColumn",
   "writeFtsBase",
+  "beginFtsBaseBuild",
+  "writeFtsBaseBuildChunk",
+  "finishFtsBaseBuild",
+  "abortFtsBaseBuild",
   "readFtsCandidates",
   "addSegment",
   "getSegment",
@@ -785,6 +791,7 @@ export class OpfsBlockStore implements BlockStore {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -807,20 +814,57 @@ export class OpfsBlockStore implements BlockStore {
     await this.#dispatch("removeFtsColumn", [tableId, columnId]);
   }
 
+  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.#dispatch("beginFtsBaseBuild", [tableId, columnId, buildId]);
+  }
+
+  async writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: FtsPosting[],
+  ): Promise<void> {
+    await this.#dispatch("writeFtsBaseBuildChunk", [tableId, columnId, buildId, ordinal, chunk]);
+  }
+
+  async finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: { coversVersion: number; chunkCount: number; totalTokens: number },
+  ): Promise<void> {
+    await this.#dispatch("finishFtsBaseBuild", [tableId, columnId, buildId, input]);
+  }
+
+  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.#dispatch("abortFtsBaseBuild", [tableId, columnId, buildId]);
+  }
+
   async readFtsCandidates(
     tableId: string,
     columnId: string,
-    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    terms: readonly FtsPostingQuery[],
     upToVersion: number,
   ): Promise<
-    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+    FtsCandidates & {
+      deltaChunkCount: number;
+      totalTokens: number;
+      coversVersion: number;
+      hasBase: boolean;
+    }
   > {
     return (await this.#dispatch("readFtsCandidates", [
       tableId,
       columnId,
       terms,
       upToVersion,
-    ])) as FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number };
+    ])) as FtsCandidates & {
+      deltaChunkCount: number;
+      totalTokens: number;
+      coversVersion: number;
+      hasBase: boolean;
+    };
   }
 
   async addSegment(record: SegmentRecord): Promise<void> {

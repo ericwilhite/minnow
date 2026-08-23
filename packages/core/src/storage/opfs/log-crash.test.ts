@@ -61,6 +61,63 @@ describe("OPFS write-ahead log crash shapes", () => {
     reopened.close();
   });
 
+  it("recovers an interrupted postings build without publishing partial chunks", async () => {
+    const shim = new MemoryOpfs();
+    const store = await OpfsBlockStore.open({ name: "postings-build", root: shim.root });
+    await store.addTable({
+      ...table("postings"),
+      id: "table",
+      ftsColumns: {
+        index: {
+          storage: "fts-chunks-v1",
+          tokenizerVersion: 1,
+          state: "building",
+          buildFromVersion: -1,
+        },
+      },
+    });
+    await store.beginFtsBaseBuild("table", "index", "interrupted");
+    await store.writeFtsBaseBuildChunk("table", "index", "interrupted", 0, [
+      { term: "partial", rowIds: [1n], tf: [1] },
+    ]);
+    store._crashForTests();
+
+    const recovered = await OpfsBlockStore.open({ name: "postings-build", root: shim.root });
+    expect(
+      await recovered.readFtsCandidates("table", "index", [{ term: "partial", prefix: false }], 9),
+    ).toMatchObject({ rowIdsByTerm: [[]], coversVersion: -1 });
+
+    // Restarting the same logical build discards the recovered staging generation. Only the
+    // final pointer swap makes any of the replacement chunks visible to readers.
+    await recovered.beginFtsBaseBuild("table", "index", "replacement");
+    await recovered.writeFtsBaseBuildChunk("table", "index", "replacement", 0, [
+      { term: "alpha", rowIds: [2n], tf: [1] },
+    ]);
+    await recovered.writeFtsBaseBuildChunk("table", "index", "replacement", 1, [
+      { term: "omega", rowIds: [3n], tf: [1] },
+    ]);
+    await recovered.finishFtsBaseBuild("table", "index", "replacement", {
+      coversVersion: 9,
+      chunkCount: 2,
+      totalTokens: 0,
+    });
+    recovered._crashForTests();
+
+    const published = await OpfsBlockStore.open({ name: "postings-build", root: shim.root });
+    expect(
+      await published.readFtsCandidates(
+        "table",
+        "index",
+        [
+          { term: "partial", prefix: false },
+          { lower: "alpha", lowerInclusive: true, upper: "omega", upperInclusive: true },
+        ],
+        9,
+      ),
+    ).toMatchObject({ rowIdsByTerm: [[], [2n, 3n]], coversVersion: 9 });
+    published.close();
+  });
+
   it("bounds mutation deduplication and releases connection state on close", async () => {
     const shim = new MemoryOpfs();
     const leader = await OpfsBlockStore.open({ name: "bounded-rpc", root: shim.root });

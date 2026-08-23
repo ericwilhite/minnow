@@ -108,8 +108,9 @@ possible; a build script that is the only writer in its process does not need on
 
 `OpfsBlockStore#exportSnapshot` runs as a single operation on the leader's queue, so no commit
 or garbage collection can interleave with it — always consistent, like the memory store, with no
-lease needed. Full-text bases export as rebuilds — a cost in speed on the restored database,
-never in answers.
+lease needed. Derived full-text and secondary-index bases are copied only when the store can prove
+they cover the exported version; otherwise they export as rebuilds — a cost in speed on the
+restored database, never in answers.
 
 `MinnowDatabase#exportSnapshot` delegates to whichever of those the database was built on, so it
 inherits the same rule. A store that implements neither method says so rather than failing as a

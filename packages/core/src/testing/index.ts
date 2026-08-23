@@ -161,6 +161,33 @@ export class FaultInjectingBlockStore implements BlockStore {
     return this.inner.writeFtsBase(tableId, columnId, input);
   }
 
+  beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    return this.inner.beginFtsBaseBuild(tableId, columnId, buildId);
+  }
+
+  writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: Parameters<BlockStore["writeFtsBaseBuildChunk"]>[4],
+  ): Promise<void> {
+    return this.inner.writeFtsBaseBuildChunk(tableId, columnId, buildId, ordinal, chunk);
+  }
+
+  finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: Parameters<BlockStore["finishFtsBaseBuild"]>[3],
+  ): Promise<void> {
+    return this.inner.finishFtsBaseBuild(tableId, columnId, buildId, input);
+  }
+
+  abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    return this.inner.abortFtsBaseBuild(tableId, columnId, buildId);
+  }
+
   removeFtsColumn(tableId: string, columnId: string): Promise<void> {
     return this.inner.removeFtsColumn(tableId, columnId);
   }

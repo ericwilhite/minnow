@@ -312,6 +312,13 @@
       "notes": "Rows whose key already exists at the statement's snapshot are skipped. Each proposed row is considered in order, so later duplicates of a key retained earlier in the same statement are skipped too."
     },
     {
+      "id": "mutation.upsert-replace",
+      "feature": "minnow",
+      "status": "supported",
+      "example": "INSERT INTO keyed (name, score, bonus) VALUES ('x', 50, 9) ON CONFLICT (name) DO REPLACE",
+      "notes": "Minnow's concise whole-row upsert spelling replaces every non-key column and also has exact semantics for a key-only table. The typed client's orReplace() emits this form."
+    },
+    {
       "id": "mutation.upsert-partial",
       "feature": "minnow",
       "status": "supported",
@@ -1181,10 +1188,33 @@
     {
       "id": "ddl.secondary-index",
       "feature": "minnow",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE INDEX keyed_score_idx ON keyed(score)",
-      "error": "Expected TABLE, found INDEX",
-      "notes": "SQL does not standardize physical index DDL. Minnow currently has its unique-key lookup and full-text indexes, but no general secondary B-tree or ordered index for application predicates and sorts."
+      "notes": "SQL does not standardize physical index DDL. Minnow supports durable, non-unique, single-column indexes that prune equality, range, and IN predicates; the predicate is always rechecked."
+    },
+    {
+      "id": "ddl.drop-secondary-index",
+      "feature": "minnow",
+      "status": "supported",
+      "setup": ["CREATE INDEX keyed_score_idx ON keyed(score)"],
+      "example": "DROP INDEX keyed_score_idx",
+      "notes": "Index names are catalog-global. IF EXISTS is also supported."
+    },
+    {
+      "id": "ddl.composite-secondary-index",
+      "feature": "minnow",
+      "status": "unsupported",
+      "example": "CREATE INDEX keyed_score_bonus_idx ON keyed(score, bonus)",
+      "error": "CREATE INDEX supports one column",
+      "notes": "The current postings layout prunes one column at a time. Composite key ordering and left-prefix planning need an explicit tuple encoding rather than concatenated scalar values."
+    },
+    {
+      "id": "ddl.unique-secondary-index",
+      "feature": "minnow",
+      "status": "unsupported",
+      "example": "CREATE UNIQUE INDEX keyed_bonus_idx ON keyed(bonus)",
+      "error": "declare the table's unique key constraint",
+      "notes": "A secondary accelerator must never silently claim uniqueness. Minnow enforces the table's one declared primary or unique key on every write; additional unique constraints need independent atomic conflict enforcement."
     },
     {
       "id": "ddl.multiple-unique-constraints",

@@ -243,6 +243,43 @@ describe("MinnowDatabaseClient", () => {
     await client.close();
   });
 
+  it("preserves both a backfill and a persistent default across schema serialization", async () => {
+    const client = connect();
+    const before = table("wire_defaults", {
+      id: column.number().unique(),
+    });
+    await client.migrate(schema([before]));
+    await client.insertBatch("wire_defaults", [{ id: 1 }]);
+
+    const after = table("wire_defaults", {
+      id: column.number().unique(),
+      status: column.string().default("future").backfill("existing"),
+    });
+    const migration = await client.migrate(schema([after]));
+    expect(migration.steps).toMatchObject([
+      {
+        kind: "add-column",
+        definition: {
+          defaultSpec: { kind: "literal", value: "future" },
+          backfillValue: "existing",
+        },
+      },
+    ]);
+    expect((await client.introspect()).tables[0]?.columns[1]).toMatchObject({
+      defaultValue: { kind: "literal", value: "future" },
+      backfill: "existing",
+    });
+    await client.insertBatch("wire_defaults", [{ id: 2, status: null }]);
+
+    expect(await client.query("SELECT id, status FROM wire_defaults ORDER BY id")).toMatchObject({
+      rows: [
+        { id: 1, status: "existing" },
+        { id: 2, status: "future" },
+      ],
+    });
+    await client.close();
+  });
+
   it("runs compiled typed queries", async () => {
     const client = connect();
     await createPeopleTable(client);

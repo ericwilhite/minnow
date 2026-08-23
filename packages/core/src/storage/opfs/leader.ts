@@ -9,6 +9,7 @@ import {
   type CreateGarbageCollectionJobInput,
   type FtsCandidates,
   type FtsColumnIndexRecord,
+  type FtsPostingQuery,
   type FtsPosting,
   type GarbageCollectionJobRecord,
   type GarbageCollectionStepResult,
@@ -24,12 +25,14 @@ import {
   type StoragePage,
   type TableColumnRecord,
   type TableRecord,
+  type SecondaryIndexRecord,
   type TempOwnerRecord,
   type TempRunPage,
   type TransactionRecord,
   type TransactionRecordUpdate,
   type TriggerRecord,
   type WriteTransactionInput,
+  activePostingStorageColumnIds,
   collectFtsCandidates,
   validateTableColumns,
 } from "../types.js";
@@ -76,9 +79,19 @@ interface FtsChunkRelocation {
   placement: Placement;
 }
 
+interface FtsBuildChunkRelocation extends FtsChunkRelocation {
+  buildId: string;
+}
+
 interface FtsBasePointer {
   coversVersion: number;
   totalTokens: number;
+  chunks: Placement[];
+  chunkBounds: Array<{ first: string; last: string }>;
+}
+
+interface FtsBaseBuildPointer {
+  buildId: string;
   chunks: Placement[];
   chunkBounds: Array<{ first: string; last: string }>;
 }
@@ -88,6 +101,7 @@ interface CheckpointState {
   core: RecordCoreState;
   blockIndex: Array<readonly [string, Placement]>;
   ftsBases: Array<readonly [string, FtsBasePointer]>;
+  ftsBuilds?: Array<readonly [string, FtsBaseBuildPointer]>;
   extents: ExtentMeta;
 }
 
@@ -98,6 +112,8 @@ type WalEntryBody =
       op: "relocatePayloads";
       blocks: BlockRelocation[];
       ftsChunks: FtsChunkRelocation[];
+      /** Optional for WAL frames written before staged-build relocation shipped. */
+      ftsBuildChunks?: FtsBuildChunkRelocation[];
     }
   | { op: "addTable"; record: TableRecord }
   | {
@@ -107,6 +123,7 @@ type WalEntryBody =
       update: {
         columns?: TableColumnRecord[];
         ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+        secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
         triggers?: TriggerRecord[] | null;
       };
     }
@@ -185,6 +202,24 @@ type WalEntryBody =
   | { op: "removeTempOwnerIfExpired"; ownerId: string; expiresAtCutoff: string }
   | { op: "removeTempOwner"; ownerId: string }
   | { op: "writeFtsBase"; tableId: string; columnId: string; pointer: FtsBasePointer }
+  | { op: "beginFtsBaseBuild"; tableId: string; columnId: string; buildId: string }
+  | {
+      op: "writeFtsBaseBuildChunk";
+      tableId: string;
+      columnId: string;
+      buildId: string;
+      ordinal: number;
+      placement: Placement;
+      bounds: { first: string; last: string };
+    }
+  | {
+      op: "finishFtsBaseBuild";
+      tableId: string;
+      columnId: string;
+      buildId: string;
+      input: { coversVersion: number; chunkCount: number; totalTokens: number };
+    }
+  | { op: "abortFtsBaseBuild"; tableId: string; columnId: string; buildId: string }
   | {
       op: "importSnapshot";
       records: Omit<DatabaseSnapshot, "blocks">;
@@ -216,6 +251,7 @@ export class OpfsLeader {
   readonly #core: RecordCore;
   readonly #blockIndex = new Map<string, Placement>();
   readonly #ftsBases = new Map<string, FtsBasePointer>();
+  readonly #ftsBuilds = new Map<string, FtsBaseBuildPointer>();
   readonly #ftsChunkCache = new Map<string, FtsPosting[]>();
   #extents: ExtentPool | undefined;
   #wal: WalWriter;
@@ -306,6 +342,7 @@ export class OpfsLeader {
 
     this.#blockIndex.clear();
     this.#ftsBases.clear();
+    this.#ftsBuilds.clear();
     this.#ftsChunkCache.clear();
     this.#extents?.close();
     this.#extents = await ExtentPool.open(this.#tree, checkpoint?.extents);
@@ -316,6 +353,7 @@ export class OpfsLeader {
       this.#core.load(checkpoint.core);
       for (const [id, placement] of checkpoint.blockIndex) this.#blockIndex.set(id, placement);
       for (const [key, pointer] of checkpoint.ftsBases) this.#ftsBases.set(key, pointer);
+      for (const [key, pointer] of checkpoint.ftsBuilds ?? []) this.#ftsBuilds.set(key, pointer);
       this.#seq = checkpoint.lastSeq;
     }
 
@@ -348,6 +386,17 @@ export class OpfsLeader {
     this.#wal = new WalWriter(this.#walHandle, endOffset);
     this.#entriesSinceCheckpoint = applied;
     this.#poisoned = false;
+
+    // A staged postings generation has no reader-visible pointer and no builder can prove it
+    // survived a leader death. Reclaim it now rather than retain unreachable extents. A
+    // still-live caller receives "build changed", marks its catalog record invalid, and a later
+    // query restarts from a fresh snapshot. The next ordinary checkpoint persists the
+    // reclamation; until then another crash simply replays and reclaims the same unpublished
+    // generation.
+    if (this.#ftsBuilds.size > 0) {
+      this.#pool.release([...this.#ftsBuilds.values()].flatMap((build) => build.chunks));
+      this.#ftsBuilds.clear();
+    }
 
     // Extents fully drained before the crash but never deleted: finish the job.
     for (const id of this.#pool.release([])) await this.#pool.deleteExtent(id);
@@ -449,6 +498,15 @@ export class OpfsLeader {
             throw new Error(`OPFS full-text chunk moved before relocation: ${move.key}`);
           }
         }
+        for (const move of body.ftsBuildChunks ?? []) {
+          const build = this.#ftsBuilds.get(move.key);
+          if (
+            build?.buildId !== move.buildId ||
+            !samePlacement(build.chunks[move.ordinal], move.from)
+          ) {
+            throw new Error(`OPFS staged postings chunk moved before relocation: ${move.key}`);
+          }
+        }
         for (const move of body.blocks) this.#blockIndex.set(move.id, move.placement);
         for (const move of body.ftsChunks) {
           const pointer = this.#ftsBases.get(move.key);
@@ -456,9 +514,17 @@ export class OpfsLeader {
           pointer.chunks[move.ordinal] = move.placement;
           this.#dropFtsChunkCache(move.key);
         }
+        for (const move of body.ftsBuildChunks ?? []) {
+          const build = this.#ftsBuilds.get(move.key);
+          if (build === undefined) {
+            throw new Error(`OPFS staged postings build is missing: ${move.key}`);
+          }
+          build.chunks[move.ordinal] = move.placement;
+        }
         this.#pool.release([
           ...body.blocks.map((move) => move.from),
           ...body.ftsChunks.map((move) => move.from),
+          ...(body.ftsBuildChunks ?? []).map((move) => move.from),
         ]);
         return undefined;
       }
@@ -467,16 +533,29 @@ export class OpfsLeader {
       case "updateTable": {
         const before = this.#core.getTable(body.id);
         const updated = this.#core.updateTable(body.id, body.expectedRevision, body.update);
-        if (before !== undefined && body.update.columns !== undefined) {
-          const retained = new Set(body.update.columns.map(({ id }) => id));
-          for (const column of before.columns) {
-            if (retained.has(column.id)) continue;
-            const key = `${before.id}/${column.id}`;
+        if (before !== undefined) {
+          const beforeStorageIds = new Set([
+            ...Object.keys(before.ftsColumns ?? {}),
+            ...Object.values(before.secondaryIndexes ?? {}).map((index) => index.storageColumnId),
+          ]);
+          const retainedStorageIds = new Set([
+            ...Object.keys(updated.ftsColumns ?? {}),
+            ...Object.values(updated.secondaryIndexes ?? {}).map((index) => index.storageColumnId),
+          ]);
+          for (const storageColumnId of beforeStorageIds) {
+            if (retainedStorageIds.has(storageColumnId)) continue;
+            const key = `${before.id}/${storageColumnId}`;
             const pointer = this.#ftsBases.get(key);
-            if (pointer === undefined) continue;
-            this.#ftsBases.delete(key);
-            this.#dropFtsChunkCache(key);
-            this.#pool.release(pointer.chunks);
+            if (pointer !== undefined) {
+              this.#ftsBases.delete(key);
+              this.#dropFtsChunkCache(key);
+              this.#pool.release(pointer.chunks);
+            }
+            const build = this.#ftsBuilds.get(key);
+            if (build !== undefined) {
+              this.#ftsBuilds.delete(key);
+              this.#pool.release(build.chunks);
+            }
           }
         }
         return updated;
@@ -490,6 +569,11 @@ export class OpfsLeader {
           this.#dropFtsChunkCache(key);
           this.#pool.release(pointer.chunks);
         }
+        for (const [key, build] of [...this.#ftsBuilds]) {
+          if (!key.startsWith(owned)) continue;
+          this.#ftsBuilds.delete(key);
+          this.#pool.release(build.chunks);
+        }
         return undefined;
       }
       case "removeFtsColumn": {
@@ -499,6 +583,11 @@ export class OpfsLeader {
           this.#ftsBases.delete(key);
           this.#dropFtsChunkCache(key);
           this.#pool.release(pointer.chunks);
+        }
+        const build = this.#ftsBuilds.get(key);
+        if (build !== undefined) {
+          this.#ftsBuilds.delete(key);
+          this.#pool.release(build.chunks);
         }
         this.#core.removeFtsColumn(body.tableId, body.columnId);
         return undefined;
@@ -597,6 +686,11 @@ export class OpfsLeader {
         return this.#core.removeTempOwner(body.ownerId);
       case "writeFtsBase": {
         const key = `${body.tableId}/${body.columnId}`;
+        const build = this.#ftsBuilds.get(key);
+        if (build !== undefined) {
+          this.#ftsBuilds.delete(key);
+          this.#pool.release(build.chunks);
+        }
         const previous = this.#ftsBases.get(key);
         if (previous !== undefined) {
           this.#pool.release(previous.chunks);
@@ -604,6 +698,66 @@ export class OpfsLeader {
         }
         this.#ftsBases.set(key, structuredClone(body.pointer));
         this.#core.pruneFtsDeltas(body.tableId, body.columnId, body.pointer.coversVersion);
+        return undefined;
+      }
+      case "beginFtsBaseBuild": {
+        const table = this.#core.getTable(body.tableId);
+        if (table === undefined || !activePostingStorageColumnIds(table).has(body.columnId)) {
+          throw new Error(`Postings index is no longer active: ${body.tableId}/${body.columnId}`);
+        }
+        const key = `${body.tableId}/${body.columnId}`;
+        const previous = this.#ftsBuilds.get(key);
+        if (previous !== undefined) this.#pool.release(previous.chunks);
+        this.#ftsBuilds.set(key, { buildId: body.buildId, chunks: [], chunkBounds: [] });
+        return undefined;
+      }
+      case "writeFtsBaseBuildChunk": {
+        const key = `${body.tableId}/${body.columnId}`;
+        const build = this.#ftsBuilds.get(key);
+        if (build?.buildId !== body.buildId) {
+          throw new Error(`Full-text base build changed: ${body.buildId}`);
+        }
+        if (body.ordinal !== build.chunks.length) {
+          throw new Error(`Full-text base chunk is out of order: ${String(body.ordinal)}`);
+        }
+        build.chunks.push(body.placement);
+        build.chunkBounds.push(body.bounds);
+        return undefined;
+      }
+      case "finishFtsBaseBuild": {
+        const key = `${body.tableId}/${body.columnId}`;
+        const build = this.#ftsBuilds.get(key);
+        if (build?.buildId !== body.buildId || build.chunks.length !== body.input.chunkCount) {
+          throw new Error(`Full-text base build is incomplete: ${body.buildId}`);
+        }
+        const table = this.#core.getTable(body.tableId);
+        if (table === undefined || !activePostingStorageColumnIds(table).has(body.columnId)) {
+          this.#ftsBuilds.delete(key);
+          this.#pool.release(build.chunks);
+          return undefined;
+        }
+        const previous = this.#ftsBases.get(key);
+        if (previous !== undefined) {
+          this.#pool.release(previous.chunks);
+          this.#dropFtsChunkCache(key);
+        }
+        this.#ftsBases.set(key, {
+          coversVersion: body.input.coversVersion,
+          totalTokens: body.input.totalTokens,
+          chunks: build.chunks,
+          chunkBounds: build.chunkBounds,
+        });
+        this.#ftsBuilds.delete(key);
+        this.#core.pruneFtsDeltas(body.tableId, body.columnId, body.input.coversVersion);
+        return undefined;
+      }
+      case "abortFtsBaseBuild": {
+        const key = `${body.tableId}/${body.columnId}`;
+        const build = this.#ftsBuilds.get(key);
+        if (build?.buildId === body.buildId) {
+          this.#ftsBuilds.delete(key);
+          this.#pool.release(build.chunks);
+        }
         return undefined;
       }
       case "importSnapshot": {
@@ -648,6 +802,7 @@ export class OpfsLeader {
       core: this.#core.dump(),
       blockIndex: [...this.#blockIndex.entries()],
       ftsBases: [...this.#ftsBases.entries()],
+      ftsBuilds: [...this.#ftsBuilds.entries()],
       extents: this.#pool.meta(),
     };
     const bytes = encodeSyncCheckpoint(state);
@@ -681,11 +836,17 @@ export class OpfsLeader {
           from.extent === extent ? [{ key, ordinal, from }] : [],
         ),
       );
-      if (blockSources.length === 0 && ftsSources.length === 0) {
+      const ftsBuildSources = [...this.#ftsBuilds.entries()].flatMap(([key, build]) =>
+        build.chunks.flatMap((from, ordinal) =>
+          from.extent === extent ? [{ key, buildId: build.buildId, ordinal, from }] : [],
+        ),
+      );
+      if (blockSources.length === 0 && ftsSources.length === 0 && ftsBuildSources.length === 0) {
         throw new Error(`OPFS extent ${String(extent)} has live bytes but no indexed payload`);
       }
       const blocks: BlockRelocation[] = [];
       const ftsChunks: FtsChunkRelocation[] = [];
+      const ftsBuildChunks: FtsBuildChunkRelocation[] = [];
       const appended: Placement[] = [];
       try {
         for (const source of blockSources) {
@@ -704,7 +865,15 @@ export class OpfsLeader {
           appended.push(placement);
           ftsChunks.push({ ...source, placement });
         }
-        this.#logged({ op: "relocatePayloads", blocks, ftsChunks });
+        for (const source of ftsBuildSources) {
+          const placement = await this.#pool.append(
+            await this.#pool.read(source.from),
+            this.#strict,
+          );
+          appended.push(placement);
+          ftsBuildChunks.push({ ...source, placement });
+        }
+        this.#logged({ op: "relocatePayloads", blocks, ftsChunks, ftsBuildChunks });
       } catch (error) {
         this.#pool.release(appended);
         throw error;
@@ -999,6 +1168,7 @@ export class OpfsLeader {
     update: {
       columns?: TableColumnRecord[];
       ftsColumns?: Record<string, FtsColumnIndexRecord> | null;
+      secondaryIndexes?: Record<string, SecondaryIndexRecord> | null;
       triggers?: TriggerRecord[] | null;
     },
   ): Promise<TableRecord> {
@@ -1335,33 +1505,100 @@ export class OpfsLeader {
     });
   }
 
+  async beginFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.#run(() => {
+      const table = this.#core.getTable(tableId);
+      if (table === undefined || !activePostingStorageColumnIds(table).has(columnId)) {
+        throw new Error(`Postings index is no longer active: ${tableId}/${columnId}`);
+      }
+      this.#logged({ op: "beginFtsBaseBuild", tableId, columnId, buildId });
+    });
+  }
+
+  async writeFtsBaseBuildChunk(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    ordinal: number,
+    chunk: FtsPosting[],
+  ): Promise<void> {
+    await this.#run(async () => {
+      const build = this.#ftsBuilds.get(`${tableId}/${columnId}`);
+      if (build?.buildId !== buildId) throw new Error(`Full-text base build changed: ${buildId}`);
+      if (ordinal !== build.chunks.length) {
+        throw new Error(`Full-text base chunk is out of order: ${String(ordinal)}`);
+      }
+      const placement = await this.#pool.append(encodeFtsChunk(chunk), this.#strict);
+      this.#logged({
+        op: "writeFtsBaseBuildChunk",
+        tableId,
+        columnId,
+        buildId,
+        ordinal,
+        placement,
+        bounds: { first: chunk[0]?.term ?? "", last: chunk[chunk.length - 1]?.term ?? "" },
+      });
+    });
+  }
+
+  async finishFtsBaseBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    input: { coversVersion: number; chunkCount: number; totalTokens: number },
+  ): Promise<void> {
+    await this.#run(async () => {
+      this.#logged({ op: "finishFtsBaseBuild", tableId, columnId, buildId, input });
+      await this.#deleteDrainedExtents();
+      await this.#compactFragmentedExtents();
+    });
+  }
+
+  async abortFtsBaseBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
+    await this.#run(async () => {
+      this.#logged({ op: "abortFtsBaseBuild", tableId, columnId, buildId });
+      await this.#deleteDrainedExtents();
+    });
+  }
+
   async readFtsCandidates(
     tableId: string,
     columnId: string,
-    terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+    terms: readonly FtsPostingQuery[],
     upToVersion: number,
   ): Promise<
-    FtsCandidates & { deltaChunkCount: number; totalTokens: number; coversVersion: number }
+    FtsCandidates & {
+      deltaChunkCount: number;
+      totalTokens: number;
+      coversVersion: number;
+      hasBase: boolean;
+    }
   > {
-    await this.#healthy();
-    const key = `${tableId}/${columnId}`;
-    const pointer = this.#ftsBases.get(key);
-    const coversVersion = pointer?.coversVersion ?? -1;
-    const deltas = this.#core.readFtsDeltas(tableId, columnId, coversVersion, upToVersion);
-    const baseChunks =
-      pointer === undefined
-        ? []
-        : await Promise.all(
-            selectFtsChunks(pointer.chunkBounds, terms).map((ordinal) =>
-              this.#loadFtsChunk(key, pointer, ordinal),
-            ),
-          );
-    return {
-      ...collectFtsCandidates([...baseChunks, ...deltas.chunkLists], terms),
-      deltaChunkCount: deltas.deltaChunkCount,
-      totalTokens: (pointer?.totalTokens ?? 0) + deltas.deltaTokens,
-      coversVersion,
-    };
+    return this.#run(async () => {
+      // Unlike immutable table blocks, derived-index extents are not protected by reader leases:
+      // DROP INDEX may reclaim them immediately. Hold the leader queue until every selected
+      // chunk is copied so a concurrent drop yields either the complete old base or no base,
+      // never a missing file halfway through a query.
+      const key = `${tableId}/${columnId}`;
+      const pointer = this.#ftsBases.get(key);
+      const coversVersion = pointer?.coversVersion ?? -1;
+      const deltas = this.#core.readFtsDeltas(tableId, columnId, coversVersion, upToVersion);
+      const baseChunks =
+        pointer === undefined
+          ? []
+          : await Promise.all(
+              selectFtsChunks(pointer.chunkBounds, terms).map((ordinal) =>
+                this.#loadFtsChunk(key, pointer, ordinal),
+              ),
+            );
+      return {
+        ...collectFtsCandidates([...baseChunks, ...deltas.chunkLists], terms),
+        deltaChunkCount: deltas.deltaChunkCount,
+        totalTokens: (pointer?.totalTokens ?? 0) + deltas.deltaTokens,
+        coversVersion,
+        hasBase: pointer !== undefined,
+      };
+    });
   }
 
   async #loadFtsChunk(
@@ -1524,12 +1761,15 @@ function placementsOf(entry: WalEntry): Placement[] {
       return entry.blocks.map(({ placement }) => placement);
     case "writeFtsBase":
       return entry.pointer.chunks;
+    case "writeFtsBaseBuildChunk":
+      return [entry.placement];
     case "importSnapshot":
       return entry.blockPlacements.map(({ placement }) => placement);
     case "relocatePayloads":
       return [
         ...entry.blocks.map(({ placement }) => placement),
         ...entry.ftsChunks.map(({ placement }) => placement),
+        ...(entry.ftsBuildChunks ?? []).map(({ placement }) => placement),
       ];
     default:
       return [];
@@ -1555,16 +1795,17 @@ function decodeFtsChunk(bytes: Uint8Array): FtsPosting[] {
 /** The ordinals of base chunks whose term range can contain any of the query's terms. */
 function selectFtsChunks(
   chunkBounds: ReadonlyArray<{ first: string; last: string }>,
-  terms: ReadonlyArray<{ term: string; prefix: boolean }>,
+  terms: readonly FtsPostingQuery[],
 ): number[] {
   const ordinals: number[] = [];
   for (const [ordinal, bounds] of chunkBounds.entries()) {
-    const needed = terms.some(({ term, prefix }) => {
-      if (bounds.last < term) return false;
-      if (prefix) {
-        return bounds.first <= `${term}￿` || bounds.first.startsWith(term);
-      }
-      return bounds.first <= term;
+    const needed = terms.some((query) => {
+      const lower = "term" in query ? query.term : query.lower;
+      const upper = "term" in query ? (query.prefix ? `${query.term}￿` : query.term) : query.upper;
+      return (
+        (lower === undefined || lower <= bounds.last) &&
+        (upper === undefined || upper >= bounds.first)
+      );
     });
     if (needed) ordinals.push(ordinal);
   }
@@ -1572,12 +1813,22 @@ function selectFtsChunks(
 }
 
 function invalidateFtsColumns(record: TableRecord): TableRecord {
-  if (record.ftsColumns === undefined) return record;
   const ftsColumns = Object.fromEntries(
-    Object.entries(record.ftsColumns).map(([columnId, state]) => [
+    Object.entries(record.ftsColumns ?? {}).map(([columnId, state]) => [
       columnId,
       { ...state, state: "invalid" as const },
     ]),
   );
-  return { ...record, ftsColumns };
+  const secondaryIndexes = Object.fromEntries(
+    Object.entries(record.secondaryIndexes ?? {}).map(([indexId, state]) => {
+      const { buildId: _abandonedBuild, ...invalid } = state;
+      void _abandonedBuild;
+      return [indexId, { ...invalid, state: "invalid" as const }];
+    }),
+  );
+  return {
+    ...record,
+    ...(Object.keys(ftsColumns).length === 0 ? {} : { ftsColumns }),
+    ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
+  };
 }

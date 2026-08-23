@@ -60,9 +60,11 @@ for every write path.
 
 ### Not yet, rather than never
 
-General secondary indexes, multiple unique constraints, composite primary and foreign keys, and
-savepoints are explicit entries in the rejected matrix. These are production-facing gaps, not
-forms omitted from the denominator.
+Composite and unique secondary indexes, multiple unique constraints, composite primary and
+foreign keys, and savepoints are explicit entries in the rejected matrix. These are
+production-facing gaps, not forms omitted from the denominator. Single-column non-unique
+secondary indexes are supported as a Minnow extension; SQL itself does not standardize physical
+index DDL.
 
 Correlated `EXISTS` and `NOT EXISTS` support equality and range comparisons by lowering them to
 semi-joins and anti-joins. Correlated scalar aggregates and `IN` still require equality.

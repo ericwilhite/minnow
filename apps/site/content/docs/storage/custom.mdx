@@ -29,7 +29,7 @@ const db = new MinnowDatabase(new MyBlockStore());
 | `TransactionStore`  | Manifests, segments, transaction records, and the atomic commit.       |
 | `LeaseStore`        | Reader pins that protect versions from garbage collection.             |
 | `MaintenanceStore`  | Resumable compaction and garbage-collection job records.               |
-| `FtsIndexStore`     | Full-text base chunks and candidate reads.                             |
+| `FtsIndexStore`     | Full-text and secondary postings bases, deltas, and candidate reads.   |
 | `TempSpillStore`    | Query spill pages and their owner leases.                              |
 
 The TSDoc in `@minnowdb/core/storage` explains the exact order of operations, the error types, and
@@ -48,10 +48,16 @@ not. `commitTransaction` is the heart of the interface: it checks the expected v
 the new version, finishes its segments, updates keys and full-text data, and marks the transaction
 complete in one saved step. A crash cannot leave half of that change visible.
 
-Catalog cleanup follows the same rule. When `updateTable` removes a column, that operation also
-removes the column from `ftsColumns` and deletes all of its full-text base chunks and commit
-deltas. `removeFtsColumn` provides the same cleanup directly. A dropped column must not leave an
-index growing invisibly for the rest of a long-running database's life.
+Catalog cleanup follows the same rule. When `updateTable` removes a column or secondary index,
+that operation also deletes all of its postings base chunks, staged generations, and commit
+deltas. `removeFtsColumn` provides the same cleanup directly. A dropped column or index must not
+leave storage growing invisibly for the rest of a long-running database's life.
+
+Postings builds are always bounded. `beginFtsBaseBuild`, `writeFtsBaseBuildChunk`,
+`finishFtsBaseBuild`, and `abortFtsBaseBuild` stage one small chunk at a time and publish the
+complete generation atomically. Starting a replacement reclaims an abandoned generation. These
+methods are required: an adapter must not fall back to one database-sized value during
+`CREATE INDEX`.
 
 `runGarbageCollectionStep` owns record reclamation as well as blob reclamation. It processes
 manifests, segments, blocks, then terminal transactions; a committed transaction can disappear

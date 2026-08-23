@@ -80,6 +80,13 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
         };
         survivesTermination: { rowsAfterRestart: number };
         checkpointCrossing: { rowsAfterReopen: number };
+        secondaryIndex: {
+          baseMatches: number;
+          tailMatches: number;
+          matchesAfterReopen: number;
+          usedBeforeReopen: boolean;
+          usedAfterReopen: boolean;
+        };
       }>;
     };
     return target.runOpfsStoreTest();
@@ -105,6 +112,14 @@ test("runs the OPFS store through real workers on real storage", async ({ page }
   // Forty batches cross the checkpoint interval several times; the cold reopen replayed
   // checkpoint plus tail back to the full row count.
   expect(result.checkpointCrossing.rowsAfterReopen).toBe(40);
+
+  // A staged index base plus a later delta survived a cold OPFS reopen, and EXPLAIN confirms
+  // both workers selected the index rather than merely producing the right answer by scanning.
+  expect(result.secondaryIndex.baseMatches).toBe(125);
+  expect(result.secondaryIndex.tailMatches).toBe(1);
+  expect(result.secondaryIndex.matchesAfterReopen).toBe(1);
+  expect(result.secondaryIndex.usedBeforeReopen).toBe(true);
+  expect(result.secondaryIndex.usedAfterReopen).toBe(true);
 
   expect(consoleErrors).toEqual([]);
 });

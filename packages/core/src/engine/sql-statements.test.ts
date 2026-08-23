@@ -107,6 +107,26 @@ describe("CREATE TABLE", () => {
 });
 
 describe("ON CONFLICT", () => {
+  it("DO REPLACE performs a whole-row upsert, including key-only tables", async () => {
+    const database = await seeded();
+    const replaced = await database.execute(
+      "INSERT INTO people (name, score) VALUES ('Ada', 99) ON CONFLICT (name) DO REPLACE RETURNING *",
+    );
+    expect(replaced).toMatchObject({
+      kind: "insert",
+      rowCount: 1,
+      returnedRows: [{ name: "Ada", score: 99 }],
+    });
+
+    await database.execute("CREATE TABLE singleton (id REAL PRIMARY KEY)");
+    await database.execute("INSERT INTO singleton (id) VALUES (1)");
+    await expect(
+      database.execute(
+        "INSERT INTO singleton (id) VALUES (1) ON CONFLICT (id) DO REPLACE RETURNING *",
+      ),
+    ).resolves.toMatchObject({ kind: "insert", rowCount: 1, returnedRows: [{ id: 1 }] });
+  });
+
   it("DO NOTHING skips existing keys and returns only inserted rows", async () => {
     const database = await seeded();
     const result = await database.execute(

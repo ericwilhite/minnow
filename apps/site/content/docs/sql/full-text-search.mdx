@@ -1,9 +1,9 @@
 ---
 title: Full-text search
-description: MATCH and BM25 over any column, with no index DDL.
+description: MATCH and BM25 over any column, with automatic full-text indexing.
 ---
 
-Search is part of an ordinary query. There is no `CREATE INDEX` and no shadow table:
+Search is part of an ordinary query. There is no full-text `CREATE INDEX` form and no shadow table:
 name the columns to search and the engine handles the rest.
 
 ```sql

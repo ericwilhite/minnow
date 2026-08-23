@@ -41,6 +41,12 @@ export interface ConsoleView {
 function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "rows") return `${String(result.result.rows.length)} rows`;
   if (result.kind === "create-table") return `created table ${result.table}`;
+  if (result.kind === "create-index") {
+    return `created index ${result.index} on ${result.table}.${result.column}`;
+  }
+  if (result.kind === "drop-index") {
+    return result.dropped ? `dropped index ${result.index}` : `no index ${result.index}`;
+  }
   if (result.kind === "create-trigger") return `created trigger ${result.name} on ${result.table}`;
   if (result.kind === "drop-trigger") return `dropped trigger ${result.name}`;
   if (result.kind === "add-column") return `added column ${result.table}.${result.column}`;

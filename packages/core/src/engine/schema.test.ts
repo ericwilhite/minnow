@@ -5,7 +5,7 @@ import {
   TableRecordConflictError,
   type BlockStore,
 } from "../storage/index.js";
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { toCatalog, type Catalog } from "./catalog.js";
 import { MinnowDatabase } from "./database.js";
 import {
@@ -35,6 +35,19 @@ const orders = table("orders", {
   total: column.number(),
 });
 
+function invalidColumnChainsAreRejectedByTypeScript(): void {
+  // @ts-expect-error nullable unique keys are invalid by construction
+  column.number().nullable().unique();
+  // @ts-expect-error a default-bearing column cannot subsequently become nullable
+  column.string().default("x").nullable();
+  // @ts-expect-error nullable columns do not take backfills
+  column.string().nullable().backfill("x");
+  // @ts-expect-error auto-increment is only available after a numeric unique key is declared
+  column.number().autoIncrement();
+  // @ts-expect-error SET NULL requires a nullable child column
+  column.number().references("parents", "id", { onDelete: "set null" });
+}
+
 function implementations(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
     { name: "memory", create: async () => new MemoryBlockStore() },
@@ -63,16 +76,37 @@ describe("schema DSL", () => {
   });
 
   it("rejects invalid table and schema definitions explicitly", () => {
+    expect(invalidColumnChainsAreRejectedByTypeScript).toBeTypeOf("function");
     expect(() =>
       table("bad", { a: column.number().unique(), b: column.string().unique() }),
     ).toThrow("may name at most one unique column");
-    expect(() => table("bad", { a: column.number().nullable().unique() })).toThrow(
-      "unique column must not be nullable",
-    );
+    expect(() =>
+      table("bad", {
+        a: (
+          column.number().nullable() as unknown as {
+            unique(): ReturnType<typeof column.number>;
+          }
+        ).unique(),
+      }),
+    ).toThrow("unique column must not be nullable");
     expect(() => schema([people, people])).toThrow("Duplicate table in schema: people");
     expect(() => schema([table("a", { x: column.number().references("missing", "y") })])).toThrow(
       "Relation target does not exist: a.x -> missing.y",
     );
+    expect(() => table(" ", { id: column.number() })).toThrow("Table name cannot start or end");
+    expect(() => table("bad", { "": column.number() })).toThrow("Column name cannot be empty");
+    expect(() =>
+      schema([
+        table("parents", { id: column.number(), label: column.string().unique() }),
+        table("children", { parent: column.number().references("parents", "id") }),
+      ]),
+    ).toThrow("Relation target must be the unique key");
+    expect(() =>
+      schema([
+        table("parents", { id: column.string().unique() }),
+        table("children", { parent: column.number().references("parents", "id") }),
+      ]),
+    ).toThrow("Relation types must match");
   });
 
   it("validates rows through the Standard Schema interface", () => {
@@ -84,6 +118,43 @@ describe("schema DSL", () => {
     } else {
       expect.unreachable("expected issues");
     }
+    const invalidScalars = table("values", {
+      id: column.number(),
+      at: column.datetime(),
+    })["~standard"].validate({ id: Number.NaN, at: new Date(Number.NaN) });
+    expect(
+      "issues" in invalidScalars ? invalidScalars.issues.map(({ path }) => path[0]) : [],
+    ).toEqual(["id", "at"]);
+  });
+});
+
+describe("typedTable SQL execution", () => {
+  it("routes inserts, updates, deletes, and reads through SQL", async () => {
+    const definition = table("typed_rows", {
+      id: column.number().unique(),
+      value: column.string(),
+      note: column.string().nullable(),
+    });
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(schema([definition]));
+    const execute = vi.spyOn(database, "execute");
+    const query = vi.spyOn(database, "query");
+    const handle = typedTable(database, definition);
+
+    await handle.insert([
+      { id: 1, value: "a" },
+      { id: 2, value: "b", note: "old" },
+    ]);
+    await handle.update({ keys: [1, 2], changes: { value: ["A", "B"], note: [undefined, "new"] } });
+    await handle.delete({ keys: [1] });
+    await expect(handle.rows()).resolves.toEqual([{ id: 2, value: "B", note: "new" }]);
+
+    expect(execute.mock.calls.map(([sql]) => sql.split(" ")[0])).toEqual([
+      "INSERT",
+      "UPDATE",
+      "DELETE",
+    ]);
+    expect(query).toHaveBeenCalledWith(expect.stringMatching(/^SELECT /));
   });
 });
 
@@ -118,20 +189,34 @@ describe("column defaults", () => {
   });
 
   it("rejects invalid default combinations explicitly", () => {
-    expect(() => table("bad", { a: column.string().default("x").nullable() })).toThrow(
-      "Defaults require a non-nullable column",
-    );
     expect(() =>
       table("bad", {
-        a: column
-          .string()
-          .default(() => "x")
-          .nullable(),
+        a: (
+          column.string().default("x") as unknown as {
+            nullable(): ReturnType<typeof column.string>;
+          }
+        ).nullable(),
       }),
     ).toThrow("Defaults require a non-nullable column");
-    expect(() => table("bad", { a: column.number().autoIncrement(), b: column.string() })).toThrow(
-      "Auto-increment requires the unique key column",
-    );
+    expect(() =>
+      table("bad", {
+        a: (
+          column.string().default(() => "x") as unknown as {
+            nullable(): ReturnType<typeof column.string>;
+          }
+        ).nullable(),
+      }),
+    ).toThrow("Defaults require a non-nullable column");
+    expect(() =>
+      table("bad", {
+        a: (
+          column.number() as unknown as {
+            autoIncrement(): ReturnType<typeof column.number>;
+          }
+        ).autoIncrement(),
+        b: column.string(),
+      }),
+    ).toThrow("Auto-increment requires the unique key column");
     expect(() => table("bad", { a: column.string().unique().default("constant") })).toThrow(
       "Unique key cannot default to a constant",
     );
@@ -878,7 +963,7 @@ describe("referential actions", () => {
     expect(() =>
       table("children", {
         id: column.number().unique(),
-        parent_id: column.number().references("parents", "id", { onDelete: "set null" }),
+        parent_id: column.number().references("parents", "id", { onDelete: "set null" as never }),
       }),
     ).toThrow("ON DELETE SET NULL requires a nullable column: children.parent_id");
   });
@@ -1082,8 +1167,13 @@ describe("views in the schema", () => {
   it("creates the view and reads through it", async () => {
     const store = new MemoryBlockStore();
     const database = new MinnowDatabase(store);
+    const runStatement = vi.spyOn(database, "runStatement");
     const result = await database.migrate(withView(ACTIVE_SQL));
     expect(result.replacedViews).toEqual(["active_customers"]);
+    expect(runStatement.mock.calls.map(([statement]) => statement.kind)).toEqual([
+      "create-table",
+      "create-view",
+    ]);
     await database.insertBatch("customers", [
       { id: 1, status: "active" },
       { id: 2, status: "churned" },
@@ -1421,6 +1511,21 @@ describe("planning a migration without engine access", () => {
     ]);
   });
 
+  it("rejects two rename targets claiming the same catalog column", () => {
+    expect(() =>
+      planMigration(
+        handBuilt,
+        schema([
+          table("notes", {
+            id: column.number().unique().autoIncrement(),
+            content: column.string().renamedFrom("body"),
+            duplicate: column.string().renamedFrom("body"),
+          }),
+        ]),
+      ),
+    ).toThrow("Rename source is used more than once: notes.body");
+  });
+
   it("plans nothing when the catalog already matches", () => {
     expect(planMigration(handBuilt, schema([notesTable()])).steps).toEqual([]);
   });
@@ -1688,7 +1793,14 @@ describe("adding a column with a backfill", () => {
       }),
     ).toThrow("Backfill value must be one of: free, paid");
     expect(() =>
-      table("t", { id: column.number().unique(), s: column.string().nullable().backfill("x") }),
+      table("t", {
+        id: column.number().unique(),
+        s: (
+          column.string().nullable() as unknown as {
+            backfill(value: string): ReturnType<typeof column.string>;
+          }
+        ).backfill("x"),
+      }),
     ).toThrow("A nullable column needs no backfill: t.s");
   });
 
@@ -1849,6 +1961,28 @@ describe("dropping columns and tables", () => {
     expect(await database.readTable("keep")).toEqual([{ id: 1 }]);
     await expect(database.query("SELECT body FROM keep")).rejects.toThrow();
     expect((await database.query("SELECT id FROM keep")).rows).toEqual([{ id: 1 }]);
+    store.close();
+  });
+
+  it("drops a managed view before the managed table it depends on", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    const owned = schema([table("source", { id: column.number().unique() })], {
+      views: [
+        view("source_ids", {
+          sql: "SELECT id FROM source",
+          columns: { id: column.number() },
+        }),
+      ],
+    });
+    await database.migrate(owned);
+    const dropped = await database.migrate(schema([]), {
+      allowDestructive: true,
+      schemaOwnsDatabase: true,
+    });
+    expect(dropped.steps.map(({ kind }) => kind)).toEqual(["drop-view", "drop-table"]);
+    expect(dropped.droppedViews).toEqual(["source_ids"]);
+    expect(dropped.droppedTables).toEqual(["source"]);
     store.close();
   });
 

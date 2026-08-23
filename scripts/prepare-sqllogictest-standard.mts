@@ -187,8 +187,12 @@ function writeSelectedFile(
 }
 
 function unsupportedReason(record: SqlLogicRecord): string | undefined {
-  if (record.kind === "statement" && /^\s*(?:CREATE|DROP)\s+INDEX\b/iu.test(record.sql)) {
-    return "secondary-index DDL is not implemented";
+  if (
+    record.kind === "statement" &&
+    /^\s*CREATE\s+INDEX\b/iu.test(record.sql) &&
+    /\([^)]*,/u.test(record.sql)
+  ) {
+    return "composite secondary-index DDL is not implemented";
   }
   if (record.kind !== "query") return undefined;
   const query: SqlLogicQuery = record;

@@ -485,13 +485,35 @@ describe("mutation builders", () => {
 
   it("routes orReplace() to the upsert path", async () => {
     const { db, database } = await seededDb();
-    await db
+    const execute = vi.spyOn(database, "execute");
+    const upsert = db
       .insertInto("people")
       .values({ name: "Ada", score: 99, city: "Cambridge" })
-      .orReplace()
-      .execute();
+      .orReplace();
+    expect(upsert.toSQL()).toEqual({
+      sql: 'INSERT INTO "people" ("name", "score", "city") VALUES ($1, $2, $3) ON CONFLICT ("name") DO REPLACE',
+      params: ["Ada", 99, "Cambridge"],
+    });
+    await upsert.execute();
+    expect(execute).toHaveBeenCalledWith(
+      expect.stringContaining('ON CONFLICT ("name") DO REPLACE'),
+      ["Ada", 99, "Cambridge"],
+    );
     const ada = await database.query("SELECT score, city FROM people WHERE name = 'Ada'");
     expect(ada.rows).toEqual([{ score: 99, city: "Cambridge" }]);
+  });
+
+  it("keeps key-only orReplace on the SQL upsert path", async () => {
+    const singleton = table("singleton", { id: column.number().unique() });
+    const singletonSchema = schema([singleton]);
+    type SingletonDb = InferDatabase<typeof singletonSchema>;
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(singletonSchema);
+    const db = new Minnow<SingletonDb>(database, { schema: singletonSchema });
+    await db.insertInto("singleton").values({ id: 1 }).execute();
+    await expect(
+      db.insertInto("singleton").values({ id: 1 }).orReplace().executeTakeFirstOrThrow(),
+    ).resolves.toEqual({ numInsertedRows: 1 });
   });
 
   it("mirrors the SQL mutation validation errors", async () => {
@@ -667,7 +689,7 @@ describe("mutation builders", () => {
     const db = new Minnow<NotesDB>(database, { schema: notesSchema });
 
     // Default-bearing columns are omissible in values(); explicit values pass through. The
-    // function default fills slug in the facade, before the batch reaches the engine. A mixed
+    // function default fills slug in the facade, before the INSERT reaches the engine. A mixed
     // batch reserves once past its explicit maximum, so the omitted row generates 11, not 1.
     const rows = await db
       .insertInto("notes")
