@@ -1322,16 +1322,20 @@ export class TempOwnerConflictError extends Error {
 
 /**
  * One coherent read of everything query preparation needs before touching blocks: the
- * current manifest version, the named table records, every segment of the found tables,
- * and the transaction records those segments reference. Stores that can produce this in
- * one atomic read collapse the sequential per-record round trips a prepare would
- * otherwise issue.
+ * current manifest version, the named table records, current segments of the found tables,
+ * and the transaction records those segments reference. Stores that can produce this in one
+ * atomic read collapse the sequential per-record round trips a prepare would otherwise issue.
  */
 export interface QueryCatalogState {
   manifestVersion: number | null;
+  /**
+   * Exact block set of manifestVersion, when resolving it was part of the same atomic read.
+   * Lets the engine pin that already-resolved snapshot instead of reading a large manifest twice.
+   */
+  manifestBlockIds?: string[];
   /** Positional per requested name; undefined where the table does not exist. */
   tables: Array<TableRecord | undefined>;
-  /** Segments of the found tables, sorted by id like listSegments. */
+  /** Current-manifest segments of the found tables, sorted by id like listSegments. */
   segments: SegmentRecord[];
   /** Records for the segments' transaction ids; missing records are omitted. */
   transactions: TransactionRecord[];
@@ -1777,8 +1781,9 @@ export interface BlockStore
   getCatalogProbe?(): Promise<CatalogProbe>;
   /**
    * Optional: one atomic catalog read for query preparation. Implementations must return
-   * the same records the individual getTableByName/listSegments/getTransactions calls
-   * would; callers fall back to those calls when this is absent.
+   * the named table records plus the segments and transactions reachable from the returned
+   * current manifest version. Historical records may be omitted: explicit version reads use
+   * listSegments/getTransactions instead. Callers fall back to those calls when this is absent.
    */
   getQueryCatalogState?(tableNames: readonly string[]): Promise<QueryCatalogState>;
   /**

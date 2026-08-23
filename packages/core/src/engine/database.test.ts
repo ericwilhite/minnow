@@ -34,6 +34,7 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   transactionGetCalls = 0;
   transactionBatchCalls = 0;
   segmentListCalls = 0;
+  manifestGetCalls = 0;
   blockIdsRead: string[][] = [];
   singleBlockIdsRead: string[] = [];
   pendingBlockJournalSizes: number[] = [];
@@ -75,6 +76,11 @@ class CountingMemoryBlockStore extends MemoryBlockStore {
   override async listSegments(tableId?: string) {
     this.segmentListCalls += 1;
     return super.listSegments(tableId);
+  }
+
+  override async getManifest(version: number) {
+    this.manifestGetCalls += 1;
+    return super.getManifest(version);
   }
 
   override async updateTransaction(
@@ -6167,10 +6173,12 @@ it("answers metadata-only queries without loading a data block", async () => {
     rows: [{ count: 3 }],
   });
   expect(store.blockReadCalls).toBe(0);
+  // Memory's atomic catalog read answers directly from RecordCore, so none of the composed
+  // per-record store methods run on this hot path.
   expect(store.transactionListCalls).toBe(0);
-  expect(store.transactionGetCalls).toBe(1);
-  expect(store.transactionBatchCalls).toBe(1);
-  expect(store.segmentListCalls).toBe(1);
+  expect(store.transactionGetCalls).toBe(0);
+  expect(store.transactionBatchCalls).toBe(0);
+  expect(store.segmentListCalls).toBe(0);
   store.close();
 });
 
@@ -6555,9 +6563,9 @@ it("shares one visibility catalog across multi-table query preparation", async (
     ),
   ).toEqual({ columns: ["count"], rows: [{ count: 2 }] });
   expect(store.transactionListCalls).toBe(0);
-  expect(store.transactionGetCalls).toBe(2);
-  expect(store.transactionBatchCalls).toBe(1);
-  expect(store.segmentListCalls).toBe(1);
+  expect(store.transactionGetCalls).toBe(0);
+  expect(store.transactionBatchCalls).toBe(0);
+  expect(store.segmentListCalls).toBe(0);
   store.close();
 });
 
@@ -7743,6 +7751,9 @@ describe("prepared-input cache and shared read lease", () => {
       "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region",
     );
     expect(store.blockReadCalls).toBeGreaterThan(0);
+    // The atomic catalog state carries the exact manifest block set. Pinning that version must
+    // validate the lease, but must not resolve the same manifest a second time first.
+    expect(store.manifestGetCalls).toBe(0);
     const blockReadsAfterFirst = store.blockReadCalls;
     const leasesAfterFirst = store.leaseCreates;
     const second = await database.query(

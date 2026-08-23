@@ -111,9 +111,9 @@ when that is what you want.
 optimizing the vendored browser engines; the build wrapper still accepts `--turbopack` when you
 want to investigate that path directly.
 
-See [Testing](https://minnowdb.com/docs/reference/testing/) for the full runner map and the
-release gate, and [Versioning](https://minnowdb.com/docs/reference/versioning/) for how a release
-is cut.
+See [SQL conformance & testing](https://minnowdb.com/docs/conformance/) for the strategy and proof,
+[Testing & benchmarks](https://minnowdb.com/docs/reference/testing/) for the full runner map, and
+[Versioning](https://minnowdb.com/docs/reference/versioning/) for how a release is cut.
 
 ## Deployment
 

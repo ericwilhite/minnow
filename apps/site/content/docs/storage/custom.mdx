@@ -108,6 +108,13 @@ snapshot pair are optional so an adapter that can do something in one atomic ste
 Callers trust a present method completely and fall back to sequential calls otherwise — never
 implement one as the sequential calls in a trench coat.
 
+`getQueryCatalogState` returns the named tables plus only the segments and transactions reachable
+from the current manifest version returned in the same atomic read. Include that manifest's exact
+block IDs too, so the engine can pin the already-resolved snapshot instead of reading it again. Do
+not return staged or superseded history: current-version query preparation must not grow with
+retained time-travel history. Explicit historical reads use the paged segment and transaction
+methods instead.
+
 **Tabs are plural and mortal.** Several connections may open one database; readers never block
 writers; a connection can die between any two operations without corrupting anything. How you
 achieve that is yours: the IndexedDB adapter leans on storage transactions, the OPFS adapter

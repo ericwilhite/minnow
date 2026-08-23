@@ -123,12 +123,19 @@ export class LeasedSnapshot extends Snapshot {
    * (`SnapshotManifestMissingError`, `LeaseConflictError`) leave this snapshot open and pass
    * through.
    */
-  async moveTo(version: number | null, ttlMs: number): Promise<LeasedSnapshot | undefined> {
+  async moveTo(
+    version: number | null,
+    ttlMs: number,
+    knownBlockIds?: readonly string[],
+  ): Promise<LeasedSnapshot | undefined> {
     this.#assertOpen();
     validateTtl(ttlMs);
     const move = this.#store.moveLease?.bind(this.#store);
     if (move === undefined) return undefined;
-    const target = await loadSnapshot(this.#store, version);
+    const target =
+      knownBlockIds === undefined
+        ? await loadSnapshot(this.#store, version)
+        : new Snapshot(this.#store, version, knownBlockIds);
     const expiresAt = new Date(this.now().getTime() + ttlMs).toISOString();
     const record = await move(this.#record.id, this.#record.revision, version, expiresAt);
     this.#released = true;
@@ -784,7 +791,10 @@ export class TransactionManager {
     return new Snapshot(this.store, current?.version ?? null, current?.blockIds ?? []);
   }
 
-  async openLeasedSnapshot(options: OpenLeasedSnapshotOptions): Promise<LeasedSnapshot> {
+  async openLeasedSnapshot(
+    options: OpenLeasedSnapshotOptions,
+    knownBlockIds?: readonly string[],
+  ): Promise<LeasedSnapshot> {
     validateTtl(options.ttlMs);
     if (options.ownerId.trim().length === 0) throw new TypeError("Lease owner cannot be empty");
     if (options.id?.trim().length === 0) {
@@ -792,7 +802,10 @@ export class TransactionManager {
     }
     const id = options.id ?? this.#createId();
     for (;;) {
-      const snapshot = await this.openSnapshot(options.version);
+      const snapshot =
+        knownBlockIds === undefined
+          ? await this.openSnapshot(options.version)
+          : new Snapshot(this.store, options.version ?? null, knownBlockIds);
       const record: LeaseRecord = {
         id,
         kind: options.kind ?? "reader",
@@ -830,20 +843,21 @@ export class TransactionManager {
   async moveLeasedSnapshot(
     snapshot: LeasedSnapshot,
     options: OpenLeasedSnapshotOptions & { version: number | null },
+    knownBlockIds?: readonly string[],
   ): Promise<LeasedSnapshot> {
     validateTtl(options.ttlMs);
     try {
-      const moved = await snapshot.moveTo(options.version, options.ttlMs);
+      const moved = await snapshot.moveTo(options.version, options.ttlMs, knownBlockIds);
       if (moved !== undefined) return moved;
     } catch (error) {
       if (!(error instanceof LeaseConflictError)) throw error;
       // Not ours to move any more — swept after expiring, most likely. A fresh lease takes its
       // place; whatever record remains is left to expire rather than deleted from under anyone.
-      const replacement = await this.openLeasedSnapshot(options);
+      const replacement = await this.openLeasedSnapshot(options, knownBlockIds);
       snapshot.discard();
       return replacement;
     }
-    const replacement = await this.openLeasedSnapshot(options);
+    const replacement = await this.openLeasedSnapshot(options, knownBlockIds);
     await snapshot.release();
     return replacement;
   }

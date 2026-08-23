@@ -95,7 +95,7 @@ npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select
 npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select5.test --trace --trace-from 800
 ```
 
-It runs 1,816 statements and 4,205 queries, checking 219,677 scalar results across 6,013 source
+It runs 1,822 statements and 4,205 queries, checking 219,677 scalar results across 6,029 source
 records. The standard set includes representative five-table and seventeen-table join-order
 families that previously exposed pathological Cartesian work. On the development machine used to
 introduce it, the whole profile took about ten seconds. That makes the broad suite part of
@@ -108,12 +108,12 @@ The supported full profile adds the exhaustive multi-way join families:
 npm run test:sql:full
 ```
 
-It is fully runnable locally, reports progress every 500 records, and contains 8,552 of the five
-selected upstream files' 10,708 records: 1,806 statements, 6,744 queries, and 4,927,952 checked
-scalar results. The remaining 2,156 are
+It is fully runnable locally, reports progress every 500 records, and contains 8,568 of the five
+selected upstream files' 10,708 records: 1,822 statements, 6,744 queries, and 4,927,952 checked
+scalar results. The remaining 2,140 are
 not hidden: `standard-exclusions.json` records the source file, source line, scope, and reason for
-every one. They currently cover secondary-index DDL, non-equality correlated scalar aggregates,
-and correlated `EXISTS` below `OR`. A further 2,539 supported exhaustive-join records move from
+every one. They currently cover non-equality correlated scalar aggregates and correlated
+`EXISTS` below `OR`. A further 2,539 supported exhaustive-join records move from
 the standard profile to the full one solely because of runtime.
 
 The corpus is pinned to immutable revision

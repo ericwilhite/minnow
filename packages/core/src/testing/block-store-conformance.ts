@@ -984,6 +984,21 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
             (await store.getTableByName("t"))?.id,
             "getQueryCatalogState must return the same records the individual reads do",
           );
+          checkEqual(
+            state.segments,
+            [],
+            "getQueryCatalogState must omit staged segments outside the current manifest",
+          );
+          checkEqual(
+            state.transactions,
+            [],
+            "getQueryCatalogState must omit transactions used only by non-current segments",
+          );
+          checkEqual(
+            state.manifestBlockIds,
+            [],
+            "getQueryCatalogState must return the exact current manifest block set",
+          );
         }
         store.close();
       },

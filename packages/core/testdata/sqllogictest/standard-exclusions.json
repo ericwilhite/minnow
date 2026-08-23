@@ -45,14 +45,14 @@
       "source": "test/select4.test",
       "sourceSha256": "155ff6bb9bbf7c2dcf1e5659bb1688dec5dab58126f8dc66d23dcae6df43f59e",
       "sourceRecords": 3857,
-      "standardIncludedRecords": 2041,
-      "fullIncludedRecords": 3851,
-      "allProfileExcludedRecords": 6,
+      "standardIncludedRecords": 2047,
+      "fullIncludedRecords": 3857,
+      "allProfileExcludedRecords": 0,
       "standardOnlyExcludedRecords": 1810,
       "standardOutput": "standard-select4.test",
-      "standardOutputSha256": "21a1e159aa9972f3f60e10517a1226b164f1d31ae5d78c38a8fffc2dfaa93508",
+      "standardOutputSha256": "2ce1545fcafde030ecec9deece70905d32d7b2fdf68c2007a224748e0010d488",
       "fullOutput": "full-select4.test",
-      "fullOutputSha256": "217feb4de64151f3bf8fd06c52bf5098e481803ca1d6880073a7ad72e7fee4c1"
+      "fullOutputSha256": "0deab3c6b821d4335e1613665c9ed8f614eeebbd24ec2e6f3ff339fe44eaacba"
     },
     {
       "source": "test/select5.test",
@@ -69,9 +69,9 @@
     }
   ],
   "sourceRecords": 10708,
-  "standardIncludedRecords": 6023,
-  "fullIncludedRecords": 8562,
-  "allProfileExcludedRecords": 2146,
+  "standardIncludedRecords": 6029,
+  "fullIncludedRecords": 8568,
+  "allProfileExcludedRecords": 2140,
   "standardOnlyExcludedRecords": 2539,
   "exclusions": [
     {
@@ -15053,48 +15053,6 @@
       "kind": "query",
       "scope": "all-profiles",
       "reason": "correlated scalar aggregates over non-equality predicates are not implemented"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 3136,
-      "kind": "statement",
-      "scope": "all-profiles",
-      "reason": "composite secondary-index DDL is not implemented"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 3139,
-      "kind": "statement",
-      "scope": "all-profiles",
-      "reason": "composite secondary-index DDL is not implemented"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 3142,
-      "kind": "statement",
-      "scope": "all-profiles",
-      "reason": "composite secondary-index DDL is not implemented"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 3145,
-      "kind": "statement",
-      "scope": "all-profiles",
-      "reason": "composite secondary-index DDL is not implemented"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 3148,
-      "kind": "statement",
-      "scope": "all-profiles",
-      "reason": "composite secondary-index DDL is not implemented"
-    },
-    {
-      "source": "test/select4.test",
-      "line": 3181,
-      "kind": "statement",
-      "scope": "all-profiles",
-      "reason": "composite secondary-index DDL is not implemented"
     },
     {
       "source": "test/select4.test",

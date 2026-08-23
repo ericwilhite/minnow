@@ -1173,7 +1173,10 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
-    const transaction = this.#transaction(["catalog", "segments", "transactions"], "readonly");
+    const transaction = this.#transaction(
+      ["catalog", "manifests", "segments", "transactions"],
+      "readonly",
+    );
     const catalog = transaction.objectStore("catalog");
     const [versionValue, epochValue, tableIds] = await Promise.all([
       requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
@@ -1204,7 +1207,27 @@ export class IndexedDbBlockStore implements BlockStore {
     const segmentValues = await Promise.all(
       foundTableIds.map((tableId) => requestResult<unknown[]>(segmentIndex.getAll(tableId))),
     );
-    const segments = segmentValues.flat().map((value) => asSegmentRecord(value));
+    const manifestStore = transaction.objectStore("manifests");
+    const manifestValue: unknown =
+      typeof versionValue === "number"
+        ? await requestResult(manifestStore.get(versionValue))
+        : undefined;
+    const currentManifest =
+      manifestValue === undefined
+        ? undefined
+        : await resolveManifestInTransaction(manifestStore, asStoredManifestRecord(manifestValue));
+    const visibleBlockIds = new Set(currentManifest?.blockIds ?? []);
+    // The version, manifest and records share this readonly transaction. Historical segments
+    // retained for time travel are not inputs to a current-version query; explicit version reads
+    // take the listSegments path and continue to see them.
+    const segments = segmentValues
+      .flat()
+      .map((value) => asSegmentRecord(value))
+      .filter((record) =>
+        Object.values(record.columnBlockIds)
+          .flat()
+          .every((blockId) => visibleBlockIds.has(blockId)),
+      );
     segments.sort((left, right) => left.id.localeCompare(right.id));
     const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
     const transactionStore = transaction.objectStore("transactions");
@@ -1214,6 +1237,7 @@ export class IndexedDbBlockStore implements BlockStore {
     await transactionDone(transaction);
     return {
       manifestVersion: typeof versionValue === "number" ? versionValue : null,
+      manifestBlockIds: [...visibleBlockIds].sort(),
       tables,
       segments,
       transactions: transactionValues

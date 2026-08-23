@@ -11,6 +11,7 @@
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import { MemoryBlockStore } from "../packages/core/src/storage/index.js";
 import { MinnowDatabase } from "../packages/core/src/engine/database.js";
 
@@ -99,6 +100,8 @@ interface PerfQuery {
   readonly name: string;
   readonly sql: string;
   readonly params?: ReadonlyArray<number | string>;
+  /** SQL only guarantees row order when the statement has an outer ORDER BY. */
+  readonly ordered?: boolean;
   /** Serve Minnow's probe-validated result memo instead of re-executing (gates memo-hit latency). */
   readonly memoize?: boolean;
 }
@@ -117,6 +120,7 @@ const QUERIES: readonly PerfQuery[] = [
   {
     name: "top-n",
     sql: "SELECT id, amount FROM data ORDER BY amount DESC, id LIMIT 100",
+    ordered: true,
   },
   {
     name: "join-aggregate",
@@ -152,6 +156,7 @@ const QUERIES: readonly PerfQuery[] = [
     // function and an unpaged report both pay for.
     name: "sort-numeric",
     sql: "SELECT id, amount FROM data ORDER BY amount",
+    ordered: true,
   },
   {
     // A page deep enough that a bounded top-K sink would retain most of what it scans. The
@@ -161,6 +166,7 @@ const QUERIES: readonly PerfQuery[] = [
     // where it was measured instead of drifting.
     name: "deep-page",
     sql: "SELECT id, amount FROM data ORDER BY region, id LIMIT 100000",
+    ordered: true,
   },
   {
     // The same point lookup, run while the catalog holds many more tables than the query
@@ -203,6 +209,52 @@ const QUERIES: readonly PerfQuery[] = [
 function median(samples: number[]): number {
   const sorted = [...samples].sort((left, right) => left - right);
   return sorted[Math.floor(sorted.length / 2)] ?? 0;
+}
+
+/**
+ * Makes the native SQLite result and Minnow's public row objects comparable without weakening
+ * SQL semantics. Unordered statements compare as multisets; an outer ORDER BY compares in exact
+ * row order. The gate refuses to time a read until this check passes, so an optimization cannot
+ * improve its number by returning fewer, different, or misordered rows.
+ */
+function comparableRows(rows: ReadonlyArray<Record<string, unknown>>, ordered: boolean): string[] {
+  const comparable = rows.map((row) =>
+    JSON.stringify(
+      Object.keys(row)
+        .sort()
+        .map((name) => [name, comparableValue(row[name])]),
+    ),
+  );
+  return ordered ? comparable : comparable.sort();
+}
+
+function comparableValue(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "bigint") return Number(value);
+  // JSON.stringify turns NaN into null and negative zero into zero; be explicit about both so a
+  // future workload that reaches them fails rather than accidentally equating distinct values.
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+  if (Object.is(value, -0)) return "-0";
+  return value;
+}
+
+function assertQueryEquivalent(query: PerfQuery, minnowResult: unknown, sqliteRows: unknown): void {
+  const actual = (minnowResult as { rows?: Array<Record<string, unknown>> }).rows;
+  if (!Array.isArray(actual) || !Array.isArray(sqliteRows)) {
+    throw new Error(`${query.name}: performance correctness check did not receive row results`);
+  }
+  const actualRows = comparableRows(actual, query.ordered === true);
+  const expectedRows = comparableRows(
+    sqliteRows as Array<Record<string, unknown>>,
+    query.ordered === true,
+  );
+  if (!isDeepStrictEqual(actualRows, expectedRows)) {
+    throw new Error(
+      `${query.name}: Minnow differs from SQLite before timing\n` +
+        `expected ${JSON.stringify(expectedRows.slice(0, 5))}\n` +
+        `received ${JSON.stringify(actualRows.slice(0, 5))}`,
+    );
+  }
 }
 
 /**
@@ -325,6 +377,11 @@ const MUTATIONS: readonly PerfMutation[] = [
     params: (n) => ["alpha", "west", (n % 1_000) + 1],
   },
 ];
+
+const MUTATION_CHECK: PerfQuery = {
+  name: "mutation-state",
+  sql: "SELECT COUNT(*) AS n, SUM(amount) AS amount, SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) AS alpha FROM data_mut",
+};
 
 function minnowRunner(database: MinnowDatabase, query: PerfQuery): () => Promise<unknown> {
   // By default the gate measures execution, not the probe-validated result memo (which would
@@ -680,6 +737,7 @@ for (const query of QUERIES) {
     sqlite: () => statement.all(...sqliteParams),
     pglite: pgliteRunner(query),
   };
+  assertQueryEquivalent(query, await runners.minnow(), runners.sqlite());
   // One iteration count per query, taken from the slowest engine's single run so that every
   // engine's sample clears the timer's resolution, and shared so the ratio compares like with
   // like.
@@ -707,11 +765,13 @@ for (const query of QUERIES) {
 for (const mutation of MUTATIONS) {
   const statement = sqlite.prepare(mutation.sql);
   const pgliteSql = positionalToNumbered(mutation.sql);
-  let counter = 0;
+  // Each engine gets the same logical sequence. A shared counter made the three runners touch
+  // disjoint keys, which looked equivalent in timing but prevented a meaningful state check.
+  const counters = { minnow: 0, sqlite: 0, pglite: 0 };
   const runners = {
-    minnow: () => minnow.execute(mutation.sql, mutation.params(counter++) as never),
-    sqlite: () => statement.run(...(mutation.params(counter++) as Array<number | string>)),
-    pglite: () => pglite.query(pgliteSql, [...mutation.params(counter++)]),
+    minnow: () => minnow.execute(mutation.sql, mutation.params(counters.minnow++) as never),
+    sqlite: () => statement.run(...(mutation.params(counters.sqlite++) as Array<number | string>)),
+    pglite: () => pglite.query(pgliteSql, [...mutation.params(counters.pglite++)]),
   };
   const singleRuns = [
     await warmUp(runners.minnow),
@@ -727,6 +787,11 @@ for (const mutation of MUTATIONS) {
       pglite: await timeRepeated(runners.pglite, iterations),
     },
   });
+  assertQueryEquivalent(
+    MUTATION_CHECK,
+    await minnow.query(MUTATION_CHECK.sql, { memoize: false }),
+    sqlite.prepare(MUTATION_CHECK.sql).all(),
+  );
 }
 
 /**
@@ -746,6 +811,7 @@ for (const query of SETTLED_QUERIES) {
     sqlite: () => statement.all(...sqliteParams),
     pglite: pgliteRunner(query),
   };
+  assertQueryEquivalent(query, await runners.minnow(), runners.sqlite());
   const singleRuns = [
     await warmUp(runners.minnow),
     await warmUp(runners.sqlite),
@@ -782,6 +848,12 @@ for (const query of SETTLED_QUERIES) {
   started = performance.now();
   await pglite.query("DELETE FROM data_mut WHERE id BETWEEN $1 AND $2", [first, last]);
   deleteMs.pglite = performance.now() - started;
+
+  assertQueryEquivalent(
+    MUTATION_CHECK,
+    await minnow.query(MUTATION_CHECK.sql, { memoize: false }),
+    sqlite.prepare(MUTATION_CHECK.sql).all(),
+  );
 
   results.push({
     name: "bulk-delete",

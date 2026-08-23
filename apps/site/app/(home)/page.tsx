@@ -74,6 +74,54 @@ export default function HomePage() {
       </section>
 
       <section className="mx-auto w-full max-w-6xl px-4 pb-20">
+        <div className="mb-8 rounded-xl border border-fd-border bg-fd-card p-6 text-left sm:p-8">
+          <div className="grid gap-6 lg:grid-cols-[1.25fr_1fr] lg:items-center">
+            <div>
+              <p className="mb-2 text-sm font-medium text-fd-primary">Correctness is a gate</p>
+              <h2 className="text-balance text-2xl font-semibold tracking-tight">
+                SQL support that is tested, not asserted
+              </h2>
+              <p className="mt-3 max-w-2xl text-sm leading-6 text-fd-muted-foreground">
+                Every feature-matrix example executes in the engine. The full upstream profile runs
+                6,744 SQLLogicTest queries and checks 4,927,952 scalar results, with every exclusion
+                named by source line and reason. The full release check also covers deterministic
+                fault simulation, memory plateaus, performance gates, and real-browser storage.
+              </p>
+              <div className="mt-5 flex flex-wrap gap-3">
+                <Link
+                  href="/docs/conformance"
+                  className="rounded-lg bg-fd-primary px-4 py-2 text-sm font-medium text-fd-primary-foreground"
+                >
+                  See the testing strategy
+                </Link>
+                <Link
+                  href="/docs/sql/feature-matrix"
+                  className="rounded-lg border border-fd-border px-4 py-2 text-sm font-medium hover:bg-fd-accent"
+                >
+                  Explore SQL support
+                </Link>
+              </div>
+            </div>
+            <dl className="grid grid-cols-2 gap-3 text-center">
+              <div className="rounded-lg border border-fd-border p-4">
+                <dt className="text-2xl font-semibold tabular-nums">6,744</dt>
+                <dd className="mt-1 text-xs text-fd-muted-foreground">upstream queries</dd>
+              </div>
+              <div className="rounded-lg border border-fd-border p-4">
+                <dt className="text-2xl font-semibold tabular-nums">4.9M</dt>
+                <dd className="mt-1 text-xs text-fd-muted-foreground">checked values</dd>
+              </div>
+              <div className="rounded-lg border border-fd-border p-4">
+                <dt className="text-2xl font-semibold tabular-nums">3</dt>
+                <dd className="mt-1 text-xs text-fd-muted-foreground">browser engines</dd>
+              </div>
+              <div className="rounded-lg border border-fd-border p-4">
+                <dt className="text-2xl font-semibold tabular-nums">0</dt>
+                <dd className="mt-1 text-xs text-fd-muted-foreground">silent skips</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
         <div className="grid gap-4 sm:grid-cols-2">
           {FACTS.map((fact) => (
             <div key={fact.title} className="rounded-xl border border-fd-border p-5">

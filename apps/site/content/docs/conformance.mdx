@@ -1,0 +1,104 @@
+---
+title: SQL conformance & testing
+description: Executable SQL support, upstream corpus coverage, deterministic simulation, and the gates every release must pass.
+---
+
+Minnow treats correctness as a release property, not a confidence level. Its SQL surface is an
+executable fixture, its fast local suite checks thousands of upstream queries, and its full profile
+checks millions of scalar results. Concurrency, storage faults, browser behavior, memory growth,
+and performance have separate gates because a correct query engine is not enough to make a safe
+database.
+
+<Callout type="info" title="The short version">
+  The release SQL profile runs 6,744 upstream queries and checks 4,927,952 scalar results. The
+  feature matrix executes every supported example through both query executors and verifies every
+  rejected form still fails deliberately. There are no silent corpus skips.
+</Callout>
+
+## SQL support is an executable contract
+
+The [SQL feature matrix](/docs/sql/feature-matrix) is loaded from
+`@minnowdb/core/sql-feature-matrix.json`. It is the same fixture the engine tests:
+
+- Every supported example runs through the ordinary database API and the lower-level executor.
+- Every rejected example must fail with its recorded error. Unsupported syntax does not silently
+  produce a plausible answer.
+- Standard features carry their ISO/IEC 9075:2023 Annex F identifier. Minnow-specific forms are
+  marked as extensions instead of being presented as standard SQL.
+- Results are diffed against SQLite and PostgreSQL wherever the engines agree on the intended
+  semantics. Deliberate differences are recorded with their reason.
+
+That is the boundary of the claim: Minnow implements the supported subset shown in the matrix. It
+does not claim all of SQL:2023, and missing production-facing forms stay visible in the rejected
+list until the implementation and its tests land together.
+
+## Broad SQLLogicTest coverage
+
+Minnow has a streaming runner for SQLite's database-neutral
+[SQLLogicTest format](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki). The corpus is
+pinned by revision and SHA-256, committed in runnable profiles, and processed one record at a time,
+so broad correctness testing does not require the corpus to live in memory.
+
+| Profile      | Coverage                                                                                      | Policy                                       |
+| ------------ | --------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| **Standard** | 4,205 queries and 219,677 checked values, including five-table and seventeen-table join cases | Runs locally in `npm test`, `check`, and CI  |
+| **Full**     | 6,744 queries and 4,927,952 checked values, including exhaustive join permutations            | Runs locally, nightly, and before publishing |
+
+The full profile includes 8,568 of the five selected upstream files' 10,708 records. The other
+2,140 are individually recorded in `standard-exclusions.json` with source file, source line,
+scope, and reason: correlated scalar aggregates over non-equality predicates, and correlated
+`EXISTS` below `OR`. Another 2,539 supported exhaustive-join records move out of the standard
+profile only to keep the normal local loop fast. There is no wildcard skip list.
+
+## More than query answers
+
+Database failures live at boundaries a SQL corpus does not exercise, so the release strategy has
+independent layers:
+
+- **Generated and differential tests** compare columnar execution with independent row-based
+  oracles across committed seeds. A discovered failure seed becomes a permanent regression.
+- **Deterministic simulation** controls concurrent clients, storage completion order, crash
+  points, compaction, and garbage collection. A failing seed and plan replay exactly.
+- **Format compatibility fixtures** reopen every released block and snapshot format, verify its
+  answers, and write into the restored database.
+- **Fault and quota sweeps** interrupt each storage operation in turn and require the reopened
+  state to be wholly before or wholly after the write—never torn.
+- **Real-browser suites** exercise the published worker entry, IndexedDB, OPFS, the docs examples,
+  and the live benchmark harness in Chromium, Firefox, and WebKit.
+- **Memory and storage soaks** require heap use to plateau after warm-up and on-disk metadata to
+  converge after long mutation histories.
+- **The performance gate** verifies seeded read, write, mutation-history, and maintenance shapes
+  against a checked-in baseline. Every timed read is answer-checked first.
+
+## Run it locally
+
+The broad suites are not CI-only. Start with the smallest command that proves the change, then
+escalate before merging or publishing:
+
+```bash
+npm test                       # unit/generative + standard SQLLogicTest
+npm run test:sql:standard      # fast upstream SQL profile
+npm run test:sql:full          # complete supported upstream profile
+npm run test:simulator:full    # long deterministic concurrency/fault run
+npm run benchmark:gate         # seeded performance regression gate
+npm run soak:memory            # forced-GC plateau checks
+npm run test:browser           # Chromium, Firefox, and WebKit
+npm run check:release          # all release-required layers
+```
+
+Use `npm run test:sql:logic -- --file <path> --stop-after <records>` to isolate a corpus boundary,
+or `npm run soak -- --rounds 200` to explore fresh generated seeds. See
+[Testing & benchmarks](/docs/reference/testing) for every runner, replay command, corpus
+provenance, maintenance invariant, and release workflow.
+
+## Release policy
+
+Every push and pull request runs the standard SQL profile, heap plateau check, and real-browser
+suite as part of the merge gate. The full SQL profile and long simulator run nightly and on
+demand; publishing repeats both against the exact commit that passed the merge gate. The
+performance gate runs nightly and whenever its runner or baseline changes. `npm run check:release`
+is the complete local pre-publish command: it combines those layers in one reproducible run.
+
+The practical rule is simple: a SQL capability lands with a focused regression, a feature-matrix
+entry, and broad-corpus coverage where the corpus contains it. A correctness bug lands with the
+smallest permanent reproduction that would have prevented it.

@@ -30,9 +30,11 @@ import { MinnowDatabase } from "./database.js";
 class CountingStore extends MemoryBlockStore {
   reads = 0;
   bytes = 0;
+  blockIds: string[] = [];
 
   override async getBlocks(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
     this.reads += ids.length;
+    this.blockIds.push(...ids);
     const blocks = await super.getBlocks(ids);
     for (const block of blocks) if (block !== undefined) this.bytes += block.byteLength;
     return blocks;
@@ -145,5 +147,40 @@ describe("zone-map pruning across a mutation history", () => {
     expect(
       (await database.query("SELECT COUNT(*) AS n FROM items", { memoize: false })).rows,
     ).toEqual([{ n: ROWS - 1 }]);
+  });
+
+  it("does not replay patched columns from deltas whose immutable keys cannot match", async () => {
+    const { database, store } = await seeded();
+    for (let id = 1; id <= 64; id += 1) {
+      await database.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [id]);
+    }
+    const table = await store.getTableByName("items");
+    if (table === undefined) throw new Error("items table is missing");
+    const amountColumn = table.columns.find((column) => column.name === "amount");
+    if (amountColumn === undefined) throw new Error("amount column is missing");
+    const irrelevantPatchBlockIds = new Set(
+      (await store.listSegments(table.id))
+        .filter((segment) => segment.kind === "update")
+        .flatMap((segment) => segment.columnBlockIds[amountColumn.id] ?? []),
+    );
+
+    // A second database has a cold decoded-block cache but sees the same committed history.
+    // It must inspect delta key headers, while loading none of their irrelevant patch payloads.
+    const reader = new MinnowDatabase(store, {
+      rowsPerBlock: ROWS_PER_BLOCK,
+      autoCompact: false,
+    });
+    store.reads = 0;
+    store.bytes = 0;
+    store.blockIds = [];
+    expect(
+      (
+        await reader.query("SELECT amount FROM items WHERE id = ?", {
+          params: [31_337],
+          memoize: false,
+        })
+      ).rows,
+    ).toEqual([{ amount: 336 }]);
+    expect(store.blockIds.some((id) => irrelevantPatchBlockIds.has(id))).toBe(false);
   });
 });

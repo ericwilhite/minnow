@@ -367,31 +367,10 @@ export class MemoryBlockStore implements BlockStore {
     return this.#core.getCatalogProbe();
   }
 
-  /**
-   * Composed over this store's own methods rather than delegated to the core, so a subclass
-   * that instruments `getTransactions` or `listSegments` observes these internal reads too —
-   * the engine's read-count tests rely on that.
-   */
   async getQueryCatalogState(tableNames: readonly string[]): Promise<QueryCatalogState> {
-    const tables = await Promise.all(tableNames.map((name) => this.getTableByName(name)));
-    const foundTableIds = new Set(
-      tables.filter((table): table is TableRecord => table !== undefined).map((table) => table.id),
-    );
-    const segments = (await this.listSegments()).filter((record) =>
-      foundTableIds.has(record.tableId),
-    );
-    const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
-    const transactions = (await this.getTransactions(transactionIds)).filter(
-      (record): record is TransactionRecord => record !== undefined,
-    );
-    const probe = this.#core.getCatalogProbe();
-    return {
-      manifestVersion: probe.manifestVersion,
-      tables,
-      segments,
-      transactions,
-      catalogEpoch: probe.catalogEpoch,
-    };
+    // RecordCore filters before cloning, which matters after a long-running database has
+    // accumulated superseded history that collection still retains for recent snapshots.
+    return this.#core.getQueryCatalogState(tableNames);
   }
 
   async getCurrentManifest(): Promise<Manifest | undefined> {

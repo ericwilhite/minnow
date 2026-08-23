@@ -712,10 +712,21 @@ export class RecordCore {
     const foundTableIds = new Set(
       tables.filter((table): table is TableRecord => table !== undefined).map((table) => table.id),
     );
-    // Filter raw records first: normalizing and sorting every segment in the database to
-    // keep a handful is the wrong order of operations on a hot path.
+    const currentManifest =
+      this.#currentVersion === null ? undefined : this.#manifests.get(this.#currentVersion);
+    const visibleBlockIds = new Set(currentManifest?.blockIds ?? []);
+    // Filter raw records first: normalizing and sorting every segment in the database to keep a
+    // handful is the wrong order of operations on a hot path. This read is anchored to the
+    // current manifest version it returns, so segments already superseded from that manifest are
+    // historical records, not query inputs. Explicit version reads use listSegments instead.
     const segments = [...this.#segments.values()]
-      .filter((record) => foundTableIds.has(record.tableId))
+      .filter(
+        (record) =>
+          foundTableIds.has(record.tableId) &&
+          Object.values(record.columnBlockIds)
+            .flat()
+            .every((blockId) => visibleBlockIds.has(blockId)),
+      )
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((record) => normalizeSegmentRecord(record));
     const transactionIds = [...new Set(segments.map((segment) => segment.transactionId))];
@@ -724,6 +735,7 @@ export class RecordCore {
     );
     return {
       manifestVersion: this.#currentVersion,
+      manifestBlockIds: [...visibleBlockIds].sort(),
       tables,
       segments,
       transactions,

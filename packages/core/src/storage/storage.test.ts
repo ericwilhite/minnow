@@ -1068,13 +1068,32 @@ for (const implementation of stores()) {
         expectedManifestVersion: null,
         committedAt: timestamp,
       });
+      // A retained historical/staged record for this table is not part of the current
+      // manifest. The atomic query read must not make every foreground prepare pay for it.
+      await store.addBlock("state-historical-block", Uint8Array.of(2));
+      await store.addSegment({
+        id: "state-historical-segment",
+        tableId: "events-id",
+        transactionId: "state-transaction",
+        rowCount: 1,
+        rowIdStart: 2n,
+        rowIdEndExclusive: 3n,
+        columnBlockIds: { "value-column": ["state-historical-block"] },
+        createdAt: timestamp,
+      });
 
       const state = await store.getQueryCatalogState?.(["events", "missing"]);
       expect(state).toBeDefined();
       expect(state?.manifestVersion).toBe(await store.getCurrentManifestVersion());
+      expect(state?.manifestBlockIds).toEqual(["state-block"]);
       expect(state?.tables).toEqual([await store.getTableByName("events"), undefined]);
-      // Only the found tables' segments are returned, matching a filtered listSegments.
-      expect(state?.segments).toEqual(await store.listSegments("events-id"));
+      // Only the found tables' current-manifest segments are returned. Explicit historical
+      // reads continue to use listSegments and can see the retained record.
+      expect((await store.listSegments("events-id")).map((segment) => segment.id)).toEqual([
+        "state-historical-segment",
+        "state-segment",
+      ]);
+      expect(state?.segments.map((segment) => segment.id)).toEqual(["state-segment"]);
       expect(state?.transactions).toEqual(
         (await store.getTransactions(["state-transaction"])).filter(
           (record) => record !== undefined,
@@ -1184,6 +1203,17 @@ for (const implementation of stores()) {
           createdAt: timestamp,
         });
       }
+      await store.createTransaction({
+        ...activeTransaction("sort-transaction"),
+        pendingBlockIds: ["sort-block"],
+        pendingSegmentIds: segmentIds.map(([segmentId]) => segmentId),
+      });
+      await store.commitTransaction({
+        transactionId: "sort-transaction",
+        expectedTransactionRevision: 0,
+        expectedManifestVersion: null,
+        committedAt: timestamp,
+      });
       const state = await store.getQueryCatalogState?.(["sort-b", "sort-a"]);
       expect(state?.segments.map((segment) => segment.id)).toEqual([
         "segment-1",

@@ -2743,7 +2743,7 @@ export class MinnowDatabase {
         transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
         segmentsByTable,
       };
-      const entry = await this.#acquireSharedLease(state.manifestVersion);
+      const entry = await this.#acquireSharedLease(state.manifestVersion, state.manifestBlockIds);
       if (entry === undefined) {
         // The manifest disappeared between the read and the lease, so the cached state is
         // anchored to a pruned version; drop it and re-read.
@@ -2829,7 +2829,10 @@ export class MinnowDatabase {
    * version and the old one retires as they finish. Returns undefined when the version's
    * manifest disappeared between the catalog read and the lease, so the caller can re-read.
    */
-  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+  async #acquireSharedLease(
+    version: number | null,
+    knownBlockIds?: readonly string[],
+  ): Promise<SharedLeaseEntry | undefined> {
     for (;;) {
       // A move in flight is closing the shared snapshot it re-pins; wait for it rather than
       // hand that snapshot out, then look again.
@@ -2860,7 +2863,7 @@ export class MinnowDatabase {
       let lease: LeasedSnapshot;
       try {
         if (current?.refCount === 0) {
-          const move = this.#transactions.moveLeasedSnapshot(current.lease, options);
+          const move = this.#transactions.moveLeasedSnapshot(current.lease, options, knownBlockIds);
           this.#sharedLeaseMove = move.then(
             () => undefined,
             () => undefined,
@@ -2871,7 +2874,7 @@ export class MinnowDatabase {
             this.#sharedLeaseMove = undefined;
           }
         } else {
-          lease = await this.#transactions.openLeasedSnapshot(options);
+          lease = await this.#transactions.openLeasedSnapshot(options, knownBlockIds);
         }
       } catch (error) {
         if (error instanceof SnapshotManifestMissingError) return undefined;
@@ -7113,12 +7116,24 @@ export class MinnowDatabase {
     }
     const storedBlocks = new Map<string, Uint8Array>();
     const descriptions = new Map<string, ReturnType<typeof inspectBlock>>();
+    const keyPredicates =
+      keyColumn === undefined
+        ? []
+        : predicates.filter((predicate) => predicate.column.id === keyColumn.id);
     const predicateBlockIds = [
-      ...new Set(
-        appends.flatMap((segment) =>
+      ...new Set([
+        ...appends.flatMap((segment) =>
           predicateColumns.flatMap((column) => segment.columnBlockIds[column.id] ?? []),
         ),
-      ),
+        // A mutation never changes the unique key it carries. Its key block can therefore
+        // prove that the whole delta cannot affect a key-range query, before the replay loads
+        // any patched columns. The descriptions are header-only and stay in the byte-bounded
+        // cache, so a long point-update history costs one new header per commit rather than a
+        // replay of every old patch on every following statement.
+        ...(keyColumn === undefined || keyPredicates.length === 0
+          ? []
+          : mutations.flatMap((segment) => segment.columnBlockIds[keyColumn.id] ?? [])),
+      ]),
     ];
     // Block descriptions are immutable per id, like decoded blocks, so a repeated pruned
     // query pays zero store reads for elimination once its descriptions are resident.
@@ -7146,10 +7161,20 @@ export class MinnowDatabase {
     }
     const prunedSegments: SegmentRecord[] = [];
     for (const segment of segments) {
-      // Deltas ride through in place: they carry the replay's key markers and patches, they are
-      // small, and their position among the appends is what makes the replay order meaningful.
       if (segment.kind === "delete" || segment.kind === "update") {
-        prunedSegments.push(segment);
+        const keyBlockIds =
+          keyColumn === undefined ? [] : (segment.columnBlockIds[keyColumn.id] ?? []);
+        const canAffect =
+          keyPredicates.length === 0 ||
+          keyBlockIds.length === 0 ||
+          keyBlockIds.some((blockId) => {
+            const description = descriptions.get(blockId);
+            if (description === undefined || description.type !== keyColumn?.type) return true;
+            return keyPredicates.every((predicate) => zoneMapCanMatch(description, predicate));
+          });
+        // Retained deltas keep their original place in the overlay. A delta ruled out by its
+        // immutable key cannot alter any row the predicate may return, including a delete.
+        if (canAffect) prunedSegments.push(segment);
         continue;
       }
       const firstIds = segment.columnBlockIds[predicateColumns[0]?.id ?? ""] ?? [];
