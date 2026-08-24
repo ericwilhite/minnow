@@ -1,44 +1,31 @@
 # @minnowdb/core
 
-Columnar SQL engine for the browser: real SQL over immutable snapshots, durable on IndexedDB or
-OPFS, with
-no WebAssembly to download. It runs in the thread that constructs it (`MinnowDatabase`), or in a
-worker through `MinnowDatabaseClient`, which mirrors the everyday query, write, migration,
-live-query, snapshot, and maintenance APIs.
-
-**[minnowdb.com](https://minnowdb.com)** — documentation, a live console, and benchmarks you
-run yourself.
+A columnar SQL database for the browser. Run PostgreSQL-style SQL over durable IndexedDB or OPFS
+storage with no server and no WebAssembly module.
 
 ```bash
 npm install @minnowdb/core
 ```
 
-- **SQL is the foundation** — parser, planner, optimizer, and a batch-based executor written here,
-  with no SQLite or DuckDB underneath. The supported surface ships as a checked-in feature matrix
-  (`@minnowdb/core/sql-feature-matrix.json`) that the engine is tested against.
-- **One schema, in TypeScript** — `table()`, `column`, and `schema()` declare tables once and
-  `migrate()` evolves them without rewriting stored data.
-- **Full-text search** — `MATCH` / BM25 on any column, with no full-text index DDL to write.
-- **Secondary indexes** — durable scalar/composite and `UNIQUE` indexes for left-prefix equality,
-  `IN`, and range pruning, plus exact ordered and covering scans where the table shape permits.
-- **Live queries** — `liveQueries()` hands back a set whose subscribers get a fresh result after
-  any commit that could have changed it, across tabs.
-- **Durable browser storage** — compressed columnar blocks on IndexedDB or OPFS, atomic
-  multi-tab commits,
-  snapshot reads, compaction and GC.
-- **Memory-aware queries** — execution works in batches under a budget you set, and sorts and
-  grouped results can spill to storage. The budget is not a hard heap limit yet.
-- **Subpath exports** — `/storage`, `/storage/toolkit`, `/client`, `/worker`,
-  `/worker-protocol`, `/transactions`, `/plan`, `/block-format`, `/testing`.
+- Direct SQL through `MinnowDatabase.query()` and `execute()`.
+- Joins, CTEs, window functions, grouping sets, upserts, `RETURNING`, triggers, exact decimals,
+  JSON/JSONB, arrays, enums, sequences, and savepoints.
+- Compressed column storage, secondary indexes, full-text search, and snapshot reads.
+- Atomic writes across tabs through IndexedDB or OPFS.
+- A ready-made worker client with the same everyday database API.
+- TypeScript schema declarations and metadata-only migrations, including SQL domains and
+  composite primary/foreign keys.
+- Batch writes, live queries, snapshots, compaction, and configurable query memory.
 
-Guides, the API reference, and the SQL feature matrix live in the
-[docs](https://minnowdb.com/docs/), which are the single source of truth. Building with an agent?
-[minnowdb.com/agent-rules.md](https://minnowdb.com/agent-rules.md) is a short rules file to drop
-into an `AGENTS.md`, and [llms.txt](https://minnowdb.com/llms.txt) indexes the documentation in
-markdown.
+Use [the PostgreSQL compatibility page](https://minnowdb.com/docs/sql/feature-matrix/) for the
+exact SQL surface. Use [the documentation](https://minnowdb.com/docs/) for installation, storage,
+workers, transactions, and API details.
 
-Every `@minnowdb` package shares a major version and moves independently inside it, so install
-them on the same major. See [Versioning](https://minnowdb.com/docs/reference/versioning/).
+The optional [Kysely dialect](https://minnowdb.com/docs/adapters/kysely/) connects Kysely's
+PostgreSQL compiler to the engine and derives its `DB` types from the same schema declaration.
+
+Every `@minnowdb` package in one application must use the same major version. See
+[Versioning](https://minnowdb.com/docs/reference/versioning/).
 
 ## License
 

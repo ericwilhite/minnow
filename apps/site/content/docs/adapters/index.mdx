@@ -1,0 +1,41 @@
+---
+title: Client adapters
+description: Connect query builders and data tools to Minnow's SQL engine.
+---
+
+Minnow's direct API accepts PostgreSQL-style SQL through `query()` and `execute()`. Client adapters
+let an existing query builder use that same engine without introducing a server or a second
+database implementation.
+
+## Kysely
+
+Kysely is the primary client adapter today. `@minnowdb/kysely` supplies a dialect backed by either
+an in-thread `MinnowDatabase` or a worker-hosted `MinnowDatabaseClient`.
+
+```bash
+npm install @minnowdb/core @minnowdb/kysely kysely
+```
+
+```ts
+import { createKysely } from "@minnowdb/kysely";
+
+await database.migrate(appSchema);
+const db = createKysely({ driver: database, schema: appSchema });
+```
+
+Kysely compiles double-quoted identifiers, `$1` parameters, transactions, schema statements, and
+`RETURNING` with its PostgreSQL compiler. Minnow checks the generated SQL against its supported
+profile and executes it normally.
+
+The [Kysely guide](/docs/adapters/kysely) covers inferred schema types, defaults, generated SQL,
+introspection, transactions, workers, and embedded-database boundaries.
+
+## Build another adapter
+
+Adapters target two small structural interfaces from `@minnowdb/core`:
+
+- `MinnowSqlExecutor` provides `query()` and `execute()`.
+- `MinnowSqlDriver` adds `introspect()` for schema-aware tools.
+
+The [extending guide](/docs/reference/extending) documents those interfaces, statement
+transactions, catalog introspection, and the machine-readable SQL compatibility profiles.

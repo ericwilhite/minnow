@@ -12,14 +12,12 @@ and a main-thread client (`@minnowdb/core/client`). Your app contributes one lin
 ```ts
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { column, schema, table } from "@minnowdb/core";
-import { createMinnow, type InferDatabase } from "@minnowdb/client";
 
 const people = table("people", {
   name: column.string().unique(),
   score: column.number(),
 });
 const appSchema = schema([people]);
-interface DB extends InferDatabase<typeof appSchema> {}
 
 const client = new MinnowDatabaseClient(
   new Worker(new URL("@minnowdb/core/worker", import.meta.url), { type: "module" }),
@@ -27,20 +25,13 @@ const client = new MinnowDatabaseClient(
 );
 await client.migrate(appSchema);
 
-// The typed client wraps the worker client exactly as it wraps an in-worker database.
-const db = createMinnow<DB>(client, { schema: appSchema });
-await db
-  .insertInto("people")
-  .values([
-    { name: "Ada", score: 10 },
-    { name: "Grace", score: 20 },
-  ])
-  .execute();
-const rows = await db
-  .selectFrom("people")
-  .select(["name", "score"])
-  .orderBy("score", "desc")
-  .execute(); // Array<{ name: string; score: number }>
+await client.execute("INSERT INTO people (name, score) VALUES ($1, $2), ($3, $4)", [
+  "Ada",
+  10,
+  "Grace",
+  20,
+]);
+const { rows } = await client.query("SELECT name, score FROM people ORDER BY score DESC");
 ```
 
 - The client sends its configuration to the worker on startup, so the stock entry needs none of
@@ -82,8 +73,9 @@ starts and stops) and satisfies `worker-src` content-security policies from your
 - **Functions can't cross.** Construction options like `now`, `createId`, or a custom store need
   a custom entry (below).
 
-The typed client doesn't care about any of this: compiled plans cross the channel by structured
-clone, so `selectFrom`, typed [writes](/docs/sql/dml), and `.live()` behave identically.
+Client adapters can wrap the same worker client because it implements `MinnowSqlDriver`. The
+[Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker
+boundary.
 
 ## Buffered writers and live queries
 

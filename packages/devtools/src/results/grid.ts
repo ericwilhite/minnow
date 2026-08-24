@@ -76,13 +76,15 @@ function formatValue(value: QueryValue): { text: string; className: string } {
  * flat run of cells with no per-row layout work.
  */
 export function createGrid(deps: GridDeps = {}): Grid {
-  const head = el("div", { class: "grid-head" });
-  const sizer = el("div", { class: "grid-sizer" });
+  const head = el("div", { class: "grid-head", attrs: { role: "row" } });
+  const sizer = el("div", { class: "grid-sizer", attrs: { role: "rowgroup" } });
   // The header lives inside the scrolling surface, sticky to its top. Outside it, a table wider
   // than the panel would scroll its rows out from under a header that stayed put.
   const surface = el("div", { class: "grid-surface" }, [head, sizer]);
   const viewport = el("div", { class: "grid-viewport" }, [surface]);
-  const node = el("div", { class: "grid" }, [viewport]);
+  const node = el("div", { class: "grid", attrs: { role: "grid", "aria-rowcount": "0" } }, [
+    viewport,
+  ]);
 
   let columns: GridColumn[] = [];
   let rows: QueryRow[] = [];
@@ -110,6 +112,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     template = columns.map(columnWidth).join(" ");
     head.style.gridTemplateColumns = template;
     sizer.style.gridTemplateColumns = template;
+    node.setAttribute("aria-colcount", String(columns.length));
     head.replaceChildren(
       ...columns.map((column) => {
         const label = el("span", { class: "grid-name", text: column.name });
@@ -157,9 +160,16 @@ export function createGrid(deps: GridDeps = {}): Grid {
   function growPool(needed: number): void {
     if (pool.length >= needed) return;
     while (pool.length < needed) {
-      const row = el("div", { class: "grid-row" });
+      const row = el("div", { class: "grid-row", attrs: { role: "row" } });
       row.style.gridTemplateColumns = template;
-      row.append(...columns.map(() => el("div", { class: "cell" })));
+      row.append(
+        ...columns.map((_column, index) =>
+          el("div", {
+            class: "cell",
+            attrs: { role: "gridcell", tabindex: index === 0 ? "0" : "-1" },
+          }),
+        ),
+      );
       pool.push(row);
       slotRow.push(-1);
       sizer.append(row);
@@ -175,6 +185,8 @@ export function createGrid(deps: GridDeps = {}): Grid {
     node.style.transform = `translateY(${String(index * rowHeight)}px)`;
     node.dataset.index = String(index);
     node.classList.toggle("sel", index === selected);
+    node.setAttribute("aria-rowindex", String(index + 2));
+    node.setAttribute("aria-selected", String(index === selected));
     const cells = node.children;
     for (let column = 0; column < columns.length; column += 1) {
       const cell = cells[column];
@@ -183,6 +195,9 @@ export function createGrid(deps: GridDeps = {}): Grid {
       const value = row[name] ?? null;
       const { text, className } = formatValue(value);
       cell.className = className;
+      cell.setAttribute("role", "gridcell");
+      cell.setAttribute("aria-colindex", String(column + 1));
+      cell.setAttribute("tabindex", column === 0 ? "0" : "-1");
       // NULL is rendered as its own marker rather than as the word, so a string reading "NULL"
       // cannot be mistaken for the absence of a value.
       if (value === null) cell.replaceChildren(el("span", { text: "NULL" }));
@@ -266,6 +281,38 @@ export function createGrid(deps: GridDeps = {}): Grid {
     deps.onSelect?.(next === undefined ? undefined : hit.row, next);
   });
 
+  sizer.addEventListener("keydown", (event) => {
+    const cell = (event.target as Element | null)?.closest<HTMLElement>(".cell");
+    const hit = locate(event);
+    if (cell === null || cell === undefined || hit === undefined) return;
+    const rowNode = cell.closest<HTMLElement>(".grid-row");
+    if (rowNode === null) return;
+    const column = Array.prototype.indexOf.call(rowNode.children, cell);
+    if (event.key === " " || event.key === "Spacebar") {
+      event.preventDefault();
+      const next = selected === hit.index ? undefined : hit.index;
+      setSelected(next);
+      deps.onSelect?.(next === undefined ? undefined : hit.row, next);
+      return;
+    }
+    if (event.key === "Enter" && hit.column !== undefined && deps.onEditCell !== undefined) {
+      event.preventDefault();
+      deps.onEditCell(hit.row, hit.column, hit.index);
+      return;
+    }
+    const rowOffset = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+    const columnOffset = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+    if (rowOffset === 0 && columnOffset === 0) return;
+    event.preventDefault();
+    const targetRow = sizer.querySelector<HTMLElement>(
+      `.grid-row[data-index="${String(hit.index + rowOffset)}"]`,
+    );
+    const targetCell = (targetRow ?? rowNode).children[
+      Math.max(0, Math.min(columns.length - 1, column + columnOffset))
+    ];
+    if (targetCell instanceof HTMLElement) targetCell.focus();
+  });
+
   sizer.addEventListener("dblclick", (event) => {
     const hit = locate(event);
     if (hit?.column === undefined) return;
@@ -320,6 +367,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     },
     setRows: (next) => {
       rows = [...next];
+      node.setAttribute("aria-rowcount", String(rows.length + 1));
       notifiedForCount = -1;
       selected = undefined;
       closeEdit();
@@ -331,6 +379,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     appendRows: (next) => {
       if (next.length === 0) return;
       rows = rows.concat(next);
+      node.setAttribute("aria-rowcount", String(rows.length + 1));
       setHeight();
       render();
     },
@@ -342,6 +391,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     removeRow: (index) => {
       if (rows[index] === undefined) return;
       rows.splice(index, 1);
+      node.setAttribute("aria-rowcount", String(rows.length + 1));
       if (selected === index) selected = undefined;
       closeEdit();
       setHeight();
@@ -351,11 +401,12 @@ export function createGrid(deps: GridDeps = {}): Grid {
     },
     setMessage: (message) => {
       rows = [];
+      node.setAttribute("aria-rowcount", columns.length === 0 ? "0" : "1");
       selected = undefined;
       closeEdit();
       reset();
       sizer.style.height = "auto";
-      sizer.append(el("div", { class: "grid-message", text: message }));
+      sizer.append(el("div", { class: "grid-message", text: message, attrs: { role: "status" } }));
     },
     editCell: (index, column, editor) => {
       closeEdit();

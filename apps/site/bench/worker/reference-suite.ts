@@ -194,6 +194,7 @@ export async function runReferenceSuite(
   return {
     datasetId: record.id,
     scale: record.scale,
+    secondaryIndexes: record.secondaryIndexes,
     sampleCount: SAMPLE_COUNT,
     engines: payload.engines,
     queries,
@@ -234,25 +235,6 @@ async function measureOnSession(
         cachedMedianMs = cached.medianMs;
         cachedBatchSize = cached.batchSize;
       }
-      // Engines with a main-thread client also report the statement through it: execution plus
-      // the channel and the rows rebuilt on the far side, which is the cost an application sees.
-      // The client's rows are checked against the oracle too — a wire format that dropped a
-      // value would otherwise show up as a faster number.
-      let clientMedianMs: number | undefined;
-      let clientBatchSize: number | undefined;
-      let clientVerified = true;
-      if (prepared.executeClient !== undefined) {
-        const runClient = (): Promise<Array<Record<string, unknown>>> =>
-          prepared.executeClient?.() ?? Promise.resolve([]);
-        const clientRows = await runClient();
-        clientVerified = tuplesMatch(
-          canonicalTuples(clientRows, (row) => definition.columns.map((column) => row[column])),
-          oracleTuples,
-        );
-        const viaClient = await measureRepeated(runClient, SAMPLE_COUNT);
-        clientMedianMs = viaClient.medianMs;
-        clientBatchSize = viaClient.batchSize;
-      }
       const tuples = canonicalTuples(rows, (row) =>
         definition.columns.map((column) => row[column]),
       );
@@ -265,14 +247,12 @@ async function measureOnSession(
         batchSize,
         ...(cachedMedianMs === undefined ? {} : { cachedMedianMs }),
         ...(cachedBatchSize === undefined ? {} : { cachedBatchSize }),
-        ...(clientMedianMs === undefined ? {} : { clientMedianMs }),
-        ...(clientBatchSize === undefined ? {} : { clientBatchSize }),
         ...(prepared.peakMemoryBytes === undefined
           ? {}
           : { peakMemoryBytes: prepared.peakMemoryBytes }),
         resultRows: rows.length,
         checksum: referenceChecksum(tuples),
-        verified: clientVerified && tuplesMatch(tuples, oracleTuples),
+        verified: tuplesMatch(tuples, oracleTuples),
       };
     } finally {
       prepared.close();

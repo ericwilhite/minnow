@@ -3,26 +3,27 @@ title: API reference
 description: The public entry points and the APIs you are most likely to use.
 ---
 
-Start with `@minnowdb/core` for the database itself. The smaller entry points let you opt into a
-worker, a typed query builder, devtools, or lower-level storage tools. This page groups closely
-related supporting types so you can find the useful surface without reading a list of every type
-parameter. Your editor will show the full signatures from the declarations shipped with each
-package.
+Start with `@minnowdb/core` for the SQL engine and schema tools. Add `@minnowdb/kysely` or
+`@minnowdb/devtools` only when you need them. The remaining core entry points expose workers,
+storage, planning, and testing tools. Your editor shows the complete signatures from each
+package's declarations.
 
-| Entry point                              | Contents                                                        |
-| ---------------------------------------- | --------------------------------------------------------------- |
-| `@minnowdb/core`                         | Schema DSL, typed client and builders, engine, live queries     |
-| `@minnowdb/core/client`                  | Main-thread worker client                                       |
-| `@minnowdb/core/worker`                  | Ready-made worker entry (side-effect import)                    |
-| `@minnowdb/core/storage`                 | Block stores: IndexedDB, OPFS, in-memory, the storage interface |
-| `@minnowdb/core/storage/toolkit`         | Building blocks for writing storage adapters                    |
-| `@minnowdb/core/transactions`            | Snapshots, transactions, recovery (lower level)                 |
-| `@minnowdb/core/block-format`            | Binary block containers and codecs (lower level)                |
-| `@minnowdb/core/worker-protocol`         | Versioned RPC frames (lower level)                              |
-| `@minnowdb/core/testing`                 | Fault injection and the shared block-store test kit             |
-| `@minnowdb/core/sql-feature-matrix.json` | The checked-in SQL feature list                                 |
-| `@minnowdb/client`                       | Optional typed query builder                                    |
-| `@minnowdb/devtools`                     | Embeddable database console and data browser                    |
+| Entry point                                    | Contents                                                        |
+| ---------------------------------------------- | --------------------------------------------------------------- |
+| `@minnowdb/core`                               | SQL engine, schema DSL, catalog, migrations, and live queries   |
+| `@minnowdb/core/client`                        | Main-thread worker client                                       |
+| `@minnowdb/core/worker`                        | Ready-made worker entry (side-effect import)                    |
+| `@minnowdb/core/plan`                          | Low-level plan construction and optimization tools              |
+| `@minnowdb/core/storage`                       | Block stores: IndexedDB, OPFS, in-memory, the storage interface |
+| `@minnowdb/core/storage/toolkit`               | Building blocks for writing storage adapters                    |
+| `@minnowdb/core/transactions`                  | Snapshots, transactions, recovery (lower level)                 |
+| `@minnowdb/core/block-format`                  | Binary block containers and codecs (lower level)                |
+| `@minnowdb/core/worker-protocol`               | Versioned RPC frames (lower level)                              |
+| `@minnowdb/core/testing`                       | Fault injection and the shared block-store test kit             |
+| `@minnowdb/core/sql-feature-matrix.json`       | Runnable SQL support and exclusion examples                     |
+| `@minnowdb/core/postgres-feature-profile.json` | PostgreSQL compatibility classifications                        |
+| `@minnowdb/kysely`                             | Optional Kysely dialect using its PostgreSQL compiler           |
+| `@minnowdb/devtools`                           | Embeddable database console and data browser                    |
 
 ---
 
@@ -30,129 +31,51 @@ package.
 
 From `@minnowdb/core`. See [Schema & migrations](/docs/schema).
 
-| Export                                                                                                   | Description                                                                                                                                                                                                         |
-| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `table(name, columns, { checks })`                                                                       | Defines a table from column builders. `checks` declares row conditions (`{ name, sql }`) enforced on every write. The result carries inferred row types and a Standard Schema `~standard` validator.                |
-| `column.boolean() / number() / string() / datetime()`                                                    | Column builders for the four logical types.                                                                                                                                                                         |
-| `column.enum([...])`                                                                                     | A string column restricted to a closed value set, typed as the literal union and validated on every write. Migrations may add values, never remove.                                                                 |
-| `.unique() / .nullable() / .renamedFrom()`                                                               | Column modifiers: unique key, NULL widening, stable-ID rename.                                                                                                                                                      |
-| `.references(table, column, { onDelete })`                                                               | Declares a FOREIGN KEY onto another table's unique key, created as a real constraint. `onDelete` is `"restrict"` (default), `"cascade"`, or `"set null"`.                                                           |
-| `.autoIncrement() / .default(value \| fn)`                                                               | Generated values: a persistent cross-tab counter for number unique keys; literal / `"now"` defaults filled engine-side on every write path; function defaults called by the typed facade before its INSERT is sent. |
-| `schema(tables, { views })`                                                                              | Bundles tables and views into a `SchemaDefinition` for `migrate()` and the typed client.                                                                                                                            |
-| `view(name, { sql, columns })`                                                                           | Declares a read-only view. The engine verifies the declared columns against the query's inferred output at migration time.                                                                                          |
-| `typedTable(database, tableDef)`                                                                         | Thin schema-typed handle that renders parameterized SQL for inserts, upserts, keyed updates/deletes, and reads.                                                                                                     |
-| `planMigration(catalog, definition)`                                                                     | Computes the metadata-only `MigrationPlan` that `migrate()` executes.                                                                                                                                               |
-| `InferRow / InferInsertRow / InferUpdateChanges`                                                         | Per-table select / insert / keyed-update shapes.                                                                                                                                                                    |
-| `Generated<T>`                                                                                           | Marks engine-filled columns in hand-declared `DB` interfaces so inserts keep the omission; `InferDatabase` applies it automatically.                                                                                |
-| `SchemaDefinition, TableSchema, AnyTable, ColumnBuilder, SchemaColumnType, MigrationStep, MigrationPlan` | Supporting types.                                                                                                                                                                                                   |
+| Export                                                                                                   | Description                                                                                                                                                                       |
+| -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `table(name, columns, options)`                                                                          | Defines a table. Options include `primaryKey`, composite `foreignKeys`, and `checks`. The result carries inferred row types and a Standard Schema `~standard` validator.          |
+| `column.boolean() / number() / string() / datetime()`                                                    | Column builders for the four physical storage types.                                                                                                                              |
+| `column.integer() / numeric() / json() / jsonb() / uuid() / time() / interval() / array()`               | Builders retaining the SQL engine's domain metadata and exact boundary types.                                                                                                     |
+| `column.enum([...])`                                                                                     | A string column restricted to a closed value set, typed as the literal union and validated on every write. Migrations may add values, never remove.                               |
+| `column.sqlEnum(name, values)`                                                                           | Per-column named enum metadata, typed as the values' literal union. It does not create a reusable `CREATE TYPE` object.                                                           |
+| `.unique() / .nullable() / .renamedFrom()`                                                               | Column modifiers: unique key, NULL widening, stable-ID rename.                                                                                                                    |
+| `.references(table, column, { onDelete })`                                                               | Declares a FOREIGN KEY onto another table's unique key, created as a real constraint. `onDelete` is `"restrict"` (default), `"cascade"`, or `"set null"`.                         |
+| `.autoIncrement() / .default(value) / .defaultSql(expression)`                                           | Catalog-owned generated values: an atomic integer-key counter, a literal, or a validated variable-free SQL expression evaluated once per omitted row. Explicit NULL is preserved. |
+| `schema(tables, { views })`                                                                              | Bundles tables and views into a `SchemaDefinition` for `migrate()`.                                                                                                               |
+| `view(name, { sql, columns })`                                                                           | Declares a read-only view. The engine verifies the declared columns against the query's inferred output at migration time.                                                        |
+| `typedTable(database, tableDef)`                                                                         | Thin schema-typed handle that renders parameterized SQL for inserts, upserts, keyed updates/deletes, and reads.                                                                   |
+| `planMigration(catalog, definition)`                                                                     | Computes the metadata-only `MigrationPlan` that `migrate()` executes.                                                                                                             |
+| `InferRow / InferInsertRow / InferUpdateChanges`                                                         | Per-table select / insert / keyed-update shapes.                                                                                                                                  |
+| `SchemaDefinition, TableSchema, AnyTable, ColumnBuilder, SchemaColumnType, MigrationStep, MigrationPlan` | Supporting types.                                                                                                                                                                 |
 
 ### Catalog introspection
 
 From `@minnowdb/core`. See [Extending Minnow](/docs/reference/extending).
 
-| Export                                              | Description                                                                                        |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `database.introspect()`                             | The published catalog: stable column IDs, key identity, foreign keys, checks, triggers, and views. |
-| `Catalog, CatalogTable, CatalogColumn, CatalogView` | Its types.                                                                                         |
-| `CatalogForeignKey, CatalogCheck, CatalogTrigger`   | Constraint and trigger entries.                                                                    |
-| `toCatalog(records)`                                | Projects storage table records into a `Catalog`; sorted by name so a diff is stable.               |
-
-## Typed client
-
-From `@minnowdb/client`, an optional package installed separately. See
-[Reading data](/docs/client/queries) and [Writing data](/docs/client/writes).
-
-| Export                                                 | Description                                                                                               |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| `InferDatabase<S>`                                     | Maps a schema to `DB`: `select`/`insert`/`update` per table, `select` only per view.                      |
-| `FromRow<Row>`                                         | Builds those three shapes from one hand-written row type, reading `Generated<T>`.                         |
-| `SelectRowOf<S>` / `InsertRowOf<S>` / `UpdateRowOf<S>` | Pull one shape back out of a `DB` entry.                                                                  |
-| `WritableTable<DB>`                                    | The `DB` names that accept writes; views are excluded structurally, so writing to one is a compile error. |
-| `TableShape<S, I, U>` / `ViewShape<S>`                 | The entry types `InferDatabase` produces.                                                                 |
-
-| Export                                                      | Description                                                                                                                                                                                                               |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createMinnow<DB>(driver, { schema })`                      | Builds the typed client. The standard form passes a named `interface DB extends InferDatabase<typeof appSchema> {}` so tooling prints `Minnow<DB>`; omitting the type argument infers `DB` from the schema value instead. |
-| `class Minnow<DB>`                                          | The typed client itself; wraps a `MinnowDatabase` or `MinnowDatabaseClient` (any `DslDriver`).                                                                                                                            |
-| `.selectFrom(table \| derived)`                             | Starts a `SelectQueryBuilder`; accepts `"people"`, `"people as p"`, or an aliased subquery.                                                                                                                               |
-| `.insertInto / .updateTable / .deleteFrom`                  | Start the mutation builders.                                                                                                                                                                                              |
-| `.with(name, () => query)`                                  | Adds a CTE usable as a from/join source in the following query.                                                                                                                                                           |
-| `.search(query, { tables?, limit?, concurrency? })`         | Document search across real tables, using the schema or live catalog. Table work is limited to four at once by default, and results are merged into a typed `{ table, row, score }` list.                                 |
-| `.query<Row>(sqlOrFragment, options?)`                      | Runs a row query through the SQL parser and statement-text plan cache; a fragment contributes its own bound parameters.                                                                                                   |
-| `.execute(sqlOrFragment, params?)`                          | Runs one query, mutation, DDL, trigger, or transaction statement. The result's `kind` field says what happened.                                                                                                           |
-| `.transaction(callback)`                                    | Runs typed builders and SQL as one atomic write. Reads see earlier work in the callback; a thrown error rolls it all back.                                                                                                |
-| `.close()`                                                  | Closes the typed client's shared live-query set. Close the driver separately when the application owns it.                                                                                                                |
-| `.driver`                                                   | The `MinnowDatabase` or `MinnowDatabaseClient` behind the typed client. Application code should keep its own reference when it already has one.                                                                           |
-| `MinnowOptions`                                             | Typed client options: the schema, plus `live: { channelName?, pollIntervalMs? }` defaults for `.live()`.                                                                                                                  |
-| `DslDriver, DslWriteSession, DriverLiveSet, DslLiveOptions` | The small driver interfaces shared by the database and worker client.                                                                                                                                                     |
-
-### SelectQueryBuilder
-
-`execute()` resolves to typed rows; the row type accretes through the chain.
-
-| Method                                                    | Description                                                                                                                                                        |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `innerJoin / leftJoin(table, lhs, rhs)`                   | Joins; callback form gets a `JoinBuilder` with `on(...)` / `onRef(...)`. Left-joined columns widen to `\| null`.                                                   |
-| `where(lhs, op, rhs)` / `where((eb) => ...)`              | Filters; string LHS is a column reference, RHS is a value.                                                                                                         |
-| `having(...)`                                             | Post-aggregation filter, same forms as `where`.                                                                                                                    |
-| `groupBy(cols)` / `orderBy(col \| expr, dir?)`            | Grouping and ordering; ORDER BY takes a selected column, an output alias, or an expression. Wildcard selects order by columns only.                                |
-| `limit(n)` / `offset(n)` / `distinct()`                   | Row-set modifiers.                                                                                                                                                 |
-| `select([...])` / `select((eb) => [...])` / `selectAll()` | Chooses the returned columns and expressions. String and expression selections may be mixed across repeated calls.                                                 |
-| `search(query, { columns? })`                             | Filters by `eb.match` and orders by BM25 relevance descending; the row shape is untouched (select `fn.bm25` yourself to read the score). Columns default to `"*"`. |
-| `union / unionAll / intersect / except(other)`            | Set operations; member row types must match.                                                                                                                       |
-| `as(alias)`                                               | Turns the query into a derived table for `selectFrom` / joins.                                                                                                     |
-| `compile()`                                               | The internal typed plan, exposed for tooling.                                                                                                                      |
-| `toSQL()`                                                 | The equivalent parameterized SQL text and bound value array.                                                                                                       |
-| `execute / executeTakeFirst / executeTakeFirstOrThrow()`  | Run through the SQL engine and return `TRow[]`, the first row or `undefined`, or throw `NoResultError`. The first-row forms add a one-row limit.                   |
-| `live()`                                                  | A `LiveQuery<TRow>` over this query. See [Live queries](/docs/client/live).                                                                                        |
-
-### Mutation builders
-
-| Method                                                                       | Description                                                                                                                     |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `InsertQueryBuilder.values(row \| rows)`                                     | Rows to insert; omitted nullable columns pad with `null`. Literals validate eagerly.                                            |
-| `.orReplace()`                                                               | Upsert by the table's unique key.                                                                                               |
-| `UpdateQueryBuilder.set(col, value)` / `.set(patch)` / `.set((eb) => patch)` | Changes; `undefined` entries in a patch are skipped, explicit `null` writes NULL.                                               |
-| `.where(...)`                                                                | Same forms as select `where`, on both update and delete builders.                                                               |
-| `.returning([...]) / .returningAll()`                                        | Rewrites the result type to projected rows: written rows for inserts, post-update values for updates, deleted rows for deletes. |
-| `.compile()`                                                                 | The internal statement, exposed for tooling.                                                                                    |
-| `.toSQL()`                                                                   | Parameterized SQL for insert, update, and delete builders.                                                                      |
-| `.execute / .executeTakeFirst / .executeTakeFirstOrThrow()`                  | Run; without `returning`, resolves to `InsertResult` / `UpdateResult` / `DeleteResult` with plain-number counts.                |
-
-### Expression builder
-
-The callback argument of `where` / `having` / `select` / `set`. See the
-[expression vocabulary](/docs/sql/select#filtering-and-choosing-columns) for the full table: comparisons
-(`eb(lhs, op, rhs)`), `eb.and/or/not`, arithmetic, `eb.between/notBetween`, `eb.ref`, `eb.fn`
-aggregates and scalar functions, window functions with `.over(...)`,
-`eb.case()...end()`, `eb.selectFrom`, and `eb.exists`. Exported supporting types include
-`ExpressionBuilder`, `ExpressionWrapper`, `AggregateExpressionWrapper`, `CaseBuilder`,
-`OverBuilder`, `WindowFunctionBuilder`, and the operator token unions.
-
-### The `sql` tag
-
-| Export                                                | Description                                                                                                                                                                                                                                                                                      |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| ``sql<Row>`…` ``                                      | Tagged template producing a `RawSqlFragment<Row>`; interpolations become bound `$n` parameters, arrays expand to IN-list placeholders, nested fragments splice with renumbered parameters. `.execute(db)` is the short row-query form; `db.query` and `db.execute` expose both SQL result paths. |
-| `sql.identifier(...parts)`                            | Quotes a dynamic identifier path. Regular interpolations remain values, never identifiers.                                                                                                                                                                                                       |
-| `RawSqlFragment, RawSqlValue, RenderedSql, SqlTag, …` | Supporting types.                                                                                                                                                                                                                                                                                |
+| Export                                                          | Description                                                                                                           |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `database.introspect()`                                         | The published catalog: stable column IDs, key identity, foreign keys, checks, secondary indexes, triggers, and views. |
+| `Catalog, CatalogTable, CatalogColumn, CatalogView`             | Its types.                                                                                                            |
+| `CatalogForeignKey, CatalogCheck, CatalogIndex, CatalogTrigger` | Constraint, index, and trigger entries.                                                                               |
+| `toCatalog(records)`                                            | Projects storage table records into a `Catalog`; sorted by name so a diff is stable.                                  |
+| `MinnowSqlExecutor`                                             | Structural `query` / `execute` contract for SQL-emitting clients.                                                     |
+| `MinnowSqlDriver`                                               | `MinnowSqlExecutor` plus `introspect()` for schema-aware adapters.                                                    |
 
 ## Live queries
 
-From `@minnowdb/core`. See [Live queries](/docs/client/live).
+From `@minnowdb/core`.
 
-| Export                                                                                                                              | Description                                                                                                                                                                                  |
-| ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `class LiveQuery<TRow>`                                                                                                             | Returned by `.live()`. `subscribe({ onChange, onComplete? })` resolves to a `LiveSubscriptionHandle`; it is also an async iterable that keeps the newest result when updates arrive quickly. |
-| `class LiveQuerySet`                                                                                                                | The SQL-level mechanism behind the typed layer, from `database.liveQueries(options)`. `subscribe(sqlOrPlan, { onChange })`, `refresh()`, `stats`, `close()`.                                 |
-| `LiveQuerySetOptions`                                                                                                               | `channelName?` (BroadcastChannel hints), `pollIntervalMs?` (fallback polling).                                                                                                               |
-| `LiveQueryStats`                                                                                                                    | Hints, sweeps, reruns executed/avoided, suppressed notifications, sweep latency.                                                                                                             |
-| `LiveQuerySubscribeOptions, LiveQuerySubscription, LiveQueryInput, LiveQueryHintChannel, LiveQueryHandlers, LiveSubscriptionHandle` | Supporting types.                                                                                                                                                                            |
+| Export                                                                                                                              | Description                                                                                                                                                                               |
+| ----------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `class LiveQuery<TRow>`                                                                                                             | A typed live query. `subscribe({ onChange, onComplete? })` resolves to a `LiveSubscriptionHandle`; it is also an async iterable that keeps the newest result when updates arrive quickly. |
+| `class LiveQuerySet`                                                                                                                | Created by `database.liveQueries(options)`. `subscribe(sqlOrPlan, { onChange })`, `refresh()`, `stats`, and `close()`.                                                                    |
+| `LiveQuerySetOptions`                                                                                                               | `channelName?` (BroadcastChannel hints), `pollIntervalMs?` (fallback polling).                                                                                                            |
+| `LiveQueryStats`                                                                                                                    | Hints, sweeps, reruns executed/avoided, suppressed notifications, sweep latency.                                                                                                          |
+| `LiveQuerySubscribeOptions, LiveQuerySubscription, LiveQueryInput, LiveQueryHintChannel, LiveQueryHandlers, LiveSubscriptionHandle` | Supporting types.                                                                                                                                                                         |
 
 ## The engine — `MinnowDatabase`
 
-From `@minnowdb/core`. The low-level asynchronous engine the typed client drives. See
-[Writes & transactions](/docs/sql/dml).
+From `@minnowdb/core`. See [Writes & transactions](/docs/sql/dml).
 
 ```ts
 new MinnowDatabase(store: BlockStore, options?: MinnowDatabaseOptions)
@@ -176,6 +99,10 @@ plans are cached separately by statement text.
 | Compaction | `compactTable`, `compactTableStep`, `resumeCompactionJob`, `listCompactionJobs`, `cancelCompactionJob`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | GC         | `collectGarbage`, `collectGarbageStep`, `resumeGarbageCollectionJob`, `listGarbageCollectionJobs`, `cleanupQuerySpill`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Lifecycle  | `close()` stops background work and live queries, rolls back an open SQL transaction, releases the reader lease, and clears resident caches. The injected store remains caller-owned.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+
+`readTable()` returns only the table's declared public columns. Engine-maintained row locators,
+including the scalar locator used for a composite primary key, cannot be selected by name or
+appear in a wildcard result.
 
 Notable supporting exports:
 
@@ -248,10 +175,21 @@ checks used by the SQL parser, so a hand-built plan is checked just like parsed 
 | `CompiledQuery, Expression, JoinPlan, Predicate, SelectItem, SetOperator, TableSource`    | Plan types.                                             |
 | `AggregateName, PredicateOperator, WindowFunctionName, QueryValue, QueryRow, QueryResult` | Supporting types.                                       |
 
-## `@minnowdb/client`
+## `@minnowdb/kysely`
 
-The optional typed query builder. Installed separately: `npm install @minnowdb/client`. See
-[Typed client](#typed-client) above and [Schema & migrations](/docs/schema).
+The optional Kysely dialect. Installed separately with Kysely itself; see
+[Kysely](/docs/adapters/kysely).
+
+| Export                                                     | Description                                                                                                                  |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `createKysely({ driver, schema })`                         | Creates `Kysely<InferKyselyDatabase<typeof schema>>`; the schema also normalizes multi-row empty-object inserts.             |
+| `InferKyselyDatabase / InferKyselyTable / InferKyselyView` | Converts schema metadata to Kysely select, insert, update, and operand types.                                                |
+| `MinnowColumnType / MinnowOperandType`                     | Kysely column metadata that lets exact `NUMERIC` results stay strings while writes and predicates accept strings or numbers. |
+| `MinnowDialect`                                            | Kysely `Dialect` using PostgreSQL SQL syntax over a `MinnowSqlDriver`.                                                       |
+| `MinnowDialectConfig`                                      | `{ driver, schema? }`; pass the schema for inferred types and empty-object insert normalization.                             |
+| `MinnowQueryCompiler`                                      | PostgreSQL compiler that keeps omission and `DEFAULT` visible; generated values stay catalog-owned.                          |
+| `MinnowKyselyDriver`                                       | The single-connection Kysely driver; usually constructed by `MinnowDialect`.                                                 |
+| `MinnowKyselyIntrospector`                                 | Catalog-backed table/view metadata with no invented schemas.                                                                 |
 
 ## `@minnowdb/core/storage`
 
@@ -265,7 +203,7 @@ The optional typed query builder. Installed separately: `npm install @minnowdb/c
 | `BlockStore`                                                                         | The complete storage interface shared by all three adapters. It combines block, catalog, transaction, lease, maintenance, full-text, and temporary-page operations. See [Writing a storage adapter](/docs/storage/custom). |
 | `Manifest, TableRecord, TableColumnRecord, SegmentRecord, RowIdSpan, LeaseRecord, …` | The persistent record types.                                                                                                                                                                                               |
 | `WriteConflictError, TableRecordConflictError`                                       | Storage-level conflicts surfaced through the engine.                                                                                                                                                                       |
-| `SimpleDataType, simpleDataTypes`                                                    | The four logical types as a value and union.                                                                                                                                                                               |
+| `SimpleDataType, simpleDataTypes`                                                    | The four physical storage types as a value and union.                                                                                                                                                                      |
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
 tooling but are storage internals — this early format carries no compatibility promise.
@@ -345,6 +283,13 @@ options.
 
 ## `@minnowdb/core/sql-feature-matrix.json`
 
-The checked-in feature list rendered at [SQL support](/docs/sql/feature-matrix): every SQL feature the
-engine claims, with per-feature support status. The engine's tests report drift
-against this file, so the docs and the engine cannot silently disagree.
+The compatibility data rendered at [PostgreSQL compatibility](/docs/sql/feature-matrix). Every
+tracked form has a support status and runnable example. The excluded forms conflict with Minnow's
+embedded model. This file does not claim to enumerate PostgreSQL's whole grammar. Engine tests
+report drift against it, so the docs and implementation stay aligned.
+
+## `@minnowdb/core/postgres-feature-profile.json`
+
+The executable dialect overlay for the same feature IDs. It classifies each form as
+`compatible`, `different`, `extension`, `unsupported`, or `inapplicable`, records the PGlite
+oracle version, and explains every deliberate PostgreSQL divergence.

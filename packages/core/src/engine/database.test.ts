@@ -296,6 +296,300 @@ function recoveryImplementations(): Array<{
   ];
 }
 
+for (const implementation of implementations()) {
+  describe(`${implementation.name} SQL boundary durability`, () => {
+    it("preserves private-namespace TEXT through queries, transactions, compaction, and snapshots", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, {
+        autoCompact: false,
+        compression: "raw",
+        rowsPerBlock: 1,
+      });
+      const numericTwo = "\0minnow-domain:numeric:2";
+      const numericTen = "\0minnow-domain:numeric:10";
+      const invalidInterval = "\0minnow-domain:interval:not-json";
+      const nestedText = "\0minnow-domain:text:\0minnow-domain:numeric:2";
+      const committedText = '\0minnow-domain:jsonb:{"a":1}';
+      const originalRows = [
+        { id: 1, value: numericTwo },
+        { id: 2, value: numericTen },
+        { id: 3, value: invalidInterval },
+        { id: 4, value: nestedText },
+      ];
+
+      await database.execute("CREATE TABLE tagged_text (id INTEGER PRIMARY KEY, value TEXT)");
+      await database.insertBatch("tagged_text", originalRows.slice(0, 2));
+      const baseline = await database.insertBatch("tagged_text", originalRows.slice(2));
+      await database.execute("CREATE INDEX tagged_text_value_idx ON tagged_text (value)");
+
+      expect(await database.readTable("tagged_text")).toEqual(originalRows);
+      expect((await database.query("SELECT id FROM tagged_text ORDER BY value, id")).rows).toEqual([
+        { id: 3 },
+        { id: 2 },
+        { id: 1 },
+        { id: 4 },
+      ]);
+      expect(
+        (
+          await database.query("SELECT id FROM tagged_text WHERE value = ? ORDER BY id", {
+            params: [numericTwo],
+          })
+        ).rows,
+      ).toEqual([{ id: 1 }]);
+      expect(
+        (
+          await database.query(
+            "SELECT value, COUNT(*) AS n FROM tagged_text GROUP BY value ORDER BY value",
+          )
+        ).rows,
+      ).toEqual([
+        { value: invalidInterval, n: 1 },
+        { value: numericTen, n: 1 },
+        { value: numericTwo, n: 1 },
+        { value: nestedText, n: 1 },
+      ]);
+
+      await database.execute("CREATE TABLE copied_text (value TEXT)");
+      await database.insertBatch("copied_text", [{ value: numericTwo }, { value: nestedText }]);
+      expect(
+        (
+          await database.query(
+            "SELECT t.id FROM tagged_text t JOIN copied_text c ON t.value = c.value ORDER BY t.id",
+          )
+        ).rows,
+      ).toEqual([{ id: 1 }, { id: 4 }]);
+      await expect(
+        database.execute("INSERT INTO copied_text VALUES (?) RETURNING value", [invalidInterval]),
+      ).resolves.toMatchObject({ returnedRows: [{ value: invalidInterval }] });
+      expect(
+        (
+          await database.query(
+            "SELECT id FROM tagged_text WHERE MATCH(value) AGAINST 'numeric' ORDER BY id",
+          )
+        ).rows,
+      ).toEqual([{ id: 1 }, { id: 2 }, { id: 4 }]);
+
+      await database.execute("BEGIN");
+      await database.execute("UPDATE tagged_text SET value = ? WHERE id = 1", [invalidInterval]);
+      expect((await database.query("SELECT value FROM tagged_text WHERE id = 1")).rows).toEqual([
+        { value: invalidInterval },
+      ]);
+      await database.execute("ROLLBACK");
+      expect((await database.query("SELECT value FROM tagged_text WHERE id = 1")).rows).toEqual([
+        { value: numericTwo },
+      ]);
+
+      await database.execute("UPDATE tagged_text SET value = ? WHERE id = 2", [nestedText]);
+      expect(
+        (
+          await database.query("SELECT id FROM tagged_text WHERE value = ? ORDER BY id", {
+            params: [nestedText],
+          })
+        ).rows,
+      ).toEqual([{ id: 2 }, { id: 4 }]);
+      await database.execute("UPDATE tagged_text SET value = ? WHERE id = 2", [numericTen]);
+
+      await database.execute("BEGIN");
+      await database.execute("UPDATE tagged_text SET value = ? WHERE id = 4", [committedText]);
+      const committed = await database.execute("COMMIT");
+      if (committed.kind !== "transaction" || committed.version === undefined) {
+        throw new Error("Expected a committed SQL transaction version");
+      }
+      const currentRows = [
+        originalRows[0],
+        originalRows[1],
+        originalRows[2],
+        { id: 4, value: committedText },
+      ];
+      expect(await database.readTable("tagged_text")).toEqual(currentRows);
+      expect(await database.readTable("tagged_text", baseline.version)).toEqual(originalRows);
+
+      await database.execute("CREATE TABLE selected_text (id INTEGER PRIMARY KEY, value TEXT)");
+      await database.execute("INSERT INTO selected_text SELECT id, value FROM tagged_text");
+      expect(await database.readTable("selected_text")).toEqual(currentRows);
+      await database.execute("CREATE TABLE cloned_text AS SELECT value FROM tagged_text");
+      expect((await database.query("SELECT value FROM cloned_text ORDER BY value")).rows).toEqual([
+        { value: invalidInterval },
+        { value: committedText },
+        { value: numericTen },
+        { value: numericTwo },
+      ]);
+
+      await database.execute("CREATE TABLE keyed_text (id TEXT PRIMARY KEY, bucket INTEGER)");
+      await database.insertBatch("keyed_text", [
+        { id: numericTwo, bucket: 1 },
+        { id: nestedText, bucket: 2 },
+        { id: invalidInterval, bucket: 2 },
+      ]);
+      await database.execute("CREATE INDEX keyed_text_bucket_idx ON keyed_text (bucket)");
+      expect(
+        (await database.query("SELECT id FROM keyed_text WHERE bucket = 2 ORDER BY id")).rows,
+      ).toEqual([{ id: invalidInterval }, { id: nestedText }]);
+      await database.execute("UPDATE keyed_text SET bucket = 3 WHERE id = ?", [numericTwo]);
+      expect((await database.query("SELECT id FROM keyed_text WHERE bucket = 3")).rows).toEqual([
+        { id: numericTwo },
+      ]);
+      await expect(
+        database.execute("INSERT INTO keyed_text VALUES (?, 9) ON CONFLICT (id) DO NOTHING", [
+          numericTwo,
+        ]),
+      ).resolves.toMatchObject({ rowCount: 0 });
+
+      await database.execute("CREATE TABLE expression_text (id INTEGER PRIMARY KEY, value TEXT)");
+      await database.execute("INSERT INTO expression_text VALUES (1, ?)", [numericTwo]);
+      await expect(
+        database.execute(
+          "INSERT INTO expression_text VALUES (1, ?) " +
+            "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value RETURNING value",
+          [nestedText],
+        ),
+      ).resolves.toMatchObject({ returnedRows: [{ value: nestedText }] });
+      await database.execute("CREATE TABLE merge_text (id INTEGER PRIMARY KEY, value TEXT)");
+      await database.insertBatch("merge_text", [
+        { id: 1, value: invalidInterval },
+        { id: 2, value: numericTen },
+      ]);
+      await database.execute(
+        "MERGE INTO expression_text t USING merge_text s ON t.id = s.id " +
+          "WHEN MATCHED THEN UPDATE SET value = s.value " +
+          "WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value)",
+      );
+      expect(await database.readTable("expression_text")).toEqual([
+        { id: 1, value: invalidInterval },
+        { id: 2, value: numericTen },
+      ]);
+
+      await database.execute("CREATE TABLE trigger_target (id INTEGER PRIMARY KEY, value TEXT)");
+      await database.execute("INSERT INTO trigger_target VALUES (1, ?)", [numericTwo]);
+      await database.execute("CREATE TABLE trigger_source (id INTEGER PRIMARY KEY, value TEXT)");
+      await database.execute(
+        "CREATE TRIGGER copy_private_text AFTER INSERT ON trigger_source BEGIN " +
+          "UPDATE trigger_target SET value = NEW.value WHERE id = 1; END",
+      );
+      await database.insertBatch("trigger_source", [{ id: 1, value: nestedText }]);
+      expect(await database.readTable("trigger_target")).toEqual([{ id: 1, value: nestedText }]);
+
+      expect((await database.compactTable("tagged_text")).compacted).toBe(true);
+      expect(await database.readTable("tagged_text")).toEqual(currentRows);
+      expect(await database.readTable("tagged_text", baseline.version)).toEqual(originalRows);
+
+      const bytes = await database.exportSnapshot();
+      const restoredStore = await implementation.create();
+      const restored = new MinnowDatabase(restoredStore, { autoCompact: false });
+      await restored.importSnapshot(bytes);
+      expect(await restored.readTable("tagged_text")).toEqual(currentRows);
+      expect(await restored.readTable("selected_text")).toEqual(currentRows);
+      expect((await restored.query("SELECT value FROM cloned_text ORDER BY value")).rows).toEqual([
+        { value: invalidInterval },
+        { value: committedText },
+        { value: numericTen },
+        { value: numericTwo },
+      ]);
+      expect(
+        (await restored.query("SELECT id FROM keyed_text WHERE bucket = 2 ORDER BY id")).rows,
+      ).toEqual([{ id: invalidInterval }, { id: nestedText }]);
+      expect((await restored.query("SELECT id FROM keyed_text WHERE bucket = 3")).rows).toEqual([
+        { id: numericTwo },
+      ]);
+      expect(await restored.readTable("expression_text")).toEqual([
+        { id: 1, value: invalidInterval },
+        { id: 2, value: numericTen },
+      ]);
+      expect(await restored.readTable("trigger_target")).toEqual([{ id: 1, value: nestedText }]);
+      expect((await restored.query("SELECT id FROM tagged_text ORDER BY value, id")).rows).toEqual([
+        { id: 3 },
+        { id: 4 },
+        { id: 2 },
+        { id: 1 },
+      ]);
+      expect(
+        (
+          await restored.query("SELECT id FROM tagged_text WHERE value = ?", {
+            params: [numericTwo],
+          })
+        ).rows,
+      ).toEqual([{ id: 1 }]);
+      expect(
+        (
+          await restored.query(
+            "SELECT id FROM tagged_text WHERE MATCH(*) AGAINST 'numeric' ORDER BY id",
+          )
+        ).rows,
+      ).toEqual([{ id: 1 }, { id: 2 }]);
+
+      await restored.close();
+      await database.close();
+      restoredStore.close();
+      store.close();
+    });
+
+    it("keeps composite row locators private and valid after compaction and restore", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, {
+        autoCompact: false,
+        compression: "raw",
+        rowsPerBlock: 1,
+      });
+      const visibleRows = [
+        { shop: 1, receipt: 1, note: "alpha" },
+        { shop: 1, receipt: 2, note: "bravo" },
+        { shop: 2, receipt: 1, note: "charlie" },
+      ];
+      await database.execute(
+        "CREATE TABLE receipts (shop INTEGER, receipt INTEGER, note TEXT, PRIMARY KEY (shop, receipt))",
+      );
+      await database.execute("INSERT INTO receipts VALUES (1, 1, 'alpha'), (1, 2, 'bravo')");
+      await database.execute("INSERT INTO receipts VALUES (2, 1, 'charlie')");
+
+      expect(await database.readTable("receipts")).toEqual(visibleRows);
+      expect((await database.query("SELECT * FROM receipts ORDER BY shop, receipt")).rows).toEqual(
+        visibleRows,
+      );
+      await expect(
+        database.readTable("receipts", { columns: ["\0minnow_primary_key"] }),
+      ).rejects.toThrow("Unknown column");
+      expect(
+        (await database.query("SELECT * FROM receipts WHERE MATCH(*) AGAINST 'bff*'")).rows,
+      ).toEqual([]);
+      await expect(
+        database.execute("INSERT INTO receipts VALUES (1, 2, 'duplicate')"),
+      ).rejects.toThrow("receipts.(shop, receipt)");
+
+      expect((await database.compactTable("receipts")).compacted).toBe(true);
+      expect(await database.readTable("receipts")).toEqual(visibleRows);
+      const bytes = await database.exportSnapshot();
+      const restoredStore = await implementation.create();
+      const restored = new MinnowDatabase(restoredStore, { autoCompact: false });
+      await restored.importSnapshot(bytes);
+
+      expect(await restored.readTable("receipts")).toEqual(visibleRows);
+      expect((await restored.query("SELECT * FROM receipts ORDER BY shop, receipt")).rows).toEqual(
+        visibleRows,
+      );
+      await expect(
+        restored.readTable("receipts", { columns: ["\0minnow_primary_key"] }),
+      ).rejects.toThrow("Unknown column");
+      expect(
+        (await restored.query("SELECT * FROM receipts WHERE MATCH(*) AGAINST 'bff*'")).rows,
+      ).toEqual([]);
+      await expect(
+        restored.execute("INSERT INTO receipts VALUES (1, 2, 'duplicate')"),
+      ).rejects.toThrow("receipts.(shop, receipt)");
+      await expect(
+        restored.execute("UPDATE receipts SET receipt = 3 WHERE shop = 1"),
+      ).rejects.toThrow("Primary key column cannot be updated");
+      const physical = await restoredStore.getTableByName("receipts");
+      expect(physical?.columns.filter(({ hidden }) => hidden === true)).toHaveLength(1);
+      expect(physical?.primaryKeyColumnIds).toHaveLength(2);
+
+      await restored.close();
+      await database.close();
+      restoredStore.close();
+      store.close();
+    });
+  });
+}
+
 interface MutationCompactionFixture {
   database: MinnowDatabase;
   tableId: string;
@@ -884,7 +1178,11 @@ for (const implementation of implementations()) {
         columns: [
           { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
           { name: "status", type: "string", defaultValue: { kind: "literal", value: "draft" } },
-          { name: "created", type: "datetime", defaultValue: { kind: "now" } },
+          {
+            name: "created",
+            type: "datetime",
+            defaultValue: { kind: "expression", sql: "CURRENT_TIMESTAMP" },
+          },
         ],
         uniqueKey: "id",
       });
@@ -896,7 +1194,12 @@ for (const implementation of implementations()) {
           nullable: false,
           defaultValue: { kind: "literal", value: "draft" },
         },
-        { name: "created", type: "datetime", nullable: false, defaultValue: { kind: "now" } },
+        {
+          name: "created",
+          type: "datetime",
+          nullable: false,
+          defaultValue: { kind: "expression", sql: "CURRENT_TIMESTAMP" },
+        },
       ]);
 
       const create = (column: {
@@ -917,7 +1220,7 @@ for (const implementation of implementations()) {
           nullable: true,
           defaultValue: { kind: "literal", value: "x" },
         }),
-      ).rejects.toThrow("Defaults require a non-nullable column");
+      ).resolves.toBeUndefined();
       await expect(
         create({
           name: "b",
@@ -926,8 +1229,8 @@ for (const implementation of implementations()) {
         }),
       ).rejects.toThrow("Unknown default kind: uuid");
       await expect(
-        create({ name: "c", type: "string", defaultValue: { kind: "now" } }),
-      ).rejects.toThrow("requires a datetime column");
+        create({ name: "c", type: "string", defaultValue: { kind: "expression", sql: "" } }),
+      ).rejects.toThrow("trimmed non-empty expression");
       await expect(
         create({ name: "d", type: "string", defaultValue: { kind: "autoincrement" } }),
       ).rejects.toThrow("Auto-increment requires a number column");
@@ -946,7 +1249,7 @@ for (const implementation of implementations()) {
       ).rejects.toThrow("Default literal must be finite");
       await expect(
         create({ name: "h", type: "datetime", defaultValue: { kind: "literal", value: 1 } }),
-      ).rejects.toThrow("Datetime columns default with now");
+      ).rejects.toThrow("Default literal must be a datetime");
       await expect(
         database.createTable({
           name: "invalid_key_literal",
@@ -955,7 +1258,7 @@ for (const implementation of implementations()) {
           ],
           uniqueKey: "key",
         }),
-      ).rejects.toThrow("Unique key cannot default to a constant");
+      ).resolves.toBeUndefined();
       store.close();
     });
 
@@ -1051,7 +1354,11 @@ for (const implementation of implementations()) {
         columns: [
           { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
           { name: "status", type: "string", defaultValue: { kind: "literal", value: "draft" } },
-          { name: "created", type: "datetime", defaultValue: { kind: "now" } },
+          {
+            name: "created",
+            type: "datetime",
+            defaultValue: { kind: "expression", sql: "CURRENT_TIMESTAMP" },
+          },
         ],
         uniqueKey: "id",
       });
@@ -1108,9 +1415,52 @@ for (const implementation of implementations()) {
       const idVector: Array<number | null> = [5, null];
       const result = await database.insertBatch("events", {
         columns: { id: idVector, label: ["a", "b"] },
+        omitted: { id: [false, true] },
       });
       expect(result.generatedColumns?.id).toEqual([5, 6]);
       expect(idVector).toEqual([5, null]);
+      store.close();
+    });
+
+    it("rejects malformed columnar omission metadata before evaluating defaults", async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store);
+      await database.createTable({
+        name: "events",
+        columns: [
+          { name: "id", type: "number", defaultValue: { kind: "autoincrement" } },
+          { name: "label", type: "string", defaultValue: { kind: "literal", value: "new" } },
+        ],
+        uniqueKey: "id",
+      });
+      await expect(
+        database.insertBatch("events", {
+          columns: { id: [null, null], label: [null, null] },
+          omitted: { label: [true] },
+          rowCount: 2,
+        }),
+      ).rejects.toThrow("Omission mask label has 1 rows; expected 2");
+      await expect(
+        database.insertBatch("events", {
+          columns: { id: [null], label: [null] },
+          omitted: { missing: [true] },
+          rowCount: 1,
+        }),
+      ).rejects.toThrow("Unknown column in omission mask: missing");
+      await expect(
+        database.insertBatch("events", {
+          columns: { id: [null], label: [null] },
+          omitted: { label: [1 as unknown as boolean] },
+          rowCount: 1,
+        }),
+      ).rejects.toThrow("Omission mask label must contain booleans");
+      await expect(
+        database.insertBatch("events", {
+          columns: { id: [null], label: [null] },
+          omitted: { id: [true, true], label: [true, true] },
+          rowCount: 2,
+        }),
+      ).rejects.toThrow("Column id has 1 rows; expected 2");
       store.close();
     });
 
@@ -1713,10 +2063,9 @@ for (const implementation of implementations()) {
         { name: "Linus", score: 30, joined: null },
       ]);
 
-      // A column no row mentions is still missing; one a row omits pads to null and then fails
-      // the column's own nullability check.
+      // An omitted column with no default becomes NULL and then fails its nullability check.
       await expect(database.insertBatch("people", [{ name: "Katherine", joined }])).rejects.toThrow(
-        "Missing column: score",
+        "score[0] cannot be null",
       );
       await expect(
         database.insertBatch("people", [
@@ -2579,12 +2928,6 @@ it("prepares append and compacted snapshots directly into stable vectors", async
     columns: ["active", "score", "label", "recordedAt"],
     rows: [
       {
-        active: null,
-        score: null,
-        label: null,
-        recordedAt: null,
-      },
-      {
         active: false,
         score: -2,
         label: "third",
@@ -2595,6 +2938,12 @@ it("prepares append and compacted snapshots directly into stable vectors", async
         score: 1.5,
         label: "shared",
         recordedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+      {
+        active: null,
+        score: null,
+        label: null,
+        recordedAt: null,
       },
     ],
   });

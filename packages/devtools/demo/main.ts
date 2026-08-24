@@ -5,7 +5,6 @@
  * Serve the repository root with vite and open /packages/devtools/demo/.
  */
 import { column, MinnowDatabase, schema, table } from "@minnowdb/core";
-import { createMinnow } from "@minnowdb/client";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
 import { mountMinnowDevtools, type DevtoolsTheme } from "@minnowdb/devtools";
 
@@ -24,23 +23,17 @@ const demoSchema = schema([people, orders]);
 const database = new MinnowDatabase(new MemoryBlockStore());
 await database.migrate(demoSchema);
 
-const db = createMinnow(database, { schema: demoSchema });
-await db
-  .insertInto("people")
-  .values([
-    { name: "Ada", score: 10, city: "London" },
-    { name: "Grace", score: 20, city: "DC" },
-    { name: "Katherine", score: 30, city: null },
-  ])
-  .execute();
-await db
-  .insertInto("orders")
-  .values([
-    { order_id: 1, person: "Ada", total: 12.5 },
-    { order_id: 2, person: "Ada", total: 7.5 },
-    { order_id: 3, person: "Grace", total: 40 },
-  ])
-  .execute();
+await database.insertBatch("people", [
+  { name: "Ada", score: 10, city: "London" },
+  { name: "Grace", score: 20, city: "DC" },
+  { name: "Katherine", score: 30, city: null },
+]);
+await database.insertBatch("orders", [
+  { order_id: 1, person: "Ada", total: 12.5 },
+  { order_id: 2, person: "Ada", total: 7.5 },
+  { order_id: 3, person: "Grace", total: 40 },
+]);
+await database.execute("CREATE UNIQUE INDEX people_by_city_score ON people(city ASC, score DESC)");
 
 /**
  * A wide, keyless table and a big keyed one, so the explorer's two hard cases — no cursor to page
@@ -75,7 +68,11 @@ await database.createTable({
   columns: [
     { name: "note_id", type: "number", defaultValue: { kind: "autoincrement" } },
     { name: "body", type: "string" },
-    { name: "written_at", type: "datetime", defaultValue: { kind: "now" } },
+    {
+      name: "written_at",
+      type: "datetime",
+      defaultValue: { kind: "expression", sql: "CURRENT_TIMESTAMP" },
+    },
   ],
 });
 await database.insert("notes", { body: "the first note" });
@@ -99,8 +96,7 @@ for (let index = 0; index < 200; index += 1) {
   await database.insert("readings", row);
 }
 
-// Attaching the facade proves the driver accessor: the panel unwraps it to the database itself.
-const devtools = mountMinnowDevtools(db, {
+const devtools = mountMinnowDevtools(database, {
   corner: "bottom-right",
   defaultOpen: true,
   initialQuery: "SELECT name, score, city FROM people ORDER BY score DESC",
@@ -121,4 +117,4 @@ document.querySelector("#ping")?.addEventListener("click", () => {
 });
 
 // Exposed so browser tests can drive the panel without reaching into the shadow root.
-Object.assign(window, { devtools, database, db });
+Object.assign(window, { devtools, database });

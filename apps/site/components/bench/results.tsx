@@ -145,6 +145,11 @@ export function ReadResults({
         {result.passed
           ? "Every query every engine could run agreed with the independent oracle."
           : "Some results disagreed with the oracle — treat these timings as suspect."}
+        {result.secondaryIndexes === "foreign-keys"
+          ? " This run includes the same 81 foreign-key secondary indexes in every engine."
+          : result.secondaryIndexes === "none"
+            ? " This run has primary keys only and no secondary indexes."
+            : " This saved run predates index-mode labels, so its secondary-index configuration is unknown."}
       </p>
       {WORKLOADS.map((workload) => (
         <Table
@@ -162,15 +167,13 @@ export function ReadResults({
                 const measured = query.engines.find((entry) => entry.engine === column.engine);
                 // An unsupported query, or one whose answer did not match the oracle, has no
                 // number worth printing. Neither has a variant column for an engine without
-                // that layer — no result memo, no worker client.
+                // that layer — there is no result memo to report.
                 const usable = measured?.supported === true && measured.verified;
                 const ms = !usable
                   ? null
                   : column.variant === "cached"
                     ? (measured.cachedMedianMs ?? null)
-                    : column.variant === "client"
-                      ? (measured.clientMedianMs ?? null)
-                      : measured.medianMs;
+                    : measured.medianMs;
                 return {
                   id: column.id,
                   ms,
@@ -326,16 +329,28 @@ export function StorageResults({ record }: { record: DatasetRecord }) {
       <h3 className="text-xl font-semibold">Storage</h3>
       <p className="mt-1 text-sm text-fd-muted-foreground">
         The same {record.totalRows.toLocaleString("en-US")} rows, as each engine stored them just
-        now.
+        now. Every copy has the workload&rsquo;s primary keys
+        {record.secondaryIndexes === "foreign-keys"
+          ? " and the same 81 foreign-key secondary indexes"
+          : record.secondaryIndexes === "none"
+            ? " and no secondary indexes"
+            : "; this saved run predates secondary-index labels"}
+        . Inserts and index builds are timed separately; ready total also includes schema creation,
+        verification, persistence, and reopen work.
       </p>
       <div className="mt-3 overflow-x-auto rounded-lg border border-fd-border">
-        <table className="w-full min-w-[36rem] text-sm">
+        <table className="w-full min-w-[72rem] text-sm">
           <thead>
             <tr className="border-b border-fd-border bg-fd-muted">
               <th className="px-3 py-2 text-left font-medium">Engine</th>
+              <th className="px-3 py-2 text-right font-medium">Table data</th>
+              <th className="px-3 py-2 text-right font-medium">Secondary indexes</th>
               <th className="px-3 py-2 text-right font-medium">On disk</th>
               <th className="px-3 py-2 text-right font-medium">Per row</th>
               <th className="px-3 py-2 text-right font-medium">Relative</th>
+              <th className="px-3 py-2 text-right font-medium">Bulk inserts</th>
+              <th className="px-3 py-2 text-right font-medium">Index build</th>
+              <th className="px-3 py-2 text-right font-medium">Ready total</th>
               <th className="px-3 py-2 text-left font-medium">Storage</th>
             </tr>
           </thead>
@@ -343,6 +358,12 @@ export function StorageResults({ record }: { record: DatasetRecord }) {
             {ready.map((entry) => (
               <tr key={entry.engine} className="border-b border-fd-border last:border-0">
                 <td className="px-3 py-1.5">{engineLabel(entry.engine)}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">
+                  {entry.dataStoredBytes === null ? "—" : formatStorage(entry.dataStoredBytes)}
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums">
+                  {entry.indexStoredBytes === null ? "—" : formatStorage(entry.indexStoredBytes)}
+                </td>
                 <td
                   className={`px-3 py-1.5 text-right tabular-nums ${
                     entry.storedBytes !== null && entry.storedBytes === smallest
@@ -362,6 +383,9 @@ export function StorageResults({ record }: { record: DatasetRecord }) {
                     ? "—"
                     : `${(entry.storedBytes / smallest).toFixed(2)}×`}
                 </td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{formatMs(entry.insertMs)}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{formatMs(entry.indexMs)}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{formatMs(entry.buildMs)}</td>
                 <td className="px-3 py-1.5 text-xs text-fd-muted-foreground">
                   {entry.persistence}
                 </td>
@@ -377,7 +401,7 @@ export function StorageResults({ record }: { record: DatasetRecord }) {
 export function FeatureResults({ result }: { result: FeatureSuiteResult }) {
   return (
     <section>
-      <h3 className="text-xl font-semibold">SQL conformance</h3>
+      <h3 className="text-xl font-semibold">PostgreSQL compatibility</h3>
       <p className="mt-1 text-sm text-fd-muted-foreground">
         {result.supportedCount} supported and {result.unsupportedCount} rejected forms from the
         published matrix, executed just now.{" "}

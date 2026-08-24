@@ -24,6 +24,7 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import rawPostgresProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
 import { seedFor } from "../testing/seeds.js";
@@ -446,9 +447,8 @@ const templates: Template[] = [
   () => ({
     sql: `SELECT id, region FROM data ORDER BY region, id`,
     ordered: true,
-    // Default NULL ordering: Minnow matches SQLite (NULLs first ascending); PostgreSQL defaults
-    // to NULLs last. Explicit NULLS FIRST/LAST agrees on all engines.
-    skip: ["pglite"],
+    // Default NULL ordering follows PostgreSQL; SQLite needs an explicit placement to agree.
+    skip: ["sqlite"],
   }),
   (rng) => ({
     sql:
@@ -629,7 +629,7 @@ const templates: Template[] = [
     ordered: false,
     skip: ["sqlite"],
   }),
-  // --- SQL:2023 surface, over the same seeded fixture ------------------------------------------
+  // --- Matrix SQL surface, over the same seeded fixture ----------------------------------------
   (rng) => ({
     // E021-06/09/11 and T055 against PostgreSQL, whose spellings are the standard's.
     sql: `SELECT id, SUBSTRING(label FROM ${String(1 + Math.floor(rng() * 4))} FOR 3) AS part, POSITION('a' IN label) AS at, LPAD(label, 9, '.') AS padded, RPAD(label, 9, '.') AS tail, OVERLAY(label PLACING 'ZZ' FROM 2 FOR 2) AS masked, CHAR_LENGTH(label) AS width, OCTET_LENGTH(label) AS bytes FROM data ORDER BY id`,
@@ -1047,6 +1047,31 @@ interface MatrixFeature {
 
 const matrixFeatures = (rawMatrix as { features: MatrixFeature[] }).features;
 
+type PostgresClassification =
+  "compatible" | "different" | "extension" | "unsupported" | "inapplicable";
+
+interface PostgresOverride {
+  id: string;
+  classification: PostgresClassification;
+  verification?: "acceptance";
+}
+
+const postgresProfile = rawPostgresProfile as {
+  defaults: {
+    supported: PostgresClassification;
+    unsupported: PostgresClassification;
+  };
+  overrides: PostgresOverride[];
+};
+const postgresOverrides = new Map(postgresProfile.overrides.map((entry) => [entry.id, entry]));
+
+function postgresClassification(feature: MatrixFeature): PostgresClassification {
+  const override = postgresOverrides.get(feature.id);
+  if (override !== undefined) return override.classification;
+  if (feature.status === "unsupported") return postgresProfile.defaults.unsupported;
+  return postgresProfile.defaults.supported;
+}
+
 /** The fixture the matrix's examples are written against, mirrored from feature-matrix.test.ts. */
 const matrixRows = [
   { region: "west", amount: 10, active: true, joined: new Date("2026-01-02T00:00:00.000Z") },
@@ -1177,7 +1202,7 @@ function writesData(id: string): boolean {
  * fails for any supported feature that is neither executed nor listed.
  */
 const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: string }>([
-  // --- SQL:2023 forms SQLite does not spell ------------------------------------------------
+  // --- PostgreSQL forms SQLite does not spell -----------------------------------------------
   ["function.char-length", { oracles: ["sqlite"], reason: "SQLite spells it LENGTH" }],
   [
     "function.substring-from-for",
@@ -1260,6 +1285,48 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     "json.array",
     { oracles: ["pglite"], reason: "PostgreSQL renders JSON text with spaces after separators" },
   ],
+  [
+    "type.exact-numeric",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "Minnow returns exact decimals as strings; both oracle adapters decode this example as a number",
+    },
+  ],
+  [
+    "type.json-jsonb",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "Minnow returns JSON text, PGlite returns a native object, and SQLite does not have PostgreSQL JSONB casts",
+    },
+  ],
+  ["type.uuid", { oracles: ["sqlite"], reason: "SQLite has no UUID type" }],
+  [
+    "type.interval",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "Minnow exposes its structured interval as canonical text; PGlite formats intervals differently and SQLite has no interval type",
+    },
+  ],
+  ["from.lateral", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
+  ["aggregate.string-agg", { oracles: ["sqlite"], reason: "SQLite spells it GROUP_CONCAT" }],
+  ["json.table", { oracles: ["sqlite"], reason: "SQLite has no SQL/JSON JSON_TABLE syntax" }],
+  ["predicate.similar-to", { oracles: ["sqlite"], reason: "SQLite has no SIMILAR TO" }],
+  [
+    "collation.explicit",
+    { oracles: ["sqlite"], reason: "SQLite does not ship PostgreSQL's named C collation" },
+  ],
+  [
+    "type.array",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "Minnow returns canonical JSON text, PostgreSQL returns a native array, and SQLite has no ARRAY constructor",
+    },
+  ],
+  ["type.time", { oracles: ["sqlite"], reason: "SQLite has no TIME literal" }],
 
   ["predicate.match", { oracles: ["sqlite", "pglite"], reason: "MATCH is a Minnow extension" }],
   [
@@ -1515,5 +1582,23 @@ describe("SQL conformance against SQLite and PGlite", () => {
     // And nothing may be exempted that does not exist, so the list cannot rot.
     const ids = new Set(matrixFeatures.map((feature) => feature.id));
     expect([...matrixSkips.keys()].filter((id) => !ids.has(id))).toEqual([]);
+
+    // The PostgreSQL profile is executable, not a second prose list: every deterministic
+    // compatible read reaches PGlite above. The sole exception is ANY_VALUE, whose chosen group
+    // member is intentionally unspecified and has its own parser-acceptance check.
+    const compatibleReads = matrixFeatures.filter(
+      (feature) =>
+        feature.status === "supported" &&
+        !writesData(feature.id) &&
+        postgresClassification(feature) === "compatible",
+    );
+    const compatiblePgliteSkips = compatibleReads
+      .filter((feature) => matrixSkips.get(feature.id)?.oracles.includes("pglite") === true)
+      .map(({ id }) => id);
+    expect(compatiblePgliteSkips).toEqual(
+      postgresProfile.overrides
+        .filter(({ verification }) => verification === "acceptance")
+        .map(({ id }) => id),
+    );
   });
 });

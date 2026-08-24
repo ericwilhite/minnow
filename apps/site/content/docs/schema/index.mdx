@@ -3,20 +3,16 @@ title: Schema & migrations
 description: Define tables once in TypeScript, and evolve them without rewriting stored data.
 ---
 
-Define tables once in TypeScript. The same declaration drives migrations, row types, and every
-query builder — and `migrate()` never rewrites stored data.
+Define tables once in TypeScript. The same declaration drives migrations, inferred core and
+Kysely types, runtime validation, and schema tooling — and `migrate()` never rewrites stored data.
 
-Schema management lives in `@minnowdb/core`, not in the typed client. `migrate()` is an engine
-capability, and the catalog it produces is what
-[schema tooling of any kind](/docs/reference/extending) builds on — so it works with or without
-[the query builder](/docs/client). The examples below use the builder where it makes the types
-easier to see.
+Schema management lives in `@minnowdb/core`. The catalog `migrate()` produces is also the public
+surface that [client adapters and other tooling](/docs/reference/extending) build on.
 
 ## Defining a schema
 
 ```ts
-import { column, schema, table, view } from "@minnowdb/core";
-import { createMinnow, type InferDatabase } from "@minnowdb/client";
+import { column, schema, table, typedTable, view } from "@minnowdb/core";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -24,19 +20,34 @@ const people = table("people", {
   joined: column.datetime().nullable(),
 });
 const appSchema = schema([people]);
-interface DB extends InferDatabase<typeof appSchema> {}
 
 await database.migrate(appSchema);
 
-// The same declaration drives the query builder's types end to end:
-const db = createMinnow<DB>(database, { schema: appSchema });
-await db.insertInto("people").values({ name: "Ada", score: 10 }).execute(); // joined pads to null
-const rows = await db.selectFrom("people").selectAll().execute();
+// The optional core handle carries the table's inferred row shapes:
+const peopleRows = typedTable(database, people);
+await peopleRows.insert([{ name: "Ada", score: 10 }]); // joined pads to null
+const rows = await peopleRows.rows();
 // Array<{ name: string; score: number; joined: Date | null }>
 ```
 
-There's a builder per column type — `column.boolean()`, `column.number()`, `column.string()`,
-`column.datetime()`, and `column.enum([...])` — and six modifiers:
+The four physical storage builders are `column.boolean()`, `column.number()`, `column.string()`,
+and `column.datetime()`. The DSL also retains the SQL domain layered over that storage:
+
+| Builder                                   | Selected type             | Insert / update type          |
+| ----------------------------------------- | ------------------------- | ----------------------------- |
+| `column.integer()`                        | `number`                  | `number` (safe integers only) |
+| `column.numeric({ precision, scale })`    | `string`                  | `string \| number`            |
+| `column.json()` / `column.jsonb()`        | `string`                  | `string`                      |
+| `column.uuid()` / `time()` / `interval()` | `string`                  | `string`                      |
+| `column.array("text")`                    | JSON array text           | JSON array text               |
+| `column.enum([...])`                      | The values' literal union | The values' literal union     |
+| `column.sqlEnum("mood", [...])`           | The values' literal union | The values' literal union     |
+
+`NUMERIC` selects as a decimal string so no precision is lost, while writes may use a decimal
+string or a finite number. JSON/JSONB and arrays use their JSON text representation at the
+JavaScript boundary, matching direct SQL and the Kysely adapter.
+
+The column modifiers are:
 
 - **`.unique()`** — marks the table's unique key (one non-null column).
 - **`.nullable()`** — permits NULL and widens the inferred type.
@@ -44,14 +55,13 @@ There's a builder per column type — `column.boolean()`, `column.number()`, `co
   persistent per-table counter that stays atomic across tabs. Number unique-key columns only.
   Explicit values are accepted and bump the counter past their maximum, so imports keep stable
   ids.
-- **`.default(value)` / `.default(fn)`** — fills omitted (or null) slots at insert time. A
-  plain value persists in the catalog and fills inside the engine, so every write path gets it —
-  raw batches, SQL statements, other tabs (datetime columns take only `"now"`, which stamps one
-  consistent timestamp per batch). A function is a userland generator — `() => ulid()`, a
-  custom nanoid, anything: the typed client (`insertInto`, `typedTable`) calls it just before
-  its parameterized INSERT is sent, so it never persists, never crosses the worker boundary, and write paths
-  that skip the typed client don't see it. Defaults require non-nullable columns, and `returning`
-  echoes the written values either way.
+- **`.default(value)` / `.defaultSql(expression)`** — stores a literal or a variable-free SQL
+  expression in the catalog. Omitted columns and explicit SQL `DEFAULT` slots evaluate it inside
+  the engine, once per inserted row, through every write path. Explicit `NULL` stays NULL; a
+  nullable column may therefore also have a default. `defaultSql` accepts the SQL functions and
+  operators Minnow implements, including `CURRENT_TIMESTAMP`, `random()`, `gen_random_uuid()`,
+  and `nextval(...)`. It rejects column references, parameters, aggregates, windows, subqueries,
+  and a result type that does not match the column. `RETURNING` echoes the generated values.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
   rather than a drop-and-add.
 - **`.backfill(value)`** — what rows written before this column existed read as, instead of NULL.
@@ -60,6 +70,11 @@ There's a builder per column type — `column.boolean()`, `column.number()`, `co
   unique key. `migrate()` creates it as a real constraint, so a write naming a parent row that
   does not exist is rejected. `onDelete` is `"restrict"` (the default), `"cascade"`, or
   `"set null"`; the last requires a nullable column.
+
+The complete select, insert, and update types are available as `InferRow<T>`, `InferInsertRow<T>`,
+and `InferUpdateChanges<T>`. Defaults and nullable columns are optional on insert; primary-key
+columns are excluded from updates. The [Kysely adapter](/docs/adapters/kysely) converts the same
+metadata to Kysely's `ColumnType<Select, Insert, Update>` automatically.
 
 ### Enum columns
 
@@ -71,9 +86,11 @@ const tickets = table("tickets", {
   id: column.number().unique().autoIncrement(),
   status: column.enum(["open", "closed", "reopened"]).default("open"),
 });
+await database.migrate(schema([tickets]));
 // Selects return "open" | "closed" | "reopened"; inserts and updates accept nothing else.
-await db.insertInto("tickets").values({ status: "open" }).execute();
-await db.insertInto("tickets").values({ status: "lost" }).execute(); // compile error
+const ticketRows = typedTable(database, tickets);
+await ticketRows.insert([{ status: "open" }]);
+await ticketRows.insert([{ status: "lost" }]); // compile error
 ```
 
 The set is enforced twice: at compile time through the inferred union, and at runtime on every
@@ -83,30 +100,29 @@ the value set is catalog metadata, which keeps its migrations metadata-only: add
 relaxing the column to `column.string()` is safe, while removing values or tightening an
 existing string column into an enum is rejected (existing rows could already violate the set).
 
+`column.sqlEnum("mood", values)` additionally retains a PostgreSQL-style type name for generated
+SQL and introspection. The name and values belong to that column declaration; the schema DSL does
+not create or manage a reusable `CREATE TYPE mood` catalog object. Use SQL or Kysely migrations
+when several independently managed tables must share one named enum type.
+
 ```ts
 const notes = table("notes", {
   id: column.number().unique().autoIncrement(),
-  slug: column.string().default(() => nanoid()), // any userland generator
+  slug: column.uuid().defaultSql("gen_random_uuid()"),
   status: column.string().default("draft"),
-  created: column.datetime().default("now"),
+  created: column.datetime().defaultSql("CURRENT_TIMESTAMP"),
   body: column.string(),
 });
-// Insert types make generated columns optional:
-await db.insertInto("notes").values({ body: "hello" }).returningAll().executeTakeFirstOrThrow();
-// { id: 1, slug: "V1StGXR8_Z5jdHi6B-myT", status: "draft", created: Date, body: "hello" }
+await database.migrate(schema([notes]));
+// Inferred insert types make generated columns optional:
+const noteRows = typedTable(database, notes);
+await noteRows.insert([{ body: "hello" }]);
 ```
 
-`InferDatabase` carries the "engine can fill this" fact into insert types automatically. If you
-hand-write your `DB` interface instead, mark those columns with `Generated<T>` and wrap the row in
-`FromRow`, which reads the marker once — at your declaration — and produces the three shapes:
-
-```ts
-import { type FromRow } from "@minnowdb/client";
-
-interface DB {
-  notes: FromRow<{ id: Generated<number>; slug: Generated<string>; body: string }>;
-}
-```
+`InferInsertRow<typeof notes>` carries the "engine can fill this" fact into the insert type.
+The SQL text remains catalog metadata and crosses the worker boundary unchanged. `CURRENT_*`
+uses one statement timestamp; volatile functions such as `gen_random_uuid()` run separately for
+each omitted row.
 
 Declaration order does not matter: `migrate()` creates a table after the tables it references, so a
 child may be listed before its parent.
@@ -118,16 +134,16 @@ to `table()`:
 
 ```ts
 const parents = table("parents", {
-  id: column.number().unique(),
+  id: column.integer().unique(),
   label: column.string(),
 });
 
 const children = table(
   "children",
   {
-    id: column.number().unique(),
-    parent_id: column.number().references("parents", "id", { onDelete: "cascade" }),
-    qty: column.number(),
+    id: column.integer().unique(),
+    parent_id: column.integer().references("parents", "id", { onDelete: "cascade" }),
+    qty: column.integer(),
   },
   { checks: [{ name: "positive_qty", sql: "qty > 0" }] },
 );
@@ -153,6 +169,46 @@ CREATE TABLE children (
 Each check is a boolean SQL expression over the table's own columns, compiled when the table is
 created — so an expression the engine cannot evaluate fails at migration time rather than on the
 first write.
+
+### Composite primary and foreign keys
+
+Use the table options for ordered, multi-column identity and relations:
+
+```ts
+const accounts = table(
+  "accounts",
+  {
+    tenant_id: column.uuid(),
+    account_no: column.integer(),
+    balance: column.numeric({ precision: 12, scale: 2 }).default("0"),
+  },
+  { primaryKey: ["tenant_id", "account_no"] },
+);
+
+const entries = table(
+  "entries",
+  {
+    tenant_id: column.uuid(),
+    account_no: column.integer(),
+    entry_no: column.integer(),
+    memo: column.string(),
+  },
+  {
+    primaryKey: ["tenant_id", "account_no", "entry_no"],
+    foreignKeys: [
+      {
+        name: "entries_account_fkey",
+        columns: ["tenant_id", "account_no"],
+        references: { table: "accounts", columns: ["tenant_id", "account_no"] },
+        onDelete: "cascade",
+      },
+    ],
+  },
+);
+```
+
+The child and parent lists must have the same arity, their domains must match, and the parent list
+must match the declared primary-key order. `.unique()` remains the shorter scalar-key form.
 
 ### Backfilling an added column
 
@@ -188,6 +244,11 @@ not supported.
 Backfills apply to non-nullable columns only. A nullable column already has an answer for rows that
 never had a value, and the declaration is rejected rather than quietly ignored.
 
+Keep `.backfill(...)` in the declaration after it has been applied. Its frozen value is part of
+the column's meaning for old segments: adding, removing, or changing it later is rejected rather
+than silently changing what existing rows read. A default is separate — it fills future inserts,
+while the backfill answers rows written before the column existed.
+
 ## Views
 
 A view is a named query. Declare it with the columns you expect it to produce:
@@ -205,12 +266,12 @@ The engine infers the query's real output schema when it creates the view and co
 you declared, so a body that drifts from its declaration fails the migration instead of surprising
 a reader later.
 
-**Views are readable, not writable.** They join `DB` like tables, so `selectFrom` works and the row
-type is what you declared — but they carry no insert shape, which makes a write a compile error:
+**Views are readable, not writable.** Query them like tables; an insert is rejected because the
+catalog records the object as a view:
 
 ```ts
-await db.selectFrom("active_customers").select(["name"]).execute(); // fine
-await db.insertInto("active_customers"); // compile error: not a writable table
+await database.query("SELECT name FROM active_customers");
+await database.execute("INSERT INTO active_customers (name) VALUES ($1)", ["Ada"]); // rejected
 ```
 
 Because nothing is stored under a view, replacing one is always safe: change the `sql` and the next
@@ -250,6 +311,12 @@ deterministic steps:
 - **Nothing is rewritten.** Not one stored byte changes: a column added later is answered at read
   time, and folding it into the blocks is
   [compaction](/docs/storage/maintenance#compaction)'s job, on its own schedule.
+
+Column storage types, SQL domains, primary-key membership/order, foreign keys, checks, and frozen
+backfills cannot be changed in place. `migrate()` rejects those changes because a catalog-only
+edit cannot prove or preserve their meaning. Enum restrictions are the exception: their set may
+widen, never narrow. Secondary indexes, triggers, named enum-type objects, and sequences remain
+SQL/Kysely migration concerns; the schema DSL does not claim ownership of them.
 
 ### Proven rather than assumed
 
@@ -291,9 +358,9 @@ await database.migrate(appSchema, { allowDestructive: true, schemaOwnsDatabase: 
 Even then, only tables a migration created are dropped. One made with `CREATE TABLE` belongs to no
 schema, exactly as with [views](#views).
 
-A drop is refused outright when something in the catalog still points at the column — the unique
-key, a `FOREIGN KEY`, or a `CHECK` — because dropping it would leave that constraint naming a
-column that is not there.
+A drop is refused outright when something in the catalog still points at the column — its primary
+or unique key, a `FOREIGN KEY`, a `CHECK`, or a secondary index — because dropping it would leave
+that catalog object naming a column that is not there.
 
 Rejected outright, rather than attempted:
 
@@ -301,43 +368,30 @@ Rejected outright, rather than attempted:
 - unique-key changes
 - non-nullable column additions **without a backfill**
 - removing enum values, or tightening a string column into an enum
-
-Both need the stored bytes rewritten, which is compaction's job, not a migration's.
-
 - adding, changing, or dropping a FOREIGN KEY or CHECK on an existing table
 
-That last one is the same rule as the rest: existing rows are not known to satisfy a constraint
-nobody has verified them against, and there is no validation scan. Declare constraints when you
+Type and identity changes need a deliberate table replacement. A new or changed constraint also
+needs proof about existing rows, and there is no validation scan. Declare constraints when you
 create the table, or create a new table and copy deliberately. Views are the exception — they hold
 no rows, so replacing one needs no proof.
 
 If you need one of those, that's a new table plus a deliberate application-level copy.
 
-## Inferred shapes
+## Inferred table shapes
 
-`InferDatabase<typeof appSchema>` maps each name in your schema to its shapes. A table contributes
-three; a view contributes one.
+Every table declaration carries select, insert, and update types directly:
 
 ```ts
-type DB = {
-  people: { select: {...}; insert: {...}; update: {...} };
-  active_people: { select: {...} }; // a view: readable only
-};
+type Person = InferRow<typeof people>;
+type NewPerson = InferInsertRow<typeof people>;
+type PersonChanges = InferUpdateChanges<typeof people>;
 ```
-
-Naming the three explicitly is what makes `DB` readable by code that did not build it — including
-your own tooling — instead of requiring it to decode a marker. It is also what makes a write to a
-view a compile error: a view has no `insert`.
 
 | Type                 | Meaning                                             |
 | -------------------- | --------------------------------------------------- |
 | `InferRow`           | The select shape; nullable columns are `\| null`.   |
 | `InferInsertRow`     | The insert shape; nullable columns may be omitted.  |
 | `InferUpdateChanges` | The partial-update shape accepted by keyed updates. |
-| `SelectRowOf<S>`     | Pulls the select row back out of a `DB` entry.      |
-| `InsertRowOf<S>`     | Likewise for inserts.                               |
-| `UpdateRowOf<S>`     | Likewise for updates.                               |
-| `WritableTable<DB>`  | The names that accept writes — views excluded.      |
 
 Each table definition also carries a Standard Schema-compatible `~standard` validator, so any
 library that speaks that interface can validate rows at runtime with your definitions.

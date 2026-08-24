@@ -39,6 +39,7 @@ describe("CAST", () => {
       run("SELECT CAST('2026-01-02T03:04:05.000Z' AS TIMESTAMP) AS d FROM rows WHERE id = 1"),
     ).toEqual([{ d: new Date("2026-01-02T03:04:05.000Z") }]);
     expect(run("SELECT CAST(NULL AS INTEGER) AS n FROM rows WHERE id = 1")).toEqual([{ n: null }]);
+    expect(run("SELECT CAST(amount AS JSONB) AS x FROM rows WHERE id = 1")).toEqual([{ x: "10" }]);
     // Integer targets truncate toward zero, including negatives.
     expect(run("SELECT CAST(0 - 2.7 AS INTEGER) AS i FROM rows WHERE id = 1")).toEqual([{ i: -2 }]);
   });
@@ -53,9 +54,7 @@ describe("CAST", () => {
     expect(() => run("SELECT CAST(2 AS BOOLEAN) AS x FROM rows")).toThrow(
       "Only 0 and 1 cast to boolean",
     );
-    expect(() => compileQuery("SELECT CAST(amount AS JSONB) AS x FROM rows")).toThrow(
-      "Unsupported CAST target: JSONB",
-    );
+    expect(() => run("SELECT CAST('nope' AS UUID) AS x FROM rows")).toThrow("Invalid UUID");
   });
 });
 
@@ -73,13 +72,13 @@ describe("quoted identifiers", () => {
 });
 
 describe("NULL ordering", () => {
-  it("defaults to NULLs first ascending and last descending", () => {
+  it("uses PostgreSQL's NULLs-last ascending and NULLs-first descending defaults", () => {
     expect(run("SELECT id, region FROM rows ORDER BY region, id").map((row) => row.id)).toEqual([
-      2, 3, 1,
+      3, 1, 2,
     ]);
     expect(
       run("SELECT id, region FROM rows ORDER BY region DESC, id").map((row) => row.id),
-    ).toEqual([1, 3, 2]);
+    ).toEqual([2, 1, 3]);
   });
 
   it("honors explicit NULLS FIRST/LAST absolutely", () => {

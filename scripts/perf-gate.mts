@@ -14,10 +14,15 @@ import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { MemoryBlockStore } from "../packages/core/src/storage/index.js";
 import { MinnowDatabase } from "../packages/core/src/engine/database.js";
+import { MinnowDialect } from "../packages/kysely/src/dialect.js";
+import { Kysely } from "kysely";
 
 const BASELINE_PATH = new URL("../packages/core/perf-baseline.json", import.meta.url);
 const ROWS = 200_000;
-const WARMUP = 2;
+// Give V8 enough executions to tier allocation-heavy grouped/DISTINCT kernels before sampling.
+// Two left that shape bimodal between fresh processes (about 17ms or 27ms) even though its
+// steady-state cost was unchanged, turning the release gate into a coin flip.
+const WARMUP = 5;
 const RUNS = 9;
 /**
  * Sub-millisecond queries are timed in batches rather than floored. Flooring both sides of the
@@ -27,23 +32,31 @@ const RUNS = 9;
  * query enough times to take at least this long, and the per-iteration cost is the total over
  * the count, which makes a 0.07ms query as measurable as a 7ms one and keeps the gate's
  * cross-engine ratio — the part that survives a change of machine — meaningful at every scale.
+ * Read-only engines calibrate independently because normalized per-iteration timings remain
+ * comparable and making a 7ms engine repeat as often as a 0.07ms engine only adds idle minutes.
  */
 const TARGET_SAMPLE_MS = 25;
-const MAX_ITERATIONS = 2_000;
+// Memo hits can complete in a few microseconds; 10k repeats is still a short sample but lets the
+// fastest path reach TARGET_SAMPLE_MS instead of deriving a release decision from timer jitter.
+const MAX_ITERATIONS = 10_000;
 /** A tiny floor remains, against a divide-by-zero on an engine that answers instantly. */
 const ratioOf = (minnowMs: number, engineMs: number): number =>
   Math.max(minnowMs, 0.0001) / Math.max(engineMs, 0.0001);
 
 /**
  * How many times to repeat one query per timed sample. Measured once from a single run, so the
- * count reflects this machine, and shared by all three engines for a given query so the ratio
- * compares like with like.
+ * count reflects this machine. The optional target and cap let stateful mutations share a
+ * bounded iteration count while read-only shapes give each engine the full-resolution sample.
  */
-function iterationsFor(singleRunMs: number): number {
-  if (singleRunMs >= TARGET_SAMPLE_MS) return 1;
+function iterationsFor(
+  singleRunMs: number,
+  targetSampleMs = TARGET_SAMPLE_MS,
+  maximumIterations = MAX_ITERATIONS,
+): number {
+  if (singleRunMs >= targetSampleMs) return 1;
   return Math.min(
-    MAX_ITERATIONS,
-    Math.max(1, Math.ceil(TARGET_SAMPLE_MS / Math.max(singleRunMs, 0.001))),
+    maximumIterations,
+    Math.max(1, Math.ceil(targetSampleMs / Math.max(singleRunMs, 0.001))),
   );
 }
 
@@ -104,6 +117,8 @@ interface PerfQuery {
   readonly ordered?: boolean;
   /** Serve Minnow's probe-validated result memo instead of re-executing (gates memo-hit latency). */
   readonly memoize?: boolean;
+  /** Include Kysely's compilation and driver bridge instead of calling Minnow directly. */
+  readonly kysely?: boolean;
 }
 
 const QUERIES: readonly PerfQuery[] = [
@@ -144,6 +159,27 @@ const QUERIES: readonly PerfQuery[] = [
     params: [123_456],
   },
   {
+    // The adapter is a shipped execution path, not just a type layer. This measures Kysely's
+    // builder/compiler and Minnow driver bridge together against the equivalent direct SQL.
+    name: "kysely-point-lookup",
+    sql: "SELECT id, amount, label FROM data WHERE id = ?",
+    params: [123_456],
+    kysely: true,
+  },
+  {
+    // Exact NUMERIC uses tagged string-domain arithmetic instead of Float64 kernels.
+    name: "exact-numeric-filter",
+    sql: "SELECT COUNT(*) AS n FROM exact_data WHERE amount + CAST(? AS NUMERIC) BETWEEN ? AND ?",
+    params: [0.5, 2500.75, 5000.75],
+  },
+  {
+    // A declared composite primary key exercises the public components while its hidden tuple
+    // locator remains an internal row-addressing detail.
+    name: "composite-key-lookup",
+    sql: "SELECT payload FROM composite_data WHERE tenant = ? AND id = ?",
+    params: ["tenant-7", 12_347],
+  },
+  {
     // Ids arrive in insertion order, so blocks are id-clustered and zone maps prune almost
     // every block; a pruning regression turns this into a full scan and trips the gate.
     name: "range-scan",
@@ -165,7 +201,10 @@ const QUERIES: readonly PerfQuery[] = [
     // sink drops it and this shape pays a full scan and one sort. Gated so that trade stays
     // where it was measured instead of drifting.
     name: "deep-page",
-    sql: "SELECT id, amount FROM data ORDER BY region, id LIMIT 100000",
+    // Keep the benchmark's historical ordering explicit. PostgreSQL defaults nullable ASC keys
+    // to NULLS LAST while SQLite defaults them to NULLS FIRST; the performance gate compares
+    // ordered rows before it times anything, so an implicit dialect default is not a fair oracle.
+    sql: "SELECT id, amount FROM data ORDER BY region NULLS FIRST, id LIMIT 100000",
     ordered: true,
   },
   {
@@ -356,6 +395,13 @@ interface PerfMutation {
 
 /** Rows the cycling keys stay inside, well under the ingested range. */
 const MUTATION_KEYS = 100_000;
+/**
+ * Stateful samples must write exactly the same amount of history in every process. Deriving this
+ * count from one noisy warm-up made both the measured history and the final oracle vary between
+ * runs. Twelve repeats put Minnow's fastest write sample safely above timer resolution while
+ * keeping the slower comparison engines bounded.
+ */
+const MUTATION_ITERATIONS = 12;
 
 const MUTATIONS: readonly PerfMutation[] = [
   {
@@ -373,8 +419,11 @@ const MUTATIONS: readonly PerfMutation[] = [
   },
   {
     name: "filtered-update",
-    sql: "UPDATE data_mut SET label = ? WHERE region = ? AND id < ?",
-    params: (n) => ["alpha", "west", (n % 1_000) + 1],
+    sql: "UPDATE data_mut SET label = ? WHERE region = ? AND id BETWEEN ? AND ?",
+    params: (n) => {
+      const start = ((n * 1_000) % MUTATION_KEYS) + 1;
+      return [n % 2 === 0 ? "alpha" : "bravo", "west", start, start + 999];
+    },
   },
 ];
 
@@ -383,7 +432,31 @@ const MUTATION_CHECK: PerfQuery = {
   sql: "SELECT COUNT(*) AS n, SUM(amount) AS amount, SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) AS alpha FROM data_mut",
 };
 
+interface BenchmarkDatabase {
+  data: {
+    id: number;
+    region: string | null;
+    amount: number;
+    active: boolean;
+    joined: Date | null;
+    label: string;
+  };
+}
+
 function minnowRunner(database: MinnowDatabase, query: PerfQuery): () => Promise<unknown> {
+  if (query.kysely === true) {
+    const id = Number(query.params?.[0] ?? 0);
+    let repeat = 0;
+    return async () => ({
+      rows: await kysely
+        .selectFrom("data")
+        .select(["id", "amount", "label"])
+        // Rotate through real rows so Minnow's result memo cannot turn this adapter measurement
+        // into a memo-hit measurement after the first builder execution.
+        .where("id", "=", id + (repeat++ % 1_000))
+        .execute(),
+    });
+  }
   // By default the gate measures execution, not the probe-validated result memo (which would
   // answer every repeat sample from cache); memo-hit shapes opt in to measure the memo path.
   const options = {
@@ -453,6 +526,32 @@ await minnow.createTable({
   ],
 });
 await minnow.insertBatch("dims", DIMS);
+const kysely = new Kysely<BenchmarkDatabase>({ dialect: new MinnowDialect({ driver: minnow }) });
+
+const DOMAIN_ROWS = 20_000;
+const domainRows = Array.from({ length: DOMAIN_ROWS }, (_, index) => {
+  const id = index + 1;
+  return {
+    id,
+    tenant: `tenant-${String(id % 20)}`,
+    amount: `${String(id % 10_000)}.25`,
+    payload: `payload-${String(id)}`,
+  };
+});
+await minnow.execute(
+  "CREATE TABLE exact_data (id INTEGER PRIMARY KEY, amount NUMERIC(30, 10) NOT NULL)",
+);
+await minnow.insertBatch(
+  "exact_data",
+  domainRows.map(({ id, amount }) => ({ id, amount })),
+);
+await minnow.execute(
+  "CREATE TABLE composite_data (tenant TEXT NOT NULL, id INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (tenant, id))",
+);
+await minnow.insertBatch(
+  "composite_data",
+  domainRows.map(({ tenant, id, payload }) => ({ tenant, id, payload })),
+);
 // The same rows, minus one deleted row: every delta-* query reads this mutation history.
 await minnow.createTable({
   name: "data_mut",
@@ -579,6 +678,10 @@ sqlite.exec(
   `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
 );
 sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
+sqlite.exec(`CREATE TABLE exact_data ("id" INTEGER PRIMARY KEY, "amount" NUMERIC NOT NULL)`);
+sqlite.exec(
+  `CREATE TABLE composite_data ("tenant" TEXT NOT NULL, "id" INTEGER NOT NULL, "payload" TEXT NOT NULL, PRIMARY KEY ("tenant", "id"))`,
+);
 {
   const insert = sqlite.prepare("INSERT INTO data VALUES (?, ?, ?, ?, ?, ?)");
   const started = performance.now();
@@ -590,6 +693,14 @@ sqlite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
   ingestMs.sqlite = performance.now() - started;
   const dim = sqlite.prepare("INSERT INTO dims VALUES (?, ?, ?)");
   for (const entry of DIMS) dim.run(entry.region, entry.label, entry.rank);
+  const exact = sqlite.prepare("INSERT INTO exact_data VALUES (?, ?)");
+  const composite = sqlite.prepare("INSERT INTO composite_data VALUES (?, ?, ?)");
+  sqlite.exec("BEGIN");
+  for (const row of domainRows) {
+    exact.run(row.id, row.amount);
+    composite.run(row.tenant, row.id, row.payload);
+  }
+  sqlite.exec("COMMIT");
   sqlite.exec(
     `CREATE TABLE data_mut ("id" INTEGER, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
   );
@@ -634,6 +745,12 @@ await pglite.exec(
   `CREATE TABLE data ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
 await pglite.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
+await pglite.exec(
+  `CREATE TABLE exact_data ("id" INTEGER PRIMARY KEY, "amount" NUMERIC(30, 10) NOT NULL)`,
+);
+await pglite.exec(
+  `CREATE TABLE composite_data ("tenant" TEXT NOT NULL, "id" INTEGER NOT NULL, "payload" TEXT NOT NULL, PRIMARY KEY ("tenant", "id"))`,
+);
 for (let index = 0; index < CATALOG_TABLES; index += 1) {
   await pglite.exec(`CREATE TABLE spare_${String(index)} ("id" INTEGER)`);
 }
@@ -656,6 +773,19 @@ for (let index = 0; index < CATALOG_TABLES; index += 1) {
 await pglite.exec(
   `INSERT INTO dims VALUES ${DIMS.map((d) => `(${[d.region, d.label, d.rank].map(sqlLiteral).join(", ")})`).join(", ")}`,
 );
+for (let start = 0; start < domainRows.length; start += 2_000) {
+  const batch = domainRows.slice(start, start + 2_000);
+  await pglite.exec(
+    `INSERT INTO exact_data VALUES ${batch
+      .map((row) => `(${String(row.id)}, ${sqlLiteral(row.amount)})`)
+      .join(", ")}`,
+  );
+  await pglite.exec(
+    `INSERT INTO composite_data VALUES ${batch
+      .map((row) => `(${sqlLiteral(row.tenant)}, ${String(row.id)}, ${sqlLiteral(row.payload)})`)
+      .join(", ")}`,
+  );
+}
 await pglite.exec(
   `CREATE TABLE data_mut ("id" INTEGER, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
 );
@@ -738,21 +868,18 @@ for (const query of QUERIES) {
     pglite: pgliteRunner(query),
   };
   assertQueryEquivalent(query, await runners.minnow(), runners.sqlite());
-  // One iteration count per query, taken from the slowest engine's single run so that every
-  // engine's sample clears the timer's resolution, and shared so the ratio compares like with
-  // like.
   const singleRuns = [
     await warmUp(runners.minnow),
     await warmUp(runners.sqlite),
     await warmUp(runners.pglite),
   ];
-  const iterations = iterationsFor(Math.max(...singleRuns));
+  const iterations = singleRuns.map((singleRun) => iterationsFor(singleRun));
   results.push({
     name: query.name,
-    minnow: await timeRepeated(runners.minnow, iterations),
+    minnow: await timeRepeated(runners.minnow, iterations[0] ?? 1),
     engine: {
-      sqlite: await timeRepeated(runners.sqlite, iterations),
-      pglite: await timeRepeated(runners.pglite, iterations),
+      sqlite: await timeRepeated(runners.sqlite, iterations[1] ?? 1),
+      pglite: await timeRepeated(runners.pglite, iterations[2] ?? 1),
     },
   });
 }
@@ -773,18 +900,15 @@ for (const mutation of MUTATIONS) {
     sqlite: () => statement.run(...(mutation.params(counters.sqlite++) as Array<number | string>)),
     pglite: () => pglite.query(pgliteSql, [...mutation.params(counters.pglite++)]),
   };
-  const singleRuns = [
-    await warmUp(runners.minnow),
-    await warmUp(runners.sqlite),
-    await warmUp(runners.pglite),
-  ];
-  const iterations = iterationsFor(Math.max(...singleRuns));
+  await warmUp(runners.minnow);
+  await warmUp(runners.sqlite);
+  await warmUp(runners.pglite);
   results.push({
     name: mutation.name,
-    minnow: await timeRepeated(runners.minnow, iterations),
+    minnow: await timeRepeated(runners.minnow, MUTATION_ITERATIONS),
     engine: {
-      sqlite: await timeRepeated(runners.sqlite, iterations),
-      pglite: await timeRepeated(runners.pglite, iterations),
+      sqlite: await timeRepeated(runners.sqlite, MUTATION_ITERATIONS),
+      pglite: await timeRepeated(runners.pglite, MUTATION_ITERATIONS),
     },
   });
   assertQueryEquivalent(
@@ -817,13 +941,13 @@ for (const query of SETTLED_QUERIES) {
     await warmUp(runners.sqlite),
     await warmUp(runners.pglite),
   ];
-  const iterations = iterationsFor(Math.max(...singleRuns));
+  const iterations = singleRuns.map((singleRun) => iterationsFor(singleRun));
   results.push({
     name: query.name,
-    minnow: await timeRepeated(runners.minnow, iterations),
+    minnow: await timeRepeated(runners.minnow, iterations[0] ?? 1),
     engine: {
-      sqlite: await timeRepeated(runners.sqlite, iterations),
-      pglite: await timeRepeated(runners.pglite, iterations),
+      sqlite: await timeRepeated(runners.sqlite, iterations[1] ?? 1),
+      pglite: await timeRepeated(runners.pglite, iterations[2] ?? 1),
     },
   });
 }
@@ -864,6 +988,7 @@ for (const query of SETTLED_QUERIES) {
 
 sqlite.close();
 await pglite.close();
+await kysely.destroy();
 
 console.log(`\nSQL performance gate — ${String(ROWS)} rows, median of ${String(RUNS)} runs`);
 console.log("query                minnow(ms)      sqlite(ms)            pglite(ms)");
@@ -896,7 +1021,8 @@ for (const result of results) {
     );
     if (threshold !== undefined && ratio > threshold) {
       failures.push(
-        `${result.name} vs ${engine}: ratio ${ratio.toFixed(2)} exceeds threshold ${String(threshold)}`,
+        `${result.name} vs ${engine}: ratio ${ratio.toFixed(2)} exceeds threshold ${String(threshold)} ` +
+          `(spread-calibrated threshold from this run: ${String(newThresholds[result.name]?.[engine])})`,
       );
     }
   }

@@ -1,5 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import {
   IndexedDbBlockStore,
@@ -130,6 +130,33 @@ describe("secondary-index SQL", () => {
     }
   });
 
+  it("publishes composite, directional, unique index metadata for inspection tools", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    try {
+      await database.execute(
+        "CREATE TABLE inspected_indexes (id INTEGER PRIMARY KEY, shop VARCHAR, total DOUBLE PRECISION)",
+      );
+      await database.execute(
+        "CREATE UNIQUE INDEX shop_total ON inspected_indexes(shop ASC, total DESC)",
+      );
+      expect((await database.introspect()).tables[0]?.indexes).toEqual([
+        {
+          name: "shop_total",
+          columns: [
+            { name: "shop", direction: "asc" },
+            { name: "total", direction: "desc" },
+          ],
+          unique: true,
+          state: "ready",
+        },
+      ]);
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
+
   for (const implementation of implementations()) {
     it(`${implementation.name} prunes composite equality, IN, and range prefixes`, async () => {
       const store = await implementation.create();
@@ -178,6 +205,29 @@ describe("secondary-index SQL", () => {
       }
     });
   }
+
+  it("skips a postings read when the table fits in one row group", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { rowsPerBlock: 16 });
+    try {
+      await database.execute("CREATE TABLE tiny (id INTEGER PRIMARY KEY, owner_id INTEGER)");
+      await database.execute("INSERT INTO tiny VALUES (1, 7), (2, 8), (3, 7)");
+      await database.execute("CREATE INDEX tiny_by_owner ON tiny(owner_id)");
+      const postings = vi.spyOn(store, "readFtsCandidates");
+
+      expect(
+        (
+          await database.query("SELECT id FROM tiny WHERE owner_id = 7 ORDER BY id", {
+            memoize: false,
+          })
+        ).rows,
+      ).toEqual([{ id: 1 }, { id: 3 }]);
+      expect(postings).not.toHaveBeenCalled();
+    } finally {
+      await database.close();
+      store.close();
+    }
+  });
 
   for (const implementation of implementations()) {
     it(`${implementation.name} enforces composite UNIQUE indexes through every mutation`, async () => {
@@ -599,7 +649,7 @@ describe("secondary-index SQL", () => {
       ).not.toContain("secondary index supplies ORDER BY");
       expect(
         (await database.query("SELECT value FROM nullable_order ORDER BY value")).rows,
-      ).toEqual([{ value: null }, { value: "a" }, { value: "b" }]);
+      ).toEqual([{ value: "a" }, { value: "b" }, { value: null }]);
     } finally {
       await database.close();
       store.close();

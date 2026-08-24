@@ -1,5 +1,6 @@
 import type {
   BatchRow,
+  Catalog,
   DeleteBatchInput,
   DeleteBatchResult,
   ExecuteResult,
@@ -19,6 +20,8 @@ import type { SnapshotExportProgress, SnapshotLoadProgress } from "@minnowdb/cor
  */
 export interface DevtoolsTarget {
   listTables(): Promise<TableDefinition[]>;
+  /** Rich catalog metadata when the target exposes the current introspection API. */
+  introspect?(): Promise<Catalog>;
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   explain(sql: string): Promise<string>;
   execute(sql: string): Promise<ExecuteResult>;

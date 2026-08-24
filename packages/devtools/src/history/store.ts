@@ -8,6 +8,8 @@ export interface HistoryEntry {
   ms: number;
   /** Rows returned, or rows affected for a statement. Absent when the run failed. */
   rowCount?: number;
+  /** Operation-specific result for a non-query statement. */
+  outcome?: string;
   error?: string;
 }
 
@@ -122,6 +124,7 @@ export function describeAge(at: number, now: number): string {
 /** The one-line summary under each entry. */
 export function describeOutcome(entry: HistoryEntry): string {
   if (entry.error !== undefined) return entry.error;
+  if (entry.outcome !== undefined) return `${entry.outcome} · ${String(entry.ms)}ms`;
   const rows = entry.rowCount ?? 0;
   return `${String(rows)} row${rows === 1 ? "" : "s"} · ${String(entry.ms)}ms`;
 }

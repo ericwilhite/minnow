@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
-import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from "./query.js";
+import {
+  bindPlanParameters,
+  compileQuery,
+  createPreparedQuery,
+  executeQuery,
+  executeRowQuery,
+} from "./query.js";
 
 const tables = new Map<string, DatabaseRow[]>([
   [
@@ -26,7 +32,7 @@ function run(sql: string, params?: unknown[]): DatabaseRow[] {
   return vectorized.rows;
 }
 
-describe("standard fetch and offset spellings", () => {
+describe("PostgreSQL FETCH and OFFSET spellings", () => {
   it("treats FETCH FIRST as LIMIT in both orders", () => {
     expect(run("SELECT id FROM rows ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY")).toEqual([
       { id: 2 },
@@ -49,6 +55,104 @@ describe("BETWEEN SYMMETRIC", () => {
     expect(
       run("SELECT id FROM rows WHERE amount NOT BETWEEN SYMMETRIC 8 AND 3 ORDER BY id"),
     ).toEqual([{ id: 1 }]);
+  });
+});
+
+describe("PostgreSQL value domains and predicates", () => {
+  it("keeps NUMERIC arithmetic exact across both executors", () => {
+    expect(run("SELECT CAST(0.1 AS DECIMAL(30, 10)) + CAST(0.2 AS NUMERIC) AS n")).toEqual([
+      { n: "0.3" },
+    ]);
+    expect(
+      run(
+        "SELECT CAST('9007199254740993' AS NUMERIC) > CAST('9007199254740992' AS NUMERIC) AS larger",
+      ),
+    ).toEqual([{ larger: true }]);
+    expect(run("SELECT CAST(2.25 AS NUMERIC) + 0.5 BETWEEN 2.75 AND 3 AS inside")).toEqual([
+      { inside: true },
+    ]);
+
+    const prepared = createPreparedQuery(
+      compileQuery("SELECT CAST(0.10 AS NUMERIC) AS n FROM rows LIMIT 1"),
+      tables,
+    );
+    expect(prepared.execute().rows).toEqual([{ n: "0.1" }]);
+    prepared.close();
+  });
+
+  it("constructs JSON, UUID, ARRAY, TIME, and INTERVAL domain values", () => {
+    expect(
+      run(
+        'SELECT CAST(\'{"b":2,"a":1}\' AS JSONB) AS j, ' +
+          "CAST('550E8400-E29B-41D4-A716-446655440000' AS UUID) AS u, " +
+          "ARRAY[1, 2, NULL] AS a, TIME '12:34:56.25' AS t, " +
+          "CAST('1 month 2 days' AS INTERVAL) AS i",
+      ),
+    ).toEqual([
+      {
+        j: '{"a":1,"b":2}',
+        u: "550e8400-e29b-41d4-a716-446655440000",
+        a: "[1,2,null]",
+        t: "12:34:56.25",
+        i: "1 mons 2 days 0 usecs",
+      },
+    ]);
+  });
+
+  it("projects constant JSON arrays through JSON_TABLE", () => {
+    expect(
+      run(
+        "SELECT j.a, j.label FROM JSON_TABLE(" +
+          '\'[{"a":2,"label":"two"},{"a":1,"label":"one"}]\', \'$[*]\' ' +
+          "COLUMNS (a INTEGER PATH '$.a', label TEXT PATH '$.label')) AS j ORDER BY j.a",
+      ),
+    ).toEqual([
+      { a: 1, label: "one" },
+      { a: 2, label: "two" },
+    ]);
+  });
+
+  it("retains JSON_TABLE's declared schema for an empty array", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await expect(
+      database.query(
+        "SELECT j.a, j.label FROM JSON_TABLE('[]', '$[*]' " +
+          "COLUMNS (a INTEGER PATH '$.a', label TEXT PATH '$.label')) AS j",
+      ),
+    ).resolves.toEqual({ columns: ["a", "label"], rows: [] });
+    await database.close();
+  });
+
+  it("evaluates SIMILAR TO and explicit collations", () => {
+    expect(run("SELECT id FROM rows WHERE region SIMILAR TO '(west|north)' ORDER BY id")).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    expect(run("SELECT id FROM rows WHERE region NOT SIMILAR TO 'w%' ORDER BY id")).toEqual([
+      { id: 3 },
+    ]);
+    expect(
+      run(
+        'SELECT region COLLATE "C" AS region FROM rows WHERE region IS NOT NULL ORDER BY region COLLATE "C"',
+      ),
+    ).toEqual([{ region: "east" }, { region: "west" }, { region: "west" }]);
+    expect(run("SELECT id FROM rows WHERE region COLLATE \"C\" = 'west' ORDER BY id")).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    expect(run("SELECT id FROM rows WHERE region COLLATE \"C\" LIKE 'w%' ORDER BY id")).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    expect(
+      run("SELECT id FROM rows WHERE region COLLATE \"C\" SIMILAR TO '(east|west)' ORDER BY id"),
+    ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(() => run("SELECT CAST('1 day trailing' AS INTERVAL) AS span")).toThrow(
+      "Invalid INTERVAL",
+    );
+    expect(run("SELECT ARRAY[CAST(0.1 AS NUMERIC), CAST(0.2 AS NUMERIC)] AS values")).toEqual([
+      { values: '["0.1","0.2"]' },
+    ]);
   });
 });
 

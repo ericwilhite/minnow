@@ -1,15 +1,14 @@
 /**
  * What the benchmarks page lets a visitor choose, and why the choices stop where they do.
  */
-import type { EngineId } from "@/bench/protocol";
+import type { EngineId, SecondaryIndexMode } from "@/bench/protocol";
 import { relationalTotalRows } from "@/bench/benchmark";
 
 /**
- * A column in the results, which is not quite the same thing as an engine: Minnow appears three
- * times per store — executing every call, with the result memo an application gets by default,
- * and through the main-thread client an application actually calls. All are the same database
- * doing the same work, so they share one materialized copy — the variant columns report what a
- * repeat, or the worker channel, costs rather than a second engine.
+ * A column in the results, which is not quite the same thing as an engine: Minnow appears twice
+ * per store — executing every call and with the result memo an application gets by default.
+ * Both are the same database doing the same work, so they share one materialized copy; the variant
+ * column reports what a repeat costs rather than a second engine.
  */
 export interface EngineChoice {
   id: ColumnId;
@@ -18,26 +17,15 @@ export interface EngineChoice {
   label: string;
   note: string;
   /**
-   * Which of the engine's read measurements the column shows: the memoized repeat, or the
-   * statement through `MinnowDatabaseClient` over the worker channel. Absent is plain execution.
+   * Which of the engine's read measurements the column shows. Absent is plain execution.
    */
-  variant?: "cached" | "client";
+  variant?: "cached";
   /** Roughly what the browser downloads to run it, from scripts/measure-library-sizes.mts. */
   download?: string;
 }
 
 export type ColumnId =
-  | "minnow"
-  | "minnow-cached"
-  | "minnow-client"
-  | "minnow-opfs"
-  | "minnow-opfs-cached"
-  | "minnow-opfs-client"
-  | "sqlite"
-  | "pglite";
-
-const CLIENT_NOTE =
-  "The same statement issued through MinnowDatabaseClient over a message channel: the RPC frame, the result crossing in its columnar wire form, and the rows rebuilt on the receiving side. It is what an application on the main thread pays; the gap to the plain column is the client layer.";
+  "minnow" | "minnow-cached" | "minnow-opfs" | "minnow-opfs-cached" | "sqlite" | "pglite";
 
 export const ENGINES: readonly EngineChoice[] = [
   {
@@ -45,7 +33,7 @@ export const ENGINES: readonly EngineChoice[] = [
     engine: "minnow",
     label: "Minnow",
     note: "This engine. Columnar blocks on IndexedDB, plain JavaScript.",
-    download: "172 KB",
+    download: "220 KB",
   },
   {
     id: "minnow-cached",
@@ -53,13 +41,6 @@ export const ENGINES: readonly EngineChoice[] = [
     variant: "cached",
     label: "Minnow (cached)",
     note: "The same statement repeated with the probe-validated result memo left on, which is the default an application gets. It measures the cache, not execution.",
-  },
-  {
-    id: "minnow-client",
-    engine: "minnow",
-    variant: "client",
-    label: "Minnow (client)",
-    note: CLIENT_NOTE,
   },
   {
     id: "minnow-opfs",
@@ -73,13 +54,6 @@ export const ENGINES: readonly EngineChoice[] = [
     variant: "cached",
     label: "Minnow (OPFS, cached)",
     note: "The OPFS store's repeat with the probe-validated result memo left on, which is the default an application gets. It measures the cache, not execution.",
-  },
-  {
-    id: "minnow-opfs-client",
-    engine: "minnow-opfs",
-    variant: "client",
-    label: "Minnow (OPFS, client)",
-    note: CLIENT_NOTE,
   },
   {
     id: "sqlite",
@@ -118,12 +92,7 @@ export function columnsFor(selected: readonly ColumnId[]): EngineChoice[] {
  * the rule and hoping it held.
  */
 export function storageLabel(choice: EngineChoice, observed?: string): string {
-  const suffix =
-    choice.variant === "cached"
-      ? " · result memo on"
-      : choice.variant === "client"
-        ? " · through the worker client"
-        : "";
+  const suffix = choice.variant === "cached" ? " · result memo on" : "";
   if (observed !== undefined) {
     // The engine's own sentence is written for the storage table; the selector wants the name.
     const vfs = observed.split(" · ")[0];
@@ -170,8 +139,8 @@ export const SUITES: readonly SuiteChoice[] = [
   },
   {
     id: "features",
-    label: "SQL conformance",
-    note: "Every example in the feature matrix, executed live. No dataset needed, so this one is quick.",
+    label: "PostgreSQL compatibility",
+    note: "Every documented SQL example, executed live. No dataset is needed, so this check is quick.",
     needsDataset: false,
   },
 ];
@@ -195,17 +164,34 @@ export const SCALES: readonly ScaleChoice[] = [0.1, 0.5, 1, 2, 5].map((scale) =>
 }));
 
 /** Rough stored bytes per engine at a scale, for the warning before a run starts. */
-const BYTES_PER_ROW: Record<EngineId, number> = {
+const BASE_BYTES_PER_ROW: Record<EngineId, number> = {
   minnow: 19,
-  // The identical block format; the command log and checkpoints add low single-digit percent.
   "minnow-opfs": 20,
-  sqlite: 80,
+  sqlite: 60,
   pglite: 150,
 };
 
-export function estimateBytes(engines: readonly EngineId[], scale: number): number {
+const INDEX_BYTES_PER_ROW: Record<EngineId, number> = {
+  minnow: 41,
+  "minnow-opfs": 20,
+  sqlite: 25,
+  pglite: 20,
+};
+
+export function estimateBytes(
+  engines: readonly EngineId[],
+  scale: number,
+  secondaryIndexes: SecondaryIndexMode,
+): number {
   const rows = relationalTotalRows(scale);
-  return engines.reduce((total, engine) => total + rows * BYTES_PER_ROW[engine], 0);
+  return engines.reduce(
+    (total, engine) =>
+      total +
+      rows *
+        (BASE_BYTES_PER_ROW[engine] +
+          (secondaryIndexes === "foreign-keys" ? INDEX_BYTES_PER_ROW[engine] : 0)),
+    0,
+  );
 }
 
 export function formatBytes(bytes: number): string {

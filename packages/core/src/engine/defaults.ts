@@ -1,10 +1,7 @@
 /**
- * Write-time default filling. For a default-bearing column (always non-nullable), a null or
- * absent slot means "generate" and an explicit value passes through untouched. Pure defaults
- * (now, literals) are filled here before validation; auto-increment slots stay null until the
- * write path reserves a range from storage, keeping generation atomic across concurrent
- * writers. Function defaults never reach the engine — the typed facade fills them before the
- * batch crosses the boundary.
+ * Write-time default filling. Only an omitted property or SQL `DEFAULT` means "generate";
+ * explicit NULL passes through untouched. Literal and SQL-expression defaults are filled before
+ * validation. Auto-increment slots stay null until the write path atomically reserves a range.
  */
 
 import type { RowIdRange, TableColumnRecord, TableRecord } from "../storage/types.js";
@@ -28,31 +25,64 @@ export interface FilledBatch {
   readonly autoIncrement?: AutoIncrementFill;
 }
 
-export function fillColumnDefaults(
+export async function fillColumnDefaults(
   table: TableRecord,
   input: ColumnarBatch,
-  now: () => Date,
+  evaluateExpression: (sql: string, rowIndex: number) => Promise<BatchValue>,
   knownRowCount?: number,
-): FilledBatch {
-  const defaultColumns = table.columns.filter((column) => column.defaultValue !== undefined);
-  if (defaultColumns.length === 0) return { batch: input, generated: new Map() };
+): Promise<FilledBatch> {
   const rowCount =
     knownRowCount ?? Object.values(input.columns).find((values) => values.length > 0)?.length ?? 0;
+  if (!Number.isSafeInteger(rowCount) || rowCount < 0) {
+    throw new TypeError(`Batch row count must be a non-negative safe integer: ${String(rowCount)}`);
+  }
+  for (const [name, values] of Object.entries(input.columns)) {
+    if (values.length !== rowCount) {
+      throw new TypeError(
+        `Column ${name} has ${String(values.length)} rows; expected ${String(rowCount)}`,
+      );
+    }
+  }
   if (rowCount === 0) return { batch: input, generated: new Map() };
   const columns: Record<string, readonly BatchValue[]> = { ...input.columns };
   const generated = new Map<string, BatchValue[]>();
   let autoIncrement: AutoIncrementFill | undefined;
-  let nowValue: Date | undefined;
-  for (const column of defaultColumns) {
+  for (const [name, mask] of Object.entries(input.omitted ?? {})) {
+    if (!table.columns.some((column) => column.name === name)) {
+      throw new TypeError(`Unknown column in omission mask: ${name}`);
+    }
+    if (mask.length !== rowCount) {
+      throw new TypeError(
+        `Omission mask ${name} has ${String(mask.length)} rows; expected ${String(rowCount)}`,
+      );
+    }
+    if (mask.some((value) => typeof value !== "boolean")) {
+      throw new TypeError(`Omission mask ${name} must contain booleans`);
+    }
+  }
+  for (const column of table.columns) {
     const defaultValue = column.defaultValue;
-    if (defaultValue === undefined) continue;
     const provided = input.columns[column.name];
+    const omitted = input.omitted?.[column.name];
+    const isOmitted = (index: number): boolean =>
+      provided === undefined || omitted?.[index] === true;
+    if (defaultValue === undefined) {
+      if (provided === undefined || omitted?.some(Boolean) === true) {
+        const values =
+          provided === undefined ? new Array<BatchValue>(rowCount).fill(null) : [...provided];
+        for (let index = 0; index < rowCount; index += 1) {
+          if (isOmitted(index)) values[index] = null;
+        }
+        columns[column.name] = values;
+      }
+      continue;
+    }
     if (defaultValue.kind === "autoincrement") {
       const missingIndexes: number[] = [];
       let maxExplicit = 0n;
       for (let index = 0; index < rowCount; index += 1) {
         const value = provided?.[index] ?? null;
-        if (value === null) {
+        if (isOmitted(index)) {
           missingIndexes.push(index);
           continue;
         }
@@ -74,14 +104,17 @@ export function fillColumnDefaults(
       provided === undefined ? new Array<BatchValue>(rowCount).fill(null) : [...provided];
     let filled = false;
     for (let index = 0; index < rowCount; index += 1) {
-      if ((values[index] ?? null) !== null) continue;
+      if (!isOmitted(index)) continue;
       filled = true;
       switch (defaultValue.kind) {
-        case "now":
-          values[index] = nowValue ??= now();
-          break;
         case "literal":
-          values[index] = defaultValue.value;
+          values[index] =
+            defaultValue.value instanceof Date
+              ? new Date(defaultValue.value.getTime())
+              : defaultValue.value;
+          break;
+        case "expression":
+          values[index] = await evaluateExpression(defaultValue.sql, index);
           break;
       }
     }
@@ -91,7 +124,7 @@ export function fillColumnDefaults(
     }
   }
   return {
-    batch: { columns },
+    batch: { columns, rowCount },
     generated,
     ...(autoIncrement === undefined ? {} : { autoIncrement }),
   };

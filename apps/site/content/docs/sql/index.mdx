@@ -3,8 +3,10 @@ title: Running SQL
 description: The four calls that execute statements, how parameters bind, and what comes back.
 ---
 
-Every statement goes through one of four methods. They differ in what they return, not in what
-they can run.
+Minnow accepts PostgreSQL-style SQL for one embedded database. Every statement goes through
+one of four methods. They differ in what they return, not in what they can run. The executable
+[feature matrix](/docs/sql/feature-matrix) lists the exact compatible surface, differences, and
+extensions.
 
 | Call                               | Use it for                                    | Returns                                  |
 | ---------------------------------- | --------------------------------------------- | ---------------------------------------- |
@@ -27,7 +29,8 @@ const { rows, columns } = await db.query(`
 
 `rows` is an array of plain objects in result order. Values arrive as their JavaScript
 equivalents: numbers as `number`, `TIMESTAMP` as `Date`, `BOOLEAN` as `boolean`, and SQL `NULL`
-as `null`. `columns` describes the shape — name and type per column — so a table component can
+as `null`. Exact decimals, JSON/JSONB, UUIDs, arrays, `TIME`, intervals, and enums arrive as
+strings so no precision or domain value is lost. `columns` describes the shape — name and type per column — so a table component can
 render headers before it has looked at a single value.
 
 `query` accepts only statements that produce rows. Hand it an `INSERT` and it throws rather than
@@ -35,11 +38,11 @@ silently writing.
 
 ## Parameters
 
-Placeholders are `?` in order, or `$1`, `$2` by position. Bind through `params`; never
-concatenate values into the text.
+PostgreSQL-style placeholders are `$1`, `$2` by position. Minnow also accepts `?` in order as an
+adapter-friendly extension. Bind through `params`; never concatenate values into the text.
 
 ```ts
-await db.query("SELECT * FROM orders WHERE status = ? AND total >= ?", {
+await db.query("SELECT * FROM orders WHERE status = $1 AND total >= $2", {
   params: ["completed", 50],
 });
 
@@ -59,7 +62,7 @@ silently-null column.
 
 ```ts
 const result = await db.execute(
-  "UPDATE orders SET status = 'refunded' WHERE order_id = ? RETURNING order_id, total",
+  "UPDATE orders SET status = 'refunded' WHERE order_id = $1 RETURNING order_id, total",
   [1001],
 );
 
@@ -71,7 +74,8 @@ if (result.kind === "update") {
 ```
 
 The kinds are `rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`,
-`add-column`, `drop-table`, `create-view`, `drop-view`, `create-trigger`, and `drop-trigger`.
+`create-type`, `create-sequence`, `add-column`, `drop-column`, `drop-table`, `create-index`, `drop-index`,
+`create-view`, `drop-view`, `create-trigger`, and `drop-trigger`.
 Row-writing kinds carry `rowCount` and the published `version`; `returnedRows` appears only when
 the statement had a `RETURNING` clause.
 
@@ -82,7 +86,7 @@ When the same statement runs in a loop, compile it once and skip even the plan-c
 ```ts
 import { bindStatementParameters, compileStatement } from "@minnowdb/core";
 
-const statement = compileStatement("INSERT INTO events (id, kind) VALUES (?, ?)");
+const statement = compileStatement("INSERT INTO events (id, kind) VALUES ($1, $2)");
 for (const event of batch) {
   await db.runStatement(bindStatementParameters(statement, [event.id, event.kind]));
 }
@@ -112,8 +116,8 @@ open a transaction:
 ```ts
 await db.execute("BEGIN");
 try {
-  await db.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?", [1, sku]);
-  await db.execute("INSERT INTO shipments (sku, shipped_at) VALUES (?, ?)", [sku, new Date()]);
+  await db.execute("UPDATE stock SET on_hand = on_hand - $1 WHERE sku = $2", [1, sku]);
+  await db.execute("INSERT INTO shipments (sku, shipped_at) VALUES ($1, $2)", [sku, new Date()]);
   await db.execute("COMMIT");
 } catch (error) {
   await db.execute("ROLLBACK");
@@ -129,9 +133,8 @@ result and ends with its callback.
 
 ## What the language covers
 
-Joins, subqueries, CTEs including recursive ones, window functions, set operations, grouping
-sets, `RETURNING`, upserts, triggers, and full-text search. The exact surface — every supported
-form and every deliberately rejected one — is the [feature matrix](/docs/sql/feature-matrix),
-which is a test fixture rather than a description: each example is executed on every test run.
-The [conformance strategy](/docs/conformance) explains how that contract is backed by the fast
-local and full upstream SQL profiles, differential checks, and the release gate.
+Joins, subqueries, recursive CTEs, window functions, set operations, grouping sets, `RETURNING`,
+upserts, triggers, and full-text search. The [PostgreSQL compatibility page](/docs/sql/feature-matrix)
+lists every documented supported form, difference, extension, and exclusion. Each example runs in
+the engine's test suite. [SQL compatibility checks](/docs/conformance) explains the comparisons
+with PGlite, SQLite, and SQLLogicTest.

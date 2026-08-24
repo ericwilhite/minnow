@@ -24,8 +24,9 @@ const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }));
 
 ### Create tables
 
-DDL is SQL like everything else. `PRIMARY KEY` declares the table's unique key — the column that
-`UPDATE`, `DELETE`, and upserts address rows through.
+DDL is SQL like everything else. `PRIMARY KEY` declares the table's row-addressing unique key —
+the column that `UPDATE`, `DELETE`, and upserts address rows through. One inline `UNIQUE` column
+can serve the same role.
 
 ```ts
 await db.execute(`CREATE TABLE customers (
@@ -50,20 +51,20 @@ await db.execute(`CREATE TABLE orders (
 
 ### Write rows
 
-`execute` runs any statement. Bind values with `?` rather than building SQL strings — the compiled
-plan is cached on the statement text and re-bound per execution, so parameters are faster as well
-as safer.
+`execute` runs any statement. Bind values with PostgreSQL-style `$1` parameters rather than
+building SQL strings — the compiled plan is cached on the statement text and re-bound per
+execution, so parameters are faster as well as safer.
 
 ```ts
 await db.execute(
   `INSERT INTO customers (customer_id, name, city, signed_up_on)
-   VALUES (?, ?, ?, ?), (?, ?, ?, ?)`,
+   VALUES ($1, $2, $3, $4)`,
   [1, "Ada Lovelace", "London", new Date("2024-03-02")],
 );
 
 const inserted = await db.execute(
   `INSERT INTO orders (order_id, customer_id, status, total, placed_at)
-   VALUES (?, ?, 'completed', ?, ?)
+   VALUES ($1, $2, 'completed', $3, $4)
    RETURNING order_id, total`,
   [1001, 1, 24.5, new Date("2025-11-14")],
 );
@@ -84,7 +85,7 @@ const { rows, columns } = await db.query(
   `SELECT c.name, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
    FROM customers c
    JOIN orders o ON o.customer_id = c.customer_id
-   WHERE o.status = ?
+   WHERE o.status = $1
    GROUP BY c.name
    ORDER BY revenue DESC
    LIMIT 10`,
@@ -117,8 +118,7 @@ joins were reordered. [Query plans](/docs/sql/plans) reads one line by line.
 
 The [console on the home page](/#console) is this, already set up: a generated retailer's
 database of around 590,000 rows, built in your browser and kept in IndexedDB. Every query on this
-site runs against it for real — and its TypeScript tab is the same database through
-[the typed client](/docs/client).
+site runs against it for real.
 
 ## Where to go next
 
@@ -126,7 +126,6 @@ site runs against it for real — and its TypeScript tab is the same database th
 - [Writing data](/docs/sql/dml) — inserts, updates, deletes, upserts, `RETURNING`.
 - [Schema & migrations](/docs/schema) — declare those tables in TypeScript instead, and evolve them
   safely as the application changes.
-- [The typed client](/docs/client) — the optional builder, if you would rather write queries that
-  infer their own row types than write SQL strings.
+- [Client adapters](/docs/adapters) — use Kysely instead of SQL strings.
 - [Transactions](/docs/engine/transactions) — atomic multi-statement writes and stable reads.
 - [Workers](/docs/engine/workers) — moving the engine off the main thread.

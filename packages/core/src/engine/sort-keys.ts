@@ -23,9 +23,10 @@ import { compareSqlStrings, compareSqlValues } from "./sql-semantics.js";
  */
 export interface SortKeyColumn {
   /**
-   * Ascending comparison with NULL smallest — the engine's default placement, which matches
-   * SQLite. Direction and an explicit NULLS FIRST/LAST stay with the caller: a placement is
-   * absolute, while direction negates the value comparison.
+   * Ascending comparison with NULL smallest. This is the column's raw comparison, not SQL's
+   * default placement: the sorter applies PostgreSQL's NULLS LAST for ASC and NULLS FIRST for
+   * DESC. Direction and an explicit NULLS FIRST/LAST stay with the caller because a placement is
+   * absolute, while direction negates only the non-null value comparison.
    *
    * Specialized when the column is built, so a comparison that runs millions of times is a
    * closure over one representation rather than a branch on which representation it holds.
@@ -84,7 +85,16 @@ export function buildSortKeyColumn(
     } else if (typeof value === "boolean" && kind !== "number" && kind !== "string") {
       kind = "boolean";
       numbers[index] = value ? 1 : 0;
-    } else if (typeof value === "string" && kind !== "number" && kind !== "boolean") {
+    } else if (
+      typeof value === "string" &&
+      // NUL-prefixed strings are the engine's lossless internal SQL-domain values
+      // (NUMERIC, ENUM, COLLATE, and friends). Their physical encoding is deliberately
+      // stable, not lexicographically ordered, so ranking the encoded strings would make
+      // ORDER BY disagree with the SQL comparator. Keep those terms on the generic path.
+      value.charCodeAt(0) !== 0 &&
+      kind !== "number" &&
+      kind !== "boolean"
+    ) {
       kind = "string";
       ranks ??= new Map();
       let rank = ranks.get(value);
@@ -368,9 +378,8 @@ class KeySorter {
    * for a term without unboxed keys. A float's bits already order like the float once the sign
    * is folded (flip every bit of a negative, the sign bit of a positive); NaN is pinned just
    * past +Infinity and signed zero collapses to +0, which is where compareSqlValues puts them.
-   * DESC inverts the non-null keys, and NULL takes the end its placement names — the low end
-   * by default, which the inversion moves to the high end for DESC, or the end an explicit
-   * NULLS FIRST/LAST asks for regardless of direction.
+   * DESC inverts the non-null keys, and NULL takes the end its placement names. When omitted,
+   * PostgreSQL's default supplies NULLS LAST for ASC and NULLS FIRST for DESC.
    */
   #encodedKeys(term: number): Uint32Array | undefined {
     const cached = this.#encoded[term];
@@ -383,33 +392,43 @@ class KeySorter {
     const buffer = new ArrayBuffer(count * 8);
     const floats = new Float64Array(buffer);
     const words = new Uint32Array(buffer);
-    const nullWord = (spec.nulls === undefined ? !spec.descending : spec.nulls === "first")
-      ? 0
-      : UINT32_MAX;
+    const nullsFirst = (spec.nulls ?? (spec.descending ? "first" : "last")) === "first";
     const flip = spec.descending ? UINT32_MAX : 0;
+    // Keep the sentinel's low word aligned with the direction's transformed values. A sentinel
+    // that differs in an otherwise constant low digit makes radix sorting run a whole extra pass.
+    // The non-null domains are bounded away from these keys: ascending runs from encoded
+    // -Infinity through pinned NaN (fff80000:00000000), and descending is its bitwise inverse.
+    const nullHi = spec.descending
+      ? nullsFirst
+        ? 0x0007fffe
+        : UINT32_MAX
+      : nullsFirst
+        ? 0
+        : 0xfff80001;
+    const nullLo = spec.descending ? UINT32_MAX : 0;
     for (let index = 0; index < count; index += 1) {
       const lo = index * 2 + LO;
       const hi = index * 2 + HI;
       if (nulls[index] === 1) {
-        words[lo] = nullWord;
-        words[hi] = nullWord;
+        words[lo] = nullLo;
+        words[hi] = nullHi;
         continue;
       }
       const value = numbers[index] ?? 0;
       if (value !== value) {
         words[lo] = flip;
         words[hi] = (0xfff80000 ^ flip) >>> 0;
-        continue;
-      }
-      // Adding +0 turns -0 into +0 and leaves every other value alone.
-      floats[index] = value + 0;
-      const rawHi = words[hi] ?? 0;
-      if ((rawHi & 0x80000000) !== 0) {
-        words[lo] = (~(words[lo] ?? 0) ^ flip) >>> 0;
-        words[hi] = (~rawHi ^ flip) >>> 0;
       } else {
-        words[lo] = ((words[lo] ?? 0) ^ flip) >>> 0;
-        words[hi] = ((rawHi | 0x80000000) ^ flip) >>> 0;
+        // Adding +0 turns -0 into +0 and leaves every other value alone.
+        floats[index] = value + 0;
+        const rawHi = words[hi] ?? 0;
+        if ((rawHi & 0x80000000) !== 0) {
+          words[lo] = (~(words[lo] ?? 0) ^ flip) >>> 0;
+          words[hi] = (~rawHi ^ flip) >>> 0;
+        } else {
+          words[lo] = ((words[lo] ?? 0) ^ flip) >>> 0;
+          words[hi] = ((rawHi | 0x80000000) ^ flip) >>> 0;
+        }
       }
     }
     this.#encoded[term] = words;
@@ -435,15 +454,13 @@ class KeySorter {
       };
     } else {
       const { column, descending } = spec;
-      const nullPlacement = spec.nulls === undefined ? 0 : spec.nulls === "first" ? 1 : -1;
+      const nulls = spec.nulls ?? (spec.descending ? "first" : "last");
       compare = (left, right) => {
-        if (nullPlacement !== 0) {
-          // An explicit placement is absolute: direction must not negate it.
-          const leftNull = column.isNull(left);
-          const rightNull = column.isNull(right);
-          if (leftNull || rightNull) {
-            return leftNull && rightNull ? 0 : (leftNull ? -1 : 1) * nullPlacement;
-          }
+        // NULL placement is absolute: direction must not negate it.
+        const leftNull = column.isNull(left);
+        const rightNull = column.isNull(right);
+        if (leftNull || rightNull) {
+          return leftNull && rightNull ? 0 : (leftNull ? -1 : 1) * (nulls === "first" ? 1 : -1);
         }
         const comparison = column.compare(left, right);
         return descending ? -comparison : comparison;

@@ -23,17 +23,20 @@ export const snippets: readonly Snippet[] = [
     id: "revenue-by-month",
     label: "Revenue by month",
     note: "Aggregates and grouping. The row type follows the select list, not the table.",
-    code: `// Every completed order, bucketed by month. Hover \`rows\` to see the type the
+    code: `import { sql } from "kysely";
+
+// Every completed order, bucketed by month. Hover \`rows\` to see the type the
 // select list produced — three keys, not the fourteen columns \`orders\` has.
+const month = sql<Date>\`DATE_TRUNC('month', placed_at)\`;
 const rows = await db
   .selectFrom("orders")
   .select((eb) => [
-    eb.fn.dateTrunc("month", "placed_at").as("month"),
+    month.as("month"),
     eb.fn.countAll().as("orders"),
-    eb.fn.round(eb.fn.sum("total"), 2).as("revenue"),
+    sql<number>\`ROUND(SUM(total), 2)\`.as("revenue"),
   ])
   .where("status", "=", "completed")
-  .groupBy((eb) => eb.fn.dateTrunc("month", "placed_at"))
+  .groupBy(month)
   .orderBy("month", "desc")
   .execute();
 
@@ -54,7 +57,7 @@ const rows = await db
 
 // db.selectFrom("custommers");                  // no such table
 // db.selectFrom("customers").select(["nmae"]);  // no such column
-// db.selectFrom("customers").select((eb) => [eb.fn.sum("name").as("x")]); // not a number
+// db.selectFrom("customers").selectAll().where("signed_up_on", "=", 42); // wrong value type
 
 console.log(rows);`,
   },
@@ -62,7 +65,9 @@ console.log(rows);`,
     id: "store-performance",
     label: "Store performance",
     note: "A join, and an alias that carries through every later column reference.",
-    code: `// Aliasing a table renames it for the whole query: after \`stores as s\`, only
+    code: `import { sql } from "kysely";
+
+// Aliasing a table renames it for the whole query: after \`stores as s\`, only
 // \`s.\` resolves, and a stale \`stores.name\` is a compile error.
 const rows = await db
   .selectFrom("stores as s")
@@ -71,7 +76,7 @@ const rows = await db
     "s.name",
     "s.city",
     eb.fn.countAll().as("orders"),
-    eb.fn.round(eb.fn.sum("o.total"), 2).as("revenue"),
+    sql<number>\`ROUND(SUM(o.total), 2)\`.as("revenue"),
   ])
   .where("o.status", "=", "completed")
   .groupBy(["s.store_id", "s.name", "s.city"])
@@ -103,13 +108,15 @@ console.log(rows);`,
     id: "customer-value",
     label: "Who spends the most",
     note: "A grouped aggregate with HAVING, ordered by an alias from the select list.",
-    code: `const rows = await db
+    code: `import { sql } from "kysely";
+
+const rows = await db
   .selectFrom("customers as c")
   .innerJoin("orders as o", "o.customer_id", "c.customer_id")
   .select((eb) => [
     "c.loyalty_tier",
     eb.fn.count("c.customer_id").distinct().as("customers"),
-    eb.fn.round(eb.fn.sum("o.total"), 2).as("revenue"),
+    sql<number>\`ROUND(SUM(o.total), 2)\`.as("revenue"),
   ])
   .groupBy("c.loyalty_tier")
   .having((eb) => eb(eb.fn.countAll(), ">", 100))
@@ -122,10 +129,20 @@ console.log(rows);`,
     id: "search",
     label: "Full-text search",
     note: "Ranked by BM25, with no index to declare and no schema change to make.",
-    code: `const hits = await db
+    code: `import { sql } from "kysely";
+
+const query = "espresso grinder";
+const hits = await db
   .selectFrom("products")
-  .select(["name", "category", "brand", "list_price"])
-  .search("espresso grinder")
+  .select([
+    "name",
+    "category",
+    "brand",
+    "list_price",
+    sql<number>\`BM25(name) AGAINST \${query}\`.as("rank"),
+  ])
+  .where(sql<boolean>\`MATCH(name) AGAINST \${query}\`)
+  .orderBy("rank", "desc")
   .limit(10)
   .execute();
 
@@ -135,27 +152,26 @@ console.log(hits);`,
     id: "raw-sql",
     label: "Dropping to SQL",
     note: "The escape hatch, with values bound as parameters rather than pasted into the text.",
-    code: `import { sql } from "@minnowdb/client";
+    code: `import { sql } from "kysely";
 
 // \`threshold\` is bound, not interpolated — the statement the engine parses is the
 // same one every time, whatever the value is.
 const threshold = 400;
-const rows = await sql\`
+const result = await sql<{ status: string; orders: number; revenue: number }>\`
   SELECT status, COUNT(*) AS orders, ROUND(SUM(total), 2) AS revenue
   FROM orders
   WHERE total > \${threshold}
   GROUP BY status
   ORDER BY revenue DESC\`.execute(db);
 
-console.log(rows);`,
+console.log(result.rows);`,
   },
   {
     id: "write",
     label: "Writing, and reading it back",
-    note: "An insert through the batch path, then the row the engine wrote.",
+    note: "A parameterized Kysely upsert, then the row the engine wrote.",
     code: `// This writes to the database in your browser. Rebuild above to undo it.
-// \`orReplace()\` routes the row through the upsert path, so running this twice
-// replaces rather than collides.
+// The conflict clause makes the snippet safe to run twice.
 const created = await db
   .insertInto("products")
   .values({
@@ -170,7 +186,14 @@ const created = await db
     launched_on: new Date(),
     discontinued: false,
   })
-  .orReplace()
+  .onConflict((conflict) =>
+    conflict.column("product_id").doUpdateSet({
+      name: "Minnow House Blend",
+      unit_cost: 6.4,
+      list_price: 15.5,
+      launched_on: new Date(),
+    }),
+  )
   .returningAll()
   .executeTakeFirstOrThrow();
 

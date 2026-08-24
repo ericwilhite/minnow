@@ -28,9 +28,9 @@ Everything else is built around these ideas.
   stable reads, and cleanup much easier to reason about.
 - **Nothing special to deploy.** No COOP/COEP headers, no SharedArrayBuffer, no WASM file to
   host. `npm install` and go.
-- **The engine is our own.** No SQLite or DuckDB underneath — engines built for POSIX files carry
-  assumptions browsers don't honor. The trade-off: the SQL surface is a careful subset, tracked in
-  the [feature matrix](/docs/sql/feature-matrix).
+- **The engine is designed for browsers.** Minnow contains its own parser, planner, optimizer, and
+  executor instead of wrapping SQLite or DuckDB. Its SQL dialect is a documented embedded subset,
+  tracked in the [PostgreSQL compatibility page](/docs/sql/feature-matrix).
 
 ## Why columns, and why blocks never change
 
@@ -114,7 +114,7 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   the same time; only one publishes, the other retries.
 - **Notifications are hints.** BroadcastChannel announces that a new version exists, but every tab
   reconciles against the durable store. A missed message costs a little latency, never a stale
-  result. [Live queries](/docs/client/live) are built on this.
+  result. [Live queries](/docs/engine/workers#buffered-writers-and-live-queries) are built on this.
 - **Dead tabs are handled by leases.** A long-running read holds a lease — a stored record with an
   expiry, renewed while the tab is alive. If the tab vanishes, the lease expires and whatever it
   pinned becomes reclaimable. No heartbeats, no guessing.
@@ -142,8 +142,8 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   re-decompression. Passing `memoize: false` to a query bypasses the computed-result entries
   and measures execution, which is what the benchmarks do.
 
-The budget is a model, not a heap meter, and not every operator can spill yet — see
-[what we don't claim](#what-we-dont-claim).
+The budget models query allocations rather than measuring the JavaScript heap. See
+[Limits](#limits) for the operations it does not cover.
 
 ## Background work
 
@@ -194,21 +194,16 @@ after every block write and manifest commit, and these must hold no matter where
 The same hook is public: `FaultInjectingBlockStore` in `@minnowdb/core/testing` wraps any store,
 so your own tests can crash the engine on purpose too.
 
-## What we don't claim
+## Limits
 
-- **A memory budget is useful, but not a hard limit yet.** Some selected columns are still built
-  in full before accounting starts, and some joins cannot spill. The budget catches whole classes of
-  blowups; it is not a hard cap on the heap.
-- **No big-dataset performance claims** until real browser measurements back them. The
-  [benchmarks](/benchmarks) publish what has been measured, methodology included.
-- **The early block format may change.** Formats only ever grow (new codecs get new IDs; old
-  bytes are never reinterpreted), but this early format — currently version 1, whose header and
-  statistics are independently checksummed — carries no compatibility promise yet.
+- **The memory budget is not a hard heap limit.** Some selected columns are built before accounting
+  starts, and some joins cannot spill. The budget prevents several large working sets but does not
+  cap the JavaScript heap.
+- **Performance depends on the browser and workload.** Run the [benchmarks](/benchmarks) to measure
+  the queries and storage adapters on your target device.
+- **The block format may change during 0.x.** Formats only grow: new codecs get new IDs and old
+  bytes are never reinterpreted. Version 1 checksums both its header and statistics.
 - **Indexes use tuple postings, not a general B-tree.** Scalar and composite keys prune leftmost
   equality/`IN` prefixes plus a following range. `UNIQUE` has independent atomic membership.
   Exact non-null indexes can also deliver `ORDER BY` and covering reads for keyless append-only
   tables; other shapes keep the ordinary scan and bounded sort.
-
-One working rule sits behind all of this: each layer advances only when measurements support it —
-storage throughput before query work, atomic commits under injected faults before multi-tab
-features. Finding out early is cheap. Finding out late is a rewrite.

@@ -159,6 +159,7 @@ export async function loadCodeMirrorEditor(deps: CodeMirrorDeps): Promise<SqlEdi
         syntaxHighlighting(syntax),
         EditorState.allowMultipleSelections.of(true),
         EditorView.lineWrapping,
+        EditorView.contentAttributes.of({ "aria-label": "SQL" }),
         keymap.of([
           {
             key: "Mod-Enter",

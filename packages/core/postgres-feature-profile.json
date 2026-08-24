@@ -1,0 +1,223 @@
+{
+  "schemaVersion": 1,
+  "name": "PostgreSQL-style SQL",
+  "oracle": {
+    "engine": "PGlite",
+    "version": "0.5.5",
+    "role": "PostgreSQL parser and result oracle used by the differential test suite"
+  },
+  "scope": {
+    "includes": "The single-database SQL syntax accepted by Minnow and its observable results for each checked example.",
+    "excludes": [
+      "server lifecycle and connections",
+      "catalogs and schemas",
+      "roles, ownership, and privileges",
+      "replication and server extensions",
+      "PostgreSQL storage and administration commands"
+    ]
+  },
+  "classifications": {
+    "compatible": "The checked example uses PostgreSQL syntax. Deterministic reads and mutations match PostgreSQL's result and resulting row state; DDL compatibility is PostgreSQL parser acceptance plus Minnow catalog assertions.",
+    "different": "Minnow supports the concept, but a spelling, type rule, or observable result deliberately differs.",
+    "extension": "Minnow accepts syntax PostgreSQL does not; this is a listed value addition, not PostgreSQL compatibility.",
+    "unsupported": "The feature is meaningful for an embedded database but Minnow does not implement it.",
+    "inapplicable": "The feature belongs to a server capability that an embedded, single-database engine does not expose."
+  },
+  "defaults": {
+    "supported": "compatible",
+    "unsupported": "unsupported"
+  },
+  "overrides": [
+    {
+      "id": "expression.arithmetic",
+      "classification": "different",
+      "reason": "Minnow has one JavaScript number type: integer-looking division stays fractional, and division by zero returns NULL instead of raising PostgreSQL's error."
+    },
+    {
+      "id": "expression.round",
+      "classification": "different",
+      "reason": "Minnow accepts ROUND(double precision, digits); PostgreSQL requires numeric for the two-argument form."
+    },
+    {
+      "id": "parameter.positional",
+      "classification": "extension",
+      "reason": "PostgreSQL uses $n parameters. Minnow also accepts ? as adapter-friendly shorthand."
+    },
+    {
+      "id": "mutation.upsert-replace",
+      "classification": "extension",
+      "reason": "DO REPLACE is Minnow shorthand for replacing every non-key value from EXCLUDED."
+    },
+    {
+      "id": "predicate.match",
+      "classification": "extension",
+      "reason": "MATCH is Minnow's index-transparent full-text predicate rather than a PostgreSQL operator."
+    },
+    {
+      "id": "predicate.match-star",
+      "classification": "extension",
+      "reason": "MATCH(*) searches every text column and is a Minnow full-text extension."
+    },
+    {
+      "id": "predicate.match-parameter",
+      "classification": "extension",
+      "reason": "Parameterized MATCH uses Minnow's index-transparent full-text predicate."
+    },
+    {
+      "id": "function.bm25",
+      "classification": "extension",
+      "reason": "BM25 exposes Minnow's full-text score; PostgreSQL uses its own text-search types and ranking functions."
+    },
+    {
+      "id": "mutation.upsert",
+      "classification": "compatible",
+      "reason": "ON CONFLICT ... DO UPDATE follows PostgreSQL syntax."
+    },
+    {
+      "id": "mutation.insert-do-nothing",
+      "classification": "compatible",
+      "reason": "ON CONFLICT ... DO NOTHING follows PostgreSQL syntax."
+    },
+    {
+      "id": "mutation.upsert-partial",
+      "classification": "compatible",
+      "reason": "A partial SET list with EXCLUDED follows PostgreSQL syntax."
+    },
+    {
+      "id": "predicate.ilike",
+      "classification": "compatible",
+      "reason": "ILIKE follows PostgreSQL syntax and case-insensitive matching semantics."
+    },
+    {
+      "id": "expression.modulo",
+      "classification": "different",
+      "reason": "Minnow permits % on its number type; PostgreSQL has no % operator for double precision."
+    },
+    {
+      "id": "expression.cast",
+      "classification": "different",
+      "reason": "Casting an approximate number to INTEGER truncates in Minnow; PostgreSQL rounds."
+    },
+    {
+      "id": "expression.date-trunc",
+      "classification": "compatible",
+      "reason": "DATE_TRUNC follows PostgreSQL syntax; Minnow evaluates datetimes in UTC because it has no session time zone."
+    },
+    {
+      "id": "function.numeric-core",
+      "classification": "different",
+      "reason": "Minnow's one number type accepts combinations that PostgreSQL's distinct integer, numeric, and double-precision overloads do not."
+    },
+    {
+      "id": "function.string-extended",
+      "classification": "different",
+      "reason": "The bundled form includes INSTR; PostgreSQL spells that function strpos with reversed arguments."
+    },
+    {
+      "id": "function.trim-multi-character",
+      "classification": "different",
+      "reason": "Minnow removes the trim string as a repeated unit; PostgreSQL treats its characters as a set."
+    },
+    {
+      "id": "aggregate.any-value",
+      "classification": "compatible",
+      "verification": "acceptance",
+      "reason": "Both engines accept ANY_VALUE, but which group member it returns is intentionally nondeterministic, so the oracle checks acceptance rather than row equality."
+    },
+    {
+      "id": "aggregate.json",
+      "classification": "different",
+      "reason": "Minnow returns JSON text; PostgreSQL returns a native JSON value, and member order is unspecified without aggregate-local ORDER BY."
+    },
+    {
+      "id": "type.exact-numeric",
+      "classification": "different",
+      "reason": "Minnow preserves exact decimals at the JavaScript boundary as strings; PGlite's default decoder returns this NUMERIC value as a number."
+    },
+    {
+      "id": "type.json-jsonb",
+      "classification": "different",
+      "reason": "Minnow returns canonical JSON text at the JavaScript boundary while PostgreSQL clients commonly decode JSONB to a native object."
+    },
+    {
+      "id": "type.interval",
+      "classification": "different",
+      "reason": "Minnow returns a canonical months/days/microseconds string; PostgreSQL clients use their own interval representation and formatting."
+    },
+    {
+      "id": "type.array",
+      "classification": "different",
+      "reason": "Minnow returns arrays as canonical JSON text at the JavaScript boundary while PostgreSQL clients commonly return native arrays."
+    },
+    {
+      "id": "json.query",
+      "classification": "different",
+      "reason": "The JSON value agrees, but Minnow returns compact JSON text while PostgreSQL's text rendering includes spaces."
+    },
+    {
+      "id": "json.object",
+      "classification": "different",
+      "reason": "The JSON value agrees, but Minnow returns compact JSON text while PostgreSQL's text rendering includes spaces."
+    },
+    {
+      "id": "json.array",
+      "classification": "different",
+      "reason": "The JSON value agrees, but Minnow returns compact JSON text while PostgreSQL's text rendering includes spaces."
+    },
+    {
+      "id": "trigger.create-after",
+      "classification": "different",
+      "reason": "Minnow uses an embedded BEGIN ... END trigger body; PostgreSQL triggers call a separately declared function."
+    },
+    {
+      "id": "trigger.create-before",
+      "classification": "different",
+      "reason": "Minnow uses an embedded BEGIN ... END trigger body; PostgreSQL triggers call a separately declared function."
+    },
+    {
+      "id": "trigger.body-update-delete",
+      "classification": "different",
+      "reason": "Minnow uses an embedded BEGIN ... END trigger body; PostgreSQL triggers call a separately declared function."
+    },
+    {
+      "id": "trigger.drop",
+      "classification": "different",
+      "reason": "PostgreSQL requires DROP TRIGGER name ON table; Minnow's trigger names are database-wide."
+    },
+    {
+      "id": "ddl.secondary-index",
+      "classification": "compatible",
+      "reason": "CREATE INDEX follows PostgreSQL syntax."
+    },
+    {
+      "id": "ddl.drop-secondary-index",
+      "classification": "compatible",
+      "reason": "DROP INDEX follows PostgreSQL syntax."
+    },
+    {
+      "id": "ddl.composite-secondary-index",
+      "classification": "compatible",
+      "reason": "Composite CREATE INDEX follows PostgreSQL syntax."
+    },
+    {
+      "id": "ddl.unique-secondary-index",
+      "classification": "compatible",
+      "reason": "CREATE UNIQUE INDEX follows PostgreSQL syntax."
+    },
+    {
+      "id": "mutation.upsert-expression",
+      "classification": "different",
+      "reason": "Minnow resolves an unqualified target column in DO UPDATE; PostgreSQL treats score beside EXCLUDED.score as ambiguous unless the target is qualified."
+    },
+    {
+      "id": "transaction.isolation-level",
+      "classification": "inapplicable",
+      "reason": "Minnow exposes one snapshot transaction model, so there is no session isolation level to configure."
+    },
+    {
+      "id": "privileges.grant",
+      "classification": "inapplicable",
+      "reason": "An embedded database has no server roles, owners, or GRANT boundary."
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-import type { ColumnDefault } from "../storage/index.js";
+import type { ColumnDefault, SqlDomain } from "../storage/index.js";
 import {
   columnFromState,
   schema,
@@ -11,6 +11,7 @@ import {
   type SchemaColumnType,
   type SchemaDefinition,
   type TableCheck,
+  type TableForeignKey,
 } from "./schema.js";
 
 /**
@@ -23,6 +24,8 @@ export interface WireColumn {
   readonly type: SchemaColumnType;
   readonly isNullable: boolean;
   readonly isUnique: boolean;
+  readonly integer?: true;
+  readonly sqlDomain?: SqlDomain;
   readonly defaultSpec?: ColumnDefault;
   readonly renamedFromName?: string;
   readonly reference?: { table: string; column: string; onDelete: ReferentialAction };
@@ -34,6 +37,8 @@ export interface WireColumn {
 export interface WireTable {
   readonly name: string;
   readonly columns: Record<string, WireColumn>;
+  readonly primaryKey?: readonly string[];
+  readonly foreignKeys?: readonly TableForeignKey[];
   /** Absent rather than empty so a frame written without the field stays readable. */
   readonly checks?: readonly TableCheck[];
 }
@@ -71,25 +76,31 @@ export type WireMigrationStep =
 
 type AnyColumn = AnyTable["columns"][string];
 
-function serializeColumn(definition: AnyColumn): WireColumn {
+function serializeColumn(
+  definition: AnyColumn,
+  frozen?: { readonly backfillValue?: boolean | number | string | Date },
+): WireColumn {
+  const backfillValue =
+    frozen === undefined
+      ? typeof definition.backfillValue === "function"
+        ? definition.backfillValue()
+        : definition.backfillValue
+      : frozen.backfillValue;
   return {
     type: definition.type,
     isNullable: definition.isNullable,
     isUnique: definition.isUnique,
+    ...(definition.integer ? { integer: true } : {}),
+    ...(definition.sqlDomain === undefined
+      ? {}
+      : { sqlDomain: structuredClone(definition.sqlDomain) }),
     ...(definition.defaultSpec === undefined ? {} : { defaultSpec: { ...definition.defaultSpec } }),
     ...(definition.renamedFromName === undefined
       ? {}
       : { renamedFromName: definition.renamedFromName }),
     ...(definition.reference === undefined ? {} : { reference: { ...definition.reference } }),
     ...(definition.enumValues === undefined ? {} : { enumValues: [...definition.enumValues] }),
-    ...(definition.backfillValue === undefined
-      ? {}
-      : {
-          backfillValue:
-            typeof definition.backfillValue === "function"
-              ? definition.backfillValue()
-              : definition.backfillValue,
-        }),
+    ...(backfillValue === undefined ? {} : { backfillValue }),
   };
 }
 
@@ -102,6 +113,10 @@ function serializeTable(definition: AnyTable): WireTable {
         serializeColumn(columnDefinition),
       ]),
     ),
+    ...(definition.primaryKey.length === 0 ? {} : { primaryKey: [...definition.primaryKey] }),
+    ...(definition.foreignKeys.length === 0
+      ? {}
+      : { foreignKeys: structuredClone(definition.foreignKeys) }),
     ...(definition.checks.length === 0
       ? {}
       : { checks: definition.checks.map((check) => ({ ...check })) }),
@@ -150,7 +165,10 @@ export function serializeMigrationSteps(steps: readonly MigrationStep[]): WireMi
           kind: "add-column",
           tableName: step.tableName,
           columnName: step.columnName,
-          definition: serializeColumn(step.definition),
+          definition: serializeColumn(
+            step.definition,
+            step.backfill === undefined ? {} : { backfillValue: step.backfill },
+          ),
         };
       case "replace-view":
         return { kind: "replace-view", view: serializeView(step.view) };
@@ -170,6 +188,8 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
     type: wire.type,
     isNullable: wire.isNullable,
     isUnique: wire.isUnique,
+    integer: wire.integer === true,
+    ...(wire.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(wire.sqlDomain) }),
     ...(wire.defaultSpec === undefined ? {} : { defaultSpec: wire.defaultSpec }),
     ...(wire.renamedFromName === undefined ? {} : { renamedFromName: wire.renamedFromName }),
     ...(wire.reference === undefined ? {} : { reference: wire.reference }),
@@ -179,16 +199,19 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
 }
 
 function deserializeTable(wire: WireTable): AnyTable {
-  return table(
-    wire.name,
-    Object.fromEntries(
-      Object.entries(wire.columns).map(([name, columnDefinition]) => [
-        name,
-        deserializeColumn(columnDefinition),
-      ]),
-    ),
-    wire.checks === undefined ? {} : { checks: wire.checks.map((check) => ({ ...check })) },
+  const columns = Object.fromEntries(
+    Object.entries(wire.columns).map(([name, columnDefinition]) => [
+      name,
+      deserializeColumn(columnDefinition),
+    ]),
   );
+  const options = {
+    ...(wire.foreignKeys === undefined ? {} : { foreignKeys: structuredClone(wire.foreignKeys) }),
+    ...(wire.checks === undefined ? {} : { checks: wire.checks.map((check) => ({ ...check })) }),
+  };
+  return wire.primaryKey === undefined
+    ? table(wire.name, columns, options)
+    : table(wire.name, columns, { ...options, primaryKey: [...wire.primaryKey] });
 }
 
 export function deserializeSchema(wire: WireSchema): SchemaDefinition<readonly AnyTable[]> {

@@ -52,8 +52,9 @@ import {
 import { OpfsTree, encodeSegment, decodeSegment } from "./files.js";
 import {
   decodeChunk,
+  decodePostingChunk,
   decodeSyncCheckpoint,
-  encodeChunk,
+  encodePostingChunk,
   encodeSyncCheckpoint,
 } from "../toolkit/wire.js";
 import { WalWriter, replayWalFrames } from "../toolkit/wal.js";
@@ -1830,11 +1831,13 @@ function samePlacement(left: Placement | undefined, right: Placement): boolean {
 }
 
 function encodeFtsChunk(chunk: FtsPosting[]): Uint8Array {
-  return encodeChunk(chunk);
+  return encodePostingChunk(chunk);
 }
 
 function decodeFtsChunk(bytes: Uint8Array): FtsPosting[] {
-  const chunk = decodeChunk(bytes) as FtsPosting[] | undefined;
+  // Generic JSON chunks were written by format-v2 releases before the compact postings codec.
+  // Keep reading them in place; the next rebuild naturally writes the compact representation.
+  const chunk = decodePostingChunk(bytes) ?? (decodeChunk(bytes) as FtsPosting[] | undefined);
   if (chunk === undefined) throw new Error("Full-text base chunk is unreadable");
   return chunk;
 }

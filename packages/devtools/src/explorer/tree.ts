@@ -1,6 +1,6 @@
 import { el, icon, iconButton, icons } from "../dom.js";
 import { readFlag, writeFlag } from "../storage.js";
-import { isEditable, type ColumnInfo, type TableInfo } from "./catalog.js";
+import { isEditable, type ColumnInfo, type IndexInfo, type TableInfo } from "./catalog.js";
 
 export interface SchemaRail {
   node: HTMLElement;
@@ -17,6 +17,8 @@ export interface SchemaRailDeps {
   onPickTable(table: TableInfo): void;
   /** A column was clicked — used to insert its name while writing a query. */
   onPickColumn(table: TableInfo, column: ColumnInfo): void;
+  /** An index was clicked — useful when composing DROP INDEX or inspecting its table. */
+  onPickIndex(table: TableInfo, index: IndexInfo): void;
   /** Expanding is independent of picking, so a table can be inspected without opening it. */
   onToggle?(table: TableInfo, expanded: boolean): void;
 }
@@ -88,8 +90,28 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
     return row;
   }
 
+  function indexRow(table: TableInfo, index: IndexInfo): HTMLElement {
+    const key = index.columns
+      .map((column) => `${column.name}${column.direction === "desc" ? " ↓" : ""}`)
+      .join(", ");
+    const row = el("button", { class: "index", type: "button" }, [
+      el("span", { class: "index-name", text: index.name }),
+      el("span", { class: "index-key", text: key }),
+      ...(index.unique ? [el("span", { class: "index-badge", text: "unique" })] : []),
+      ...(index.state === "ready"
+        ? []
+        : [el("span", { class: `index-badge ${index.state}`, text: index.state })]),
+    ]);
+    row.title = `${index.unique ? "UNIQUE " : ""}${index.name} (${key}) · ${index.state}`;
+    row.addEventListener("click", () => {
+      deps.onPickIndex(table, index);
+    });
+    return row;
+  }
+
   function tableRow(table: TableInfo): HTMLElement[] {
     const open = table.name === expanded;
+    const indexes = table.indexes ?? [];
     const chevron = el("button", {
       class: "tnode-toggle",
       type: "button",
@@ -110,8 +132,15 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
       el("span", { class: "tnode-name", text: table.name }),
       el("span", {
         class: "tnode-meta",
-        text: String(table.columns.length),
-        title: `${String(table.columns.length)} columns`,
+        text:
+          indexes.length === 0
+            ? String(table.columns.length)
+            : `${String(table.columns.length)} · ${String(indexes.length)} idx`,
+        title: `${String(table.columns.length)} columns${
+          indexes.length === 0
+            ? ""
+            : `, ${String(indexes.length)} ${indexes.length === 1 ? "index" : "indexes"}`
+        }`,
       }),
       ...(isEditable(table)
         ? []
@@ -136,11 +165,18 @@ export function createSchemaRail(deps: SchemaRailDeps): SchemaRail {
     return open
       ? [
           row,
-          el(
-            "div",
-            { class: "cols" },
-            table.columns.map((column) => columnRow(table, column)),
-          ),
+          el("div", { class: "cols" }, [
+            ...table.columns.map((column) => columnRow(table, column)),
+            ...(indexes.length === 0
+              ? []
+              : [
+                  el("div", {
+                    class: "index-group",
+                    text: `Indexes · ${String(indexes.length)}`,
+                  }),
+                  ...indexes.map((index) => indexRow(table, index)),
+                ]),
+          ]),
         ]
       : [row];
   }

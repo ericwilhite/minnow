@@ -8,7 +8,7 @@ import { runSnippet, toRunnableBody } from "./run";
  */
 describe("rewriting a compiled snippet", () => {
   it("keeps every line where it was", () => {
-    const compiled = 'import { sql } from "@minnowdb/client";\n\nconsole.log(sql);\n';
+    const compiled = 'import { sql } from "kysely";\n\nconsole.log(sql);\n';
     expect(toRunnableBody(compiled).split("\n")).toHaveLength(compiled.split("\n").length);
   });
 
@@ -38,7 +38,7 @@ describe("rewriting a compiled snippet", () => {
 });
 
 describe("running a snippet", () => {
-  const scope = { modules: { "@minnowdb/client": { sql: "tag" } }, globals: { db: { rows: 2 } } };
+  const scope = { modules: { kysely: { sql: "tag" } }, globals: { db: { rows: 2 } } };
 
   it("awaits at the top level and collects what it printed", async () => {
     const result = await runSnippet(
@@ -51,16 +51,13 @@ describe("running a snippet", () => {
   });
 
   it("resolves an import against the page's own modules", async () => {
-    const result = await runSnippet(
-      'import { sql } from "@minnowdb/client";\nconsole.log(sql);',
-      scope,
-    );
+    const result = await runSnippet('import { sql } from "kysely";\nconsole.log(sql);', scope);
     expect(result.output).toEqual([{ level: "log", values: ["tag"] }]);
   });
 
   it("names the modules it has when a specifier misses", async () => {
     const result = await runSnippet('import x from "react";', scope);
-    expect(result.failure).toBe('The console has no "react". It can import "@minnowdb/client".');
+    expect(result.failure).toBe('The console has no "react". It can import "kysely".');
   });
 
   it("reports a throw as a result rather than throwing", async () => {

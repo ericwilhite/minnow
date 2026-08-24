@@ -35,7 +35,7 @@ const TABS: ReadonlyArray<{ id: Language; label: string; note: string }> = [
   {
     id: "typescript",
     label: "TypeScript",
-    note: "The same data through the typed client, checked against the schema as you type.",
+    note: "Explore the same data with inline schema checking as you type.",
   },
 ];
 

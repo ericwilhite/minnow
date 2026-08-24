@@ -1,90 +1,76 @@
 {
-  "version": 2,
-  "description": "Machine-readable SQL feature matrix for the MinnowDatabase engine, keyed to the feature identifiers of ISO/IEC 9075:2023 (SQL:2023) Annex F. Every entry carries an example; the conformance test executes supported examples through both executors and asserts that each unsupported example still fails with the recorded error fragment. `feature` is the standard's identifier, or \"minnow\" for an extension the standard does not define. Entries marked unsupported describe the SQL surface only: each carries a note explaining why the engine does not promise it, and several are deliberate — an embedded database in a page has no principals to GRANT to, and transactions are an API rather than statements.",
+  "version": 4,
+  "description": "Executable PostgreSQL compatibility examples for MinnowDatabase. postgres-feature-profile.json records differences, extensions, and embedded exclusions.",
   "features": [
     {
       "id": "select.projection",
-      "feature": "E051",
       "status": "supported",
       "example": "SELECT region, amount FROM rows"
     },
     {
       "id": "select.alias",
-      "feature": "E051-05",
       "status": "supported",
       "example": "SELECT amount AS total FROM rows"
     },
     {
       "id": "select.wildcard",
-      "feature": "E051",
       "status": "supported",
       "example": "SELECT * FROM rows"
     },
     {
       "id": "select.distinct",
-      "feature": "E051-01",
       "status": "supported",
       "example": "SELECT DISTINCT region FROM rows"
     },
     {
       "id": "select.scalar-subquery",
-      "feature": "F471",
       "status": "supported",
       "example": "SELECT (SELECT MAX(amount) FROM rows) AS peak FROM rows LIMIT 1"
     },
     {
       "id": "expression.arithmetic",
-      "feature": "E011-04",
       "status": "supported",
       "example": "SELECT amount * 2 + 1 AS scaled FROM rows"
     },
     {
       "id": "expression.round",
-      "feature": "T441",
       "status": "supported",
       "example": "SELECT ROUND(amount / 3, 2) AS thirds FROM rows",
       "notes": "Precision truncates to an integer and clamps to 0..30; halfway values round away from zero, matching SQLite."
     },
     {
       "id": "literal.string",
-      "feature": "E021-03",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region = 'west'"
     },
     {
       "id": "literal.number",
-      "feature": "E011",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount >= 10"
     },
     {
       "id": "literal.boolean",
-      "feature": "T031",
       "status": "supported",
       "example": "SELECT active, amount FROM rows WHERE active = TRUE"
     },
     {
       "id": "literal.null-comparison",
-      "feature": "E131",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region != NULL"
     },
     {
       "id": "literal.date",
-      "feature": "F051-01",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE joined >= DATE '2026-01-01'"
     },
     {
       "id": "literal.timestamp",
-      "feature": "F051-03",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE joined >= TIMESTAMP '2026-01-01 00:00:00'",
       "notes": "TIMESTAMP 'y-m-d h:m:s' with the time optional. A literal without a zone is UTC, as every datetime in a Minnow database is."
     },
     {
       "id": "parameter.numbered",
-      "feature": "E182",
       "status": "supported",
       "example": "SELECT region, amount FROM rows WHERE amount >= $1 ORDER BY amount",
       "params": [6],
@@ -92,7 +78,6 @@
     },
     {
       "id": "parameter.positional",
-      "feature": "E182",
       "status": "supported",
       "example": "SELECT region, amount FROM rows WHERE amount >= ? AND active = ? ORDER BY amount",
       "params": [6, true],
@@ -100,294 +85,257 @@
     },
     {
       "id": "join.inner-equi",
-      "feature": "F041-01",
       "status": "supported",
       "example": "SELECT r.region, d.label FROM rows r JOIN dims d ON d.region = r.region"
     },
     {
       "id": "join.left-equi",
-      "feature": "F041-03",
       "status": "supported",
       "example": "SELECT r.region, d.label FROM rows r LEFT JOIN dims d ON d.region = r.region"
     },
     {
       "id": "where.and",
-      "feature": "E061-14",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > 5 AND region = 'west'"
     },
     {
       "id": "where.in-list",
-      "feature": "E061-03",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IN ('west', 'east')"
     },
     {
       "id": "where.not-in-list",
-      "feature": "E061-03",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region NOT IN ('north')"
     },
     {
       "id": "where.in-subquery",
-      "feature": "E061-11",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IN (SELECT region FROM dims)"
     },
     {
       "id": "where.scalar-subquery",
-      "feature": "E061-09",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > (SELECT AVG(amount) FROM rows)"
     },
     {
       "id": "group-by",
-      "feature": "E051-02",
       "status": "supported",
       "example": "SELECT region, COUNT(*) AS count FROM rows GROUP BY region"
     },
     {
       "id": "group-by.rollup",
-      "feature": "T431",
       "status": "supported",
       "example": "SELECT region, SUM(amount) AS total FROM rows GROUP BY ROLLUP(region)",
       "notes": "ROLLUP/CUBE/GROUPING SETS desugar into a UNION ALL of grouped blocks. The GROUPING() marker is deliberately unsupported, so rollup NULLs and data NULLs are indistinguishable. SQLite itself has none of these."
     },
     {
       "id": "group-by.grouping-sets",
-      "feature": "T431",
       "status": "supported",
       "example": "SELECT region, active, COUNT(*) AS c FROM rows GROUP BY GROUPING SETS ((region), (active), ())"
     },
     {
       "id": "having",
-      "feature": "E051-06",
       "status": "supported",
       "example": "SELECT region, COUNT(*) AS count FROM rows GROUP BY region HAVING COUNT(*) > 1"
     },
     {
       "id": "aggregate.count",
-      "feature": "E091-02",
       "status": "supported",
       "example": "SELECT COUNT(*) AS count FROM rows"
     },
     {
       "id": "aggregate.sum",
-      "feature": "E091-05",
       "status": "supported",
       "example": "SELECT SUM(amount) AS total FROM rows"
     },
     {
       "id": "aggregate.avg",
-      "feature": "E091-01",
       "status": "supported",
       "example": "SELECT AVG(amount) AS mean FROM rows"
     },
     {
       "id": "aggregate.min-max",
-      "feature": "E091-03",
       "status": "supported",
       "example": "SELECT MIN(amount) AS low, MAX(amount) AS high FROM rows"
     },
     {
       "id": "order-by.multi-column",
-      "feature": "E121",
       "status": "supported",
       "example": "SELECT region, amount FROM rows ORDER BY region, amount DESC"
     },
     {
       "id": "order-by.wildcard-reference",
-      "feature": "E121",
       "status": "supported",
       "example": "SELECT * FROM rows ORDER BY amount"
     },
     {
       "id": "limit",
-      "feature": "F856",
       "status": "supported",
       "example": "SELECT amount FROM rows ORDER BY amount LIMIT 2"
     },
     {
       "id": "cte.non-recursive",
-      "feature": "T121",
       "status": "supported",
       "example": "WITH west AS (SELECT amount FROM rows WHERE region = 'west') SELECT COUNT(*) AS count FROM west"
     },
     {
       "id": "cte.chained",
-      "feature": "T121",
       "status": "supported",
       "example": "WITH a AS (SELECT amount FROM rows), b AS (SELECT amount FROM a WHERE amount > 5) SELECT COUNT(*) AS count FROM b"
     },
     {
       "id": "cte.column-list",
-      "feature": "T121",
       "status": "supported",
       "example": "WITH totals(place, total) AS (SELECT region, SUM(amount) FROM rows GROUP BY region) SELECT place, total FROM totals",
       "notes": "A CTE names its own output columns. A recursive CTE takes the names before its step member, which refers to the working set by them."
     },
     {
       "id": "derived-table",
-      "feature": "F591",
       "status": "supported",
       "example": "SELECT d.total FROM (SELECT region, SUM(amount) AS total FROM rows GROUP BY region) d ORDER BY d.total"
     },
     {
       "id": "union.distinct",
-      "feature": "E071-01",
       "status": "supported",
       "example": "SELECT region FROM rows UNION SELECT region FROM dims ORDER BY region"
     },
     {
       "id": "union.all",
-      "feature": "E071-02",
       "status": "supported",
       "example": "SELECT region FROM rows UNION ALL SELECT region FROM dims"
     },
     {
       "id": "window.row-number",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn FROM rows"
     },
     {
       "id": "window.rank",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT region, RANK() OVER (ORDER BY amount) AS r FROM rows"
     },
     {
       "id": "window.dense-rank",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT region, DENSE_RANK() OVER (ORDER BY amount) AS dr FROM rows"
     },
     {
       "id": "mutation.insert-values",
-      "feature": "E101-01",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('a', 1), ('b', 2)",
       "notes": "Through execute(); query() stays read-only."
     },
     {
       "id": "mutation.insert-values-implicit-columns",
-      "feature": "E101-01",
       "status": "supported",
       "example": "INSERT INTO keyed VALUES ('z', 2, NULL)",
       "notes": "When the column list is omitted, VALUES must supply every table column in declaration order."
     },
     {
+      "id": "mutation.insert-default-values",
+      "status": "supported",
+      "setup": [
+        "CREATE TABLE defaulted_insert (name TEXT DEFAULT 'generated', score INTEGER NOT NULL DEFAULT 7)"
+      ],
+      "example": "INSERT INTO defaulted_insert DEFAULT VALUES",
+      "notes": "DEFAULT VALUES inserts one row using catalog defaults. DEFAULT is also accepted in an individual VALUES slot."
+    },
+    {
       "id": "mutation.update-keyed",
-      "feature": "E101-03",
       "status": "supported",
       "example": "UPDATE keyed SET score = score + 1 WHERE score > 0",
       "notes": "Requires a unique-key table; read-then-mutate, not serializable."
     },
     {
       "id": "mutation.delete-keyed",
-      "feature": "E101-04",
       "status": "supported",
       "example": "DELETE FROM keyed WHERE score < 0",
       "notes": "Requires a unique-key table."
     },
     {
       "id": "mutation.returning",
-      "feature": "T495",
       "status": "supported",
       "example": "DELETE FROM keyed WHERE name = 'x' RETURNING name, score",
       "notes": "RETURNING works on INSERT, UPDATE, and DELETE; inserts echo written values, updates return post-update values, deletes the rows as read."
     },
     {
       "id": "mutation.upsert",
-      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
-      "notes": "PostgreSQL-compatible extension rather than SQL:2023 F312 (MERGE). The conflict target is the unique key and assigned values may read the target row or EXCLUDED proposal."
+      "notes": "PostgreSQL-compatible ON CONFLICT form. The conflict target is the unique key and assigned values may read the target row or EXCLUDED proposal."
     },
     {
       "id": "mutation.insert-do-nothing",
-      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 9), ('z', 1) ON CONFLICT (name) DO NOTHING",
       "notes": "Rows whose key already exists at the statement's snapshot are skipped. Each proposed row is considered in order, so later duplicates of a key retained earlier in the same statement are skipped too."
     },
     {
       "id": "mutation.upsert-replace",
-      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score, bonus) VALUES ('x', 50, 9) ON CONFLICT (name) DO REPLACE",
-      "notes": "Minnow's concise whole-row upsert spelling replaces every non-key column and also has exact semantics for a key-only table. The typed client's orReplace() emits this form."
+      "notes": "Minnow's concise whole-row upsert spelling replaces every non-key column and also has exact semantics for a key-only table."
     },
     {
       "id": "mutation.upsert-partial",
-      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score, bonus) VALUES ('x', 50, 9) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
       "notes": "Assigning a subset of target columns changes only those columns; unassigned columns keep their stored values. Assignment targets need not appear in the INSERT column list. Mixed update/insert batches publish atomically or roll back together."
     },
     {
       "id": "where.or",
-      "feature": "E061-14",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'"
     },
     {
       "id": "where.like",
-      "feature": "E061-04",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region LIKE 'w%'",
       "notes": "% matches any run and _ matches one Unicode codepoint."
     },
     {
       "id": "predicate.is-distinct-from",
-      "feature": "T151",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IS DISTINCT FROM 'west'",
       "notes": "Null-safe: NULL is not distinct from NULL."
     },
     {
       "id": "predicate.boolean-test",
-      "feature": "T031",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE active IS TRUE OR active IS UNKNOWN",
       "notes": "IS [NOT] TRUE/FALSE/UNKNOWN never return UNKNOWN; they desugar to null-safe comparisons."
     },
     {
       "id": "predicate.like-escape",
-      "feature": "E061-05",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region LIKE 'we!%st' ESCAPE '!' OR region LIKE 'we%'",
       "notes": "ESCAPE makes the next pattern character literal, wildcards included."
     },
     {
       "id": "predicate.quantified",
-      "feature": "E061-07",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > ALL (SELECT amount FROM dims)",
       "notes": "ANY/SOME/ALL with full three-valued logic; correlated forms are rejected. SQLite itself has no quantified comparisons."
     },
     {
       "id": "predicate.ilike",
-      "feature": "minnow",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region ILIKE 'WE%'",
       "notes": "Case-insensitive LIKE, a PostgreSQL extension; SQLite's LIKE is case-insensitive by default instead."
     },
     {
       "id": "predicate.match",
-      "feature": "minnow",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE MATCH(region) AGAINST 'west'"
     },
     {
       "id": "predicate.match-star",
-      "feature": "minnow",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE MATCH(*) AGAINST 'wes*'"
     },
     {
       "id": "predicate.match-parameter",
-      "feature": "minnow",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE MATCH(region) AGAINST $1 ORDER BY BM25(region) AGAINST $1 DESC",
       "params": ["west"],
@@ -395,235 +343,198 @@
     },
     {
       "id": "function.bm25",
-      "feature": "minnow",
       "status": "supported",
       "example": "SELECT region, BM25(region) AGAINST 'west' AS score FROM rows WHERE MATCH(region) AGAINST 'west' ORDER BY score DESC"
     },
     {
       "id": "order-by.expression",
-      "feature": "E121",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > 0 ORDER BY amount * 2 DESC, region"
     },
     {
       "id": "where.between",
-      "feature": "E061-02",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount BETWEEN 1 AND 5"
     },
     {
       "id": "where.between-symmetric",
-      "feature": "T461",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount BETWEEN SYMMETRIC 5 AND 1",
       "notes": "SYMMETRIC accepts the bounds in either order."
     },
     {
       "id": "where.is-null",
-      "feature": "E061-06",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IS NULL"
     },
     {
       "id": "where.is-not-null",
-      "feature": "E061-06",
       "status": "supported",
       "example": "SELECT amount FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "where.exists",
-      "feature": "E061-08",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE EXISTS (SELECT 1 FROM dims)",
       "notes": "Both uncorrelated and correlated EXISTS are supported. Correlated forms are decorrelated into joins rather than executed once per outer row."
     },
     {
       "id": "expression.case",
-      "feature": "F261-02",
       "status": "supported",
       "example": "SELECT CASE WHEN amount > 5 THEN 'big' ELSE 'small' END AS size FROM rows"
     },
     {
       "id": "subquery.correlated",
-      "feature": "E061-13",
       "status": "supported",
       "example": "SELECT region FROM rows r WHERE amount > (SELECT AVG(amount) FROM rows q WHERE q.region = r.region)",
       "notes": "Equality-correlated subqueries decorrelate into derived-table joins at compile time; both executors run plain joins."
     },
     {
       "id": "subquery.correlated-exists",
-      "feature": "E061-13",
       "status": "supported",
       "example": "SELECT amount FROM rows r WHERE EXISTS (SELECT region FROM dims d WHERE d.region = r.region)",
       "notes": "EXISTS joins the subquery's distinct correlation keys; NOT EXISTS becomes a left join checked with IS NULL."
     },
     {
       "id": "subquery.correlated-select",
-      "feature": "E061-13",
       "status": "supported",
       "example": "SELECT r.region, (SELECT AVG(q.amount) FROM rows q WHERE q.region = r.region) AS regional FROM rows r",
       "notes": "Correlated scalar aggregates decorrelate in the select list too, outside grouped queries."
     },
     {
       "id": "subquery.correlated-non-equi",
-      "feature": "E061-13",
       "status": "supported",
       "example": "SELECT r.amount FROM rows r WHERE EXISTS (SELECT q.amount FROM rows q WHERE q.amount < r.amount)",
       "notes": "Non-equality EXISTS and NOT EXISTS correlations lower to semi-joins and anti-joins; correlated scalar aggregates and IN remain equality-only."
     },
     {
       "id": "subquery.correlated-not-in",
-      "feature": "E061-13",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows r WHERE region NOT IN (SELECT d.region FROM dims d WHERE d.region = r.region)",
-      "error": "use NOT EXISTS",
-      "notes": "Correlated NOT IN has NULL semantics that the join rewrite cannot preserve; NOT EXISTS expresses the intent."
+      "status": "supported",
+      "example": "SELECT region FROM rows r WHERE region NOT IN (SELECT d.region FROM dims d WHERE d.region = r.region)"
     },
     {
       "id": "cte.recursive",
-      "feature": "T131",
       "status": "supported",
       "example": "WITH RECURSIVE n AS (SELECT MIN(amount) AS v FROM rows UNION ALL SELECT v + 1 FROM n WHERE v < 6) SELECT v FROM n",
       "notes": "Linear delta recursion with UNION or UNION ALL, capped at 10,000 iterations and 1,000,000 rows. Plain WITH still rejects self-references."
     },
     {
       "id": "mutation.with-cte",
-      "feature": "T121",
       "status": "supported",
       "example": "WITH totals AS (SELECT MAX(score) AS top FROM keyed) DELETE FROM keyed WHERE score >= (SELECT top FROM totals) RETURNING name",
       "notes": "WITH precedes INSERT/UPDATE/DELETE; the CTEs are visible to the statement's queries and subqueries."
     },
     {
       "id": "set.intersect",
-      "feature": "F302-01",
       "status": "supported",
       "example": "SELECT region FROM rows INTERSECT SELECT region FROM dims",
-      "notes": "INTERSECT binds tighter than UNION and EXCEPT, per the SQL standard."
+      "notes": "INTERSECT binds tighter than UNION and EXCEPT, matching PostgreSQL."
     },
     {
       "id": "set.except",
-      "feature": "E071-03",
       "status": "supported",
       "example": "SELECT region FROM rows EXCEPT SELECT region FROM dims"
     },
     {
       "id": "set.intersect-all",
-      "feature": "F302-02",
       "status": "supported",
       "example": "SELECT region FROM rows INTERSECT ALL SELECT region FROM dims",
       "notes": "Bag semantics; SQLite itself has no INTERSECT ALL."
     },
     {
       "id": "set.except-all",
-      "feature": "F304",
       "status": "supported",
       "example": "SELECT region FROM rows EXCEPT ALL SELECT region FROM dims",
       "notes": "Bag semantics; SQLite itself has no EXCEPT ALL."
     },
     {
       "id": "aggregate.count-distinct",
-      "feature": "E091-07",
       "status": "supported",
       "example": "SELECT COUNT(DISTINCT region) AS regions FROM rows"
     },
     {
       "id": "aggregate.filter",
-      "feature": "T612",
       "status": "supported",
       "example": "SELECT region, COUNT(*) FILTER (WHERE amount > 5) AS big FROM rows GROUP BY region",
       "notes": "Desugars into a CASE inside the aggregate, so it works with every aggregate and DISTINCT."
     },
     {
       "id": "window.aggregate-over",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT SUM(amount) OVER (PARTITION BY region) AS total FROM rows",
       "notes": "Default frame only: whole partition without OVER ordering, running with peers when ordered."
     },
     {
       "id": "window.in-expression",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT amount, amount - LAG(amount) OVER (ORDER BY amount, region) AS change, 100.0 * amount / SUM(amount) OVER () AS pct FROM rows",
       "notes": "A window is an expression: the arithmetic around it is evaluated after the window has run, over the column it produced."
     },
     {
       "id": "window.over-grouped",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT region, SUM(amount) AS total, ROW_NUMBER() OVER (ORDER BY SUM(amount) DESC, region) AS rank, SUM(SUM(amount)) OVER () AS everything FROM rows GROUP BY region HAVING COUNT(*) > 0",
-      "notes": "Windows run after GROUP BY and HAVING, as the standard orders them, so they rank groups and their OVER clause reads the group's aggregates."
+      "notes": "Windows run after GROUP BY and HAVING, matching PostgreSQL, so they rank groups and their OVER clause reads the group's aggregates."
     },
     {
       "id": "window.value-functions",
-      "feature": "T617",
       "status": "supported",
       "example": "SELECT amount, FIRST_VALUE(amount) OVER (PARTITION BY region ORDER BY amount) AS lowest, LAST_VALUE(amount) OVER (PARTITION BY region ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS highest FROM rows",
-      "notes": "FIRST_VALUE/LAST_VALUE respect the frame; the default frame ends at the current peer group, as the standard specifies."
+      "notes": "FIRST_VALUE/LAST_VALUE respect the frame; matching PostgreSQL, the default frame ends at the current peer group."
     },
     {
       "id": "window.ntile",
-      "feature": "T614",
       "status": "supported",
       "example": "SELECT amount, NTILE(2) OVER (ORDER BY amount) AS half FROM rows"
     },
     {
       "id": "window.distribution",
-      "feature": "T612",
       "status": "supported",
       "example": "SELECT amount, PERCENT_RANK() OVER (ORDER BY amount) AS pr, CUME_DIST() OVER (ORDER BY amount) AS cd FROM rows"
     },
     {
       "id": "window.frame",
-      "feature": "T612",
       "status": "supported",
       "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount, joined ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS windowed FROM rows",
       "notes": "ROWS frames take row-distance bounds; RANGE frames take UNBOUNDED and CURRENT ROW bounds, where CURRENT ROW spans the ordering peer group."
     },
     {
       "id": "join.right",
-      "feature": "F041-04",
       "status": "supported",
       "example": "SELECT r.region FROM rows r RIGHT JOIN dims d ON d.region = r.region",
       "notes": "Desugars to the mirrored LEFT JOIN; supported as the sole join of a block."
     },
     {
       "id": "join.non-equi",
-      "feature": "F041-08",
       "status": "supported",
       "example": "SELECT r.region FROM rows r JOIN dims d ON d.amount > r.amount",
       "notes": "Executes as a nested-loop join (probe x build); equalities keep the hash path."
     },
     {
       "id": "select.distinct-wildcard",
-      "feature": "E051-01",
       "status": "supported",
       "example": "SELECT DISTINCT * FROM rows",
       "notes": "Expands to DISTINCT over every wildcard output column once input schemas are known."
     },
     {
       "id": "limit.offset",
-      "feature": "F856",
       "status": "supported",
       "example": "SELECT amount FROM rows LIMIT 5 OFFSET 2",
       "notes": "OFFSET is accepted directly after LIMIT."
     },
     {
       "id": "select.no-from",
-      "feature": "E051",
       "status": "supported",
       "example": "SELECT 1 + 1 AS two, UPPER('minnow') AS name"
     },
     {
       "id": "select.values",
-      "feature": "F641",
       "status": "supported",
       "example": "SELECT v.column1 AS n, v.column2 AS tag FROM (VALUES (1, 'one'), (2, 'two')) v",
       "notes": "VALUES works standalone, as a set-operation member, and as a derived table with AS alias(col, ...) renaming; columns default to column1..columnN."
     },
     {
       "id": "limit.parameter",
-      "feature": "F865",
       "status": "supported",
       "example": "SELECT region, amount FROM rows ORDER BY region NULLS LAST, amount LIMIT $1 OFFSET $2",
       "params": [2, 1],
@@ -631,28 +542,24 @@
     },
     {
       "id": "limit.fetch-first",
-      "feature": "F856",
       "status": "supported",
       "example": "SELECT amount FROM rows ORDER BY amount OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY",
-      "notes": "The standard fetch clause is a spelling of LIMIT; SQLite itself only speaks LIMIT."
+      "notes": "PostgreSQL's FETCH clause is accepted as a spelling of LIMIT; SQLite itself only speaks LIMIT."
     },
     {
       "id": "offset.standalone",
-      "feature": "F856",
       "status": "supported",
       "example": "SELECT amount FROM rows ORDER BY amount OFFSET 2",
       "notes": "OFFSET no longer requires LIMIT. SQLite itself needs LIMIT -1 OFFSET n."
     },
     {
       "id": "ddl.create-table",
-      "feature": "F031-01",
       "status": "supported",
       "example": "CREATE TABLE made (id INTEGER PRIMARY KEY, label TEXT NOT NULL, at TIMESTAMP)",
-      "notes": "Standard type names map onto the four logical types (widths parse and are ignored); one PRIMARY KEY or UNIQUE column becomes the unique key. Dropping or altering tables stays a programmatic concern."
+      "notes": "Common PostgreSQL type names map onto Minnow's four stored value kinds (widths parse and are ignored); one PRIMARY KEY or UNIQUE column becomes the row-addressing key. ALTER TABLE ADD/DROP COLUMN and DROP TABLE are tracked separately."
     },
     {
       "id": "mutation.update-keyless",
-      "feature": "E101-03",
       "status": "unsupported",
       "example": "UPDATE rows SET amount = 1",
       "error": "UPDATE requires a table with a unique key",
@@ -660,21 +567,18 @@
     },
     {
       "id": "trigger.create-after",
-      "feature": "T211",
       "status": "supported",
       "example": "CREATE TRIGGER keyed_audit AFTER INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END",
       "notes": "AFTER and BEFORE row triggers on INSERT/UPDATE/DELETE, executed atomically inside the triggering commit with NEW/OLD references. Bodies: INSERT ... VALUES into keyless tables; UPDATE/DELETE against keyed tables. One cascade level is allowed; deeper chains error at write time."
     },
     {
       "id": "trigger.create-before",
-      "feature": "T211",
       "status": "supported",
       "example": "CREATE TRIGGER keyed_before BEFORE INSERT ON keyed BEGIN INSERT INTO rows (region, amount) VALUES (NEW.name, NEW.score); END",
       "notes": "BEFORE bodies stage ahead of the primary write but publish in the same atomic commit, so timing is a portability feature: atomicity and visibility are identical to AFTER."
     },
     {
       "id": "trigger.body-update-delete",
-      "feature": "T211",
       "status": "supported",
       "example": "CREATE TRIGGER keyed_counts AFTER INSERT ON keyed BEGIN UPDATE stats SET total = total + NEW.score WHERE region = NEW.name; END",
       "setup": [
@@ -685,7 +589,6 @@
     },
     {
       "id": "trigger.drop",
-      "feature": "T211",
       "status": "supported",
       "example": "DROP TRIGGER droppable_audit",
       "setup": [
@@ -694,185 +597,158 @@
     },
     {
       "id": "where.parenthesized",
-      "feature": "E061-14",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE (amount > 5 AND region = 'west')"
     },
     {
       "id": "where.not",
-      "feature": "E061-14",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE NOT active = TRUE"
     },
     {
       "id": "expression.concat",
-      "feature": "E021-07",
       "status": "supported",
       "example": "SELECT region || '-' || label AS tag FROM dims",
       "notes": "|| concatenates strings and propagates NULL; non-string operands are a type error."
     },
     {
       "id": "expression.modulo",
-      "feature": "T441",
       "status": "supported",
       "example": "SELECT amount % 3 AS remainder FROM rows",
       "notes": "Division and remainder by zero are NULL, matching SQLite."
     },
     {
       "id": "expression.cast",
-      "feature": "F201",
       "status": "supported",
       "example": "SELECT CAST(amount AS INTEGER) AS whole, CAST(amount AS TEXT) AS label FROM rows",
-      "notes": "Standard type names map to the four logical types; integer targets truncate toward zero, and non-numeric strings fail rather than becoming 0."
+      "notes": "Common PostgreSQL type names map to the four stored value kinds; integer targets truncate toward zero, unlike PostgreSQL's rounding, and non-numeric strings fail rather than becoming 0."
     },
     {
       "id": "identifier.quoted",
-      "feature": "E031-01",
       "status": "supported",
       "example": "SELECT \"region\", \"rows\".\"amount\" FROM \"rows\" WHERE \"amount\" > 5",
       "notes": "Double-quoted identifiers are never keywords and keep their exact spelling."
     },
     {
       "id": "order-by.nulls",
-      "feature": "T611",
       "status": "supported",
       "example": "SELECT region, amount FROM rows ORDER BY region NULLS LAST, amount",
-      "notes": "Without NULLS FIRST/LAST the default matches SQLite: NULLs first ascending, last descending."
+      "notes": "Without NULLS FIRST/LAST the default follows PostgreSQL: NULLs last ascending, first descending."
     },
     {
       "id": "expression.coalesce",
-      "feature": "F261-04",
       "status": "supported",
       "example": "SELECT COALESCE(region, 'unknown') AS region_label FROM rows",
       "notes": "Arguments evaluate left to right; the first non-NULL value wins. All non-NULL arguments must share one type."
     },
     {
       "id": "expression.date-trunc",
-      "feature": "minnow",
       "status": "supported",
       "example": "SELECT DATE_TRUNC('month', joined) AS joined_month FROM rows",
       "notes": "Units: year, quarter, month, week (Monday start), day, hour, minute, second. Truncation is in UTC; the engine has no session time zone."
     },
     {
       "id": "expression.date-add",
-      "feature": "F052",
       "status": "supported",
       "example": "SELECT joined + INTERVAL '1 month' AS next_month, joined - INTERVAL '2 days 3 hours' AS earlier FROM rows WHERE joined IS NOT NULL",
       "notes": "INTERVAL added to or subtracted from a datetime. Months are calendar arithmetic, so 31 January plus a month clamps to the end of February."
     },
     {
       "id": "function.string-core",
-      "feature": "E021-08",
       "status": "supported",
       "example": "SELECT UPPER(label) AS u, LOWER(label) AS l, LENGTH(label) AS n, SUBSTR(label, 2, 3) AS mid, TRIM(label) AS t FROM dims",
       "notes": "SUBSTRING is accepted as a spelling of SUBSTR; LENGTH and SUBSTR count characters, not UTF-16 units."
     },
     {
       "id": "function.abs",
-      "feature": "T441",
       "status": "supported",
       "example": "SELECT ABS(amount - 5) AS distance FROM rows"
     },
     {
       "id": "function.numeric-core",
-      "feature": "T441",
       "status": "supported",
       "example": "SELECT NULLIF(amount, 3) AS n, GREATEST(amount, 5) AS g, LEAST(amount, 5) AS l, FLOOR(amount) AS f, CEILING(amount) AS c, MOD(amount, 4) AS m, POWER(2, 3) AS p, SQRT(16) AS s FROM rows",
       "notes": "GREATEST/LEAST ignore NULL arguments, matching PostgreSQL."
     },
     {
       "id": "function.string-extended",
-      "feature": "E021-06",
       "status": "supported",
       "example": "SELECT REPLACE(region, 'we', 'be') AS r, LTRIM(' x') AS lt, RTRIM('x ') AS rt, INSTR(region, 'st') AS i FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "function.extract",
-      "feature": "F052",
       "status": "supported",
       "example": "SELECT EXTRACT(year FROM joined) AS y, EXTRACT(dow FROM joined) AS d FROM rows WHERE joined IS NOT NULL",
       "notes": "Fields: year, quarter, month, week (ISO), day, hour, minute, second, epoch, dow — all in UTC. SQLite spells this strftime."
     },
     {
       "id": "aggregate.distinct-argument",
-      "feature": "E091-07",
       "status": "supported",
       "example": "SELECT region, COUNT(DISTINCT amount) AS amounts, COUNT(DISTINCT active) AS states, SUM(amount) AS total FROM rows GROUP BY region",
       "notes": "COUNT/SUM/AVG/MIN/MAX accept DISTINCT. Each one keeps its own set of values, so several can appear in one select, beside ordinary aggregates, inside expressions, and in HAVING."
     },
     {
       "id": "join.multi-key",
-      "feature": "F041-01",
       "status": "supported",
       "example": "SELECT r.region FROM rows r JOIN dims d ON d.region = r.region AND d.amount = r.amount",
       "notes": "Multi-key conditions execute as a nested-loop join; single equalities keep the hash path."
     },
     {
       "id": "join.cross",
-      "feature": "F401-04",
       "status": "supported",
       "example": "SELECT r.region AS region, d.label AS label FROM rows r CROSS JOIN dims d"
     },
     {
       "id": "join.full",
-      "feature": "F401-02",
       "status": "supported",
       "example": "SELECT r.amount AS amount, d.label AS label FROM rows r FULL JOIN dims d ON d.region = r.region",
       "notes": "Desugars into a union of two left joins, so it must be the sole join, with an equality ON and no grouping or DISTINCT yet."
     },
     {
       "id": "order-by.ordinal",
-      "feature": "E121",
       "status": "supported",
       "example": "SELECT region, amount FROM rows ORDER BY 2 DESC",
       "notes": "Ordinals resolve to the select list at compile time; out-of-range ordinals are an error."
     },
     {
       "id": "window.lag-lead",
-      "feature": "T615",
       "status": "supported",
       "example": "SELECT amount, LAG(amount) OVER (ORDER BY amount) AS previous, LEAD(amount, 1, -1) OVER (ORDER BY amount) AS next FROM rows",
       "notes": "LAG/LEAD take a constant offset (default 1) and default value (default NULL), and require ORDER BY inside OVER."
     },
     {
       "id": "mutation.insert-select",
-      "feature": "E101-01",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) SELECT name || '2' AS name, score + 1 AS score FROM keyed",
       "notes": "The SELECT runs at one snapshot and materializes before the batch write."
     },
     {
       "id": "mutation.merge",
-      "feature": "F312",
       "status": "supported",
       "setup": ["INSERT INTO keyed (name, score, bonus) VALUES ('z', 5, NULL)"],
       "example": "MERGE INTO keyed k USING (SELECT 'z' AS name, 9 AS score) s ON k.name = s.name WHEN MATCHED THEN UPDATE SET score = s.score WHEN NOT MATCHED THEN INSERT (name, score) VALUES (s.name, s.score)",
-      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope — atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed. Two source rows matching one target row is a cardinality violation, as the standard says, rather than a last-one-wins race. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
+      "notes": "One pass over the source decides each row's branch, and the branches apply as batched writes inside a single write scope — atomic, and firing the same triggers the equivalent INSERT, UPDATE, and DELETE would. The match must equate the target's unique key with a source value, which is how rows are addressed. Matching PostgreSQL, two source rows cannot act on one target row. MATCHED BY SOURCE, MATCHED BY TARGET, and RETURNING are not supported."
     },
     {
       "id": "transaction.begin",
-      "feature": "E151-01",
       "status": "supported",
       "example": "BEGIN",
       "notes": "Holds the same scope `write()` opens between statements instead of around a callback: writes stage into it, reads see what it staged, and COMMIT publishes them together. Schema changes are refused inside one, because the catalog commits outside the scope and a rollback could not take them back. A transaction left untouched past the idle bound rolls itself back, so an abandoned BEGIN cannot hold storage forever."
     },
     {
       "id": "transaction.commit",
-      "feature": "E151-01",
       "status": "supported",
       "setup": ["BEGIN"],
       "example": "COMMIT"
     },
     {
       "id": "transaction.rollback",
-      "feature": "E151-02",
       "status": "supported",
       "setup": ["BEGIN"],
       "example": "ROLLBACK"
     },
     {
       "id": "transaction.isolation-level",
-      "feature": "E152-01",
       "status": "unsupported",
       "example": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
       "error": "Expected SELECT, found SET",
@@ -880,321 +756,294 @@
     },
     {
       "id": "function.char-length",
-      "feature": "E021-04",
       "status": "supported",
       "example": "SELECT CHAR_LENGTH(region) AS n FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "function.octet-length",
-      "feature": "E021-05",
       "status": "supported",
       "example": "SELECT OCTET_LENGTH(region) AS n FROM rows WHERE region IS NOT NULL",
       "notes": "Counts the UTF-8 encoding's bytes."
     },
     {
       "id": "function.substring-from-for",
-      "feature": "E021-06",
       "status": "supported",
       "example": "SELECT SUBSTRING(region FROM 1 FOR 2) AS part FROM rows WHERE region IS NOT NULL",
       "notes": "The position window is intersected with the string, so a start below 1 shortens the result instead of shifting it."
     },
     {
       "id": "function.trim-specification",
-      "feature": "E021-09",
       "status": "supported",
       "example": "SELECT TRIM(LEADING 'w' FROM region) AS trimmed FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "function.trim-multi-character",
-      "feature": "T056",
       "status": "supported",
       "example": "SELECT TRIM(BOTH 'we' FROM region) AS trimmed FROM rows WHERE region IS NOT NULL",
-      "notes": "The trim string is removed as a whole repeated unit, per the standard; PostgreSQL reads a multi-character argument as a set of characters instead."
+      "notes": "Minnow removes a multi-character trim string as a repeated unit; PostgreSQL reads the argument as a set of characters instead."
     },
     {
       "id": "function.position",
-      "feature": "E021-11",
       "status": "supported",
       "example": "SELECT POSITION('es' IN region) AS at FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "function.pad",
-      "feature": "T055",
       "status": "supported",
       "example": "SELECT LPAD(region, 6, '-') AS padded FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "function.overlay",
-      "feature": "T042",
       "status": "supported",
       "example": "SELECT OVERLAY(region PLACING 'X' FROM 1 FOR 1) AS masked FROM rows WHERE region IS NOT NULL"
     },
     {
       "id": "select.qualified-wildcard",
-      "feature": "E051-07",
       "status": "supported",
       "example": "SELECT rows.* FROM rows",
       "notes": "Output names follow the rule a bare * uses: the column's own name from one source, alias-qualified from several."
     },
     {
       "id": "from.column-alias-list",
-      "feature": "E051-09",
       "status": "supported",
       "example": "SELECT y.a AS a FROM rows AS y(a, b, c, d)"
     },
     {
       "id": "aggregate.all-quantifier",
-      "feature": "E091-06",
       "status": "supported",
       "example": "SELECT SUM(ALL amount) AS total FROM rows"
     },
     {
       "id": "derived-table.set-operation",
-      "feature": "E071-06",
       "status": "supported",
       "example": "SELECT s.amount AS amount FROM (SELECT amount FROM rows UNION SELECT amount FROM dims) s"
     },
     {
       "id": "comment.simple",
-      "feature": "E161",
       "status": "supported",
       "example": "SELECT amount FROM rows -- a comment"
     },
     {
       "id": "comment.bracketed",
-      "feature": "T351",
       "status": "supported",
       "example": "SELECT /* a comment */ amount FROM rows"
     },
     {
       "id": "join.comma",
-      "feature": "F041-07",
       "status": "supported",
       "example": "SELECT rows.amount AS amount FROM rows, dims WHERE dims.region = rows.region"
     },
     {
       "id": "join.using",
-      "feature": "F401-04",
       "status": "supported",
       "example": "SELECT rows.amount AS amount FROM rows JOIN dims USING (region)",
-      "notes": "The joined columns are not merged the way the standard describes: they stay one per side, so `SELECT *` returns both and an unqualified reference to a join column is ambiguous. Qualify it, or name the side you want."
+      "notes": "Unlike PostgreSQL, joined columns stay one per side: `SELECT *` returns both and an unqualified reference to a join column is ambiguous. Qualify it, or name the side you want."
     },
     {
       "id": "join.natural",
-      "feature": "F401-01",
       "status": "supported",
       "example": "SELECT rows.amount AS amount FROM rows NATURAL JOIN dims",
       "notes": "The shared columns are compared but not merged, so an unqualified reference to one is ambiguous — qualify it. NATURAL RIGHT JOIN is rejected, because the right-join mirror rewrites the sources the shared-column search reads."
     },
     {
       "id": "datetime.current-date",
-      "feature": "F051-06",
       "status": "supported",
       "example": "SELECT CURRENT_DATE > DATE '2000-01-01' AS elapsed",
       "notes": "Resolved once per execution, so every row of a statement sees one instant; results that read the clock never memoize."
     },
     {
       "id": "datetime.current-timestamp",
-      "feature": "F051-08",
       "status": "supported",
       "example": "SELECT CURRENT_TIMESTAMP > TIMESTAMP '2000-01-01 00:00:00' AS elapsed"
     },
     {
       "id": "datetime.localtime",
-      "feature": "F051-07",
       "status": "supported",
       "example": "SELECT LOCALTIME IS NOT NULL AS ticking",
       "notes": "The engine has no TIME type, so LOCALTIME reads as an 'HH:MM:SS' string, like SQLite's CURRENT_TIME."
     },
     {
       "id": "predicate.row-comparison",
-      "feature": "F641",
       "status": "supported",
       "example": "SELECT amount FROM rows WHERE (region, amount) = ('west', 10)"
     },
     {
       "id": "predicate.row-in",
-      "feature": "F641",
       "status": "supported",
       "example": "SELECT amount FROM rows WHERE (region, amount) IN (('west', 10), ('east', 3))"
     },
     {
       "id": "predicate.row-null",
-      "feature": "F641",
       "status": "supported",
       "example": "SELECT amount FROM rows WHERE (region, region) IS NOT NULL"
     },
     {
       "id": "literal.radix",
-      "feature": "T661",
       "status": "supported",
       "example": "SELECT 0x0A AS ten"
     },
     {
       "id": "literal.digit-separator",
-      "feature": "T662",
       "status": "supported",
       "example": "SELECT 1_000 AS thousand"
     },
     {
       "id": "limit.with-ties",
-      "feature": "F866",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE region IS NOT NULL ORDER BY region DESC FETCH FIRST 1 ROWS WITH TIES",
       "notes": "The limit cannot be pushed into a scan, so these plans run unlimited and the ordered result is trimmed."
     },
     {
       "id": "cte.in-subquery",
-      "feature": "T122",
       "status": "supported",
       "example": "SELECT s.amount AS amount FROM (WITH inner_cte AS (SELECT amount FROM rows) SELECT amount FROM inner_cte) s"
     },
     {
       "id": "window.nth-value",
-      "feature": "T618",
       "status": "supported",
       "example": "SELECT NTH_VALUE(amount, 2) OVER (ORDER BY amount) AS second FROM rows"
     },
     {
       "id": "window.named",
-      "feature": "T620",
       "status": "supported",
       "example": "SELECT SUM(amount) OVER w AS running FROM rows WINDOW w AS (ORDER BY amount)"
     },
     {
       "id": "window.frame-groups",
-      "feature": "T612",
       "status": "supported",
       "example": "SELECT COUNT(*) OVER (ORDER BY amount GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS peers FROM rows"
     },
     {
       "id": "window.frame-exclude",
-      "feature": "T612",
       "status": "supported",
       "example": "SELECT COUNT(*) OVER (ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS others FROM rows"
     },
     {
       "id": "aggregate.grouping",
-      "feature": "T433",
       "status": "supported",
       "example": "SELECT GROUPING(region) AS aggregated FROM rows GROUP BY ROLLUP(region)",
       "notes": "A bitmask over the arguments, most significant first."
     },
     {
       "id": "aggregate.any-value",
-      "feature": "T626",
       "status": "supported",
       "example": "SELECT ANY_VALUE(amount) AS sample FROM rows",
       "notes": "Which row of the group answers is implementation-dependent; this engine returns the minimum."
     },
     {
       "id": "aggregate.variance",
-      "feature": "T621",
       "status": "supported",
       "example": "SELECT VAR_POP(amount) AS spread FROM rows",
       "notes": "Built from COUNT and SUM rather than a dedicated accumulator: the variance is E(x2) - E(x)2. Bare VARIANCE and STDDEV are the sample forms, as in PostgreSQL."
     },
     {
       "id": "aggregate.stddev",
-      "feature": "T621",
       "status": "supported",
       "example": "SELECT STDDEV_POP(amount) AS spread FROM rows"
     },
     {
       "id": "aggregate.boolean",
-      "feature": "T631",
       "status": "supported",
       "example": "SELECT EVERY(amount > 1) AS all_positive FROM rows"
     },
     {
       "id": "json.value",
-      "feature": "T822",
       "status": "supported",
       "example": "SELECT JSON_VALUE('{\"a\": 1}', '$.a') AS a",
-      "notes": "JSON documents are text in ordinary string columns, as in SQLite; the path subset is $, member steps, and array subscripts."
+      "notes": "Accepts JSON text and stored JSON/JSONB values. Paths support $, member steps, and array subscripts."
     },
     {
       "id": "json.query",
-      "feature": "T823",
       "status": "supported",
       "example": "SELECT JSON_QUERY('{\"a\": [1, 2]}', '$.a') AS a"
     },
     {
       "id": "json.exists",
-      "feature": "T821",
       "status": "supported",
       "example": "SELECT JSON_EXISTS('{\"a\": 1}', '$.a') AS present"
     },
     {
       "id": "json.is-json",
-      "feature": "T825",
       "status": "supported",
       "example": "SELECT '{\"a\": 1}' IS JSON OBJECT AS shaped"
     },
     {
       "id": "json.object",
-      "feature": "T811",
       "status": "supported",
       "example": "SELECT JSON_OBJECT('a' VALUE 1, 'missing' VALUE NULL) AS document",
-      "notes": "The omitted clauses are NULL ON NULL and WITHOUT UNIQUE KEYS: a SQL NULL becomes a JSON null and duplicate keys remain in the JSON text. Scalar keys are converted to text; a NULL key is rejected. The explicit null-handling and unique-key clauses are not supported. Constructors return JSON text because Minnow has no JSON storage type."
+      "notes": "Defaults to NULL ON NULL and WITHOUT UNIQUE KEYS. NULL keys are rejected. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
     },
     {
       "id": "json.array",
-      "feature": "T812",
       "status": "supported",
       "example": "SELECT JSON_ARRAY(1, NULL, 2) AS document",
-      "notes": "The omitted null-handling clause is NULL ON NULL, so a SQL NULL becomes a JSON null. The explicit NULL/ABSENT ON NULL clause is not supported. Constructors return JSON text because Minnow has no JSON storage type."
+      "notes": "Defaults to NULL ON NULL. The explicit NULL/ABSENT clause is not supported. The constructor returns JSON text; cast or store it as JSON/JSONB for domain validation and JSONB canonicalization."
     },
     {
       "id": "ddl.create-table-if-not-exists",
-      "feature": "F031-01",
       "status": "supported",
       "example": "CREATE TABLE IF NOT EXISTS made (a INTEGER)"
     },
     {
       "id": "ddl.create-table-default",
-      "feature": "E141-07",
       "status": "supported",
       "example": "CREATE TABLE defaulted (id INTEGER PRIMARY KEY, tier TEXT DEFAULT 'basic')",
-      "notes": "A column with a DEFAULT is NOT NULL unless declared otherwise: the engine fills absent values from the default, so NULL and the default cannot both claim the slot."
+      "notes": "DEFAULT accepts a variable-free scalar expression. Omission or SQL DEFAULT invokes it; explicit NULL follows the column's independent nullability."
     },
     {
       "id": "ddl.create-table-key-clause",
-      "feature": "E141-08",
       "status": "supported",
       "example": "CREATE TABLE keyed_clause (a INTEGER, b TEXT, PRIMARY KEY (a))"
     },
     {
       "id": "ddl.alter-table-add-column",
-      "feature": "F031-04",
       "status": "supported",
       "example": "ALTER TABLE rows ADD COLUMN note TEXT",
       "notes": "Existing rows have no value for the new column, so it is always nullable."
     },
     {
       "id": "ddl.create-table-as-select",
-      "feature": "T172",
       "status": "supported",
       "example": "CREATE TABLE copied AS SELECT region FROM rows"
     },
     {
       "id": "type.exact-numeric",
-      "feature": "E011-03",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT CAST(1.25 AS DECIMAL(12, 2)) AS amount",
-      "error": "Exact NUMERIC and DECIMAL are not supported yet",
-      "notes": "Mapping a fixed-point declaration onto binary Float64 silently changes money and other exact values. Minnow rejects the declaration until the catalog, blocks, expressions, and aggregates can preserve its precision and scale end to end."
+      "notes": "Exact through storage, arithmetic, comparison, aggregates, and windows. Division retains 20 fractional digits."
+    },
+    {
+      "id": "type.json-jsonb",
+      "status": "supported",
+      "example": "SELECT CAST('{\"a\":1}' AS JSONB) AS document",
+      "notes": "JSON validates and preserves key order; JSONB canonicalizes object keys. Results use JSON text."
+    },
+    {
+      "id": "type.uuid",
+      "status": "supported",
+      "example": "SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID) AS id",
+      "notes": "Validated and normalized to canonical lowercase text."
+    },
+    {
+      "id": "type.interval",
+      "status": "supported",
+      "example": "SELECT CAST('1 day' AS INTERVAL) AS span",
+      "notes": "Preserves separate month, day, and microsecond fields. Interval arithmetic is not yet exposed."
+    },
+    {
+      "id": "ddl.enum",
+      "status": "supported",
+      "example": "CREATE TYPE mood AS ENUM ('sad', 'ok')",
+      "notes": "Enum columns validate members and compare in declaration order. ALTER TYPE is not supported."
     },
     {
       "id": "ddl.secondary-index",
-      "feature": "minnow",
       "status": "supported",
       "example": "CREATE INDEX keyed_score_idx ON keyed(score)",
-      "notes": "SQL does not standardize physical index DDL. Minnow supports durable scalar and composite indexes. Leftmost equality and IN prefixes plus the next range column prune candidates; every predicate is rechecked."
+      "notes": "PostgreSQL-compatible CREATE INDEX syntax over durable scalar and composite indexes. Leftmost equality and IN prefixes plus the next range column prune candidates; every predicate is rechecked."
     },
     {
       "id": "ddl.drop-secondary-index",
-      "feature": "minnow",
       "status": "supported",
       "setup": ["CREATE INDEX keyed_score_idx ON keyed(score)"],
       "example": "DROP INDEX keyed_score_idx",
@@ -1202,75 +1051,63 @@
     },
     {
       "id": "ddl.composite-secondary-index",
-      "feature": "minnow",
       "status": "supported",
       "example": "CREATE INDEX keyed_score_bonus_idx ON keyed(score, bonus)",
       "notes": "Composite keys use a prefix-free, type-preserving tuple encoding with ASC or DESC per component. Planning follows the SQL leftmost-prefix rule."
     },
     {
       "id": "ddl.unique-secondary-index",
-      "feature": "minnow",
       "status": "supported",
       "example": "CREATE UNIQUE INDEX keyed_bonus_idx ON keyed(bonus)",
-      "notes": "UNIQUE membership is enforced atomically across inserts, updates, deletes, upserts, triggers, write scopes, snapshots, and concurrent tabs. As in standard SQL, any NULL component does not conflict."
+      "notes": "UNIQUE membership is enforced atomically across inserts, updates, deletes, upserts, triggers, write scopes, snapshots, and concurrent tabs. Matching PostgreSQL, any NULL component does not conflict."
     },
     {
       "id": "ddl.multiple-unique-constraints",
-      "feature": "E141-08",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE TABLE multi_unique (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
-      "error": "CREATE TABLE supports one unique key column",
-      "notes": "CREATE TABLE still accepts one primary or unique row-addressing key. Add independently enforced candidate keys after creation with CREATE UNIQUE INDEX; ON CONFLICT continues to target the row-addressing key."
+      "notes": "Each table-level or column-level UNIQUE constraint is enforced independently."
     },
     {
       "id": "ddl.composite-primary-key",
-      "feature": "E141-08",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE TABLE composite_key (shop INTEGER, receipt INTEGER, PRIMARY KEY (shop, receipt))",
-      "error": "CREATE TABLE supports one unique key column",
-      "notes": "Composite identity needs a canonical tuple encoding across lookup, conflict detection, updates, deletes, foreign keys, and snapshot import rather than lossy string concatenation."
+      "notes": "Composite keys use a hidden scalar row locator; primary-key components are immutable."
     },
     {
       "id": "ddl.composite-foreign-key",
-      "feature": "E141-04",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE TABLE composite_child (shop INTEGER, receipt INTEGER, FOREIGN KEY (shop, receipt) REFERENCES composite_key(shop, receipt))",
-      "error": "FOREIGN KEY supports one column",
-      "notes": "Foreign-key probes currently target one parent unique-key column. Composite references depend on the same tuple-key representation and indexing as composite primary keys."
+      "setup": [
+        "CREATE TABLE composite_key (shop INTEGER, receipt INTEGER, PRIMARY KEY (shop, receipt))"
+      ]
     },
     {
       "id": "ddl.alter-table-drop-column",
-      "feature": "F031",
       "status": "supported",
       "example": "ALTER TABLE keyed DROP COLUMN bonus",
       "notes": "A metadata-only drop refuses unique keys, checks, foreign keys, triggers, views, and the last column. Stored column blocks remain until compaction rewrites their segments; persisted full-text data for the column is removed atomically with the catalog update. RESTRICT is the default and CASCADE is rejected."
     },
     {
       "id": "mutation.upsert-expression",
-      "feature": "minnow",
       "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 2) ON CONFLICT (name) DO UPDATE SET score = score + EXCLUDED.score",
       "notes": "Assignments may read the stored target row, the proposed EXCLUDED row, parameters, constants, CASE, and scalar functions. All conflicting updates and fresh inserts execute in one write scope; one statement cannot affect the same existing key twice. Aggregates, windows, subqueries, and conflict-key reassignment are rejected."
     },
     {
       "id": "mutation.upsert-update-where",
-      "feature": "minnow",
-      "status": "unsupported",
+      "status": "supported",
       "example": "INSERT INTO keyed (name, score) VALUES ('x', 2) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score WHERE EXCLUDED.score > keyed.score",
-      "error": "Expected eof, found WHERE",
-      "notes": "The optional PostgreSQL-compatible predicate that can turn a conflicting update into a no-op is not implemented yet. Use CASE in the assignment when retaining the existing value has the same effect."
+      "notes": "A false conflict predicate leaves the existing row unchanged."
     },
     {
       "id": "transaction.savepoint",
-      "feature": "E151",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SAVEPOINT line_item",
-      "error": "Expected SELECT, found SAVEPOINT",
-      "notes": "A write scope is atomic at its outer boundary but has no nested rollback marker. Savepoints need bounded staged-state checkpoints that can release or rewind blocks, mutations, and trigger effects without publishing them."
+      "setup": ["BEGIN"],
+      "notes": "SAVEPOINT, ROLLBACK TO, and RELEASE operate on staged transaction state."
     },
     {
       "id": "privileges.grant",
-      "feature": "E081",
       "status": "unsupported",
       "example": "GRANT SELECT ON rows TO reader",
       "error": "Expected SELECT, found GRANT",
@@ -1278,78 +1115,60 @@
     },
     {
       "id": "from.lateral",
-      "feature": "T491",
-      "status": "unsupported",
-      "example": "SELECT x.amount FROM rows, LATERAL (SELECT amount FROM dims WHERE dims.region = rows.region) x",
-      "error": "LATERAL sources are not supported",
-      "notes": "A lateral source re-executes per row of its left side, which the executors have no operator for."
+      "status": "supported",
+      "example": "SELECT x.amount FROM rows r, LATERAL (SELECT amount FROM dims WHERE dims.region = r.region) x",
+      "notes": "Equality-correlated derived sources become set-at-a-time joins. Correlated grouping, ordering, and LIMIT remain unsupported."
     },
     {
-      "id": "aggregate.listagg",
-      "feature": "T625",
-      "status": "unsupported",
-      "example": "SELECT LISTAGG(region, ',') AS regions FROM rows",
-      "error": "Unsupported function: LISTAGG",
-      "notes": "Needs an ordered string accumulator in the vectorized group state, which the fixed count/sum/value accumulators cannot hold."
+      "id": "aggregate.string-agg",
+      "status": "supported",
+      "example": "SELECT STRING_AGG(region, ',') AS regions FROM rows",
+      "notes": "DISTINCT, aggregate-local ORDER BY, and bounded spill execution are supported."
     },
     {
       "id": "json.table",
-      "feature": "T824",
-      "status": "unsupported",
-      "example": "SELECT j.a FROM rows, JSON_TABLE(rows.region, '$' COLUMNS (a INTEGER PATH '$.a')) AS j",
-      "error": "JSON_TABLE is not supported",
-      "notes": "A row-producing operator; the same gap as LATERAL."
+      "status": "supported",
+      "example": "SELECT j.a FROM JSON_TABLE('{\"a\":1}', '$' COLUMNS (a INTEGER PATH '$.a')) AS j",
+      "notes": "Constant documents support $ and $[*] row paths. Correlated documents are not yet supported."
     },
     {
       "id": "predicate.similar-to",
-      "feature": "T141",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT amount FROM rows WHERE region SIMILAR TO 'w%'",
-      "error": "Expected eof, found SIMILAR",
-      "notes": "LIKE and the regular-expression-free MATCH cover the same ground for the data sizes this engine targets."
+      "notes": "Whole-string SQL wildcard and regular-expression semantics."
     },
     {
       "id": "collation.explicit",
-      "feature": "F690",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows ORDER BY region COLLATE \"en\"",
-      "error": "Expected eof, found COLLATE",
-      "notes": "String comparison is one documented collation; a per-query collation would change index order too."
+      "status": "supported",
+      "example": "SELECT region FROM rows ORDER BY region COLLATE \"C\"",
+      "notes": "C, POSIX, and host Intl locale names are accepted. Collated ordering does not use a plain string index."
     },
     {
       "id": "aggregate.json",
-      "feature": "T826",
       "status": "supported",
       "example": "SELECT JSON_ARRAYAGG(region) AS regions FROM rows",
-      "notes": "Accepts one value expression, including DISTINCT. The omitted null-handling clause is NULL ON NULL, an empty input returns NULL, and the result is JSON text. FILTER, window use, an aggregate-local ORDER BY, and explicit NULL/ABSENT ON NULL clauses are not supported. Without an aggregate-local ORDER BY, member order is unspecified."
+      "notes": "Supports DISTINCT, includes SQL NULL as JSON null, and returns NULL for empty input. FILTER, window use, aggregate-local ORDER BY, and explicit NULL/ABSENT clauses are not supported; input order is otherwise unspecified."
     },
     {
       "id": "type.array",
-      "feature": "S091",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT ARRAY[1, 2] AS pair",
-      "error": "Unsupported SQL character: [",
-      "notes": "Array and multiset types would need an encoding and a comparison order the columnar format would carry forever; a JSON document in a text column covers the same shape."
+      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. Subscripts and array operators are not yet supported."
     },
     {
       "id": "type.time",
-      "feature": "F051-02",
-      "status": "unsupported",
+      "status": "supported",
       "example": "SELECT TIME '12:00:00' AS at",
-      "error": "Expected eof",
-      "notes": "The engine has four logical types and stores every datetime as an instant in UTC; a bare time of day has no instant. LOCALTIME reads as an 'HH:MM:SS' string instead."
+      "notes": "A time of day without a time zone, returned as canonical text."
     },
     {
       "id": "ddl.sequence",
-      "feature": "T176",
-      "status": "unsupported",
+      "status": "supported",
       "example": "CREATE SEQUENCE order_ids",
-      "error": "Expected TABLE, found SEQUENCE",
-      "notes": "A sequence is a second kind of catalog object with its own durability and contention story; the key column's autoincrement default covers the common use."
+      "notes": "NEXTVAL and session-local CURRVAL are supported. Sequence options and ALTER SEQUENCE are not."
     },
     {
       "id": "ddl.drop-table",
-      "feature": "F031-13",
       "status": "supported",
       "setup": ["CREATE TABLE doomed (a INTEGER)"],
       "example": "DROP TABLE doomed",
@@ -1357,32 +1176,28 @@
     },
     {
       "id": "ddl.create-view",
-      "feature": "F031-02",
       "status": "supported",
       "example": "CREATE VIEW west AS SELECT region, amount FROM rows WHERE region = 'west'",
       "notes": "The catalog stores the query text and the schema inferred from it, so a view answers the same questions a table does and reads expand it into the query it stands for — anywhere a read runs, including inside a write scope. A view is never a write target. CREATE OR REPLACE redefines one; a view stacked on it follows the new definition, and a cycle two redefinitions close is caught on the next read rather than recursed."
     },
     {
       "id": "ddl.drop-view",
-      "feature": "F031-16",
       "status": "supported",
       "setup": ["CREATE VIEW doomed_view AS SELECT amount FROM rows"],
       "example": "DROP VIEW doomed_view"
     },
     {
       "id": "ddl.check-constraint",
-      "feature": "E141-06",
       "status": "supported",
       "example": "CREATE TABLE checked (a INTEGER NOT NULL CHECK (a > 0), CONSTRAINT small CHECK (a < 100))",
       "notes": "A row condition over the table's own columns, evaluated by the writer on every path that writes a row — insert, upsert, and update, which is checked against its post-image. A constraint fails only when it evaluates to false, so SQL's unknown passes: NULL satisfies CHECK (a > 0) unless the column is also NOT NULL."
     },
     {
       "id": "ddl.foreign-key",
-      "feature": "E141-04",
       "status": "supported",
       "setup": ["CREATE TABLE parents (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"],
       "example": "CREATE TABLE children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
-      "notes": "Single-column references to the parent's unique key, which is the column the engine can probe for existence and the one its keyed writes address rows by. Every write of a referencing column checks the parent exists, reading through the writing transaction so a child inserted beside its parent in one scope sees it; a NULL reference names no parent and is satisfied. ON DELETE takes RESTRICT (the default), CASCADE, and SET NULL, applied inside the deleting transaction. ON UPDATE has nothing to act on, because a unique key cannot change."
+      "notes": "Scalar and composite references target the parent's matching primary-key columns. Writes validate against their transaction; NULL references are satisfied. ON DELETE supports RESTRICT, CASCADE, and SET NULL atomically. Primary keys are immutable, so ON UPDATE has no action."
     }
   ]
 }

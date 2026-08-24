@@ -94,13 +94,25 @@ export function columnList(entity: TableShape): string {
 
 export function secondaryIndexSql(entities: readonly EntityDefinition[]): string[] {
   return entities.flatMap((entity) =>
-    entity.columns
-      .filter((column) => column.name.endsWith("_id") && column.name !== entity.primaryKey)
-      .map(
-        (column) =>
-          `CREATE INDEX ${quoteIdentifier(`idx_${entity.name}_${column.name}`)} ON ${quoteIdentifier(entity.name)} (${quoteIdentifier(column.name)})`,
-      ),
+    (entity.secondaryIndexes ?? []).map(
+      (column) =>
+        `CREATE INDEX ${quoteIdentifier(`idx_${entity.name}_${column}`)} ON ${quoteIdentifier(entity.name)} (${quoteIdentifier(column)})`,
+    ),
   );
+}
+
+/**
+ * Builds the workload's secondary indexes through an engine's own DDL path and reports that
+ * cost separately from row insertion. Keeping the loop here means every driver consumes the
+ * exact same index list; a driver cannot quietly drift by copying only part of the workload DDL.
+ */
+export async function createSecondaryIndexes(
+  entities: readonly EntityDefinition[],
+  execute: (sql: string) => unknown,
+): Promise<number> {
+  const started = performance.now();
+  for (const sql of secondaryIndexSql(entities)) await execute(sql);
+  return performance.now() - started;
 }
 
 export function quoteIdentifier(value: string): string {

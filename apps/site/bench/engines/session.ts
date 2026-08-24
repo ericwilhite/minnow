@@ -18,14 +18,6 @@ export interface PreparedStatement {
    */
   executeCached?(): Promise<Array<Record<string, unknown>>>;
   /**
-   * minnow only: the same statement issued through `MinnowDatabaseClient` over a message
-   * channel, with the memo off like `execute()`. It adds what an application on the main thread
-   * pays on top of execution — the RPC frame, the result crossing the channel in its columnar
-   * wire form, and the rows rebuilt on the receiving side — and is reported beside `execute()`
-   * so a regression in that layer shows as the gap between the two.
-   */
-  executeClient?(): Promise<Array<Record<string, unknown>>>;
-  /**
    * Peak modeled execution memory, in bytes, for the most recent `execute()`. Reported by
    * engines that can measure their own execution; the browser's cross-engine memory API
    * (performance.measureUserAgentSpecificMemory) is unavailable in this harness, so this is

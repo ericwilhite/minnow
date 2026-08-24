@@ -25,4 +25,5 @@ export { QueryMemoryBudgetError, type QueryMemoryUsage } from "./memory.js";
 export { optimizePlan, renderPlan } from "./optimizer.js";
 export * from "./schema.js";
 export * from "./live.js";
+export * from "./sql-driver.js";
 export type { AsyncQueryExecutionOptions, QuerySpillStore } from "./vector.js";

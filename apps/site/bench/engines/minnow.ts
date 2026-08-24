@@ -3,7 +3,7 @@ import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { IndexedDbBlockStore, type BlockStore } from "@minnowdb/core/storage";
 import { generateEntityBatch, getScenario } from "../benchmark";
 import type { DatasetRecord, EngineId, EngineMaterialization } from "../protocol";
-import { canonicalizeRow, normalizeRows } from "./shared";
+import { canonicalizeRow, createSecondaryIndexes, normalizeRows } from "./shared";
 import type {
   EngineDriver,
   EngineSession,
@@ -84,6 +84,9 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
       const store = await backend.openStore(record);
       const database = new MinnowDatabase(store, databaseOptions(record));
       let insertMs = 0;
+      let indexMs: number;
+      let dataStoredBytes: number;
+      let indexStoredBytes: number;
       try {
         const entities = getScenario("commerce").entities;
         for (const entity of entities) {
@@ -107,6 +110,12 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             context.report(`MinnowDatabase · ${entity.name}`, completedRows);
           }
         }
+        dataStoredBytes = await store.getLogicalStorageBytes();
+        indexMs =
+          record.secondaryIndexes === "foreign-keys"
+            ? await createSecondaryIndexes(entities, (sql) => database.execute(sql))
+            : 0;
+        indexStoredBytes = Math.max(0, (await store.getLogicalStorageBytes()) - dataStoredBytes);
         const orderRows =
           entities.find((entity) => entity.name === "orders")?.rows(record.scale) ?? 0;
         const counted = await database.query("SELECT COUNT(*) AS row_count FROM orders");
@@ -115,15 +124,19 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             `MinnowDatabase verification failed: expected ${String(orderRows)} orders, found ${String(counted.rows[0]?.row_count)}`,
           );
         }
+        const storedBytes = await store.getLogicalStorageBytes();
         return {
           engine: backend.id,
           status: "ready",
           storageName: name,
           version: "workspace",
           persistence: backend.persistence,
-          storedBytes: await store.getLogicalStorageBytes(),
+          dataStoredBytes,
+          indexStoredBytes,
+          storedBytes,
           buildMs: performance.now() - started,
           insertMs,
+          indexMs,
         };
       } finally {
         store.close();
@@ -133,7 +146,6 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
     async openSession(record: DatasetRecord): Promise<EngineSession> {
       const store = await backend.openStore(record);
       const database = new MinnowDatabase(store, databaseOptions(record));
-      const connection = connectClient(database);
       return {
         engine: backend.id,
         async prepare(sql) {
@@ -144,7 +156,6 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             peakMemoryBytes?: number;
             execute: () => Promise<Array<Record<string, unknown>>>;
             executeCached: () => Promise<Array<Record<string, unknown>>>;
-            executeClient: () => Promise<Array<Record<string, unknown>>>;
             close: () => void;
           } = {
             plan,
@@ -166,18 +177,12 @@ export function createMinnowDriver(backend: MinnowStorageBackend): EngineDriver 
             // rather than instead of it.
             executeCached: async () =>
               normalizeRows((await database.query(sql)).rows).map(canonicalizeRow),
-            // The same execution through the client: memo off, so the difference from
-            // `execute` is the channel and the rows rebuilt on the receiving side.
-            executeClient: async () =>
-              normalizeRows((await connection.client.query(sql, { memoize: false })).rows).map(
-                canonicalizeRow,
-              ),
             close: () => undefined,
           };
           return statement;
         },
         async close() {
-          await connection.close();
+          await database.close();
           store.close();
         },
       };

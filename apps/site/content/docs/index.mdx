@@ -1,11 +1,11 @@
 ---
-title: Overview
-description: A columnar SQL engine that runs entirely in the browser.
+title: A browser native SQL database
+description: Run PostgreSQL-style SQL over durable browser-local data.
 ---
 
-Minnow is a SQL database that runs in the browser. You give it SQL; it parses, plans, optimizes,
-and executes that SQL against columnar data stored in IndexedDB or OPFS. There is no server, no
-WebAssembly module to download and compile, and no build step.
+Minnow is a columnar SQL database for the browser. It stores data in IndexedDB or OPFS and runs
+queries on the device, so an application can filter, join, aggregate, and update local data
+without a server round trip.
 
 ```ts
 import { MinnowDatabase } from "@minnowdb/core";
@@ -16,12 +16,12 @@ const db = new MinnowDatabase(await IndexedDbBlockStore.open({ name: "shop" }));
 await db.execute(`CREATE TABLE orders (
   order_id INTEGER PRIMARY KEY,
   customer_id INTEGER NOT NULL,
-  total DOUBLE PRECISION NOT NULL,
+  total NUMERIC(12, 2) NOT NULL,
   placed_at TIMESTAMP NOT NULL
 )`);
 
 const { rows } = await db.query(`
-  SELECT DATE_TRUNC('month', placed_at) AS month, ROUND(SUM(total), 2) AS revenue
+  SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total) AS revenue
   FROM orders
   GROUP BY DATE_TRUNC('month', placed_at)
   ORDER BY month DESC
@@ -29,52 +29,55 @@ const { rows } = await db.query(`
 ```
 
 <Callout type="warn" title="Experimental">
-  The early block format carries no compatibility promise, and the SQL surface is a
-  correctness-first subset of SQL:2023 rather than the whole standard. Everything the engine does
-  and deliberately refuses to do is listed, keyed to the standard's own feature identifiers, in the
-  [feature matrix](/docs/sql/feature-matrix).
+  Minnow is in 0.x. Minor releases can include breaking changes, and the stored block format may
+  change. Pin exact package versions in applications. The [versioning
+  guide](/docs/reference/versioning) explains the policy.
 </Callout>
 
-## What is here
+## Why use Minnow
 
-The engine is the product. Parser, planner, optimizer, and a batch-based query runner are implemented
-in this repository — there is no SQLite or DuckDB underneath, and no WebAssembly anywhere.
+- **PostgreSQL-style SQL.** Use familiar parameters, joins, CTEs, window functions, grouping sets,
+  upserts, `RETURNING`, triggers, exact decimals, JSON/JSONB, arrays, enums, sequences, and
+  savepoints. The [feature matrix](/docs/sql/feature-matrix) names the exact supported forms and
+  every deliberate difference.
+- **Fast scans over local application data.** Minnow stores compressed columns, reads only the
+  columns a query uses, and skips blocks that cannot match. Secondary indexes speed up selective
+  filters and ordered reads.
+- **Durable and safe across tabs.** Writes publish atomically to IndexedDB or OPFS. Each query sees
+  one stable version, even while another tab commits.
+- **No server or Wasm setup.** Minnow is plain JavaScript. There is no database process, Wasm
+  module, compile delay, `SharedArrayBuffer`, or special response header to configure.
+- **Works off the UI thread.** The worker client exposes the same query, write, migration,
+  snapshot, and maintenance calls as the direct engine.
+- **Handles larger working sets.** Queries run in batches. Sorts and grouped results can spill to
+  storage when they exceed the configured execution budget.
 
-- **[SQL](/docs/sql)** — how to run statements, and what the language surface is: joins, CTEs,
-  window functions, set operations, grouping sets, upserts with `RETURNING`, full-text search.
-- **[SQL conformance & testing](/docs/conformance)** — the executable feature contract, upstream
-  SQLLogicTest profiles, deterministic simulation, fault sweeps, and release gates.
-- **[Schema](/docs/schema)** — declaring tables, constraints, and views in TypeScript, and what a
-  migration will and will not do to a database that already holds rows.
-- **[Typed client](/docs/client)** — the optional query builder: inferred row types, typed writes,
-  and live queries.
-- **[Engine](/docs/engine)** — the `MinnowDatabase` API, transactions and snapshots, running the
-  engine in a worker, and the memory budget.
-- **[Storage](/docs/storage)** — the shared storage interface and the three included adapters,
-  plus snapshots and background maintenance.
-- **[Comparison](/docs/comparison)** — Minnow against IndexedDB, Dexie, SQLite Wasm, PGlite, and
-  DuckDB-Wasm, including where each of them is the better answer.
+## Choose how you query
 
-## What it is for
+Both interfaces use the same SQL engine and can share one database.
 
-Minnow suits an application that already has data on the device and wants to ask real questions
-of it: an offline-first tool, a local analytics view, a large table a user needs to slice without
-a round trip. It is a database, not a cache — writes are durable, commits are atomic across tabs,
-and a reader never sees half of a write.
+| Interface                                   | Use it when                                               |
+| ------------------------------------------- | --------------------------------------------------------- |
+| [`MinnowDatabase`](/docs/sql)               | You want direct SQL and the smallest dependency set.      |
+| [`@minnowdb/kysely`](/docs/adapters/kysely) | You want Kysely's type-safe PostgreSQL query-builder API. |
 
-It is not a replacement for a server database. Everything runs on one machine, against one
-browser's storage quota, with one writer's worth of throughput.
+## Where Minnow fits
 
-## What you can count on
+Minnow works well for offline tools, local dashboards, data explorers, and applications that keep
+their own relational data on the device. It supports both day-to-day keyed reads and writes and
+analytical queries over the data that accumulates.
 
-Four ideas guide the design. [Architecture](/docs/reference/architecture) explains why.
+Minnow is not a server database or a sync service. It works on one device, inside one browser's
+storage quota. If you need replication, multi-user access, exact SQLite file compatibility, or
+the full PostgreSQL server, see the [comparison guide](/docs/comparison).
 
-- **The durable store is the source of truth.** Correctness never depends on `BroadcastChannel`,
-  Web Locks, or page-close handlers. Durability ends at a committed storage write — an IndexedDB
-  transaction, or a checksummed OPFS log entry.
-- **Published data is immutable.** Writes append and publish atomically; another tab sees the old
-  version or the new one, never a partial write.
-- **Reads are snapshot reads.** A query executes against one version. Reads never block writes and
-  writes never block reads.
-- **The engine is our own.** No embedded database underneath, and no Wasm to fetch before the
-  first query answers.
+## Start here
+
+- **[Installation](/docs/installation)** — install the engine and choose a storage adapter.
+- **[Your first query](/docs/first-query)** — create tables, write rows, and run a grouped query.
+- **[SQL](/docs/sql)** — statement APIs, supported reads and writes, full-text search, and plans.
+- **[Schema and migrations](/docs/schema)** — define tables in TypeScript and evolve them without
+  rewriting stored data.
+- **[Client adapters](/docs/adapters)** — connect Kysely to Minnow's SQL engine.
+- **[Workers and engine options](/docs/engine)** — keep work off the main thread and tune memory.
+- **[Storage](/docs/storage)** — IndexedDB, OPFS, memory, snapshots, and custom adapters.

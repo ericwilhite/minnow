@@ -2,8 +2,8 @@
  * The workspace's versions.
  *
  * Every published package shares a major version, and moves independently inside it. A major is
- * the compatibility line: `@minnowdb/client@2.x` works with `@minnowdb/core@2.x`, whichever
- * minors the two happen to be on, because the client is built on the engine's published
+ * the compatibility line: `@minnowdb/kysely@2.x` works with `@minnowdb/core@2.x`, whichever
+ * minors the two happen to be on, because the adapter is built on the engine's published
  * primitives and a change that breaks that contract is by definition a major one. Below that
  * line each package releases at its own pace, so a fix to the devtools console does not have to
  * drag the engine's version along with it.
@@ -14,7 +14,7 @@
  *
  *   npm run version:check                      verify the workspace agrees with itself
  *   npm run version:set -- minor @minnowdb/core  move one package inside the shared major
- *   npm run version:set -- 0.3.1 @minnowdb/client
+ *   npm run version:set -- 0.1.1 @minnowdb/kysely
  *   npm run version:set -- major               move every package to the next major, together
  *
  * The private packages — the repository root and the docs site — mirror `@minnowdb/core`, which

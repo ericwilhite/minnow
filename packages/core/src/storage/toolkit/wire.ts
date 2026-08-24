@@ -86,6 +86,7 @@ function decodeEnvelope(magic: string, bytes: Uint8Array): Uint8Array | undefine
 }
 
 const CHUNK_MAGIC = "MNWCHNK1";
+const POSTING_CHUNK_MAGIC = "MNWPOST1";
 const SYNC_CHECKPOINT_MAGIC = "MNWCKPS1";
 
 /** Immutable artifact payloads (full-text base chunks) inside extents. */
@@ -96,6 +97,147 @@ export function encodeChunk(value: unknown): Uint8Array {
 export function decodeChunk(bytes: Uint8Array): unknown {
   const payload = decodeEnvelope(CHUNK_MAGIC, bytes);
   return payload === undefined ? undefined : decodeRecordJson(payload);
+}
+
+/** The structural part of FtsPosting kept here to avoid coupling the low-level codec to storage. */
+export interface PostingChunkEntry {
+  term: string;
+  rowIds: bigint[];
+  tf: number[];
+}
+
+/**
+ * Compact postings payload for OPFS. The old generic JSON encoding spelled every bigint row
+ * locator as `{\"$n\":\"123\"}`; secondary indexes therefore took more space than the compressed
+ * table they accelerated. Terms are UTF-8 and the already-sorted row locators are delta-varints.
+ * The envelope keeps the same version and checksum guarantees as every other immutable chunk.
+ */
+export function encodePostingChunk(entries: readonly PostingChunkEntry[]): Uint8Array {
+  const writer = new BinaryWriter();
+  writer.varuint(BigInt(entries.length));
+  for (const entry of entries) {
+    if (entry.rowIds.length !== entry.tf.length) {
+      throw new TypeError("Posting row IDs and term frequencies must have the same length");
+    }
+    const term = textEncoder.encode(entry.term);
+    writer.varuint(BigInt(term.byteLength));
+    writer.bytes(term);
+    writer.varuint(BigInt(entry.rowIds.length));
+    let previous = 0n;
+    for (const rowId of entry.rowIds) {
+      if (rowId < previous) throw new TypeError("Posting row IDs must be sorted");
+      writer.varuint(rowId - previous);
+      previous = rowId;
+    }
+    for (const frequency of entry.tf) {
+      if (!Number.isSafeInteger(frequency) || frequency < 0) {
+        throw new TypeError("Posting term frequencies must be non-negative whole numbers");
+      }
+      writer.varuint(BigInt(frequency));
+    }
+  }
+  return encodeEnvelope(POSTING_CHUNK_MAGIC, writer.finish());
+}
+
+/** `undefined` means this is an older generic chunk; callers then use the JSON decoder. */
+export function decodePostingChunk(bytes: Uint8Array): PostingChunkEntry[] | undefined {
+  const payload = decodeEnvelope(POSTING_CHUNK_MAGIC, bytes);
+  if (payload === undefined) return undefined;
+  const reader = new BinaryReader(payload);
+  const count = reader.safeInteger("posting count");
+  const entries = new Array<PostingChunkEntry>(count);
+  for (let entryIndex = 0; entryIndex < count; entryIndex += 1) {
+    const termLength = reader.safeInteger("posting term length");
+    const term = textDecoder.decode(reader.bytes(termLength));
+    const rowCount = reader.safeInteger("posting row count");
+    const rowIds = new Array<bigint>(rowCount);
+    let previous = 0n;
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      previous += reader.varuint();
+      rowIds[rowIndex] = previous;
+    }
+    const tf = new Array<number>(rowCount);
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      tf[rowIndex] = reader.safeInteger("posting term frequency");
+    }
+    entries[entryIndex] = { term, rowIds, tf };
+  }
+  if (!reader.done) throw new Error("Posting chunk has trailing bytes");
+  return entries;
+}
+
+class BinaryWriter {
+  #buffer = new Uint8Array(1_024);
+  #length = 0;
+
+  bytes(bytes: Uint8Array): void {
+    this.#reserve(bytes.byteLength);
+    this.#buffer.set(bytes, this.#length);
+    this.#length += bytes.byteLength;
+  }
+
+  varuint(value: bigint): void {
+    if (value < 0n) throw new RangeError("A varuint cannot be negative");
+    do {
+      this.#reserve(1);
+      const byte = Number(value & 0x7fn);
+      value >>= 7n;
+      this.#buffer[this.#length] = value === 0n ? byte : byte | 0x80;
+      this.#length += 1;
+    } while (value !== 0n);
+  }
+
+  finish(): Uint8Array {
+    return this.#buffer.slice(0, this.#length);
+  }
+
+  #reserve(extra: number): void {
+    const needed = this.#length + extra;
+    if (needed <= this.#buffer.byteLength) return;
+    let capacity = this.#buffer.byteLength;
+    while (capacity < needed) capacity *= 2;
+    const grown = new Uint8Array(capacity);
+    grown.set(this.#buffer);
+    this.#buffer = grown;
+  }
+}
+
+class BinaryReader {
+  #offset = 0;
+
+  constructor(private readonly source: Uint8Array) {}
+
+  get done(): boolean {
+    return this.#offset === this.source.byteLength;
+  }
+
+  bytes(length: number): Uint8Array {
+    if (this.#offset + length > this.source.byteLength)
+      throw new Error("Posting chunk is truncated");
+    const bytes = this.source.subarray(this.#offset, this.#offset + length);
+    this.#offset += length;
+    return bytes;
+  }
+
+  varuint(): bigint {
+    let value = 0n;
+    let shift = 0n;
+    for (let byteIndex = 0; byteIndex < 10; byteIndex += 1) {
+      const byte = this.source[this.#offset];
+      if (byte === undefined) throw new Error("Posting chunk is truncated");
+      this.#offset += 1;
+      value |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return value;
+      shift += 7n;
+    }
+    throw new Error("Posting chunk varuint is too wide");
+  }
+
+  safeInteger(label: string): number {
+    const value = this.varuint();
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError(`${label} is too large`);
+    return Number(value);
+  }
 }
 
 /**

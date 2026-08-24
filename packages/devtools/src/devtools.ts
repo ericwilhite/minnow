@@ -88,6 +88,7 @@ export function createDevtools(
     write: resolved.write,
     initialQuery: resolved.initialQuery,
     storageKey: resolved.storageKey,
+    onCatalogChange: () => loadCatalog(),
   });
 
   /**
@@ -105,6 +106,10 @@ export function createDevtools(
     },
     onPickColumn: (table, column) => {
       if (panel.activeView() === "query") view.insert(`${table.name}.${column.name}`);
+      else void explorer.open(table.name);
+    },
+    onPickIndex: (table, index) => {
+      if (panel.activeView() === "query") view.insert(index.name);
       else void explorer.open(table.name);
     },
   });
@@ -153,7 +158,11 @@ export function createDevtools(
   /** Read once for the whole panel: the rail, the explorer, and completion share one catalog. */
   async function loadCatalog(): Promise<void> {
     try {
-      const catalog = toCatalog(await target.listTables());
+      const [tables, introspection] = await Promise.all([
+        target.listTables(),
+        target.introspect?.(),
+      ]);
+      const catalog = toCatalog(tables, introspection);
       rail.setCatalog(catalog);
       view.setSchema(
         Object.fromEntries(

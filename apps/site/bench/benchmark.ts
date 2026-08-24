@@ -24,6 +24,8 @@ export interface EntityDefinition {
   rows(scale: number): number;
   columns: ColumnDefinition[];
   primaryKey?: string;
+  /** Secondary-index columns the comparison workload gives to every engine. */
+  secondaryIndexes?: readonly string[];
   relationship?: string;
 }
 
@@ -533,7 +535,16 @@ function relationalCommerceEntities(): EntityDefinition[] {
     primaryKey: string,
     relationship: string,
     columns: ColumnDefinition[],
-  ): EntityDefinition => ({ name, rows: row(name), primaryKey, relationship, columns });
+  ): EntityDefinition => ({
+    name,
+    rows: row(name),
+    primaryKey,
+    secondaryIndexes: columns
+      .filter((column) => column.name.endsWith("_id") && column.name !== primaryKey)
+      .map((column) => column.name),
+    relationship,
+    columns,
+  });
   return [
     entity("countries", "country_id", "countries 1 → many regions", [
       numberColumn("country_id", (index) => index + 1),

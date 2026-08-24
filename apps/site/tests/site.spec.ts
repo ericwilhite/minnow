@@ -28,6 +28,7 @@ const benchmarkTest = test.extend<{ page: Page }>({
 
 test("the home page builds a database in the browser and answers a query", async ({ page }) => {
   await page.goto("/");
+  await expect(page.locator("h1")).toHaveText("A browser native SQL database");
   // The devtools mark their own host element, whatever the page wraps it in.
   const panel = page.locator("[data-minnow-devtools]");
 
@@ -44,6 +45,11 @@ test("the home page builds a database in the browser and answers a query", async
   await expect(panel.locator(".statusbar").first()).toContainText(/\d+ rows/, {
     timeout: 60_000,
   });
+});
+
+test("the docs overview uses the product headline", async ({ page }) => {
+  await page.goto("/docs/");
+  await expect(page.locator("h1")).toHaveText("A browser native SQL database");
 });
 
 test("the console reopens an existing database instead of rebuilding it", async ({ page }) => {
@@ -243,19 +249,26 @@ test("the SQL docs render and the feature matrix comes from the checked-in fixtu
   await expect(page.locator("h1")).toHaveText("Running SQL");
 
   await page.goto("/docs/sql/feature-matrix/");
-  await expect(page.locator("h1")).toHaveText("Feature matrix");
+  await expect(page.locator("h1")).toHaveText("PostgreSQL compatibility");
   // Counts are rendered from sql-feature-matrix.json, so they move when the engine's surface does.
-  await expect(page.getByText(/\d+ forms, each executed through both executors/)).toBeVisible();
-  await expect(page.getByText(/\d+ forms, each checked on every test run/)).toBeVisible();
+  await expect(page.getByText(/\d+ checked forms · \d+ PostgreSQL compatible/)).toBeVisible();
+  await expect(page.getByText(/\d+ deliberate embedded-database exclusions/)).toBeVisible();
+  await expect(page.getByText("PostgreSQL compatible", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Unsupported", { exact: true }).first()).toBeVisible();
   await expect(page.locator("body")).toContainText("UPDATE requires a table with a unique key");
 });
 
 test("the docs navigation covers every section", async ({ page }) => {
   await page.goto("/docs/");
   const sidebar = page.locator("#nd-sidebar");
-  for (const section of ["SQL", "Schema", "Typed client", "Engine", "Storage", "Reference"]) {
+  for (const section of ["SQL", "Schema", "Client adapters", "Engine", "Storage", "Reference"]) {
     await expect(sidebar.getByText(section, { exact: true }).first()).toBeVisible();
   }
+  await expect(sidebar.getByText("TypeScript clients", { exact: true })).toHaveCount(0);
+
+  await page.goto("/docs/adapters/");
+  await expect(page.locator("h1")).toHaveText("Client adapters");
+  await expect(page.getByText("Kysely is the primary client adapter today.")).toBeVisible();
 });
 
 benchmarkTest(
@@ -293,6 +306,11 @@ benchmarkTest(
     await page.getByRole("checkbox", { name: /Minnow \(OPFS, cached\)/ }).check();
     await page.getByRole("checkbox", { name: /Writes/ }).uncheck();
     await page.getByRole("button", { name: "0.1×" }).click();
+    await expect(page.getByRole("button", { name: "Primary keys only" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "+ 81 FK indexes" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     await page.getByRole("button", { name: "Run", exact: true }).click();
 
     const failure = page.locator(".text-red-500");
@@ -338,6 +356,8 @@ benchmarkTest(
     // column's own sentence, which proves that copy really materialized through its own store.
     await expect(page.getByRole("heading", { name: "Storage" })).toBeVisible();
     await expect(page.getByText("as each engine stored them just now")).toBeVisible();
+    await expect(page.getByRole("columnheader", { name: "Table data" })).toBeVisible();
+    await expect(page.getByRole("columnheader", { name: "Secondary indexes" })).toBeVisible();
     await expect(page.getByText("OPFS · immutable compressed column blocks")).toBeVisible();
   },
 );
@@ -360,6 +380,8 @@ test("every docs page is published as markdown, with indexes above it", async ({
   expect(index.ok()).toBe(true);
   const listed = await index.text();
   expect(listed).toContain("](/docs/sql/select.md)");
+  expect(listed).toContain("](/docs/adapters/kysely.md)");
+  expect(listed).not.toContain("](/docs/client/");
   expect(listed).not.toContain("](https://minnowdb.com");
 
   // And the markdown it points at is the page's own prose, with its components expanded: the
@@ -367,16 +389,29 @@ test("every docs page is published as markdown, with indexes above it", async ({
   const markdown = await request.get("/docs/sql/feature-matrix.md");
   expect(markdown.ok()).toBe(true);
   const text = await markdown.text();
-  expect(text).toContain("# Feature matrix");
-  expect(text).toContain("| `select.projection` | E051 |");
+  expect(text).toContain("# PostgreSQL compatibility");
+  expect(text).toContain(
+    "| `select.projection` | compatible | `SELECT region, amount FROM rows` |",
+  );
+  expect(text).toContain("| `mutation.upsert-update-where` | compatible | `INSERT INTO keyed");
+  expect(text).toContain(
+    "| `mutation.update-keyless` | unsupported | `UPDATE rows SET amount = 1` |",
+  );
   expect(text).not.toMatch(/<[A-Z]/);
+
+  const postgresProfile = await request.get("/postgres-feature-profile.json");
+  expect(postgresProfile.ok()).toBe(true);
+  expect(await postgresProfile.json()).toMatchObject({
+    name: "PostgreSQL-style SQL",
+    defaults: { supported: "compatible" },
+  });
 
   // The rules file an agent is told to fetch is generated from the page that documents it, so
   // the two cannot drift apart.
   const rules = await request.get("/agent-rules.md");
   expect(rules.ok()).toBe(true);
   expect(await rules.text()).toContain(
-    "`UPDATE` and `DELETE` require a table with a `PRIMARY KEY`",
+    "`UPDATE` and `DELETE` require scalar or composite row identity: a `PRIMARY KEY`",
   );
 
   // And the whole set is one link away from every page.
@@ -451,6 +486,26 @@ test("the devtools page opens the floating panel over itself", async ({ page }) 
   // The status bar and the history entry both report it; the first is the status bar.
   await expect(panel.getByText(/\d+ rows · \d+ms/).first()).toBeVisible({ timeout: 60_000 });
 
+  // DDL takes the execute path, shows an operation-specific review, and refreshes rich catalog
+  // metadata when it lands. This covers composite/directional index support end to end rather
+  // than only checking the engine result type.
+  const editor = panel.locator(".cm-content").first();
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(
+    "CREATE INDEX customers_by_city_id ON customers(city ASC, customer_id DESC)",
+  );
+  await panel.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(
+    panel.getByRole("heading", { name: "Create index customers_by_city_id" }),
+  ).toBeVisible();
+  await panel.getByRole("button", { name: "Create index" }).click();
+  await expect(panel.locator(".notice.done")).toContainText("created index customers_by_city_id", {
+    timeout: 60_000,
+  });
+  await panel.getByRole("button", { name: "Expand customers" }).click();
+  await expect(panel.locator(".index", { hasText: "customers_by_city_id" })).toBeVisible();
+
   // Closing leaves the launcher behind, the way it does in an application.
   await page.getByRole("button", { name: "Close devtools" }).click();
   await expect(panel).toBeHidden();
@@ -482,6 +537,6 @@ test("a link to a file the site serves opens the file", async ({ page }) => {
 
   // A link to a page still navigates on the client.
   await page.goBack();
-  await page.getByRole("link", { name: "Feature matrix" }).first().click();
+  await page.getByRole("link", { name: "PostgreSQL compatibility" }).first().click();
   await expect(page).toHaveURL(/\/docs\/sql\/feature-matrix\/$/);
 });

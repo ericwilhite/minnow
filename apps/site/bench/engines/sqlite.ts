@@ -5,11 +5,11 @@ import type { DatasetRecord, EngineMaterialization } from "../protocol";
 import {
   canonicalizeRow,
   columnList,
+  createSecondaryIndexes,
   createTableSql,
   normalizeRows,
   quoteIdentifier,
   rowsFromColumns,
-  secondaryIndexSql,
 } from "./shared";
 import type {
   EngineDriver,
@@ -99,6 +99,9 @@ export const sqliteDriver: EngineDriver = {
     const path = databasePath(record);
     let database = await openDatabase(sqlite, path);
     let insertMs = 0;
+    let indexMs: number;
+    let dataStoredBytes: number;
+    let indexStoredBytes: number;
     try {
       const entities = getScenario("commerce").entities;
       for (const entity of entities) database.exec(createTableSql(entity));
@@ -126,7 +129,21 @@ export const sqliteDriver: EngineDriver = {
           statement.finalize();
         }
       }
-      for (const sql of secondaryIndexSql(entities)) database.exec(sql);
+      dataStoredBytes =
+        Number(database.selectValue("PRAGMA page_count") ?? 0) *
+        Number(database.selectValue("PRAGMA page_size") ?? 0);
+      indexMs =
+        record.secondaryIndexes === "foreign-keys"
+          ? await createSecondaryIndexes(entities, (sql) => {
+              database.exec(sql);
+            })
+          : 0;
+      indexStoredBytes = Math.max(
+        0,
+        Number(database.selectValue("PRAGMA page_count") ?? 0) *
+          Number(database.selectValue("PRAGMA page_size") ?? 0) -
+          dataStoredBytes,
+      );
       database.exec("PRAGMA optimize");
       // Close and reopen so what the record marks "ready" is what actually persisted.
       database.close();
@@ -151,9 +168,12 @@ export const sqliteDriver: EngineDriver = {
           sqlite.vfs === "opfs"
             ? "OPFS VFS · persistent SQLite file"
             : "OPFS SAH-pool VFS · persistent SQLite file",
+        dataStoredBytes,
+        indexStoredBytes,
         storedBytes: pageCount * pageSize,
         buildMs: performance.now() - started,
         insertMs,
+        indexMs,
       };
     } finally {
       if (database.isOpen()) database.close();

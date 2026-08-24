@@ -81,7 +81,7 @@ only after its manifest is pruned and no segment or unfinished compaction names 
 aborted one waits for every pending artifact to disappear. Adapters must apply that whole step
 as one operation. `removePrunedManifestRecords` then deletes only markers that no readable version
 needs **and whose unused blocks are all gone**. That marker remembers unfinished work between
-small collection passes, so deleting it early can strand part of a large backlog. A
+small collection passes, so deleting it early can strand part of a large cleanup. A
 file-backed adapter may delete immutable block payloads after logging the resolved step, as the
 toolkit example does.
 
@@ -194,7 +194,7 @@ log each change, save checkpoints with `dump()` (serialize the result immediatel
 arrays still refer to the live state), and replay the log on open. For any single-log design,
 write and flush the checkpoint before resetting the log — never the other way around.
 
-The proof all of this composes is checked in as a test:
+A shared test checks that these parts work together:
 [`toolkit-example.test.ts`](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/storage/toolkit/toolkit-example.test.ts)
 builds a complete, persistent, log-structured `BlockStore` from these exports alone: record
 handling from `RecordCore`, one log, blocks in packed files, and a checkpoint at open. It passes

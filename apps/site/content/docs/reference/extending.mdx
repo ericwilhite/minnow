@@ -3,21 +3,24 @@ title: Extending Minnow
 description: Public APIs for building a typed layer, schema tool, or adapter on top of the engine.
 ---
 
-SQL is the foundation. The engine runs statements on its own, and typed layers — including the
-official [`@minnowdb/client`](/docs/client) — use the public APIs on this page.
+SQL is the foundation. The engine runs statements on its own, and client adapters — including the
+official [`@minnowdb/kysely`](/docs/adapters/kysely) package — use the public APIs on this page.
 
-`@minnowdb/client` ships separately and uses only these APIs. That keeps this page grounded in a
-real client instead of a set of hooks that have never been used outside the engine.
+The Kysely adapter ships separately and uses only these APIs. That keeps this page grounded in a
+real adapter instead of a set of hooks that have never been used outside the engine.
 
 ## The building blocks
 
-| API                       | Import                | What it gives you                                                                      |
-| ------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
-| `execute(sql, params)`    | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                  |
-| `introspect()`            | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                           |
-| Statement transactions    | `@minnowdb/core`      | `BEGIN` / `COMMIT` / `ROLLBACK`, drivable from a layer that owns its own control flow. |
-| Plan construction         | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.          |
-| `sql-feature-matrix.json` | `@minnowdb/core`      | A machine-readable list of supported and rejected SQL.                                 |
+| API                             | Import                | What it gives you                                                                         |
+| ------------------------------- | --------------------- | ----------------------------------------------------------------------------------------- |
+| `MinnowSqlExecutor`             | `@minnowdb/core`      | Structural `query` / `execute` boundary implemented in-thread and through a worker.       |
+| `MinnowSqlDriver`               | `@minnowdb/core`      | The SQL executor plus `introspect()` for schema-aware adapters.                           |
+| `execute(sql, params)`          | `@minnowdb/core`      | One entry point whose `kind` tells you what happened.                                     |
+| `introspect()`                  | `@minnowdb/core`      | The catalog: stable IDs, keys, constraints, triggers, views.                              |
+| Statement transactions          | `@minnowdb/core`      | `BEGIN`, savepoints, `COMMIT`, and `ROLLBACK` for adapter-owned control flow.             |
+| Plan construction               | `@minnowdb/core/plan` | Build the same logical plan the SQL parser builds, and hand it to the engine.             |
+| `sql-feature-matrix.json`       | `@minnowdb/core`      | A machine-readable list of supported and rejected SQL.                                    |
+| `postgres-feature-profile.json` | `@minnowdb/core`      | PostgreSQL-compatible forms, deliberate differences, extensions, and embedded exclusions. |
 
 ## Running statements
 
@@ -26,15 +29,17 @@ what happened without a second query:
 
 ```ts
 const result = await database.execute(
-  `INSERT INTO orders (order_id, total) VALUES (?, ?)`,
+  `INSERT INTO orders (order_id, total) VALUES ($1, $2)`,
   [1, 25],
 );
 // { kind: "insert", table: "orders", rowCount: 1, version: 4 }
 ```
 
-Bind values with `?` rather than building SQL strings. The compiled plan is cached on the statement
-text and re-bound per execution, so parameters are faster as well as safer — and a layer that
-inlines literals instead defeats that cache, since every distinct value becomes a distinct key.
+Emit PostgreSQL's `$1`, `$2` placeholders rather than building SQL strings. Minnow also accepts
+`?` as adapter shorthand, but `$n` is the public dialect target. The compiled plan is cached on
+the statement text and re-bound per execution, so parameters are faster as well as safer — and a
+layer that inlines literals instead defeats that cache, since every distinct value becomes a
+distinct key.
 
 Identifiers quote with double quotes, doubling an embedded quote: `"order id"`, `"say ""hi"""`.
 
@@ -48,9 +53,10 @@ const catalog = await database.introspect();
 
 for (const table of catalog.tables) {
   table.name;
-  table.uniqueKeyColumnId; // identity, not a name
-  table.columns; // { id, name, type, integer?, nullable, defaultValue?, enumValues?, isAutoIncrementing }
-  table.foreignKeys; // { name, column, parentTable, parentColumn, onDelete }
+  table.uniqueKeyColumnId; // scalar identity, when present
+  table.primaryKeyColumnIds; // ordered scalar or composite primary identity
+  table.columns; // { id, name, type, integer?, sqlDomain?, nullable, defaultValue?, enumValues?, isAutoIncrementing }
+  table.foreignKeys; // scalar column fields plus columns?/parentColumns? for composite keys
   table.checks; // { name, sql }
   table.triggers; // { name, event, timing }
 }
@@ -96,7 +102,7 @@ appearing as a step — see [the rejected list](/docs/schema#what-migrate-does).
 
 **Applying still goes through the engine.** `database.migrate(schema)` plans and applies in one
 call. Some steps have no SQL spelling — a rename happens through the column's stable ID, which
-`ALTER TABLE` cannot express — so there is no statement list you could run yourself today. If you
+`ALTER TABLE` cannot express — so there is no equivalent statement list to run yourself. If you
 need the split, plan with `planMigration` to decide and inspect, then hand the same schema to
 `migrate()` to apply.
 
@@ -108,8 +114,8 @@ that needs to decide its own control flow:
 ```ts
 await database.execute("BEGIN");
 try {
-  await database.execute(`UPDATE accounts SET balance = balance - ? WHERE id = ?`, [10, 1]);
-  await database.execute(`UPDATE accounts SET balance = balance + ? WHERE id = ?`, [10, 2]);
+  await database.execute(`UPDATE accounts SET balance = balance - $1 WHERE id = $2`, [10, 1]);
+  await database.execute(`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, [10, 2]);
   await database.execute("COMMIT");
 } catch (error) {
   await database.execute("ROLLBACK");
@@ -117,9 +123,8 @@ try {
 }
 ```
 
-A layer can wrap these calls in a callback-based helper if that feels better for its users.
-
-Savepoints are not implemented, so transactions do not nest.
+A layer can wrap these calls in a callback-based helper. For nested work, emit `SAVEPOINT name`,
+`ROLLBACK TO SAVEPOINT name`, and `RELEASE SAVEPOINT name`; a second `BEGIN` is still rejected.
 
 ## Building plans directly
 
@@ -136,39 +141,36 @@ costs 11–28 µs, which is under 1% of any query that touches real data.
 
 ## Discovering what the engine accepts
 
-A layer that generates SQL will eventually emit something the engine does not support. The answer
-is the feature matrix, shipped as data:
+A layer that generates SQL needs a precise support boundary. The feature matrix provides it as
+data:
 
 ```ts
 import matrix from "@minnowdb/core/sql-feature-matrix.json" with { type: "json" };
 
 const unsupported = matrix.features.filter((entry) => entry.status === "unsupported");
-// each carries: id, an Annex F feature or "minnow", an example, and the error it raises
+// each carries: id, example, error, and the reason for the boundary
 ```
 
-There are 201 entries, with 182 supported. The engine's tests read this same file, so a change to
-the language cannot leave the list quietly out of date.
+The engine's tests read this same file and the PostgreSQL profile beside it, so a change to the
+language cannot leave either list quietly out of date.
 
-The gaps most likely to matter to a SQL generator:
+Generators should account for these narrower supported forms:
 
-| Gap                             | Note                                                      |
-| ------------------------------- | --------------------------------------------------------- |
-| correlated non-equi scalar/`IN` | range correlation is currently for `EXISTS`/`NOT EXISTS`  |
-| correlated `NOT IN`             | use `NOT EXISTS`                                          |
-| correlated `EXISTS` below `OR`  | keep it as a top-level `WHERE` conjunct                   |
-| `LATERAL` sources               | no operator re-executes a source per row of its left side |
-| exact `NUMERIC` / `DECIMAL`     | use safe integer minor units or canonical decimal text    |
-| secondary and composite keys    | one unique key column is the only keyed address today     |
-| savepoints                      | only the outer transaction can roll back                  |
-| upsert `DO UPDATE ... WHERE`    | use `CASE` when retaining the old value is equivalent     |
-| `COLLATE`, sequences, `ARRAY`   | absent; the matrix records each with its error            |
+| Boundary                                  | Rule                                                                   |
+| ----------------------------------------- | ---------------------------------------------------------------------- |
+| keyless `UPDATE` / `DELETE`               | rows need scalar or composite identity                                 |
+| correlated scalar/`IN` range predicates   | equality correlation only; range correlation is available for `EXISTS` |
+| correlated `EXISTS` below `OR`            | keep correlation as a top-level conjunct                               |
+| correlated `LATERAL` grouping/order/limit | use the supported equality-correlated projection/join shape            |
+| correlated `JSON_TABLE` documents         | only constant documents with `$` and `$[*]` row paths                  |
+| enum/sequence evolution                   | no `ALTER TYPE`, sequence options, or `ALTER SEQUENCE`                 |
+| server/session commands                   | no schemas, `GRANT`, or configurable isolation levels                  |
 
-Every one of these raises an explicit error naming the constraint, so a generator can surface a
-useful message rather than a failure deep in execution.
+Each rejected form raises an explicit error. Supported entries with a scoped boundary carry that
+boundary in their matrix note.
 
 ## Row types
 
-If your layer is typed, [`InferDatabase`](/docs/schema#inferred-shapes) gives you a `DB` where each
-table names its `select`, `insert`, and `update` shapes and each view names only `select`. Reading
-those three names is all that is required — there is no marker to decode, and the absence of
-`insert` on a view is what makes writing to one a compile error.
+If your adapter is typed, build its database type from the catalog or from your application's own
+schema types. The Kysely adapter uses Kysely's ordinary table-to-row `DB` interface and does not
+require Minnow-specific wrappers.

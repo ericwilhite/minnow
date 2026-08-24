@@ -10,10 +10,7 @@ export interface Rect extends Size {
   y: number;
 }
 
-/**
- * Below this the panel stops being usable. The sidebars drop out on their own as the panel
- * narrows, so this only has to leave room for the view itself.
- */
+/** Preferred drag floor when the viewport has room; a smaller viewport always wins. */
 export const minimumSize: Size = { width: 500, height: 320 };
 
 /** Gap between the panel and the viewport edge when it first opens. */
@@ -25,16 +22,28 @@ function clamp(value: number, low: number, high: number): number {
 
 /** The size a freshly opened panel takes: roomy, but never larger than the window it floats in. */
 export function preferredSize(viewport: Size): Size {
+  const available = {
+    width: Math.max(1, viewport.width - 2 * 8),
+    height: Math.max(1, viewport.height - 2 * 8),
+  };
   return {
-    width: clamp(Math.round(viewport.width * 0.72), minimumSize.width, viewport.width - 2 * 8),
-    height: clamp(Math.round(viewport.height * 0.7), minimumSize.height, viewport.height - 2 * 8),
+    width: clamp(
+      Math.round(viewport.width * 0.72),
+      Math.min(minimumSize.width, available.width),
+      available.width,
+    ),
+    height: clamp(
+      Math.round(viewport.height * 0.7),
+      Math.min(minimumSize.height, available.height),
+      available.height,
+    ),
   };
 }
 
 /** Places a panel of the given size against one corner of the viewport. */
 export function cornerRect(corner: DevtoolsCorner, viewport: Size, size: Size): Rect {
-  const width = clamp(size.width, minimumSize.width, viewport.width);
-  const height = clamp(size.height, minimumSize.height, viewport.height);
+  const width = clamp(size.width, Math.min(minimumSize.width, viewport.width), viewport.width);
+  const height = clamp(size.height, Math.min(minimumSize.height, viewport.height), viewport.height);
   const right = corner.endsWith("right");
   const bottom = corner.startsWith("bottom");
   return clampToViewport(
@@ -53,12 +62,8 @@ export function cornerRect(corner: DevtoolsCorner, viewport: Size, size: Size): 
  * monitor shrinks to fit rather than hanging off the edge with its controls unreachable.
  */
 export function clampToViewport(rect: Rect, viewport: Size): Rect {
-  const width = clamp(rect.width, minimumSize.width, Math.max(viewport.width, minimumSize.width));
-  const height = clamp(
-    rect.height,
-    minimumSize.height,
-    Math.max(viewport.height, minimumSize.height),
-  );
+  const width = clamp(rect.width, Math.min(minimumSize.width, viewport.width), viewport.width);
+  const height = clamp(rect.height, Math.min(minimumSize.height, viewport.height), viewport.height);
   return {
     width,
     height,
@@ -92,22 +97,22 @@ export function resizeBy(
   let { x, y, width, height } = rect;
 
   if (edge.includes("e")) {
-    width = clamp(width + dx, minimumSize.width, Math.max(viewport.width - x, minimumSize.width));
+    const available = viewport.width - x;
+    width = clamp(width + dx, Math.min(minimumSize.width, available), available);
   } else if (edge.includes("w")) {
     const right = x + width;
-    x = clamp(x + dx, 0, right - minimumSize.width);
+    const minimum = Math.min(minimumSize.width, right);
+    x = clamp(x + dx, 0, right - minimum);
     width = right - x;
   }
 
   if (edge.includes("s")) {
-    height = clamp(
-      height + dy,
-      minimumSize.height,
-      Math.max(viewport.height - y, minimumSize.height),
-    );
+    const available = viewport.height - y;
+    height = clamp(height + dy, Math.min(minimumSize.height, available), available);
   } else if (edge.includes("n")) {
     const bottom = y + height;
-    y = clamp(y + dy, 0, bottom - minimumSize.height);
+    const minimum = Math.min(minimumSize.height, bottom);
+    y = clamp(y + dy, 0, bottom - minimum);
     height = bottom - y;
   }
 

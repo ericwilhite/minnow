@@ -1,249 +1,144 @@
 ---
-title: Comparison
-description: How Minnow compares to IndexedDB, Dexie, SQLite Wasm, PGlite, and DuckDB-Wasm.
+title: Choosing a browser database
+description: Compare Minnow with IndexedDB, Dexie, SQLite Wasm, PGlite, and DuckDB-Wasm.
 ---
 
-Five things store data in a browser and are worth weighing against Minnow: IndexedDB, Dexie,
-SQLite Wasm, PGlite, and DuckDB-Wasm. Each section says where that one wins, where Minnow wins,
-and when to pick it instead.
+Choose Minnow when a browser application owns relational data and needs both ordinary reads and
+writes and analytical SQL over that data. Choose another tool when file compatibility, sync, a
+complete server dialect, or direct file analysis matters more.
 
-Minnow is a local database for both kinds of work an application has: the row work it does all
-day — keyed reads, inserts, updates — and the analysis over what accumulates — filters,
-aggregates, joins. Columnar storage makes the analysis cheap, and the OPFS store's write-ahead
-log makes the row work fast; on the live [benchmarks](/benchmarks) it measures ahead of the Wasm
-SQL engines at both (the trade databases call HTAP). It has no sync, no server, and no
-compatibility with anyone else's SQL dialect.
+| Need                                                                            | Best starting point    |
+| ------------------------------------------------------------------------------- | ---------------------- |
+| Local application tables with filters, joins, aggregates, search, and updates   | **Minnow**             |
+| Small record collections fetched mainly by key or declared index                | **Dexie** or IndexedDB |
+| The SQLite dialect, file format, extensions, or shared mobile/server migrations | **SQLite Wasm**        |
+| The PostgreSQL server and extension surface, or ElectricSQL sync                | **PGlite**             |
+| In-browser analysis of Parquet, Arrow, or CSV files                             | **DuckDB-Wasm**        |
+| Multi-device or multi-user synchronization                                      | A sync engine          |
 
-| What you are building                                                                  | Reach for                        |
-| -------------------------------------------------------------------------------------- | -------------------------------- |
-| An app's own tables: keyed reads and writes, plus filters, joins, aggregates on device | **Minnow**                       |
-| Storing and fetching records by key, a few hundred at a time                           | **Dexie**, or IndexedDB directly |
-| Sharing exact SQL, schema, or migrations with a SQLite server/mobile app               | **SQLite Wasm**                  |
-| Sharing exact SQL with a PostgreSQL backend, extensions included                       | **PGlite**                       |
-| Querying Parquet or Arrow files, or millions of rows of analytics                      | **DuckDB-Wasm**                  |
+## Why choose Minnow
 
-## What a browser downloads
+- **One database for application work and analysis.** Primary and secondary indexes handle
+  selective reads and writes. Columnar storage keeps scans, joins, and aggregates efficient as
+  data grows.
+- **PostgreSQL-style SQL without a PostgreSQL server.** Use familiar syntax directly or through
+  Kysely. The [compatibility page](/docs/sql/feature-matrix) lists exact matches, differences,
+  extensions, and exclusions.
+- **Small, browser-native delivery.** Minnow is plain JavaScript with no Wasm compile step,
+  `SharedArrayBuffer`, or cross-origin isolation requirement.
+- **Durable multi-tab storage.** IndexedDB and OPFS adapters publish atomic commits and give each
+  reader a stable snapshot.
+- **Control over memory and threading.** Run the engine in a worker, set an execution budget, and
+  spill large sorts and grouped results to storage.
+- **Native Kysely types.** `@minnowdb/kysely` derives its full database type from the same schema
+  declaration Minnow migrates, including defaults and exact numeric boundaries.
 
-Size matters here more than it does on a server, because the user waits for it on a cold load,
-and a Wasm engine must also compile its module before answering the first query.
+Minnow does not provide a server, replication, multi-device sync, or compatibility with another
+database's file format.
 
-| Engine           | Download (gzip) | Raw     | Compile step |
-| ---------------- | --------------- | ------- | ------------ |
-| IndexedDB        | 0               | 0       | No           |
-| Dexie 4.4.5      | 30 KB           | 96 KB   | No           |
-| **Minnow**       | **185 KB**      | 675 KB  | No           |
-| SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes          |
-| PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes          |
-| DuckDB-Wasm 1.33 | 8.1 MB          | 36.7 MB | Yes          |
+## Browser download size
 
-The three benchmarked engines come from `npm run benchmark:sizes`, which bundles each package's
-browser entry with identical esbuild settings and adds the Wasm modules and packed data
-directories it fetches at run time. Dexie is its shipped `dexie.min.js`; DuckDB-Wasm is the `eh`
-bundle's Wasm module plus its worker. Gzip is level 9 throughout, which is what a static host
-serves.
+Download size affects cold starts, and Wasm engines also compile a module before the first query.
 
-Minnow's number is the whole library, every storage adapter included; the adapters tree-shake,
-so an application that uses one store ships less than the table says.
+| Engine           | Download (gzip) | Raw     | Wasm compile step |
+| ---------------- | --------------- | ------- | ----------------- |
+| IndexedDB        | 0               | 0       | No                |
+| Dexie 4.4.5      | 30 KB           | 96 KB   | No                |
+| **Minnow**       | **220 KB**      | 832 KB  | No                |
+| SQLite Wasm 3.53 | 457 KB          | 1.1 MB  | Yes               |
+| PGlite 0.5.5     | 5.6 MB          | 16.6 MB | Yes               |
+| DuckDB-Wasm 1.33 | 8.1 MB          | 36.7 MB | Yes               |
 
-Size is not the argument on its own — a 5 MB engine that caches well is fine for a tool people
-open every day. It is the argument for a page that has to be interactive on first visit.
+These values use identical esbuild settings and include the Wasm modules and packed runtime data
+each package downloads. Minnow's number includes every storage adapter; unused adapters can
+tree-shake from an application bundle.
 
 ## IndexedDB
 
-The API every browser already has: an asynchronous key-value store with secondary indexes and
-transactions.
+IndexedDB is the built-in asynchronous key-value database in every modern browser. It supports
+transactions and secondary indexes without adding a dependency.
 
-**Where it beats Minnow.** Nothing to install and nothing to load. For storing a few hundred
-records and fetching them by key or by one index, it is the right tool and everything else is
-overhead.
+**Choose IndexedDB when** the application stores a small number of objects and access is almost
+always “get this key” or “read this index.” Nothing else is smaller.
 
-**Where Minnow beats it.** IndexedDB has no query language. Any filter it cannot serve from an
-index, and every join, aggregate, sort, and group, becomes a cursor loop in your JavaScript that
-pulls every record into the main thread as a structured-clone object. That is fine at a thousand
-rows and unusable at a million. Minnow stores compressed columns instead of individual records,
-reads only the columns a query names, skips whole blocks from their statistics, and does the work
-in a worker over typed arrays.
-
-**Use it instead when** your data access is "get this record, put this record" and it always will
-be.
+**Choose Minnow when** the application needs joins, grouping, aggregation, sorting, full-text
+search, or SQL. Minnow stores compressed columns and can run in a worker instead of turning each
+query into application cursor code over cloned objects.
 
 ## Dexie
 
-The most widely used IndexedDB wrapper: promises, a declarative schema with versioned migrations,
-compound indexes, a `where()` query API, and live queries. Dexie Cloud adds hosted sync.
+Dexie adds promises, schema migrations, compound indexes, a query API, and live queries to
+IndexedDB. Dexie Cloud adds hosted sync.
 
-**Where it beats Minnow.** It is a fifth of the size. Its migration story is mature. Single-record
-writes are cheaper — a put is one IndexedDB operation, where Minnow publishes a versioned commit.
-It has a sync product; Minnow has none. It runs in Node under a shim; Minnow does not run in Node
-at all.
+**Choose Dexie when** indexed record access is the main workload, bundle size is critical, or you
+want its mature migration or sync ecosystem.
 
-**Where Minnow beats it.** The shape of the data, mostly. Dexie stores what IndexedDB stores —
-one object per record, fetched by key or by a declared index, with no relations between tables —
-so joins, aggregation, grouping, window functions, and text search are your loops over the
-objects it hands back. Minnow stores relational tables as compressed columns and plans real SQL
-over them: per-query work scales with the columns and blocks a query touches, not with the
-number of records in the table. And keyed reads are no longer the reason to pick a key-value
-store: Minnow's OPFS store answers a point lookup from the leader's memory in tens of
-microseconds, under what a raw IndexedDB `get` costs before Dexie adds anything.
+**Choose Minnow when** the same local data also needs relational and analytical queries. Minnow
+plans SQL across tables and reads the columns and blocks a query needs instead of materializing
+every record as a JavaScript object.
 
-**Use it instead when** you want indexed key-value access with a schema, and the analysis either
-does not exist or happens on a server.
-
-Everything above applies about equally to `idb`, `localForage`, and hand-written IndexedDB
-helpers. They differ in ergonomics, not in what the engine underneath can answer.
+The same broad trade-off applies to `idb`, `localForage`, and direct IndexedDB wrappers.
 
 ## SQLite Wasm
 
-SQLite compiled to WebAssembly, published by the SQLite project itself. The most mature SQL engine
-in existence, running in a browser tab.
+SQLite Wasm brings SQLite's mature SQL engine, file format, extensions, indexes, and tooling into
+the browser.
 
-**Where it beats Minnow.** In everything thirty years of maturity buys:
+**Choose SQLite Wasm when** the application needs SQLite compatibility, existing SQLite
+migrations, broad index support, extensions, or the ability to move the same database file among
+browser, mobile, and server environments.
 
-- **The SQL surface is complete.** Minnow implements a documented subset of SQL:2023 and refuses
-  the rest by design. SQLite implements SQLite, and there is thirty years of it.
-- **Its indexes are broader.** Minnow's durable indexes can be composite and unique, and a
-  qualifying keyless-table index can cover a query or deliver `ORDER BY` without a separate
-  sort. SQLite's mature B-tree model still supports more index forms, expressions, collations,
-  partial indexes, and broader covering and ordering plans.
-- **Portability.** The same schema, the same statements, and the same file work on a server, on
-  mobile, and in the browser. Minnow's block format is its own, and this early format carries no
-  compatibility promise.
-- **Ecosystem.** Extensions, ORMs, tooling, and answers to almost any question you will have.
+**Choose Minnow when** browser-local analytical reads, compressed column storage, a smaller plain
+JavaScript download, and simple multi-tab persistence matter more. Minnow uses IndexedDB or OPFS
+without requiring cross-origin isolation headers.
 
-**Where Minnow beats it.**
-
-- **Speed, on our own benchmarks.** The [benchmarks](/benchmarks) build both engines live on your
-  machine — SQLite with primary keys and foreign-key indexes declared, every answer checked
-  against an independent oracle before a timing counts. On the machines we run them on, Minnow's
-  OPFS store measures faster on every case: keyed lookups and single-row writes by several times,
-  a 100,000-row load by three to four, and the analytical queries throughout. The IndexedDB store
-  holds even with SQLite on lookups and still wins the writes. Run them yourself — there are no
-  published numbers to take on trust.
-- **Bytes on disk.** Compressed columns store the benchmark dataset in roughly a quarter of the
-  bytes SQLite's row pages take — and browser storage is a quota on a device you do not own.
-- **Nothing to compile.** 185 KB of JavaScript against 457 KB and a Wasm instantiation before the
-  first statement runs.
-- **Persistence is not a decision that costs you something.** SQLite in a browser has to pick a
-  VFS, and the choice is awkward: the `opfs` VFS supports several tabs at once but needs
-  `SharedArrayBuffer`, which means serving COOP and COEP headers; `opfs-sahpool` is faster and
-  needs no headers but does not allow simultaneous connections. Minnow writes to IndexedDB or
-  OPFS, needs no special headers either way, and is multi-tab by construction on both — commits
-  are atomic across tabs and readers see whole versions.
-- **Scans and bulk loads.** Row storage reads every column of every row it touches. For
-  aggregates over a large table, and for loading a large table in the first place, columns win.
-- **A memory budget.** Minnow can spill sorts and grouped results to storage when they outgrow the
-  execution budget. The budget is not a hard JavaScript heap cap yet. SQLite in Wasm is bounded by
-  the module's heap, and exceeding it fails the query.
-
-**Use it instead when** you need SQLite specifically: its dialect, its file format, its
-extensions, or parity with a server or mobile app that already runs it.
-
-`sql.js`, `wa-sqlite`, and `SQLocal` are the same engine with different loaders and storage
-layers. `sql.js` in particular keeps the whole database in memory and persists by serializing all
-of it, which is a different durability model from anything else on this page.
+SQLite's B-tree design is especially strong for the smallest point reads and writes. Minnow's
+columnar design favors scans, aggregates, and bulk loads. Run the [live benchmarks](/benchmarks)
+for the workload and browser you care about.
 
 ## PGlite
 
-PostgreSQL itself, compiled to WebAssembly, as a single-connection in-process database. It anchors
-ElectricSQL's sync story.
+PGlite runs PostgreSQL in WebAssembly. It provides PostgreSQL's types, behavior, migrations, and
+extensions such as `pgvector`, and it is part of ElectricSQL's sync architecture.
 
-**Where it beats Minnow.** It is PostgreSQL: real Postgres types, real Postgres behavior, and
-extensions including `pgvector`. If your server is Postgres, one query works in both places, and
-your migrations are the migrations you already have. It has a first-class sync engine built around
-it.
+**Choose PGlite when** exact PostgreSQL compatibility, extensions, shared server SQL, or
+ElectricSQL sync is the requirement.
 
-**Where Minnow beats it.** Size, mostly, and by a factor of thirty: 185 KB against 5.6 MB
-gzipped, which unpacks to a 9.9 MB Wasm module and a 6.1 MB packed data directory before Postgres
-starts. Beyond that, PGlite allows one instance per data directory, so multiple tabs need
-coordination you write; its durability setting is a real trade (strict flushes its filesystem
-image to IndexedDB after every statement, which we measured at 13–20 ms per statement, including
-single-row lookups); and it is row-oriented, so wide scans read what they do not need.
-
-**Use it instead when** Postgres compatibility is the requirement, or you are adopting ElectricSQL.
+**Choose Minnow when** the application needs a much smaller download, no Wasm startup, columnar
+queries, and durable access from several tabs. Minnow supports a documented embedded PostgreSQL
+dialect rather than the complete server.
 
 ## DuckDB-Wasm
 
-The other columnar engine in the browser, and the closest thing to a direct competitor on the
-analytics side. It reads Parquet and Arrow natively and is very fast.
+DuckDB-Wasm is a mature columnar analytics engine that reads Parquet, Arrow, and CSV directly.
 
-**Where it beats Minnow.** It is a mature analytical engine with years of optimizer work behind
-it, a much larger SQL surface, and direct reading of Parquet, CSV, and Arrow from URLs or files —
-Minnow has none of that. On large analytical queries over data that fits in memory, expect it to
-win.
+**Choose DuckDB-Wasm when** the task is analysis over files, very large in-memory datasets, or a
+SQL surface built for analytical tooling.
 
-**Where Minnow beats it.**
+**Choose Minnow when** the data is an application's own durable state and users also insert,
+update, and delete individual rows. Minnow provides IndexedDB and OPFS persistence, atomic
+multi-tab writes, and background maintenance around that workload.
 
-- **Download.** 185 KB against roughly 8.1 MB gzipped, which is a 36 MB Wasm module unpacked.
-- **Durability is the whole design.** DuckDB-Wasm is happiest in memory; its persistent path is
-  OPFS, constrained about concurrent access. Minnow's storage model — immutable blocks, an
-  atomically published manifest, leases, garbage collection, and crash testing with injected
-  faults — exists precisely because a browser tab dies without warning, and it holds on
-  IndexedDB and OPFS alike.
-- **Memory ceiling.** Wasm in a tab caps out around 4 GB, and DuckDB-Wasm cannot spill to local
-  storage when a query exceeds what it has. Minnow spills.
-- **Writes.** DuckDB is built for bulk-loading and querying, not for an application mutating rows
-  as users work. Minnow takes single-row `INSERT`/`UPDATE`/`DELETE` as delta segments and compacts
-  them in the background.
+## Sync engines
 
-**Use it instead when** the job is analysis over files — a notebook, a dashboard fed by Parquet, a
-data tool — rather than an application's own durable state.
+ElectricSQL, Zero, Triplit, InstantDB, PowerSync, Jazz, and CRDT libraries solve synchronization
+between devices or users. Minnow does not. Choose a sync product when replication and conflict
+resolution are requirements.
 
-## Adjacent categories
+Minnow's SQL and snapshot APIs can serve as building blocks for a future sync layer, but no sync
+adapter ships with the project.
 
-These solve different problems, and Minnow does not compete with them directly.
+## Minnow's limits
 
-**Sync engines** — ElectricSQL, Zero, Triplit, InstantDB, PowerSync, Jazz, and the CRDT libraries
-(Automerge, Yjs) keep a local copy in step with a server and with other users. Minnow has no
-replication and no conflict resolution, so if multi-user or multi-device state is the requirement,
-this is the category. Their local query engine is usually SQLite, PGlite, or a document store, and
-it is rarely where their effort goes; Minnow's `execute` and snapshot APIs are ordinary building blocks, so
-a sync layer could be written over them.
+- Minnow is in 0.x, so minor releases can include breaking changes and the stored block format may
+  change.
+- Its SQL dialect is an embedded PostgreSQL subset, not the PostgreSQL server.
+- `UPDATE` and `DELETE` require row identity: a primary key or one inline unique column.
+- Secondary indexes support scalar and composite left-prefix equality, `IN`, range filtering, and
+  selected ordered or covering reads. They do not provide PostgreSQL's full access-method system.
+- The engine runs in browsers, not Node.js.
+- There is no replication, server process, or multi-device sync.
 
-**Reactive and document stores** — RxDB, PouchDB, TinyBase, WatermelonDB, LokiJS, and SignalDB add
-schemas, reactive queries, and usually replication over IndexedDB or OPFS. Reactivity and framework
-bindings are their centre, and most have a sync option. None is columnar, none plans a query, and
-the heavy lifting still lands in JavaScript objects created one row at a time. Minnow has
-[live queries](/docs/client/live) too, but as a feature of the typed client rather than the shape
-of the whole system.
-
-**SQL over JavaScript arrays** — AlaSQL and similar libraries parse SQL and run it over in-memory
-arrays. Easy to drop in for data you already hold, with no persistence model, no memory bound, and
-no snapshot isolation.
-
-## Where Minnow is weakest
-
-- **It is 0.x.** Breaking changes land in minor releases and the block format carries no
-  compatibility promise. See [Versioning](/docs/reference/versioning).
-- **The SQL surface is a subset**, and it is not anyone else's dialect. What is supported and what
-  is deliberately refused is listed in the [feature matrix](/docs/sql/feature-matrix), keyed to the
-  standard's feature identifiers, but a statement written for SQLite or Postgres may not run.
-- **No sync, no replication, no server.** One machine, one browser's storage quota.
-- **Secondary indexes are deliberately narrow.** They cover one column and prune equality, range,
-  and `IN` filters. They do not yet enforce uniqueness, combine columns, cover a query, or deliver
-  sorted output like a B-tree.
-- **No Node build.** The engine targets browsers, so there is no shared code path with a Node
-  server, and tests run in real browsers rather than under a Node shim.
-- **The ecosystem is one repository.** No third-party ORMs, no extensions, no Stack Overflow
-  answers. The published [catalog and plan APIs](/docs/reference/extending) are there so
-  that layers can be built, but nobody has built them yet.
-
-## What is actually different
-
-Five things are hard to get anywhere else:
-
-- **Real SQL with nothing to compile.** No Wasm module, no COOP/COEP headers, no
-  `SharedArrayBuffer`, no build step. The first query runs as soon as the JavaScript parses.
-- **Columnar storage inside browser storage.** Compressed column blocks with statistics, so scans and
-  aggregates over large tables stay cheap without an index to declare or maintain.
-- **Storage you can swap.** The engine runs over a public adapter interface with a shared test kit
-  and reusable building blocks. IndexedDB and OPFS ship, and
-  [writing another store](/docs/storage/custom) needs no engine changes.
-- **A storage model built for tabs that die.** Immutable blocks, atomic manifest publication,
-  snapshot reads, leases, and crash tests that kill the engine at every write.
-- **Answers checked against other engines.** A seeded query corpus runs through the executor and
-  through native SQLite and PGlite on every test run, and results must agree. See
-  [Testing](/docs/reference/testing).
-
-Check any of it yourself. The [console](/#console) on the home page holds around 590,000 rows in
-your browser, and the [benchmarks](/benchmarks) build Minnow, SQLite Wasm, and PGlite on your
-machine and verify every answer against an independent oracle before a timing counts.
+Try Minnow in the [live SQL and Kysely console](/#console). The
+[benchmarks](/benchmarks) run Minnow, SQLite Wasm, and PGlite on your machine and verify every
+answer before reporting a time.

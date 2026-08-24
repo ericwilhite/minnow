@@ -1,6 +1,6 @@
 ---
 title: Testing & benchmarks
-description: The test runners, the release gate, the performance gate, and the benchmark workloads.
+description: Test commands, SQL checks, browser coverage, and benchmark workloads.
 ---
 
 One set of focused runners covers fast correctness checks, real-browser behavior, performance
@@ -8,11 +8,15 @@ regressions, and the benchmark harness behind the live benchmarks page.
 
 This page is the source of truth for running and maintaining Minnow's tests and benchmarks.
 
+The typecheck, build, and browser prerequisites force a fresh TypeScript project-reference build.
+They do not trust an existing `.tsbuildinfo`, so a release gate proves the current sources even
+after generated declarations or asynchronous signatures change.
+
 ## Choose the smallest runner that proves the change
 
 | Command                        | What it runs                                                                    | Use it for                         |
 | ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
-| `npm test`                     | Vitest plus the committed standard SQLLogicTest profile                         | Normal implementation work         |
+| `npm test`                     | Vitest plus the committed fast SQLLogicTest profile                             | Normal implementation work         |
 | `npm run test:unit`            | Vitest unit, generated, simulator, comparison, and harness tests                | A focused inner loop               |
 | `npm run test:sql:standard`    | 4,205 result-checked upstream queries; committed, offline, about ten seconds    | Every SQL or optimizer change      |
 | `npm run test:sql:full`        | The full supported profile, including exhaustive multi-way join permutations    | Before a release                   |
@@ -26,7 +30,7 @@ This page is the source of truth for running and maintaining Minnow's tests and 
 | `npm run test:browser`         | Both browser runners, in sequence                                               | Cross-browser regression checks    |
 | `npm run benchmark:gate`       | Seeded Node performance ratios against the checked-in baseline                  | Query-executor performance changes |
 | `npm run benchmark:sizes`      | Download size of every comparison engine, from the installed packages           | Dependency or public-entry changes |
-| `npm run check`                | Format, types, lint, build, coverage, and standard SQLLogicTest                 | The local merge gate               |
+| `npm run check`                | Format, types, lint, build, coverage, and fast SQLLogicTest                     | The local merge gate               |
 | `npm run check:release`        | The local gate, full SQL/simulator, performance, and browser runners            | Release candidates                 |
 
 Install the browser binaries once before using a browser runner:
@@ -35,7 +39,7 @@ Install the browser binaries once before using a browser runner:
 npx playwright install chromium firefox webkit
 ```
 
-The merge gate and standard SQL profile run in `.github/workflows/ci.yml` on every push and pull
+The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request. `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
 nightly and on demand. The release workflow repeats both against the exact CI-tested commit and
 will not publish until they pass. `.github/workflows/performance.yml` runs the performance gate
@@ -63,8 +67,12 @@ application it starts.
   another asserts the `/benchmarks` route is cross-origin isolated. Documentation cannot drift
   into non-running sample code, and the harness cannot drift from the page that runs it.
 - **The performance gate** detects regressions on stable seeded query shapes, reads and writes
-  alike. It is a guardrail, not a published cross-engine benchmark: the comparison engines run
-  without indexes, which is fine for noticing that Minnow got slower and useless as a fair
+  alike. Read-only engines calibrate their repeat counts independently so every fast path gets a
+  measurable sample; every stateful mutation window executes the same fixed 12-operation sequence
+  on all three engines and finishes with a cross-engine state check. The suite includes
+  exact-NUMERIC arithmetic, composite-key lookup, and the Kysely compilation/driver path as well
+  as direct SQL. It is a guardrail, not a published cross-engine benchmark: the comparison engines
+  run without indexes, which is fine for noticing that Minnow got slower and useless as a fair
   cross-engine claim.
 
 ## SQLLogicTest: broad, strict SQL correctness
@@ -96,9 +104,9 @@ npm run test:sql:logic -- --file packages/core/testdata/sqllogictest/full-select
 ```
 
 It runs 1,822 statements and 4,205 queries, checking 219,677 scalar results across 6,029 source
-records. The standard set includes representative five-table and seventeen-table join-order
-families that previously exposed pathological Cartesian work. On the development machine used to
-introduce it, the whole profile took about ten seconds. That makes the broad suite part of
+records. The fast set includes representative five-table and seventeen-table join-order families
+that guard against pathological Cartesian work. On the development machine used to measure it,
+the whole profile took about ten seconds. That makes the broad suite part of
 `npm test`, `npm run check`, and every pull request, instead of a suite agents discover only after
 they finish a change.
 
@@ -114,7 +122,7 @@ scalar results. The remaining 2,140 are
 not hidden: `standard-exclusions.json` records the source file, source line, scope, and reason for
 every one. They currently cover non-equality correlated scalar aggregates and correlated
 `EXISTS` below `OR`. A further 2,539 supported exhaustive-join records move from
-the standard profile to the full one solely because of runtime.
+the fast profile to the full one solely because of runtime.
 
 The corpus is pinned to immutable revision
 `572273bf5076176e17f47aea75115a225e70fef8`. `upstream.json` records its URL, date, 115,244,234-byte
@@ -292,7 +300,7 @@ reopens the store and asks whether what survived is coherent.
 The test cares about all-or-nothing writes, not whether an interrupted write survives. A write
 stopped halfway may be present or absent; both are correct. What is never correct is a torn state — a row nobody wrote, a duplicated
 key, a database that will not reopen. Every assertion is phrased as "the surviving state is one a
-caller could have observed", never "the write landed".
+caller could have observed", never "the write committed".
 
 The set of fault points the workload reaches is pinned in the test. If a change starts or stops
 routing writes through one, the sweep fails and someone decides whether it should follow.
@@ -338,7 +346,7 @@ To iterate on the harness, run the unit tests (`npm test`) for the generator, an
 suite rules, then `npm run test:browser:site` to run a suite in real browsers. To try a change by
 hand, `npm run site:dev` and open `/benchmarks`.
 
-## The settled history
+## Performance after repeated writes
 
 Most gate shapes read a table as it was loaded. The `settled-*` shapes read it as it is after a
 day of use: the same rows with a thousand point updates applied and the background maintenance

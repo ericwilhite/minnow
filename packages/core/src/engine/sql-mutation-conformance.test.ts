@@ -214,7 +214,7 @@ const stepTemplates: StepTemplate[] = [
     sql: `UPDATE items SET amount = amount + ? WHERE region = ?`,
     params: [quarter(state.rng) - 50, pick(state.rng, REGIONS)],
   }),
-  // SQL:2023 predicates on the write path: a row comparison chooses the rows to update, and
+  // PostgreSQL predicates on the write path: a row comparison chooses the rows to update, and
   // the standard string functions build the new value. Both engines have to agree on which
   // rows matched as well as on what they became.
   (state) => ({

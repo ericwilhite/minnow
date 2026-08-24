@@ -4,16 +4,16 @@ description: One major across every package, what a version change means, and ho
 ---
 
 Every Minnow package shares a major version and moves independently inside it. The major is the
-compatibility line: any `@minnowdb/client@0.x` works with any `@minnowdb/core@0.x`, whichever
-minors the two happen to be on.
+compatibility line: any `@minnowdb/kysely@0.x` works with any `@minnowdb/core@0.x`, whichever
+minors the two happen to be on. The same rule covers `@minnowdb/devtools`.
 
 ```bash
-npm install @minnowdb/core @minnowdb/client
+npm install @minnowdb/core @minnowdb/kysely
 ```
 
-The client and devtools console use the engine's public APIs. A change that stops those APIs from
-working is a major change, so each package depends on its siblings
-by a range that spans the major and stops at it:
+The Kysely dialect and devtools console use the engine's public APIs. A change that stops those
+APIs from working is a major change, so each package depends on its siblings by a range that spans
+the major and stops at it:
 
 ```json
 "dependencies": { "@minnowdb/core": ">=0.1.0 <1.0.0" }
@@ -64,12 +64,12 @@ Then commit and push. That is the whole release:
 
 ```bash
 npm run check:release   # optional locally; CI runs the same gate
-git commit -am "Release core 0.2.0" && git push
+git commit -am "Release core 0.3.0" && git push
 ```
 
 Publishing is driven by the versions in the manifests, not by a tag or a command. When that
 commit's CI run goes green, `.github/workflows/release.yml` publishes every package whose version
-npm does not already have and tags each one `@minnowdb/core@0.2.0`. A push that changes no version
+npm does not already have and tags each one `@minnowdb/core@0.3.0`. A push that changes no version
 publishes nothing, and a rerun after a failure is safe, because the registry decides what has
 already shipped.
 

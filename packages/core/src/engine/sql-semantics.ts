@@ -1,3 +1,11 @@
+import {
+  collatedDomainCompare,
+  enumDomainCompare,
+  exactNumericCompare,
+  externalSqlDomainValue,
+  externalSqlTextValue,
+} from "./sql-domains.js";
+
 /**
  * SQL value semantics shared by the row and vector executors.
  *
@@ -10,6 +18,23 @@
  * and signed zero compares equal because SQL numeric equality does not distinguish it.
  */
 export function compareSqlValues(left: unknown, right: unknown): number {
+  const plainLeft = externalSqlTextValue(left);
+  const plainRight = externalSqlTextValue(right);
+  if (
+    (typeof left === "string" && plainLeft !== left) ||
+    (typeof right === "string" && plainRight !== right)
+  ) {
+    if (typeof plainLeft !== "string" || typeof plainRight !== "string") {
+      throw new TypeError("Values must have comparable SQL types");
+    }
+    return compareSqlStrings(plainLeft, plainRight);
+  }
+  const collated = collatedDomainCompare(left, right);
+  if (collated !== undefined) return collated;
+  const enumOrder = enumDomainCompare(left, right);
+  if (enumOrder !== undefined) return enumOrder;
+  const exact = exactNumericCompare(left, right);
+  if (exact !== undefined) return exact;
   const a = left instanceof Date ? left.getTime() : left;
   const b = right instanceof Date ? right.getTime() : right;
   if (a === b) return 0;
@@ -36,7 +61,7 @@ export function encodeSqlEqualityValue(value: unknown): readonly unknown[] {
   if (value === null || value === undefined) return [0];
   if (typeof value === "boolean") return [1, value];
   if (typeof value === "number") return [2, String(value === 0 ? 0 : value)];
-  if (typeof value === "string") return [3, value];
+  if (typeof value === "string") return [3, externalSqlTextValue(value)];
   if (value instanceof Date) return [4, value.getTime()];
   throw new TypeError("Query produced an unsupported value");
 }
@@ -88,6 +113,44 @@ export function compileLikePattern(
   return regExp;
 }
 
+const similarCache = new Map<string, RegExp>();
+
+/** PostgreSQL SIMILAR TO: SQL wildcards plus the SQL regular-expression operators, whole-string. */
+export function compileSimilarPattern(pattern: string, escape = "\\"): RegExp {
+  if (Array.from(escape).length !== 1) throw new TypeError("SIMILAR TO ESCAPE takes one character");
+  const key = JSON.stringify([escape, pattern]);
+  const cached = similarCache.get(key);
+  if (cached !== undefined) return cached;
+  let source = "^(?:";
+  let escaped = false;
+  let inClass = false;
+  for (const character of pattern) {
+    if (escaped) {
+      source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+      escaped = false;
+      continue;
+    }
+    if (character === escape) {
+      escaped = true;
+      continue;
+    }
+    if (character === "[") inClass = true;
+    if (character === "]") inClass = false;
+    if (!inClass && character === "%") source += "[\\s\\S]*";
+    else if (!inClass && character === "_") source += "[\\s\\S]";
+    else if (inClass || "|*+()[]".includes(character)) source += character;
+    else source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+  }
+  if (escaped) throw new TypeError("SIMILAR TO pattern ends with its escape character");
+  try {
+    const compiled = new RegExp(`${source})$`, "u");
+    similarCache.set(key, compiled);
+    return compiled;
+  } catch {
+    throw new TypeError(`Invalid SIMILAR TO pattern: ${pattern}`);
+  }
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -112,6 +175,7 @@ export function defineSqlResultProperty(
  * a silent coercion here would make `LENGTH(42)` answer instead of failing.
  */
 export function stringArgument(name: string, value: unknown): string {
-  if (typeof value !== "string") throw new TypeError(`${name} requires a string argument`);
-  return value;
+  const external = externalSqlDomainValue(value);
+  if (typeof external !== "string") throw new TypeError(`${name} requires a string argument`);
+  return external;
 }

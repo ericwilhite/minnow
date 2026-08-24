@@ -1,5 +1,5 @@
 import type { DatabaseRow } from "./database.js";
-import type { ColumnDefault } from "../storage/types.js";
+import type { ColumnDefault, SqlDomain } from "../storage/types.js";
 import { SqlCompileError } from "./errors.js";
 import {
   cachedQueryTerms,
@@ -25,9 +25,25 @@ import { optimizePlan } from "./optimizer.js";
 import {
   compareSqlValues as compareValues,
   compileLikePattern,
+  compileSimilarPattern,
   encodeSqlEqualityValue,
   roundSqlNumber,
 } from "./sql-semantics.js";
+import {
+  arrayDomainValue,
+  collatedDomainValue,
+  exactNumericBinary,
+  exactNumericValue,
+  externalSqlDomainValue,
+  intervalDomainValue,
+  isExactNumeric,
+  isSqlDomainValue,
+  jsonDomainValue,
+  normalizeSqlDomainValue,
+  protectedSqlTextValue,
+  timeDomainValue,
+  uuidDomainValue,
+} from "./sql-domains.js";
 import {
   columnarTableFromRows,
   prepareVectorQuery,
@@ -69,7 +85,8 @@ export interface QueryExecutionOptions {
 
 export type BinaryOperator = "+" | "-" | "*" | "/" | "%" | "||";
 export type ComparisonOperator = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=";
-export type AggregateName = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG";
+export type AggregateName =
+  "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG" | "STRING_AGG";
 export type ScalarFunctionName =
   | "ROUND"
   | "COALESCE"
@@ -108,7 +125,16 @@ export type ScalarFunctionName =
   | "JSON_EXISTS"
   | "JSON_OBJECT"
   | "JSON_ARRAY"
-  | "IS_JSON";
+  | "IS_JSON"
+  | "ARRAY"
+  /** Optimizer-only, prefix-free equality key for hashable multi-column decorrelation. */
+  | "MINNOW_TUPLE_KEY"
+  /** Parser-produced wrapper carrying one explicit collation through ordering/comparison. */
+  | "MINNOW_COLLATE"
+  | "NEXTVAL"
+  | "CURRVAL"
+  | "RANDOM"
+  | "GEN_RANDOM_UUID";
 
 export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "ROUND",
@@ -149,7 +175,20 @@ export const scalarFunctionNames: ReadonlySet<string> = new Set([
   "JSON_OBJECT",
   "JSON_ARRAY",
   "IS_JSON",
+  "ARRAY",
+  "MINNOW_TUPLE_KEY",
+  "MINNOW_COLLATE",
+  "NEXTVAL",
+  "CURRVAL",
+  "RANDOM",
+  "GEN_RANDOM_UUID",
 ] satisfies ScalarFunctionName[]);
+
+/** Functions whose answer can change without any catalog or input-row change. */
+export const volatileScalarFunctionNames: ReadonlySet<string> = new Set([
+  "RANDOM",
+  "GEN_RANDOM_UUID",
+]);
 
 /**
  * The niladic datetime functions (F051-06/07/08). Their value is the statement's own clock
@@ -215,7 +254,7 @@ function trimEnds(
       end -= unit.length;
     }
   }
-  return text.slice(start, end);
+  return protectedSqlTextValue(text.slice(start, end));
 }
 
 /**
@@ -225,11 +264,25 @@ function trimEnds(
  * number cast to datetime reads as milliseconds since the epoch.
  */
 function castValue(value: unknown, target: string): unknown {
+  if (target.startsWith("numeric")) {
+    const [, precision, scale] = target.split(":");
+    return exactNumericValue(
+      value,
+      precision === undefined || precision === "" ? undefined : Number(precision),
+      scale === undefined || scale === "" ? undefined : Number(scale),
+    );
+  }
+  if (target === "json") return jsonDomainValue(value, false);
+  if (target === "jsonb") return jsonDomainValue(value, true);
+  if (target === "uuid") return uuidDomainValue(value);
+  if (target === "time") return timeDomainValue(value);
+  if (target === "interval") return intervalDomainValue(value);
   if (target === "string") {
-    if (typeof value === "string") return value;
-    if (typeof value === "number") return String(value);
-    if (typeof value === "boolean") return value ? "true" : "false";
-    if (value instanceof Date) return value.toISOString();
+    const external = externalSqlDomainValue(value);
+    if (typeof external === "string") return protectedSqlTextValue(external);
+    if (typeof value === "number") return protectedSqlTextValue(String(value));
+    if (typeof value === "boolean") return protectedSqlTextValue(value ? "true" : "false");
+    if (value instanceof Date) return protectedSqlTextValue(value.toISOString());
   }
   if (target === "number" || target === "number-integer") {
     let parsed: number | undefined;
@@ -299,6 +352,8 @@ export function scalarFunctionValue(
     // means a call survived that pass, which would silently give one statement two clocks.
     throw new TypeError(`${name} must be resolved before execution`);
   }
+  if (name === "RANDOM") return Math.random();
+  if (name === "GEN_RANDOM_UUID") return globalThis.crypto.randomUUID();
   if (name === "DATE_TRUNC") return dateTruncValue(values[0], values[1]);
   if (name === "DATE_ADD") return dateAddValue(values[0], values[1], values[2]);
   if (name === "GREATEST" || name === "LEAST") {
@@ -318,6 +373,18 @@ export function scalarFunctionValue(
   if (name === "JSON_ARRAY" || name === "JSON_OBJECT") {
     // These build from every argument, so a NULL first one is data, not an early exit.
     return jsonConstructor(name, values);
+  }
+  if (name === "ARRAY") return arrayDomainValue(values);
+  if (name === "MINNOW_COLLATE") return collatedDomainValue(values[0], values[1]);
+  if (name === "NEXTVAL" || name === "CURRVAL") {
+    throw new TypeError(`${name} must be resolved by the database catalog`);
+  }
+  if (name === "MINNOW_TUPLE_KEY") {
+    // SQL equality cannot match a tuple containing NULL. JSON stringification of the tagged
+    // scalar equality encodings is prefix-free and keeps strings, numbers, booleans, and
+    // datetimes distinct, so the ordinary single-key hash join can safely carry a composite.
+    if (values.some((value) => value === null || value === undefined)) return null;
+    return JSON.stringify(values.map(encodeSqlEqualityValue));
   }
   const first = values[0];
   if (first === null || first === undefined) return null;
@@ -356,9 +423,9 @@ export function scalarFunctionValue(
       if (values[2] === null || values[2] === undefined) return null;
       const search = stringArgument("REPLACE", values[1]);
       if (search === "") return stringArgument("REPLACE", first);
-      return stringArgument("REPLACE", first)
-        .split(search)
-        .join(stringArgument("REPLACE", values[2]));
+      return protectedSqlTextValue(
+        stringArgument("REPLACE", first).split(search).join(stringArgument("REPLACE", values[2])),
+      );
     }
     case "INSTR": {
       if (values[1] === null || values[1] === undefined) return null;
@@ -378,9 +445,9 @@ export function scalarFunctionValue(
     case "ABS":
       return Math.abs(numeric(first));
     case "UPPER":
-      return stringArgument("UPPER", first).toUpperCase();
+      return protectedSqlTextValue(stringArgument("UPPER", first).toUpperCase());
     case "LOWER":
-      return stringArgument("LOWER", first).toLowerCase();
+      return protectedSqlTextValue(stringArgument("LOWER", first).toLowerCase());
     case "TRIM":
       // SQL TRIM removes spaces, not general whitespace.
       return trimEnds("TRIM", first, values[1], "both");
@@ -401,7 +468,7 @@ export function scalarFunctionValue(
       // A scalar comes back as itself; an object or array has no scalar value to give.
       if (value === null) return null;
       if (typeof value === "object") return null;
-      return typeof value === "string" ? value : JSON.stringify(value);
+      return protectedSqlTextValue(typeof value === "string" ? value : JSON.stringify(value));
     }
     case "JSON_QUERY": {
       const found = jsonAtPath(first, values[1], "JSON_QUERY");
@@ -426,12 +493,14 @@ export function scalarFunctionValue(
       }
       const filler = Array.from(fill);
       // An empty fill cannot pad, so the value passes through, matching PostgreSQL.
-      if (filler.length === 0) return text.join("");
+      if (filler.length === 0) return protectedSqlTextValue(text.join(""));
       const padding: string[] = [];
       while (padding.length < width - text.length) {
         padding.push(filler[padding.length % filler.length] ?? "");
       }
-      return name === "LPAD" ? padding.join("") + text.join("") : text.join("") + padding.join("");
+      return protectedSqlTextValue(
+        name === "LPAD" ? padding.join("") + text.join("") : text.join("") + padding.join(""),
+      );
     }
     case "OVERLAY": {
       // OVERLAY(s PLACING r FROM start [FOR length]) replaces `length` characters of `s`
@@ -451,16 +520,18 @@ export function scalarFunctionValue(
       if (!Number.isInteger(span) || span < 0) {
         throw new TypeError("OVERLAY length must be a non-negative integer");
       }
-      return [
-        ...text.slice(0, start - 1),
-        ...replacement,
-        ...text.slice(Math.min(start - 1 + span, text.length)),
-      ].join("");
+      return protectedSqlTextValue(
+        [
+          ...text.slice(0, start - 1),
+          ...replacement,
+          ...text.slice(Math.min(start - 1 + span, text.length)),
+        ].join(""),
+      );
     }
     case "CAST":
       return castValue(first, typeof values[1] === "string" ? values[1] : "");
     case "SUBSTR": {
-      // SQL:2023 6.32: the result is the characters whose positions fall in both the requested
+      // PostgreSQL SUBSTRING returns the characters whose positions fall in both the requested
       // window and the string, so a start before 1 shortens the result instead of shifting it,
       // and a window entirely off the string is empty rather than an error.
       const text = Array.from(stringArgument("SUBSTR", first));
@@ -478,7 +549,7 @@ export function scalarFunctionValue(
       }
       const from = Math.max(start, 1);
       const to = Math.min(until, text.length + 1);
-      return to <= from ? "" : text.slice(from - 1, to - 1).join("");
+      return protectedSqlTextValue(to <= from ? "" : text.slice(from - 1, to - 1).join(""));
     }
   }
 }
@@ -602,7 +673,7 @@ export function dateTruncValue(unit: unknown, value: unknown): Date | null {
 }
 
 export type Expression =
-  | { kind: "literal"; value: QueryValue }
+  | { kind: "literal"; value: QueryValue; internalSqlValue?: true; sqlDomain?: SqlDomain }
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }
   | { kind: "column"; reference: string }
@@ -618,6 +689,11 @@ export type Expression =
       name: AggregateName | ScalarFunctionName;
       arguments: Expression[];
       distinct?: boolean;
+      aggregateOrderBy?: Array<{
+        expression: Expression;
+        direction: "asc" | "desc";
+        nulls?: "first" | "last";
+      }>;
     }
   | { kind: "list"; items: Expression[] }
   | { kind: "subquery"; block: CompiledQuery }
@@ -735,7 +811,37 @@ export function windowOutputType(
   if (carries && window.argumentAlias !== undefined) {
     return innerSchema.find(({ name }) => name === window.argumentAlias)?.type ?? "number";
   }
+  if (
+    (window.name === "SUM" || window.name === "AVG") &&
+    window.argumentAlias !== undefined &&
+    innerSchema.find(({ name }) => name === window.argumentAlias)?.sqlDomain?.kind === "numeric"
+  ) {
+    return "string";
+  }
   return "number";
+}
+
+/** Logical domain carried or produced by a window result, when its physical type is not enough. */
+export function windowOutputDomain(
+  window: WindowSpec,
+  innerSchema: readonly SqlColumnSchema[],
+): SqlDomain | undefined {
+  if (window.argumentAlias === undefined) return undefined;
+  const domain = innerSchema.find(({ name }) => name === window.argumentAlias)?.sqlDomain;
+  if (domain === undefined) return undefined;
+  if (
+    window.name === "MIN" ||
+    window.name === "MAX" ||
+    window.name === "LAG" ||
+    window.name === "LEAD" ||
+    window.name === "FIRST_VALUE" ||
+    window.name === "LAST_VALUE" ||
+    window.name === "NTH_VALUE" ||
+    ((window.name === "SUM" || window.name === "AVG") && domain.kind === "numeric")
+  ) {
+    return domain;
+  }
+  return undefined;
 }
 
 export interface SelectItem {
@@ -759,6 +865,8 @@ export interface TableSource {
    * is an ordinary select list and nothing else has to know about it.
    */
   columnAliases?: string[];
+  /** Parser marker for a derived source allowed to reference sources to its left. */
+  lateral?: true;
 }
 
 export interface JoinPlan extends TableSource {
@@ -807,6 +915,8 @@ export type PredicateOperator =
   | "NOT LIKE"
   | "ILIKE"
   | "NOT ILIKE"
+  | "SIMILAR TO"
+  | "NOT SIMILAR TO"
   | "IS DISTINCT FROM"
   | "IS NOT DISTINCT FROM"
   | "IS TRUE";
@@ -831,8 +941,8 @@ export interface CompiledQuery {
     expression: Expression;
     direction: "asc" | "desc";
     /**
-     * Explicit NULL placement, absolute regardless of direction. Absent keeps the default:
-     * NULL sorts smallest, so ASC puts NULLs first and DESC puts them last (SQLite's default).
+     * Explicit NULL placement, absolute regardless of direction. Absent keeps PostgreSQL's
+     * default: NULLS LAST for ASC and NULLS FIRST for DESC.
      */
     nulls?: "first" | "last";
   }>;
@@ -864,6 +974,10 @@ export interface CompiledQuery {
    * because the answer depends on the clock rather than on the data.
    */
   usesStatementDatetime?: boolean;
+  /** NEXTVAL/CURRVAL appear in this parsed statement and need connection-local resolution. */
+  usesSequenceCalls?: boolean;
+  /** RANDOM/GEN_RANDOM_UUID appear and make result memoization unsafe. */
+  usesVolatileFunctions?: boolean;
 }
 
 /** ORDER BY / LIMIT / OFFSET tail of a select or set operation. */
@@ -953,6 +1067,7 @@ const aggregateNames = new Set<AggregateName>([
   "MIN",
   "MAX",
   "JSON_ARRAYAGG",
+  "STRING_AGG",
 ]);
 /** Set functions the parser builds from COUNT/SUM rather than from their own accumulator. */
 const statisticalAggregates = new Set([
@@ -1029,28 +1144,24 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   }
   if (parser.parameterCount > 0) compiled.parameterCount = parser.parameterCount;
   if (parser.usesStatementDatetime) compiled.usesStatementDatetime = true;
+  if (parser.usesSequenceCalls) compiled.usesSequenceCalls = true;
+  if (parser.usesVolatileFunctions) compiled.usesVolatileFunctions = true;
   return compiled;
 }
 
 /**
- * Reads a column DEFAULT into the catalog's own representation: a constant, or the
- * CURRENT_TIMESTAMP family, which the catalog records as "now" and fills per inserted row.
+ * Reads a column DEFAULT into the catalog's own representation. Literal nodes stay structured;
+ * every other variable-free SQL expression is preserved as authored for catalog introspection.
  */
-function columnDefaultFor(expression: Expression): ColumnDefault {
+function columnDefaultFor(expression: Expression, sql: string): ColumnDefault {
   if (expression.kind === "literal") {
     const value = expression.value;
     if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
       return { kind: "literal", value };
     }
-    if (value instanceof Date) return { kind: "literal", value: value.toISOString() };
+    if (value instanceof Date) return { kind: "literal", value: new Date(value.getTime()) };
   }
-  if (
-    expression.kind === "call" &&
-    (expression.name === "CURRENT_TIMESTAMP" || expression.name === "CURRENT_DATE")
-  ) {
-    return { kind: "now" };
-  }
-  throw new TypeError("DEFAULT takes a constant or CURRENT_TIMESTAMP");
+  return { kind: "expression", sql };
 }
 
 /**
@@ -1078,13 +1189,29 @@ export type MergeBranch =
 export interface ForeignKeyDefinition {
   name: string;
   column: string;
+  columns?: string[];
   parentTable: string;
   parentColumn?: string;
+  parentColumns?: string[];
   onDelete: "restrict" | "cascade" | "set null";
 }
 
-/** An INSERT value: a constant, or an unbound `?`/`$n` placeholder awaiting its parameter. */
-export type InsertValue = QueryValue | { parameter: number };
+export interface UniqueConstraintDefinition {
+  name: string;
+  columns: string[];
+}
+
+/** An INSERT value: a constant, SQL DEFAULT, or an unbound placeholder. */
+export interface DefaultInsertValue {
+  readonly default: true;
+}
+export type InsertValue = QueryValue | DefaultInsertValue | { parameter: number };
+
+export function isDefaultInsertValue(value: InsertValue): value is DefaultInsertValue {
+  return (
+    typeof value === "object" && value !== null && !(value instanceof Date) && "default" in value
+  );
+}
 
 export type CompiledStatement =
   | { kind: "select"; sql: string; parameterCount?: number }
@@ -1093,6 +1220,8 @@ export type CompiledStatement =
       table: string;
       columns: string[];
       rows: InsertValue[][];
+      /** PostgreSQL's one-row `DEFAULT VALUES` form; execution expands it to omitted columns. */
+      defaultValues?: true;
       /** INSERT ... SELECT source; `rows` is then empty and fills at execution. */
       query?: CompiledQuery;
       /**
@@ -1102,9 +1231,13 @@ export type CompiledStatement =
        */
       onConflict?: {
         column: string;
+        /** The full PostgreSQL conflict target; `column` remains the scalar fast-path name. */
+        columns?: string[];
         action: "nothing" | "replace" | "update";
         /** Expressions evaluated against the stored target row and the proposed EXCLUDED row. */
         assignments?: Array<{ column: string; expression: Expression }>;
+        /** PostgreSQL's post-conflict filter: false or unknown leaves the stored row untouched. */
+        where?: Expression;
       };
       returning?: string[] | "*";
       parameterCount?: number;
@@ -1131,6 +1264,7 @@ export type CompiledStatement =
         name: string;
         type: SqlColumnType;
         integer?: true;
+        sqlDomain?: SqlDomain;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         enumValues?: readonly string[];
@@ -1139,12 +1273,16 @@ export type CompiledStatement =
       checks?: Array<{ name: string; sql: string }>;
       foreignKeys?: ForeignKeyDefinition[];
       uniqueKey?: string;
+      compositePrimaryKey?: string[];
+      uniqueConstraints?: UniqueConstraintDefinition[];
       /** CREATE TABLE IF NOT EXISTS: an existing table of that name is left alone. */
       ifNotExists?: boolean;
       /** Schema-owned objects carry this bit atomically with creation. */
       managed?: boolean;
       parameterCount?: number;
     }
+  | { kind: "create-enum"; name: string; values: string[]; parameterCount?: number }
+  | { kind: "create-sequence"; name: string; parameterCount?: number }
   | {
       kind: "create-index";
       index: string;
@@ -1189,7 +1327,12 @@ export type CompiledStatement =
       parameterCount?: number;
     }
   | { kind: "drop-view"; view: string; ifExists?: boolean; parameterCount?: number }
-  | { kind: "transaction"; action: "begin" | "commit" | "rollback"; parameterCount?: number }
+  | {
+      kind: "transaction";
+      action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release";
+      name?: string;
+      parameterCount?: number;
+    }
   | {
       kind: "merge";
       /** The target table, and the correlation name its columns are read under. */
@@ -1217,6 +1360,7 @@ export type CompiledStatement =
         name: string;
         type: SqlColumnType;
         integer?: true;
+        sqlDomain?: SqlDomain;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         enumValues?: readonly string[];
@@ -1249,6 +1393,40 @@ export type CompiledStatement =
  * mode a transaction could relax into.
  */
 function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledStatement {
+  const identifierAt = (index: number): string => {
+    const token = tokens[index];
+    if (token?.kind !== "identifier") {
+      throw new TypeError(`Expected savepoint name, found ${token?.text ?? "end of input"}`);
+    }
+    return token.text;
+  };
+  if (keyword === "SAVEPOINT") {
+    const name = identifierAt(1);
+    if (tokens[2]?.kind !== "eof") throw new TypeError("Unexpected input after SAVEPOINT name");
+    return { kind: "transaction", action: "savepoint", name };
+  }
+  if (keyword === "RELEASE") {
+    const hasNoise =
+      tokens[1]?.kind === "identifier" && tokens[1].text.toUpperCase() === "SAVEPOINT";
+    const name = identifierAt(hasNoise ? 2 : 1);
+    if (tokens[hasNoise ? 3 : 2]?.kind !== "eof") {
+      throw new TypeError("Unexpected input after RELEASE name");
+    }
+    return { kind: "transaction", action: "release", name };
+  }
+  if (
+    keyword === "ROLLBACK" &&
+    tokens[1]?.kind === "identifier" &&
+    tokens[1].text.toUpperCase() === "TO"
+  ) {
+    const hasNoise =
+      tokens[2]?.kind === "identifier" && tokens[2].text.toUpperCase() === "SAVEPOINT";
+    const name = identifierAt(hasNoise ? 3 : 2);
+    if (tokens[hasNoise ? 4 : 3]?.kind !== "eof") {
+      throw new TypeError("Unexpected input after ROLLBACK TO name");
+    }
+    return { kind: "transaction", action: "rollback-to", name };
+  }
   const words = tokens
     .filter((token) => token.kind === "identifier")
     .map((token) => token.text.toUpperCase());
@@ -1277,6 +1455,63 @@ export function compileCheckExpression(sql: string, name: string): Expression {
     throw new TypeError(`CHECK ${name} takes a row condition over this table's own columns`);
   }
   return expression;
+}
+
+export interface DefaultExpressionTarget {
+  readonly name: string;
+  readonly type: SqlColumnType;
+  readonly sqlDomain?: SqlDomain;
+}
+
+/**
+ * Parses and type-checks one catalog default. PostgreSQL defaults are variable-free scalar
+ * expressions: functions and operators are allowed, while row references, parameters,
+ * aggregates, windows, and subqueries are not.
+ */
+export function validateDefaultExpression(sql: string, target: DefaultExpressionTarget): void {
+  const parser = new Parser(tokenize(sql), sql);
+  const expression = parser.parseExpression();
+  const hasSubquery = (value: Expression): boolean =>
+    value.kind === "subquery" ||
+    value.kind === "exists" ||
+    childExpressions(value).some(hasSubquery);
+  if (
+    expressionColumns(expression).length > 0 ||
+    containsParameter(expression) ||
+    hasAggregate(expression) ||
+    containsWindow(expression) ||
+    hasSubquery(expression)
+  ) {
+    throw new TypeError(`DEFAULT ${target.name} takes a variable-free scalar SQL expression`);
+  }
+  const plan: CompiledQuery = {
+    sql: `(default ${target.name})`,
+    base: { table: DUAL_TABLE, alias: DUAL_TABLE },
+    joins: [],
+    select: [{ expression, alias: "value" }],
+    predicates: [],
+    groupBy: [],
+    having: [],
+    orderBy: [],
+  };
+  let inferred: SqlColumnType | undefined;
+  try {
+    inferred = inferBlockSchema(plan, new Map())[0]?.type;
+  } catch (error) {
+    if (!(error instanceof TypeError) || !error.message.startsWith("Cannot infer a column type")) {
+      throw error;
+    }
+  }
+  // A bare NULL is polymorphic in PostgreSQL; the destination column supplies its type.
+  if (
+    inferred !== undefined &&
+    inferred !== target.type &&
+    !(target.sqlDomain?.kind === "numeric" && inferred === "number")
+  ) {
+    throw new TypeError(
+      `DEFAULT ${target.name} produces ${inferred}, but the column is ${target.type}`,
+    );
+  }
 }
 
 /**
@@ -1443,7 +1678,9 @@ export function compileStatement(sql: string): CompiledStatement {
       keyword === "BEGIN" ||
       keyword === "START" ||
       keyword === "COMMIT" ||
-      keyword === "ROLLBACK"
+      keyword === "ROLLBACK" ||
+      keyword === "SAVEPOINT" ||
+      keyword === "RELEASE"
     ) {
       return parseTransactionStatement(keyword, tokens);
     }
@@ -1461,6 +1698,42 @@ export function compileStatement(sql: string): CompiledStatement {
     }
     if (keyword === "CREATE") {
       if (isTriggerDdl) return parseCreateTrigger(text, tokens);
+      if (second?.kind === "identifier" && second.text.toUpperCase() === "TYPE") {
+        const name = tokens[2];
+        if (name?.kind !== "identifier") throw new TypeError("CREATE TYPE needs a name");
+        const as = tokens[3];
+        const enumToken = tokens[4];
+        if (
+          as?.kind !== "identifier" ||
+          as.text.toUpperCase() !== "AS" ||
+          enumToken?.kind !== "identifier" ||
+          enumToken.text.toUpperCase() !== "ENUM" ||
+          tokens[5]?.text !== "("
+        ) {
+          throw new TypeError("CREATE TYPE supports AS ENUM (...)");
+        }
+        const values: string[] = [];
+        let index = 6;
+        for (;;) {
+          const value = tokens[index];
+          if (value?.kind !== "string") throw new TypeError("ENUM values must be string literals");
+          values.push(value.text);
+          index += 1;
+          if (tokens[index]?.text === ")") break;
+          if (tokens[index]?.text !== ",") throw new TypeError("Expected comma in ENUM values");
+          index += 1;
+        }
+        if (tokens[index + 1]?.kind !== "eof") throw new TypeError("Unexpected input after ENUM");
+        return { kind: "create-enum", name: name.text, values };
+      }
+      if (second?.kind === "identifier" && second.text.toUpperCase() === "SEQUENCE") {
+        const name = tokens[2];
+        if (name?.kind !== "identifier") throw new TypeError("CREATE SEQUENCE needs a name");
+        if (tokens[3]?.kind !== "eof") {
+          throw new TypeError("CREATE SEQUENCE options are not supported yet");
+        }
+        return { kind: "create-sequence", name: name.text };
+      }
       const viewAt = second?.text.toUpperCase() === "OR" ? 3 : 1;
       if (tokens[viewAt]?.kind === "identifier" && tokens[viewAt].text.toUpperCase() === "VIEW") {
         return parseCreateView(text, tokens, viewAt === 3);
@@ -1477,7 +1750,7 @@ export function compileStatement(sql: string): CompiledStatement {
       return statement;
     }
     if (keyword === "ALTER") {
-      parser = new Parser(tokens);
+      parser = new Parser(tokens, text);
       return parser.parseAlterTable();
     }
     if (keyword === "DROP") {
@@ -1815,6 +2088,9 @@ function bindExpression(expression: Expression, values: readonly QueryValue[]): 
   }
   if (expression.kind === "call") {
     expression.arguments = expression.arguments.map((argument) => bindExpression(argument, values));
+    for (const order of expression.aggregateOrderBy ?? []) {
+      order.expression = bindExpression(order.expression, values);
+    }
     return expression;
   }
   if (expression.kind === "list") {
@@ -1931,7 +2207,9 @@ export function bindPlanParameters(
 }
 
 function isParameterSlot(value: InsertValue): value is { parameter: number } {
-  return typeof value === "object" && value !== null && !(value instanceof Date);
+  return (
+    typeof value === "object" && value !== null && !(value instanceof Date) && "parameter" in value
+  );
 }
 
 /** The mutation-statement counterpart of bindPlanParameters; SELECTs bind through their plan. */
@@ -1947,6 +2225,8 @@ export function bindStatementParameters(
   }
   if (
     statement.kind === "create-table" ||
+    statement.kind === "create-enum" ||
+    statement.kind === "create-sequence" ||
     statement.kind === "create-trigger" ||
     statement.kind === "drop-trigger"
   ) {
@@ -1964,6 +2244,9 @@ export function bindStatementParameters(
       for (const assignment of clone.onConflict.assignments) {
         assignment.expression = bindExpression(assignment.expression, values);
       }
+    }
+    if (clone.onConflict?.where !== undefined) {
+      clone.onConflict.where = bindExpression(clone.onConflict.where, values);
     }
     return clone;
   }
@@ -2014,6 +2297,8 @@ export interface SqlColumnSchema {
   type: SqlColumnType;
   /** Exact SQL whole-number domain, physically stored as a safe JavaScript number. */
   integer?: true;
+  /** Logical SQL domain when the stable physical representation alone is not semantic. */
+  sqlDomain?: SqlDomain;
 }
 
 /**
@@ -2028,11 +2313,14 @@ export function inferBlockSchema(
   const sources = [plan.base, ...plan.joins];
   const multipleSources = sources.length > 1;
   const wildcardSchema = (source: TableSource): SqlColumnSchema[] =>
-    (schemas.get(source.table) ?? []).map((column) => ({
-      name: multipleSources ? `${source.alias}.${column.name}` : column.name,
-      type: column.type,
-      ...(column.integer === true ? { integer: true } : {}),
-    }));
+    (schemas.get(source.table) ?? [])
+      .filter((column) => !column.name.startsWith("\0"))
+      .map((column) => ({
+        name: multipleSources ? `${source.alias}.${column.name}` : column.name,
+        type: column.type,
+        ...(column.integer === true ? { integer: true } : {}),
+        ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+      }));
   if (
     plan.select[0]?.expression.kind === "wildcard" &&
     plan.select[0].expression.table === undefined
@@ -2068,6 +2356,74 @@ export function inferBlockSchema(
       (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[0]),
     );
     return matches.length === 1 && matches[0]?.integer === true;
+  };
+  const resolveColumnDomain = (reference: string): SqlDomain | undefined => {
+    const parts = reference.split(".");
+    if (parts.length === 2) {
+      const source = sources.find(({ alias }) => alias === parts[0]);
+      return source === undefined
+        ? undefined
+        : (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1])?.sqlDomain;
+    }
+    const matches = sources.flatMap((source) =>
+      (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[0]),
+    );
+    return matches.length === 1 ? matches[0]?.sqlDomain : undefined;
+  };
+  const castDomain = (target: string): SqlDomain | undefined => {
+    if (target.startsWith("numeric:")) {
+      const [, precisionWord = "", scaleWord = ""] = target.split(":");
+      const precision = precisionWord === "" ? undefined : Number(precisionWord);
+      const scale = scaleWord === "" ? undefined : Number(scaleWord);
+      return {
+        kind: "numeric",
+        ...(precision === undefined ? {} : { precision }),
+        ...(scale === undefined ? {} : { scale }),
+      };
+    }
+    if (target === "json" || target === "jsonb" || target === "uuid" || target === "time") {
+      return { kind: target };
+    }
+    if (target === "interval") return { kind: "interval" };
+    return undefined;
+  };
+  const inferDomain = (expression: Expression): SqlDomain | undefined => {
+    if (expression.kind === "literal") return expression.sqlDomain;
+    if (expression.kind === "column") return resolveColumnDomain(expression.reference);
+    if (expression.kind === "binary") {
+      const left = inferDomain(expression.left);
+      const right = inferDomain(expression.right);
+      return left?.kind === "numeric" || right?.kind === "numeric"
+        ? { kind: "numeric" }
+        : undefined;
+    }
+    if (expression.kind === "case") {
+      const outcomes = [
+        ...expression.branches.map((branch) => branch.then),
+        ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+      ];
+      return outcomes.map(inferDomain).find((domain) => domain !== undefined);
+    }
+    if (expression.kind !== "call") return undefined;
+    if (expression.name === "CAST") {
+      const target = expression.arguments[1];
+      return target?.kind === "literal" && typeof target.value === "string"
+        ? castDomain(target.value)
+        : undefined;
+    }
+    if (
+      expression.name === "SUM" ||
+      expression.name === "AVG" ||
+      expression.name === "MIN" ||
+      expression.name === "MAX" ||
+      expression.name === "COALESCE" ||
+      expression.name === "NULLIF" ||
+      expression.name === "GREATEST" ||
+      expression.name === "LEAST"
+    ) {
+      return expression.arguments.map(inferDomain).find((domain) => domain !== undefined);
+    }
+    return undefined;
   };
   const infer = (expression: Expression): SqlColumnType | "null" => {
     if (expression.kind === "subquery" || expression.kind === "list") {
@@ -2138,16 +2494,20 @@ export function inferBlockSchema(
         }
         return "string";
       }
+      const exactNumeric = inferDomain(expression)?.kind === "numeric";
       for (const side of [expression.left, expression.right]) {
         const type = infer(side);
-        if (type === "string" || type === "boolean") {
+        if (type === "boolean" || (type === "string" && inferDomain(side)?.kind !== "numeric")) {
           throw new TypeError(`Arithmetic requires numeric operands: ${plan.sql}`);
         }
       }
+      return exactNumeric ? "string" : "number";
+    }
+    if (expression.name === "COUNT") {
       return "number";
     }
-    if (expression.name === "COUNT" || expression.name === "SUM" || expression.name === "AVG") {
-      return "number";
+    if (expression.name === "SUM" || expression.name === "AVG") {
+      return inferDomain(expression)?.kind === "numeric" ? "string" : "number";
     }
     if (
       expression.name === "ROUND" ||
@@ -2161,16 +2521,24 @@ export function inferBlockSchema(
       expression.name === "INSTR" ||
       expression.name === "EXTRACT" ||
       expression.name === "OCTET_LENGTH" ||
-      expression.name === "GROUPING"
+      expression.name === "GROUPING" ||
+      expression.name === "NEXTVAL" ||
+      expression.name === "CURRVAL" ||
+      expression.name === "RANDOM"
     ) {
       return "number";
     }
     if (
       expression.name === "JSON_ARRAYAGG" ||
+      expression.name === "STRING_AGG" ||
       expression.name === "JSON_VALUE" ||
       expression.name === "JSON_QUERY" ||
       expression.name === "JSON_OBJECT" ||
-      expression.name === "JSON_ARRAY"
+      expression.name === "JSON_ARRAY" ||
+      expression.name === "ARRAY" ||
+      expression.name === "MINNOW_TUPLE_KEY" ||
+      expression.name === "MINNOW_COLLATE" ||
+      expression.name === "GEN_RANDOM_UUID"
     ) {
       return "string";
     }
@@ -2179,8 +2547,8 @@ export function inferBlockSchema(
     if (expression.name === "CURRENT_DATE" || expression.name === "CURRENT_TIMESTAMP") {
       return "datetime";
     }
-    // The engine has no TIME type, so LOCALTIME reads as an 'HH:MM:SS' string, like SQLite's
-    // CURRENT_TIME.
+    // LOCALTIME is the statement clock's canonical 'HH:MM:SS' text; explicit TIME values use
+    // the same public representation while carrying a logical domain internally.
     if (expression.name === "LOCALTIME") return "string";
     if (
       expression.name === "NULLIF" ||
@@ -2204,6 +2572,7 @@ export function inferBlockSchema(
       const word =
         target?.kind === "literal" && typeof target.value === "string" ? target.value : "";
       if (word === "number-integer") return "number";
+      if (castDomain(word) !== undefined) return "string";
       if (word === "number" || word === "string" || word === "boolean" || word === "datetime") {
         return word;
       }
@@ -2263,8 +2632,62 @@ export function inferBlockSchema(
         item.expression.arguments[1]?.kind === "literal" &&
         item.expression.arguments[1].value === "number-integer") ||
       (item.expression.kind === "call" && item.expression.name === "COUNT");
-    return [{ name: item.alias, type, ...(integer ? { integer: true } : {}) }];
+    const sqlDomain = inferDomain(item.expression);
+    return [
+      {
+        name: item.alias,
+        type,
+        ...(integer ? { integer: true } : {}),
+        ...(sqlDomain === undefined ? {} : { sqlDomain }),
+      },
+    ];
   });
+}
+
+/** Whether a final result can contain one of the engine's tagged string-domain values. */
+export function queryResultNeedsExternalization(
+  plan: CompiledQuery,
+  schemas: ReadonlyMap<string, readonly SqlColumnSchema[]>,
+): boolean {
+  // This is only a result-boundary optimization flag, not a second typecheck. In particular,
+  // PostgreSQL permits an untyped NULL output and Minnow historically permits heterogeneous CASE
+  // results, so calling inferBlockSchema here would make execution stricter just because tagged
+  // domains exist elsewhere in the engine. Be conservative instead: externalization is a cheap
+  // prefix check, and only domain-bearing schemas or expressions pay it.
+  const createsDomain = (expression: Expression): boolean => {
+    if (expression.kind === "literal" && expression.internalSqlValue === true) return true;
+    if (expression.kind === "call") {
+      if (expression.name === "ARRAY" || expression.name === "MINNOW_COLLATE") return true;
+      if (expression.name === "CAST") {
+        const target = expression.arguments[1];
+        if (
+          target?.kind === "literal" &&
+          typeof target.value === "string" &&
+          (target.value.startsWith("numeric:") ||
+            ["json", "jsonb", "uuid", "time", "interval"].includes(target.value))
+        ) {
+          return true;
+        }
+      }
+    }
+    return childExpressions(expression).some(createsDomain);
+  };
+  try {
+    // Plain TEXT uses a protected execution-time wrapper when it happens to share the internal
+    // domain namespace, so string outputs cross the same boundary as logical SQL domains.
+    return inferBlockSchema(plan, schemas).some(
+      (column) => column.type === "string" || column.sqlDomain !== undefined,
+    );
+  } catch {
+    // This flag must not make execution stricter for historically accepted shapes such as an
+    // untyped NULL or heterogeneous CASE. When exact inference cannot answer, scan if any source
+    // or expression could carry an internal string; externalization itself remains copy-on-change.
+    return (
+      [...schemas.values()].some((columns) =>
+        columns.some((column) => column.type === "string" || column.sqlDomain !== undefined),
+      ) || plan.select.some(({ expression }) => createsDomain(expression))
+    );
+  }
 }
 
 export function referencedColumns(
@@ -2318,8 +2741,12 @@ export function referencedColumns(
       const named = expression.table;
       for (const source of sources) {
         if (named !== undefined && source.alias !== named) continue;
-        for (const column of schemas.get(source.table) ?? [])
+        for (const column of schemas.get(source.table) ?? []) {
+          // Storage may carry unspellable NUL-prefixed locator columns for composite identity.
+          // Explicit internal references can request one; SQL wildcards are public schema only.
+          if (column.startsWith("\u0000")) continue;
           requested.get(source.table)?.add(column);
+        }
       }
     }
   };
@@ -2417,11 +2844,15 @@ export function createPreparedQuery(
   const ties = withTiesPlan(plan);
   if (ties.plan !== plan)
     return trimPreparedResults(createPreparedQuery(ties.plan, tables, options), ties.trim);
+  // Rows passed to this low-level public entry point are public SQL values. Escape the private
+  // string-domain namespace before derived blocks add their own already-internal results. This
+  // comes after WITH TIES lowering because that lowering recursively prepares the same input.
+  tables = cloneRowTables(tables, true);
   // Every engine entry expands MATCH(*) exactly once, here against the row tables' own
   // columns; past this point no executor sees the "*" sentinel.
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
-  for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
+  for (const step of resolution.steps) step.substitute(executeRowQueryInternal(step.block, tables));
   plan = resolution.plan;
   tables = resolveDerivedRowTables(plan, tables);
   plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
@@ -2436,7 +2867,10 @@ export function createPreparedQuery(
     return createPreparedRowQuery(plan, tables, memory);
   }
   try {
-    return createPreparedColumnarQuery(plan, normalizeColumnarTables(plan, tables), memory);
+    return trimPreparedResults(
+      createPreparedColumnarQuery(plan, normalizeColumnarTables(plan, tables), memory),
+      externalizeQueryResult,
+    );
   } catch (error) {
     memory.close();
     throw error;
@@ -2448,7 +2882,11 @@ export function createPreparedColumnarQuery(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, ColumnarTable>,
   memory: QueryMemoryContext = new QueryMemoryContext(),
-  options: { ftsStats?: ReadonlyMap<string, FtsStats> } = {},
+  options: {
+    ftsStats?: ReadonlyMap<string, FtsStats>;
+    /** False only when catalog-backed schema inference proves every output is already public. */
+    outputNeedsExternalization?: boolean;
+  } = {},
 ): PreparedQuery {
   plan = resolveStatementDatetimes(plan);
   const ties = withTiesPlan(plan);
@@ -2478,6 +2916,7 @@ export function createPreparedColumnarQuery(
     memory.close();
     throw error;
   }
+  const outputNeedsExternalization = options.outputNeedsExternalization;
   return {
     sql: plan.sql,
     tables: [plan.base.table, ...plan.joins.map((join) => join.table)],
@@ -2486,11 +2925,14 @@ export function createPreparedColumnarQuery(
     },
     execute() {
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
-      return prepared.execute();
+      return markExternalizationState(prepared.execute(), outputNeedsExternalization);
     },
     async executeAsync(options) {
       if (closed || prepared === undefined) throw new Error("Prepared query is closed");
-      return prepared.executeAsync(options);
+      return markExternalizationState(
+        await prepared.executeAsync(options),
+        outputNeedsExternalization,
+      );
     },
     close() {
       if (closed) return;
@@ -2517,11 +2959,11 @@ function createPreparedRowQuery(
     },
     execute() {
       if (closed || rows === undefined) throw new Error("Prepared query is closed");
-      return executeRowQuery(plan, cloneRowTables(rows));
+      return externalizeQueryResult(executeRowQueryInternal(plan, cloneRowTables(rows)));
     },
     async executeAsync() {
       if (closed || rows === undefined) throw new Error("Prepared query is closed");
-      return executeRowQuery(plan, cloneRowTables(rows));
+      return externalizeQueryResult(executeRowQueryInternal(plan, cloneRowTables(rows)));
     },
     close() {
       closed = true;
@@ -2533,6 +2975,7 @@ function createPreparedRowQuery(
 
 function cloneRowTables(
   tables: ReadonlyMap<string, DatabaseRow[]>,
+  protectText = false,
 ): ReadonlyMap<string, DatabaseRow[]> {
   return new Map(
     [...tables].map(([name, rows]) => [
@@ -2541,7 +2984,11 @@ function cloneRowTables(
         Object.fromEntries(
           Object.entries(row).map(([column, value]) => [
             column,
-            value instanceof Date ? new Date(value.getTime()) : value,
+            value instanceof Date
+              ? new Date(value.getTime())
+              : protectText && typeof value === "string"
+                ? protectedSqlTextValue(value)
+                : value,
           ]),
         ),
       ),
@@ -2556,7 +3003,7 @@ export function executeQuery(
 ): QueryResult {
   const prepared = createPreparedQuery(plan, tables, options);
   try {
-    return prepared.execute();
+    return externalizeQueryResult(prepared.execute());
   } finally {
     prepared.close();
   }
@@ -2711,7 +3158,12 @@ export function createRecursiveCteState(base: QueryResult, all: boolean): Recurs
 /** The direct child expressions of a node; subqueries and EXISTS scope their own blocks. */
 export function childExpressions(expression: Expression): Expression[] {
   if (expression.kind === "binary") return [expression.left, expression.right];
-  if (expression.kind === "call") return [...expression.arguments];
+  if (expression.kind === "call") {
+    return [
+      ...expression.arguments,
+      ...(expression.aggregateOrderBy ?? []).map((order) => order.expression),
+    ];
+  }
   if (expression.kind === "list") return [...expression.items];
   if (expression.kind === "condition" || expression.kind === "logical") {
     return [expression.left, expression.right];
@@ -2752,7 +3204,18 @@ export function mapChildExpressions(
   }
   if (expression.kind === "not") return { ...expression, operand: map(expression.operand) };
   if (expression.kind === "call") {
-    return { ...expression, arguments: expression.arguments.map(map) };
+    return {
+      ...expression,
+      arguments: expression.arguments.map(map),
+      ...(expression.aggregateOrderBy === undefined
+        ? {}
+        : {
+            aggregateOrderBy: expression.aggregateOrderBy.map((order) => ({
+              ...order,
+              expression: map(order.expression),
+            })),
+          }),
+    };
   }
   if (expression.kind === "list") return { ...expression, items: expression.items.map(map) };
   if (expression.kind === "case") {
@@ -3017,6 +3480,20 @@ function aggregateWindowMembers(
   if (window.name === "NTH_VALUE") return values[members[(window.offset ?? 1) - 1] ?? -1] ?? null;
   if (present.length === 0) return null;
   if (window.name === "SUM" || window.name === "AVG") {
+    const exact = present.some((member) => isExactNumeric(values[member]));
+    if (exact) {
+      let total = exactNumericValue(0);
+      for (const member of present) {
+        const value = values[member];
+        if (!isExactNumeric(value)) {
+          throw new TypeError("Exact NUMERIC window input mixed with an approximate number");
+        }
+        const next = exactNumericBinary("+", total, value);
+        if (next === null || next === undefined) throw new Error("Exact NUMERIC sum disappeared");
+        total = next;
+      }
+      return window.name === "SUM" ? total : exactNumericBinary("/", total, present.length);
+    }
     const total = present.reduce<number>((sum, member) => sum + numeric(values[member]), 0);
     return window.name === "SUM" ? total : total / present.length;
   }
@@ -3096,8 +3573,6 @@ function applyAggregateWindowPartition(
     }
   }
   const values: unknown[] = [];
-  const prefixNonNull = new Float64Array(size + 1);
-  const prefixSum = new Float64Array(size + 1);
   const sums = window.name === "SUM" || window.name === "AVG";
   for (let position = 0; position < size; position += 1) {
     const value =
@@ -3105,9 +3580,29 @@ function applyAggregateWindowPartition(
         ? undefined
         : (rows[indexes[start + position] ?? -1]?.[window.argumentAlias] ?? null);
     values.push(value);
+  }
+  const exactSums = sums && values.some((value) => isExactNumeric(value));
+  const prefixNonNull = new Float64Array(size + 1);
+  const prefixSum = exactSums ? undefined : new Float64Array(size + 1);
+  const prefixExact = exactSums ? new Array<string>(size + 1) : undefined;
+  const exactZero = exactNumericValue(0);
+  if (exactZero === null) throw new Error("Exact NUMERIC zero disappeared");
+  if (prefixExact !== undefined) prefixExact[0] = exactZero;
+  for (let position = 0; position < size; position += 1) {
+    const value = values[position];
     const nonNull = window.argumentAlias !== undefined && value !== null && value !== undefined;
     prefixNonNull[position + 1] = (prefixNonNull[position] ?? 0) + (nonNull ? 1 : 0);
-    prefixSum[position + 1] = (prefixSum[position] ?? 0) + (sums && nonNull ? numeric(value) : 0);
+    if (prefixExact !== undefined) {
+      if (nonNull && !isExactNumeric(value)) {
+        throw new TypeError("Exact NUMERIC window input mixed with an approximate number");
+      }
+      const previous = prefixExact[position] ?? exactZero;
+      const next = nonNull ? exactNumericBinary("+", previous, value) : previous;
+      if (next === null || next === undefined) throw new Error("Exact NUMERIC sum disappeared");
+      prefixExact[position + 1] = next;
+    } else if (prefixSum !== undefined) {
+      prefixSum[position + 1] = (prefixSum[position] ?? 0) + (sums && nonNull ? numeric(value) : 0);
+    }
   }
   // GROUPS frames count peer groups rather than rows, so each position needs its group's
   // ordinal and the group boundaries to translate an offset back into row positions.
@@ -3206,8 +3701,19 @@ function applyAggregateWindowPartition(
           : (prefixNonNull[high] ?? 0) - (prefixNonNull[low] ?? 0);
     } else if (sums) {
       const nonNull = (prefixNonNull[high] ?? 0) - (prefixNonNull[low] ?? 0);
-      const total = (prefixSum[high] ?? 0) - (prefixSum[low] ?? 0);
-      value = nonNull === 0 ? null : window.name === "SUM" ? total : total / nonNull;
+      if (nonNull === 0) {
+        value = null;
+      } else if (prefixExact !== undefined) {
+        const total = exactNumericBinary(
+          "-",
+          prefixExact[high] ?? exactZero,
+          prefixExact[low] ?? exactZero,
+        );
+        value = window.name === "SUM" ? total : exactNumericBinary("/", total, nonNull);
+      } else {
+        const total = (prefixSum?.[high] ?? 0) - (prefixSum?.[low] ?? 0);
+        value = window.name === "SUM" ? total : total / nonNull;
+      }
     } else {
       let best: unknown;
       for (let member = low; member < high; member += 1) {
@@ -3458,27 +3964,27 @@ function resolveDerivedRowTables(
   for (const source of sources) {
     if (source.recursive !== undefined) {
       const { reference, base, step, all } = source.recursive;
-      const state = createRecursiveCteState(executeRowQuery(base, tables), all);
+      const state = createRecursiveCteState(executeRowQueryInternal(base, tables), all);
       while (state.frontier.length > 0) {
         const stepTables = new Map(tables);
         stepTables.set(reference, state.frontier);
-        state.absorb(executeRowQuery(step, stepTables));
+        state.absorb(executeRowQueryInternal(step, stepTables));
       }
       resolved.set(source.table, state.rows);
       continue;
     }
     if (source.union !== undefined) {
-      const results = source.union.blocks.map((block) => executeRowQuery(block, tables));
+      const results = source.union.blocks.map((block) => executeRowQueryInternal(block, tables));
       resolved.set(source.table, combineUnionResults(results, source.union.ops).rows);
       continue;
     }
     if (source.windowed !== undefined) {
-      const inner = executeRowQuery(source.windowed.block, tables);
+      const inner = executeRowQueryInternal(source.windowed.block, tables);
       resolved.set(source.table, applyWindowFunctions(inner, source.windowed.windows).rows);
       continue;
     }
     if (source.derived === undefined) continue;
-    resolved.set(source.table, executeRowQuery(source.derived, tables).rows);
+    resolved.set(source.table, executeRowQueryInternal(source.derived, tables).rows);
   }
   return resolved;
 }
@@ -3500,13 +4006,20 @@ function normalizeColumnarTables(
       .filter(([name]) => requiredTables.has(name))
       .map(([name, table]) => [
         name,
-        columnarTableFromRows(name, table, requestedColumns.get(name) ?? []),
+        columnarTableFromRows(name, table, requestedColumns.get(name) ?? [], false),
       ]),
   );
 }
 
 /** Correctness reference retained while the vector executor matures. */
 export function executeRowQuery(
+  plan: CompiledQuery,
+  tables: ReadonlyMap<string, DatabaseRow[]>,
+): QueryResult {
+  return externalizeQueryResult(executeRowQueryInternal(plan, cloneRowTables(tables, true)));
+}
+
+function executeRowQueryInternal(
   plan: CompiledQuery,
   tables: ReadonlyMap<string, DatabaseRow[]>,
 ): QueryResult {
@@ -3520,7 +4033,9 @@ export function executeRowQuery(
   plan = ties.plan;
   plan = expandFtsColumns(plan, rowTableSearchableColumns(tables));
   const resolution = subqueryResolutionSteps(plan);
-  for (const step of resolution.steps) step.substitute(executeRowQuery(step.block, tables));
+  for (const step of resolution.steps) {
+    step.substitute(executeRowQueryInternal(step.block, tables));
+  }
   // Stats annotation writes into the plan; when resolution had nothing to clone, the plan is
   // still the caller's (possibly cached) object, and frozen statistics would survive into later
   // executions against different rows.
@@ -3584,12 +4099,13 @@ export function executeRowQuery(
         : [];
     const sortColumns = plan.orderBy.map(({ expression, direction, nulls }) => ({
       outputName: orderOutputName(expression, plan.select, orderSources),
+      direction,
       multiplier: direction === "desc" ? -1 : 1,
       nulls,
     }));
     rows.sort((left, right) => {
-      for (const { outputName, multiplier, nulls } of sortColumns) {
-        const placed = explicitNullOrder(left[outputName], right[outputName], nulls);
+      for (const { outputName, direction, multiplier, nulls } of sortColumns) {
+        const placed = nullOrder(left[outputName], right[outputName], nulls, direction);
         if (placed !== undefined && placed !== 0) return placed;
         const comparison = compareValues(left[outputName], right[outputName]);
         if (comparison !== 0) return comparison * multiplier;
@@ -3767,7 +4283,9 @@ function project(
 function evaluate(expression: Expression, context: RowContext, group?: RowContext[]): unknown {
   switch (expression.kind) {
     case "literal":
-      return expression.value;
+      return typeof expression.value === "string" && expression.internalSqlValue !== true
+        ? protectedSqlTextValue(expression.value)
+        : expression.value;
     case "parameter":
       throw new TypeError(
         `Placeholder $${String(expression.index + 1)} is unbound; pass parameters when executing`,
@@ -3821,8 +4339,12 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (typeof left !== "string" || typeof right !== "string") {
           throw new TypeError("|| requires string operands");
         }
-        return left + right;
+        return protectedSqlTextValue(
+          String(externalSqlDomainValue(left)) + String(externalSqlDomainValue(right)),
+        );
       }
+      const exact = exactNumericBinary(expression.operator, left, right);
+      if (exact !== undefined) return exact;
       const a = numeric(left);
       const b = numeric(right);
       if (expression.operator === "+") return a + b;
@@ -3837,6 +4359,63 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
         if (group === undefined)
           throw new TypeError(`${expression.name} requires grouped execution`);
         const argument = expression.arguments[0] ?? { kind: "wildcard" as const };
+        if (expression.name === "STRING_AGG") {
+          const delimiter = expression.arguments[1];
+          if (delimiter === undefined) throw new TypeError("STRING_AGG requires a delimiter");
+          let members = group.flatMap((row) => {
+            const value = evaluate(argument, row);
+            if (value === null || value === undefined) return [];
+            if (typeof value !== "string") {
+              throw new TypeError("STRING_AGG value must be a string");
+            }
+            const separator = evaluate(delimiter, row);
+            if (separator !== null && separator !== undefined && typeof separator !== "string") {
+              throw new TypeError("STRING_AGG delimiter must be a string");
+            }
+            return [
+              {
+                value,
+                delimiter: separator ?? "",
+                order: (expression.aggregateOrderBy ?? []).map((item) =>
+                  evaluate(item.expression, row),
+                ),
+              },
+            ];
+          });
+          if (expression.distinct === true) {
+            const seen = new Set<string>();
+            members = members.filter((member) => {
+              const key = JSON.stringify([member.value, member.delimiter]);
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          }
+          if ((expression.aggregateOrderBy?.length ?? 0) > 0) {
+            members.sort((left, right) => {
+              for (const [index, order] of (expression.aggregateOrderBy ?? []).entries()) {
+                const a = left.order[index];
+                const b = right.order[index];
+                const placed = nullOrder(a, b, order.nulls, order.direction);
+                if (placed !== undefined && placed !== 0) return placed;
+                const compared = compareValues(a, b);
+                if (compared !== 0) return order.direction === "desc" ? -compared : compared;
+              }
+              return 0;
+            });
+          }
+          if (members.length === 0) return null;
+          return protectedSqlTextValue(
+            members
+              .map((member, index) =>
+                index === 0
+                  ? String(externalSqlDomainValue(member.value))
+                  : String(externalSqlDomainValue(member.delimiter)) +
+                    String(externalSqlDomainValue(member.value)),
+              )
+              .join(""),
+          );
+        }
         let values =
           argument.kind === "wildcard"
             ? group.map(() => 1)
@@ -3854,14 +4433,14 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
           });
         }
         if (expression.name === "COUNT") return values.length;
-        if (expression.name === "SUM")
-          return values.length === 0
-            ? null
-            : values.reduce<number>((sum, value) => sum + numeric(value), 0);
+        if (expression.name === "SUM") return values.length === 0 ? null : sumNumericValues(values);
         if (expression.name === "AVG")
           return values.length === 0
             ? null
-            : values.reduce<number>((sum, value) => sum + numeric(value), 0) / values.length;
+            : (() => {
+                const sum = sumNumericValues(values);
+                return exactNumericBinary("/", sum, values.length) ?? numeric(sum) / values.length;
+              })();
         if (expression.name === "JSON_ARRAYAGG") {
           return values.length === 0
             ? null
@@ -3905,7 +4484,9 @@ function evaluatePredicate(predicate: Predicate, context: RowContext): boolean {
     predicate.operator === "LIKE" ||
     predicate.operator === "NOT LIKE" ||
     predicate.operator === "ILIKE" ||
-    predicate.operator === "NOT ILIKE"
+    predicate.operator === "NOT ILIKE" ||
+    predicate.operator === "SIMILAR TO" ||
+    predicate.operator === "NOT SIMILAR TO"
   ) {
     return (
       evaluateBooleanExpression(
@@ -4168,7 +4749,7 @@ export function distinctFromComparison(left: unknown, right: unknown): boolean {
   const leftNull = left === null || left === undefined;
   const rightNull = right === null || right === undefined;
   if (leftNull || rightNull) return leftNull !== rightNull;
-  return comparable(left) !== comparable(right);
+  return compareValues(comparable(left), comparable(right)) !== 0;
 }
 
 /**
@@ -4242,23 +4823,30 @@ export function evaluateBooleanExpression(
       operator === "LIKE" ||
       operator === "NOT LIKE" ||
       operator === "ILIKE" ||
-      operator === "NOT ILIKE"
+      operator === "NOT ILIKE" ||
+      operator === "SIMILAR TO" ||
+      operator === "NOT SIMILAR TO"
     ) {
-      const value = evaluateValue(expression.left);
-      const pattern = evaluateValue(expression.right);
+      const value = externalSqlDomainValue(evaluateValue(expression.left));
+      const pattern = externalSqlDomainValue(evaluateValue(expression.right));
       if (value === null || value === undefined || pattern === null || pattern === undefined) {
         return null;
       }
       if (typeof value !== "string" || typeof pattern !== "string") {
         throw new TypeError("LIKE requires string operands");
       }
-      const matched = likeMatches(
-        pattern,
-        value,
-        operator === "ILIKE" || operator === "NOT ILIKE",
-        expression.escape,
-      );
-      return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
+      const similar = operator === "SIMILAR TO" || operator === "NOT SIMILAR TO";
+      const matched = similar
+        ? compileSimilarPattern(pattern, expression.escape ?? "\\").test(value)
+        : likeMatches(
+            pattern,
+            value,
+            operator === "ILIKE" || operator === "NOT ILIKE",
+            expression.escape,
+          );
+      return operator === "LIKE" || operator === "ILIKE" || operator === "SIMILAR TO"
+        ? matched
+        : !matched;
     }
     if (operator === "IS DISTINCT FROM" || operator === "IS NOT DISTINCT FROM") {
       const distinct = distinctFromComparison(
@@ -4272,8 +4860,8 @@ export function evaluateBooleanExpression(
     if (left === null || left === undefined || right === null || right === undefined) return null;
     const a = comparable(left);
     const b = comparable(right);
-    if (operator === "=") return a === b;
-    if (operator === "!=" || operator === "<>") return a !== b;
+    if (operator === "=") return compareValues(a, b) === 0;
+    if (operator === "!=" || operator === "<>") return compareValues(a, b) !== 0;
     const comparison = compareValues(a, b);
     if (operator === ">") return comparison > 0;
     if (operator === ">=") return comparison >= 0;
@@ -4302,8 +4890,12 @@ function comparisonHolds(
     operator === "LIKE" ||
     operator === "NOT LIKE" ||
     operator === "ILIKE" ||
-    operator === "NOT ILIKE"
+    operator === "NOT ILIKE" ||
+    operator === "SIMILAR TO" ||
+    operator === "NOT SIMILAR TO"
   ) {
+    leftValue = externalSqlDomainValue(leftValue);
+    rightValue = externalSqlDomainValue(rightValue);
     if (
       leftValue === null ||
       leftValue === undefined ||
@@ -4315,12 +4907,13 @@ function comparisonHolds(
     if (typeof leftValue !== "string" || typeof rightValue !== "string") {
       throw new TypeError("LIKE requires string operands");
     }
-    const matched = likeMatches(
-      rightValue,
-      leftValue,
-      operator === "ILIKE" || operator === "NOT ILIKE",
-    );
-    return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
+    const similar = operator === "SIMILAR TO" || operator === "NOT SIMILAR TO";
+    const matched = similar
+      ? compileSimilarPattern(rightValue).test(leftValue)
+      : likeMatches(rightValue, leftValue, operator === "ILIKE" || operator === "NOT ILIKE");
+    return operator === "LIKE" || operator === "ILIKE" || operator === "SIMILAR TO"
+      ? matched
+      : !matched;
   }
   if (
     leftValue === null ||
@@ -4331,8 +4924,8 @@ function comparisonHolds(
     return false;
   const left = comparable(leftValue);
   const right = comparable(rightValue);
-  if (operator === "=") return left === right;
-  if (operator === "!=" || operator === "<>") return left !== right;
+  if (operator === "=") return compareValues(left, right) === 0;
+  if (operator === "!=" || operator === "<>") return compareValues(left, right) !== 0;
   const comparison = compareValues(left, right);
   if (operator === ">") return comparison > 0;
   if (operator === ">=") return comparison >= 0;
@@ -4410,7 +5003,7 @@ function validateGrouping(plan: CompiledQuery): void {
   const groupExpressions = new Set(plan.groupBy.map((expression) => JSON.stringify(expression)));
   for (const item of plan.select) {
     if (hasAggregate(item.expression)) continue;
-    // A constant expression is the same for every group, as standard SQL allows. A full-text
+    // A constant expression is the same for every group, as PostgreSQL allows. A full-text
     // node is never constant — MATCH(*) carries no column children before expansion, but it
     // reads every searchable column of its row.
     if (
@@ -4460,28 +5053,40 @@ function comparable(value: unknown): unknown {
 }
 
 /**
- * Resolves an explicit NULLS FIRST/LAST placement for one order term. Returns undefined when
- * no explicit placement applies (either none was requested or neither side is NULL); otherwise
- * the signed placement, which is absolute — direction negation must not apply to it. Two NULLs
- * return 0 so the comparison falls through to the next term.
+ * Resolves NULL placement for one order term. An omitted placement follows PostgreSQL: NULLS LAST
+ * for ASC and NULLS FIRST for DESC. Returns undefined when neither side is NULL; otherwise the
+ * signed placement is absolute, so direction negation must not apply to it. Two NULLs return 0
+ * so comparison falls through to the next term.
  */
-export function explicitNullOrder(
+export function nullOrder(
   left: unknown,
   right: unknown,
   nulls: "first" | "last" | undefined,
+  direction: "asc" | "desc",
 ): number | undefined {
-  if (nulls === undefined) return undefined;
   const leftNull = left === null || left === undefined;
   const rightNull = right === null || right === undefined;
   if (!leftNull && !rightNull) return undefined;
   if (leftNull && rightNull) return 0;
-  return (leftNull ? -1 : 1) * (nulls === "first" ? 1 : -1);
+  const placement = nulls ?? (direction === "desc" ? "first" : "last");
+  return (leftNull ? -1 : 1) * (placement === "first" ? 1 : -1);
 }
 
 function numeric(value: unknown): number {
   if (typeof value !== "number")
     throw new TypeError("Arithmetic and numeric aggregates require numbers");
   return value;
+}
+
+function sumNumericValues(values: readonly unknown[]): unknown {
+  let total = values[0];
+  if (total === undefined) return null;
+  for (let index = 1; index < values.length; index += 1) {
+    const value = values[index];
+    const exact = exactNumericBinary("+", total, value);
+    total = exact === undefined ? numeric(total) + numeric(value) : exact;
+  }
+  return total;
 }
 
 function asQueryValue(value: unknown): QueryValue {
@@ -4495,6 +5100,59 @@ function asQueryValue(value: unknown): QueryValue {
     return value;
   if (value === undefined) return null;
   throw new TypeError("Query produced an unsupported value");
+}
+
+function asExternalQueryValue(value: unknown): QueryValue {
+  return asQueryValue(externalSqlDomainValue(value));
+}
+
+const alreadyExternalResults = new WeakSet<QueryResult>();
+
+function markExternalizationState(
+  result: QueryResult,
+  outputNeedsExternalization: boolean | undefined,
+): QueryResult {
+  if (outputNeedsExternalization === false) alreadyExternalResults.add(result);
+  return result;
+}
+
+/** Carries the internal no-conversion proof across a defensive result copy. */
+export function copyQueryResultExternalization(
+  source: QueryResult,
+  copy: QueryResult,
+): QueryResult {
+  if (alreadyExternalResults.has(source)) alreadyExternalResults.add(copy);
+  return copy;
+}
+
+/** Removes internal domain tags only after every comparison, group, join, and sort is complete. */
+export function externalizeQueryResult(result: QueryResult): QueryResult {
+  if (alreadyExternalResults.has(result)) return result;
+  let changed = false;
+  const rows = new Array<DatabaseRow>(result.rows.length);
+  for (let rowIndex = 0; rowIndex < result.rows.length; rowIndex += 1) {
+    const row = result.rows[rowIndex] ?? {};
+    let output = row;
+    // Ordinary primitive results are already public values. Most queries never touch one of the
+    // tagged PostgreSQL domains, so keep their row objects and avoid rebuilding a large result
+    // set merely to discover that every value is unchanged.
+    for (const name of result.columns) {
+      const value = row[name];
+      if (value !== undefined && !isSqlDomainValue(value)) continue;
+      const external = asExternalQueryValue(value);
+      if (external === value) continue;
+      if (output === row) output = { ...row };
+      output[name] = external;
+      changed = true;
+    }
+    rows[rowIndex] = output;
+  }
+  const externalized = changed ? { columns: [...result.columns], rows } : result;
+  // Public TEXT is allowed to begin with the private tag prefix, so externalization is not
+  // byte-idempotent. Record the boundary crossing: a wrapper such as executeQuery(query()) must
+  // not interpret the now-public bytes a second time.
+  alreadyExternalResults.add(externalized);
+  return externalized;
 }
 
 /** Gives bare conflict-update columns the target-row meaning SQL assigns them. */
@@ -4541,6 +5199,10 @@ class Parser {
 
   /** Set when the statement names CURRENT_DATE, CURRENT_TIMESTAMP, or LOCALTIME. */
   usesStatementDatetime = false;
+  /** Set when the statement names NEXTVAL or CURRVAL. */
+  usesSequenceCalls = false;
+  /** Set when the statement names a volatile scalar function. */
+  usesVolatileFunctions = false;
 
   /** Total parameter slots the statement expects; 0 when it has no placeholders. */
   get parameterCount(): number {
@@ -4653,7 +5315,7 @@ class Parser {
         for (const [name, block] of outer) this.#ctes.set(name, block);
       }
     }
-    // INTERSECT binds tighter than UNION and EXCEPT, per the SQL standard.
+    // INTERSECT binds tighter than UNION and EXCEPT, matching PostgreSQL.
     const firstTerm = this.#setTerm(sql);
     let plan = firstTerm.block;
     if (this.#isKeyword("UNION") || this.#isKeyword("EXCEPT")) {
@@ -4711,7 +5373,7 @@ class Parser {
         throw new TypeError("ORDER BY or LIMIT in a UNION member requires parentheses");
       }
     }
-    // Standard SQL assigns a trailing ORDER BY or LIMIT to the whole compound. After an
+    // PostgreSQL assigns a trailing ORDER BY or LIMIT to the whole compound. After an
     // unparenthesized last member the clause was greedily parsed into that member and lifts
     // out; after a parenthesized member it is still unparsed.
     const last = members[members.length - 1];
@@ -4820,14 +5482,35 @@ class Parser {
       name: string;
       type: SqlColumnType;
       integer?: true;
+      sqlDomain?: SqlDomain;
       nullable?: boolean;
       defaultValue?: ColumnDefault;
     }> = [];
     const checks: Array<{ name: string; sql: string }> = [];
     const foreignKeys: ForeignKeyDefinition[] = [];
-    let uniqueKey: string | undefined;
+    const uniqueConstraints: UniqueConstraintDefinition[] = [];
+    let primaryKey: string[] | undefined;
+    const constraintColumns = (): string[] => {
+      this.#expectPunctuation("(");
+      const names: string[] = [];
+      for (;;) {
+        names.push(this.#identifier());
+        if (!this.#punctuation(",")) break;
+      }
+      this.#expectPunctuation(")");
+      if (new Set(names).size !== names.length) {
+        throw new TypeError("Constraint columns must be unique");
+      }
+      return names;
+    };
     for (;;) {
-      if (this.#isKeyword("CONSTRAINT") || this.#isKeyword("CHECK") || this.#isKeyword("FOREIGN")) {
+      if (
+        this.#isKeyword("CONSTRAINT") ||
+        this.#isKeyword("CHECK") ||
+        this.#isKeyword("FOREIGN") ||
+        this.#isKeyword("PRIMARY") ||
+        this.#isKeyword("UNIQUE")
+      ) {
         // A table-level constraint, named or not.
         let constraintName: string | undefined;
         if (this.#isKeyword("CONSTRAINT")) {
@@ -4837,18 +5520,33 @@ class Parser {
         if (this.#isKeyword("FOREIGN")) {
           this.#keyword("FOREIGN");
           this.#keyword("KEY");
-          this.#expectPunctuation("(");
-          const column = this.#identifier();
-          if (this.#peek().text === ",") {
-            throw new TypeError("FOREIGN KEY supports one column, the parent's unique key");
-          }
-          this.#expectPunctuation(")");
-          foreignKeys.push(this.#references(constraintName ?? `${table}_${column}_fkey`, column));
+          const names = constraintColumns();
+          foreignKeys.push(
+            this.#references(constraintName ?? `${table}_${names.join("_")}_fkey`, names),
+          );
+          if (!this.#punctuation(",")) break;
+          continue;
+        }
+        if (this.#isKeyword("PRIMARY")) {
+          this.#keyword("PRIMARY");
+          this.#keyword("KEY");
+          if (primaryKey !== undefined) throw new TypeError("CREATE TABLE has two PRIMARY KEYs");
+          primaryKey = constraintColumns();
+          if (!this.#punctuation(",")) break;
+          continue;
+        }
+        if (this.#isKeyword("UNIQUE")) {
+          this.#keyword("UNIQUE");
+          const names = constraintColumns();
+          uniqueConstraints.push({
+            name: constraintName ?? `${table}_${names.join("_")}_key`,
+            columns: names,
+          });
           if (!this.#punctuation(",")) break;
           continue;
         }
         if (!this.#isKeyword("CHECK")) {
-          throw new TypeError("Table constraints are CHECK and FOREIGN KEY");
+          throw new TypeError("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY");
         }
         checks.push(
           this.#checkConstraint(constraintName ?? `${table}_check_${String(checks.length + 1)}`),
@@ -4856,37 +5554,15 @@ class Parser {
         if (!this.#punctuation(",")) break;
         continue;
       }
-      if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
-        // E141-08: the table-level spelling of the same single-column key.
-        if (this.#isKeyword("PRIMARY")) {
-          this.#keyword("PRIMARY");
-          this.#keyword("KEY");
-        } else this.#keyword("UNIQUE");
-        this.#expectPunctuation("(");
-        const keyColumn = this.#identifier();
-        if (this.#peek().text === ",") {
-          throw new TypeError("CREATE TABLE supports one unique key column");
-        }
-        this.#expectPunctuation(")");
-        if (uniqueKey !== undefined && uniqueKey !== keyColumn) {
-          throw new TypeError("CREATE TABLE supports one unique key column");
-        }
-        uniqueKey = keyColumn;
-        if (!this.#punctuation(",")) break;
-        continue;
-      }
       const name = this.#identifier();
       const columnType = this.#columnType();
       let nullable = true;
-      let explicitlyNullable = false;
       let defaultValue: ColumnDefault | undefined;
       for (;;) {
         if (this.#isKeyword("DEFAULT")) {
-          // E141-07. The catalog fills defaults at insert time, so they are constants: a
-          // literal, or the CURRENT_TIMESTAMP family, which it stores as "now".
+          // PostgreSQL-compatible variable-free scalar expression, retained in the catalog.
           this.#keyword("DEFAULT");
-          const expression = this.#expression();
-          defaultValue = columnDefaultFor(expression);
+          defaultValue = this.#columnDefault();
           continue;
         }
         if (this.#isKeyword("CHECK")) {
@@ -4894,21 +5570,20 @@ class Parser {
           continue;
         }
         if (this.#isKeyword("REFERENCES")) {
-          foreignKeys.push(this.#references(`${table}_${name}_fkey`, name));
+          foreignKeys.push(this.#references(`${table}_${name}_fkey`, [name]));
           continue;
         }
         if (this.#isKeyword("PRIMARY") || this.#isKeyword("UNIQUE")) {
           if (this.#isKeyword("PRIMARY")) {
             this.#keyword("PRIMARY");
             this.#keyword("KEY");
+            if (primaryKey !== undefined) throw new TypeError("CREATE TABLE has two PRIMARY KEYs");
+            primaryKey = [name];
+            nullable = false;
           } else {
             this.#keyword("UNIQUE");
+            uniqueConstraints.push({ name: `${table}_${name}_key`, columns: [name] });
           }
-          if (uniqueKey !== undefined) {
-            throw new TypeError("CREATE TABLE supports one unique key column");
-          }
-          uniqueKey = name;
-          nullable = false;
           continue;
         }
         if (this.#isKeyword("NOT")) {
@@ -4924,15 +5599,10 @@ class Parser {
         if (this.#isKeyword("NULL")) {
           this.#keyword("NULL");
           nullable = true;
-          explicitlyNullable = true;
           continue;
         }
         break;
       }
-      // A default answers what an absent value means, so the column cannot also be nullable
-      // unless the author says so — and then the engine rejects the pair, since NULL and the
-      // default would both claim the same slot.
-      if (defaultValue !== undefined && !explicitlyNullable) nullable = false;
       columns.push({
         name,
         ...columnType,
@@ -4946,10 +5616,13 @@ class Parser {
     if (new Set(columns.map((column) => column.name)).size !== columns.length) {
       throw new TypeError("CREATE TABLE column names must be unique");
     }
-    if (uniqueKey !== undefined && !columns.some((column) => column.name === uniqueKey)) {
-      throw new TypeError(`CREATE TABLE key column is not declared: ${uniqueKey}`);
-    }
     const declared = new Set(columns.map((column) => column.name));
+    for (const name of [
+      ...(primaryKey ?? []),
+      ...uniqueConstraints.flatMap((key) => key.columns),
+    ]) {
+      if (!declared.has(name)) throw new TypeError(`Constraint column is not declared: ${name}`);
+    }
     for (const check of checks) {
       for (const reference of expressionColumnNames(
         compileCheckExpression(check.sql, check.name),
@@ -4962,13 +5635,27 @@ class Parser {
         }
       }
     }
+    // Preserve the released single-UNIQUE row-addressing behavior when no PRIMARY KEY was
+    // declared. Additional UNIQUE constraints remain independently enforced secondary keys.
+    const promotedUnique =
+      primaryKey === undefined && uniqueConstraints[0]?.columns.length === 1
+        ? uniqueConstraints.shift()
+        : undefined;
+    const uniqueKey = primaryKey?.length === 1 ? primaryKey[0] : promotedUnique?.columns[0];
+    const primaryNames = new Set(primaryKey ?? []);
     return {
       kind: "create-table",
       table,
       columns: columns.map((column) =>
-        column.name === uniqueKey ? { ...column, nullable: false } : column,
+        column.name === uniqueKey || primaryNames.has(column.name)
+          ? { ...column, nullable: false }
+          : column,
       ),
       ...(uniqueKey === undefined ? {} : { uniqueKey }),
+      ...(primaryKey === undefined || primaryKey.length < 2
+        ? {}
+        : { compositePrimaryKey: primaryKey }),
+      ...(uniqueConstraints.length === 0 ? {} : { uniqueConstraints }),
       ...(checks.length === 0 ? {} : { checks }),
       ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
       ...(ifNotExists ? { ifNotExists: true } : {}),
@@ -4980,13 +5667,20 @@ class Parser {
    * key cannot change in this engine, so ON UPDATE has nothing to act on and only the
    * no-op actions parse; ON DELETE takes the three the engine can carry out.
    */
-  #references(name: string, column: string): ForeignKeyDefinition {
+  #references(name: string, columns: string[]): ForeignKeyDefinition {
     this.#keyword("REFERENCES");
     const parentTable = this.#identifier();
-    let parentColumn: string | undefined;
+    let parentColumns: string[] | undefined;
     if (this.#punctuation("(")) {
-      parentColumn = this.#identifier();
+      parentColumns = [];
+      for (;;) {
+        parentColumns.push(this.#identifier());
+        if (!this.#punctuation(",")) break;
+      }
       this.#expectPunctuation(")");
+    }
+    if (parentColumns !== undefined && parentColumns.length !== columns.length) {
+      throw new TypeError("FOREIGN KEY and REFERENCES must name the same number of columns");
     }
     let onDelete: ForeignKeyDefinition["onDelete"] = "restrict";
     while (this.#isKeyword("ON")) {
@@ -5006,9 +5700,10 @@ class Parser {
     }
     return {
       name,
-      column,
+      column: columns[0] ?? "",
+      ...(columns.length === 1 ? {} : { columns }),
       parentTable,
-      ...(parentColumn === undefined ? {} : { parentColumn }),
+      ...(parentColumns === undefined ? {} : { parentColumn: parentColumns[0], parentColumns }),
       onDelete,
     };
   }
@@ -5060,6 +5755,15 @@ class Parser {
     const expression = this.#expression();
     this.#take("eof");
     return expression;
+  }
+
+  /** Reads one column DEFAULT while preserving its authored SQL for catalog introspection. */
+  #columnDefault(): ColumnDefault {
+    const start = this.#peek().start;
+    const expression = this.#expression();
+    const sql = this.text.slice(start, this.#peek().start).trim();
+    if (sql.length === 0) throw new TypeError("DEFAULT requires an expression");
+    return columnDefaultFor(expression, sql);
   }
 
   /** DROP VIEW [IF EXISTS] name (F031-16). */
@@ -5152,7 +5856,7 @@ class Parser {
     for (;;) {
       if (this.#isKeyword("DEFAULT")) {
         this.#keyword("DEFAULT");
-        defaultValue = columnDefaultFor(this.#expression());
+        defaultValue = this.#columnDefault();
         continue;
       }
       if (this.#isKeyword("NOT")) {
@@ -5185,9 +5889,18 @@ class Parser {
   #castTarget(): string {
     const word = this.#identifier().toUpperCase();
     if (word === "NUMERIC" || word === "DECIMAL") {
-      throw new TypeError(
-        "Exact NUMERIC and DECIMAL are not supported yet; use INTEGER for exact whole values or DOUBLE PRECISION for approximate values",
-      );
+      let precision: number | undefined;
+      let scale: number | undefined;
+      if (this.#punctuation("(")) {
+        precision = Number(this.#take("number").text);
+        if (this.#punctuation(",")) scale = Number(this.#take("number").text);
+        else scale = 0;
+        this.#expectPunctuation(")");
+      }
+      return `numeric:${precision === undefined ? "" : String(precision)}:${scale === undefined ? "" : String(scale)}`;
+    }
+    if (["JSON", "JSONB", "UUID", "TIME", "INTERVAL"].includes(word)) {
+      return word.toLowerCase();
     }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
@@ -5205,19 +5918,37 @@ class Parser {
     return integer ? "number-integer" : mapped;
   }
 
-  #columnType(): { type: SqlColumnType; integer?: true } {
-    const word = this.#identifier().toUpperCase();
+  #columnType(): { type: SqlColumnType; integer?: true; sqlDomain?: SqlDomain } {
+    const declared = this.#identifier();
+    const word = declared.toUpperCase();
     if (word === "NUMERIC" || word === "DECIMAL") {
-      throw new TypeError(
-        "Exact NUMERIC and DECIMAL are not supported yet; use INTEGER for exact whole values or DOUBLE PRECISION for approximate values",
-      );
+      let precision: number | undefined;
+      let scale: number | undefined;
+      if (this.#punctuation("(")) {
+        precision = Number(this.#take("number").text);
+        scale = this.#punctuation(",") ? Number(this.#take("number").text) : 0;
+        this.#expectPunctuation(")");
+      }
+      return {
+        type: "string",
+        sqlDomain: {
+          kind: "numeric",
+          ...(precision === undefined ? {} : { precision }),
+          ...(scale === undefined ? {} : { scale }),
+        },
+      };
+    }
+    if (["JSON", "JSONB", "UUID", "TIME", "INTERVAL"].includes(word)) {
+      return { type: "string", sqlDomain: { kind: word.toLowerCase() as "json" } };
     }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
       return { type: "number" };
     }
     const mapped = createTableTypeNames.get(word);
-    if (mapped === undefined) throw new TypeError(`Unsupported column type: ${word}`);
+    if (mapped === undefined) {
+      return { type: "string", sqlDomain: { kind: "enum", name: declared, values: [] } };
+    }
     // Character widths document intent and do not truncate values.
     if (this.#punctuation("(")) {
       this.#take("number");
@@ -5225,6 +5956,10 @@ class Parser {
         throw new TypeError(`${word} takes one width`);
       }
       this.#expectPunctuation(")");
+    }
+    if (this.#punctuation("[")) {
+      this.#expectPunctuation("]");
+      return { type: "string", sqlDomain: { kind: "array", element: word } };
     }
     const integer =
       word === "INTEGER" || word === "INT" || word === "BIGINT" || word === "SMALLINT";
@@ -5256,6 +5991,19 @@ class Parser {
     }
     if (new Set(columns).size !== columns.length) {
       throw new TypeError("INSERT columns must be unique");
+    }
+    if (this.#isKeyword("DEFAULT")) {
+      this.#keyword("DEFAULT");
+      this.#keyword("VALUES");
+      return {
+        kind: "insert",
+        table,
+        columns,
+        rows: [[]],
+        defaultValues: true,
+        ...this.#onConflictClause(table),
+        ...this.#returningClause(),
+      };
     }
     if (this.#isKeyword("SELECT")) {
       const query = optimizePlan(this.#selectBlock("(insert select)"));
@@ -5303,26 +6051,35 @@ class Parser {
   #onConflictClause(table: string): {
     onConflict?: {
       column: string;
+      columns?: string[];
       action: "nothing" | "replace" | "update";
       assignments?: Array<{ column: string; expression: Expression }>;
+      where?: Expression;
     };
   } {
     if (!this.#isKeyword("ON")) return {};
     this.#keyword("ON");
     this.#keyword("CONFLICT");
     this.#expectPunctuation("(");
-    const column = this.#identifier();
+    const columns: string[] = [];
+    for (;;) {
+      columns.push(this.#identifier());
+      if (!this.#punctuation(",")) break;
+    }
     this.#expectPunctuation(")");
+    const column = columns[0];
+    if (column === undefined) throw new TypeError("ON CONFLICT needs at least one column");
+    const target = columns.length === 1 ? {} : { columns };
     this.#keyword("DO");
     if (this.#isKeyword("NOTHING")) {
       this.#keyword("NOTHING");
-      return { onConflict: { column, action: "nothing" } };
+      return { onConflict: { column, ...target, action: "nothing" } };
     }
     // Minnow's concise whole-row upsert spelling. Unlike DO UPDATE SET, it also has an exact
     // meaning for a table whose unique key is its only column.
     if (this.#isKeyword("REPLACE")) {
       this.#keyword("REPLACE");
-      return { onConflict: { column, action: "replace" } };
+      return { onConflict: { column, ...target, action: "replace" } };
     }
     this.#keyword("UPDATE");
     this.#keyword("SET");
@@ -5334,7 +6091,7 @@ class Parser {
       if (assigned.has(target)) {
         throw new TypeError(`ON CONFLICT DO UPDATE sets a column twice: ${target}`);
       }
-      if (target === column) {
+      if (columns.includes(target)) {
         throw new TypeError("ON CONFLICT DO UPDATE cannot reassign the conflict key");
       }
       assigned.add(target);
@@ -5344,7 +6101,20 @@ class Parser {
       });
       if (!this.#punctuation(",")) break;
     }
-    return { onConflict: { column, action: "update", assignments } };
+    let where: Expression | undefined;
+    if (this.#isKeyword("WHERE")) {
+      this.#keyword("WHERE");
+      where = rewriteUpsertExpression(this.#expression(), table);
+    }
+    return {
+      onConflict: {
+        column,
+        ...target,
+        action: "update",
+        assignments,
+        ...(where === undefined ? {} : { where }),
+      },
+    };
   }
 
   /** RETURNING * or RETURNING col, ... — the engine's runStatement implements the semantics. */
@@ -5537,6 +6307,10 @@ class Parser {
   }
 
   #insertValue(label: string): InsertValue {
+    if (this.#isKeyword("DEFAULT")) {
+      this.#keyword("DEFAULT");
+      return { default: true };
+    }
     const expression = this.#expression();
     // A bare placeholder stays a slot; the batch write binds it later. Placeholders nested in
     // arithmetic would need expression retention through the batch path, so they stay rejected.
@@ -6168,17 +6942,130 @@ class Parser {
       return this.#derivedSource(derived, alias);
     }
     const table = this.#identifier();
+    if (table.toUpperCase() === "LATERAL") {
+      this.#expectPunctuation("(");
+      const derived = this.#queryExpression("(lateral)");
+      this.#expectPunctuation(")");
+      const alias = this.#sourceAlias();
+      if (alias === undefined) throw new TypeError("A LATERAL derived table requires an alias");
+      if (this.#punctuation("(")) this.#applyColumnAliases(derived);
+      return { ...this.#derivedSource(derived, alias), lateral: true };
+    }
     if (this.#peek().text === "(") {
       // Two row-producing sources the executors have no operator for; both parse far enough to
       // say so, rather than failing on the punctuation that follows.
       const upper = table.toUpperCase();
-      if (upper === "LATERAL") {
-        throw new TypeError("LATERAL sources are not supported");
-      }
       if (upper === "JSON_TABLE") {
-        throw new TypeError(
-          "JSON_TABLE is not supported; JSON_VALUE and JSON_QUERY read one value",
-        );
+        this.#expectPunctuation("(");
+        const document = this.#expression();
+        if (
+          containsParameter(document) ||
+          expressionColumns(document).length > 0 ||
+          hasAggregate(document)
+        ) {
+          throw new TypeError("JSON_TABLE currently requires a constant document");
+        }
+        this.#expectPunctuation(",");
+        const rowPath = this.#take("string").text;
+        this.#keyword("COLUMNS");
+        this.#expectPunctuation("(");
+        const columns: Array<{
+          name: string;
+          type: SqlColumnType;
+          integer?: true;
+          sqlDomain?: SqlDomain;
+          path: string;
+        }> = [];
+        for (;;) {
+          const name = this.#identifier();
+          const columnType = this.#columnType();
+          this.#keyword("PATH");
+          columns.push({ name, ...columnType, path: this.#take("string").text });
+          if (!this.#punctuation(",")) break;
+        }
+        this.#expectPunctuation(")");
+        this.#expectPunctuation(")");
+        const alias = this.#sourceAlias();
+        if (alias === undefined) throw new TypeError("JSON_TABLE requires an alias");
+        const raw = externalSqlDomainValue(evaluate(document, {}));
+        if (typeof raw !== "string") throw new TypeError("JSON_TABLE document must be JSON text");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          throw new TypeError("JSON_TABLE document is invalid JSON");
+        }
+        const members =
+          rowPath === "$"
+            ? [parsed]
+            : rowPath === "$[*]" && Array.isArray(parsed)
+              ? parsed
+              : (() => {
+                  throw new TypeError("JSON_TABLE row path supports $ and $[*]");
+                })();
+        const blockFor = (member: unknown, empty = false): CompiledQuery => ({
+          sql: "(json table row)",
+          base: { table: DUAL_TABLE, alias: DUAL_TABLE },
+          joins: [],
+          select: columns.map((column) => {
+            const selected = jsonAtPath(JSON.stringify(member), column.path, "JSON_TABLE");
+            const value = empty
+              ? column.sqlDomain?.kind === "numeric"
+                ? jsonTableColumnValue(column, 0)
+                : column.type === "number"
+                  ? 0
+                  : column.type === "boolean"
+                    ? false
+                    : column.type === "datetime"
+                      ? new Date(0)
+                      : ""
+              : jsonTableColumnValue(column, selected.found ? selected.value : null);
+            return {
+              expression: {
+                kind: "literal" as const,
+                value,
+                ...(column.sqlDomain === undefined
+                  ? {}
+                  : { internalSqlValue: true as const, sqlDomain: column.sqlDomain }),
+              },
+              alias: column.name,
+            };
+          }),
+          predicates: empty
+            ? [
+                {
+                  left: { kind: "literal", value: false },
+                  operator: "IS TRUE",
+                  right: { kind: "literal", value: true },
+                },
+              ]
+            : [],
+          groupBy: [],
+          having: [],
+          orderBy: [],
+        });
+        const blocks =
+          members.length === 0 ? [blockFor(null, true)] : members.map((member) => blockFor(member));
+        const firstBlock = blocks[0];
+        if (firstBlock === undefined) throw new TypeError("JSON_TABLE requires a row source");
+        const derived =
+          blocks.length === 1
+            ? firstBlock
+            : ({
+                sql: "(json table)",
+                base: {
+                  table: `(json table ${String(this.nextDerivedSequence())})`,
+                  alias: "json_table",
+                  union: { blocks, ops: blocks.slice(1).map(() => "union all" as const) },
+                },
+                joins: [],
+                select: [{ expression: { kind: "wildcard" as const }, alias: "*" }],
+                predicates: [],
+                groupBy: [],
+                having: [],
+                orderBy: [],
+              } satisfies CompiledQuery);
+        return this.#derivedSource(derived, alias);
       }
     }
     const candidate = this.#recursiveCandidate;
@@ -6480,16 +7367,13 @@ class Parser {
     // After a value expression, NOT can only introduce NOT BETWEEN / NOT IN / NOT LIKE.
     let negated = false;
     if (this.#isKeyword("NOT")) {
+      const next = this.tokens[this.#index + 1];
+      const nextWord =
+        next?.kind === "identifier" && next.quoted !== true ? next.text.toUpperCase() : "";
+      // In a column definition, `DEFAULT <expression> NOT NULL` ends the expression here.
+      if (!["BETWEEN", "IN", "LIKE", "ILIKE", "SIMILAR"].includes(nextWord)) return left;
       this.#keyword("NOT");
       negated = true;
-      if (
-        !this.#isKeyword("BETWEEN") &&
-        !this.#isKeyword("IN") &&
-        !this.#isKeyword("LIKE") &&
-        !this.#isKeyword("ILIKE")
-      ) {
-        throw new TypeError(`Expected BETWEEN, IN, LIKE, or ILIKE after NOT`);
-      }
     }
     if (this.#isKeyword("BETWEEN")) {
       this.#keyword("BETWEEN");
@@ -6565,6 +7449,26 @@ class Parser {
         ...(escape === undefined ? {} : { escape }),
       };
     }
+    if (this.#isKeyword("SIMILAR")) {
+      this.#keyword("SIMILAR");
+      this.#keyword("TO");
+      const pattern = this.#additive();
+      let escape: string | undefined;
+      if (this.#isKeyword("ESCAPE")) {
+        this.#keyword("ESCAPE");
+        escape = this.#take("string").text;
+        if (Array.from(escape).length !== 1) {
+          throw new TypeError("SIMILAR TO ESCAPE takes a single character");
+        }
+      }
+      return {
+        kind: "condition",
+        operator: negated ? "NOT SIMILAR TO" : "SIMILAR TO",
+        left,
+        right: pattern,
+        ...(escape === undefined ? {} : { escape }),
+      };
+    }
     const token = this.#peek();
     if (token.kind === "operator" && ["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text)) {
       const operator = this.#comparison();
@@ -6592,6 +7496,15 @@ class Parser {
   #additive(minimumPrecedence = 0): Expression {
     let left = this.#primary();
     for (;;) {
+      if (this.#isKeyword("COLLATE")) {
+        this.#keyword("COLLATE");
+        left = {
+          kind: "call",
+          name: "MINNOW_COLLATE",
+          arguments: [left, { kind: "literal", value: this.#identifier() }],
+        };
+        continue;
+      }
       const operator = this.#peek().text;
       // || binds loosest, matching PostgreSQL: concatenation applies to whole arithmetic terms.
       const precedence =
@@ -6902,6 +7815,30 @@ class Parser {
     if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
       return { kind: "literal", value: timestampLiteral(this.#take("string").text) };
     }
+    if (upper === "TIME" && this.#peek().kind === "string") {
+      return {
+        kind: "literal",
+        value: timeDomainValue(this.#take("string").text),
+        internalSqlValue: true,
+        sqlDomain: { kind: "time" },
+      };
+    }
+    if (upper === "INTERVAL" && this.#peek().kind === "string") {
+      return {
+        kind: "literal",
+        value: intervalDomainValue(this.#take("string").text),
+        internalSqlValue: true,
+        sqlDomain: { kind: "interval" },
+      };
+    }
+    if (upper === "ARRAY" && this.#punctuation("[")) {
+      const arguments_: Expression[] = [];
+      if (!this.#punctuation("]")) {
+        arguments_.push(...this.#expressionList());
+        this.#expectPunctuation("]");
+      }
+      return { kind: "call", name: "ARRAY", arguments: arguments_ };
+    }
     if (this.#punctuation("(")) {
       if (
         upper === "ROW_NUMBER" ||
@@ -7042,8 +7979,13 @@ class Parser {
       // (T626); MIN is one such choice and reuses its accumulator exactly.
       const name = (upper === "ANY_VALUE" ? "MIN" : (functionSpellings.get(upper) ?? upper)) as
         AggregateName | ScalarFunctionName;
+      if (name === "MINNOW_TUPLE_KEY" || name === "MINNOW_COLLATE") {
+        throw new TypeError(`Unsupported function: ${identifier}`);
+      }
       if (!aggregateNames.has(name as AggregateName) && !scalarFunctionNames.has(name))
         throw new TypeError(`Unsupported function: ${identifier}`);
+      if (name === "NEXTVAL" || name === "CURRVAL") this.usesSequenceCalls = true;
+      if (volatileScalarFunctionNames.has(name)) this.usesVolatileFunctions = true;
       let distinct = false;
       if (this.#isKeyword("DISTINCT")) {
         if (!aggregateNames.has(name as AggregateName)) {
@@ -7056,14 +7998,26 @@ class Parser {
         this.#keyword("ALL");
       }
       const args: Expression[] = [];
+      let aggregateOrderBy: CompiledQuery["orderBy"] | undefined;
       if (!this.#punctuation(")")) {
-        args.push(...this.#expressionList());
+        if (name === "STRING_AGG") {
+          args.push(this.#expression());
+          this.#expectPunctuation(",");
+          args.push(this.#expression());
+          if (this.#isKeyword("ORDER")) aggregateOrderBy = this.#orderByClause();
+        } else {
+          args.push(...this.#expressionList());
+        }
         this.#expectPunctuation(")");
       }
-      if (distinct && (args.length !== 1 || args[0]?.kind === "wildcard")) {
+      const distinctArity = name === "STRING_AGG" ? 2 : 1;
+      if (distinct && (args.length !== distinctArity || args[0]?.kind === "wildcard")) {
         throw new TypeError(`${name}(DISTINCT) requires exactly one scalar argument`);
       }
-      if (aggregateNames.has(name as AggregateName) && args.length !== 1)
+      if (name === "STRING_AGG" && args.length !== 2) {
+        throw new TypeError("STRING_AGG requires a value and delimiter");
+      }
+      if (aggregateNames.has(name as AggregateName) && name !== "STRING_AGG" && args.length !== 1)
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "JSON_ARRAYAGG" && args[0]?.kind === "wildcard") {
         throw new TypeError("JSON_ARRAYAGG requires a scalar value expression");
@@ -7098,6 +8052,9 @@ class Parser {
         throw new TypeError("OVERLAY requires a string, a replacement, a start, and a length");
       }
       if (statementDatetimeNames.has(name) && args.length !== 0) {
+        throw new TypeError(`${name} takes no arguments`);
+      }
+      if (volatileScalarFunctionNames.has(name) && args.length !== 0) {
         throw new TypeError(`${name} takes no arguments`);
       }
       if (
@@ -7173,6 +8130,9 @@ class Parser {
         if (name === "JSON_ARRAYAGG") {
           throw new TypeError("JSON_ARRAYAGG window use is not supported");
         }
+        if (name === "STRING_AGG") {
+          throw new TypeError("STRING_AGG window use is not supported");
+        }
         if (distinct) throw new TypeError("DISTINCT window aggregates are not supported");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
@@ -7189,7 +8149,13 @@ class Parser {
           ...(frame === undefined ? {} : { frame }),
         };
       }
-      return { kind: "call", name, arguments: args, ...(distinct ? { distinct: true } : {}) };
+      return {
+        kind: "call",
+        name,
+        arguments: args,
+        ...(distinct ? { distinct: true } : {}),
+        ...(aggregateOrderBy === undefined ? {} : { aggregateOrderBy }),
+      };
     }
     let reference = identifier;
     if (this.#punctuation(".")) {
@@ -7858,10 +8824,12 @@ export function expandDistinctWildcard(
     if (columns === undefined || columns.length === 0) {
       throw new TypeError(`SELECT DISTINCT * requires known columns for: ${source.table}`);
     }
-    return columns.map((name) => {
-      const output = multiple ? `${source.alias}.${name}` : name;
-      return { expression: { kind: "column" as const, reference: output }, alias: output };
-    });
+    return columns
+      .filter((name) => !name.startsWith("\0"))
+      .map((name) => {
+        const output = multiple ? `${source.alias}.${name}` : name;
+        return { expression: { kind: "column" as const, reference: output }, alias: output };
+      });
   });
   const { distinctWildcard, ...rest } = plan;
   void distinctWildcard;
@@ -7873,19 +8841,24 @@ export function expandDistinctWildcard(
  * table's columns positionally (E051-09). The table's own column order is only known here, so
  * the parser records the names and this pass — one per execution entry — applies them.
  */
-/** Whether any block of the plan reads a table name the catalog answers with a view. */
-export function planReadsViews(plan: CompiledQuery, isView: (name: string) => boolean): boolean {
+/** Whether any block of the plan reads a table accepted by the supplied catalog predicate. */
+export function planReadsTable(plan: CompiledQuery, matches: (name: string) => boolean): boolean {
   if (
     [plan.base, ...plan.joins].some(
-      (source) => source.derived === undefined && isView(source.table),
+      (source) => source.derived === undefined && matches(source.table),
     )
   )
     return true;
   let nested = false;
   forEachNestedBlock(plan, (inner) => {
-    nested ||= planReadsViews(inner, isView);
+    nested ||= planReadsTable(inner, matches);
   });
   return nested;
+}
+
+/** Whether any block of the plan reads a table name the catalog answers with a view. */
+export function planReadsViews(plan: CompiledQuery, isView: (name: string) => boolean): boolean {
+  return planReadsTable(plan, isView);
 }
 
 /**
@@ -7996,11 +8969,14 @@ function sourceWildcardColumns(
   source: TableSource,
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): readonly string[] | undefined {
-  if (source.derived !== undefined) return source.derived.select.map((item) => item.alias);
+  if (source.derived !== undefined)
+    return source.derived.select.map((item) => item.alias).filter((name) => !name.startsWith("\0"));
   if (source.union !== undefined) {
-    return source.union.blocks[0]?.select.map((item) => item.alias);
+    return source.union.blocks[0]?.select
+      .map((item) => item.alias)
+      .filter((name) => !name.startsWith("\0"));
   }
-  return columnsOf(source.table);
+  return columnsOf(source.table)?.filter((name) => !name.startsWith("\0"));
 }
 
 /** Whether any block of the plan still carries an unresolved NATURAL join marker. */
@@ -8351,14 +9327,14 @@ export function transparentProjectionSource(
 
 /** Projects a result to a wrapper's visible aliases, preserving row order. */
 export function projectResultColumns(result: QueryResult, aliases: readonly string[]): QueryResult {
-  return {
+  return copyQueryResultExternalization(result, {
     columns: [...aliases],
     rows: result.rows.map((row) => {
       const projected: QueryRow = {};
       for (const alias of aliases) projected[alias] = row[alias] ?? null;
       return projected;
     }),
-  };
+  });
 }
 
 /** Names a derived (subquery or expanded CTE) source under the shared sequence. */
@@ -8402,6 +9378,46 @@ function renameBlockOutputs(block: CompiledQuery, columns: readonly string[], na
  * writes a T and leaves the time off entirely for midnight. A literal without a zone is UTC, the
  * same reading `DATE` already takes and the same one every datetime in a Minnow database has.
  */
+function jsonTableColumnValue(
+  column: {
+    type: SqlColumnType;
+    integer?: true;
+    sqlDomain?: SqlDomain;
+  },
+  value: unknown,
+): QueryValue {
+  if (value === null || value === undefined) return null;
+  if (column.sqlDomain !== undefined) {
+    const input =
+      column.sqlDomain.kind === "array" && typeof value !== "string"
+        ? JSON.stringify(value)
+        : value;
+    return normalizeSqlDomainValue(column.sqlDomain, input);
+  }
+  if (column.type === "string") {
+    return typeof value === "string" ? value : JSON.stringify(value);
+  }
+  if (column.type === "boolean") {
+    if (typeof value !== "boolean")
+      throw new TypeError("JSON_TABLE boolean column needs a boolean");
+    return value;
+  }
+  if (column.type === "number") {
+    const number = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(number) || (column.integer === true && !Number.isSafeInteger(number))) {
+      throw new TypeError("JSON_TABLE numeric column has an invalid value");
+    }
+    return number;
+  }
+  let date: Date;
+  if (value instanceof Date) date = value;
+  else if (typeof value === "string") date = new Date(value);
+  else if (typeof value === "number") date = new Date(value);
+  else throw new TypeError("JSON_TABLE datetime is invalid");
+  if (!Number.isFinite(date.getTime())) throw new TypeError("JSON_TABLE datetime is invalid");
+  return date;
+}
+
 export function timestampLiteral(text: string): Date {
   const trimmed = text.trim();
   const match =
@@ -8741,7 +9757,7 @@ function tokenize(sql: string): Token[] {
     }
     if (["+", "-", "*", "/", "%", "=", ">", "<"].includes(character))
       tokens.push({ kind: "operator", text: character, start: index, end: index + 1 });
-    else if (["(", ")", ",", "."].includes(character))
+    else if (["(", ")", "[", "]", ",", "."].includes(character))
       tokens.push({ kind: "punctuation", text: character, start: index, end: index + 1 });
     else throw new SqlCompileError(`Unsupported SQL character: ${character}`, index, 1);
     index += 1;

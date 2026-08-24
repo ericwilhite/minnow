@@ -1,4 +1,13 @@
-import type { ColumnDefault, SimpleDataType, TableRecord } from "../storage/index.js";
+import {
+  secondaryIndexColumnIds,
+  secondaryIndexDirections,
+  type ColumnDefault,
+  type SecondaryIndexState,
+  type SimpleDataType,
+  type SqlDomain,
+  type TableRecord,
+} from "../storage/index.js";
+import { externalSqlDomainValue } from "./sql-domains.js";
 
 /**
  * The published shape of the catalog: everything a schema tool needs to diff a live database
@@ -18,8 +27,9 @@ export interface CatalogColumn {
   readonly type: SimpleDataType;
   /** True for SQL INTEGER/SMALLINT/BIGINT columns, whose values must stay exactly representable. */
   readonly integer?: true;
+  readonly sqlDomain?: SqlDomain;
   readonly nullable: boolean;
-  /** Filled at insert time for null-or-absent slots; never applied at read time. */
+  /** Filled for omitted or SQL DEFAULT insert slots; never applied at read time. */
   readonly defaultValue?: ColumnDefault;
   /** String columns only: the closed set of values writes may draw from. */
   readonly enumValues?: readonly string[];
@@ -32,8 +42,10 @@ export interface CatalogColumn {
 export interface CatalogForeignKey {
   readonly name: string;
   readonly column: string;
+  readonly columns?: readonly string[];
   readonly parentTable: string;
   readonly parentColumn: string;
+  readonly parentColumns?: readonly string[];
   readonly onDelete: "restrict" | "cascade" | "set null";
 }
 
@@ -49,6 +61,18 @@ export interface CatalogTrigger {
   readonly timing: "before" | "after";
 }
 
+/** One SQL-declared secondary index, in declared key order. */
+export interface CatalogIndex {
+  readonly name: string;
+  readonly columns: ReadonlyArray<{
+    readonly name: string;
+    readonly direction: "asc" | "desc";
+  }>;
+  readonly unique: boolean;
+  /** Build health is visible so inspection tools never present an invalid accelerator as ready. */
+  readonly state: SecondaryIndexState;
+}
+
 export interface CatalogTable {
   readonly name: string;
   /**
@@ -60,8 +84,12 @@ export interface CatalogTable {
   readonly columns: readonly CatalogColumn[];
   /** The unique key's column ID, absent on a table declared without one. */
   readonly uniqueKeyColumnId?: string;
+  /** Declared PRIMARY KEY columns, including composite keys, in comparison order. */
+  readonly primaryKeyColumnIds?: readonly string[];
   readonly foreignKeys: readonly CatalogForeignKey[];
   readonly checks: readonly CatalogCheck[];
+  /** SQL-declared secondary indexes. Absent in catalogs produced before index introspection. */
+  readonly indexes?: readonly CatalogIndex[];
   /**
    * Reported but not declarable through the schema DSL: a trigger's body is a statement, not a
    * column, so it stays SQL-only. A tool that rewrites triggers still needs to see them.
@@ -94,10 +122,13 @@ function toCatalogColumn(column: TableRecord["columns"][number]): CatalogColumn 
     name: column.name,
     type: column.type,
     ...(column.integer === true ? { integer: true } : {}),
+    ...(column.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(column.sqlDomain) }),
     nullable: column.nullable,
     ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
     ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
-    ...(column.backfill === undefined ? {} : { backfill: column.backfill }),
+    ...(column.backfill === undefined
+      ? {}
+      : { backfill: externalSqlDomainValue(column.backfill) as boolean | number | string | Date }),
     isAutoIncrementing: column.defaultValue?.kind === "autoincrement",
   };
 }
@@ -108,7 +139,8 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
   const tables: CatalogTable[] = [];
   const views: CatalogView[] = [];
   for (const record of byName) {
-    const columns = record.columns.map(toCatalogColumn);
+    if (record.enumType !== undefined || record.sequence !== undefined) continue;
+    const columns = record.columns.filter((column) => !column.hidden).map(toCatalogColumn);
     if (record.view !== undefined) {
       views.push({
         name: record.name,
@@ -122,11 +154,30 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
       name: record.name,
       managed: record.managed === true,
       columns,
-      ...(record.uniqueKeyColumnId === undefined
+      ...(record.uniqueKeyColumnId === undefined ||
+      record.columns.find((column) => column.id === record.uniqueKeyColumnId)?.hidden === true
         ? {}
         : { uniqueKeyColumnId: record.uniqueKeyColumnId }),
+      ...(record.primaryKeyColumnIds === undefined
+        ? {}
+        : { primaryKeyColumnIds: [...record.primaryKeyColumnIds] }),
       foreignKeys: (record.foreignKeys ?? []).map((key) => ({ ...key })),
       checks: (record.checks ?? []).map((check) => ({ ...check })),
+      ...(record.secondaryIndexes === undefined
+        ? {}
+        : {
+            indexes: Object.values(record.secondaryIndexes)
+              .map((index) => ({
+                name: index.name,
+                columns: secondaryIndexColumnIds(index).map((columnId, position) => ({
+                  name: record.columns.find((column) => column.id === columnId)?.name ?? columnId,
+                  direction: secondaryIndexDirections(index)[position] ?? "asc",
+                })),
+                unique: index.unique === true,
+                state: index.state,
+              }))
+              .sort((left, right) => left.name.localeCompare(right.name)),
+          }),
       triggers: (record.triggers ?? []).map(({ name, event, timing }) => ({
         name,
         event,

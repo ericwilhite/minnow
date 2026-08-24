@@ -21,7 +21,7 @@ import {
   type InferRow,
   type InferUpdateChanges,
 } from "./schema.js";
-import { deserializeSchema, serializeSchema } from "./schema-wire.js";
+import { deserializeSchema, serializeMigrationSteps, serializeSchema } from "./schema-wire.js";
 
 const people = table("people", {
   name: column.string().unique(),
@@ -38,14 +38,14 @@ const orders = table("orders", {
 function invalidColumnChainsAreRejectedByTypeScript(): void {
   // @ts-expect-error nullable unique keys are invalid by construction
   column.number().nullable().unique();
-  // @ts-expect-error a default-bearing column cannot subsequently become nullable
-  column.string().default("x").nullable();
   // @ts-expect-error nullable columns do not take backfills
   column.string().nullable().backfill("x");
   // @ts-expect-error auto-increment is only available after a numeric unique key is declared
   column.number().autoIncrement();
   // @ts-expect-error SET NULL requires a nullable child column
   column.number().references("parents", "id", { onDelete: "set null" });
+  // @ts-expect-error defaults are catalog values or SQL expressions, never JavaScript callbacks
+  column.string().default(() => "generated");
 }
 
 function implementations(): Array<{ name: string; create: () => Promise<BlockStore> }> {
@@ -128,6 +128,246 @@ describe("schema DSL", () => {
   });
 });
 
+describe("SQL-domain and composite-key schema declarations", () => {
+  const accounts = table(
+    "accounts",
+    {
+      tenant_id: column.uuid(),
+      account_no: column.integer(),
+      balance: column.numeric({ precision: 12, scale: 2 }).default("0"),
+      profile: column.jsonb().nullable(),
+      state: column.sqlEnum("account_state", ["open", "closed"]).default("open"),
+      tags: column.array("text").nullable(),
+    },
+    { primaryKey: ["tenant_id", "account_no"] },
+  );
+
+  it("retains exact read/write types and excludes every primary-key column from updates", () => {
+    expectTypeOf<InferRow<typeof accounts>>().toEqualTypeOf<{
+      tenant_id: string;
+      account_no: number;
+      balance: string;
+      profile: string | null;
+      state: "open" | "closed";
+      tags: string | null;
+    }>();
+    expectTypeOf<InferInsertRow<typeof accounts>>().toEqualTypeOf<
+      {
+        tenant_id: string;
+        account_no: number;
+      } & {
+        balance?: string | number;
+        profile?: string | null;
+        state?: "open" | "closed";
+        tags?: string | null;
+      }
+    >();
+    expectTypeOf<InferUpdateChanges<typeof accounts>>().toEqualTypeOf<{
+      balance?: string | number;
+      profile?: string | null;
+      state?: "open" | "closed";
+      tags?: string | null;
+    }>();
+  });
+
+  it("rejects malformed domain metadata and values at declaration or validation time", () => {
+    expect(() => column.numeric({ precision: 2, scale: 3 })).toThrow(
+      "Invalid NUMERIC domain metadata",
+    );
+    expect(() => column.array("  ")).toThrow("ARRAY element type must be a trimmed non-empty name");
+    expect(() =>
+      table("bad_uuid", {
+        id: column.integer().unique(),
+        value: column.uuid().default("not-a-uuid"),
+      }),
+    ).toThrow("Invalid UUID value");
+    const integers = table("integers", { id: column.integer().unique() });
+    expect(integers["~standard"].validate({ id: 1.5 })).toEqual({
+      issues: [{ message: "Expected safe integer", path: ["id"] }],
+    });
+  });
+
+  it("round-trips domains, primary keys, and composite relations through the wire", () => {
+    const entries = table(
+      "entries",
+      {
+        tenant_id: column.uuid(),
+        account_no: column.integer(),
+        entry_no: column.integer(),
+      },
+      {
+        primaryKey: ["tenant_id", "account_no", "entry_no"],
+        foreignKeys: [
+          {
+            name: "entries_account_fkey",
+            columns: ["tenant_id", "account_no"],
+            references: { table: "accounts", columns: ["tenant_id", "account_no"] },
+            onDelete: "cascade",
+          },
+        ],
+      },
+    );
+    const restored = deserializeSchema(serializeSchema(schema([accounts, entries])));
+    expect(restored.tables[0]?.primaryKey).toEqual(["tenant_id", "account_no"]);
+    expect(restored.tables[0]?.columns.balance?.sqlDomain).toEqual({
+      kind: "numeric",
+      precision: 12,
+      scale: 2,
+    });
+    expect(restored.tables[1]?.foreignKeys).toEqual(entries.foreignKeys);
+  });
+
+  it("creates composite keys and relations and supports typed composite mutations", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    const entries = table(
+      "entries",
+      {
+        tenant_id: column.uuid(),
+        account_no: column.integer(),
+        entry_no: column.integer(),
+        memo: column.string(),
+      },
+      {
+        primaryKey: ["tenant_id", "account_no", "entry_no"],
+        foreignKeys: [
+          {
+            name: "entries_account_fkey",
+            columns: ["tenant_id", "account_no"],
+            references: { table: "accounts", columns: ["tenant_id", "account_no"] },
+            onDelete: "cascade",
+          },
+        ],
+      },
+    );
+    await database.migrate(schema([entries, accounts]));
+    const tenant = "9b2c7c8f-6f56-4a78-a8e1-7936cc12bd83";
+    await typedTable(database, accounts).insert([{ tenant_id: tenant, account_no: 7 }]);
+    const handle = typedTable(database, entries);
+    await handle.insert([{ tenant_id: tenant, account_no: 7, entry_no: 1, memo: "before" }]);
+    await expect(
+      handle.update({
+        keys: [{ tenant_id: tenant, account_no: 7, entry_no: 1 }],
+        changes: { memo: ["after"] },
+      }),
+    ).resolves.toMatchObject({ kind: "update", rowCount: 1 });
+    expect(
+      (
+        await database.query("SELECT tenant_id, account_no, entry_no, memo FROM entries", {
+          memoize: false,
+        })
+      ).rows,
+    ).toEqual([{ tenant_id: tenant, account_no: 7, entry_no: 1, memo: "after" }]);
+    expect(await handle.rows()).toEqual([
+      { tenant_id: tenant, account_no: 7, entry_no: 1, memo: "after" },
+    ]);
+    await handle.delete({ keys: [{ tenant_id: tenant, account_no: 7, entry_no: 1 }] });
+    expect(await handle.rows()).toEqual([]);
+    store.close();
+  });
+
+  it("preserves and validates domain defaults and added-column backfills", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    const before = table("prices", {
+      id: column.integer().unique(),
+      label: column.string(),
+    });
+    await database.migrate(schema([before]));
+    await database.execute("INSERT INTO prices (id, label) VALUES (1, 'old')");
+    const after = table("prices", {
+      id: column.integer().unique(),
+      label: column.string(),
+      amount: column.numeric({ precision: 8, scale: 2 }).default("1.25").backfill("0"),
+    });
+    await database.migrate(schema([after]));
+    await database.execute("INSERT INTO prices (id, label) VALUES (2, 'new')");
+    expect((await database.query("SELECT id, amount FROM prices ORDER BY id")).rows).toEqual([
+      { id: 1, amount: "0" },
+      { id: 2, amount: "1.25" },
+    ]);
+    const amount = (await database.introspect()).tables[0]?.columns.find(
+      ({ name }) => name === "amount",
+    );
+    expect(amount).toMatchObject({
+      backfill: "0",
+      sqlDomain: { kind: "numeric", precision: 8, scale: 2 },
+    });
+    expect((await database.migrate(schema([after]))).steps).toEqual([]);
+    store.close();
+  });
+
+  it("keeps logical domains when SQL adds columns beside schema-managed ones", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.execute("CREATE TYPE mood AS ENUM ('calm', 'busy')");
+    await database.execute("CREATE TABLE domain_additions (id INTEGER PRIMARY KEY)");
+    await database.execute("ALTER TABLE domain_additions ADD COLUMN amount NUMERIC(8, 2)");
+    await database.execute("ALTER TABLE domain_additions ADD COLUMN feeling mood");
+    await database.execute(
+      "INSERT INTO domain_additions (id, amount, feeling) VALUES (1, 12.50, 'calm')",
+    );
+    expect((await database.query("SELECT amount, feeling FROM domain_additions")).rows).toEqual([
+      { amount: "12.5", feeling: "calm" },
+    ]);
+    expect(
+      (await database.introspect()).tables[0]?.columns.map(({ name, sqlDomain }) => ({
+        name,
+        ...(sqlDomain === undefined ? {} : { sqlDomain }),
+      })),
+    ).toEqual([
+      { name: "id" },
+      { name: "amount", sqlDomain: { kind: "numeric", precision: 8, scale: 2 } },
+      { name: "feeling", sqlDomain: { kind: "enum", name: "mood", values: ["calm", "busy"] } },
+    ]);
+    store.close();
+  });
+
+  it("rejects unsafe domain, primary-key, and frozen-backfill changes", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(schema([accounts]));
+    await expect(
+      database.migrate(
+        schema([
+          table(
+            "accounts",
+            {
+              ...accounts.columns,
+              balance: column.numeric({ precision: 14, scale: 2 }).default("0"),
+            },
+            { primaryKey: ["tenant_id", "account_no"] },
+          ),
+        ]),
+      ),
+    ).rejects.toThrow("Column domains cannot change: accounts.balance");
+
+    const before = table("flags", { id: column.integer().unique() });
+    await database.migrate(schema([before]));
+    const added = table("flags", {
+      id: column.integer().unique(),
+      state: column.string().backfill("old"),
+    });
+    await database.migrate(schema([added]));
+    await expect(
+      database.migrate(
+        schema([
+          table("flags", {
+            id: column.integer().unique(),
+            state: column.string().backfill("changed"),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("Backfills cannot change: flags.state");
+    await expect(
+      database.migrate(
+        schema([table("flags", { id: column.integer().unique(), state: column.string() })]),
+      ),
+    ).rejects.toThrow("Backfills cannot be removed: flags.state");
+    store.close();
+  });
+});
+
 describe("typedTable SQL execution", () => {
   it("routes inserts, updates, deletes, and reads through SQL", async () => {
     const definition = table("typed_rows", {
@@ -160,53 +400,38 @@ describe("typedTable SQL execution", () => {
 
 const notes = table("notes", {
   id: column.number().unique().autoIncrement(),
-  slug: column.string().default(() => `slug-${crypto.randomUUID()}`),
+  slug: column.uuid().defaultSql("gen_random_uuid()"),
   status: column.string().default("draft"),
-  created: column.datetime().default("now"),
+  created: column.datetime().defaultSql("CURRENT_TIMESTAMP"),
   body: column.string(),
   tags: column.string().nullable(),
 });
 
 describe("column defaults", () => {
-  it("carries default specs and function defaults on builders", () => {
+  it("carries literal and SQL default specs on builders", () => {
     expect(notes.columns.id.defaultSpec).toEqual({ kind: "autoincrement" });
     expect(notes.columns.status.defaultSpec).toEqual({ kind: "literal", value: "draft" });
-    expect(notes.columns.created.defaultSpec).toEqual({ kind: "now" });
+    expect(notes.columns.created.defaultSpec).toEqual({
+      kind: "expression",
+      sql: "CURRENT_TIMESTAMP",
+    });
     expect(notes.columns.body.defaultSpec).toBeUndefined();
     expect(notes.columns.id.hasDefault).toBe(true);
     expect(notes.columns.body.hasDefault).toBe(false);
-    // A function default is carried as-is, never as a catalog spec.
-    expect(notes.columns.slug.defaultSpec).toBeUndefined();
-    expect(notes.columns.slug.defaultFn?.()).toMatch(/^slug-/);
+    expect(notes.columns.slug.defaultSpec).toEqual({
+      kind: "expression",
+      sql: "gen_random_uuid()",
+    });
     expect(notes.columns.slug.hasDefault).toBe(true);
-    // Declaring one kind of default replaces the other.
-    const replaced = column
-      .string()
-      .default(() => "generated")
-      .default("literal");
-    expect(replaced.defaultFn).toBeUndefined();
+    const replaced = column.string().defaultSql("lower('generated')").default("literal");
     expect(replaced.defaultSpec).toEqual({ kind: "literal", value: "literal" });
   });
 
   it("rejects invalid default combinations explicitly", () => {
-    expect(() =>
-      table("bad", {
-        a: (
-          column.string().default("x") as unknown as {
-            nullable(): ReturnType<typeof column.string>;
-          }
-        ).nullable(),
-      }),
-    ).toThrow("Defaults require a non-nullable column");
-    expect(() =>
-      table("bad", {
-        a: (
-          column.string().default(() => "x") as unknown as {
-            nullable(): ReturnType<typeof column.string>;
-          }
-        ).nullable(),
-      }),
-    ).toThrow("Defaults require a non-nullable column");
+    expect(table("nullable_default", { a: column.string().default("x").nullable() })).toBeDefined();
+    expect(
+      table("nullable_sql", { a: column.string().defaultSql("lower('X')").nullable() }),
+    ).toBeDefined();
     expect(() =>
       table("bad", {
         a: (
@@ -217,16 +442,29 @@ describe("column defaults", () => {
         b: column.string(),
       }),
     ).toThrow("Auto-increment requires the unique key column");
-    expect(() => table("bad", { a: column.string().unique().default("constant") })).toThrow(
-      "Unique key cannot default to a constant",
-    );
+    expect(
+      table("constant_key", { a: column.string().unique().default("constant") }),
+    ).toBeDefined();
     expect(() =>
       (column.string() as unknown as { autoIncrement: () => unknown }).autoIncrement(),
     ).toThrow("Auto-increment requires a number column");
-    expect(() => column.datetime().default("later" as "now")).toThrow(
-      'Datetime columns default with "now"',
-    );
+    expect(() => column.datetime().default("later" as unknown as Date)).toThrow("valid Date");
     expect(() => column.number().default(Number.NaN)).toThrow("finite number");
+    expect(() =>
+      table("row_expression", {
+        source: column.string(),
+        copy: column.string().defaultSql("source"),
+      }),
+    ).toThrow("variable-free scalar SQL expression");
+    expect(() =>
+      table("parameter_expression", { value: column.string().defaultSql("$1") }),
+    ).toThrow("variable-free scalar SQL expression");
+    expect(() =>
+      table("aggregate_expression", { value: column.number().defaultSql("COUNT(*)") }),
+    ).toThrow("variable-free scalar SQL expression");
+    expect(() =>
+      table("wrong_expression_type", { value: column.string().defaultSql("1 + 2") }),
+    ).toThrow("produces number, but the column is string");
   });
 
   it("makes default-bearing columns optional in insert rows", () => {
@@ -237,6 +475,15 @@ describe("column defaults", () => {
     // @ts-expect-error body has no default and stays required
     const missing: Insert = { id: 1 };
     expect(missing).toBeDefined();
+
+    const nullableDefault = table("nullable_default_type", {
+      body: column.string(),
+      status: column.string().default("draft").nullable(),
+    });
+    type NullableDefaultInsert = InferInsertRow<typeof nullableDefault>;
+    const omitted: NullableDefaultInsert = { body: "omitted" };
+    const explicitNull: NullableDefaultInsert = { body: "null", status: null };
+    expect([nullableDefault, omitted, explicitNull]).toBeDefined();
   });
 
   it("accepts omitted default-bearing columns through the Standard Schema validator", () => {
@@ -250,7 +497,7 @@ describe("column defaults", () => {
     }
   });
 
-  it("round-trips default specs through the wire format and drops functions", () => {
+  it("round-trips every default spec through the wire format", () => {
     const rebuilt = deserializeSchema(serializeSchema(schema([notes])));
     const rebuiltColumns = rebuilt.tables[0]?.columns ?? {};
     expect(
@@ -262,16 +509,13 @@ describe("column defaults", () => {
       ),
     ).toEqual({
       id: { kind: "autoincrement" },
-      slug: null,
+      slug: { kind: "expression", sql: "gen_random_uuid()" },
       status: { kind: "literal", value: "draft" },
-      created: { kind: "now" },
+      created: { kind: "expression", sql: "CURRENT_TIMESTAMP" },
       body: null,
       tags: null,
     });
     expect(rebuiltColumns.id?.isUnique).toBe(true);
-    // Function defaults are facade-side only: they cannot cross postMessage, so the wire
-    // format drops them and the catalog records no default for the column.
-    expect(rebuiltColumns.slug?.defaultFn).toBeUndefined();
   });
 
   it("plans default alterations and rejects auto-increment transitions", () => {
@@ -325,6 +569,47 @@ describe("column defaults", () => {
     expect(removed.steps).toEqual([
       { kind: "alter-default", tableName: "notes", columnName: "status", defaultValue: null },
     ]);
+    const currentWithExpression = [
+      {
+        ...notesRecord,
+        columns: [
+          idRecord,
+          {
+            ...statusRecord,
+            defaultValue: { kind: "expression" as const, sql: "lower('QUEUED')" },
+          },
+        ],
+      },
+    ];
+    expect(
+      planMigration(
+        toCatalog(currentWithExpression),
+        schema([
+          table("notes", {
+            id: idColumn,
+            status: column.string().defaultSql("lower('QUEUED')"),
+          }),
+        ]),
+      ).steps,
+    ).toEqual([]);
+    expect(
+      planMigration(
+        toCatalog(currentWithExpression),
+        schema([
+          table("notes", {
+            id: idColumn,
+            status: column.string().defaultSql("upper('queued')"),
+          }),
+        ]),
+      ).steps,
+    ).toEqual([
+      {
+        kind: "alter-default",
+        tableName: "notes",
+        columnName: "status",
+        defaultValue: { kind: "expression", sql: "upper('queued')" },
+      },
+    ]);
     // Dropping the generator is a catalog edit: nothing stored changes, writes just stop
     // being filled.
     expect(
@@ -337,26 +622,32 @@ describe("column defaults", () => {
     ]);
   });
 
-  it("fills function defaults through typedTable before the batch reaches the engine", async () => {
+  it("evaluates SQL defaults per omitted row and preserves explicit NULL", async () => {
     const store = new MemoryBlockStore();
-    const database = new MinnowDatabase(store);
-    let counter = 0;
-    const entries = table("entries", {
-      key: column
-        .string()
-        .unique()
-        .default(() => `key-${String((counter += 1))}`),
-      body: column.string(),
+    const stamped = new Date("2026-08-24T12:34:56.000Z");
+    const database = new MinnowDatabase(store, { now: () => stamped });
+    const entries = table("default_expressions", {
+      id: column.integer().unique().autoIncrement(),
+      token: column.uuid().defaultSql("gen_random_uuid()"),
+      created: column.datetime().defaultSql("CURRENT_TIMESTAMP"),
+      amount: column.numeric({ precision: 8, scale: 2 }).defaultSql("1.25 + 2"),
+      note: column.string().default("generated").nullable(),
     });
     await database.migrate(schema([entries]));
-    const handle = typedTable(database, entries);
-    await handle.insert([{ body: "generated" }, { key: "explicit", body: "kept" }]);
-    const rows = await handle.rows();
-    expect(rows.map(({ key }) => key).sort()).toEqual(["explicit", "key-1"]);
-    // The raw batch API bypasses the facade, so the function default does not apply there.
-    await expect(database.insertBatch("entries", [{ key: null, body: "raw" }])).rejects.toThrow(
-      "key[0] cannot be null",
+    const result = await database.insertBatch("default_expressions", [{}, { note: null }]);
+    expect(result.generatedColumns?.created).toEqual([stamped, stamped]);
+    const rows = await database.query(
+      "SELECT id, token, created, amount, note FROM default_expressions ORDER BY id",
     );
+    expect(rows.rows).toMatchObject([
+      { id: 1, created: stamped, amount: "3.25", note: "generated" },
+      { id: 2, created: stamped, amount: "3.25", note: null },
+    ]);
+    expect(rows.rows.map(({ token }) => token)).toEqual([
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+    ]);
+    expect(rows.rows[0]?.token).not.toBe(rows.rows[1]?.token);
     store.close();
   });
 
@@ -377,6 +668,23 @@ describe("column defaults", () => {
     expect((await database.migrate(schema([v2]))).steps).toEqual([]);
     const inserted = await database.insertBatch("posts", [{}]);
     expect(inserted.generatedColumns).toEqual({ id: [1], status: ["draft"] });
+
+    const v3 = table("posts", {
+      id: column.number().unique().autoIncrement(),
+      status: column.string().defaultSql("upper('queued')"),
+    });
+    await database.migrate(schema([v3]));
+    expect((await database.insertBatch("posts", [{}])).generatedColumns).toEqual({
+      id: [2],
+      status: ["QUEUED"],
+    });
+
+    await database.migrate(schema([v1]));
+    await expect(database.insertBatch("posts", [{}])).rejects.toThrow("status[0] cannot be null");
+    expect((await database.query("SELECT id, status FROM posts ORDER BY id")).rows).toEqual([
+      { id: 1, status: "draft" },
+      { id: 2, status: "QUEUED" },
+    ]);
     store.close();
   });
 });
@@ -514,11 +822,11 @@ describe("enum columns", () => {
       status: column.enum(["open", "closed"]).default("open"),
     });
     await database.migrate(schema([v1]));
-    const inserted = await database.insertBatch("tickets", [
-      { status: null },
-      { status: "closed" },
-    ]);
+    const inserted = await database.insertBatch("tickets", [{}, { status: "closed" }]);
     expect(inserted.generatedColumns?.status).toEqual(["open", "closed"]);
+    await expect(database.insertBatch("tickets", [{ status: null }])).rejects.toThrow(
+      "status[0] cannot be null",
+    );
     await expect(database.insertBatch("tickets", [{ status: "reopened" }])).rejects.toThrow(
       "status[0] must be one of: open, closed",
     );
@@ -1693,6 +2001,45 @@ describe("adding a column with a backfill", () => {
     store.close();
   });
 
+  it("keeps a new column's backfill separate from its future SQL default", async () => {
+    const { database, store } = await seeded();
+    const evolved = schema([
+      table("notes", {
+        id: column.number().unique(),
+        body: column.string(),
+        status: column.string().backfill("legacy").defaultSql("lower('NEW')"),
+      }),
+    ]);
+    await database.migrate(evolved);
+    await database.insertBatch("notes", [{ id: 3, body: "new" }]);
+    expect((await database.query("SELECT id, status FROM notes ORDER BY id")).rows).toEqual([
+      { id: 1, status: "legacy" },
+      { id: 2, status: "legacy" },
+      { id: 3, status: "new" },
+    ]);
+    store.close();
+  });
+
+  it("uses a new nullable column's default only for future writes", async () => {
+    const { database, store } = await seeded();
+    await database.migrate(
+      schema([
+        table("notes", {
+          id: column.number().unique(),
+          body: column.string(),
+          status: column.string().default("new").nullable(),
+        }),
+      ]),
+    );
+    await database.insertBatch("notes", [{ id: 3, body: "new" }]);
+    expect((await database.query("SELECT id, status FROM notes ORDER BY id")).rows).toEqual([
+      { id: 1, status: null },
+      { id: 2, status: null },
+      { id: 3, status: "new" },
+    ]);
+    store.close();
+  });
+
   it("does not rewrite the stored segments", async () => {
     const { database, store } = await seeded();
     const before = await database.listVisibleSegments("notes");
@@ -1721,7 +2068,7 @@ describe("adding a column with a backfill", () => {
   it("freezes a generated backfill so every reader agrees", async () => {
     const { database, store } = await seeded();
     let calls = 0;
-    await database.migrate(
+    const migrated = await database.migrate(
       schema([
         table("notes", {
           id: column.number().unique(),
@@ -1734,6 +2081,11 @@ describe("adding a column with a backfill", () => {
       ]),
     );
     expect(calls).toBe(1);
+    const reported = serializeMigrationSteps(migrated.steps);
+    expect(calls).toBe(1);
+    expect(reported.find((step) => step.kind === "add-column")).toMatchObject({
+      definition: { backfillValue: 101 },
+    });
     const rows = await database.readTable("notes");
     expect(rows.map((row) => row.stamp)).toEqual([101, 101]);
     // Re-reading does not re-run the generator.

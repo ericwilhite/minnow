@@ -1,84 +1,45 @@
 ---
-title: Feature matrix
-description: Every SQL form the engine supports, and every one it deliberately rejects.
+title: PostgreSQL compatibility
+description: See which PostgreSQL forms Minnow supports, changes, extends, or excludes.
 ---
 
-For the upstream corpus, differential oracles, fault simulation, and release policy behind these
-claims, see [SQL conformance & testing](/docs/conformance).
+Minnow implements PostgreSQL-style SQL for one embedded browser database. Familiar behavior
+includes double-quoted identifiers, `$1` parameters, `RETURNING`, `ILIKE`, `ON CONFLICT`, and
+PostgreSQL NULL ordering.
 
-This page is generated from `sql-feature-matrix.json`, which is a **test fixture** rather than a
-description. On every test run, each supported example below is executed through both of the
-engine's executors, and each rejected example is checked to still fail with the recorded error. A
-page built from it cannot drift from what the engine does.
+The list below classifies each documented SQL form:
 
-Every entry is keyed to the feature identifier ISO/IEC 9075:2023 (SQL:2023) gives it in Annex F,
-so what the engine claims can be checked against the standard rather than against its own
-vocabulary. Forms the standard does not define — `MATCH` and BM25 relevance, `ILIKE`,
-`DATE_TRUNC` — are marked as extensions instead. Supported forms are also diffed against SQLite
-and PostgreSQL on every run, and where the three genuinely disagree the difference is recorded
-with the reason rather than hidden: multi-character `TRIM` removes the whole string here, as the
-standard says, while PostgreSQL removes any of its characters.
+- **PostgreSQL compatible** — the syntax and result follow PostgreSQL for the example shown.
+- **PostgreSQL difference** — Minnow supports the form with a documented result or type difference.
+- **Minnow extension** — Minnow adds syntax or behavior for its embedded use case.
+- **Not applicable** — the PostgreSQL form belongs to a server concept Minnow does not have.
+- **Unsupported** — Minnow rejects the form with the listed error.
 
-## Deliberate omissions
+Every supported example runs through both query execution paths. Compatible reads and writes are
+also compared with PGlite. Every excluded example is checked for the documented error, so this
+page stays aligned with the engine.
 
-Some of what is missing is missing on purpose. The reasons fall into three groups.
+This is a form-by-form compatibility guide, not a claim that Minnow contains the complete
+PostgreSQL grammar. These supported features have narrower limits:
 
-### Because the browser is the runtime
+- `LATERAL` supports equality-correlated projections and joins, without correlated grouping,
+  ordering, or `LIMIT`.
+- `JSON_TABLE` supports constant documents with `$` and `$[*]` row paths.
+- `CREATE SEQUENCE` supports `NEXTVAL` and session-local `CURRVAL`, without sequence options.
+- enums support declaration, validation, and declaration-order comparison, without `ALTER TYPE`.
+- exact `NUMERIC`, JSON/JSONB, UUID, arrays, `TIME`, intervals, and enums keep their full values
+  internally and return strings at the JavaScript boundary.
 
-`BEGIN` … `COMMIT` works, but with a bound on it. A transaction a statement string can open is one
-a lost reference, a closed tab, or a thrown error could leave open forever, holding storage a
-background sweep cannot reclaim — so one left untouched rolls itself back, and schema changes are
-refused inside it, because the catalog commits outside the scope and a rollback could not take
-them back. `db.write(async (tx) => { … })` remains the form with no bound to hit: it ends when its
-callback does, however it ends.
+Minnow deliberately excludes three PostgreSQL server or storage-model features:
 
-There is one isolation level, so `SET TRANSACTION ISOLATION LEVEL` has nothing to set: every read
-runs against a single version and every write scope commits atomically.
+- `UPDATE` and `DELETE` on tables without row identity;
+- configurable transaction isolation levels;
+- roles and `GRANT` privileges.
 
-There are no array, `UUID`, or `INTERVAL` column types. Each would need an encoding, a comparison
-order, and a set of operators that the columnar format would carry forever, for a gain an
-application can get today by storing text and parsing it. There is no `JSON` column type either,
-for the same reason — but the SQL/JSON functions read documents out of ordinary text columns, the
-way SQLite does: `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON_ARRAY`,
-`JSON_ARRAYAGG`, and the `IS JSON` check. JSON constructors and `JSON_ARRAYAGG` use SQL's default
-`NULL ON NULL` behavior and return JSON text. `JSON_TABLE` is missing because it produces rows
-rather than a value, which the executors have no operator for.
-
-Exact `NUMERIC` and `DECIMAL` are also rejected: treating them as the existing Float64 number type
-would silently violate their defining guarantee. SQL integer columns accept only values in
-JavaScript's exact safe-integer range. Approximate work must opt into `DOUBLE PRECISION`, `REAL`, or
-`FLOAT`; money can use safe integer minor units until Minnow has an exact fixed-point type end to
-end.
-
-`FOREIGN KEY` supports one column pointing to another table's unique key. Every write path checks
-the parent exists. `ON DELETE` supports `RESTRICT`, `CASCADE`, and `SET NULL`, and those follow-up
-changes happen in the same transaction as the delete. `ON UPDATE` is unnecessary because Minnow's
-unique keys cannot change. `CHECK` conditions are also enforced on every path that writes a row.
-
-### Because of how mutations work
-
-`UPDATE` and `DELETE` need the table to have a unique key. Mutation segments address rows by that
-key; a table without one can only be appended to. This is not a SQL-layer restriction — it holds
-for every write path.
-
-### Not yet, rather than never
-
-Composite primary and foreign keys, table declarations with multiple unique constraints, and
-savepoints are explicit entries in the rejected matrix. These are production-facing gaps, not
-forms omitted from the denominator. Scalar, composite, and `UNIQUE` secondary indexes are
-supported as Minnow extensions; SQL itself does not standardize physical index DDL. A table still
-has one row-addressing primary/unique key, while `CREATE UNIQUE INDEX` adds independently enforced
-candidate keys.
-
-Correlated `EXISTS` and `NOT EXISTS` support equality and range comparisons by lowering them to
-semi-joins and anti-joins. Correlated scalar aggregates and `IN` still require equality.
-Correlated `NOT IN` is rejected because its three-valued `NULL` behavior cannot be preserved by
-the available join rewrite; `NOT EXISTS` expresses that intent without a hidden per-row query.
-
-## Supported
+## Supported SQL
 
 <SqlFeatureMatrix status="supported" />
 
-## Rejected
+## Deliberate exclusions
 
 <SqlFeatureMatrix status="unsupported" />

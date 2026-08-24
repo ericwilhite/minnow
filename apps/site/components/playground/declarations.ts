@@ -1,7 +1,7 @@
 /**
  * What the editor is told about this page.
  *
- * The packages' own `.d.ts` files describe `Minnow<DB>`; they cannot describe *this* `DB`,
+ * The packages' own `.d.ts` files describe `Kysely<DB>`; they cannot describe *this* `DB`,
  * because the playground's schema is a value in this repository rather than a published type. So
  * the ambient declaration below is printed from the same `retailSchema` the loader migrates —
  * one derivation, which is what stops the editor promising a column the database does not have.
@@ -24,27 +24,27 @@ const TYPES = {
  */
 export function playgroundDeclarations(tables: readonly TableSpec[]): string {
   const rows = tables.map((table) => {
-    const columns = table.columns.map(
-      (col) => `    ${col.name}: ${TYPES[col.type]}${col.nullable === true ? " | null" : ""};`,
-    );
-    // `FromRow` reads the row once and produces the three shapes the builders need — what a
-    // row selects as, what an insert accepts, and what an update changes. Without it every
-    // column resolves to `never` and the builder accepts nothing.
-    return `  /** ${table.description} */\n  ${table.name}: FromRow<{\n${columns.join("\n")}\n  }>;`;
+    const columns = table.columns.map((column) => {
+      const value = `${TYPES[column.type]}${column.nullable === true ? " | null" : ""}`;
+      const insert = `${value}${column.nullable === true ? " | undefined" : ""}`;
+      const update = column.name === table.uniqueKey ? "never" : value;
+      return `    ${column.name}: MinnowColumnType<${value}, ${insert}, ${update}, ${value}>;`;
+    });
+    return `  /** ${table.description} */\n  ${table.name}: {\n${columns.join("\n")}\n  };`;
   });
 
-  return `type FromRow<TRow> = import("@minnowdb/client").FromRow<TRow>;
+  return `type MinnowColumnType<S, I, U, O> = import("@minnowdb/kysely").MinnowColumnType<S, I, U, O>;
 
 /**
- * The playground's database, as the typed client sees it. Every table below was created from
+ * The playground's database, as Kysely sees it. Every table below was created from
  * the same declaration, so a column that autocompletes here exists in storage.
  */
 interface DB {
 ${rows.join("\n")}
 }
 
-/** The typed client over the database this page built. Start with \`db.selectFrom("orders")\`. */
-declare const db: import("@minnowdb/client").Minnow<DB>;
+/** Kysely over the database this page built. Start with \`db.selectFrom("orders")\`. */
+declare const db: import("kysely").Kysely<DB>;
 
 /** The engine underneath, for the batch APIs and everything the builder does not cover. */
 declare const database: import("@minnowdb/core/client").MinnowDatabaseClient;
@@ -59,7 +59,7 @@ declare const database: import("@minnowdb/core/client").MinnowDatabaseClient;
  * one setup rather than two.
  */
 export const SETUP_SNIPPET = `import { MinnowDatabaseClient } from "@minnowdb/core/client";
-import { createMinnow, type InferDatabase } from "@minnowdb/client";
+import { createKysely } from "@minnowdb/kysely";
 import { retailDefinition } from "./schema";
 
 const worker = new Worker(new URL("@minnowdb/core/worker", import.meta.url), {
@@ -71,5 +71,4 @@ const database = new MinnowDatabaseClient(worker, {
 await database.ready();
 await database.migrate(retailDefinition);
 
-interface DB extends InferDatabase<typeof retailDefinition> {}
-const db = createMinnow<DB>(database, { schema: retailDefinition });`;
+const db = createKysely({ driver: database, schema: retailDefinition });`;

@@ -35,9 +35,11 @@ export {
 export {
   LOG_FORMAT_VERSION,
   decodeChunk,
+  decodePostingChunk,
   decodeRecordJson,
   decodeSyncCheckpoint,
   encodeChunk,
+  encodePostingChunk,
   encodeRecordJson,
   encodeSyncCheckpoint,
 } from "./wire.js";

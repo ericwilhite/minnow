@@ -95,7 +95,9 @@ describe("vector query execution", () => {
   it("spills stable ORDER BY runs under a budget and removes every temp page", async () => {
     const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
       id: index,
-      bucket: index % 11,
+      // Exercise PostgreSQL's implicit NULLS LAST through both the per-run radix sort and the
+      // comparison-based spill merge. The row executor is the independent reference below.
+      bucket: index % 17 === 0 ? null : index % 11,
     }));
     // No LIMIT: a limited ORDER BY retains only the top rows and fits the budget without spilling.
     const plan = compileQuery("SELECT id, bucket FROM rows ORDER BY bucket, id DESC");
@@ -198,6 +200,31 @@ describe("vector query execution", () => {
     expect(spill.putCount).toBeGreaterThan(0);
     expect(spill.pages.size).toBe(0);
     expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(100_000);
+    prepared.close();
+  });
+
+  it("spills ordered STRING_AGG groups without changing aggregate order", async () => {
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, id) => ({
+      bucket: id % 400,
+      label: `v${String(id).padStart(4, "0")}`,
+      priority: (id * 37) % 101,
+    }));
+    const tables = new Map([["rows", rows]]);
+    const plan = compileQuery(
+      "SELECT bucket, STRING_AGG(label, ',' ORDER BY priority DESC, label) AS labels " +
+        "FROM rows GROUP BY bucket ORDER BY bucket",
+    );
+    const prepared = createPreparedQuery(plan, tables, {
+      executionMemoryBudgetBytes: 200_000,
+    });
+    expect(() => prepared.execute()).toThrow(QueryMemoryBudgetError);
+    const spill = new TestSpillStore();
+    expect(await prepared.executeAsync({ spillStore: spill, spillPageRows: 64 })).toEqual(
+      executeRowQuery(plan, tables),
+    );
+    expect(spill.putCount).toBeGreaterThan(0);
+    expect(spill.pages.size).toBe(0);
+    expect(prepared.memoryUsage.peakBytes).toBeLessThanOrEqual(200_000);
     prepared.close();
   });
 

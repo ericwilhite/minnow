@@ -38,6 +38,59 @@ describe("classifyStatement", () => {
     expect(classifyStatement("UPDATE people SET score = 0")).toMatchObject({ filtered: false });
   });
 
+  it("routes DDL and transaction statements through execute with an exact review", () => {
+    expect(
+      classifyStatement("CREATE UNIQUE INDEX people_lookup ON people (city ASC, score DESC)"),
+    ).toMatchObject({
+      kind: "execute",
+      operation: "create-index",
+      summary: {
+        title: "Create unique index people_lookup",
+        facts: [
+          ["index", "people_lookup"],
+          ["table", "people"],
+          ["columns", "city ASC, score DESC"],
+        ],
+        confirmLabel: "Create index",
+      },
+    });
+    expect(classifyStatement("DROP TABLE people")).toMatchObject({
+      kind: "execute",
+      operation: "drop-table",
+      summary: { destructive: true },
+    });
+    expect(classifyStatement("BEGIN")).toMatchObject({
+      kind: "execute",
+      operation: "transaction",
+      summary: { confirmLabel: "Begin" },
+    });
+    expect(classifyStatement("ALTER TABLE people ADD COLUMN note VARCHAR")).toMatchObject({
+      kind: "execute",
+      operation: "add-column",
+    });
+    expect(classifyStatement("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")).toMatchObject({
+      kind: "execute",
+      operation: "create-enum",
+      summary: {
+        title: "Create enum type mood",
+        facts: [
+          ["type", "mood"],
+          ["values", "sad, ok, happy"],
+        ],
+        confirmLabel: "Create type",
+      },
+    });
+    expect(classifyStatement("CREATE SEQUENCE order_number")).toMatchObject({
+      kind: "execute",
+      operation: "create-sequence",
+      summary: {
+        title: "Create sequence order_number",
+        facts: [["sequence", "order_number"]],
+        confirmLabel: "Create sequence",
+      },
+    });
+  });
+
   it("passes the located compile error through", () => {
     const sql = "SELECT * FROM people WHERE name = 'oops";
     expect(() => classifyStatement(sql)).toThrow(SqlCompileError);
@@ -56,6 +109,8 @@ describe("changesData", () => {
     expect(changesData(classifyStatement("DELETE FROM people"))).toBe(true);
     expect(changesData(classifyStatement("UPDATE people SET score = 0"))).toBe(true);
     expect(changesData(classifyStatement("INSERT INTO people (name) VALUES ('a')"))).toBe(true);
+    expect(changesData(classifyStatement("CREATE INDEX by_name ON people(name)"))).toBe(true);
+    expect(changesData(classifyStatement("COMMIT"))).toBe(true);
   });
 });
 
@@ -80,5 +135,12 @@ describe("summarize", () => {
     expect(
       summarize(classifyStatement("DELETE FROM people WHERE score < 0")).warning,
     ).toBeUndefined();
+  });
+
+  it("explains destructive schema changes before they run", () => {
+    const summary = summarize(classifyStatement("DROP INDEX by_name"));
+    expect(summary.title).toBe("Drop index by_name");
+    expect(summary.warning).toContain("scan more data");
+    expect(summary.destructive).toBe(true);
   });
 });

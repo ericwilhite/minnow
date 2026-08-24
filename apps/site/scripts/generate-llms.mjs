@@ -13,13 +13,13 @@
  *
  * The custom components the pages use are expanded rather than dropped, because what they render
  * is content: a callout becomes a blockquote, and the SQL feature matrix becomes a table of all
- * 190 forms. An unrecognised component stops the build — a `.md` twin with raw JSX in it would be
+ * SQL forms. An unrecognised component stops the build — a `.md` twin with raw JSX in it would be
  * a page that quietly lies about what the site says.
  *
  * Everything is written under the build's base path, so an archived version has its own
  * llms.txt describing its own release rather than pointing at the current one.
  */
-import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,12 +27,25 @@ const siteRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const contentRoot = path.join(siteRoot, "content/docs");
 const publicRoot = path.join(siteRoot, "public");
 const matrixFile = path.join(siteRoot, "../../packages/core/sql-feature-matrix.json");
+const postgresProfileFile = path.join(
+  siteRoot,
+  "../../packages/core/postgres-feature-profile.json",
+);
 const corePackageFile = path.join(siteRoot, "../../packages/core/package.json");
 
 const ORIGIN = "https://minnowdb.com";
 const basePath = process.env.SITE_BASE_PATH ?? "";
 const version = JSON.parse(readFileSync(corePackageFile, "utf8")).version;
 const matrix = JSON.parse(readFileSync(matrixFile, "utf8"));
+const postgresProfile = JSON.parse(readFileSync(postgresProfileFile, "utf8"));
+const postgresOverrides = new Map(postgresProfile.overrides.map((entry) => [entry.id, entry]));
+
+function postgresClassification(feature) {
+  const override = postgresOverrides.get(feature.id);
+  if (override !== undefined) return override.classification;
+  if (feature.status === "unsupported") return postgresProfile.defaults.unsupported;
+  return postgresProfile.defaults.supported;
+}
 
 /**
  * A link to something else on this site, from the root, carrying the base path this build was
@@ -93,22 +106,31 @@ function collect(directory, slugPrefix) {
 
 function featureTable(status) {
   const selected = matrix.features.filter((feature) => feature.status === status);
+  if (status === "unsupported") {
+    selected.sort((left, right) => left.id.localeCompare(right.id));
+  }
   const lines = [
     status === "supported"
       ? `${selected.length} forms, each executed on every test run and diffed against SQLite and PostgreSQL wherever the three agree on what the answer should be.`
       : `${selected.length} forms, each checked on every test run to still fail with the error below.`,
     "",
-    `| Feature | SQL:2023 | Example | ${status === "supported" ? "Notes" : "Rejected with"} |`,
-    "| --- | --- | --- | --- |",
+    status === "supported"
+      ? "| Feature | PostgreSQL profile | Example | Notes |"
+      : "| Feature | PostgreSQL profile | Example | Rejected with | Why |",
+    status === "supported" ? "| --- | --- | --- | --- |" : "| --- | --- | --- | --- | --- |",
   ];
   const cell = (value) => (value ?? "").replaceAll("|", "\\|");
   for (const feature of selected) {
-    const last = status === "supported" ? feature.notes : feature.error;
     lines.push(
-      `| \`${feature.id}\` | ${feature.feature === "minnow" ? "Minnow extension" : feature.feature} | \`${cell(feature.example)}\` | ${last === undefined ? "" : cell(last)} |`,
+      status === "supported"
+        ? `| \`${feature.id}\` | ${postgresClassification(feature)} | \`${cell(feature.example)}\` | ${cell(feature.notes)} |`
+        : `| \`${feature.id}\` | ${postgresClassification(feature)} | \`${cell(feature.example)}\` | ${cell(feature.error)} | ${cell(feature.notes)} |`,
     );
   }
-  lines.push("", `The same data as JSON: ${url("/sql-feature-matrix.json")}`);
+  lines.push(
+    "",
+    `The same data as JSON: ${url("/sql-feature-matrix.json")}. PostgreSQL classifications: ${url("/postgres-feature-profile.json")}.`,
+  );
   return lines.join("\n");
 }
 
@@ -137,7 +159,7 @@ const CODE = /(```[\s\S]*?```|``[^\n]*?``|`[^`\n]*`)/g;
 
 /**
  * Apply a transformation to prose only. Code is left exactly as written: a fenced TypeScript
- * block is full of things that look like components — `InferDatabase<DB>` for one — and rewriting
+ * block is full of things that look like components — `Array<Row>` for one — and rewriting
  * inside it would corrupt an example a reader is meant to paste.
  */
 function outsideCode(markdown, transform) {
@@ -222,6 +244,22 @@ for (const page of everyPage) {
   write(markdownPath(page), markdown);
 }
 
+// A removed MDX page must remove its generated twin too. Otherwise stale documentation remains
+// publicly fetchable even after it has disappeared from the sidebar, llms indexes, and source.
+const expectedMarkdownFiles = new Set(
+  everyPage.map((page) => path.join(publicRoot, markdownPath(page).replace(/^\//, ""))),
+);
+function generatedMarkdownFiles(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) return generatedMarkdownFiles(file);
+    return entry.isFile() && entry.name.endsWith(".md") ? [file] : [];
+  });
+}
+for (const file of generatedMarkdownFiles(path.join(publicRoot, "docs"))) {
+  if (!expectedMarkdownFiles.has(file)) rmSync(file);
+}
+
 // The rules block on the agents page, published on its own so it can be fetched straight into a
 // project's AGENTS.md. It lives in the page rather than beside it so that what the site shows and
 // what an agent downloads cannot drift apart.
@@ -236,9 +274,9 @@ if (rules === null) {
 write("/agent-rules.md", rules[1]);
 
 const summary =
-  "Minnow is a columnar SQL engine that runs entirely in the browser. It parses, plans, and " +
-  "executes SQL itself over immutable columnar blocks stored in IndexedDB, with no server and no " +
-  "WebAssembly to download.";
+  "Minnow is a columnar SQL database for the browser. It runs PostgreSQL-style SQL over durable " +
+  "IndexedDB or OPFS data through direct SQL or Kysely, with no server and no " +
+  "WebAssembly module.";
 
 write(
   "/llms.txt",
@@ -250,11 +288,12 @@ write(
     `Published at ${ORIGIN}. Every link below is site-relative, so this file reads the same from ` +
       "a local build as from the live site.",
     "",
-    `Engine version ${version}. \`@minnowdb/core\`, \`@minnowdb/client\`, and \`@minnowdb/devtools\` ` +
+    `Engine version ${version}. \`@minnowdb/core\`, \`@minnowdb/kysely\`, and \`@minnowdb/devtools\` ` +
       "share a major version and move independently inside it; install them on the same major.",
     "",
     `Every page below is the markdown the site was written from. The whole set in one file is at ${url("/llms-full.txt")}, ` +
-      `and the SQL surface as data is at ${url("/sql-feature-matrix.json")}.`,
+      `the SQL surface as data is at ${url("/sql-feature-matrix.json")}, and its PostgreSQL ` +
+      `classifications are at ${url("/postgres-feature-profile.json")}.`,
     "",
     `Writing Minnow code? ${url("/agent-rules.md")} is a short rules file covering the API, the ` +
       "traps, and the SQL forms this engine rejects.",
@@ -270,7 +309,7 @@ write(
     ]),
     "## Optional",
     "",
-    `- [Console](${url("/#console")}): a live database of ~590,000 rows, generated in the browser, that any SQL can be run against — or queried through the typed client, in a TypeScript editor with the published declarations loaded.`,
+    `- [Console](${url("/#console")}): a live database of ~590,000 rows, generated in the browser, with SQL and TypeScript editors backed by the published declarations.`,
     `- [Benchmarks](${url("/benchmarks/")}): Minnow against SQLite Wasm and PGlite, run in the visitor's browser.`,
     `- [Source](https://github.com/ericwilhite/minnow): the repository, MIT licensed.`,
     "",
@@ -312,6 +351,7 @@ if (basePath === "") {
 }
 
 copyFileSync(matrixFile, path.join(publicRoot, "sql-feature-matrix.json"));
+copyFileSync(postgresProfileFile, path.join(publicRoot, "postgres-feature-profile.json"));
 
 console.log(
   `llms.txt, llms-full.txt, agent-rules.md, sitemap.xml, and ${everyPage.length} markdown pages ` +

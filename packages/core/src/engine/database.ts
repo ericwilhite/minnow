@@ -96,6 +96,7 @@ import {
   type SegmentKind,
   type SegmentRecord,
   type SimpleDataType,
+  type SqlDomain,
   decodeSnapshot,
   encodeSnapshot,
   type SnapshotExportProgress,
@@ -115,6 +116,7 @@ import {
   TransactionManager,
   type DatabaseTransaction,
   type LeasedSnapshot,
+  type TransactionCheckpoint,
 } from "../transactions/index.js";
 import {
   applyWindowFunctions,
@@ -132,8 +134,10 @@ import {
   createPreparedColumnarQuery,
   evaluateJoinedRowExpression,
   evaluateRowExpression,
+  externalizeQueryResult,
   expressionColumnNames,
   inferBlockSchema,
+  isDefaultInsertValue,
   referencedColumns,
   childExpressions,
   expandFtsColumns,
@@ -144,12 +148,17 @@ import {
   planContainsFts,
   planHasNaturalJoins,
   planHasSourceColumnAliases,
+  planReadsTable,
   planReadsViews,
   planReadsBeyondSingleScan,
   projectResultColumns,
+  queryResultNeedsExternalization,
+  resolveStatementDatetimes,
   subqueryResolutionSteps,
   topLevelFtsMatchConjuncts,
   transparentProjectionSource,
+  validateDefaultExpression,
+  windowOutputDomain,
   windowOutputType,
   type ComparisonOperator,
   type PredicateOperator,
@@ -163,6 +172,7 @@ import {
   type QueryRow,
   type QueryValue,
   type SqlColumnSchema,
+  type UniqueConstraintDefinition,
 } from "./query.js";
 import {
   copyQueryResult,
@@ -178,6 +188,14 @@ import {
 } from "./memory.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySetOptions } from "./live.js";
 import { chooseJoinOrder, renderPlan } from "./optimizer.js";
+import { encodeSqlEqualityValue } from "./sql-semantics.js";
+import {
+  externalSqlDomainValue,
+  externalSqlTextValue,
+  isSqlDomainValue,
+  normalizeSqlDomainValue,
+  protectedSqlTextValue,
+} from "./sql-domains.js";
 import { toCatalog, type Catalog } from "./catalog.js";
 import {
   applyColumnSteps,
@@ -203,7 +221,12 @@ import {
 // The on-disk format is little-endian; the bulk Float64 copy reads platform order.
 const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const vectorTextDecoder = new TextDecoder("utf-8", { fatal: true });
+const SQL_DOMAIN_PREFIX_BYTES = new TextEncoder().encode("\u0000minnow-domain:");
 const NULL_STRING_VECTOR_CODE = 0xffffffff;
+/** Unspellable SQL identifier used as the scalar locator for a declared composite primary key. */
+const COMPOSITE_KEY_COLUMN_NAME = "\u0000minnow_primary_key";
+const ENUM_TYPE_PREFIX = "\u0000minnow_enum_type:";
+const SEQUENCE_PREFIX = "\u0000minnow_sequence:";
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
 const DEFAULT_COMPACTION_TARGET_BLOCK_BYTES = 2 * 1024 * 1024;
@@ -394,13 +417,43 @@ export interface ColumnDefinition {
   type: SimpleDataType;
   /** SQL integer-domain guard; ordinary API number columns remain finite Float64 values. */
   integer?: true;
+  /** PostgreSQL logical domain over the primitive storage type. */
+  sqlDomain?: SqlDomain;
   nullable?: boolean;
-  /** Fills null-or-absent slots at insert time; never applied at read time. */
+  /** Fills omitted or SQL DEFAULT slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
   /** String columns only: the closed set of values writes must draw from. */
   enumValues?: readonly string[];
   /** What rows written before this column existed read as, instead of NULL. */
   backfill?: boolean | number | string | Date;
+}
+
+function normalizedColumnBackfill(
+  column: Pick<ColumnDefinition, "name" | "type" | "integer" | "sqlDomain" | "enumValues">,
+  value: boolean | number | string | Date,
+): boolean | number | string | Date {
+  if (column.sqlDomain !== undefined) {
+    const normalized = normalizeSqlDomainValue(column.sqlDomain, value);
+    if (normalized === null) throw new TypeError(`Backfill cannot be NULL: ${column.name}`);
+    return normalized;
+  }
+  const valid =
+    column.type === "datetime"
+      ? value instanceof Date && Number.isFinite(value.getTime())
+      : column.type === "number"
+        ? typeof value === "number" &&
+          Number.isFinite(value) &&
+          (column.integer !== true || Number.isSafeInteger(value))
+        : typeof value === column.type;
+  if (!valid) throw new TypeError(`Backfill does not fit column: ${column.name}`);
+  if (
+    column.enumValues !== undefined &&
+    typeof value === "string" &&
+    !column.enumValues.includes(value)
+  ) {
+    throw new TypeError(`Backfill must be one of the enum values: ${column.name}`);
+  }
+  return value;
 }
 
 export interface MigrateOptions {
@@ -425,9 +478,13 @@ export interface CreateTableInput {
   checks?: ReadonlyArray<{ name: string; sql: string }>;
   /** Marks the table as created from a schema, which lets a later migration drop it. */
   managed?: boolean;
-  /** Single-column references to another table's unique key (E141-04). */
+  /** References to a parent PRIMARY/unique row-addressing key. */
   foreignKeys?: readonly ForeignKeyDefinition[];
   uniqueKey?: string;
+  /** PostgreSQL composite PRIMARY KEY, backed by a hidden canonical tuple locator. */
+  compositePrimaryKey?: readonly string[];
+  /** Independently enforced PostgreSQL UNIQUE constraints. */
+  uniqueConstraints?: readonly UniqueConstraintDefinition[];
 }
 
 export type { BatchRow, BatchValue, ColumnarBatch, InsertBatchInput } from "./batch.js";
@@ -877,6 +934,8 @@ interface CatalogFacts {
   views: ReadonlyMap<string, string>;
   /** Parent table name to the foreign keys referencing it. */
   childKeys: ReadonlyMap<string, readonly ChildForeignKey[]>;
+  /** Physical table and column names to PostgreSQL logical-domain metadata. */
+  domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>;
 }
 
 /** Thrown into a held write scope to make it abort; never surfaces to a caller. */
@@ -911,6 +970,8 @@ function isTransactionalStatement(
 export type ExecuteResult =
   | { kind: "rows"; result: QueryResult }
   | { kind: "create-table"; table: string }
+  | { kind: "create-type"; name: string }
+  | { kind: "create-sequence"; name: string }
   | {
       kind: "create-index";
       index: string;
@@ -925,7 +986,12 @@ export type ExecuteResult =
   | { kind: "drop-column"; table: string; column: string; dropped: boolean }
   | { kind: "drop-table"; table: string; dropped: boolean }
   | { kind: "merge"; table: string; rowCount: number; version?: number }
-  | { kind: "transaction"; action: "begin" | "commit" | "rollback"; version?: number }
+  | {
+      kind: "transaction";
+      action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release";
+      name?: string;
+      version?: number;
+    }
   | { kind: "create-view"; view: string }
   | { kind: "drop-view"; view: string; dropped: boolean }
   | { kind: "create-trigger"; table: string; name: string }
@@ -947,12 +1013,51 @@ export type ExecuteResult =
       returnedRows?: QueryRow[];
     };
 
+function externalizeExecuteResult(result: ExecuteResult): ExecuteResult {
+  if (!("returnedRows" in result) || !Array.isArray(result.returnedRows)) return result;
+  const columns = [...new Set(result.returnedRows.flatMap((row) => Object.keys(row)))];
+  return {
+    ...result,
+    returnedRows: externalizeQueryResult({ columns, rows: result.returnedRows }).rows,
+  };
+}
+
 /** Rejects an INSERT value that is still an unbound `?`/`$n` slot. */
 function boundInsertValue(value: InsertValue): QueryValue {
+  if (isDefaultInsertValue(value)) {
+    throw new TypeError("SQL DEFAULT is an omission marker, not a scalar value");
+  }
   if (typeof value === "object" && value !== null && !(value instanceof Date)) {
     throw new TypeError("Statement has unbound placeholders; pass parameters when executing");
   }
   return value;
+}
+
+/** Keeps SQL DEFAULT distinct from explicit NULL while pivoting INSERT rows. */
+function insertStatementBatch(
+  statement: Extract<CompiledStatement, { kind: "insert" }>,
+): ColumnarBatch {
+  const columns: Record<string, BatchValue[]> = {};
+  const omitted: Record<string, boolean[]> = {};
+  statement.columns.forEach((name, columnIndex) => {
+    const values = new Array<BatchValue>(statement.rows.length).fill(null);
+    const mask = new Array<boolean>(statement.rows.length).fill(false);
+    for (let rowIndex = 0; rowIndex < statement.rows.length; rowIndex += 1) {
+      const value = statement.rows[rowIndex]?.[columnIndex];
+      if (value === undefined || isDefaultInsertValue(value)) {
+        mask[rowIndex] = true;
+      } else {
+        values[rowIndex] = boundInsertValue(value);
+      }
+    }
+    columns[name] = values;
+    if (mask.some(Boolean)) omitted[name] = mask;
+  });
+  return {
+    columns,
+    ...(Object.keys(omitted).length === 0 ? {} : { omitted }),
+    rowCount: statement.rows.length,
+  };
 }
 
 /** Quotes a catalog identifier for internally generated SQL. */
@@ -986,6 +1091,8 @@ export interface StatementWriter extends WriteSession {
 /** The extra entry point held by BEGIN so already-compiled statements are not parsed twice. */
 interface TransactionStatementWriter extends StatementWriter {
   executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
+  checkpoint(): TransactionCheckpoint;
+  rollbackTo(checkpoint: TransactionCheckpoint): Promise<void>;
 }
 
 export interface VisibleSegment {
@@ -1037,6 +1144,8 @@ export class MinnowDatabase {
   readonly #transactionIdleTimeoutMs: number;
   /** What the catalog says, derived once per epoch; see `#catalogFacts`. */
   #catalogCache: { epoch: number; facts: CatalogFacts } | undefined;
+  /** CURRVAL is connection-local, matching PostgreSQL session semantics. */
+  readonly #sequenceCurrValues = new Map<string, number>();
   /** The scope a statement-level BEGIN opened, held until COMMIT, ROLLBACK, or the idle sweep. */
   #openTransaction:
     | {
@@ -1048,6 +1157,8 @@ export class MinnowDatabase {
         busy: number;
         /** When the last statement started or finished, by the injected clock. */
         activeAt: number;
+        /** Nested SQL savepoints in creation order; duplicate names shadow earlier markers. */
+        savepoints: Array<{ name: string; checkpoint: TransactionCheckpoint }>;
       }
     | undefined;
   readonly #compression: Compression;
@@ -1115,6 +1226,8 @@ export class MinnowDatabase {
    * and skips tokenize/parse/optimize entirely.
    */
   readonly #planCache = new Map<string, CompiledQuery>();
+  /** Mutation/DDL SQL to immutable parsed statement, with parameter binding cloning on hits. */
+  readonly #statementCache = new Map<string, CompiledStatement>();
   readonly #visibilityFingerprints = new WeakMap<SegmentVisibilityCatalog, Map<string, string>>();
   readonly #visibleSegmentsMemo = new WeakMap<
     SegmentVisibilityCatalog,
@@ -1232,6 +1345,7 @@ export class MinnowDatabase {
     if (open !== undefined) await open.finished.catch(() => undefined);
 
     this.#planCache.clear();
+    this.#statementCache.clear();
     this.#catalogStateCache.clear();
     this.#liveProofContexts.clear();
     this.#gzipVerdicts.clear();
@@ -1245,6 +1359,19 @@ export class MinnowDatabase {
   async createTable(input: CreateTableInput): Promise<void> {
     const name = validateName(input.name, "Table");
     if (input.columns.length === 0) throw new TypeError("A table needs at least one column");
+    const enumDomains = new Map<string, SqlDomain>();
+    for (const column of input.columns) {
+      if (column.sqlDomain?.kind !== "enum" || column.sqlDomain.values.length > 0) continue;
+      const record = await this.store.getTableByName(`${ENUM_TYPE_PREFIX}${column.sqlDomain.name}`);
+      if (record?.enumType === undefined) {
+        throw new TypeError(`Unsupported column type: ${column.sqlDomain.name}`);
+      }
+      enumDomains.set(column.name, {
+        kind: "enum",
+        name: record.enumType.name,
+        values: [...record.enumType.values],
+      });
+    }
     const names = new Set<string>();
     const columns: TableColumnRecord[] = input.columns.map((column) => {
       const columnName = validateName(column.name, "Column");
@@ -1256,23 +1383,71 @@ export class MinnowDatabase {
       if (column.enumValues !== undefined && column.type !== "string") {
         throw new TypeError(`Enum values require a string column: ${columnName}`);
       }
+      const sqlDomain = enumDomains.get(column.name) ?? column.sqlDomain;
       return {
         id: this.#createId(),
         name: columnName,
         type: column.type,
         ...(column.integer === true ? { integer: true } : {}),
+        ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
         nullable: column.nullable ?? false,
         ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
         ...(column.enumValues === undefined
           ? {}
           : { enumValues: validateEnumValues(column.enumValues, columnName) }),
-        ...(column.backfill === undefined ? {} : { backfill: column.backfill }),
+        ...(column.backfill === undefined
+          ? {}
+          : {
+              backfill: normalizedColumnBackfill(
+                {
+                  name: columnName,
+                  type: column.type,
+                  ...(column.integer === true ? { integer: true as const } : {}),
+                  ...(sqlDomain === undefined ? {} : { sqlDomain }),
+                  ...(column.enumValues === undefined ? {} : { enumValues: column.enumValues }),
+                },
+                column.backfill,
+              ),
+            }),
       };
     });
-    const uniqueKeyColumn =
-      input.uniqueKey === undefined
+    if (input.uniqueKey !== undefined && input.compositePrimaryKey !== undefined) {
+      throw new TypeError("A table cannot declare both scalar and composite primary keys");
+    }
+    const compositePrimaryColumns = (input.compositePrimaryKey ?? []).map((columnName) => {
+      const column = columns.find((candidate) => candidate.name === columnName);
+      if (column === undefined) {
+        throw new TypeError(`PRIMARY KEY column not found: ${columnName}`);
+      }
+      return column;
+    });
+    if (
+      input.compositePrimaryKey !== undefined &&
+      (compositePrimaryColumns.length < 2 ||
+        new Set(compositePrimaryColumns.map((column) => column.id)).size !==
+          compositePrimaryColumns.length)
+    ) {
+      throw new TypeError("A composite PRIMARY KEY needs at least two distinct columns");
+    }
+    for (const column of compositePrimaryColumns) {
+      if (column.nullable) throw new TypeError(`PRIMARY KEY cannot be nullable: ${column.name}`);
+    }
+    const hiddenCompositeKey =
+      compositePrimaryColumns.length === 0
         ? undefined
-        : columns.find((column) => column.name === input.uniqueKey);
+        : ({
+            id: this.#createId(),
+            name: COMPOSITE_KEY_COLUMN_NAME,
+            type: "string",
+            nullable: false,
+            hidden: true,
+          } satisfies TableColumnRecord);
+    if (hiddenCompositeKey !== undefined) columns.push(hiddenCompositeKey);
+    const uniqueKeyColumn =
+      hiddenCompositeKey ??
+      (input.uniqueKey === undefined
+        ? undefined
+        : columns.find((column) => column.name === input.uniqueKey));
     if (input.uniqueKey !== undefined && uniqueKeyColumn === undefined) {
       throw new TypeError(`Unique key column not found: ${input.uniqueKey}`);
     }
@@ -1285,16 +1460,30 @@ export class MinnowDatabase {
           { ...column, isUniqueKey: column === uniqueKeyColumn },
           column.defaultValue,
         );
+        if (column.defaultValue.kind === "literal" && column.sqlDomain !== undefined) {
+          normalizeSqlDomainValue(column.sqlDomain, column.defaultValue.value);
+        }
+        if (column.defaultValue.kind === "expression") {
+          validateDefaultExpression(column.defaultValue.sql, {
+            name: `${name}.${column.name}`,
+            type: column.type,
+            ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+          });
+        }
       }
     }
     const foreignKeys = await Promise.all(
       (input.foreignKeys ?? []).map(async (key) => {
-        const child = columns.find((column) => column.name === key.column);
-        if (child === undefined) {
-          throw new TypeError(
-            `FOREIGN KEY ${key.name} names a column this table has no: ${key.column}`,
-          );
-        }
+        const childNames = key.columns ?? [key.column];
+        const children = childNames.map((columnName) => {
+          const column = columns.find((candidate) => candidate.name === columnName);
+          if (column === undefined) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} names a column this table has no: ${columnName}`,
+            );
+          }
+          return column;
+        });
         // Self-references are allowed, and then the parent is this very table, which does not
         // exist yet — its own declaration is the authority on the key.
         const parent =
@@ -1304,38 +1493,76 @@ export class MinnowDatabase {
             `FOREIGN KEY ${key.name} references a table that does not exist: ${key.parentTable}`,
           );
         }
-        const parentKey =
+        const parentColumns = parent === undefined ? columns : parent.columns;
+        const parentPrimaryIds =
           parent === undefined
-            ? columns.find((column) => column.name === input.uniqueKey)
-            : getUniqueKeyColumn(parent);
-        if (parentKey === undefined) {
+            ? compositePrimaryColumns.length > 0
+              ? compositePrimaryColumns.map((column) => column.id)
+              : uniqueKeyColumn === undefined
+                ? []
+                : [uniqueKeyColumn.id]
+            : (parent.primaryKeyColumnIds ??
+              (parent.uniqueKeyColumnId === undefined ? [] : [parent.uniqueKeyColumnId]));
+        const parentPrimary = parentPrimaryIds
+          .map((columnId) => parentColumns.find((column) => column.id === columnId))
+          .filter((column): column is TableColumnRecord => column !== undefined && !column.hidden);
+        if (parentPrimary.length === 0) {
           throw new TypeError(
             `FOREIGN KEY ${key.name} references a table with no unique key: ${key.parentTable}`,
           );
         }
-        if (key.parentColumn !== undefined && key.parentColumn !== parentKey.name) {
+        const requestedParentNames =
+          key.parentColumns ??
+          (key.parentColumn === undefined
+            ? parentPrimary.map((column) => column.name)
+            : [key.parentColumn]);
+        if (
+          requestedParentNames.length !== parentPrimary.length ||
+          requestedParentNames.some(
+            (columnName, index) => columnName !== parentPrimary[index]?.name,
+          )
+        ) {
           throw new TypeError(
-            `FOREIGN KEY ${key.name} must reference ${key.parentTable}'s unique key ${parentKey.name}`,
+            `FOREIGN KEY ${key.name} must reference ${key.parentTable}'s primary key (${parentPrimary.map((column) => column.name).join(", ")})`,
           );
         }
-        if (child.type !== parentKey.type) {
+        if (children.length !== parentPrimary.length) {
           throw new TypeError(
-            `FOREIGN KEY ${key.name} compares ${child.type} with ${parentKey.type}`,
+            `FOREIGN KEY ${key.name} has ${String(children.length)} child columns for ${String(parentPrimary.length)} parent columns`,
           );
         }
-        if ((child.integer === true) !== (parentKey.integer === true)) {
-          throw new TypeError(
-            `FOREIGN KEY ${key.name} compares an integer domain with an approximate number domain`,
-          );
-        }
-        if (key.onDelete === "set null" && !child.nullable) {
-          throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
-        }
+        children.forEach((child, index) => {
+          const parentKey = parentPrimary[index];
+          if (parentKey === undefined) {
+            throw new TypeError(`FOREIGN KEY ${key.name} is missing a parent key column`);
+          }
+          if (child.type !== parentKey.type) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} compares ${child.type} with ${parentKey.type}`,
+            );
+          }
+          if ((child.integer === true) !== (parentKey.integer === true)) {
+            throw new TypeError(
+              `FOREIGN KEY ${key.name} compares an integer domain with an approximate number domain`,
+            );
+          }
+          if (
+            JSON.stringify(child.sqlDomain ?? null) !== JSON.stringify(parentKey.sqlDomain ?? null)
+          ) {
+            throw new TypeError(`FOREIGN KEY ${key.name} compares different SQL value domains`);
+          }
+          if (key.onDelete === "set null" && !child.nullable) {
+            throw new TypeError(`FOREIGN KEY ${key.name} cannot SET NULL a NOT NULL column`);
+          }
+        });
+        const parentNames = parentPrimary.map((column) => column.name);
         return {
           name: validateName(key.name, "Constraint"),
-          column: key.column,
+          column: childNames[0] ?? "",
+          ...(childNames.length === 1 ? {} : { columns: childNames }),
           parentTable: key.parentTable,
-          parentColumn: parentKey.name,
+          parentColumn: parentNames[0] ?? "",
+          ...(parentNames.length === 1 ? {} : { parentColumns: parentNames }),
           onDelete: key.onDelete,
         };
       }),
@@ -1346,8 +1573,47 @@ export class MinnowDatabase {
       compileCheckExpression(check.sql, check.name);
       return { name: validateName(check.name, "Constraint"), sql: check.sql };
     });
+    const tableId = this.#createId();
+    const currentVersion = (await this.store.getCurrentManifest())?.version ?? -1;
+    const indexNames = new Set<string>();
+    const secondaryIndexes: Record<string, SecondaryIndexRecord> = {};
+    for (const constraint of input.uniqueConstraints ?? []) {
+      const indexName = validateName(constraint.name, "Constraint");
+      if (indexNames.has(indexName)) throw new TypeError(`Constraint already exists: ${indexName}`);
+      indexNames.add(indexName);
+      const indexedColumns = constraint.columns.map((columnName) => {
+        const column = columns.find(
+          (candidate) => candidate.name === columnName && !candidate.hidden,
+        );
+        if (column === undefined) {
+          throw new TypeError(`UNIQUE ${indexName} names an unknown column: ${columnName}`);
+        }
+        return column;
+      });
+      if (
+        indexedColumns.length === 0 ||
+        new Set(indexedColumns.map((column) => column.id)).size !== indexedColumns.length
+      ) {
+        throw new TypeError(`UNIQUE ${indexName} needs distinct columns`);
+      }
+      const indexId = this.#createId();
+      secondaryIndexes[indexId] = {
+        name: indexName,
+        columnId: indexedColumns[0]?.id ?? "",
+        columnIds: indexedColumns.map((column) => column.id),
+        directions: indexedColumns.map(() => "asc" as const),
+        unique: true,
+        uniqueEnforced: true,
+        termEncoding: "tuple-v1",
+        storage: "postings-v1",
+        storageColumnId: this.#createId(),
+        locator: uniqueKeyColumn === undefined ? "row-id" : "key-hash-v1",
+        state: "ready",
+        buildFromVersion: currentVersion,
+      };
+    }
     await this.store.addTable({
-      id: this.#createId(),
+      id: tableId,
       name,
       columns,
       ...(foreignKeys.length === 0 ? {} : { foreignKeys }),
@@ -1355,6 +1621,10 @@ export class MinnowDatabase {
       ...(input.managed === true ? { managed: true } : {}),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyColumnId: uniqueKeyColumn.id }),
       ...(uniqueKeyColumn === undefined ? {} : { uniqueKeyLookupReady: true }),
+      ...(compositePrimaryColumns.length === 0
+        ? {}
+        : { primaryKeyColumnIds: compositePrimaryColumns.map((column) => column.id) }),
+      ...(Object.keys(secondaryIndexes).length === 0 ? {} : { secondaryIndexes }),
       createdAt: this.#now().toISOString(),
     });
   }
@@ -1369,21 +1639,28 @@ export class MinnowDatabase {
   }
 
   async listTables(): Promise<TableDefinition[]> {
-    return (await this.store.listTables()).map((table) => {
-      const uniqueKey = table.columns.find((column) => column.id === table.uniqueKeyColumnId)?.name;
-      return {
-        name: table.name,
-        columns: table.columns.map((column) => ({
-          name: column.name,
-          type: column.type,
-          ...(column.integer === true ? { integer: true } : {}),
-          nullable: column.nullable,
-          ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
-          ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
-        })),
-        ...(uniqueKey === undefined ? {} : { uniqueKey }),
-      };
-    });
+    return (await this.store.listTables())
+      .filter((table) => table.enumType === undefined && table.sequence === undefined)
+      .map((table) => {
+        const uniqueKey = table.columns.find(
+          (column) => column.id === table.uniqueKeyColumnId,
+        )?.name;
+        return {
+          name: table.name,
+          columns: visibleTableColumns(table).map((column) => ({
+            name: column.name,
+            type: column.type,
+            ...(column.integer === true ? { integer: true } : {}),
+            ...(column.sqlDomain === undefined
+              ? {}
+              : { sqlDomain: structuredClone(column.sqlDomain) }),
+            nullable: column.nullable,
+            ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+            ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
+          })),
+          ...(uniqueKey === undefined ? {} : { uniqueKey }),
+        };
+      });
   }
 
   /**
@@ -1493,10 +1770,11 @@ export class MinnowDatabase {
     const schemas = new Map(
       (await this.store.listTables()).map((table) => [
         table.name,
-        table.columns.map(({ name: column, type, integer }) => ({
+        table.columns.map(({ name: column, type, integer, sqlDomain }) => ({
           name: column,
           type,
           ...(integer === true ? { integer: true as const } : {}),
+          ...(sqlDomain === undefined ? {} : { sqlDomain }),
         })),
       ]),
     );
@@ -1511,6 +1789,7 @@ export class MinnowDatabase {
         name: column.name,
         type: column.type,
         ...(column.integer === true ? { integer: true as const } : {}),
+        ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
         nullable: true,
       })),
       view: { sql, ...(options.managed === true ? { managed: true } : {}) },
@@ -1607,19 +1886,21 @@ export class MinnowDatabase {
             (record.id === table.id
               ? record.columns.filter((candidate) => candidate.id !== column.id)
               : record.columns
-            ).map(({ name, type, integer }) => ({
+            ).map(({ name, type, integer, sqlDomain }) => ({
               name,
               type,
               ...(integer === true ? { integer: true as const } : {}),
+              ...(sqlDomain === undefined ? {} : { sqlDomain }),
             })),
           ]),
         );
         try {
           const inferred = inferBlockSchema(compileQuery(owner.view.sql), schemas);
-          const stored = owner.columns.map(({ name, type, integer }) => ({
+          const stored = owner.columns.map(({ name, type, integer, sqlDomain }) => ({
             name,
             type,
             ...(integer === true ? { integer: true as const } : {}),
+            ...(sqlDomain === undefined ? {} : { sqlDomain }),
           }));
           if (JSON.stringify(inferred) !== JSON.stringify(stored)) {
             throw new TypeError("view output would change");
@@ -1742,7 +2023,7 @@ export class MinnowDatabase {
 
   async insertBatch(tableName: string, input: InsertBatchInput): Promise<InsertBatchResult> {
     const table = await this.#findTable(tableName);
-    const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
     await this.#assertForeignKeysPresent(
       table,
       (column) => batch.columns[column] ?? [],
@@ -1770,14 +2051,58 @@ export class MinnowDatabase {
     };
   }
 
-  /** Pivots, fills pure defaults, and validates — the shared front half of insert and upsert. */
-  #fillDefaults(table: TableRecord, input: InsertBatchInput): FilledBatch & { rowCount: number } {
+  /** Pivots, evaluates SQL defaults, and validates — shared by insert and upsert. */
+  async #fillDefaults(
+    table: TableRecord,
+    input: InsertBatchInput,
+  ): Promise<FilledBatch & { rowCount: number }> {
     const pivoted = toColumnarBatch(input);
     // The pivot stamps rowCount, so an all-default batch keeps its row count even after the
     // columnar form crossed the worker boundary.
-    const filled = fillColumnDefaults(table, pivoted, this.#now, pivoted.rowCount);
+    const statementNow = this.#now();
+    const filled = await fillColumnDefaults(
+      table,
+      pivoted,
+      (sql) => this.#evaluateDefaultExpression(sql, statementNow),
+      pivoted.rowCount,
+    );
+    const inputRowCount =
+      pivoted.rowCount ??
+      Object.values(pivoted.columns).find((values) => values.length > 0)?.length ??
+      0;
+    normalizeDomainBatch(table, filled.batch);
+    for (const name of filled.generated.keys()) {
+      const column = table.columns.find((candidate) => candidate.name === name);
+      const values = filled.batch.columns[name];
+      if (column?.sqlDomain === undefined || values === undefined) continue;
+      filled.generated.set(
+        name,
+        values.map((value) => externalSqlDomainValue(value) as BatchValue),
+      );
+    }
+    fillCompositePrimaryKey(table, filled.batch, inputRowCount);
     const rowCount = validateBatch(table, filled.batch, filled.autoIncrement?.column.name);
     return { ...filled, rowCount };
+  }
+
+  /** Evaluates a validated catalog expression through the ordinary SQL execution pipeline. */
+  async #evaluateDefaultExpression(sql: string, statementNow: Date): Promise<BatchValue> {
+    let plan = this.#compileCached(`SELECT ${sql} AS value`);
+    // CURRENT_* is statement-stable even though each omitted row evaluates the rest of its
+    // expression separately. Sequence and volatile calls deliberately remain per row.
+    plan = resolveStatementDatetimes(plan, statementNow);
+    const result = await this.#queryCompiled(plan);
+    const value = result.rows[0]?.value ?? null;
+    if (
+      value === null ||
+      typeof value === "boolean" ||
+      typeof value === "number" ||
+      typeof value === "string" ||
+      value instanceof Date
+    ) {
+      return value;
+    }
+    throw new TypeError(`DEFAULT produced an unsupported value: ${sql}`);
   }
 
   async insert(tableName: string, row: BatchRow): Promise<InsertBatchResult> {
@@ -1790,7 +2115,7 @@ export class MinnowDatabase {
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before it can be upserted: ${table.name}`);
     }
-    const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
     await this.#assertForeignKeysPresent(
       table,
       (column) => batch.columns[column] ?? [],
@@ -1821,12 +2146,43 @@ export class MinnowDatabase {
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
     }
+    input = normalizeDomainUpdate(table, input);
     const keys = validateUpdateBatch(table, keyColumn, input);
-    await this.#assertForeignKeysPresent(
-      table,
-      (column) => input.changes[column] ?? [],
-      (sql, params) => this.query(sql, { params, memoize: false }),
+    const changedForeignKey = (table.foreignKeys ?? []).some((key) =>
+      foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
     );
+    if (changedForeignKey) {
+      const selectedColumns = [
+        ...visibleTableColumns(table),
+        ...(keyColumn.hidden === true ? [keyColumn] : []),
+      ];
+      const selected = selectedColumns.map(({ name }) => quoteSqlIdentifier(name)).join(", ");
+      const rows = await this.query(
+        `SELECT ${selected} FROM ${quoteSqlIdentifier(table.name)} WHERE ${quoteSqlIdentifier(
+          keyColumn.name,
+        )} IN (${input.keys.map(() => "?").join(", ")})`,
+        { params: input.keys, memoize: false },
+      );
+      const byKey = new Map(
+        rows.rows.map(
+          (row) => [keyToken(keyColumn.type, row[keyColumn.name] ?? null), row] as const,
+        ),
+      );
+      const postImages = input.keys.map((key, index) => {
+        const old = byKey.get(keyToken(keyColumn.type, key));
+        return Object.fromEntries(
+          visibleTableColumns(table).map(({ name }) => [
+            name,
+            input.changes[name]?.[index] ?? old?.[name] ?? null,
+          ]),
+        );
+      });
+      await this.#assertForeignKeysPresent(
+        table,
+        (column) => postImages.map((row) => row[column] ?? null),
+        (sql, params) => this.query(sql, { params, memoize: false }),
+      );
+    }
     return this.#runWrite(async () => {
       const current = await this.store.getTable(table.id);
       if (current === undefined) throw new TypeError(`Unknown table: ${tableName}`);
@@ -1850,13 +2206,20 @@ export class MinnowDatabase {
   }
 
   async deleteBatch(tableName: string, input: DeleteBatchInput): Promise<DeleteBatchResult> {
+    const table = await this.#findTable(tableName);
+    const keyColumn = getUniqueKeyColumn(table);
+    const keyDomain = keyColumn?.sqlDomain;
+    if (keyDomain !== undefined) {
+      input = {
+        keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)),
+      };
+    }
     const dependents = await this.#childForeignKeys(tableName);
     if (dependents.length === 0) {
       return this.#runWrite(() => this.#deleteBatchOnce(tableName, input));
     }
     // E141-04: the referential actions and the delete itself publish as one commit, so no tab
     // can observe a parent gone while its children still point at it.
-    const table = await this.#findTable(tableName);
     const started = performance.now();
     const { result, version } = await this.write(async (session) => {
       await this.#applyReferentialActions(table, [...input.keys], session, REFERENTIAL_CASCADES);
@@ -1890,6 +2253,12 @@ export class MinnowDatabase {
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
+    }
+    const keyDomain = keyColumn.sqlDomain;
+    if (keyDomain !== undefined) {
+      input = {
+        keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)),
+      };
     }
     if (input.keys.length === 0) throw new TypeError("A delete batch needs at least one key");
     const keys = new Map<string, Exclude<BatchValue, null>>();
@@ -2541,7 +2910,7 @@ export class MinnowDatabase {
         const keyColumn = getUniqueKeyColumn(table);
         const value = resolvedKeys.get(error.keyToken);
         if (keyColumn !== undefined && value !== undefined) {
-          throw new UniqueConstraintError(table.name, keyColumn.name, value);
+          throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
         }
       }
       throw await this.#translateSecondaryUniqueConflict(error);
@@ -2555,8 +2924,28 @@ export class MinnowDatabase {
     const table = await this.#findTable(tableName);
     const options =
       typeof versionOrOptions === "number" ? { version: versionOrOptions } : versionOrOptions;
-    const columns = resolveReadColumns(table, options?.columns);
-    return this.#materializeTable(table, options?.version, columns);
+    const columns = resolvePublicReadColumns(table, options?.columns);
+    const rows = (await this.#materializeTable(table, options?.version, columns)).map((row) => {
+      let output = row;
+      for (const column of columns) {
+        const value = row[column.name];
+        if (
+          column.type !== "string" ||
+          column.sqlDomain !== undefined ||
+          typeof value !== "string" ||
+          !isSqlDomainValue(value)
+        ) {
+          continue;
+        }
+        if (output === row) output = { ...row };
+        output[column.name] = protectedSqlTextValue(value);
+      }
+      return output;
+    });
+    return externalizeQueryResult({
+      columns: columns.map(({ name }) => name),
+      rows,
+    }).rows;
   }
 
   /**
@@ -2603,6 +2992,22 @@ export class MinnowDatabase {
     return plan;
   }
 
+  #compileStatementCached(sql: string): CompiledStatement {
+    const cached = this.#statementCache.get(sql);
+    if (cached !== undefined) {
+      this.#statementCache.delete(sql);
+      this.#statementCache.set(sql, cached);
+      return cached;
+    }
+    const statement = compileStatement(sql);
+    this.#statementCache.set(sql, statement);
+    if (this.#statementCache.size > PLAN_CACHE_LIMIT) {
+      const oldest = this.#statementCache.keys().next().value;
+      if (oldest !== undefined) this.#statementCache.delete(oldest);
+    }
+    return statement;
+  }
+
   async #prepareCompiledPlan(
     plan: CompiledQuery,
     options: QueryOptions = {},
@@ -2631,6 +3036,7 @@ export class MinnowDatabase {
       let columnarTables = new Map<string, ColumnarTable>();
       let resolvedPlan = plan;
       let ftsStats: Map<string, FtsStats> | undefined;
+      let outputNeedsExternalization = true;
       const prepareAtSnapshot = async (
         snapshot: LeasedSnapshot,
         realTables: Map<string, TableRecord>,
@@ -2639,10 +3045,11 @@ export class MinnowDatabase {
         const typedSchemas = new Map<string, SqlColumnSchema[]>(
           [...realTables.values()].map((table) => [
             table.name,
-            table.columns.map(({ name, type, integer }) => ({
+            table.columns.map(({ name, type, integer, sqlDomain }) => ({
               name,
               type,
               ...(integer === true ? { integer: true as const } : {}),
+              ...(sqlDomain === undefined ? {} : { sqlDomain }),
             })),
           ]),
         );
@@ -2681,6 +3088,7 @@ export class MinnowDatabase {
           // columnar forms of derived and windowed sources too, not just the result memo.
           options.memoize !== false,
         );
+        outputNeedsExternalization = queryResultNeedsExternalization(resolvedPlan, typedSchemas);
       };
       if (options.version !== undefined) {
         // Explicit time travel keeps the per-call lease and version-anchored reads.
@@ -2700,7 +3108,10 @@ export class MinnowDatabase {
         chooseJoinOrder(resolvedPlan, columnarTables),
         columnarTables,
         memory,
-        ftsStats === undefined ? {} : { ftsStats },
+        {
+          ...(ftsStats === undefined ? {} : { ftsStats }),
+          outputNeedsExternalization,
+        },
       );
     } catch (error) {
       memory.close();
@@ -3030,7 +3441,12 @@ export class MinnowDatabase {
             }
             memberSchema.forEach((column, index) => {
               const expected = schema?.[index];
-              if (expected !== undefined && column.type !== expected.type) {
+              if (
+                expected !== undefined &&
+                (column.type !== expected.type ||
+                  JSON.stringify(column.sqlDomain ?? null) !==
+                    JSON.stringify(expected.sqlDomain ?? null))
+              ) {
                 throw new TypeError(`UNION member column types must match: ${expected.name}`);
               }
             });
@@ -3080,10 +3496,14 @@ export class MinnowDatabase {
         });
         const schema = [
           ...innerSchema,
-          ...source.windowed.windows.map((window) => ({
-            name: window.alias,
-            type: windowOutputType(window, innerSchema),
-          })),
+          ...source.windowed.windows.map((window) => {
+            const sqlDomain = windowOutputDomain(window, innerSchema);
+            return {
+              name: window.alias,
+              type: windowOutputType(window, innerSchema),
+              ...(sqlDomain === undefined ? {} : { sqlDomain }),
+            };
+          }),
         ];
         typedSchemas.set(source.table, schema);
         const table = derivedColumnarTable(source.table, windowed, schema);
@@ -3170,8 +3590,10 @@ export class MinnowDatabase {
     if (open !== undefined) {
       // Read-your-writes: inside BEGIN … COMMIT a read sees the pre-scope snapshot plus what
       // this transaction has staged, and nothing another writer published in between.
-      return this.#duringTransaction(open, () =>
-        open.session.query(sql, options.params === undefined ? {} : { params: options.params }),
+      return externalizeQueryResult(
+        await this.#duringTransaction(open, () =>
+          open.session.query(sql, options.params === undefined ? {} : { params: options.params }),
+        ),
       );
     }
     const plan = bindPlanParameters(this.#compileCached(sql), options.params);
@@ -3185,18 +3607,22 @@ export class MinnowDatabase {
       // A statement that reads the clock is not a function of the data, so the catalog epoch
       // cannot tell a fresh answer from a stale one.
       plan.usesStatementDatetime !== true &&
+      plan.usesVolatileFunctions !== true &&
       options.version === undefined &&
       options.executionMemoryBudgetBytes === undefined &&
       options.spillToStorage === undefined &&
       options.spillPageRows === undefined &&
       probe !== undefined;
-    if (probe === undefined || !memoizable) return this.#queryCompiled(plan, options);
-    return this.#memoizedQuery(
-      plan,
-      `res ${queryResultMemoKey(sql, options.params ?? [])}`,
-      options,
-      probe,
-    );
+    const result =
+      probe === undefined || !memoizable
+        ? await this.#queryCompiled(plan, options)
+        : await this.#memoizedQuery(
+            plan,
+            `res ${queryResultMemoKey(sql, options.params ?? [])}`,
+            options,
+            probe,
+          );
+    return externalizeQueryResult(result);
   }
 
   /**
@@ -3245,8 +3671,8 @@ export class MinnowDatabase {
     // read has to ask the catalog. It asks by epoch — an O(1) probe the store already serves for
     // result memoization — and only re-reads the view set when the catalog has actually moved.
     // A database with no views therefore pays one probe, not a catalog scan per query.
-    const { views } = await this.#catalogFacts(probe);
-    let rewritten = plan;
+    const { views, domains } = await this.#catalogFacts(probe);
+    let rewritten = plan.usesSequenceCalls === true ? await this.#resolveSequenceCalls(plan) : plan;
     if (views.size > 0 && planReadsViews(plan, (name) => views.has(name))) {
       const bodies = new Map<string, CompiledQuery>();
       rewritten = expandViewSources(rewritten, (name) => {
@@ -3258,6 +3684,9 @@ export class MinnowDatabase {
         bodies.set(name, compiled);
         return compiled;
       });
+    }
+    if (domains.size > 0 && planReadsTable(rewritten, (name) => domains.has(name))) {
+      rewritten = normalizePlanDomainLiterals(rewritten, domains);
     }
     if (!aliased && !natural) return rewritten;
     // These two need column *order*, which only the records carry; both are rare enough that
@@ -3273,6 +3702,92 @@ export class MinnowDatabase {
     return natural ? expandNaturalJoins(rewritten, columnsOf) : rewritten;
   }
 
+  /** Resolves connection-local sequence calls before either synchronous executor sees the plan. */
+  async #resolveSequenceCalls(plan: CompiledQuery): Promise<CompiledQuery> {
+    const usesSequence = (expression: Expression): boolean =>
+      (expression.kind === "call" &&
+        (expression.name === "NEXTVAL" || expression.name === "CURRVAL")) ||
+      childExpressions(expression).some(usesSequence);
+    const selected = new Set(plan.select.map((item) => item.expression));
+    const sequenceExpressions: Expression[] = [];
+    forEachBlockExpression(plan, (expression) => {
+      if (!usesSequence(expression)) return;
+      sequenceExpressions.push(expression);
+      if (!selected.has(expression)) {
+        throw new TypeError("NEXTVAL and CURRVAL are supported in the SELECT list");
+      }
+    });
+    if (sequenceExpressions.length === 0) return plan;
+    if (plan.base.table !== DUAL_TABLE || plan.joins.length > 0) {
+      throw new TypeError("NEXTVAL and CURRVAL currently require a SELECT without FROM");
+    }
+    const resolved = structuredClone(plan);
+    const rewrite = async (expression: Expression): Promise<Expression> => {
+      if (
+        expression.kind === "call" &&
+        (expression.name === "NEXTVAL" || expression.name === "CURRVAL")
+      ) {
+        const argument = expression.arguments[0];
+        if (
+          expression.arguments.length !== 1 ||
+          argument?.kind !== "literal" ||
+          typeof argument.value !== "string"
+        ) {
+          throw new TypeError(`${expression.name} requires one constant sequence name`);
+        }
+        const name = argument.value;
+        if (expression.name === "CURRVAL") {
+          const current = this.#sequenceCurrValues.get(name);
+          if (current === undefined) throw new TypeError(`CURRVAL is not defined yet: ${name}`);
+          return { kind: "literal", value: current };
+        }
+        const record = await this.store.getTableByName(`${SEQUENCE_PREFIX}${name}`);
+        if (record?.sequence === undefined) throw new TypeError(`Sequence does not exist: ${name}`);
+        const range = await this.store.reserveAutoIncrement(
+          record.id,
+          record.sequence.columnId,
+          1,
+          BigInt(record.sequence.start),
+        );
+        const value = Number(range.start);
+        if (!Number.isSafeInteger(value))
+          throw new RangeError(`Sequence is outside the safe integer range: ${name}`);
+        this.#sequenceCurrValues.set(name, value);
+        return { kind: "literal", value };
+      }
+      if (
+        expression.kind === "binary" ||
+        expression.kind === "condition" ||
+        expression.kind === "logical"
+      ) {
+        expression.left = await rewrite(expression.left);
+        expression.right = await rewrite(expression.right);
+      } else if (expression.kind === "call") {
+        for (let index = 0; index < expression.arguments.length; index += 1) {
+          const argument = expression.arguments[index];
+          if (argument !== undefined) expression.arguments[index] = await rewrite(argument);
+        }
+      } else if (expression.kind === "list") {
+        for (let index = 0; index < expression.items.length; index += 1) {
+          const item = expression.items[index];
+          if (item !== undefined) expression.items[index] = await rewrite(item);
+        }
+      } else if (expression.kind === "not") {
+        expression.operand = await rewrite(expression.operand);
+      } else if (expression.kind === "case") {
+        for (const branch of expression.branches) {
+          branch.when = await rewrite(branch.when);
+          branch.then = await rewrite(branch.then);
+        }
+        if (expression.otherwise !== undefined)
+          expression.otherwise = await rewrite(expression.otherwise);
+      }
+      return expression;
+    };
+    for (const item of resolved.select) item.expression = await rewrite(item.expression);
+    return resolved;
+  }
+
   /**
    * The two things the catalog knows that statements cannot: which names are views, and which
    * tables reference which. Both are consulted by every read or write of the relevant kind, so
@@ -3286,7 +3801,14 @@ export class MinnowDatabase {
     if (cached !== undefined && epoch !== undefined && cached.epoch === epoch) return cached.facts;
     const views = new Map<string, string>();
     const childKeys = new Map<string, ChildForeignKey[]>();
+    const domains = new Map<string, ReadonlyMap<string, SqlDomain>>();
     for (const table of await this.store.listTables()) {
+      const tableDomains = new Map(
+        table.columns.flatMap((column) =>
+          column.sqlDomain === undefined ? [] : [[column.name, column.sqlDomain] as const],
+        ),
+      );
+      if (tableDomains.size > 0) domains.set(table.name, tableDomains);
       if (table.view !== undefined) views.set(table.name, table.view.sql);
       for (const key of table.foreignKeys ?? []) {
         const existing = childKeys.get(key.parentTable);
@@ -3294,7 +3816,7 @@ export class MinnowDatabase {
         else existing.push({ table, key });
       }
     }
-    const facts: CatalogFacts = { views, childKeys };
+    const facts: CatalogFacts = { views, childKeys, domains };
     if (epoch !== undefined) this.#catalogCache = { epoch, facts };
     return facts;
   }
@@ -4250,41 +4772,27 @@ export class MinnowDatabase {
     valueAt: (source: "new" | "old", column: string, rowIndex: number) => BatchValue,
     cascadeBudget: number,
   ): Promise<void> {
-    const derivedRows: BatchValue[][] = [];
+    const derivedRows: InsertValue[][] = [];
     for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
       const params = bindings.map((binding) => valueAt(binding.source, binding.column, rowIndex));
       const bound = bindStatementParameters(compiled, params);
       if (bound.kind !== "insert") continue;
-      for (const row of bound.rows) {
-        derivedRows.push(
-          row.map((value) =>
-            typeof value === "object" && value !== null && "parameter" in value ? null : value,
-          ),
-        );
-      }
+      derivedRows.push(...bound.rows);
     }
     const target = await this.#findTable(compiled.table);
     if (target.uniqueKeyColumnId !== undefined) {
       throw new TypeError(`Trigger bodies insert into keyless tables only: ${target.name}`);
     }
-    const columns: Record<string, BatchValue[]> = {};
-    compiled.columns.forEach((name, columnIndex) => {
-      columns[name] = derivedRows.map((row) => row[columnIndex] ?? null);
-    });
-    // Unlisted columns pad with NULL exactly like a top-level INSERT: defaults fill their
-    // null slots, nullable columns store NULL. CREATE TRIGGER rejects bodies omitting a
-    // non-nullable column without a default.
-    for (const column of target.columns) {
-      if (!(column.name in columns)) {
-        columns[column.name] = derivedRows.map(() => null);
-      }
-    }
-    const filled = fillColumnDefaults(
+    const input = insertStatementBatch({ ...compiled, rows: derivedRows });
+    const statementNow = this.#now();
+    const filled = await fillColumnDefaults(
       target,
-      toColumnarBatch({ columns }),
-      this.#now,
+      input,
+      (sql) => this.#evaluateDefaultExpression(sql, statementNow),
       derivedRows.length,
     );
+    normalizeDomainBatch(target, filled.batch);
+    fillCompositePrimaryKey(target, filled.batch, derivedRows.length);
     validateBatch(target, filled.batch, filled.autoIncrement?.column.name);
     if (filled.autoIncrement !== undefined && filled.autoIncrement.missingIndexes.length > 0) {
       const values = await this.store.reserveAutoIncrement(
@@ -4388,16 +4896,20 @@ export class MinnowDatabase {
           );
         }
         seenKeys.add(token);
-        mergedKeys.push(key);
+        mergedKeys.push(storedSqlValueFromExecution(keyColumn, key));
         if (bound.kind === "update") {
           for (const assignment of bound.assignments) {
+            const column = target.columns.find((candidate) => candidate.name === assignment.column);
+            if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
             const value = evaluateRowExpression(assignment.expression, target.name, row);
             if (typeof value === "number" && !Number.isFinite(value)) {
               throw new TypeError(
                 `UPDATE assignment produced a non-finite number: ${assignment.column}`,
               );
             }
-            (mergedChanges[assignment.column] ??= []).push(value);
+            (mergedChanges[assignment.column] ??= []).push(
+              storedSqlValueFromExecution(column, value),
+            );
           }
         }
       }
@@ -4599,6 +5111,16 @@ export class MinnowDatabase {
         open();
         return guarded(() => this.runStatement(statement, { writer }));
       },
+      checkpoint: () => {
+        open();
+        return transaction.checkpoint();
+      },
+      rollbackTo: async (checkpoint) => {
+        if (closed) throw new Error("The write scope has ended");
+        await transaction.rollbackTo(checkpoint);
+        poisoned = undefined;
+        staged = transaction.stagedWorkCount === 0 ? 0 : 1;
+      },
     };
     try {
       const result = await action(session, transaction, writer);
@@ -4731,10 +5253,11 @@ export class MinnowDatabase {
     const typedSchemas = new Map<string, SqlColumnSchema[]>(
       [...realTables.values()].map((table) => [
         table.name,
-        table.columns.map(({ name, type, integer }) => ({
+        table.columns.map(({ name, type, integer, sqlDomain }) => ({
           name,
           type,
           ...(integer === true ? { integer: true as const } : {}),
+          ...(sqlDomain === undefined ? {} : { sqlDomain }),
         })),
       ]),
     );
@@ -4816,7 +5339,7 @@ export class MinnowDatabase {
     cascadeBudget = 1,
   ): Promise<StagedWriteResult> {
     const table = await this.#findTable(tableName);
-    const { batch, generated, autoIncrement, rowCount } = this.#fillDefaults(table, input);
+    const { batch, generated, autoIncrement, rowCount } = await this.#fillDefaults(table, input);
     await this.#assertForeignKeysPresent(
       table,
       (column) => batch.columns[column] ?? [],
@@ -4934,6 +5457,7 @@ export class MinnowDatabase {
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be updated: ${table.name}`);
     }
+    input = normalizeDomainUpdate(table, input);
     const keys = validateUpdateBatch(table, keyColumn, input);
     // Read-your-writes membership: keys staged by this scope pass, keys the scope removed
     // fail, and everything else checks against the committed snapshot as usual.
@@ -4947,13 +5471,10 @@ export class MinnowDatabase {
     if (committedKeys.size > 0) {
       await this.#assertKeysExist(table, keyColumn, transaction.snapshotVersion, committedKeys);
     }
-    await this.#assertForeignKeysPresent(
-      table,
-      (column) => input.changes[column] ?? [],
-      (sql, params) => this.#sessionQuery(transaction, sql, { params }),
-      transaction,
-    );
     const sessionChecks = table.checks ?? [];
+    const changedForeignKey = (table.foreignKeys ?? []).some((key) =>
+      foreignKeyColumns(key).some((column) => input.changes[column] !== undefined),
+    );
     const preImages = await this.#triggerPreImages(
       table,
       keyColumn,
@@ -4961,6 +5482,7 @@ export class MinnowDatabase {
       "update",
       (preImageSql, params) => this.#sessionQuery(transaction, preImageSql, { params }),
       sessionChecks.length > 0 ||
+        changedForeignKey ||
         secondaryIndexUpdateNeedsPreImages(table, input) ||
         readyUniqueSecondaryIndexes(table).some(({ columns }) =>
           columns.some((column) => input.changes[column.name] !== undefined),
@@ -4982,6 +5504,14 @@ export class MinnowDatabase {
         ? (preImages[rowIndex]?.[column] ?? null)
         : (changed[rowIndex] ?? null);
     };
+    if (changedForeignKey) {
+      await this.#assertForeignKeysPresent(
+        table,
+        (column) => input.keys.map((_, row) => sessionUpdateValueAt("new", column, row)),
+        (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+        transaction,
+      );
+    }
     // The same post-image rule as a standalone update, so a scope — and the partial upsert that
     // runs inside one — cannot write a row a direct UPDATE would refuse.
     if (sessionChecks.length > 0) {
@@ -5071,6 +5601,12 @@ export class MinnowDatabase {
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) {
       throw new TypeError(`Table needs a unique key before rows can be deleted: ${table.name}`);
+    }
+    const keyDomain = keyColumn.sqlDomain;
+    if (keyDomain !== undefined) {
+      input = {
+        keys: input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value)),
+      };
     }
     // The dependents go first and in this same scope, so a cascade publishes with its cause.
     await this.#applyReferentialActions(
@@ -5194,7 +5730,11 @@ export class MinnowDatabase {
     const probe = this.store.getCatalogProbe?.bind(this.store);
     // The same memo a SQL query gets, keyed by the plan: a typed query is compiled once by the
     // builder and run many times, and it used to re-execute on every run.
-    if (probe === undefined || query.plan.usesStatementDatetime === true) {
+    if (
+      probe === undefined ||
+      query.plan.usesStatementDatetime === true ||
+      query.plan.usesVolatileFunctions === true
+    ) {
       return (await this.#queryCompiled(query.plan)).rows as TRow[];
     }
     return (await this.#memoizedQuery(query.plan, `typed ${planMemoKey(query.plan)}`, {}, probe))
@@ -5242,10 +5782,29 @@ export class MinnowDatabase {
     const declared = Object.entries(step.view.columns).map(([name, definition]) => ({
       name,
       type: definition.type,
+      ...(definition.integer ? { integer: true as const } : {}),
+      ...(definition.sqlDomain === undefined ? {} : { sqlDomain: definition.sqlDomain }),
     }));
-    const inferred = record.columns.map(({ name, type }) => ({ name, type }));
-    const render = (columns: Array<{ name: string; type: string }>): string =>
-      columns.map(({ name, type }) => `${name} ${type}`).join(", ");
+    const inferred = record.columns.map(({ name, type, integer, sqlDomain }) => ({
+      name,
+      type,
+      ...(integer === true ? { integer: true as const } : {}),
+      ...(sqlDomain === undefined ? {} : { sqlDomain }),
+    }));
+    const render = (
+      columns: Array<{
+        name: string;
+        type: string;
+        integer?: true;
+        sqlDomain?: SqlDomain;
+      }>,
+    ): string =>
+      columns
+        .map(
+          ({ name, type, integer, sqlDomain }) =>
+            `${name} ${type}${integer === true ? " integer" : ""}${sqlDomain === undefined ? "" : ` ${JSON.stringify(sqlDomain)}`}`,
+        )
+        .join(", ");
     if (render(declared) !== render(inferred)) {
       throw new TypeError(
         `View ${step.view.name} declares (${render(declared)}) but its query produces ` +
@@ -5389,6 +5948,7 @@ export class MinnowDatabase {
       if (step.kind === "create-table") {
         const entries = Object.entries(step.table.columns);
         const uniqueEntry = entries.find(([, columnDefinition]) => columnDefinition.isUnique);
+        const primaryKey = step.table.primaryKey;
         // Constraints ride along with the columns: a table declared with a relation or a row
         // condition must reject the same writes whichever path created it. Dropping them here
         // is what made `migrate()` produce a weaker table than the equivalent SQL DDL.
@@ -5396,10 +5956,17 @@ export class MinnowDatabase {
         await this.runStatement({
           kind: "create-table",
           table: step.table.name,
-          ...(uniqueEntry === undefined ? {} : { uniqueKey: uniqueEntry[0] }),
+          ...(uniqueEntry === undefined && primaryKey.length !== 1
+            ? {}
+            : { uniqueKey: uniqueEntry?.[0] ?? primaryKey[0] }),
+          ...(primaryKey.length < 2 ? {} : { compositePrimaryKey: [...primaryKey] }),
           columns: entries.map(([name, columnDefinition]) => ({
             name,
             type: columnDefinition.type,
+            ...(columnDefinition.integer ? { integer: true as const } : {}),
+            ...(columnDefinition.sqlDomain === undefined
+              ? {}
+              : { sqlDomain: structuredClone(columnDefinition.sqlDomain) }),
             ...(columnDefinition.isNullable ? { nullable: true } : {}),
             ...(columnDefinition.defaultSpec === undefined
               ? {}
@@ -5649,8 +6216,10 @@ export class MinnowDatabase {
    * in between fails the statement explicitly rather than silently mutating other rows.
    */
   async execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult> {
-    const statement = compileStatement(sql);
-    if (statement.kind === "transaction") return this.#runTransactionStatement(statement.action);
+    const statement = this.#compileStatementCached(sql);
+    if (statement.kind === "transaction") {
+      return this.#runTransactionStatement(statement.action, statement.name);
+    }
     if (statement.kind === "select") {
       return {
         kind: "rows",
@@ -5669,9 +6238,13 @@ export class MinnowDatabase {
           `${boundStatement.kind.toUpperCase().replace("-", " ")} is not allowed inside a transaction`,
         );
       }
-      return this.#duringTransaction(open, () => open.session.executeStatement(boundStatement));
+      return externalizeExecuteResult(
+        await this.#duringTransaction(open, () => open.session.executeStatement(boundStatement)),
+      );
     }
-    return this.runStatement(bindStatementParameters(statement, params));
+    return externalizeExecuteResult(
+      await this.runStatement(bindStatementParameters(statement, params)),
+    );
   }
 
   /**
@@ -5688,6 +6261,83 @@ export class MinnowDatabase {
     transaction?: DatabaseTransaction,
   ): Promise<void> {
     for (const key of table.foreignKeys ?? []) {
+      const childNames = foreignKeyColumns(key);
+      const parentNames = foreignKeyParentColumns(key);
+      if (childNames.length > 1) {
+        const vectors = childNames.map(rowsByColumn);
+        const rowCount = vectors[0]?.length ?? 0;
+        if (vectors.some((values) => values.length !== rowCount)) {
+          throw new TypeError(`FOREIGN KEY ${key.name} columns have different row counts`);
+        }
+        const tuples = new Map<string, QueryValue[]>();
+        for (let row = 0; row < rowCount; row += 1) {
+          const values = vectors.map((vector) => vector[row] ?? null);
+          // MATCH SIMPLE: any NULL makes the whole referencing row satisfied.
+          if (values.some((value) => value === null)) continue;
+          const tuple = values as QueryValue[];
+          tuples.set(sqlTupleToken(tuple), tuple);
+        }
+        if (tuples.size === 0) continue;
+        const parent = await this.store.getTableByName(key.parentTable);
+        if (parent === undefined) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} references a missing table: ${key.parentTable}`,
+          );
+        }
+        let wanted = [...tuples.values()];
+        const parentKey = getUniqueKeyColumn(parent);
+        const primaryColumns = primaryKeyColumns(parent);
+        if (
+          parent.uniqueKeyLookupReady === true &&
+          parentKey?.hidden === true &&
+          primaryColumns.map((column) => column.name).join("\u0000") === parentNames.join("\u0000")
+        ) {
+          const byTuple = new Map(
+            wanted.map((tuple) => {
+              const locator = compositeKeyValue(primaryColumns, tuple);
+              return [sqlTupleToken(tuple), keyToken(parentKey.type, locator)] as const;
+            }),
+          );
+          const overlay =
+            transaction === undefined ? undefined : this.#stagedKeyOverlay(transaction, parent.id);
+          const probed = [...new Set(byTuple.values())].filter(
+            (token) => overlay?.added.has(token) !== true,
+          );
+          const present = new Set(
+            probed.length === 0 ? [] : await this.store.getExistingUniqueKeys(parent.id, probed),
+          );
+          wanted = wanted.filter((tuple) => {
+            const token = byTuple.get(sqlTupleToken(tuple)) ?? "";
+            if (overlay?.removed.has(token) === true) return true;
+            if (overlay?.added.has(token) === true) return false;
+            return !present.has(token);
+          });
+        }
+        if (wanted.length === 0) continue;
+        const predicates = wanted
+          .map(
+            () => `(${parentNames.map((name) => `${quoteSqlIdentifier(name)} = ?`).join(" AND ")})`,
+          )
+          .join(" OR ");
+        const found = await read(
+          `SELECT ${parentNames
+            .map((name, index) => `${quoteSqlIdentifier(name)} AS p${String(index)}`)
+            .join(", ")} FROM ${quoteSqlIdentifier(key.parentTable)} WHERE ${predicates}`,
+          wanted.flat(),
+        );
+        const present = new Set(
+          found.rows.map((row) =>
+            sqlTupleToken(parentNames.map((_, index) => row[`p${String(index)}`] ?? null)),
+          ),
+        );
+        const missing = wanted.find((tuple) => !present.has(sqlTupleToken(tuple)));
+        if (missing !== undefined) {
+          throw new TypeError(
+            `FOREIGN KEY ${key.name} has no ${key.parentTable} row with (${parentNames.join(", ")}) (${missing.map(String).join(", ")})`,
+          );
+        }
+        continue;
+      }
       const values = rowsByColumn(key.column);
       const distinct = [...new Set(values.filter((value): value is QueryValue => value !== null))];
       if (distinct.length === 0) continue;
@@ -5790,18 +6440,43 @@ export class MinnowDatabase {
     if (cascadeBudget < 0) {
       throw new Error(`Referential cascade depth exceeded at table: ${parent.name}`);
     }
-    const placeholders = keys.map(() => "?").join(", ");
+    const parentPrimary = primaryKeyColumns(parent);
+    let parentTuples: QueryValue[][];
+    if (parentPrimary.length > 1) {
+      const locator = getUniqueKeyColumn(parent);
+      if (locator?.hidden !== true)
+        throw new Error(`Composite key locator is missing: ${parent.name}`);
+      const found = await session.query(
+        `SELECT ${parentPrimary
+          .map((column, index) => `${quoteSqlIdentifier(column.name)} AS p${String(index)}`)
+          .join(", ")} FROM ${quoteSqlIdentifier(parent.name)} WHERE ${quoteSqlIdentifier(
+          locator.name,
+        )} IN (${keys.map(() => "?").join(", ")})`,
+        { params: [...keys] },
+      );
+      parentTuples = found.rows.map((row) =>
+        parentPrimary.map((_, index) => row[`p${String(index)}`] ?? null),
+      );
+    } else {
+      parentTuples = keys.map((key) => [key]);
+    }
+    if (parentTuples.length === 0) return;
     for (const { table: child, key } of children) {
+      const childColumns = foreignKeyColumns(key);
       const childKeyColumn = getUniqueKeyColumn(child);
       const selected =
         childKeyColumn === undefined
-          ? quoteSqlIdentifier(key.column)
+          ? quoteSqlIdentifier(childColumns[0] ?? key.column)
           : `${quoteSqlIdentifier(childKeyColumn.name)} AS child_key`;
+      const predicates = parentTuples
+        .map(
+          () =>
+            `(${childColumns.map((column) => `${quoteSqlIdentifier(column)} = ?`).join(" AND ")})`,
+        )
+        .join(" OR ");
       const affected = await session.query(
-        `SELECT ${selected} FROM ${quoteSqlIdentifier(child.name)} WHERE ${quoteSqlIdentifier(
-          key.column,
-        )} IN (${placeholders})`,
-        { params: [...keys] },
+        `SELECT ${selected} FROM ${quoteSqlIdentifier(child.name)} WHERE ${predicates}`,
+        { params: parentTuples.flat() },
       );
       if (affected.rows.length === 0) continue;
       if (key.onDelete === "restrict") {
@@ -5823,7 +6498,9 @@ export class MinnowDatabase {
       }
       await session.updateBatch(child.name, {
         keys: childKeys,
-        changes: { [key.column]: childKeys.map(() => null) },
+        changes: Object.fromEntries(
+          childColumns.map((column) => [column, childKeys.map(() => null)]),
+        ),
       });
     }
   }
@@ -5853,7 +6530,10 @@ export class MinnowDatabase {
    * `transactionIdleTimeoutMs` rolls itself back, and closing the database rolls back whatever
    * is open.
    */
-  async #runTransactionStatement(action: "begin" | "commit" | "rollback"): Promise<ExecuteResult> {
+  async #runTransactionStatement(
+    action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release",
+    name?: string,
+  ): Promise<ExecuteResult> {
     if (action === "begin") {
       if (this.#openTransaction !== undefined) {
         throw new TypeError("A transaction is already open; COMMIT or ROLLBACK it first");
@@ -5877,6 +6557,7 @@ export class MinnowDatabase {
         settle,
         busy: 0,
         activeAt: this.#now().getTime(),
+        savepoints: [],
         finished: finished.then(
           ({ version }) => ({ version }),
           (error: unknown) => {
@@ -5904,6 +6585,35 @@ export class MinnowDatabase {
     if (open === undefined) {
       throw new TypeError(`${action.toUpperCase()} without an open transaction`);
     }
+    if (action === "savepoint") {
+      if (name === undefined) throw new TypeError("SAVEPOINT needs a name");
+      await this.#duringTransaction(open, async () => {
+        open.savepoints.push({ name, checkpoint: open.session.checkpoint() });
+      });
+      return { kind: "transaction", action, name };
+    }
+    if (action === "rollback-to" || action === "release") {
+      if (name === undefined) throw new TypeError(`${action.toUpperCase()} needs a name`);
+      let index = -1;
+      for (let candidate = open.savepoints.length - 1; candidate >= 0; candidate -= 1) {
+        if (open.savepoints[candidate]?.name === name) {
+          index = candidate;
+          break;
+        }
+      }
+      if (index === -1) throw new TypeError(`Savepoint does not exist: ${name}`);
+      if (action === "rollback-to") {
+        const checkpoint = open.savepoints[index]?.checkpoint;
+        if (checkpoint === undefined) throw new Error(`Savepoint disappeared: ${name}`);
+        await this.#duringTransaction(open, () => open.session.rollbackTo(checkpoint));
+        // The named marker remains usable; everything established after it is gone.
+        open.savepoints.splice(index + 1);
+      } else {
+        // PostgreSQL RELEASE closes the named marker and every marker nested inside it.
+        open.savepoints.splice(index);
+      }
+      return { kind: "transaction", action, name };
+    }
     this.#openTransaction = undefined;
     clearInterval(open.timer);
     open.settle(action === "commit" ? "commit" : "rollback");
@@ -5926,58 +6636,88 @@ export class MinnowDatabase {
   ): Promise<ExecuteResult> {
     const table = await this.#findTable(statement.table);
     const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
+    const onConflict = statement.onConflict;
+    if (onConflict === undefined) throw new Error("ON CONFLICT update metadata is missing");
+    const conflictColumns = onConflict.columns ?? [onConflict.column];
+    const addressColumns =
+      keyColumn?.hidden === true
+        ? primaryKeyColumns(table).map(({ name }) => name)
+        : keyColumn === undefined
+          ? []
+          : [keyColumn.name];
+    if (
+      keyColumn === undefined ||
+      conflictColumns.length !== addressColumns.length ||
+      conflictColumns.some((name, index) => name !== addressColumns[index])
+    ) {
       throw new TypeError(
-        `ON CONFLICT targets the table's unique key column: ${keyColumn?.name ?? "(none)"}`,
+        `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
       );
-    }
-    const keyIndex = statement.columns.indexOf(keyColumn.name);
-    if (keyIndex === -1) {
-      // Without the key in the insert list no row can conflict; run as a plain insert.
-      const { onConflict, ...plain } = statement;
-      void onConflict;
-      return this.runStatement(plain, options);
-    }
-    const keyToken = (value: QueryValue): string =>
-      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
-    const proposedKeys = new Set<string>();
-    for (const row of statement.rows) {
-      const key = boundInsertValue(row[keyIndex] ?? null);
-      if (key === null) continue;
-      const token = keyToken(key);
-      if (proposedKeys.has(token)) {
-        throw new TypeError(
-          `ON CONFLICT DO UPDATE cannot affect ${keyColumn.name} ${String(key)} twice`,
-        );
-      }
-      proposedKeys.add(token);
     }
     for (const name of statement.columns) {
       if (!table.columns.some((column) => column.name === name)) {
         throw new TypeError(`INSERT column does not exist: ${name}`);
       }
     }
+    const proposedBatch = insertStatementBatch(statement);
+    const statementNow = this.#now();
+    const filledProposed = await fillColumnDefaults(
+      table,
+      proposedBatch,
+      (sql) => this.#evaluateDefaultExpression(sql, statementNow),
+      statement.rows.length,
+    );
+    normalizeDomainBatch(table, filledProposed.batch);
+    fillCompositePrimaryKey(table, filledProposed.batch, statement.rows.length);
+    const proposed = filledProposed.batch;
+    // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
+    // even when every proposed row happens to find an existing key.
+    validateBatch(table, proposed, filledProposed.autoIncrement?.column.name);
+    const keyValues = proposed.columns[keyColumn.name] ?? [];
+    const keyToken = (value: QueryValue): string =>
+      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
+    const proposedKeys = new Set<string>();
+    for (const key of keyValues) {
+      if (key === null) continue;
+      const token = keyToken(key);
+      if (proposedKeys.has(token)) {
+        throw new TypeError(
+          `ON CONFLICT DO UPDATE cannot affect ${publicKeyName(table, keyColumn)} ${String(key)} twice`,
+        );
+      }
+      proposedKeys.add(token);
+    }
     const returningColumns =
       options.returning === undefined
         ? undefined
         : options.returning === "*"
-          ? table.columns.map(({ name }) => name)
+          ? visibleTableColumns(table).map(({ name }) => name)
           : [...options.returning];
     for (const name of returningColumns ?? []) {
       if (!table.columns.some((column) => column.name === name)) {
         throw new TypeError(`RETURNING column does not exist: ${name}`);
       }
     }
-    const assignments = statement.onConflict.assignments ?? [];
+    const assignments = onConflict.assignments ?? [];
+    const conflictWhere = onConflict.where;
+    const conflictExpressions = [
+      ...assignments.map((assignment) => assignment.expression),
+      ...(conflictWhere === undefined ? [] : [conflictWhere]),
+    ];
     for (const assignment of assignments) {
       const targetColumn = table.columns.find(({ name }) => name === assignment.column);
       if (targetColumn === undefined) {
         throw new TypeError(`ON CONFLICT DO UPDATE column does not exist: ${assignment.column}`);
       }
-      if (targetColumn.id === keyColumn.id) {
+      if (
+        targetColumn.id === keyColumn.id ||
+        (table.primaryKeyColumnIds ?? []).includes(targetColumn.id)
+      ) {
         throw new TypeError("ON CONFLICT DO UPDATE cannot reassign the conflict key");
       }
-      for (const reference of expressionColumnNames(assignment.expression)) {
+    }
+    for (const expression of conflictExpressions) {
+      for (const reference of expressionColumnNames(expression)) {
         const [alias, name, extra] = reference.split(".");
         if (alias === undefined || extra !== undefined || name === undefined) {
           throw new TypeError(`Invalid ON CONFLICT column reference: ${reference}`);
@@ -5990,8 +6730,11 @@ export class MinnowDatabase {
         }
       }
     }
-    const replacementColumns = table.columns.filter((column) => column.id !== keyColumn.id);
+    const replacementColumns = visibleTableColumns(table).filter(
+      (column) => !(table.primaryKeyColumnIds ?? [keyColumn.id]).includes(column.id),
+    );
     const wholeRowReplacement =
+      conflictWhere === undefined &&
       assignments.length === replacementColumns.length &&
       replacementColumns.every((column) =>
         assignments.some(
@@ -6003,51 +6746,76 @@ export class MinnowDatabase {
       );
     if (wholeRowReplacement) {
       // The established upsert path writes the same post-image with fewer read/commit rounds and
-      // retains its bounded retry behavior under many-tab contention. More general expressions
-      // stay on the read-evaluate-update path below.
+      // retains its bounded retry behavior under many-tab contention. Materialize the proposal
+      // first: re-entering with the original omission markers would evaluate sequence, random,
+      // and UUID defaults twice and could even change which row conflicts.
+      const columns = visibleTableColumns(table).map(({ name }) => name);
+      const deferredAutoIncrement = new Set(filledProposed.autoIncrement?.missingIndexes ?? []);
+      const rows: InsertValue[][] = Array.from({ length: statement.rows.length }, (_, rowIndex) =>
+        columns.map((name) =>
+          name === filledProposed.autoIncrement?.column.name && deferredAutoIncrement.has(rowIndex)
+            ? { default: true }
+            : (proposed.columns[name]?.[rowIndex] ?? null),
+        ),
+      );
       return this.runStatement(
         {
           ...statement,
-          onConflict: { column: keyColumn.name, action: "replace" },
+          columns,
+          rows,
+          onConflict: {
+            column: onConflict.column,
+            ...(onConflict.columns === undefined ? {} : { columns: onConflict.columns }),
+            action: "replace",
+          },
         },
         options,
       );
     }
-    const proposedColumns: Record<string, BatchValue[]> = {};
-    for (const [position, name] of statement.columns.entries()) {
-      proposedColumns[name] = statement.rows.map((row) => boundInsertValue(row[position] ?? null));
+    // The general DO UPDATE path classifies proposed rows itself instead of re-entering the
+    // ordinary upsert writer. Materialize its deferred auto-increment slots now so an omitted
+    // generated key is a fresh key, not an explicit NULL when the fresh subset is staged.
+    if (
+      filledProposed.autoIncrement !== undefined &&
+      filledProposed.autoIncrement.missingIndexes.length > 0
+    ) {
+      const values = await this.store.reserveAutoIncrement(
+        table.id,
+        filledProposed.autoIncrement.column.id,
+        filledProposed.autoIncrement.missingIndexes.length,
+        filledProposed.autoIncrement.atLeast,
+      );
+      patchAutoIncrementValues(proposed, filledProposed.autoIncrement, values);
+      const patched = proposed.columns[filledProposed.autoIncrement.column.name] ?? [];
+      for (const rowIndex of filledProposed.autoIncrement.missingIndexes) {
+        validateValue(filledProposed.autoIncrement.column, patched[rowIndex] ?? null, rowIndex);
+      }
     }
-    for (const column of table.columns) {
-      proposedColumns[column.name] ??= statement.rows.map(() => null);
-    }
-    const filledProposed = fillColumnDefaults(
-      table,
-      { columns: proposedColumns },
-      this.#now,
-      statement.rows.length,
-    );
-    const proposed = filledProposed.batch;
-    // UPSERT only handles a uniqueness conflict. Other INSERT-domain failures are still errors,
-    // even when every proposed row happens to find an existing key.
-    validateBatch(table, proposed, filledProposed.autoIncrement?.column.name);
     const proposedRow = (index: number): DatabaseRow =>
       Object.fromEntries(
         table.columns.map(({ name }) => [name, proposed.columns[name]?.[index] ?? null]),
       );
-    const apply = async (transaction: WriteSession): Promise<QueryRow[] | undefined> => {
-      const existing = await this.#existingInsertKeys(table, keyColumn, statement, (sql, params) =>
-        transaction.query(sql, { params }),
+    const apply = async (
+      transaction: WriteSession,
+    ): Promise<{ affectedRows: number[]; returnedRows?: QueryRow[] }> => {
+      const present = await transaction.query(
+        `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(
+          table.name,
+        )} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keyValues.map(() => "?").join(", ")})`,
+        { params: keyValues },
       );
+      const existing = new Set(present.rows.map((row) => keyToken(row.key ?? null)));
       const freshRows: number[] = [];
       const conflictingRows: number[] = [];
+      const updatedRows: number[] = [];
       const seenConflicts = new Set<string>();
-      for (const [rowIndex, row] of statement.rows.entries()) {
-        const key = boundInsertValue(row[keyIndex] ?? null);
+      for (const rowIndex of statement.rows.keys()) {
+        const key = keyValues[rowIndex] ?? null;
         if (key !== null && existing.has(keyToken(key))) {
           const token = keyToken(key);
           if (seenConflicts.has(token)) {
             throw new TypeError(
-              `ON CONFLICT DO UPDATE cannot affect ${keyColumn.name} ${String(key)} twice`,
+              `ON CONFLICT DO UPDATE cannot affect ${publicKeyName(table, keyColumn)} ${String(key)} twice`,
             );
           }
           seenConflicts.add(token);
@@ -6056,7 +6824,7 @@ export class MinnowDatabase {
       }
       if (conflictingRows.length > 0) {
         const keys = conflictingRows.map((rowIndex) => {
-          const value = boundInsertValue(statement.rows[rowIndex]?.[keyIndex] ?? null);
+          const value = keyValues[rowIndex] ?? null;
           if (value === null) {
             throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
           }
@@ -6069,6 +6837,7 @@ export class MinnowDatabase {
         const currentByKey = new Map(
           selected.rows.map((row) => [keyToken(row[keyColumn.name] ?? null), row] as const),
         );
+        const updateKeys: QueryValue[] = [];
         const changes: Record<string, BatchValue[]> = Object.fromEntries(
           assignments.map(({ column }) => [column, []]),
         );
@@ -6080,16 +6849,29 @@ export class MinnowDatabase {
             throw new Error(`ON CONFLICT row disappeared before update: ${String(key)}`);
           }
           const excluded = proposedRow(rowIndex);
+          const joined = { [table.name]: current, EXCLUDED: excluded };
+          if (
+            conflictWhere !== undefined &&
+            evaluateJoinedRowExpression(conflictWhere, joined) !== true
+          ) {
+            continue;
+          }
+          updateKeys.push(key);
+          updatedRows.push(rowIndex);
           for (const assignment of assignments) {
+            const column = table.columns.find((candidate) => candidate.name === assignment.column);
+            if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
             changes[assignment.column]?.push(
-              evaluateJoinedRowExpression(assignment.expression, {
-                [table.name]: current,
-                EXCLUDED: excluded,
-              }),
+              storedSqlValueFromExecution(
+                column,
+                evaluateJoinedRowExpression(assignment.expression, joined),
+              ),
             );
           }
         }
-        await transaction.updateBatch(table.name, { keys, changes });
+        if (updateKeys.length > 0) {
+          await transaction.updateBatch(table.name, { keys: updateKeys, changes });
+        }
       }
       if (freshRows.length > 0) {
         const columns: Record<string, BatchValue[]> = {};
@@ -6100,8 +6882,10 @@ export class MinnowDatabase {
         }
         await transaction.insertBatch(table.name, { columns });
       }
-      if (returningColumns === undefined) return undefined;
-      const keys = statement.rows.map((row) => boundInsertValue(row[keyIndex] ?? null));
+      const affectedRows = [...freshRows, ...updatedRows].sort((left, right) => left - right);
+      if (returningColumns === undefined) return { affectedRows };
+      const keys = affectedRows.map((rowIndex) => keyValues[rowIndex] ?? null);
+      if (keys.length === 0) return { affectedRows, returnedRows: [] };
       const selectedColumns = [...new Set([keyColumn.name, ...returningColumns])];
       const selected = selectedColumns.map(quoteSqlIdentifier).join(", ");
       const result = await transaction.query(
@@ -6114,49 +6898,28 @@ export class MinnowDatabase {
           return [keyToken(key), row] as const;
         }),
       );
-      return keys.map((key) => {
+      const returnedRows = keys.map((key) => {
         const row = rowsByKey.get(keyToken(key)) ?? {};
         return Object.fromEntries(returningColumns.map((name) => [name, row[name] ?? null]));
       });
+      return { affectedRows, returnedRows };
     };
-    let returnedRows: QueryRow[] | undefined;
+    let outcome: { affectedRows: number[]; returnedRows?: QueryRow[] };
     let version: number | null | undefined;
     if (options.writer === undefined) {
       const completed = await this.write(apply);
-      returnedRows = completed.result;
+      outcome = completed.result;
       version = completed.version;
     } else {
-      returnedRows = await apply(options.writer);
+      outcome = await apply(options.writer);
     }
     return {
       kind: "insert",
       table: statement.table,
-      rowCount: statement.rows.length,
+      rowCount: outcome.affectedRows.length,
       ...(version === null || version === undefined ? {} : { version }),
-      ...(returnedRows === undefined ? {} : { returnedRows }),
+      ...(outcome.returnedRows === undefined ? {} : { returnedRows: outcome.returnedRows }),
     };
-  }
-
-  /** Existing unique keys among an insert statement's rows, read at one snapshot. */
-  async #existingInsertKeys(
-    table: TableRecord,
-    keyColumn: TableRecord["columns"][number],
-    statement: Extract<CompiledStatement, { kind: "insert" }>,
-    query: (sql: string, params: readonly QueryValue[]) => Promise<QueryResult> = (sql, params) =>
-      this.query(sql, { params }),
-  ): Promise<Set<string>> {
-    const keyIndex = statement.columns.indexOf(keyColumn.name);
-    const keys = statement.rows
-      .map((row) => boundInsertValue(row[keyIndex] ?? null))
-      .filter((value): value is Exclude<QueryValue, null> => value !== null);
-    if (keys.length === 0) return new Set();
-    const keyToken = (value: QueryValue): string =>
-      value instanceof Date ? `d${value.toISOString()}` : `${typeof value} ${String(value)}`;
-    const result = await query(
-      `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(table.name)} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keys.map(() => "?").join(", ")})`,
-      keys,
-    );
-    return new Set(result.rows.map((row) => keyToken(row.key ?? null)));
   }
 
   /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
@@ -6166,14 +6929,46 @@ export class MinnowDatabase {
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     const table = await this.#findTable(statement.table);
     const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
+    const conflictColumns =
+      statement.onConflict?.columns ??
+      (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
+    const addressColumns =
+      keyColumn?.hidden === true
+        ? primaryKeyColumns(table).map(({ name }) => name)
+        : keyColumn === undefined
+          ? []
+          : [keyColumn.name];
+    if (
+      keyColumn === undefined ||
+      conflictColumns.length !== addressColumns.length ||
+      conflictColumns.some((name, index) => name !== addressColumns[index])
+    ) {
       throw new TypeError(
-        `ON CONFLICT targets the table's unique key column: ${keyColumn?.name ?? "(none)"}`,
+        `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
       );
     }
-    const keyIndex = statement.columns.indexOf(keyColumn.name);
-    if (keyIndex === -1) return statement;
-    const keys = statement.rows.map((row) => boundInsertValue(row[keyIndex] ?? null));
+    const proposed = insertStatementBatch(statement);
+    const statementNow = this.#now();
+    const filled = await fillColumnDefaults(
+      table,
+      proposed,
+      (sql) => this.#evaluateDefaultExpression(sql, statementNow),
+      statement.rows.length,
+    );
+    normalizeDomainBatch(table, filled.batch);
+    fillCompositePrimaryKey(table, filled.batch, statement.rows.length);
+    const columns = visibleTableColumns(table).map(({ name }) => name);
+    const deferredAutoIncrement = new Set(filled.autoIncrement?.missingIndexes ?? []);
+    const materializedRows: InsertValue[][] = Array.from(
+      { length: statement.rows.length },
+      (_, rowIndex) =>
+        columns.map((name) =>
+          name === filled.autoIncrement?.column.name && deferredAutoIncrement.has(rowIndex)
+            ? { default: true }
+            : (filled.batch.columns[name]?.[rowIndex] ?? null),
+        ),
+    );
+    const keys = filled.batch.columns[keyColumn.name] ?? [];
     const plan: CompiledQuery = {
       sql: "(on conflict do nothing)",
       base: { table: table.name, alias: table.name },
@@ -6196,14 +6991,15 @@ export class MinnowDatabase {
       writer === undefined ? await this.#queryCompiled(plan) : await writer.queryPlan(plan);
     const existing = new Set<QueryValue | string>(
       existingRows.rows.map((row) => {
-        const value = row.key ?? null;
+        const value = storedSqlValueFromExecution(keyColumn, row.key ?? null);
         return value instanceof Date ? value.toISOString() : value;
       }),
     );
     return {
       ...statement,
-      rows: statement.rows.filter((row) => {
-        const value = boundInsertValue(row[keyIndex] ?? null);
+      columns,
+      rows: materializedRows.filter((_, index) => {
+        const value = keys[index] ?? null;
         if (value === null) return true;
         const normalized = value instanceof Date ? value.toISOString() : value;
         if (existing.has(normalized)) return false;
@@ -6239,7 +7035,10 @@ export class MinnowDatabase {
     const { result: applied, version } = await this.write(async (session) => {
       const sourceRows = (await session.query(sourceSql)).rows;
       const keys = sourceRows.map((row) =>
-        evaluateJoinedRowExpression(sourceKey, { [statement.source.alias]: row }),
+        storedSqlValueFromExecution(
+          keyColumn,
+          evaluateJoinedRowExpression(sourceKey, { [statement.source.alias]: row }),
+        ),
       );
       const present = new Map<string, DatabaseRow>();
       const wanted = keys.filter((key): key is QueryValue => key !== null);
@@ -6251,8 +7050,8 @@ export class MinnowDatabase {
           { params: wanted },
         );
         for (const row of existing.rows) {
-          const key = row[keyColumn.name];
-          if (key !== null && key !== undefined) present.set(keyToken(keyColumn.type, key), row);
+          const key = storedSqlValueFromExecution(keyColumn, row[keyColumn.name] ?? null);
+          if (key !== null) present.set(keyToken(keyColumn.type, key), row);
         }
       }
       const { updates, deletes, inserts } = classifyMergeRows({
@@ -6288,11 +7087,9 @@ export class MinnowDatabase {
         changedRows += result.rowCount;
       }
       if (inserts.length > 0) {
-        const columns: Record<string, BatchValue[]> = {};
-        for (const column of target.columns) {
-          columns[column.name] = inserts.map((row) => row[column.name] ?? null);
-        }
-        const result = await session.insertBatch(target.name, { columns });
+        // Keep absent properties absent: omission invokes a catalog default while explicit NULL
+        // must remain SQL NULL. Pivoting every target column here used to collapse that boundary.
+        const result = await session.insertBatch(target.name, inserts);
         changedRows += result.rowCount;
       }
       return changedRows;
@@ -6310,6 +7107,7 @@ export class MinnowDatabase {
     writer?: StatementWriter,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     if (statement.query === undefined) return statement;
+    const target = await this.#findTable(statement.table);
     let result: QueryResult;
     if (writer === undefined) {
       const prepared = await this.#prepareCompiledPlan(statement.query);
@@ -6324,9 +7122,16 @@ export class MinnowDatabase {
     }
     const { query, ...rest } = statement;
     void query;
+    const targetColumns = statement.columns.map((name) =>
+      target.columns.find((column) => column.name === name),
+    );
     return {
       ...rest,
-      rows: result.rows.map((row) => result.columns.map((column) => row[column] ?? null)),
+      rows: result.rows.map((row) =>
+        result.columns.map((column, position) =>
+          storedSqlValueFromExecution(targetColumns[position], row[column] ?? null),
+        ),
+      ),
     };
   }
 
@@ -6344,6 +7149,55 @@ export class MinnowDatabase {
     if (statement.kind === "select") {
       return { kind: "rows", result: await this.query(statement.sql) };
     }
+    if (statement.kind === "create-enum") {
+      const values = validateEnumValues(statement.values, statement.name);
+      const storageName = `${ENUM_TYPE_PREFIX}${statement.name}`;
+      if (await this.store.getTableByName(storageName)) {
+        throw new TypeError(`Type already exists: ${statement.name}`);
+      }
+      await this.store.addTable({
+        id: this.#createId(),
+        name: storageName,
+        columns: [
+          {
+            id: this.#createId(),
+            name: "value",
+            type: "string",
+            nullable: false,
+            hidden: true,
+          },
+        ],
+        enumType: { name: statement.name, values },
+        createdAt: this.#now().toISOString(),
+      });
+      this.#planCache.clear();
+      return { kind: "create-type", name: statement.name };
+    }
+    if (statement.kind === "create-sequence") {
+      const storageName = `${SEQUENCE_PREFIX}${statement.name}`;
+      if (await this.store.getTableByName(storageName)) {
+        throw new TypeError(`Sequence already exists: ${statement.name}`);
+      }
+      const columnId = this.#createId();
+      await this.store.addTable({
+        id: this.#createId(),
+        name: storageName,
+        columns: [
+          {
+            id: columnId,
+            name: "value",
+            type: "number",
+            integer: true,
+            nullable: false,
+            hidden: true,
+            defaultValue: { kind: "autoincrement" },
+          },
+        ],
+        sequence: { name: statement.name, start: 1, columnId },
+        createdAt: this.#now().toISOString(),
+      });
+      return { kind: "create-sequence", name: statement.name };
+    }
     if (statement.kind === "create-table") {
       if (statement.ifNotExists === true) {
         const existing = await this.store.getTableByName(statement.table);
@@ -6355,6 +7209,12 @@ export class MinnowDatabase {
         ...(statement.checks === undefined ? {} : { checks: statement.checks }),
         ...(statement.foreignKeys === undefined ? {} : { foreignKeys: statement.foreignKeys }),
         ...(statement.uniqueKey === undefined ? {} : { uniqueKey: statement.uniqueKey }),
+        ...(statement.compositePrimaryKey === undefined
+          ? {}
+          : { compositePrimaryKey: statement.compositePrimaryKey }),
+        ...(statement.uniqueConstraints === undefined
+          ? {}
+          : { uniqueConstraints: statement.uniqueConstraints }),
         ...(statement.managed === undefined ? {} : { managed: statement.managed }),
       });
       return { kind: "create-table", table: statement.table };
@@ -6373,23 +7233,37 @@ export class MinnowDatabase {
       const schemas = new Map(
         records.map((record) => [
           record.name,
-          record.columns.map(({ name, type, integer }) => ({
+          record.columns.map(({ name, type, integer, sqlDomain }) => ({
             name,
             type,
             ...(integer === true ? { integer: true as const } : {}),
+            ...(sqlDomain === undefined ? {} : { sqlDomain }),
           })),
         ]),
       );
-      const columns = inferBlockSchema(statement.query, schemas).map(({ name, type, integer }) => ({
-        name,
-        type,
-        ...(integer === true ? { integer: true as const } : {}),
-        nullable: true,
-      }));
+      const columns = inferBlockSchema(statement.query, schemas).map(
+        ({ name, type, integer, sqlDomain }) => ({
+          name,
+          type,
+          ...(integer === true ? { integer: true as const } : {}),
+          ...(sqlDomain === undefined ? {} : { sqlDomain }),
+          nullable: true,
+        }),
+      );
       const result = await this.#queryCompiled(statement.query);
       await this.createTable({ name: statement.table, columns });
       if (result.rows.length > 0) {
-        await this.insertBatch(statement.table, result.rows);
+        await this.insertBatch(
+          statement.table,
+          result.rows.map((row) =>
+            Object.fromEntries(
+              columns.map((column) => [
+                column.name,
+                storedSqlValueFromExecution(column, row[column.name] ?? null),
+              ]),
+            ),
+          ),
+        );
       }
       return { kind: "create-table", table: statement.table };
     }
@@ -6431,7 +7305,23 @@ export class MinnowDatabase {
     if (statement.kind === "add-column") {
       // F031-04. Existing rows have no value for the new column, so it is always nullable;
       // a DEFAULT fills the rows written afterwards.
-      const added = statement.column;
+      let added = statement.column;
+      if (added.sqlDomain?.kind === "enum" && added.sqlDomain.values.length === 0) {
+        const enumRecord = await this.store.getTableByName(
+          `${ENUM_TYPE_PREFIX}${added.sqlDomain.name}`,
+        );
+        if (enumRecord?.enumType === undefined) {
+          throw new TypeError(`Unsupported column type: ${added.sqlDomain.name}`);
+        }
+        added = {
+          ...added,
+          sqlDomain: {
+            kind: "enum",
+            name: enumRecord.enumType.name,
+            values: [...enumRecord.enumType.values],
+          },
+        };
+      }
       const record = await this.store.getTableByName(statement.table);
       if (record === undefined) throw new TypeError(`Unknown table: ${statement.table}`);
       if (
@@ -6445,6 +7335,30 @@ export class MinnowDatabase {
       if (record.columns.some(({ name }) => name === added.name)) {
         throw new TypeError(`Column already exists: ${statement.table}.${added.name}`);
       }
+      if (added.defaultValue !== undefined) {
+        validateColumnDefault(
+          {
+            name: added.name,
+            type: added.type,
+            ...(added.integer === true ? { integer: true as const } : {}),
+            ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+            nullable: added.nullable ?? false,
+            isUniqueKey: false,
+            ...(added.enumValues === undefined ? {} : { enumValues: added.enumValues }),
+          },
+          added.defaultValue,
+        );
+        if (added.defaultValue.kind === "literal" && added.sqlDomain !== undefined) {
+          normalizeSqlDomainValue(added.sqlDomain, added.defaultValue.value);
+        }
+        if (added.defaultValue.kind === "expression") {
+          validateDefaultExpression(added.defaultValue.sql, {
+            name: `${statement.table}.${added.name}`,
+            type: added.type,
+            ...(added.sqlDomain === undefined ? {} : { sqlDomain: added.sqlDomain }),
+          });
+        }
+      }
       const columns = [
         ...structuredClone(record.columns),
         {
@@ -6452,10 +7366,13 @@ export class MinnowDatabase {
           name: added.name,
           type: added.type,
           ...(added.integer === true ? { integer: true as const } : {}),
+          ...(added.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(added.sqlDomain) }),
           nullable: added.nullable ?? false,
           ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
           ...(added.enumValues === undefined ? {} : { enumValues: [...added.enumValues] }),
-          ...(added.backfill === undefined ? {} : { backfill: added.backfill }),
+          ...(added.backfill === undefined
+            ? {}
+            : { backfill: normalizedColumnBackfill(added, added.backfill) }),
         },
       ];
       await this.store.updateTable(record.id, record.revision ?? 0, { columns });
@@ -6500,18 +7417,23 @@ export class MinnowDatabase {
       await this.#dropTrigger(statement.name);
       return { kind: "drop-trigger", name: statement.name };
     }
-    if (statement.kind === "transaction") return this.#runTransactionStatement(statement.action);
+    if (statement.kind === "transaction") {
+      return this.#runTransactionStatement(statement.action, statement.name);
+    }
     if (statement.kind === "insert" && statement.columns.length === 0) {
       const table = await this.#findTable(statement.table);
-      const columns = table.columns.map((column) => column.name);
+      const columns = visibleTableColumns(table).map((column) => column.name);
       const producedColumns = statement.query?.select.length;
       if (producedColumns !== undefined && producedColumns !== columns.length) {
         throw new TypeError("INSERT ... SELECT must produce exactly the table column count");
       }
-      if (statement.rows.some((row) => row.length !== columns.length)) {
+      if (statement.defaultValues === true) {
+        // Keep the empty column list: omission, not NULL, is what invokes catalog defaults.
+      } else if (statement.rows.some((row) => row.length !== columns.length)) {
         throw new TypeError("Each INSERT row must match the table column count");
+      } else {
+        statement = { ...statement, columns };
       }
-      statement = { ...statement, columns };
     }
     // A RETURNING clause parsed from SQL text applies unless the caller overrides it.
     if (statement.returning !== undefined && options.returning === undefined) {
@@ -6539,9 +7461,22 @@ export class MinnowDatabase {
       const viaUpsert = statement.onConflict?.action === "replace";
       if (viaUpsert) {
         const keyColumn = getUniqueKeyColumn(table);
-        if (keyColumn === undefined || statement.onConflict?.column !== keyColumn.name) {
+        const conflictColumns =
+          statement.onConflict?.columns ??
+          (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
+        const addressColumns =
+          keyColumn?.hidden === true
+            ? primaryKeyColumns(table).map(({ name }) => name)
+            : keyColumn === undefined
+              ? []
+              : [keyColumn.name];
+        if (
+          keyColumn === undefined ||
+          conflictColumns.length !== addressColumns.length ||
+          conflictColumns.some((name, index) => name !== addressColumns[index])
+        ) {
           throw new TypeError(
-            `ON CONFLICT targets the table's unique key column: ${keyColumn?.name ?? "(none)"}`,
+            `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
           );
         }
       }
@@ -6550,17 +7485,10 @@ export class MinnowDatabase {
           throw new TypeError(`INSERT column does not exist: ${name}`);
         }
       }
-      const columns: Record<string, BatchValue[]> = {};
-      statement.columns.forEach((column, index) => {
-        columns[column] = statement.rows.map((row) => boundInsertValue(row[index] ?? null));
-      });
-      // Unlisted columns pad with NULL: defaults fill their null slots engine-side, nullable
-      // columns store NULL, and a non-nullable column without a default rejects the batch.
-      for (const column of table.columns) {
-        if (!(column.name in columns)) {
-          columns[column.name] = statement.rows.map(() => null);
-        }
-      }
+      const input = insertStatementBatch(statement);
+      // Normalize before dispatch as well as inside the write path so RETURNING echoes the exact
+      // stored/public domain value rather than the caller's unnormalized spelling.
+      normalizeDomainBatch(table, input);
       const writer = options.writer;
       // A scope stages and reports rows; a standalone write also publishes a version and any
       // values the engine generated. Both shapes answer here, and the narrow one has less to
@@ -6569,15 +7497,14 @@ export class MinnowDatabase {
         version?: number;
         generatedColumns?: Record<string, BatchValue[]>;
       } = await (viaUpsert
-        ? (writer?.upsertBatch(statement.table, { columns }) ??
-          this.upsertBatch(statement.table, { columns }))
-        : (writer?.insertBatch(statement.table, { columns }) ??
-          this.insertBatch(statement.table, { columns })));
+        ? (writer?.upsertBatch(statement.table, input) ?? this.upsertBatch(statement.table, input))
+        : (writer?.insertBatch(statement.table, input) ??
+          this.insertBatch(statement.table, input)));
       let returningColumns: readonly string[] | undefined;
       if (options.returning !== undefined) {
         returningColumns =
           options.returning === "*"
-            ? table.columns.map((column) => column.name)
+            ? visibleTableColumns(table).map((column) => column.name)
             : options.returning;
         for (const name of returningColumns) {
           if (!table.columns.some((column) => column.name === name)) {
@@ -6597,11 +7524,18 @@ export class MinnowDatabase {
           : {
               returnedRows: statement.rows.map((row, rowIndex) =>
                 Object.fromEntries(
-                  returningColumns.map((name) => [
-                    name,
-                    generated[name]?.[rowIndex] ??
-                      boundInsertValue(row[statement.columns.indexOf(name)] ?? null),
-                  ]),
+                  returningColumns.map((name) => {
+                    const column = table.columns.find((candidate) => candidate.name === name);
+                    const position = statement.columns.indexOf(name);
+                    const inserted = position < 0 ? undefined : row[position];
+                    const value =
+                      generated[name]?.[rowIndex] ??
+                      input.columns[name]?.[rowIndex] ??
+                      (inserted === undefined || isDefaultInsertValue(inserted)
+                        ? null
+                        : boundInsertValue(inserted));
+                    return [name, executionSqlValueFromInput(column, value)];
+                  }),
                 ),
               ),
             }),
@@ -6618,11 +7552,41 @@ export class MinnowDatabase {
       options.returning === undefined
         ? undefined
         : options.returning === "*"
-          ? table.columns.map(({ name }) => name)
+          ? visibleTableColumns(table).map(({ name }) => name)
           : [...options.returning];
+    const updateAssignments =
+      statement.kind !== "update"
+        ? []
+        : await (async () => {
+            if (!table.columns.some((column) => column.sqlDomain !== undefined)) {
+              return statement.assignments;
+            }
+            const { domains } = await this.#catalogFacts();
+            if (!domains.has(table.name)) return statement.assignments;
+            const normalized = normalizePlanDomainLiterals(
+              {
+                sql: `UPDATE ${table.name}`,
+                base: { table: table.name, alias: table.name },
+                joins: [],
+                select: statement.assignments.map((assignment) => ({
+                  expression: assignment.expression,
+                  alias: assignment.column,
+                })),
+                predicates: [],
+                groupBy: [],
+                having: [],
+                orderBy: [],
+              },
+              domains,
+            );
+            return statement.assignments.map((assignment, index) => ({
+              ...assignment,
+              expression: normalized.select[index]?.expression ?? assignment.expression,
+            }));
+          })();
     const referenced = new Set([keyColumn.name, ...(returningColumns ?? [])]);
     if (statement.kind === "update") {
-      for (const assignment of statement.assignments) {
+      for (const assignment of updateAssignments) {
         for (const column of expressionColumnNames(assignment.expression)) {
           referenced.add(column.split(".").at(-1) ?? column);
         }
@@ -6652,8 +7616,11 @@ export class MinnowDatabase {
       // columns first — most of a bulk delete's cost, at 200k rows.
       rows = (await this.#queryCompiled(plan)).rows;
     }
-    const keys = rows.map((row) => row[keyColumn.name]);
-    if (keys.some((key) => key === null || key === undefined)) {
+    const keys =
+      keyColumn.type === "string" && keyColumn.sqlDomain === undefined
+        ? rows.map((row) => storedSqlValueFromExecution(keyColumn, row[keyColumn.name] ?? null))
+        : rows.map((row) => row[keyColumn.name] ?? null);
+    if (keys.some((key) => key === null)) {
       throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
     }
     if (statement.kind === "delete") {
@@ -6673,8 +7640,8 @@ export class MinnowDatabase {
       }
       const deleted: { deletedRowCount?: number; rowCount?: number; version?: number | null } =
         options.writer === undefined
-          ? await this.deleteBatch(table.name, { keys: keys as BatchValue[] })
-          : await options.writer.deleteBatch(table.name, { keys: keys as BatchValue[] });
+          ? await this.deleteBatch(table.name, { keys })
+          : await options.writer.deleteBatch(table.name, { keys });
       return {
         kind: "delete",
         table: table.name,
@@ -6694,7 +7661,12 @@ export class MinnowDatabase {
       };
     }
     const changes: Record<string, Array<BatchValue | null>> = {};
-    for (const assignment of statement.assignments) {
+    const returnedChanges: Record<string, Array<BatchValue | null>> | undefined =
+      returningColumns === undefined ? undefined : {};
+    for (const assignment of updateAssignments) {
+      const column = table.columns.find((candidate) => candidate.name === assignment.column);
+      if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
+      const executionValues = returnedChanges === undefined ? undefined : ([] as BatchValue[]);
       changes[assignment.column] = rows.map((row) => {
         const value = evaluateRowExpression(assignment.expression, table.name, row);
         if (typeof value === "number" && !Number.isFinite(value)) {
@@ -6702,13 +7674,19 @@ export class MinnowDatabase {
             `UPDATE assignment produced a non-finite number: ${assignment.column}`,
           );
         }
-        return value;
+        executionValues?.push(value);
+        return column.type === "string" && column.sqlDomain === undefined
+          ? storedSqlValueFromExecution(column, value)
+          : value;
       });
+      if (executionValues !== undefined && returnedChanges !== undefined) {
+        returnedChanges[assignment.column] = executionValues;
+      }
     }
     const updated: { updatedRowCount?: number; rowCount?: number; version?: number | null } =
       options.writer === undefined
-        ? await this.updateBatch(table.name, { keys: keys as BatchValue[], changes })
-        : await options.writer.updateBatch(table.name, { keys: keys as BatchValue[], changes });
+        ? await this.updateBatch(table.name, { keys, changes })
+        : await options.writer.updateBatch(table.name, { keys, changes });
     const returnedRows =
       returningColumns === undefined
         ? undefined
@@ -6716,7 +7694,9 @@ export class MinnowDatabase {
             Object.fromEntries(
               returningColumns.map((name) => [
                 name,
-                name in changes ? (changes[name]?.[index] ?? null) : (row[name] ?? null),
+                returnedChanges !== undefined && name in returnedChanges
+                  ? (returnedChanges[name]?.[index] ?? null)
+                  : (row[name] ?? null),
               ]),
             ),
           );
@@ -6836,6 +7816,17 @@ export class MinnowDatabase {
     );
     const schemas = new Map(
       tables.map((table) => [table.name, table.columns.map(({ name }) => name)]),
+    );
+    const typedSchemas = new Map<string, SqlColumnSchema[]>(
+      tables.map((table) => [
+        table.name,
+        table.columns.map(({ name, type, integer, sqlDomain }) => ({
+          name,
+          type,
+          ...(integer === true ? { integer: true as const } : {}),
+          ...(sqlDomain === undefined ? {} : { sqlDomain }),
+        })),
+      ]),
     );
     const columns = referencedColumns(plan, schemas);
     // Streaming must choose the scan/build orientation before creating its sliding base view.
@@ -6987,12 +7978,10 @@ export class MinnowDatabase {
               ),
             );
           }
-          prepared = createPreparedColumnarQuery(
-            plan,
-            inputTables,
-            memory,
-            ftsStats === undefined ? {} : { ftsStats },
-          );
+          prepared = createPreparedColumnarQuery(plan, inputTables, memory, {
+            ...(ftsStats === undefined ? {} : { ftsStats }),
+            outputNeedsExternalization: queryResultNeedsExternalization(plan, typedSchemas),
+          });
           if (!attempt.spill) {
             try {
               const streamedResult = await prepared.executeAsync({
@@ -7386,7 +8375,7 @@ export class MinnowDatabase {
             collectMemory.close();
             continue;
           }
-          const buildInput = columnarTableFromRows(buildTableName, buildRows);
+          const buildInput = columnarTableFromRows(buildTableName, buildRows, undefined, false);
           buildRows = [];
           const streamedBase = await baseView.create(passMemory);
           const inputTables = new Map<string, ColumnarTable>([
@@ -7533,7 +8522,10 @@ export class MinnowDatabase {
               throw new Error(`Column type mismatch: ${state.column.name}`);
             }
             state.resident.push({
-              vector: this.#blockColumnVector(run[index] ?? "", decoded),
+              vector: plainTextExecutionVector(
+                state.column,
+                this.#blockColumnVector(run[index] ?? "", decoded),
+              ),
               startRow: state.nextBlockStartRow,
             });
             state.nextBlockIndex += 1;
@@ -7924,7 +8916,7 @@ export class MinnowDatabase {
           const bytes = columnVectorRetainedBytes(vector);
           memory.reserve(bytes, "Streamed mutation replay");
           retainedBytes += bytes;
-          changed.set(column.id, vector);
+          changed.set(column.id, plainTextExecutionVector(column, vector));
         }
         mutationChangedVectors.set(segment.id, changed);
       }
@@ -11331,7 +12323,7 @@ export class MinnowDatabase {
     for (const [token, value] of keys) {
       if (existing.has(token)) {
         if (kind === "insert") {
-          throw new UniqueConstraintError(table.name, keyColumn.name, value);
+          throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
         }
         updated += 1;
       } else {
@@ -11829,11 +12821,16 @@ export class MinnowDatabase {
         const end = Math.min(materialized.rowCount, start + this.#rowsPerBlock);
         const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
         for (let row = start; row < end; row += 1) {
-          const values = valueVectors.map((vector) =>
-            vector === undefined ? null : vectorValue(vector, row),
+          const values = valueVectors.map((vector, position) =>
+            vector === undefined
+              ? null
+              : storedSqlValueFromExecution(columns[position], vectorValue(vector, row)),
           );
           if (values.some((value) => value === null)) continue;
-          const locator = secondaryKeyLocator(keyColumn.type, vectorValue(keyVector, row));
+          const locator = secondaryKeyLocator(
+            keyColumn.type,
+            storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
+          );
           addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
         }
         const postings = sortedSecondaryPostings(byTerm);
@@ -11893,8 +12890,10 @@ export class MinnowDatabase {
         if (end <= start) throw new Error(`Secondary-index scan made no progress: ${table.name}`);
         const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
         for (let row = start; row < end; row += 1) {
-          const values = valueVectors.map((vector) =>
-            vector === undefined ? null : vectorValue(vector, row),
+          const values = valueVectors.map((vector, position) =>
+            vector === undefined
+              ? null
+              : storedSqlValueFromExecution(columns[position], vectorValue(vector, row)),
           );
           if (values.some((value) => value === null)) continue;
           const locator =
@@ -11902,7 +12901,9 @@ export class MinnowDatabase {
               ? (rowIdAt?.(row) ?? 0n)
               : secondaryKeyLocator(
                   keyColumn.type,
-                  keyVector === undefined ? null : vectorValue(keyVector, row),
+                  keyVector === undefined
+                    ? null
+                    : storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
                 );
           addSecondaryPosting(byTerm, index, columns, values, locator, uniqueTerms);
         }
@@ -12427,6 +13428,22 @@ export class MinnowDatabase {
       return { segments, pruned: false };
     }
 
+    // A postings lookup can only repay itself by eliminating a physical row group. Small OLTP
+    // tables commonly fit in one block; probing the durable index and mapping its key locators
+    // back through that same block adds work but cannot reduce I/O. Let the ordinary cached block
+    // scan answer those tables directly. Multiple one-block segments still qualify because the
+    // index can eliminate whole segments.
+    const anchorColumn = keyColumn ?? table.columns[0];
+    if (
+      anchorColumn === undefined ||
+      segments.reduce(
+        (total, segment) => total + (segment.columnBlockIds[anchorColumn.id]?.length ?? 0),
+        0,
+      ) <= 1
+    ) {
+      return { segments, pruned: false };
+    }
+
     const upToVersion = snapshot.version ?? -1;
     let candidates: bigint[] | undefined;
     for (const predicate of predicates) {
@@ -12920,7 +13937,18 @@ export class MinnowDatabase {
     const columnInputs = new Map(
       projectedColumns.map(
         (column) =>
-          [column.name, { type: column.type, values: valuesById.get(column.id) ?? [] }] as const,
+          [
+            column.name,
+            {
+              type: column.type,
+              values:
+                column.type === "string" && column.sqlDomain === undefined
+                  ? (valuesById.get(column.id) ?? []).map((value) =>
+                      typeof value === "string" ? protectedSqlTextValue(value) : value,
+                    )
+                  : (valuesById.get(column.id) ?? []),
+            },
+          ] as const,
       ),
     );
     return { ...createColumnarTable(table.name, columnInputs), orderedForPlan: true };
@@ -13496,12 +14524,17 @@ export class MinnowDatabase {
     }
     if (outputRow !== rowCount) throw new Error(`Column row count mismatch: ${column.name}`);
     if (column.type === "string") {
+      const dictionary = stringDictionary.dictionary;
+      const protectedDictionary =
+        column.sqlDomain === undefined && stringDictionary.hasSqlDomainValue
+          ? dictionary.map(protectedSqlTextValue)
+          : dictionary;
       return {
         kind: "string",
         length: rowCount,
         validity,
         codes: stringCodes ?? new Uint32Array(),
-        dictionary: stringDictionary.dictionary,
+        dictionary: protectedDictionary,
       };
     }
     if (column.type === "boolean") {
@@ -13806,7 +14839,7 @@ function classifyMergeRows(input: {
     const token = key === null ? undefined : keyToken(keyColumn.type, key);
     const matched = token === undefined ? undefined : present.get(token);
     if (key !== null && token !== undefined && matched !== undefined) {
-      // SQL:2023 15.8: two source rows may not both act on one target row. Applying the last one
+      // PostgreSQL raises a cardinality violation when two source rows act on one target row.
       // silently would make the result depend on the order the source happened to produce.
       if (claimed.has(token)) {
         throw new TypeError(
@@ -13839,7 +14872,12 @@ function classifyMergeRows(input: {
           if (assignment.column === keyColumn.name) {
             throw new TypeError(`MERGE cannot update the unique key: ${keyColumn.name}`);
           }
-          changes[assignment.column] = evaluateJoinedRowExpression(assignment.expression, context);
+          const column = target.columns.find((candidate) => candidate.name === assignment.column);
+          if (column === undefined) throw new TypeError(`Unknown column: ${assignment.column}`);
+          changes[assignment.column] = storedSqlValueFromExecution(
+            column,
+            evaluateJoinedRowExpression(assignment.expression, context),
+          );
         }
         work.updates.set(token, { key, changes });
         return;
@@ -13855,7 +14893,13 @@ function classifyMergeRows(input: {
       const row: Record<string, BatchValue> = {};
       columns.forEach((column, position) => {
         const value = values[position];
-        if (value !== undefined) row[column] = evaluateJoinedRowExpression(value, context);
+        if (value === undefined) return;
+        const targetColumn = target.columns.find((candidate) => candidate.name === column);
+        if (targetColumn === undefined) throw new TypeError(`Unknown column: ${column}`);
+        row[column] = storedSqlValueFromExecution(
+          targetColumn,
+          evaluateJoinedRowExpression(value, context),
+        );
       });
       work.inserts.push(row);
       return;
@@ -14102,6 +15146,9 @@ function validateUpdateBatch(
     const column = table.columns.find((candidate) => candidate.name === name);
     if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
     if (column.id === keyColumn.id) throw new TypeError(`Unique key cannot be updated: ${name}`);
+    if ((table.primaryKeyColumnIds ?? []).includes(column.id)) {
+      throw new TypeError(`Primary key column cannot be updated: ${name}`);
+    }
     const values = input.changes[name] ?? [];
     if (values.length !== input.keys.length) {
       throw new TypeError("Every changed column must have the same row count as the keys");
@@ -14128,6 +15175,24 @@ function resolveReadColumns(
     if (seen.has(name)) throw new TypeError(`Duplicate projected column: ${name}`);
     seen.add(name);
     const column = table.columns.find((candidate) => candidate.name === name);
+    if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
+    return column;
+  });
+}
+
+/** Public table reads never reveal physical implementation columns, even by explicit name. */
+function resolvePublicReadColumns(
+  table: TableRecord,
+  names: readonly string[] | undefined,
+): TableColumnRecord[] {
+  const visible = visibleTableColumns(table);
+  if (names === undefined) return visible;
+  if (names.length === 0) throw new TypeError("A projected read needs at least one column");
+  const seen = new Set<string>();
+  return names.map((name) => {
+    if (seen.has(name)) throw new TypeError(`Duplicate projected column: ${name}`);
+    seen.add(name);
+    const column = visible.find((candidate) => candidate.name === name);
     if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
     return column;
   });
@@ -14264,6 +15329,38 @@ function sortedFtsPostings(byTerm: Map<string, { rowIds: bigint[]; tf: number[] 
 }
 
 const secondaryNumberBits = new DataView(new ArrayBuffer(8));
+
+/** Converts a SQL evaluator's unambiguous TEXT representation back to its physical user value. */
+function storedSqlValueFromExecution(
+  column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
+  value: BatchValue,
+): BatchValue {
+  return column?.type === "string" && column.sqlDomain === undefined && typeof value === "string"
+    ? (externalSqlTextValue(value) as BatchValue)
+    : value;
+}
+
+/** Protects a physical plain-TEXT value before a schema-less result externalizer sees it. */
+function executionSqlValueFromStorage(
+  column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
+  value: BatchValue,
+): BatchValue {
+  return column?.type === "string" && column.sqlDomain === undefined && typeof value === "string"
+    ? protectedSqlTextValue(value)
+    : value;
+}
+
+/** Canonicalizes an INSERT input exactly as storage does before exposing it through RETURNING. */
+function executionSqlValueFromInput(
+  column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
+  value: BatchValue,
+): BatchValue {
+  const stored =
+    column?.sqlDomain === undefined
+      ? value
+      : (normalizeSqlDomainValue(column.sqlDomain, value) as BatchValue);
+  return executionSqlValueFromStorage(column, stored);
+}
 
 /** Lexicographic scalar encoding whose byte order is the engine's SQL order for one type. */
 function secondaryIndexTerm(type: SimpleDataType, value: BatchValue): string {
@@ -14545,7 +15642,11 @@ function buildFtsColumnDeltas(
     const byTerm = new Map<string, { rowIds: bigint[]; tf: number[] }>();
     let totalTokens = 0;
     (input.columns[column.name] ?? []).forEach((value, index) => {
-      totalTokens += addFtsDocument(byTerm, value, rowIdStart + BigInt(index));
+      const documentValue =
+        column.type === "string" && column.sqlDomain === undefined && typeof value === "string"
+          ? protectedSqlTextValue(value)
+          : value;
+      totalTokens += addFtsDocument(byTerm, documentValue, rowIdStart + BigInt(index));
     });
     return [{ columnId, postings: sortedFtsPostings(byTerm), totalTokens }];
   });
@@ -14790,12 +15891,233 @@ type FtsCandidatesResult = Awaited<ReturnType<BlockStore["readFtsCandidates"]>>;
 /** The columns a MATCH(*) document draws from: everything except booleans. */
 function searchableFtsColumns(table: TableRecord | undefined): readonly string[] | undefined {
   if (table === undefined) return undefined;
-  return table.columns.filter((column) => column.type !== "boolean").map((column) => column.name);
+  return visibleTableColumns(table)
+    .filter((column) => column.type !== "boolean")
+    .map((column) => column.name);
 }
 
 function getUniqueKeyColumn(table: TableRecord): TableColumnRecord | undefined {
   if (table.uniqueKeyColumnId === undefined) return undefined;
   return table.columns.find((column) => column.id === table.uniqueKeyColumnId);
+}
+
+function visibleTableColumns(table: TableRecord): TableColumnRecord[] {
+  return table.columns.filter((column) => column.hidden !== true);
+}
+
+function publicKeyName(table: TableRecord, keyColumn: TableColumnRecord): string {
+  if (!keyColumn.hidden) return keyColumn.name;
+  const names = (table.primaryKeyColumnIds ?? []).map(
+    (columnId) => table.columns.find((column) => column.id === columnId)?.name ?? columnId,
+  );
+  return `(${names.join(", ")})`;
+}
+
+function primaryKeyColumns(table: TableRecord): TableColumnRecord[] {
+  const ids = table.primaryKeyColumnIds;
+  if (ids !== undefined) {
+    return ids.map((columnId) => {
+      const column = table.columns.find((candidate) => candidate.id === columnId);
+      if (column === undefined) throw new Error(`Primary key column is missing: ${table.name}`);
+      return column;
+    });
+  }
+  const scalar = getUniqueKeyColumn(table);
+  return scalar === undefined || scalar.hidden ? [] : [scalar];
+}
+
+function foreignKeyColumns(
+  key: NonNullable<TableRecord["foreignKeys"]>[number],
+): readonly string[] {
+  return key.columns ?? [key.column];
+}
+
+function foreignKeyParentColumns(
+  key: NonNullable<TableRecord["foreignKeys"]>[number],
+): readonly string[] {
+  return key.parentColumns ?? [key.parentColumn];
+}
+
+function sqlTupleToken(values: readonly unknown[]): string {
+  return JSON.stringify(values.map(encodeSqlEqualityValue));
+}
+
+function compositeKeyValue(
+  columns: readonly TableColumnRecord[],
+  values: readonly BatchValue[],
+): string {
+  if (columns.length !== values.length || values.some((value) => value === null)) {
+    throw new TypeError("A composite key needs one non-null value per column");
+  }
+  return columns
+    .map((column, index) => secondaryTupleComponent(column.type, values[index] ?? null))
+    .join("");
+}
+
+/** Canonicalizes logical PostgreSQL domains before validation and primitive block encoding. */
+function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
+  for (const column of table.columns) {
+    const domain = column.sqlDomain;
+    if (domain === undefined) continue;
+    const values = input.columns[column.name];
+    if (values === undefined) continue;
+    (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
+      normalizeSqlDomainValue(domain, value),
+    );
+  }
+}
+
+function normalizeDomainUpdate(table: TableRecord, input: UpdateBatchInput): UpdateBatchInput {
+  if (!table.columns.some((column) => column.sqlDomain !== undefined)) return input;
+  let changed = false;
+  const changes: Record<string, readonly BatchValue[]> = { ...input.changes };
+  for (const [name, values] of Object.entries(input.changes)) {
+    const domain = table.columns.find((column) => column.name === name)?.sqlDomain;
+    if (domain === undefined) continue;
+    changed = true;
+    changes[name] = values.map((value) => normalizeSqlDomainValue(domain, value));
+  }
+  const key = getUniqueKeyColumn(table);
+  const keyDomain = key?.sqlDomain;
+  const keys =
+    keyDomain === undefined
+      ? input.keys
+      : input.keys.map((value) => normalizeSqlDomainValue(keyDomain, value));
+  return changed || keys !== input.keys ? { keys, changes } : input;
+}
+
+/** Coerces literals and bound parameters opposite a domain column before planning/index probes. */
+function normalizePlanDomainLiterals(
+  input: CompiledQuery,
+  domains: ReadonlyMap<string, ReadonlyMap<string, SqlDomain>>,
+): CompiledQuery {
+  const plan = structuredClone(input);
+  const rewriteBlock = (block: CompiledQuery): void => {
+    for (const source of [block.base, ...block.joins]) {
+      if (source.derived !== undefined) rewriteBlock(source.derived);
+      source.union?.blocks.forEach(rewriteBlock);
+      if (source.windowed !== undefined) rewriteBlock(source.windowed.block);
+      if (source.recursive !== undefined) {
+        rewriteBlock(source.recursive.base);
+        rewriteBlock(source.recursive.step);
+      }
+    }
+    const sources = [block.base, ...block.joins];
+    const domainFor = (reference: string): SqlDomain | undefined => {
+      const separator = reference.indexOf(".");
+      if (separator !== -1) {
+        const alias = reference.slice(0, separator);
+        const name = reference.slice(separator + 1);
+        const source = sources.find((candidate) => candidate.alias === alias);
+        return source === undefined ? undefined : domains.get(source.table)?.get(name);
+      }
+      const matches = sources.flatMap((source) => {
+        const domain = domains.get(source.table)?.get(reference);
+        return domain === undefined ? [] : [domain];
+      });
+      return matches.length === 1 ? matches[0] : undefined;
+    };
+    const coercePair = (column: Expression, value: Expression): void => {
+      if (column.kind !== "column") return;
+      const domain = domainFor(column.reference);
+      if (domain === undefined) return;
+      if (value.kind === "literal") {
+        value.value = normalizeSqlDomainValue(domain, value.value);
+        value.internalSqlValue = true;
+        value.sqlDomain = domain;
+      } else if (value.kind === "list") {
+        for (const item of value.items) {
+          if (item.kind === "literal") {
+            item.value = normalizeSqlDomainValue(domain, item.value);
+            item.internalSqlValue = true;
+            item.sqlDomain = domain;
+          }
+        }
+      }
+    };
+    const rewrite = (expression: Expression): Expression => {
+      if (expression.kind === "binary") {
+        expression.left = rewrite(expression.left);
+        expression.right = rewrite(expression.right);
+      } else if (expression.kind === "call") {
+        expression.arguments = expression.arguments.map(rewrite);
+      } else if (expression.kind === "list") {
+        expression.items = expression.items.map(rewrite);
+      } else if (expression.kind === "condition") {
+        expression.left = rewrite(expression.left);
+        expression.right = rewrite(expression.right);
+        coercePair(expression.left, expression.right);
+        coercePair(expression.right, expression.left);
+      } else if (expression.kind === "logical") {
+        expression.left = rewrite(expression.left);
+        expression.right = rewrite(expression.right);
+      } else if (expression.kind === "not") {
+        expression.operand = rewrite(expression.operand);
+      } else if (expression.kind === "case") {
+        for (const branch of expression.branches) {
+          branch.when = rewrite(branch.when);
+          branch.then = rewrite(branch.then);
+        }
+        if (expression.otherwise !== undefined)
+          expression.otherwise = rewrite(expression.otherwise);
+      } else if (expression.kind === "window") {
+        expression.partitionBy = expression.partitionBy.map(rewrite);
+        for (const order of expression.orderBy) order.expression = rewrite(order.expression);
+        if (expression.argument !== undefined) expression.argument = rewrite(expression.argument);
+      } else if (expression.kind === "subquery") {
+        rewriteBlock(expression.block);
+      } else if (expression.kind === "exists") {
+        rewriteBlock(expression.block);
+      } else if (expression.kind === "fts" && expression.columns !== "*") {
+        expression.columns = expression.columns.map(rewrite);
+      }
+      return expression;
+    };
+    for (const item of block.select) item.expression = rewrite(item.expression);
+    for (const join of block.joins) {
+      join.left = rewrite(join.left);
+      join.right = rewrite(join.right);
+      if (join.on !== undefined) join.on = rewrite(join.on);
+    }
+    for (const predicate of [...block.predicates, ...block.having]) {
+      predicate.left = rewrite(predicate.left);
+      predicate.right = rewrite(predicate.right);
+      coercePair(predicate.left, predicate.right);
+      coercePair(predicate.right, predicate.left);
+    }
+    block.groupBy = block.groupBy.map(rewrite);
+    for (const order of block.orderBy) order.expression = rewrite(order.expression);
+  };
+  rewriteBlock(plan);
+  return plan;
+}
+
+/** Materializes a composite PRIMARY KEY's hidden scalar locator without touching public values. */
+function fillCompositePrimaryKey(table: TableRecord, input: ColumnarBatch, rowCount: number): void {
+  const ids = table.primaryKeyColumnIds;
+  if (ids === undefined || ids.length < 2) return;
+  const keyColumn = getUniqueKeyColumn(table);
+  if (keyColumn?.hidden !== true)
+    throw new Error(`Composite key locator is missing: ${table.name}`);
+  const columns = ids.map((columnId) => {
+    const column = table.columns.find(
+      (candidate) => candidate.id === columnId && !candidate.hidden,
+    );
+    if (column === undefined) throw new Error(`Composite key column is missing: ${table.name}`);
+    return column;
+  });
+  const keys: string[] = [];
+  for (let row = 0; row < rowCount; row += 1) {
+    const values = columns.map((column) => input.columns[column.name]?.[row] ?? null);
+    const nullAt = values.findIndex((value) => value === null);
+    if (nullAt !== -1) {
+      throw new TypeError(
+        `PRIMARY KEY ${columns[nullAt]?.name ?? ""}[${String(row)}] cannot be null`,
+      );
+    }
+    keys.push(compositeKeyValue(columns, values));
+  }
+  (input.columns as Record<string, readonly BatchValue[]>)[keyColumn.name] = keys;
 }
 
 function batchKeys(
@@ -14809,7 +16131,7 @@ function batchKeys(
     if (value === null) throw new TypeError(`Unique key cannot be null: ${keyColumn.name}`);
     const token = keyToken(keyColumn.type, value);
     if (keys.has(token)) {
-      throw new UniqueConstraintError(table.name, keyColumn.name, value);
+      throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
     }
     keys.set(token, value);
   }
@@ -14911,6 +16233,8 @@ function positiveFiniteNumber(value: number, name: string): number {
 
 const INITIAL_DICTIONARY_CAPACITY = 8;
 const INITIAL_DICTIONARY_ARENA_BYTES = 256;
+/** Physical dictionaries known to contain at least one value in the private domain namespace. */
+const sqlDomainDictionaries = new WeakSet<readonly string[]>();
 
 /**
  * Interns decoded strings by their raw UTF-8 bytes. The columns that grouping and filtering
@@ -14927,10 +16251,15 @@ class StringDictionaryBuilder {
   #lengths = new Uint32Array(INITIAL_DICTIONARY_CAPACITY);
   #arena = new Uint8Array(INITIAL_DICTIONARY_ARENA_BYTES);
   #arenaLength = 0;
+  #hasSqlDomainValue = false;
 
   /** UTF-8 bytes held by the distinct values, tracked so callers skip a re-encoding pass. */
   get byteLength(): number {
     return this.#arenaLength;
+  }
+
+  get hasSqlDomainValue(): boolean {
+    return this.#hasSqlDomainValue;
   }
 
   codeForBytes(content: Uint8Array, start: number, end: number): number {
@@ -14963,7 +16292,20 @@ class StringDictionaryBuilder {
     const bucket = hash & (this.#buckets.length - 1);
     this.#next[code] = this.#buckets[bucket] ?? -1;
     this.#buckets[bucket] = code;
-    this.dictionary.push(vectorTextDecoder.decode(content.subarray(start, end)));
+    const decoded = vectorTextDecoder.decode(content.subarray(start, end));
+    this.dictionary.push(decoded);
+    // Check raw bytes before asking the decoded string about its prefix. Ordinary data almost
+    // never starts with NUL, so high-cardinality TEXT avoids one startsWith call per distinct
+    // value while the rare private-namespace collision is still detected exactly.
+    if (
+      !this.#hasSqlDomainValue &&
+      length >= SQL_DOMAIN_PREFIX_BYTES.length &&
+      content[start] === 0 &&
+      equalByteRange(SQL_DOMAIN_PREFIX_BYTES, 0, content, start, SQL_DOMAIN_PREFIX_BYTES.length)
+    ) {
+      this.#hasSqlDomainValue = true;
+      sqlDomainDictionaries.add(this.dictionary);
+    }
     return code;
   }
 
@@ -15126,6 +16468,23 @@ function createStreamedColumnVector(type: SimpleDataType, length: number): Colum
     return { kind: type, length, validity, values: new Float64Array(0), window };
   }
   return { kind: type, length, validity, codes: new Uint32Array(0), dictionary: [], window };
+}
+
+/**
+ * Gives a physical plain-TEXT vector its unambiguous execution representation. Domain columns
+ * deliberately keep their tags; ordinary TEXT only copies the rare dictionary that collides
+ * with that namespace, preserving the cached zero-copy vector for every normal dictionary.
+ */
+function plainTextExecutionVector(column: TableColumnRecord, vector: ColumnVector): ColumnVector {
+  if (
+    column.type !== "string" ||
+    column.sqlDomain !== undefined ||
+    vector.kind !== "string" ||
+    !sqlDomainDictionaries.has(vector.dictionary)
+  ) {
+    return vector;
+  }
+  return { ...vector, dictionary: vector.dictionary.map(protectedSqlTextValue) };
 }
 
 interface MutableStreamedVectorFields {
@@ -16129,6 +17488,10 @@ function secondaryIndexPredicates(
         matchedColumns += 1;
         continue;
       }
+      // Domain encodings are stable equality keys, but are not all bytewise SQL orderings
+      // (notably exact NUMERIC and declaration-ordered ENUM). Range pruning on them would be
+      // unsound, so preserve equality acceleration and let range predicates scan/recheck.
+      if (column.sqlDomain !== undefined) break;
       if (constraint.lower === undefined && constraint.upper === undefined) break;
       const descending = secondaryIndexDirections(index)[position] === "desc";
       queries = prefixes.map((prefix) => {
@@ -16233,7 +17596,9 @@ function secondaryIndexOrderForPlan(
       table.columns.find((column) => column.id === columnId),
     );
     if (
-      indexColumns.some((column) => column === undefined || column.nullable) ||
+      indexColumns.some(
+        (column) => column === undefined || column.nullable || column.sqlDomain !== undefined,
+      ) ||
       (requireCovering && projectedColumns.some((column) => !ids.includes(column.id))) ||
       orderColumns.length > ids.length ||
       orderColumns.some((column, position) => column?.id !== ids[position])

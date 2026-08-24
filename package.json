@@ -1,6 +1,6 @@
 {
   "name": "minnow",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "license": "MIT",
   "author": "Eric Wilhite",
   "repository": {
@@ -15,16 +15,16 @@
   ],
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true",
-    "build": "tsc -b && npm run build --workspace @minnowdb/site",
+    "build": "tsc -b --force && npm run build --workspace @minnowdb/site",
     "site:dev": "npm run dev --workspace @minnowdb/site",
     "site:build": "npm run build --workspace @minnowdb/site",
-    "typecheck": "tsc -b --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit",
+    "typecheck": "tsc -b --force --pretty false && npm exec --workspace @minnowdb/site -- tsc --noEmit",
     "test": "npm run test:unit && npm run test:sql:standard",
     "test:unit": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:browser": "npm run test:browser:library && npm run test:browser:site",
-    "test:browser:library": "tsc -b packages/core && playwright test --config playwright.library.config.ts",
-    "test:browser:site": "tsc -b packages/core && playwright test --config playwright.site.config.ts",
+    "test:browser:library": "tsc -b packages/core --force && playwright test --config playwright.library.config.ts",
+    "test:browser:site": "tsc -b packages/core --force && playwright test --config playwright.site.config.ts",
     "test:sql:logic": "vite-node scripts/sql-logic-test.mts",
     "test:sql:fetch": "vite-node scripts/fetch-sqllogictest.mts",
     "test:sql:prepare-standard": "vite-node scripts/prepare-sqllogictest-standard.mts",

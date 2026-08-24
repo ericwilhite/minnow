@@ -10,12 +10,17 @@
 /** A value a column can hold. */
 export type BatchValue = boolean | number | string | Date | null;
 
-/** One row. Columns left out are written as null, so nullable columns can be omitted. */
+/** One row. A missing property is SQL omission; an explicit `null` remains SQL NULL. */
 export type BatchRow = Readonly<Record<string, BatchValue>>;
 
 /** The columnar form: one array per column, all of the same length, aligned by index. */
 export interface ColumnarBatch {
   columns: Readonly<Record<string, readonly BatchValue[]>>;
+  /**
+   * Per-row SQL omission markers. A true slot asks the engine to use the column default (or NULL
+   * when no default exists), without conflating that request with an explicit NULL value.
+   */
+  omitted?: Readonly<Record<string, readonly boolean[]>>;
   /**
    * The batch's row count when no column carries it — a pivot of rows whose every column is
    * default-generated produces an empty column map, and the count would otherwise be lost
@@ -35,22 +40,33 @@ export function isColumnarBatch(input: InsertBatchInput): input is ColumnarBatch
 export function toColumnarBatch(input: InsertBatchInput): ColumnarBatch {
   if (isColumnarBatch(input)) return input;
   if (input.length === 0) throw new TypeError("A batch needs at least one row");
-  // One pass over the rows, discovering columns in first-seen order. A column no row mentions
-  // stays absent, so the write still fails with "Missing column"; a column only some rows
-  // mention keeps its pre-filled nulls, which the per-column nullability check then accepts or
-  // rejects. Reading each row object once beats one full re-walk of every row per column.
+  // One pass over the rows, discovering columns in first-seen order. Values and omission are
+  // separate so an explicit NULL can never accidentally invoke a default.
   const columnsByName = new Map<string, BatchValue[]>();
+  const omittedByName = new Map<string, boolean[]>();
   for (let index = 0; index < input.length; index += 1) {
     const row = input[index];
     if (row === undefined) continue;
     for (const name of Object.keys(row)) {
+      const value: unknown = row[name];
+      if (value === undefined) continue;
       let values = columnsByName.get(name);
       if (values === undefined) {
         values = new Array<BatchValue>(input.length).fill(null);
         columnsByName.set(name, values);
+        omittedByName.set(name, new Array<boolean>(input.length).fill(true));
       }
-      values[index] = row[name] ?? null;
+      values[index] = value as BatchValue;
+      const omitted = omittedByName.get(name);
+      if (omitted !== undefined) omitted[index] = false;
     }
   }
-  return { columns: Object.fromEntries(columnsByName), rowCount: input.length };
+  const omitted = Object.fromEntries(
+    [...omittedByName].filter(([, values]) => values.some(Boolean)),
+  );
+  return {
+    columns: Object.fromEntries(columnsByName),
+    ...(Object.keys(omitted).length === 0 ? {} : { omitted }),
+    rowCount: input.length,
+  };
 }

@@ -5,7 +5,8 @@ import ts from "typescript";
 import { beforeAll, describe, expect, it } from "vitest";
 import { MinnowDatabase } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage";
-import { createMinnow, sql } from "@minnowdb/client";
+import { createKysely } from "@minnowdb/kysely";
+import { sql } from "kysely";
 import { retailBatches, retailDefinition, retailSchema } from "@/lib/dataset/retail";
 import { playgroundDeclarations } from "./declarations";
 import { runSnippet } from "./run";
@@ -95,11 +96,12 @@ function diagnose(code: string): string[] {
 describe("the console's declarations", () => {
   it("resolve every package a snippet may import", () => {
     const probe = [
-      'import { createMinnow, sql } from "@minnowdb/client";',
+      'import { createKysely } from "@minnowdb/kysely";',
+      'import { sql } from "kysely";',
       'import { MinnowDatabase, column, schema, table } from "@minnowdb/core";',
       'import { MemoryBlockStore } from "@minnowdb/core/storage";',
       'import { MinnowDatabaseClient } from "@minnowdb/core/client";',
-      "void [createMinnow, sql, MinnowDatabase, column, schema, table, MemoryBlockStore, MinnowDatabaseClient];",
+      "void [createKysely, sql, MinnowDatabase, column, schema, table, MemoryBlockStore, MinnowDatabaseClient];",
     ].join("\n");
     expect(diagnose(probe)).toEqual([]);
   });
@@ -139,8 +141,11 @@ describe("running every snippet", () => {
       await engine.insertBatch(batch.table, batch.rows);
     }
     scope = {
-      modules: { "@minnowdb/client": { sql }, "@minnowdb/core": {} },
-      globals: { db: createMinnow(engine, { schema: retailDefinition }), database: engine },
+      modules: { kysely: { sql }, "@minnowdb/kysely": { createKysely }, "@minnowdb/core": {} },
+      globals: {
+        db: createKysely({ driver: engine, schema: retailDefinition }),
+        database: engine,
+      },
     };
   });
 

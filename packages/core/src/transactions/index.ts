@@ -52,6 +52,18 @@ export class TransactionClosedError extends Error {
   }
 }
 
+/** Opaque staged-state marker used by SQL SAVEPOINT. */
+export interface TransactionCheckpoint {
+  readonly transactionId: string;
+  readonly pendingBlockIds: readonly string[];
+  readonly pendingSegmentIds: readonly string[];
+  readonly uniqueKeyChanges: readonly UniqueKeyChanges[];
+  readonly ftsChanges: readonly FtsChanges[];
+  readonly supersededBlockIds: readonly string[];
+  readonly changedTableIds: readonly string[];
+  readonly logicallyUnchanged: boolean;
+}
+
 export class Snapshot {
   readonly #blockIds: Set<string>;
 
@@ -222,6 +234,64 @@ export class DatabaseTransaction {
       this.#ftsChanges.length +
       this.#supersededBlockIds.size
     );
+  }
+
+  /** Captures all publish-relevant state; row-id/autoincrement reservations deliberately burn. */
+  checkpoint(): TransactionCheckpoint {
+    this.#assertActive();
+    return {
+      transactionId: this.id,
+      pendingBlockIds: [...this.#record.pendingBlockIds],
+      pendingSegmentIds: [...this.#record.pendingSegmentIds],
+      uniqueKeyChanges: structuredClone(this.#uniqueKeyChanges),
+      ftsChanges: structuredClone(this.#ftsChanges),
+      supersededBlockIds: [...this.#supersededBlockIds],
+      changedTableIds: [...this.#changedTableIds],
+      logicallyUnchanged: this.#logicallyUnchanged,
+    };
+  }
+
+  /** Rewinds staged artifacts and every in-memory commit delta to one earlier checkpoint. */
+  async rollbackTo(checkpoint: TransactionCheckpoint): Promise<void> {
+    this.#assertActive();
+    if (checkpoint.transactionId !== this.id) {
+      throw new TypeError("A transaction checkpoint belongs to another transaction");
+    }
+    const blockPrefix = checkpoint.pendingBlockIds;
+    const segmentPrefix = checkpoint.pendingSegmentIds;
+    if (
+      blockPrefix.some((id, index) => this.#record.pendingBlockIds[index] !== id) ||
+      segmentPrefix.some((id, index) => this.#record.pendingSegmentIds[index] !== id) ||
+      blockPrefix.length > this.#record.pendingBlockIds.length ||
+      segmentPrefix.length > this.#record.pendingSegmentIds.length
+    ) {
+      throw new TypeError("A transaction checkpoint is no longer reachable");
+    }
+    const removedBlockIds = this.#record.pendingBlockIds.slice(blockPrefix.length);
+    const removedSegmentIds = this.#record.pendingSegmentIds.slice(segmentPrefix.length);
+    if (this.#persisted && (removedBlockIds.length > 0 || removedSegmentIds.length > 0)) {
+      // The journal forgets first, so a crash can at worst leave unreachable immutable garbage;
+      // it can never publish an artifact the savepoint rolled back. Normal completion removes
+      // those artifacts immediately below.
+      this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
+        pendingBlockIds: blockPrefix,
+        pendingSegmentIds: segmentPrefix,
+        updatedAt: this.now().toISOString(),
+      });
+    }
+    this.#uniqueKeyChanges.splice(
+      0,
+      this.#uniqueKeyChanges.length,
+      ...structuredClone(checkpoint.uniqueKeyChanges),
+    );
+    this.#ftsChanges.splice(0, this.#ftsChanges.length, ...structuredClone(checkpoint.ftsChanges));
+    this.#supersededBlockIds.clear();
+    for (const id of checkpoint.supersededBlockIds) this.#supersededBlockIds.add(id);
+    this.#changedTableIds.clear();
+    for (const id of checkpoint.changedTableIds) this.#changedTableIds.add(id);
+    this.#logicallyUnchanged = checkpoint.logicallyUnchanged;
+    await Promise.all(removedSegmentIds.map((id) => this.store.removeSegment(id)));
+    await Promise.all(removedBlockIds.map((id) => this.store.removeBlock(id)));
   }
 
   async snapshot(): Promise<Snapshot> {

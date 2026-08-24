@@ -2,17 +2,17 @@
   "title": "Documentation",
   "pages": [
     "index",
-    "comparison",
     "installation",
     "first-query",
     "sql",
-    "conformance",
     "schema",
-    "client",
+    "adapters",
     "engine",
     "storage",
-    "---Also---",
     "devtools",
+    "comparison",
+    "---Reference---",
+    "conformance",
     "reference"
   ]
 }

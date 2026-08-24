@@ -267,6 +267,24 @@ describe("public SQL queries", () => {
     expect(executeQuery(plan, input)).toEqual(executeRowQuery(plan, input));
   });
 
+  it("keeps ordinary row-table text out of the internal SQL-domain namespace", () => {
+    const values = [
+      "\0minnow-domain:numeric:10",
+      "\0minnow-domain:interval:not-json",
+      "\0minnow-domain:text:\0minnow-domain:uuid:not-a-uuid",
+    ];
+    // The unrelated empty table selects the row executor, whose public input boundary must have
+    // the same escaping semantics as the columnar executor and MinnowDatabase storage scans.
+    const input = new Map<string, DatabaseRow[]>([
+      ["t", values.map((value, index) => ({ id: index + 1, value }))],
+      ["empty", []],
+    ]);
+    const plan = compileQuery("SELECT value FROM t ORDER BY id");
+    const expected = { columns: ["value"], rows: values.map((value) => ({ value })) };
+    expect(executeQuery(plan, input)).toEqual(expected);
+    expect(executeRowQuery(plan, input)).toEqual(expected);
+  });
+
   it("orders a wildcard select by a qualified column reference", async () => {
     // A wildcard select names its outputs after the source columns, so a qualified ORDER BY
     // reference has to be rewritten into that naming. Looking it up verbatim used to match no
@@ -806,9 +824,9 @@ describe("public SQL queries", () => {
       input,
     );
     expect(grouped.rows).toEqual([
-      { region: null, amounts: 1 },
       { region: "east", amounts: 1 },
       { region: "west", amounts: 2 },
+      { region: null, amounts: 1 },
     ]);
     const constants = executeQuery(
       compileQuery("SELECT 'total' AS tag, COUNT(*) AS count FROM rows"),
@@ -1007,8 +1025,8 @@ describe("public SQL queries", () => {
           columns: ["kind", "active", "count", "total"],
           rows: [
             { kind: "business", active: false, count: 1, total: 20 },
-            { kind: "personal", active: null, count: 1, total: null },
             { kind: "personal", active: true, count: 1, total: 10 },
+            { kind: "personal", active: null, count: 1, total: null },
           ],
         };
         const current = {

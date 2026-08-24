@@ -52,7 +52,10 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   const editor: EditableTarget | undefined =
     deps.write && isEditableTarget(target) ? target : undefined;
 
-  const status = el("div", { class: "statusbar" });
+  const status = el("div", {
+    class: "statusbar",
+    attrs: { role: "status", "aria-live": "polite" },
+  });
   /**
    * The rail drops out of the layout on a narrow panel, so the toolbar carries its own way to
    * choose a table. It is the only route to one when the rail is away, and a shortcut when it is
@@ -65,7 +68,7 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
   const crumb = el("span", { class: "crumb-meta", text: "" });
   const addRow = button("btn mini", "Add row");
   const deleteRow = button("btn mini danger", "Delete row");
-  const banner = el("div", { class: "banner" });
+  const banner = el("div", { class: "banner", attrs: { role: "status" } });
   banner.hidden = true;
 
   const grid = createGrid({
@@ -372,8 +375,13 @@ export function createExplorer(deps: ExplorerDeps): ExplorerView {
     insertForm.close();
     updateRowActions();
     tablePicker.value = name;
-    crumb.textContent =
-      current.uniqueKey === undefined ? "no unique key" : `key: ${current.uniqueKey}`;
+    const indexCount = current.indexes?.length ?? 0;
+    crumb.textContent = [
+      current.uniqueKey === undefined ? "no unique key" : `key: ${current.uniqueKey}`,
+      indexCount === 0 ? "" : `${String(indexCount)} ${indexCount === 1 ? "index" : "indexes"}`,
+    ]
+      .filter((part) => part.length > 0)
+      .join(" · ");
     await reload();
   }
 

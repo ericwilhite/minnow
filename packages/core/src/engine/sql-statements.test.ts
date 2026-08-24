@@ -36,6 +36,125 @@ describe("RETURNING in SQL statements", () => {
   });
 });
 
+describe("INSERT defaults", () => {
+  it("evaluates SQL defaults per omitted row and preserves explicit NULL", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE defaulted (id INTEGER DEFAULT 1, label TEXT DEFAULT lower('MADE') NOT NULL, note TEXT DEFAULT 'note', token TEXT DEFAULT gen_random_uuid())",
+    );
+
+    const first = await database.execute("INSERT INTO defaulted DEFAULT VALUES RETURNING *");
+    expect(first).toMatchObject({
+      kind: "insert",
+      returnedRows: [{ id: 1, label: "made", note: "note" }],
+    });
+    const second = await database.execute(
+      "INSERT INTO defaulted (id, label, note, token) VALUES (2, DEFAULT, NULL, DEFAULT) RETURNING *",
+    );
+    expect(second).toMatchObject({
+      kind: "insert",
+      returnedRows: [{ id: 2, label: "made", note: null }],
+    });
+    const firstToken = (first as { returnedRows?: Array<{ token?: string }> }).returnedRows?.[0]
+      ?.token;
+    const secondToken = (second as { returnedRows?: Array<{ token?: string }> }).returnedRows?.[0]
+      ?.token;
+    expect(firstToken).toMatch(/^[0-9a-f-]{36}$/);
+    expect(secondToken).toMatch(/^[0-9a-f-]{36}$/);
+    expect(firstToken).not.toBe(secondToken);
+    await expect(
+      database.execute("INSERT INTO defaulted (id, label) VALUES (3, NULL)"),
+    ).rejects.toThrow("label[0] cannot be null");
+  });
+
+  it("evaluates a sequence default once through ON CONFLICT DO NOTHING", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE SEQUENCE generated_ids");
+    await database.execute(
+      "CREATE TABLE generated (id INTEGER DEFAULT NEXTVAL('generated_ids') PRIMARY KEY, label TEXT NOT NULL)",
+    );
+    expect(
+      await database.execute(
+        "INSERT INTO generated (label) VALUES ('one') ON CONFLICT (id) DO NOTHING RETURNING id",
+      ),
+    ).toMatchObject({ returnedRows: [{ id: 1 }] });
+    expect((await database.query("SELECT CURRVAL('generated_ids') AS n")).rows).toEqual([{ n: 1 }]);
+  });
+
+  it("uses an omitted defaulted key to find ON CONFLICT DO UPDATE exactly once", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE SEQUENCE conflict_ids");
+    await database.execute(
+      "CREATE TABLE generated_conflict (id INTEGER DEFAULT NEXTVAL('conflict_ids') PRIMARY KEY, label TEXT NOT NULL)",
+    );
+    // An explicit key does not consume the independent sequence, so the proposed default is 1
+    // and must find this row even though id is absent from the INSERT column list.
+    await database.execute("INSERT INTO generated_conflict (id, label) VALUES (1, 'old')");
+    expect(
+      await database.execute(
+        "INSERT INTO generated_conflict (label) VALUES ('new') " +
+          "ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label RETURNING *",
+      ),
+    ).toMatchObject({ returnedRows: [{ id: 1, label: "new" }] });
+    expect((await database.query("SELECT CURRVAL('conflict_ids') AS n")).rows).toEqual([{ n: 1 }]);
+  });
+
+  it("materializes an omitted auto-increment key in the general DO UPDATE path", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.createTable({
+      name: "generated_conflict",
+      columns: [
+        { name: "id", type: "number", integer: true, defaultValue: { kind: "autoincrement" } },
+        { name: "label", type: "string" },
+        { name: "note", type: "string", defaultValue: { kind: "literal", value: "kept" } },
+      ],
+      uniqueKey: "id",
+    });
+    expect(
+      await database.execute(
+        "INSERT INTO generated_conflict (label) VALUES ('fresh') " +
+          "ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label RETURNING *",
+      ),
+    ).toMatchObject({ returnedRows: [{ id: 1, label: "fresh", note: "kept" }] });
+    expect(
+      await database.execute(
+        "INSERT INTO generated_conflict (id, label, note) VALUES (1, 'updated', DEFAULT) " +
+          "ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label RETURNING *",
+      ),
+    ).toMatchObject({ returnedRows: [{ id: 1, label: "updated", note: "kept" }] });
+  });
+
+  it("rejects defaults that are not variable-free or type-compatible", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await expect(
+      database.execute("CREATE TABLE row_default (source TEXT, copy TEXT DEFAULT source)"),
+    ).rejects.toThrow("variable-free scalar SQL expression");
+    await expect(
+      database.execute("CREATE TABLE wrong_default (value TEXT DEFAULT 1)"),
+    ).rejects.toThrow("Default literal must be a string");
+    await expect(
+      database.execute("CREATE TABLE subquery_default (value INTEGER DEFAULT (SELECT 1))"),
+    ).rejects.toThrow("variable-free scalar SQL expression");
+  });
+
+  it("supports durable sequence and random defaults", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE SEQUENCE default_ids");
+    await database.execute(
+      "CREATE TABLE generated (id INTEGER DEFAULT nextval('default_ids'), sample REAL DEFAULT random())",
+    );
+    await database.execute("INSERT INTO generated DEFAULT VALUES");
+    await database.execute("INSERT INTO generated DEFAULT VALUES");
+    const rows = (await database.query("SELECT id, sample FROM generated ORDER BY id")).rows;
+    expect(rows.map(({ id }) => id)).toEqual([1, 2]);
+    for (const { sample } of rows) {
+      expect(sample).toEqual(expect.any(Number));
+      expect(sample as number).toBeGreaterThanOrEqual(0);
+      expect(sample as number).toBeLessThan(1);
+    }
+  });
+});
+
 describe("INSERT ... SELECT", () => {
   it("materializes the query at one snapshot and inserts its rows", async () => {
     const database = await seeded();
@@ -95,18 +214,164 @@ describe("CREATE TABLE", () => {
     ]);
   });
 
-  it("rejects unknown types and duplicate unique keys", async () => {
+  it("rejects unknown types and enforces additional UNIQUE constraints", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
-    await expect(database.execute("CREATE TABLE bad (x JSONB)")).rejects.toThrow(
-      "Unsupported column type: JSONB",
+    await expect(database.execute("CREATE TABLE bad (x NO_SUCH_TYPE)")).rejects.toThrow(
+      "Unsupported column type: NO_SUCH_TYPE",
     );
+    await database.execute(
+      "CREATE TABLE good (a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT, CONSTRAINT good_c_key UNIQUE (c))",
+    );
+    await database.execute("INSERT INTO good VALUES (1, 'b1', 'c1')");
+    await expect(database.execute("INSERT INTO good VALUES (2, 'b1', 'c2')")).rejects.toThrow(
+      "good.b",
+    );
+    await expect(database.execute("INSERT INTO good VALUES (2, 'b2', 'c1')")).rejects.toThrow(
+      "good.c",
+    );
+    // PostgreSQL UNIQUE allows multiple NULLs.
+    await database.execute("INSERT INTO good VALUES (2, NULL, NULL), (3, NULL, NULL)");
+  });
+
+  it("stores PostgreSQL value domains over stable primitive block encodings", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
     await expect(
-      database.execute("CREATE TABLE bad (a INTEGER PRIMARY KEY, b TEXT UNIQUE)"),
-    ).rejects.toThrow("one unique key column");
+      database.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')"),
+    ).resolves.toEqual({ kind: "create-type", name: "mood" });
+    await expect(database.execute("CREATE TABLE bad_domain (x missing_type)")).rejects.toThrow(
+      "Unsupported column type: missing_type",
+    );
+    await database.execute(
+      "CREATE TABLE domain_values (" +
+        "id UUID PRIMARY KEY, amount NUMERIC(30, 10), document JSONB, choices INTEGER[], " +
+        "at TIME, span INTERVAL, feeling mood)",
+    );
+    const inserted = await database.execute(
+      "INSERT INTO domain_values VALUES (" +
+        "'550E8400-E29B-41D4-A716-446655440000', 0.1, '{\"b\":2,\"a\":1}', " +
+        "ARRAY[1, 2], TIME '12:34:56', INTERVAL '1 month 2 days', 'happy') RETURNING *",
+    );
+    expect(inserted).toMatchObject({
+      returnedRows: [
+        {
+          id: "550e8400-e29b-41d4-a716-446655440000",
+          amount: "0.1",
+          document: '{"a":1,"b":2}',
+          choices: "[1,2]",
+          at: "12:34:56",
+          span: "1 mons 2 days 0 usecs",
+          feeling: "happy",
+        },
+      ],
+    });
+    expect(
+      (await database.query("SELECT feeling FROM domain_values WHERE amount = 0.1")).rows,
+    ).toEqual([{ feeling: "happy" }]);
+    await database.execute(
+      "INSERT INTO domain_values (id, feeling) VALUES ('00000000-0000-0000-0000-000000000001', 'sad')",
+    );
+    expect(
+      (await database.query("SELECT feeling FROM domain_values ORDER BY feeling")).rows,
+    ).toEqual([{ feeling: "sad" }, { feeling: "happy" }]);
+    await expect(
+      database.execute(
+        "INSERT INTO domain_values (id, feeling) VALUES ('00000000-0000-0000-0000-000000000002', 'unknown')",
+      ),
+    ).rejects.toThrow("not a value of enum mood");
+    expect((await database.listTables()).map(({ name }) => name)).toEqual(["domain_values"]);
+  });
+
+  it("uses a composite PRIMARY KEY as hidden row identity", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE receipts (shop INTEGER, receipt INTEGER, total REAL, PRIMARY KEY (shop, receipt))",
+    );
+    await database.execute("INSERT INTO receipts VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)");
+    await expect(database.execute("INSERT INTO receipts VALUES (1, 2, 99)")).rejects.toThrow(
+      "receipts.(shop, receipt)",
+    );
+    expect((await database.query("SELECT * FROM receipts ORDER BY shop, receipt")).rows).toEqual([
+      { shop: 1, receipt: 1, total: 10 },
+      { shop: 1, receipt: 2, total: 20 },
+      { shop: 2, receipt: 1, total: 30 },
+    ]);
+    expect(await database.readTable("receipts")).toEqual([
+      { shop: 1, receipt: 1, total: 10 },
+      { shop: 1, receipt: 2, total: 20 },
+      { shop: 2, receipt: 1, total: 30 },
+    ]);
+    // The physical tuple locator is neither a public projection nor a MATCH(*) document field.
+    expect(
+      (await database.query("SELECT * FROM receipts WHERE MATCH(*) AGAINST 'bff*'")).rows,
+    ).toEqual([]);
+    await database.execute("UPDATE receipts SET total = total + 5 WHERE shop = 1 AND receipt = 2");
+    await expect(
+      database.execute("UPDATE receipts SET receipt = 3 WHERE shop = 1"),
+    ).rejects.toThrow("Primary key column cannot be updated");
+    await database.execute("DELETE FROM receipts WHERE shop = 2 AND receipt = 1");
+    expect(
+      (await database.query("SELECT shop, receipt, total FROM receipts ORDER BY shop, receipt"))
+        .rows,
+    ).toEqual([
+      { shop: 1, receipt: 1, total: 10 },
+      { shop: 1, receipt: 2, total: 25 },
+    ]);
+    expect((await database.listTables())[0]?.columns.map(({ name }) => name)).toEqual([
+      "shop",
+      "receipt",
+      "total",
+    ]);
+  });
+
+  it("enforces composite FOREIGN KEY tuples and cascades with their parent", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE receipts (shop INTEGER, receipt INTEGER, PRIMARY KEY (shop, receipt))",
+    );
+    await database.execute(
+      "CREATE TABLE lines (id INTEGER PRIMARY KEY, shop INTEGER, receipt INTEGER, " +
+        "FOREIGN KEY (shop, receipt) REFERENCES receipts (shop, receipt) ON DELETE CASCADE)",
+    );
+    await database.execute("INSERT INTO receipts VALUES (1, 1), (1, 2)");
+    await database.execute("INSERT INTO lines VALUES (10, 1, 1), (11, 1, 2), (12, NULL, 99)");
+    await expect(database.execute("INSERT INTO lines VALUES (13, 2, 1)")).rejects.toThrow(
+      "FOREIGN KEY lines_shop_receipt_fkey",
+    );
+    await database.execute("UPDATE lines SET receipt = 2 WHERE id = 10");
+    await expect(database.execute("UPDATE lines SET shop = 2 WHERE id = 10")).rejects.toThrow(
+      "FOREIGN KEY lines_shop_receipt_fkey",
+    );
+    await database.execute("DELETE FROM receipts WHERE shop = 1 AND receipt = 1");
+    expect((await database.query("SELECT id, shop, receipt FROM lines ORDER BY id")).rows).toEqual([
+      { id: 10, shop: 1, receipt: 2 },
+      { id: 11, shop: 1, receipt: 2 },
+      { id: 12, shop: null, receipt: 99 },
+    ]);
   });
 });
 
 describe("ON CONFLICT", () => {
+  it("addresses composite primary keys for NOTHING, REPLACE, and conditional UPDATE", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE receipts (shop INTEGER, receipt INTEGER, total INTEGER, PRIMARY KEY (shop, receipt))",
+    );
+    await database.execute("INSERT INTO receipts VALUES (1, 1, 10)");
+    await database.execute(
+      "INSERT INTO receipts VALUES (1, 1, 20), (1, 2, 30) ON CONFLICT (shop, receipt) DO NOTHING",
+    );
+    await database.execute(
+      "INSERT INTO receipts VALUES (1, 1, 5) ON CONFLICT (shop, receipt) DO UPDATE SET total = EXCLUDED.total WHERE EXCLUDED.total > receipts.total",
+    );
+    await database.execute(
+      "INSERT INTO receipts VALUES (1, 1, 40) ON CONFLICT (shop, receipt) DO REPLACE",
+    );
+    expect((await database.query("SELECT * FROM receipts ORDER BY shop, receipt")).rows).toEqual([
+      { shop: 1, receipt: 1, total: 40 },
+      { shop: 1, receipt: 2, total: 30 },
+    ]);
+  });
+
   it("DO REPLACE performs a whole-row upsert, including key-only tables", async () => {
     const database = await seeded();
     const replaced = await database.execute(
@@ -289,6 +554,46 @@ describe("ON CONFLICT", () => {
         "INSERT INTO people (name, score) VALUES ('Ada', 1), ('Ada', 2) ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score",
       ),
     ).rejects.toThrow("cannot affect name Ada twice");
+  });
+
+  it("applies DO UPDATE WHERE after finding the conflict and returns only affected rows", async () => {
+    const database = await seeded();
+    const result = await database.execute(
+      "INSERT INTO people (name, score) VALUES ('Ada', 9), ('Grace', 30), ('Linus', 4) " +
+        "ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score " +
+        "WHERE EXCLUDED.score > people.score RETURNING *",
+    );
+    expect(result).toMatchObject({
+      kind: "insert",
+      rowCount: 2,
+      returnedRows: [
+        { name: "Grace", score: 30 },
+        { name: "Linus", score: 4 },
+      ],
+    });
+    expect((await database.query("SELECT name, score FROM people ORDER BY name")).rows).toEqual([
+      { name: "Ada", score: 10 },
+      { name: "Grace", score: 30 },
+      { name: "Linus", score: 4 },
+    ]);
+
+    const unknown = await database.execute(
+      "INSERT INTO people (name, score) VALUES ('Ada', 100) " +
+        "ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score WHERE NULL RETURNING score",
+    );
+    expect(unknown).toMatchObject({ kind: "insert", rowCount: 0, returnedRows: [] });
+    expect((await database.query("SELECT score FROM people WHERE name = 'Ada'")).rows).toEqual([
+      { score: 10 },
+    ]);
+
+    await database.execute(
+      "INSERT INTO people (name, score) VALUES ('Ada', 13) " +
+        "ON CONFLICT (name) DO UPDATE SET score = EXCLUDED.score WHERE EXCLUDED.score > ?",
+      [12],
+    );
+    expect((await database.query("SELECT score FROM people WHERE name = 'Ada'")).rows).toEqual([
+      { score: 13 },
+    ]);
   });
 
   it("fills EXCLUDED defaults before evaluating conflict expressions", async () => {

@@ -17,10 +17,25 @@ CREATE TABLE orders (
 )
 ```
 
-Columns are nullable unless marked `NOT NULL`. Exactly one column may be `PRIMARY KEY` — written
-on the column or as a table-level `PRIMARY KEY (order_id)` — and it is the table's unique key: the
-column that `UPDATE`, `DELETE`, and `ON CONFLICT` address rows through. Additional scalar or
-composite candidate keys can be enforced with `CREATE UNIQUE INDEX` after the table exists.
+Columns are nullable unless marked `NOT NULL`. A scalar or composite `PRIMARY KEY` is the table's
+row identity: `UPDATE`, `DELETE`, foreign keys, and `ON CONFLICT` address rows through it. A table
+may declare several scalar or composite `UNIQUE` constraints, inline or table-level; each is
+enforced independently. A table with one inline `UNIQUE` column and no primary key uses that
+column as its row identity.
+
+```sql
+CREATE TABLE order_items (
+  order_id INTEGER,
+  line_no INTEGER,
+  sku TEXT NOT NULL,
+  serial_no TEXT UNIQUE,
+  PRIMARY KEY (order_id, line_no),
+  UNIQUE (order_id, sku)
+)
+```
+
+Primary-key components are immutable. Composite identity uses an internal scalar locator, so it
+does not add tuple comparison work to ordinary scans.
 
 `CREATE TABLE IF NOT EXISTS` leaves an existing table of that name alone, and `CREATE TABLE …
 AS SELECT` takes both its columns and its first rows from a query:
@@ -46,8 +61,8 @@ CREATE TABLE orders (
 A constraint fails only when it evaluates to false, so SQL's unknown passes: a NULL column
 satisfies `CHECK (total >= 0)` unless the column is also `NOT NULL`.
 
-A `FOREIGN KEY` references another table's unique key — the column the engine can probe for
-existence, and the one its keyed writes address rows by:
+A `FOREIGN KEY` references another table's primary row identity. Scalar and composite references
+use the same ordered columns as the parent key:
 
 ```sql
 CREATE TABLE orders (
@@ -57,17 +72,26 @@ CREATE TABLE orders (
 )
 ```
 
+```sql
+CREATE TABLE order_notes (
+  order_id INTEGER,
+  line_no INTEGER,
+  note TEXT,
+  FOREIGN KEY (order_id, line_no) REFERENCES order_items(order_id, line_no)
+)
+```
+
 Every write of a referencing column checks that the parent row exists, reading through the writing
 transaction, so a child inserted beside its parent in one scope sees it. A NULL reference names no
 parent and is satisfied.
 
 `ON DELETE` takes `RESTRICT` (the default), `CASCADE`, and `SET NULL`, and the action runs inside
 the deleting transaction — a parent and its dependents publish together or not at all. `ON UPDATE`
-has nothing to act on, because a unique key cannot change.
+has nothing to act on, because primary-key columns cannot change.
 
-A table without a `PRIMARY KEY` is append-only. That is a reasonable choice for an event log, and
-a mistake for anything a user edits, because it cannot be changed later without recreating the
-table.
+A table without a row-addressing `PRIMARY KEY` or single inline `UNIQUE` column is append-only. That is a
+reasonable choice for an event log, and a mistake for anything a user edits, because the key
+cannot be added later without recreating the table.
 
 ## Secondary indexes
 
@@ -87,6 +111,10 @@ columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. `ASC` 
 of the physical tuple order. Minnow still evaluates the SQL predicate on every candidate row, so
 a stale posting or an internal locator collision can cost an extra read but cannot change an
 answer.
+
+Exact equality remains indexable for SQL-domain columns such as `NUMERIC` and enum. Their lossless
+physical strings are not bytewise SQL order, so range pruning and index-supplied `ORDER BY` fall
+back to the ordinary scan/sort path for correctness.
 
 `UNIQUE` is not an optimizer hint. It owns an independent membership set that commits atomically
 with every insert, update, delete, upsert, trigger-derived write, and multi-statement write scope.
@@ -114,16 +142,23 @@ Those restrictions affect speed only, never the accepted SQL or its result.
 
 ## Column types
 
-Four physical types, chosen because they are what a browser can store and compare without
-ambiguity. SQL integer columns retain an additional exact-domain guard in the catalog:
+Blocks retain four compact physical kinds—number, string, boolean, and datetime—but SQL domains
+add validation and semantics without widening hot scan vectors:
 
-| Domain             | SQL spellings                       | JavaScript |
-| ------------------ | ----------------------------------- | ---------- |
-| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`     | `number`   |
-| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT` | `number`   |
-| string             | `VARCHAR(n)`, `TEXT`, `CHAR(n)`     | `string`   |
-| boolean            | `BOOLEAN`                           | `boolean`  |
-| datetime           | `TIMESTAMP`, `DATE`                 | `Date`     |
+| SQL domain         | Spellings                                    | JavaScript result                 |
+| ------------------ | -------------------------------------------- | --------------------------------- |
+| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`              | `number`                          |
+| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT`          | `number`                          |
+| exact decimal      | `NUMERIC(p, s)`, `DECIMAL(p, s)`             | decimal `string`                  |
+| string             | `VARCHAR(n)`, `TEXT`, `CHAR(n)`              | `string`                          |
+| boolean            | `BOOLEAN`                                    | `boolean`                         |
+| datetime           | `TIMESTAMP`, `DATE`                          | `Date`                            |
+| time of day        | `TIME`                                       | canonical `string`                |
+| JSON               | `JSON`, `JSONB`                              | JSON `string`                     |
+| UUID               | `UUID`                                       | lowercase `string`                |
+| interval           | `INTERVAL`                                   | months/days/microseconds `string` |
+| array              | `INTEGER[]`, `TEXT[]`, and other core arrays | JSON `string`                     |
+| enum               | a name declared by `CREATE TYPE … AS ENUM`   | member `string`                   |
 
 Widths in `VARCHAR(80)` are accepted and ignored — they document intent, and nothing truncates.
 An integer write, literal, default, or cast must be inside JavaScript's exact safe-integer range,
@@ -132,30 +167,63 @@ instead of rounding an ID or quantity before it reaches disk. SQL declarations s
 automatically; the low-level `createTable` API can request the same domain with `integer: true` on
 a number column.
 
-`NUMERIC(p, s)` and `DECIMAL(p, s)` are rejected. They promise exact fixed-point arithmetic, which
-the current Float64 number blocks cannot provide. Use an integer minor unit such as cents when the
-safe-integer range is sufficient, or store a canonical decimal string and do arithmetic in a
-decimal library. `DOUBLE PRECISION`, `REAL`, and `FLOAT` are the explicit approximate choices.
+Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
+comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.
+Division returns up to 20 fractional digits. Use an integer minor unit when that simpler boundary
+fits; use `DOUBLE PRECISION` only when approximation is intended.
 
-Types the engine deliberately does not have — `JSON`/`JSONB`, arrays, `UUID`, `INTERVAL` as a
-stored type, enums as a database type — are rejected at `CREATE TABLE` rather than silently
-stored as text.
+`JSON` validates a document and preserves object key order; `JSONB` canonicalizes object keys.
+UUID values validate and normalize. Arrays use canonical JSON at the JavaScript boundary. Minnow
+does not support array subscripts or PostgreSQL array operators. Intervals retain separate month,
+day, and microsecond fields; interval-to-interval arithmetic is unsupported.
+
+Declare an enum before using it as a column type:
+
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped');
+CREATE TABLE order_state (
+  order_id INTEGER PRIMARY KEY,
+  status order_status NOT NULL
+);
+```
+
+Enum members validate on write and sort in declaration order. `ALTER TYPE` is not supported.
+
+Sequences are durable, non-transactional counters:
+
+```sql
+CREATE SEQUENCE order_ids;
+SELECT NEXTVAL('order_ids') AS order_id;
+SELECT CURRVAL('order_ids') AS current_order_id;
+```
+
+`CURRVAL` is local to the database session and fails before its first `NEXTVAL`. Minnow does not
+support sequence options, `ALTER SEQUENCE`, or sequence calls inside table-reading queries.
+`nextval('name')` is valid in a column default. Use the key column's `autoincrement` default for
+ordinary table IDs.
 
 ## Defaults
 
-A column can declare a default in SQL, either a constant or `CURRENT_TIMESTAMP`:
+A column default is a variable-free SQL expression:
 
 ```sql
 CREATE TABLE events (
   event_id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,
   source TEXT DEFAULT 'app',
-  noted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  noted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  request_id UUID DEFAULT gen_random_uuid()
 )
 ```
 
-A column with a default is `NOT NULL` unless declared otherwise, because the default is what an
-absent value means — NULL and the default cannot both claim the slot.
+The expression may use the operators and scalar functions Minnow supports, including
+`CURRENT_TIMESTAMP`, `random()`, `gen_random_uuid()`, and `nextval(...)`. It cannot reference a
+row column, take a parameter, aggregate rows, use a window, or contain a subquery. The engine
+parses and type-checks it before changing the catalog. `CURRENT_*` is stable for the statement;
+volatile functions run once for each omitted row.
+
+A default does not imply `NOT NULL`. Omission or an explicit SQL `DEFAULT` invokes it. An explicit
+`NULL` remains NULL and is accepted or rejected by the column's own nullability.
 
 The same defaults, and the `autoincrement` kind that SQL has no spelling for, are available
 through `createTable`, which is also the form the [schema DSL](/docs/schema) compiles to:
@@ -167,16 +235,20 @@ await db.createTable({
   columns: [
     { name: "event_id", type: "number", defaultValue: { kind: "autoincrement" } },
     { name: "kind", type: "string" },
-    { name: "noted_at", type: "datetime", defaultValue: { kind: "now" } },
+    {
+      name: "noted_at",
+      type: "datetime",
+      defaultValue: { kind: "expression", sql: "CURRENT_TIMESTAMP" },
+    },
     { name: "source", type: "string", defaultValue: { kind: "literal", value: "app" } },
   ],
 });
 ```
 
-Three kinds: `now`, a `literal`, and `autoincrement` on the key column. They fill null-or-absent
-slots at insert time and are never applied at read time, so adding a default later does not
-rewrite the rows already stored. Arbitrary expressions are deliberately not representable — the
-spec is stored in the catalog and crosses the worker boundary, so it has to be plain data.
+The catalog uses `literal` and `expression` specs, plus `autoincrement` on the key column. The SQL
+expression itself is plain structured-clone-safe data, so it persists and crosses the worker
+boundary. Defaults fill only omitted or SQL `DEFAULT` slots at write time; adding or changing one
+never rewrites rows already stored.
 
 ## Evolving a table
 

@@ -19,8 +19,9 @@ SELECT name FROM products WHERE MATCH(name, brand) AGAINST 'copper kettle'
 SELECT name FROM products WHERE MATCH(*) AGAINST 'yirgacheffe'
 ```
 
-`MATCH(*)` searches numbers and dates through their standard text form, so `MATCH(*) AGAINST
-'2025'` finds rows by a date column as well as by text.
+`MATCH(*)` searches every declared column, including numbers and dates through their canonical
+text form, so `MATCH(*) AGAINST '2025'` finds rows by a date column as well as by text. Internal
+row locators are never searchable or returned by `SELECT *`.
 
 ## Ranking
 

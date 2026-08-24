@@ -27,7 +27,7 @@ const repo = path.join(here, "../../..");
 const output = path.join(here, "../public/playground-types.json");
 
 /** The packages a snippet in the console may import from. */
-const PACKAGES = ["@minnowdb/core", "@minnowdb/client"];
+const PACKAGES = ["@minnowdb/core", "@minnowdb/kysely", "kysely"];
 
 /** Where the editor is told each package lives; matches what a real `node_modules` would hold. */
 const root = (name) => `file:///node_modules/${name}`;
@@ -55,7 +55,9 @@ const files = {};
 const paths = {};
 
 for (const name of PACKAGES) {
-  const packageDir = path.join(repo, "packages", name.replace("@minnowdb/", ""));
+  const packageDir = name.startsWith("@minnowdb/")
+    ? path.join(repo, "packages", name.replace("@minnowdb/", ""))
+    : path.join(repo, "node_modules", name);
   const manifest = JSON.parse(await readFile(path.join(packageDir, "package.json"), "utf8"));
 
   for await (const file of declarations(path.join(packageDir, "dist"))) {
@@ -66,7 +68,18 @@ for (const name of PACKAGES) {
   // The export map is what a bundler resolves, so it is what the editor is told too — a subpath
   // the package does not publish must not resolve here either.
   for (const [subpath, target] of Object.entries(manifest.exports ?? {})) {
-    const types = typeof target === "object" && target !== null ? target.types : undefined;
+    const runtime =
+      typeof target === "string"
+        ? target
+        : typeof target === "object" && target !== null
+          ? target.default
+          : undefined;
+    const types =
+      typeof target === "object" && target !== null && typeof target.types === "string"
+        ? target.types
+        : typeof runtime === "string" && runtime.endsWith(".js")
+          ? runtime.replace(/\.js$/, ".d.ts")
+          : undefined;
     if (typeof types !== "string") continue;
     const specifier = subpath === "." ? name : `${name}/${subpath.slice(2)}`;
     // Relative to the compiler's `baseUrl`, which the console sets to `file:///`.

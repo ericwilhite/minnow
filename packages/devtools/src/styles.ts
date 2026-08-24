@@ -173,7 +173,7 @@ button { font: inherit; color: inherit; }
 .panel.floating .titlebar.dragging { cursor: grabbing; }
 .mark { display: flex; color: var(--mdt-accent); }
 .mark svg { width: 17px; height: 17px; }
-.title { font-size: 12.5px; font-weight: 500; }
+.title { font-size: 12.5px; font-weight: 500; white-space: nowrap; }
 .spacer { flex: 1; }
 
 .badge {
@@ -212,9 +212,12 @@ button { font: inherit; color: inherit; }
 /* Below this there is no room for it beside the tabs, and the buttons are what matter. */
 @container mdt-titlebar (max-width: 520px) {
   .snap-status { display: none; }
+  .titlebar > .badge:not(.snap-status) { display: none; }
+  .title { display: none; }
 }
 
 .winbtn {
+  flex: none;
   width: 24px;
   height: 24px;
   border: none;
@@ -301,6 +304,9 @@ button { font: inherit; color: inherit; }
  */
 @container mdt-panel (max-width: 600px) {
   .rail { display: none; }
+}
+@container mdt-panel (max-width: 450px) {
+  .crumb-meta { display: none; }
 }
 @container mdt-console (max-width: 620px) {
   .history { display: none; }
@@ -399,6 +405,43 @@ button { font: inherit; color: inherit; }
 .col-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .col-type { font-size: 10.5px; color: var(--mdt-text-faint); }
 .col-key { font-size: 9.5px; color: var(--mdt-warn); }
+.index-group {
+  padding: 6px 10px 2px 26px;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--mdt-text-faint);
+}
+.index {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: 5px;
+  row-gap: 1px;
+  width: 100%;
+  padding: 2.5px 10px 2.5px 26px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--mdt-mono);
+  font-size: 10.5px;
+  color: var(--mdt-text-secondary);
+  text-align: left;
+}
+.index:hover { background: var(--mdt-bg-hover); color: var(--mdt-text); }
+.index-name, .index-key { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.index-name { grid-column: 1; }
+.index-key { grid-column: 1 / -1; grid-row: 2; color: var(--mdt-text-faint); }
+.index-badge {
+  flex: none;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 9px;
+  background: var(--mdt-accent-bg);
+  color: var(--mdt-accent);
+}
+.index-badge.building { background: var(--mdt-warn-bg); color: var(--mdt-warn); }
+.index-badge.invalid { background: var(--mdt-danger-bg); color: var(--mdt-danger); }
 
 .crumb { font-family: var(--mdt-mono); font-size: 12.5px; display: flex; align-items: center; gap: 8px; }
 .crumb-meta { font-family: var(--mdt-mono); font-size: 11px; color: var(--mdt-text-faint); }

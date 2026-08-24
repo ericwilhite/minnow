@@ -5,11 +5,11 @@ import type { DatasetRecord, EngineMaterialization } from "../protocol";
 import {
   canonicalizeRow,
   columnList,
+  createSecondaryIndexes,
   createTableSql,
   normalizeRows,
   quoteIdentifier,
   rowsFromColumns,
-  secondaryIndexSql,
   sqlType,
 } from "./shared";
 import type {
@@ -122,6 +122,9 @@ export const pgliteDriver: EngineDriver = {
     const name = dataDirName(record);
     let database = await openPglite(name, record.durability, "write");
     let insertMs = 0;
+    let indexMs: number;
+    let dataStoredBytes: number | null;
+    let indexStoredBytes: number | null;
     try {
       const entities = getScenario("commerce").entities;
       for (const entity of entities) await database.exec(createTableSql(entity));
@@ -157,7 +160,26 @@ export const pgliteDriver: EngineDriver = {
           context.report(`PGlite · ${entity.name}`, completedRows);
         }
       }
-      for (const sql of secondaryIndexSql(entities)) await database.exec(sql);
+      const dataSizeResult = await database.query<{ bytes: number | bigint }>(
+        "SELECT pg_database_size(current_database()) AS bytes",
+      );
+      dataStoredBytes =
+        dataSizeResult.rows[0]?.bytes === undefined ? null : Number(dataSizeResult.rows[0].bytes);
+      indexMs =
+        record.secondaryIndexes === "foreign-keys"
+          ? await createSecondaryIndexes(entities, (sql) => database.exec(sql))
+          : 0;
+      const indexedSizeResult = await database.query<{ bytes: number | bigint }>(
+        "SELECT pg_database_size(current_database()) AS bytes",
+      );
+      const indexedStoredBytes =
+        indexedSizeResult.rows[0]?.bytes === undefined
+          ? null
+          : Number(indexedSizeResult.rows[0].bytes);
+      indexStoredBytes =
+        dataStoredBytes === null || indexedStoredBytes === null
+          ? null
+          : Math.max(0, indexedStoredBytes - dataStoredBytes);
       await database.exec("ANALYZE");
       await database.syncToFs();
       // Close and reopen so what the record marks "ready" is what actually persisted.
@@ -177,6 +199,8 @@ export const pgliteDriver: EngineDriver = {
       const sizeResult = await database.query<{ bytes: number | bigint }>(
         "SELECT pg_database_size(current_database()) AS bytes",
       );
+      const storedBytes =
+        sizeResult.rows[0]?.bytes === undefined ? null : Number(sizeResult.rows[0].bytes);
       return {
         engine: "pglite",
         status: "ready",
@@ -186,10 +210,12 @@ export const pgliteDriver: EngineDriver = {
           record.durability === "relaxed"
             ? "IndexedDB VFS · persistent PostgreSQL data directory · relaxed flush on reads, strict on writes"
             : "IndexedDB VFS · persistent PostgreSQL data directory · strict flush",
-        storedBytes:
-          sizeResult.rows[0]?.bytes === undefined ? null : Number(sizeResult.rows[0].bytes),
+        dataStoredBytes,
+        indexStoredBytes,
+        storedBytes,
         buildMs: performance.now() - started,
         insertMs,
+        indexMs,
       };
     } finally {
       await closePglite(database);

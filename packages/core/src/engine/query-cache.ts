@@ -1,4 +1,4 @@
-import type { QueryResult, QueryRow } from "./query.js";
+import { copyQueryResultExternalization, type QueryResult, type QueryRow } from "./query.js";
 import { defineSqlResultProperty } from "./sql-semantics.js";
 
 /** Modest per-entry cap so one giant result cannot thrash the shared artifact cache. */
@@ -35,7 +35,7 @@ export function planMemoKey(plan: unknown): string {
  */
 export function copyQueryResult(result: QueryResult): QueryResult {
   const columns = result.columns;
-  return {
+  const copy = {
     columns: [...columns],
     rows: result.rows.map((row) => {
       const copy: QueryRow = { ...row };
@@ -46,6 +46,7 @@ export function copyQueryResult(result: QueryResult): QueryResult {
       return copy;
     }),
   };
+  return copyQueryResultExternalization(result, copy);
 }
 
 /** Modeled retained payload for one cached query result. */

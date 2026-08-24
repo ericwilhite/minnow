@@ -7,6 +7,7 @@ import {
   scalarFunctionNames,
   scalarFunctionValue,
   splitCondition,
+  volatileScalarFunctionNames,
   type BinaryOperator,
   type ComparisonOperator,
   type CompiledQuery,
@@ -17,6 +18,7 @@ import {
   type QueryValue,
   type TableSource,
 } from "./query.js";
+import { isSqlDomainValue } from "./sql-domains.js";
 
 /**
  * Deterministic plan-to-plan rewrites over the shared compiled representation. Every rule
@@ -62,6 +64,7 @@ export function chooseJoinOrder(
 }
 
 function optimizeBlock(block: CompiledQuery): void {
+  decorrelateLateralSources(block);
   decorrelateBlock(block);
   for (const source of [block.base, ...block.joins]) {
     if (source.derived !== undefined) optimizeBlock(source.derived);
@@ -79,6 +82,85 @@ function optimizeBlock(block: CompiledQuery): void {
   pushPredicatesIntoDerived(block);
   pruneDerivedProjections(block);
   combineDerivedLimit(block);
+}
+
+/** Converts equality-correlated LATERAL derived tables into ordinary set-at-a-time joins. */
+function decorrelateLateralSources(block: CompiledQuery): void {
+  if (block.base.lateral === true) {
+    throw new TypeError("LATERAL needs a source to its left");
+  }
+  const available = new Set([block.base.alias]);
+  for (const join of block.joins) {
+    if (join.lateral !== true) {
+      available.add(join.alias);
+      continue;
+    }
+    delete join.lateral;
+    const inner = join.derived;
+    if (inner === undefined) throw new TypeError("LATERAL requires a derived query");
+    if (!blockReferencesOutside(inner)) {
+      available.add(join.alias);
+      continue;
+    }
+    if (
+      inner.groupBy.length > 0 ||
+      inner.having.length > 0 ||
+      inner.orderBy.length > 0 ||
+      inner.limit !== undefined
+    ) {
+      throw new TypeError(
+        "Correlated LATERAL queries cannot use grouping, HAVING, ORDER BY, or LIMIT",
+      );
+    }
+    const keys = extractCorrelation(inner, available, "LATERAL");
+    const keyAliases = keys.map((_, index) => `\u0000lateral_key_${String(index + 1)}`);
+    keys.forEach((key, index) => {
+      inner.select.push({ expression: key.inner, alias: keyAliases[index] ?? "" });
+    });
+    const correlations = keys.map<Expression>((key, index) => ({
+      kind: "condition",
+      operator: key.operator,
+      left: key.outer,
+      right: { kind: "column", reference: `${join.alias}.${keyAliases[index] ?? ""}` },
+    }));
+    const cross =
+      join.on?.kind === "condition" &&
+      join.on.operator === "=" &&
+      join.on.left.kind === "literal" &&
+      join.on.left.value === 1 &&
+      join.on.right.kind === "literal" &&
+      join.on.right.value === 1;
+    const original = cross
+      ? undefined
+      : (join.on ?? {
+          kind: "condition" as const,
+          operator: "=" as const,
+          left: join.left,
+          right: join.right,
+        });
+    const conditions = [...correlations, ...(original === undefined ? [] : [original])];
+    const first = conditions[0];
+    if (conditions.length === 1 && first?.kind === "condition" && first.operator === "=") {
+      join.left = first.left;
+      join.right = first.right;
+      delete join.on;
+    } else {
+      join.left = { kind: "literal", value: null };
+      join.right = { kind: "literal", value: null };
+      const seed = conditions[0];
+      if (seed === undefined) throw new Error("LATERAL correlation condition is missing");
+      join.on = conditions.slice(1).reduce<Expression>(
+        (combined, condition) => ({
+          kind: "logical",
+          operator: "and",
+          left: combined,
+          right: condition,
+        }),
+        seed,
+      );
+    }
+    available.add(join.alias);
+  }
 }
 
 // --- Join key extraction ---------------------------------------------------------------------
@@ -496,16 +578,13 @@ function decorrelatePredicate(
       right: { kind: "literal", value: null },
     };
   }
-  // outer IN (correlated subquery)
+  // outer IN / NOT IN (correlated subquery)
   if (
     (predicate.operator === "IN" || predicate.operator === "NOT IN") &&
     predicate.right.kind === "subquery"
   ) {
     const inner = predicate.right.block;
     if (!blockReferencesOutside(inner)) return undefined;
-    if (predicate.operator === "NOT IN") {
-      throw new TypeError("Correlated NOT IN subqueries are not supported; use NOT EXISTS");
-    }
     rejectGroupedInner(inner, "IN");
     const item = inner.select[0];
     if (inner.select.length !== 1 || item === undefined || item.expression.kind === "wildcard") {
@@ -513,6 +592,9 @@ function decorrelatePredicate(
     }
     guardWildcard(block);
     const keys = extractCorrelation(inner, scope, "IN");
+    if (predicate.operator === "NOT IN") {
+      return decorrelateNotIn(block, predicate.left, inner, item.expression, keys, nextAlias);
+    }
     const alias = nextAlias();
     const derived: CompiledQuery = {
       sql: "(correlated in)",
@@ -549,6 +631,116 @@ function decorrelatePredicate(
   return scalarSide === "left"
     ? { left: value, operator: predicate.operator, right: predicate.right }
     : { left: predicate.left, operator: predicate.operator, right: value };
+}
+
+/**
+ * Rewrites `probe NOT IN (correlated values)` without losing SQL's empty-set and NULL rules.
+ *
+ * One hash anti-join removes exact matches using a prefix-free composite key containing every
+ * correlation key plus the compared value. A grouped left join then carries two counts for the
+ * correlated set: total rows and non-null values. An absent group means the set is empty (true,
+ * even for a NULL probe); otherwise the probe must be non-null and the two counts equal. The two
+ * derived scans are bounded set-at-a-time work—no per-outer-row subquery or nested-loop join.
+ */
+function decorrelateNotIn(
+  block: CompiledQuery,
+  probe: Expression,
+  inner: CompiledQuery,
+  item: Expression,
+  keys: CorrelationKey[],
+  nextAlias: () => string,
+): Predicate {
+  const valuesAlias = nextAlias();
+  const values: CompiledQuery = {
+    sql: "(correlated not in values)",
+    base: structuredClone(inner.base),
+    joins: structuredClone(inner.joins),
+    select: [
+      ...keys.map((key, index) => ({
+        expression: structuredClone(key.inner),
+        alias: `k${String(index)}`,
+      })),
+      { expression: structuredClone(item), alias: "v" },
+    ],
+    predicates: structuredClone(inner.predicates),
+    groupBy: [...keys.map((key) => structuredClone(key.inner)), structuredClone(item)],
+    having: [],
+    orderBy: [],
+  };
+  const tuple = (arguments_: Expression[]): Expression => ({
+    kind: "call",
+    name: "MINNOW_TUPLE_KEY",
+    arguments: arguments_,
+  });
+  block.joins.push({
+    table: valuesAlias,
+    alias: valuesAlias,
+    derived: values,
+    kind: "anti",
+    left: tuple([...keys.map((key) => structuredClone(key.outer)), structuredClone(probe)]),
+    right: tuple([
+      ...keys.map((_, index) => ({
+        kind: "column" as const,
+        reference: `${valuesAlias}.k${String(index)}`,
+      })),
+      { kind: "column", reference: `${valuesAlias}.v` },
+    ]),
+  });
+
+  const flagsAlias = nextAlias();
+  const flags: CompiledQuery = {
+    sql: "(correlated not in flags)",
+    base: structuredClone(inner.base),
+    joins: structuredClone(inner.joins),
+    select: [
+      ...keys.map((key, index) => ({
+        expression: structuredClone(key.inner),
+        alias: `k${String(index)}`,
+      })),
+      {
+        expression: { kind: "call", name: "COUNT", arguments: [{ kind: "wildcard" }] },
+        alias: "n",
+      },
+      {
+        expression: { kind: "call", name: "COUNT", arguments: [structuredClone(item)] },
+        alias: "nn",
+      },
+    ],
+    predicates: structuredClone(inner.predicates),
+    groupBy: keys.map((key) => structuredClone(key.inner)),
+    having: [],
+    orderBy: [],
+  };
+  pushCorrelationJoin(block, flagsAlias, flags, keys, "left");
+
+  const total: Expression = { kind: "column", reference: `${flagsAlias}.n` };
+  const nonNull: Expression = { kind: "column", reference: `${flagsAlias}.nn` };
+  const safe: Expression = {
+    kind: "logical",
+    operator: "or",
+    left: {
+      kind: "condition",
+      operator: "IS NULL",
+      left: total,
+      right: { kind: "literal", value: null },
+    },
+    right: {
+      kind: "logical",
+      operator: "and",
+      left: {
+        kind: "condition",
+        operator: "IS NOT NULL",
+        left: structuredClone(probe),
+        right: { kind: "literal", value: null },
+      },
+      right: { kind: "condition", operator: "=", left: total, right: nonNull },
+    },
+  };
+  return {
+    left: safe,
+    operator: "IS TRUE",
+    right: { kind: "literal", value: true },
+  };
 }
 
 /**
@@ -802,7 +994,18 @@ function foldExpression(expression: Expression): Expression {
     const right = foldExpression(expression.right);
     if (left.kind === "literal" && right.kind === "literal") {
       const folded = foldBinary(expression.operator, left.value, right.value);
-      if (folded !== undefined) return { kind: "literal", value: folded };
+      if (folded !== undefined) {
+        const domain =
+          left.sqlDomain?.kind === "numeric" || right.sqlDomain?.kind === "numeric"
+            ? ({ kind: "numeric" } as const)
+            : undefined;
+        return {
+          kind: "literal",
+          value: folded,
+          ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
+          ...(domain === undefined ? {} : { sqlDomain: domain }),
+        };
+      }
     }
     return { ...expression, left, right };
   }
@@ -813,6 +1016,7 @@ function foldExpression(expression: Expression): Expression {
     );
     if (
       expression.name !== "COALESCE" &&
+      !volatileScalarFunctionNames.has(expression.name) &&
       isScalarFunctionName(expression.name) &&
       literalValues.length === foldedArguments.length
     ) {
@@ -825,7 +1029,36 @@ function foldExpression(expression: Expression): Expression {
           folded instanceof Date ||
           (typeof folded === "number" && Number.isFinite(folded))
         ) {
-          return { kind: "literal", value: folded };
+          const target = foldedArguments[1];
+          const targetWord =
+            expression.name === "CAST" &&
+            target?.kind === "literal" &&
+            typeof target.value === "string"
+              ? target.value
+              : undefined;
+          const sqlDomain =
+            targetWord?.startsWith("numeric:") === true
+              ? (() => {
+                  const [, precisionWord = "", scaleWord = ""] = targetWord.split(":");
+                  return {
+                    kind: "numeric" as const,
+                    ...(precisionWord === "" ? {} : { precision: Number(precisionWord) }),
+                    ...(scaleWord === "" ? {} : { scale: Number(scaleWord) }),
+                  };
+                })()
+              : targetWord === "json" ||
+                  targetWord === "jsonb" ||
+                  targetWord === "uuid" ||
+                  targetWord === "time" ||
+                  targetWord === "interval"
+                ? ({ kind: targetWord } as const)
+                : undefined;
+          return {
+            kind: "literal",
+            value: folded,
+            ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
+            ...(sqlDomain === undefined ? {} : { sqlDomain }),
+          };
         }
       } catch {
         // A function that rejects its constant arguments folds nowhere; execution reports it.

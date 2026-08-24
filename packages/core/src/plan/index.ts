@@ -1,11 +1,11 @@
 /**
- * The plan-construction primitives, published so a typed client can be built outside this package.
+ * The plan-construction primitives, published so a typed query layer can be built externally.
  *
  * A query builder's whole job is to assemble the same logical plan the SQL parser assembles, and
  * then hand it to the engine. That requires the plan's types, the block-assembly functions the
  * parser itself ends in, and the validators that keep a hand-built plan as strict as a parsed one.
- * Exposing them here is what lets `@minnowdb/client` — or anyone else's builder — produce plans the
- * engine treats as indistinguishable from parsed SQL.
+ * Exposing them here lets an external builder produce plans the engine treats as indistinguishable
+ * from parsed SQL.
  *
  * This module re-exports rather than owns: the plan types still live beside the parser that
  * produces them. Splitting them into a leaf module of their own is the next step, and it will not

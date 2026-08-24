@@ -7,8 +7,8 @@ The examples on this page run against the schema of the [console on the home pag
 `stores`, `employees`, `products`, `customers`, `orders`, `order_items`, and `returns`. Paste any
 of them into the console there.
 
-Prefer a typed builder to SQL strings? [Queries](/docs/client/queries) covers the same ground
-through `@minnowdb/client`, and compiles to the same plans.
+Prefer a typed builder to SQL strings? The [Kysely adapter](/docs/adapters/kysely) compiles its
+PostgreSQL-style queries for the same engine.
 
 ## Filtering and choosing columns
 
@@ -22,11 +22,12 @@ ORDER BY placed_at DESC
 LIMIT 50
 ```
 
-`WHERE` supports comparison, `BETWEEN`, `IN`, `LIKE`, `IS NULL`, `AND` / `OR` / `NOT`, and
-`CASE`. Filters on columns with recorded value ranges can skip whole groups of rows without decoding
+`WHERE` supports comparison, `BETWEEN`, `IN`, `LIKE`, `ILIKE`, `SIMILAR TO`, `IS NULL`,
+`AND` / `OR` / `NOT`, and `CASE`. Filters on columns with recorded value ranges can skip whole groups of rows without decoding
 them — see [Query plans](/docs/sql/plans).
 
-`ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, and ordinals.
+`ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
+`COLLATE` on string expressions.
 `LIMIT` and `OFFSET` both work, and a `LIMIT` without an `ORDER BY` returns rows in no promised
 order, as in any SQL engine.
 
@@ -51,6 +52,9 @@ An `ON` clause that carries more than its equality still hashes on that equality
 = a.order_id AND b.product_id > a.product_id` builds on the order and applies the rest to the
 pairs it finds, rather than comparing every row with every row.
 
+Equality-correlated `LATERAL` derived sources are decorrelated into the same set-at-a-time join
+path. Correlated lateral queries do not support grouping, `HAVING`, ordering, or `LIMIT`.
+
 ## Aggregation
 
 ```sql
@@ -68,12 +72,16 @@ HAVING SUM(i.line_total) > 10000
 ORDER BY revenue DESC
 ```
 
-`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `JSON_ARRAYAGG`, and `COUNT(DISTINCT …)` are available.
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `JSON_ARRAYAGG`, and per-aggregate `DISTINCT`
+are available.
 The numeric and counting aggregates accept `FILTER (WHERE …)` for conditional aggregation.
 `JSON_ARRAYAGG(value)` returns JSON text, keeps SQL nulls as JSON nulls by default, and returns
 SQL `NULL` for an empty input. Filter its input in `WHERE`; aggregate-local ordering and
 `FILTER` are not supported for this aggregate. `GROUP BY` also accepts `GROUPING SETS`, `ROLLUP`,
 and `CUBE`.
+
+`STRING_AGG(value, delimiter ORDER BY expression)` skips NULL values, supports `DISTINCT`, and
+spills under the same query-memory bound as other grouped aggregates.
 
 `DISTINCT` is per aggregate, not per query: each one keeps its own set of values, so a select can
 carry several of them beside ordinary aggregates, inside expressions, and in `HAVING` —
@@ -100,10 +108,22 @@ A derived table needs an alias. Scalar subqueries, `IN (SELECT …)`, and `EXIST
 Correlated `EXISTS` and `NOT EXISTS`, including range comparisons such as `inner.amount <
 outer.amount`, decorrelate into semi-joins and anti-joins rather than executing per row.
 
-Correlated scalar aggregates and `IN` require equality correlation. Correlated `NOT IN` is
-rejected because its `NULL` semantics cannot be preserved by that rewrite; use `NOT EXISTS`.
-Minnow reports these boundaries explicitly instead of quietly running a nested query for every
-outer row.
+Correlated scalar aggregates, `IN`, and `NOT IN` require equality correlation. `NOT IN` preserves
+its empty-set and NULL behavior during decorrelation. Correlated scalar/`IN` range predicates and
+correlated `EXISTS` nested below `OR` remain explicit boundaries rather than per-row execution.
+
+Constant JSON documents can also produce rows:
+
+```sql
+SELECT item.sku, item.qty
+FROM JSON_TABLE(
+  '[{"sku":"A-1","qty":2},{"sku":"B-4","qty":1}]',
+  '$[*]' COLUMNS (sku TEXT PATH '$.sku', qty INTEGER PATH '$.qty')
+) AS item
+```
+
+`JSON_TABLE` accepts `$` and `$[*]` row paths over a constant document. Correlated document
+expressions are unsupported.
 
 ## Common table expressions
 
@@ -152,7 +172,7 @@ FROM orders
 aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and explicit `ROWS` / `RANGE`
 frames.
 
-A window runs after `GROUP BY` and `HAVING`, as the standard orders them, so it ranks the groups
+A window runs after `GROUP BY` and `HAVING`, matching PostgreSQL, so it ranks the groups
 rather than the rows behind them and its `OVER` clause reads the group's own aggregates — that is
 what makes the `ROW_NUMBER() OVER (PARTITION BY p.category ORDER BY SUM(i.line_total) DESC)` above
 the best sellers per category. `SUM(SUM(total)) OVER (PARTITION BY region)` is the same idea: the

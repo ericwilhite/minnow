@@ -3,14 +3,14 @@ title: Writing data
 description: Insert, update, delete, upsert, and RETURNING.
 ---
 
-Prefer a typed builder to SQL strings? [Mutations](/docs/client/writes) covers the same ground
-through `@minnowdb/client`.
+Prefer a typed builder to SQL strings? The [Kysely adapter](/docs/adapters/kysely) supports inserts,
+updates, deletes, transactions, and `RETURNING`.
 
 ## Insert
 
 ```sql
 INSERT INTO customers (customer_id, name, city, signed_up_on)
-VALUES (?, ?, ?, ?)
+VALUES ($1, $2, $3, $4)
 ```
 
 You can add several rows in one statement. `INSERT … SELECT` also works: Minnow reads from the
@@ -32,18 +32,27 @@ INSERT INTO shipments VALUES ('A-1', 1, CURRENT_TIMESTAMP)
 The value count must then equal the table's full column count. Prefer an explicit list in
 application code so a later schema change cannot silently change the positional meaning.
 
-Columns you leave out are written as `NULL`, so a nullable column can simply be omitted. A
-`NOT NULL` column without a value or a default is an error.
+Columns you leave out use their catalog default, or `NULL` when they are nullable. A `NOT NULL`
+column without a value or a default is an error. PostgreSQL's explicit forms work too:
+
+```sql
+INSERT INTO preferences DEFAULT VALUES;
+INSERT INTO events (event_id, kind, noted_at) VALUES ($1, $2, DEFAULT);
+```
+
+`DEFAULT VALUES` inserts one row. `DEFAULT` can occupy any slot in a `VALUES` list, including
+several rows at once. Both run the same stored defaults as an omitted column; there is no hidden
+adapter-only behavior. An explicit `NULL` never invokes a default.
 
 ## Update and delete
 
 ```sql
-UPDATE orders SET status = 'refunded', total = total - ? WHERE order_id = ?
-DELETE FROM orders WHERE placed_at < ?
+UPDATE orders SET status = 'refunded', total = total - $1 WHERE order_id = $2
+DELETE FROM orders WHERE placed_at < $1
 ```
 
 Any `WHERE` clause works. Minnow finds the matching rows and records the change. `SET` expressions
-can read the row's current values, as `total - ?` does above.
+can read the row's current values, as `total - $1` does above.
 
 <Callout title="The table needs a unique key">
   `UPDATE` and `DELETE` are rejected on a table with no `PRIMARY KEY`:
@@ -65,11 +74,11 @@ await db.deleteBatch("orders", { keys: [1001, 1002, 1003] });
 
 ## Upsert
 
-`ON CONFLICT` is a PostgreSQL-compatible extension; SQL:2023 standardizes `MERGE` instead.
+`ON CONFLICT` is Minnow's PostgreSQL-compatible upsert form.
 
 ```sql
 INSERT INTO customers (customer_id, name, city, signed_up_on)
-VALUES (?, ?, ?, ?)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (customer_id) DO UPDATE SET name = EXCLUDED.name, city = EXCLUDED.city
 ```
 
@@ -80,16 +89,15 @@ parameters, constants, `CASE`, arithmetic, and scalar functions:
 
 ```sql
 INSERT INTO inventory (sku, received)
-VALUES (?, ?)
+VALUES ($1, $2)
 ON CONFLICT (sku) DO UPDATE SET on_hand = on_hand + EXCLUDED.received
 ```
 
-When every non-key column should be replaced, Minnow also accepts the concise whole-row form used
-by the typed client's `orReplace()`:
+When every non-key column should be replaced, Minnow also accepts a concise whole-row form:
 
 ```sql
 INSERT INTO customers (customer_id, name, city, signed_up_on)
-VALUES (?, ?, ?, ?)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (customer_id) DO REPLACE
 ```
 
@@ -99,9 +107,19 @@ column.
 
 Conflict updates and fresh inserts from one statement publish atomically. One statement cannot
 update the same existing key twice. The conflict key itself cannot be reassigned, and aggregates,
-windows, and subqueries are not allowed in the assignment. A `WHERE` predicate after the
-`DO UPDATE SET` list is not supported yet; use `CASE` to retain the stored value when that is
-equivalent.
+windows, and subqueries are not allowed in the assignment. A predicate after the assignment list
+can turn a conflict into a no-op:
+
+```sql
+INSERT INTO inventory (sku, received)
+VALUES ($1, $2)
+ON CONFLICT (sku) DO UPDATE
+SET on_hand = on_hand + EXCLUDED.received
+WHERE EXCLUDED.received > 0
+```
+
+The predicate can read the stored target row and `EXCLUDED`, with the same scalar-expression
+boundary as assignments.
 
 ## RETURNING
 
@@ -110,7 +128,7 @@ the removed rows for `DELETE`:
 
 ```sql
 UPDATE products SET list_price = list_price * 1.05
-WHERE product_id = ?
+WHERE product_id = $1
 RETURNING product_id, name, list_price
 ```
 
@@ -132,7 +150,7 @@ data blocks, so the check does not scan the table.
 import { UniqueConstraintError } from "@minnowdb/core";
 
 try {
-  await db.execute("INSERT INTO customers (customer_id, name) VALUES (?, ?)", [1, "Ada"]);
+  await db.execute("INSERT INTO customers (customer_id, name) VALUES ($1, $2)", [1, "Ada"]);
 } catch (error) {
   if (error instanceof UniqueConstraintError) {
     // error.tableName, error.keys

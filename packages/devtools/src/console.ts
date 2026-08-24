@@ -21,6 +21,8 @@ export interface ConsoleDeps {
   storageKey: string;
   /** The shadow root, which CodeMirror needs to place itself correctly. */
   root: ShadowRoot;
+  /** Refreshes shared schema metadata after a successful DDL statement. */
+  onCatalogChange(): Promise<void>;
 }
 
 export interface ConsoleView {
@@ -41,6 +43,8 @@ export interface ConsoleView {
 function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "rows") return `${String(result.result.rows.length)} rows`;
   if (result.kind === "create-table") return `created table ${result.table}`;
+  if (result.kind === "create-type") return `created type ${result.name}`;
+  if (result.kind === "create-sequence") return `created sequence ${result.name}`;
   if (result.kind === "create-index") {
     return `created${result.unique ? " unique" : ""} index ${result.index} on ${result.table}(${result.columns.join(", ")})`;
   }
@@ -74,6 +78,31 @@ function affectedRows(result: ExecuteResult): number {
   return result.result.rows.length;
 }
 
+function returnedResult(result: ExecuteResult): QueryResult | undefined {
+  if (!("returnedRows" in result)) return undefined;
+  return {
+    columns: Object.keys(result.returnedRows[0] ?? {}),
+    rows: result.returnedRows,
+  };
+}
+
+function changesCatalog(result: ExecuteResult): boolean {
+  return [
+    "create-table",
+    "create-type",
+    "create-sequence",
+    "create-index",
+    "drop-index",
+    "add-column",
+    "drop-column",
+    "drop-table",
+    "create-view",
+    "drop-view",
+    "create-trigger",
+    "drop-trigger",
+  ].includes(result.kind);
+}
+
 /** The SQL console: type a statement, run it, read the rows, and find it again afterwards. */
 export function createConsole(deps: ConsoleDeps): ConsoleView {
   const history = createHistoryStore(globalThis.localStorage, deps.storageKey);
@@ -88,10 +117,14 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
 
   const run = button("btn primary", "Run");
   run.prepend(icon(icons.play));
-  const notice = el("div", { class: "notice" });
+  const notice = el("div", { class: "notice", attrs: { "aria-live": "polite" } });
   notice.hidden = true;
   const grid = createGrid();
-  const status = el("div", { class: "statusbar" }, [el("span", { text: "ready" })]);
+  const status = el(
+    "div",
+    { class: "statusbar", attrs: { role: "status", "aria-live": "polite" } },
+    [el("span", { text: "ready" })],
+  );
 
   const historyRail = createHistoryRail({
     storageKey: deps.storageKey,
@@ -120,10 +153,28 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   const planView = el("div", { class: "plan-view" }, [planText]);
   planView.hidden = true;
 
-  const resultTabs = el("div", { class: "subtabs" });
-  const rowsTab = button("subtab on", "Rows");
-  const planTab = button("subtab", "Plan");
+  const resultTabs = el("div", { class: "subtabs", attrs: { role: "tablist" } });
+  const rowsTab = button("subtab on", "Rows", {
+    attrs: {
+      role: "tab",
+      "aria-selected": "true",
+      "aria-controls": "mdt-result-rows",
+    },
+  });
+  const planTab = button("subtab", "Plan", {
+    attrs: {
+      role: "tab",
+      "aria-selected": "false",
+      "aria-controls": "mdt-result-plan",
+      tabindex: "-1",
+    },
+  });
   resultTabs.append(rowsTab, planTab);
+  grid.node.id = "mdt-result-rows";
+  grid.node.setAttribute("aria-label", "Rows");
+  planView.id = "mdt-result-plan";
+  planView.setAttribute("role", "tabpanel");
+  planView.setAttribute("aria-label", "Plan");
 
   const splitter = el("div", {
     class: "splitter",
@@ -131,6 +182,9 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
       role: "separator",
       "aria-orientation": "horizontal",
       "aria-label": "Resize the editor",
+      tabindex: "0",
+      "aria-valuemin": "60",
+      "aria-valuenow": "170",
     },
   });
   const main = el("div", { class: "console-main" }, [
@@ -160,6 +214,7 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
 
   function applySplit(): void {
     editorSlot.style.height = `${String(Math.round(editorHeight))}px`;
+    splitter.setAttribute("aria-valuenow", String(Math.round(editorHeight)));
   }
 
   let splitStart = 0;
@@ -184,6 +239,18 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   });
   applySplit();
 
+  splitter.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const bounds = main.getBoundingClientRect().height;
+    editorHeight = resizeSplit(editorHeight, event.key === "ArrowUp" ? -10 : 10, bounds, {
+      top: 60,
+      bottom: 120,
+    });
+    applySplit();
+    writeStored(splitKey, String(Math.round(editorHeight)));
+  });
+
   grid.setMessage("Run a query to see rows here.");
   renderHistory();
 
@@ -195,6 +262,10 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   function showResultTab(which: "rows" | "plan"): void {
     rowsTab.className = which === "rows" ? "subtab on" : "subtab";
     planTab.className = which === "plan" ? "subtab on" : "subtab";
+    rowsTab.setAttribute("aria-selected", String(which === "rows"));
+    planTab.setAttribute("aria-selected", String(which === "plan"));
+    rowsTab.tabIndex = which === "rows" ? 0 : -1;
+    planTab.tabIndex = which === "plan" ? 0 : -1;
     grid.node.hidden = which !== "rows";
     planView.hidden = which !== "plan";
     if (which === "plan") void loadPlan();
@@ -204,6 +275,15 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     const sql = editor.value().trim();
     if (sql.length === 0) {
       planText.textContent = "Write a query to see its plan.";
+      return;
+    }
+    try {
+      if (classifyStatement(sql).kind !== "select") {
+        planText.textContent = "Plans are available for SELECT statements.";
+        return;
+      }
+    } catch (error) {
+      planText.textContent = error instanceof Error ? error.message : String(error);
       return;
     }
     planText.textContent = "Explaining…";
@@ -220,6 +300,13 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
   planTab.addEventListener("click", () => {
     showResultTab("plan");
   });
+  resultTabs.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const next = event.target === rowsTab ? planTab : rowsTab;
+    showResultTab(next === rowsTab ? "rows" : "plan");
+    next.focus();
+  });
 
   function renderHistory(): void {
     historyRail.render(history.entries(), selectedEntry);
@@ -227,6 +314,8 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
 
   function setNotice(kind: "error" | "blocked" | "done", message: string): void {
     notice.className = `notice ${kind}`;
+    notice.setAttribute("role", kind === "done" ? "status" : "alert");
+    notice.setAttribute("aria-live", kind === "done" ? "polite" : "assertive");
     notice.replaceChildren(icon(icons.warning), el("span", { text: message }));
     notice.hidden = false;
   }
@@ -293,8 +382,8 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
         facts: summary.facts,
         sql,
         ...(summary.warning === undefined ? {} : { warning: summary.warning }),
-        confirmLabel: intent.kind === "delete" ? "Delete rows" : `Run ${intent.kind}`,
-        destructive: intent.kind === "delete",
+        confirmLabel: summary.confirmLabel,
+        ...(summary.destructive === undefined ? {} : { destructive: summary.destructive }),
       });
       if (!confirmed) {
         setStatus("cancelled");
@@ -318,10 +407,18 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
       } else {
         const result = await deps.target.execute(sql);
         const ms = Math.round(performance.now() - started);
-        grid.setMessage("Statement ran.");
+        const returned = returnedResult(result);
+        if (returned === undefined) grid.setMessage("Statement ran.");
+        else renderRows(returned);
         setNotice("done", describeExecuteResult(result));
-        record(sql, { ms, rowCount: affectedRows(result) });
+        const entry = record(sql, {
+          ms,
+          rowCount: affectedRows(result),
+          outcome: describeExecuteResult(result),
+        });
+        if (returned !== undefined) history.rememberResult(entry.id, returned);
         setStatus(`${describeExecuteResult(result)} · ${String(ms)}ms`);
+        if (changesCatalog(result)) await deps.onCatalogChange();
       }
     } catch (error) {
       const ms = Math.round(performance.now() - started);

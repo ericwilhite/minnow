@@ -1,4 +1,4 @@
-import type { TableDefinition } from "@minnowdb/core";
+import type { Catalog, TableDefinition } from "@minnowdb/core";
 import type { ColumnType } from "../sql/literal.js";
 
 export interface ColumnInfo {
@@ -17,12 +17,25 @@ export interface ColumnInfo {
 export interface TableInfo {
   name: string;
   columns: ColumnInfo[];
+  /** SQL-declared indexes, when the target exposes rich catalog introspection. */
+  indexes?: IndexInfo[];
   /** The single non-nullable unique-key column, when the table has one. */
   uniqueKey?: string;
 }
 
+export interface IndexInfo {
+  name: string;
+  columns: Array<{ name: string; direction: "asc" | "desc" }>;
+  unique: boolean;
+  state: "building" | "ready" | "invalid";
+}
+
 /** Normalizes the catalog into what the explorer needs, in the order the engine reports it. */
-export function toCatalog(tables: readonly TableDefinition[]): TableInfo[] {
+export function toCatalog(
+  tables: readonly TableDefinition[],
+  introspection?: Catalog,
+): TableInfo[] {
+  const metadata = new Map(introspection?.tables.map((table) => [table.name, table]));
   return tables.map((table) => ({
     name: table.name,
     columns: table.columns.map((column) => ({
@@ -32,6 +45,16 @@ export function toCatalog(tables: readonly TableDefinition[]): TableInfo[] {
       isUniqueKey: column.name === table.uniqueKey,
       hasDefault: column.defaultValue !== undefined,
     })),
+    ...(metadata.get(table.name)?.indexes === undefined
+      ? {}
+      : {
+          indexes: (metadata.get(table.name)?.indexes ?? []).map((index) => ({
+            name: index.name,
+            columns: index.columns.map((column) => ({ ...column })),
+            unique: index.unique,
+            state: index.state,
+          })),
+        }),
     ...(table.uniqueKey === undefined ? {} : { uniqueKey: table.uniqueKey }),
   }));
 }

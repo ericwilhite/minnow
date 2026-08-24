@@ -1,9 +1,8 @@
 /**
- * SQL:2023 (ISO/IEC 9075:2023) surface tests, keyed to the feature IDs of Annex F. The
- * differential harness diffs these forms against SQLite and PGlite where the oracles agree;
- * this file pins the semantics the standard fixes on its own — including the ones no oracle
- * can judge, like a statement's single reading of the clock — and the errors that mark the
- * boundary of what the engine accepts.
+ * PostgreSQL-flavored SQL surface tests. The differential harness diffs these forms against
+ * SQLite and PGlite where the oracles agree; this file pins the semantics that need a focused
+ * example of their own — including the ones no oracle can judge, like a statement's single
+ * reading of the clock — and the errors that mark the boundary of what the engine accepts.
  *
  * `run` executes through both executors and asserts they agree, so no feature can be correct in
  * one and wrong in the other.
@@ -38,8 +37,8 @@ function value(sql: string): unknown {
   return run(sql)[0]?.v;
 }
 
-describe("E021 character strings", () => {
-  it("measures length in characters, octets, and the standard spellings", () => {
+describe("character strings", () => {
+  it("measures length in characters, octets, and the PostgreSQL spellings", () => {
     expect(value("SELECT CHAR_LENGTH('héllo') AS v")).toBe(5);
     expect(value("SELECT CHARACTER_LENGTH('héllo') AS v")).toBe(5);
     expect(value("SELECT LENGTH('héllo') AS v")).toBe(5);
@@ -47,7 +46,7 @@ describe("E021 character strings", () => {
     expect(value("SELECT OCTET_LENGTH('héllo') AS v")).toBe(6);
   });
 
-  it("takes substrings by the standard's position window (E021-06)", () => {
+  it("takes substrings by a position window", () => {
     expect(value("SELECT SUBSTRING('abcdef' FROM 2 FOR 3) AS v")).toBe("bcd");
     expect(value("SELECT SUBSTRING('abcdef' FROM 3) AS v")).toBe("cdef");
     expect(value("SELECT SUBSTRING('abcdef', 2, 3) AS v")).toBe("bcd");
@@ -59,7 +58,7 @@ describe("E021 character strings", () => {
     expect(() => run("SELECT SUBSTR('abcdef', 1, -1) AS v")).toThrow("non-negative integer");
   });
 
-  it("trims with a side, a trim string, and the default space (E021-09, T056)", () => {
+  it("trims with a side, a trim string, and the default space", () => {
     expect(value("SELECT TRIM(label) AS v FROM rows WHERE id = 1")).toBe("alpha");
     expect(value("SELECT TRIM(BOTH FROM label) AS v FROM rows WHERE id = 1")).toBe("alpha");
     expect(value("SELECT TRIM(BOTH 'x' FROM label) AS v FROM rows WHERE id = 2")).toBe("bravo");
@@ -69,14 +68,14 @@ describe("E021 character strings", () => {
     expect(value("SELECT TRIM(TRAILING 'x' FROM label) AS v FROM rows WHERE id = 2")).toBe(
       "xxbravo",
     );
-    // T056: a multi-character trim removes the whole string repeatedly, not a set of characters.
+    // Minnow deliberately removes a multi-character trim as a repeated string, not a character set.
     expect(value("SELECT TRIM(LEADING 'ab' FROM 'ababcab') AS v")).toBe("cab");
     expect(value("SELECT TRIM(BOTH 'ab' FROM 'abXab') AS v")).toBe("X");
     expect(value("SELECT LTRIM('xxa', 'x') AS v")).toBe("a");
     expect(() => compileQuery("SELECT TRIM(LEADING 'x') AS v")).toThrow("TRIM LEADING requires");
   });
 
-  it("finds positions and pads to width (E021-11, T055)", () => {
+  it("finds positions and pads to width", () => {
     expect(value("SELECT POSITION('cd' IN 'abcdef') AS v")).toBe(3);
     expect(value("SELECT POSITION('zz' IN 'abcdef') AS v")).toBe(0);
     expect(value("SELECT POSITION('' IN 'abc') AS v")).toBe(1);
@@ -110,8 +109,8 @@ describe("E021 character strings", () => {
   });
 });
 
-describe("E051 basic query specification", () => {
-  it("selects one source's columns with a qualified wildcard (E051-07)", () => {
+describe("basic query specification", () => {
+  it("selects one source's columns with a qualified wildcard", () => {
     expect(run("SELECT r.* FROM rows r WHERE id = 3")).toEqual([
       { id: 3, region: "east", amount: 3, label: "charlie" },
     ]);
@@ -125,7 +124,7 @@ describe("E051 basic query specification", () => {
     expect(() => run("SELECT x.* FROM rows r")).toThrow("Unknown table for x.*");
   });
 
-  it("renames a table's columns positionally (E051-09)", () => {
+  it("renames a table's columns positionally", () => {
     expect(run("SELECT y.a AS a, y.c AS c FROM rows AS y(a, b, c, d) WHERE a = 3")).toEqual([
       { a: 3, c: 3 },
     ]);
@@ -137,15 +136,15 @@ describe("E051 basic query specification", () => {
     );
   });
 
-  it("accepts the ALL set quantifier on aggregates (E091-06)", () => {
+  it("accepts the ALL set quantifier on aggregates", () => {
     expect(value("SELECT SUM(ALL amount) AS v FROM rows")).toBe(27);
     expect(value("SELECT COUNT(ALL region) AS v FROM rows")).toBe(3);
     expect(value("SELECT COUNT(DISTINCT region) AS v FROM rows")).toBe(2);
   });
 });
 
-describe("E071 query expressions", () => {
-  it("nests set operations inside derived tables and CTEs (E071-06)", () => {
+describe("query expressions", () => {
+  it("nests set operations inside derived tables and CTEs", () => {
     expect(
       run("SELECT s.id FROM (SELECT id FROM rows UNION SELECT 99 AS id) s ORDER BY id"),
     ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 99 }]);
@@ -158,7 +157,7 @@ describe("E071 query expressions", () => {
   });
 });
 
-describe("E161 and T351 comments", () => {
+describe("comments", () => {
   it("skips simple and bracketed comments without changing the statement", () => {
     const plain = run("SELECT id FROM rows WHERE id = 1");
     expect(run("SELECT id FROM rows WHERE id = 1 -- trailing")).toEqual(plain);
@@ -170,7 +169,7 @@ describe("E161 and T351 comments", () => {
   });
 });
 
-describe("F041-07 comma joins", () => {
+describe("comma joins", () => {
   it("reads a comma between table references as a cross join", () => {
     expect(run("SELECT COUNT(*) AS v FROM rows, dims")).toEqual([{ v: 4 }]);
     expect(
@@ -190,7 +189,7 @@ describe("F041-07 comma joins", () => {
   });
 });
 
-describe("F401 named-column and natural joins", () => {
+describe("named-column and natural joins", () => {
   it("joins on the named columns with USING", () => {
     expect(
       run("SELECT r.id AS id, d.tag AS tag FROM rows r JOIN dims d USING (region) ORDER BY id"),
@@ -205,7 +204,7 @@ describe("F401 named-column and natural joins", () => {
     expect(() => compileQuery("SELECT id FROM rows r JOIN dims d USING (nope)")).not.toThrow();
   });
 
-  it("joins on every shared column with NATURAL (F401-01)", () => {
+  it("joins on every shared column with NATURAL", () => {
     // rows and dims share only `region`.
     expect(run("SELECT r.id AS id FROM rows r NATURAL JOIN dims d ORDER BY id")).toEqual([
       { id: 1 },
@@ -221,7 +220,7 @@ describe("F401 named-column and natural joins", () => {
   });
 });
 
-describe("F866 FETCH FIRST ... WITH TIES", () => {
+describe("FETCH FIRST ... WITH TIES", () => {
   it("keeps the rows tying with the last one", () => {
     // amounts are 3, 6, 8, 10 — no ties, so WITH TIES and ONLY agree.
     expect(run("SELECT id, amount FROM rows ORDER BY amount FETCH FIRST 2 ROWS ONLY")).toEqual(
@@ -241,7 +240,7 @@ describe("F866 FETCH FIRST ... WITH TIES", () => {
   });
 });
 
-describe("T122 WITH in subqueries", () => {
+describe("WITH in subqueries", () => {
   it("scopes a nested WITH to the query expression that declares it", () => {
     expect(
       run(
@@ -261,8 +260,8 @@ describe("T122 WITH in subqueries", () => {
   });
 });
 
-describe("F051 datetime functions", () => {
-  it("reads the clock once per statement (F051-06/07/08)", () => {
+describe("datetime functions", () => {
+  it("reads the clock once per statement", () => {
     expect(
       value("SELECT CASE WHEN CURRENT_TIMESTAMP = CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS v"),
     ).toBe(1);
@@ -279,7 +278,7 @@ describe("F051 datetime functions", () => {
     expect(
       executeRowQuery(compileQuery("SELECT CURRENT_TIMESTAMP AS v"), tables).rows[0]?.v,
     ).toBeInstanceOf(Date);
-    // The engine has no TIME type, so LOCALTIME reads as an 'HH:MM:SS' string.
+    // LOCALTIME and explicit TIME values share the canonical public text representation.
     expect(once("SELECT LOCALTIME AS v")).toMatch(/^\d{2}:\d{2}:\d{2}$/);
     expect(once("SELECT CURRENT_TIME AS v")).toMatch(/^\d{2}:\d{2}:\d{2}$/);
     expect(() => compileQuery("SELECT CURRENT_DATE(3) AS v")).toThrow("Expected )");
@@ -302,8 +301,8 @@ describe("F051 datetime functions", () => {
   });
 });
 
-describe("T611/T612 window frames and functions", () => {
-  it("reads a value at a position in the frame (T618)", () => {
+describe("window frames and functions", () => {
+  it("reads a value at a position in the frame", () => {
     expect(run("SELECT id, NTH_VALUE(amount, 2) OVER (ORDER BY id) AS v FROM rows")).toEqual([
       { id: 1, v: null },
       { id: 2, v: 6 },
@@ -322,8 +321,8 @@ describe("T611/T612 window frames and functions", () => {
   });
 
   it("counts peer groups in a GROUPS frame", () => {
-    // Ordered by region the peer groups are NULL (id 4), east (id 3), then west (ids 1 and 2),
-    // and the frame spans the current group plus the one before it.
+    // PostgreSQL's default puts the peer groups east (id 3), west (ids 1 and 2), then NULL
+    // (id 4); the frame spans the current group plus the one before it.
     expect(
       run(
         "SELECT id, COUNT(*) OVER (ORDER BY region GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM rows ORDER BY id",
@@ -331,8 +330,8 @@ describe("T611/T612 window frames and functions", () => {
     ).toEqual([
       { id: 1, v: 3 },
       { id: 2, v: 3 },
-      { id: 3, v: 2 },
-      { id: 4, v: 1 },
+      { id: 3, v: 1 },
+      { id: 4, v: 3 },
     ]);
     expect(() =>
       compileQuery("SELECT SUM(amount) OVER (GROUPS UNBOUNDED PRECEDING) AS v FROM rows"),
@@ -375,7 +374,7 @@ describe("T611/T612 window frames and functions", () => {
     ]);
   });
 
-  it("names a window once and reuses it (T620)", () => {
+  it("names a window once and reuses it", () => {
     expect(
       run(
         "SELECT id, SUM(amount) OVER w AS s, COUNT(*) OVER w AS c FROM rows WINDOW w AS (ORDER BY id)",
@@ -421,7 +420,7 @@ describe("set functions beyond the five accumulators", () => {
     expect(value("SELECT VAR_POP(amount) AS v FROM rows WHERE id = 99")).toBeNull();
   });
 
-  it("picks any value of a group (T626) and folds booleans", () => {
+  it("picks any value of a group and folds booleans", () => {
     // ANY_VALUE returns one row's value per group; which one is implementation-dependent.
     const picked = run("SELECT region, ANY_VALUE(amount) AS v FROM rows GROUP BY region");
     expect(picked.length).toBe(3);
@@ -440,7 +439,7 @@ describe("set functions beyond the five accumulators", () => {
   });
 });
 
-describe("T433 GROUPING", () => {
+describe("GROUPING", () => {
   it("marks the columns a grouping set aggregated away", () => {
     expect(
       run(
@@ -465,7 +464,7 @@ describe("T433 GROUPING", () => {
   });
 });
 
-describe("F641 row constructors", () => {
+describe("row constructors", () => {
   it("compares rows field by field and lexicographically", () => {
     expect(run("SELECT id FROM rows WHERE (id, region) = (1, 'west')")).toEqual([{ id: 1 }]);
     // Inequality is the disjunction of the field inequalities, so a NULL field cannot make the
@@ -509,7 +508,7 @@ describe("F641 row constructors", () => {
     ]);
   });
 
-  it("rejects rows the standard gives no meaning", () => {
+  it("rejects row comparisons PostgreSQL gives no meaning", () => {
     expect(() => compileQuery("SELECT id FROM rows WHERE (id, region) = (1, 'west', 2)")).toThrow(
       "same number of fields",
     );
@@ -523,7 +522,31 @@ describe("F641 row constructors", () => {
   });
 });
 
-describe("E151 statement transactions", () => {
+describe("sequences", () => {
+  it("reserves durable monotone values and tracks CURRVAL per database session", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await expect(database.execute("CREATE SEQUENCE order_ids")).resolves.toEqual({
+      kind: "create-sequence",
+      name: "order_ids",
+    });
+    await expect(database.query("SELECT CURRVAL('order_ids') AS n")).rejects.toThrow(
+      "CURRVAL is not defined yet",
+    );
+    expect((await database.query("SELECT NEXTVAL('order_ids') AS n")).rows).toEqual([{ n: 1 }]);
+    expect(
+      (await database.query("SELECT NEXTVAL('order_ids') AS n, CURRVAL('order_ids') AS c")).rows,
+    ).toEqual([{ n: 2, c: 2 }]);
+    expect((await database.listTables()).map(({ name }) => name)).not.toContain("order_ids");
+
+    const reopened = new MinnowDatabase(store);
+    expect((await reopened.query("SELECT NEXTVAL('order_ids') AS n")).rows).toEqual([{ n: 3 }]);
+    await reopened.close();
+    await database.close();
+  });
+});
+
+describe("statement transactions", () => {
   async function counted(): Promise<MinnowDatabase> {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
@@ -559,6 +582,47 @@ describe("E151 statement transactions", () => {
     expect(await rows(database)).toEqual([{ id: 3, n: 30 }]);
     await database.execute("ROLLBACK");
     expect(await rows(database)).toEqual([{ id: 1, n: 10 }]);
+  });
+
+  it("rewinds nested savepoints, staged artifacts, and uniqueness deltas", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.execute(
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL, email TEXT UNIQUE)",
+    );
+    await database.execute("INSERT INTO t VALUES (1, 10, 'one@example.test')");
+    const baselineBlocks = await store.listBlockIds();
+    const baselineSegments = await store.listSegments();
+
+    await database.execute("BEGIN");
+    await database.execute("SAVEPOINT outer_mark");
+    await database.execute("INSERT INTO t VALUES (2, 20, 'reused@example.test')");
+    await database.execute("SAVEPOINT inner_mark");
+    await database.execute("UPDATE t SET n = 99 WHERE id = 1");
+    expect(await rows(database)).toEqual([
+      { id: 1, n: 99 },
+      { id: 2, n: 20 },
+    ]);
+
+    await database.execute("ROLLBACK TO SAVEPOINT outer_mark");
+    expect(await rows(database)).toEqual([{ id: 1, n: 10 }]);
+    expect(await store.listBlockIds()).toEqual(baselineBlocks);
+    expect(await store.listSegments()).toEqual(baselineSegments);
+    await expect(database.execute("RELEASE inner_mark")).rejects.toThrow(
+      "Savepoint does not exist",
+    );
+
+    // The unique-membership addition made after the marker was rewound too.
+    await database.execute("INSERT INTO t VALUES (3, 30, 'reused@example.test')");
+    await database.execute("RELEASE SAVEPOINT outer_mark");
+    await expect(database.execute("ROLLBACK TO outer_mark")).rejects.toThrow(
+      "Savepoint does not exist",
+    );
+    await database.execute("COMMIT");
+    expect(await rows(database)).toEqual([
+      { id: 1, n: 10 },
+      { id: 3, n: 30 },
+    ]);
   });
 
   it("rolls back a transaction left open, rather than holding the scope forever", async () => {
@@ -630,7 +694,7 @@ describe("E151 statement transactions", () => {
       "CREATE TABLE is not allowed inside a transaction",
     );
     await database.execute("ROLLBACK");
-    // The standard's optional noise parses; an isolation level does not, since there is one.
+    // PostgreSQL's optional transaction noise parses; an isolation level does not, since there is one.
     await database.execute("BEGIN WORK");
     await database.execute("COMMIT TRANSACTION");
     await expect(
@@ -639,7 +703,7 @@ describe("E151 statement transactions", () => {
   });
 });
 
-describe("F312 MERGE", () => {
+describe("MERGE", () => {
   async function stocked(): Promise<MinnowDatabase> {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(
@@ -663,6 +727,22 @@ describe("F312 MERGE", () => {
       { sku: 1, qty: 13, note: "a" },
       { sku: 2, qty: 5, note: "b" },
       { sku: 3, qty: 7, note: "new" },
+    ]);
+  });
+
+  it("keeps omitted MERGE insert columns omitted so their defaults run", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute(
+      "CREATE TABLE merge_target (id INTEGER PRIMARY KEY, label TEXT DEFAULT lower('GENERATED') NOT NULL, note TEXT DEFAULT 'kept')",
+    );
+    await database.execute("CREATE TABLE merge_source (id INTEGER PRIMARY KEY)");
+    await database.execute("INSERT INTO merge_source VALUES (1)");
+    await database.execute(
+      `MERGE INTO merge_target t USING merge_source s ON t.id = s.id
+       WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)`,
+    );
+    expect((await database.query("SELECT * FROM merge_target")).rows).toEqual([
+      { id: 1, label: "generated", note: "kept" },
     ]);
   });
 
@@ -718,7 +798,7 @@ describe("F312 MERGE", () => {
 
   it("refuses two source rows for one target row", async () => {
     const database = await stocked();
-    // SQL:2023 15.8 makes this a cardinality violation. Applying the last one silently would
+    // PostgreSQL raises a cardinality violation here. Applying the last one silently would
     // make the result depend on the order the source happened to produce.
     await expect(
       database.execute(
@@ -756,7 +836,7 @@ describe("F312 MERGE", () => {
   });
 });
 
-describe("F031 views", () => {
+describe("views", () => {
   async function seeded(): Promise<MinnowDatabase> {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(
@@ -768,7 +848,7 @@ describe("F031 views", () => {
     return database;
   }
 
-  it("answers by name, and reads through to the tables behind it (F031-02)", async () => {
+  it("answers by name, and reads through to the tables behind it", async () => {
     const database = await seeded();
     await database.execute(
       "CREATE VIEW big AS SELECT id, region, total FROM orders WHERE total >= 10",
@@ -947,7 +1027,7 @@ describe("catalog-dependent rewrites", () => {
   });
 });
 
-describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
+describe("SQL/JSON", () => {
   const documents = new Map<string, DatabaseRow[]>([
     [
       "docs",
@@ -973,7 +1053,7 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     return vectorized.rows[0]?.v;
   };
 
-  it("reads scalars along a path (T822)", () => {
+  it("reads scalars along a path", () => {
     expect(json("SELECT JSON_VALUE(doc, '$.name') AS v FROM docs")).toBe("ada");
     expect(json("SELECT JSON_VALUE(doc, '$.meta.score') AS v FROM docs")).toBe("9");
     expect(json("SELECT JSON_VALUE(doc, '$.tags[1]') AS v FROM docs")).toBe("y");
@@ -984,13 +1064,13 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     expect(json("SELECT JSON_VALUE(doc, '$.meta') AS v FROM docs")).toBeNull();
     // A document that is not JSON selects nothing rather than failing the statement.
     expect(json("SELECT JSON_VALUE(plain, '$.a') AS v FROM docs")).toBeNull();
-    // Values arrive as text, so a numeric use casts, as the standard's RETURNING would.
+    // Values arrive as text, so a numeric use casts, matching PostgreSQL's RETURNING behavior.
     expect(json("SELECT CAST(JSON_VALUE(doc, '$.meta.score') AS INTEGER) + 1 AS v FROM docs")).toBe(
       10,
     );
   });
 
-  it("returns JSON text for objects and arrays (T823) and tests existence (T821)", () => {
+  it("returns JSON text for objects and arrays and tests existence", () => {
     expect(json("SELECT JSON_QUERY(doc, '$.meta') AS v FROM docs")).toBe('{"score":9}');
     expect(json("SELECT JSON_QUERY(doc, '$.tags') AS v FROM docs")).toBe('["x","y"]');
     expect(json("SELECT JSON_QUERY(doc, '$.nope') AS v FROM docs")).toBeNull();
@@ -999,7 +1079,7 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     expect(json("SELECT JSON_EXISTS(doc, '$.tags[5]') AS v FROM docs")).toBe(false);
   });
 
-  it("tests a value's JSON shape (T825)", () => {
+  it("tests a value's JSON shape", () => {
     const ids = (sql: string): DatabaseRow[] => executeQuery(compileQuery(sql), documents).rows;
     expect(ids("SELECT id FROM docs WHERE doc IS JSON")).toEqual([{ id: 1 }]);
     expect(ids("SELECT id FROM docs WHERE plain IS JSON")).toEqual([]);
@@ -1011,7 +1091,7 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     ]);
   });
 
-  it("constructs objects and arrays (T811, T812)", () => {
+  it("constructs objects and arrays", () => {
     expect(json("SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 'two') AS v")).toBe('{"a":1,"b":"two"}');
     expect(json("SELECT JSON_OBJECT(KEY 'a' VALUE 1) AS v")).toBe('{"a":1}');
     expect(json("SELECT JSON_OBJECT('a', 1) AS v")).toBe('{"a":1}');
@@ -1031,7 +1111,7 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     );
   });
 
-  it("aggregates values into JSON arrays with SQL null semantics (T826)", () => {
+  it("aggregates values into JSON arrays with PostgreSQL null semantics", () => {
     expect(value("SELECT JSON_ARRAYAGG(region) AS v FROM rows")).toBe(
       '["west","west","east",null]',
     );
@@ -1044,9 +1124,9 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
         "SELECT region, JSON_ARRAYAGG(amount) AS amounts FROM rows GROUP BY region ORDER BY region",
       ),
     ).toEqual([
-      { region: null, amounts: "[8]" },
       { region: "east", amounts: "[3]" },
       { region: "west", amounts: "[10,6]" },
+      { region: null, amounts: "[8]" },
     ]);
   });
 
@@ -1060,6 +1140,24 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
     expect(() => compileQuery("SELECT JSON_ARRAYAGG(region) OVER () FROM rows")).toThrow(
       "window use is not supported",
     );
+  });
+
+  it("aggregates strings with PostgreSQL STRING_AGG semantics", () => {
+    expect(value("SELECT STRING_AGG(region, ',') AS v FROM rows")).toBe("west,west,east");
+    expect(value("SELECT STRING_AGG(DISTINCT region, '|') AS v FROM rows")).toBe("west|east");
+    expect(value("SELECT STRING_AGG(label, ',' ORDER BY amount DESC) AS v FROM rows")).toBe(
+      "  alpha  ,delta,xxbravoxx,charlie",
+    );
+    expect(value("SELECT STRING_AGG(region, ',') AS v FROM rows WHERE amount < 0")).toBeNull();
+    expect(
+      run(
+        "SELECT region, STRING_AGG(label, '/') AS labels FROM rows GROUP BY region ORDER BY region",
+      ),
+    ).toEqual([
+      { region: "east", labels: "charlie" },
+      { region: "west", labels: "  alpha  /xxbravoxx" },
+      { region: null, labels: "delta" },
+    ]);
   });
 
   it("rejects paths and arities it cannot answer", () => {
@@ -1083,7 +1181,7 @@ describe("SQL/JSON (T811, T812, T821-T823, T825)", () => {
   });
 });
 
-describe("E141/F031 schema statements", () => {
+describe("schema statements", () => {
   async function fresh(): Promise<MinnowDatabase> {
     return new MinnowDatabase(new MemoryBlockStore());
   }
@@ -1096,7 +1194,7 @@ describe("E141/F031 schema statements", () => {
     await database.execute("INSERT INTO t (id, name) VALUES (1, 'ada')");
     const rows = await database.query("SELECT id, name, tier, made IS NOT NULL AS stamped FROM t");
     expect(rows.rows).toEqual([{ id: 1, name: "ada", tier: "basic", stamped: true }]);
-    // E141-08: the table-level spelling of the same single-column key.
+    // The table-level spelling of the same single-column key.
     await database.execute("CREATE TABLE u (a INTEGER, b TEXT, PRIMARY KEY (a))");
     await expect(
       database.execute("INSERT INTO u (a, b) VALUES (1, 'x'), (1, 'y')"),
@@ -1142,18 +1240,122 @@ describe("E141/F031 schema statements", () => {
     ).rejects.toThrow("id[0] must be a safe integer");
   });
 
-  it("rejects exact numeric declarations until they have exact storage semantics", async () => {
+  it("preserves exact NUMERIC values through storage, arithmetic, and aggregates", async () => {
     const database = await fresh();
-    const error = "Exact NUMERIC and DECIMAL are not supported yet";
+    await database.execute("CREATE TABLE money (id INTEGER PRIMARY KEY, amount DECIMAL(30, 10))");
+    await database.execute("INSERT INTO money VALUES (1, 0.1), (2, 0.2)");
+    expect(
+      (await database.query("SELECT SUM(amount) AS total, AVG(amount) AS mean FROM money")).rows,
+    ).toEqual([{ total: "0.3", mean: "0.15" }]);
+    expect(
+      (
+        await database.query(
+          "SELECT amount + CAST(0.2 AS NUMERIC) AS total FROM money WHERE id = 1",
+        )
+      ).rows,
+    ).toEqual([{ total: "0.3" }]);
+    expect(
+      (
+        await database.query(
+          "SELECT total FROM (SELECT amount + CAST(0.2 AS NUMERIC) AS total FROM money) d ORDER BY total DESC",
+        )
+      ).rows,
+    ).toEqual([{ total: "0.4" }, { total: "0.3" }]);
+    expect(
+      (
+        await database.query(
+          "SELECT id, SUM(amount) OVER (ORDER BY id) AS running FROM money ORDER BY id",
+        )
+      ).rows,
+    ).toEqual([
+      { id: 1, running: "0.1" },
+      { id: 2, running: "0.3" },
+    ]);
+    await database.execute("CREATE INDEX money_amount_idx ON money (amount)");
+    expect(
+      (await database.query("SELECT amount FROM money WHERE amount > 0.15 ORDER BY amount")).rows,
+    ).toEqual([{ amount: "0.2" }]);
+    await database.execute("CREATE TABLE copied_money AS SELECT amount FROM money");
+    await database.execute("INSERT INTO copied_money VALUES (0.4)");
+    expect((await database.query("SELECT SUM(amount) AS total FROM copied_money")).rows).toEqual([
+      { total: "0.7" },
+    ]);
+    expect(
+      (await database.listTables()).find(({ name }) => name === "copied_money")?.columns[0]
+        ?.sqlDomain,
+    ).toMatchObject({ kind: "numeric" });
+    await database.execute("CREATE VIEW money_view AS SELECT amount FROM money");
+    expect((await database.query("SELECT SUM(amount) AS total FROM money_view")).rows).toEqual([
+      { total: "0.3" },
+    ]);
     await expect(
-      database.execute("CREATE TABLE money (id INTEGER PRIMARY KEY, amount DECIMAL(12, 2))"),
-    ).rejects.toThrow(error);
-    await expect(database.query("SELECT CAST(1.25 AS NUMERIC(12, 2)) AS amount")).rejects.toThrow(
-      error,
-    );
+      database.execute("INSERT INTO money VALUES (3, '100000000000000000000.00')"),
+    ).rejects.toThrow("NUMERIC(30, 10) overflow");
   });
 
-  it("adds a column to an existing table (F031-04)", async () => {
+  it("keeps ordinary TEXT distinct from internal SQL-domain encodings", async () => {
+    const database = await fresh();
+    const numericTwo = "\0minnow-domain:numeric:2";
+    const numericTen = "\0minnow-domain:numeric:10";
+    const invalidInterval = "\0minnow-domain:interval:not-json";
+    await database.execute("CREATE TABLE tagged_text (id INTEGER PRIMARY KEY, value TEXT)");
+    await database.insertBatch("tagged_text", [
+      { id: 1, value: numericTwo },
+      { id: 2, value: numericTen },
+      { id: 3, value: invalidInterval },
+    ]);
+
+    expect(await database.readTable("tagged_text")).toEqual([
+      { id: 1, value: numericTwo },
+      { id: 2, value: numericTen },
+      { id: 3, value: invalidInterval },
+    ]);
+    expect((await database.query("SELECT value FROM tagged_text ORDER BY id")).rows).toEqual([
+      { value: numericTwo },
+      { value: numericTen },
+      { value: invalidInterval },
+    ]);
+    // TEXT ordering stays lexical; the same bytes must not acquire NUMERIC ordering semantics.
+    expect(
+      (await database.query("SELECT id FROM tagged_text WHERE id < 3 ORDER BY value")).rows,
+    ).toEqual([{ id: 2 }, { id: 1 }]);
+    expect(
+      (await database.query("SELECT id FROM tagged_text WHERE value = ?", { params: [numericTwo] }))
+        .rows,
+    ).toEqual([{ id: 1 }]);
+    expect((await database.query("SELECT ? AS value", { params: [invalidInterval] })).rows).toEqual(
+      [{ value: invalidInterval }],
+    );
+    expect(
+      (
+        await database.query("SELECT ? || ? AS value", {
+          params: ["\0minnow-", "domain:numeric:2"],
+        })
+      ).rows,
+    ).toEqual([{ value: numericTwo }]);
+  });
+
+  it("queries stored JSONB values through SQL/JSON functions", async () => {
+    const database = await fresh();
+    await database.execute("CREATE TABLE native_docs (id INTEGER PRIMARY KEY, document JSONB)");
+    await database.execute(
+      `INSERT INTO native_docs VALUES (1, '{"meta":{"score":9},"name":"Ada"}')`,
+    );
+    expect(
+      (
+        await database.query(
+          "SELECT JSON_VALUE(document, '$.name') AS name, " +
+            "CAST(JSON_VALUE(document, '$.meta.score') AS INTEGER) AS score " +
+            "FROM native_docs",
+        )
+      ).rows,
+    ).toEqual([{ name: "Ada", score: 9 }]);
+    expect(
+      (await database.query("SELECT document IS JSON AS valid FROM native_docs")).rows,
+    ).toEqual([{ valid: true }]);
+  });
+
+  it("adds a column to an existing table", async () => {
     const database = await fresh();
     await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)");
     await database.execute("INSERT INTO t (id) VALUES (1)");
@@ -1173,7 +1375,7 @@ describe("E141/F031 schema statements", () => {
     ).rejects.toThrow("adds a nullable column");
   });
 
-  it("drops an independent column without rewriting surviving rows (F031)", async () => {
+  it("drops an independent column without rewriting surviving rows", async () => {
     const database = await fresh();
     await database.execute(
       "CREATE TABLE receipts (id INTEGER PRIMARY KEY, total INTEGER NOT NULL, note TEXT)",
@@ -1245,7 +1447,7 @@ describe("E141/F031 schema statements", () => {
     ).toMatchObject({ rowIdsByTerm: [[]], deltaChunkCount: 0, coversVersion: -1 });
   });
 
-  it("creates a table from a query (T172)", async () => {
+  it("creates a table from a query", async () => {
     const database = await fresh();
     await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, region TEXT NOT NULL)");
     await database.execute("INSERT INTO t (id, region) VALUES (1, 'west'), (2, 'east')");
@@ -1256,7 +1458,7 @@ describe("E141/F031 schema statements", () => {
     );
   });
 
-  it("enforces CHECK constraints on every write path (E141-06)", async () => {
+  it("enforces CHECK constraints on every write path", async () => {
     const database = await fresh();
     await database.execute(
       "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL CHECK (qty > 0), note TEXT, CONSTRAINT short_note CHECK (LENGTH(note) < 5))",
@@ -1303,7 +1505,7 @@ describe("E141/F031 schema statements", () => {
     ).rejects.toThrow("references a table that does not exist: other");
   });
 
-  it("enforces foreign keys on both sides (E141-04)", async () => {
+  it("enforces foreign keys on both sides", async () => {
     const database = await fresh();
     await database.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
     await database.execute(
@@ -1325,7 +1527,7 @@ describe("E141/F031 schema statements", () => {
     await expect(database.execute("UPDATE orders SET customer = 98 WHERE id = 10")).rejects.toThrow(
       "has no customers row with id 98",
     );
-    // A NULL reference names no parent, which the standard leaves satisfied.
+    // A NULL reference names no parent, matching PostgreSQL's satisfied result.
     await database.execute("INSERT INTO notes (id, customer, body) VALUES (20, NULL, 'none')");
 
     // Parent side: the default refuses while a child still points at the row.
@@ -1356,7 +1558,7 @@ describe("E141/F031 schema statements", () => {
     // probe for existence and the only one its keyed writes address rows by.
     await expect(
       database.execute("CREATE TABLE c (a INTEGER REFERENCES customers(name))"),
-    ).rejects.toThrow("must reference customers's unique key id");
+    ).rejects.toThrow("must reference customers's primary key (id)");
     await expect(
       database.execute("CREATE TABLE c (a TEXT REFERENCES customers(id))"),
     ).rejects.toThrow("compares string with number");
@@ -1443,7 +1645,7 @@ describe("E141/F031 schema statements", () => {
   });
 });
 
-describe("T661 and T662 numeric literals", () => {
+describe("numeric literals", () => {
   it("reads non-decimal integers and digit separators", () => {
     expect(value("SELECT 0x1F AS v")).toBe(31);
     expect(value("SELECT 0X1f AS v")).toBe(31);

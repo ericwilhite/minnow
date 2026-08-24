@@ -4,7 +4,7 @@ description: The shared storage interface, and choosing between IndexedDB, OPFS,
 ---
 
 A database is an engine plus a store. The engine decides what to write; the store decides where it
-goes. Three adapters ship today, all using the same `BlockStore` interface, so swapping one
+goes. Minnow includes three adapters, all using the same `BlockStore` interface, so swapping one
 for another changes nothing else about your code.
 
 | Adapter                                          | Import                   | Survives a reload | Use it for                                         |
@@ -14,10 +14,9 @@ for another changes nothing else about your code.
 | [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage` | No                | Tests, scratch work, throwaway analysis.           |
 
 The two durable adapters hold the same block format, and a [snapshot](/docs/storage/snapshots)
-moves a database between them. Speed is measured live on the [benchmarks page](/benchmarks)
-rather than asserted here — on current engines the OPFS adapter's small reads and writes
-measure several times faster. Where OPFS is unavailable — notably Safari private browsing —
-IndexedDB is the fallback, and it remains the default.
+moves a database between them. OPFS is usually faster for small reads and writes; use the
+[benchmarks page](/benchmarks) to measure both in your browser. Where OPFS is unavailable — notably
+Safari private browsing — use IndexedDB, which remains the default.
 
 ## What a store holds
 

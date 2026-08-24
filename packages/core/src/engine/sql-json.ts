@@ -1,11 +1,11 @@
 import { stringArgument } from "./sql-semantics.js";
+import { externalSqlDomainValue } from "./sql-domains.js";
 
 /**
- * The SQL/JSON support the engine keeps (T801 family). Documents are UTF-8 text in ordinary
- * string columns, exactly as SQLite stores them: no new logical type, no new storage format,
- * and every function below is a scalar over that text. The path language is the subset with an
- * unambiguous single result — `$`, member steps, and array subscripts — because the multi-value
- * forms need a row-producing operator (JSON_TABLE) the executors do not have.
+ * SQL/JSON scalar support (T801 family). Documents may be ordinary JSON text or native JSON/JSONB
+ * domain values carried by the string vector representation. Scalar paths take one unambiguous
+ * result: `$`, member steps, and array subscripts. JSON_TABLE owns its separate `$`/`$[*]`
+ * row-producing subset in the parser.
  */
 interface JsonPathStep {
   kind: "member" | "index";
@@ -57,7 +57,7 @@ export function jsonAtPath(
   const steps = parseJsonPath(path, caller);
   let current: unknown;
   try {
-    current = JSON.parse(stringArgument(caller, document));
+    current = JSON.parse(stringArgument(caller, externalSqlDomainValue(document)));
   } catch {
     // A document that is not JSON selects nothing rather than failing the whole statement,
     // matching the standard's default ON ERROR behaviour for these functions.
@@ -81,6 +81,7 @@ export function jsonAtPath(
 
 /** Whether a value is JSON text of the requested shape (T825). */
 export function jsonIsValid(document: unknown, kind: string): boolean {
+  document = externalSqlDomainValue(document);
   if (typeof document !== "string") return false;
   let parsed: unknown;
   try {
@@ -103,13 +104,14 @@ export function jsonIsValid(document: unknown, kind: string): boolean {
 
 /** A SQL value as its JSON counterpart: datetimes serialize as ISO text, like every cast. */
 export function jsonValueOf(value: unknown): unknown {
-  return value instanceof Date ? value.toISOString() : value;
+  const external = externalSqlDomainValue(value);
+  return external instanceof Date ? external.toISOString() : external;
 }
 
 /**
  * JSON_ARRAY(v, ...) and JSON_OBJECT(k, v, ...) (T811/T812). The omitted null-handling clause is
  * `NULL ON NULL`: SQL NULL becomes a JSON null. `ABSENT ON NULL` is a separate spelling rather
- * than the default. Both constructors return JSON text because Minnow has no JSON storage type.
+ * than the default. Constructors return JSON text at the JavaScript boundary.
  */
 export function jsonConstructor(
   name: "JSON_ARRAY" | "JSON_OBJECT",

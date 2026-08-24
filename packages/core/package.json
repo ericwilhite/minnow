@@ -1,7 +1,7 @@
 {
   "name": "@minnowdb/core",
-  "version": "0.2.1",
-  "description": "A columnar SQL engine that runs entirely in the browser: real SQL over immutable snapshots, durable on IndexedDB or OPFS, with no WebAssembly to download.",
+  "version": "0.3.0",
+  "description": "A columnar SQL database for the browser: PostgreSQL-style SQL over durable IndexedDB or OPFS data, with no server or WebAssembly module.",
   "license": "MIT",
   "author": "Eric Wilhite",
   "homepage": "https://minnowdb.com/docs/",
@@ -69,6 +69,7 @@
       "types": "./dist/testing/index.d.ts",
       "default": "./dist/testing/index.js"
     },
+    "./postgres-feature-profile.json": "./postgres-feature-profile.json",
     "./sql-feature-matrix.json": "./sql-feature-matrix.json",
     "./package.json": "./package.json"
   },
@@ -77,6 +78,7 @@
     "!dist/**/*.test.*",
     "!dist/**/*.spec.*",
     "!dist/*.tsbuildinfo",
-    "sql-feature-matrix.json"
+    "sql-feature-matrix.json",
+    "postgres-feature-profile.json"
   ]
 }

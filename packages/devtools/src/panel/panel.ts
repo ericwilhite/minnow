@@ -104,7 +104,13 @@ export function createPanel(deps: PanelDeps): Panel {
       class: "tab",
       type: "button",
       text: view.label,
-      attrs: { role: "tab", "aria-selected": "false", "aria-controls": `mdt-view-${view.id}` },
+      attrs: {
+        id: `mdt-tab-${view.id}`,
+        role: "tab",
+        "aria-selected": "false",
+        "aria-controls": `mdt-view-${view.id}`,
+        tabindex: "-1",
+      },
     });
     tab.addEventListener("click", () => {
       select(view.id);
@@ -123,12 +129,33 @@ export function createPanel(deps: PanelDeps): Panel {
       view.node.hidden = !selected;
       buttons[index]?.classList.toggle("on", selected);
       buttons[index]?.setAttribute("aria-selected", String(selected));
+      if (buttons[index] !== undefined) buttons[index].tabIndex = selected ? 0 : -1;
       if (selected && !shown.has(view.id)) {
         shown.add(view.id);
         view.onFirstShow?.();
       }
     });
   }
+
+  tabs.addEventListener("keydown", (event) => {
+    const index = buttons.indexOf(event.target as HTMLButtonElement);
+    if (index < 0) return;
+    const offset = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? buttons.length - 1
+          : offset === 0
+            ? -1
+            : (index + offset + buttons.length) % buttons.length;
+    if (nextIndex < 0) return;
+    event.preventDefault();
+    const next = deps.views[nextIndex];
+    if (next === undefined) return;
+    select(next.id);
+    buttons[nextIndex]?.focus();
+  });
 
   const maximize = iconButton("winbtn", "Maximize", icons.maximize);
   const close = iconButton("winbtn", "Close devtools", icons.close);
@@ -157,7 +184,7 @@ export function createPanel(deps: PanelDeps): Panel {
   for (const view of deps.views) {
     view.node.id = `mdt-view-${view.id}`;
     view.node.setAttribute("role", "tabpanel");
-    view.node.setAttribute("aria-label", view.label);
+    view.node.setAttribute("aria-labelledby", `mdt-tab-${view.id}`);
   }
   const node = el(
     "div",

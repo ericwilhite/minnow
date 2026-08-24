@@ -52,7 +52,6 @@ export default defineConfig({
         functions: 84,
         lines: 84,
         "packages/core/src/**": { statements: 87, branches: 78, functions: 91, lines: 89 },
-        "packages/client/src/**": { statements: 89, branches: 81, functions: 94, lines: 91 },
       },
     },
   },

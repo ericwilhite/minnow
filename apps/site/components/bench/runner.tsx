@@ -17,6 +17,7 @@ import type {
   FeatureSuiteResult,
   LiveSuiteResult,
   ReferenceSuiteResult,
+  SecondaryIndexMode,
   WorkProgress,
   WriteSuiteResult,
 } from "@/bench/protocol";
@@ -55,6 +56,7 @@ export function BenchRunner() {
   const [columns, setColumns] = useState<ColumnId[]>(["minnow", "minnow-cached", "sqlite"]);
   const [suites, setSuites] = useState<string[]>(["write", "reference", "live"]);
   const [scale, setScale] = useState(0.5);
+  const [secondaryIndexes, setSecondaryIndexes] = useState<SecondaryIndexMode>("foreign-keys");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [results, setResults] = useState<Results>({});
 
@@ -108,6 +110,7 @@ export function BenchRunner() {
             compression: "gzip",
             targetBlockBytes: 1_048_576,
             durability: "relaxed",
+            secondaryIndexes,
             engines,
           },
           onProgress("Building the dataset"),
@@ -171,7 +174,7 @@ export function BenchRunner() {
         const task = client.start<FeatureSuiteResult>(
           "suiteFeatureMatrix",
           { engines },
-          onProgress("Checking SQL conformance"),
+          onProgress("Checking PostgreSQL compatibility"),
         );
         running.current = task.requestId;
         next.features = await task.result;
@@ -185,7 +188,7 @@ export function BenchRunner() {
       const message = error instanceof Error ? error.message : String(error);
       setPhase(message.includes("cancelled") ? { kind: "idle" } : { kind: "failed", message });
     }
-  }, [columns, suites, scale]);
+  }, [columns, suites, scale, secondaryIndexes]);
 
   const cancel = useCallback(() => {
     const id = running.current;
@@ -196,7 +199,7 @@ export function BenchRunner() {
 
   const needsDataset = SUITES.some((suite) => suites.includes(suite.id) && suite.needsDataset);
   const chosen = columnsFor(columns);
-  const bytes = estimateBytes(enginesForColumns(columns), scale);
+  const bytes = estimateBytes(enginesForColumns(columns), scale, secondaryIndexes);
   const busy = phase.kind === "running";
 
   return (
@@ -273,6 +276,31 @@ export function BenchRunner() {
               </button>
             ))}
           </div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {(
+              [
+                { id: "none", label: "Primary keys only" },
+                { id: "foreign-keys", label: "+ 81 FK indexes" },
+              ] as const
+            ).map((choice) => (
+              <button
+                key={choice.id}
+                type="button"
+                aria-pressed={choice.id === secondaryIndexes}
+                disabled={busy || !needsDataset}
+                onClick={() => {
+                  setSecondaryIndexes(choice.id);
+                }}
+                className={
+                  choice.id === secondaryIndexes
+                    ? "rounded-md border border-fd-primary bg-fd-primary/10 px-2 py-1 text-sm font-medium text-fd-primary"
+                    : "rounded-md border border-fd-border px-2 py-1 text-sm hover:bg-fd-accent disabled:opacity-50"
+                }
+              >
+                {choice.label}
+              </button>
+            ))}
+          </div>
           {needsDataset ? (
             <p className="mt-2 text-xs text-fd-muted-foreground">
               {formatRows(SCALES.find((c) => c.scale === scale)?.rows ?? 0)} rows across 50 tables,
@@ -280,7 +308,7 @@ export function BenchRunner() {
             </p>
           ) : (
             <p className="mt-2 text-xs text-fd-muted-foreground">
-              SQL conformance needs no dataset.
+              PostgreSQL compatibility needs no dataset.
             </p>
           )}
         </fieldset>

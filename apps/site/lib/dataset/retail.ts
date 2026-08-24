@@ -56,7 +56,7 @@ export type Row = Record<string, Value>;
 /**
  * The schema, in dependency order — every table's foreign keys point at a table already created.
  *
- * This is the single declaration. `migrate()` creates the tables from it, `InferDatabase` turns
+ * This is the single declaration. `migrate()` creates the tables from it, the Kysely adapter turns
  * it into the row types the typed console hands to the visitor, and `retailSchema` below reduces
  * it back to the plain shape the loader and the tests read. Nothing here is written twice, so a
  * column added to a table cannot be missing from the types that describe it.
@@ -144,11 +144,11 @@ export const retailTables = [
   }),
 ] as const;
 
-/** The schema `migrate()` takes, and the value the typed client infers its row types from. */
+/** The schema `migrate()` takes, and the value Kysely infers its DB map from. */
 export const retailDefinition = schema(retailTables);
 
 /**
- * What each table holds, in one line. Read by the typed console, which prints them as doc
+ * What each table holds, in one line. Read by the Kysely console, which prints them as doc
  * comments on the generated row types — so hovering `orders` in the editor says what an order is.
  */
 export const retailDescriptions: Record<string, string> = {

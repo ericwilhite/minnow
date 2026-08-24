@@ -9,22 +9,23 @@ search dialog, or the syntax highlighter's markup around every keyword.
 
 ## Machine-readable documentation
 
-| URL                                                    | What it is                                                                        |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| [`/llms.txt`](/llms.txt)                               | Every page, titled and described, linked to its markdown. Follows llmstxt.org.    |
-| [`/llms-full.txt`](/llms-full.txt)                     | The whole documentation set in one file, about 240 KB.                            |
-| `/docs/<page>.md`                                      | The markdown twin of any page: drop the trailing slash and add `.md`.             |
-| [`/sql-feature-matrix.json`](/sql-feature-matrix.json) | Every SQL form the engine supports and rejects, with a runnable example for each. |
-| [`/versions.json`](/versions.json)                     | Which versions are published, and the path each one is served at.                 |
-| [`/sitemap.xml`](/sitemap.xml)                         | Every page on the site.                                                           |
+| URL                                                                | What it is                                                                     |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| [`/llms.txt`](/llms.txt)                                           | Every page, titled and described, linked to its markdown. Follows llmstxt.org. |
+| [`/llms-full.txt`](/llms-full.txt)                                 | The whole documentation set in one file.                                       |
+| `/docs/<page>.md`                                                  | The markdown twin of any page: drop the trailing slash and add `.md`.          |
+| [`/sql-feature-matrix.json`](/sql-feature-matrix.json)             | Tracked SQL forms, runnable examples, errors, and boundary notes.              |
+| [`/postgres-feature-profile.json`](/postgres-feature-profile.json) | PostgreSQL-compatible forms, differences, extensions, and embedded exclusions. |
+| [`/versions.json`](/versions.json)                                 | Which versions are published, and the path each one is served at.              |
+| [`/sitemap.xml`](/sitemap.xml)                                     | Every page on the site.                                                        |
 
 Each page also declares its markdown twin in its head, as
 `<link rel="alternate" type="text/markdown">`, so a crawler finds it without being told the rule.
 
-The feature matrix is worth pointing an agent at directly. It is not a description of the engine
-written by hand — it is the fixture the engine is tested against, so every example in it is
-executed on every test run and every rejection is checked to still fail with the error recorded
-there. See [Feature matrix](/docs/sql/feature-matrix).
+Point an agent at the feature matrix when it writes SQL. The engine tests every example and checks
+every excluded form for its recorded error. Excluded forms conflict with the embedded database
+model, and narrower supported forms carry a boundary note. See
+[PostgreSQL compatibility](/docs/sql/feature-matrix).
 
 Each of these is versioned with the docs it belongs to. `minnowdb.com/llms.txt` describes the
 current release; an archived release serves its own at `minnowdb.com/v0.1/llms.txt`. Point an
@@ -53,22 +54,25 @@ machines: https://minnowdb.com/llms.txt
   `OpfsBlockStore.open({ name })` is the same call for OPFS, inside a worker only; OPFS does not
   exist in Safari private browsing, so fall back to IndexedDB when
   `navigator.storage?.getDirectory` is missing or rejects.
-- `@minnowdb/core`, `@minnowdb/client`, and `@minnowdb/devtools` share a major version and move
+- `@minnowdb/core`, `@minnowdb/kysely`, and `@minnowdb/devtools` share a major version and move
   independently inside it. Install them on the same major; npm refuses a mixed-major set.
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns }`. It throws on a
   statement that writes, rather than writing.
 - `db.execute(sql, params)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `create-table`, `add-column`,
-  `drop-column`, `drop-table`, `create-index`, `drop-index`, `create-view`, `drop-view`,
+  `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`, `create-view`, `drop-view`,
   `create-trigger`, or `drop-trigger`) before reading `rowCount`, `version`, or `returnedRows`.
-- Bind parameters with `?` in order or `$1` by position. Never concatenate values into SQL:
-  compiled plans are cached on the statement text, so a parameterized statement is planned once
-  and interpolation throws that work away on every call.
-- `UPDATE` and `DELETE` require a table with a `PRIMARY KEY`. A table without one can only be
-  appended to. Give a table a key if its rows will ever be edited.
+- Write PostgreSQL-style SQL and bind parameters with `$1`, `$2` by position. `?` in order is
+  also accepted as a Minnow extension. Never concatenate values into SQL: compiled plans are
+  cached on the statement text, so a parameterized statement is planned once and interpolation
+  throws that work away on every call.
+- `UPDATE` and `DELETE` require scalar or composite row identity: a `PRIMARY KEY`, or the
+  single inline `UNIQUE` form. A table without one can only be appended to. Primary-key components
+  cannot be updated.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers. `NUMERIC` and
-  `DECIMAL` are rejected because exact fixed-point storage is not implemented; use integer minor
-  units or canonical decimal text, and use `DOUBLE PRECISION` only when approximation is intended.
+  `DECIMAL` are exact and return decimal strings; use `DOUBLE PRECISION` only when approximation
+  is intended. JSON/JSONB, UUID, arrays, `TIME`, intervals, and enum values also return strings at
+  the JavaScript boundary.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
 - On teardown, `await db.close()` before `store.close()` for a direct engine. For a worker,
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
@@ -86,16 +90,20 @@ machines: https://minnowdb.com/llms.txt
   enforces additional candidate keys atomically; any NULL component does not conflict.
   `DROP INDEX name` removes the catalog, postings, and unique membership. A matching non-null index
   can satisfy `ORDER BY` (and cover the query) on a keyless append-only table; other shapes sort.
+  Logical domains such as exact NUMERIC and enum use indexes for equality, but scan/sort for ranges.
+- SQL transactions support `SAVEPOINT name`, `ROLLBACK TO SAVEPOINT name`, and
+  `RELEASE SAVEPOINT name`. A second `BEGIN` is rejected; use a savepoint for nested work.
 - `db.explain(sql)` returns the optimized plan as text.
-- Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form. It
-  lists every supported and rejected form with an example.
-- Not supported, and what to write instead: `LATERAL` (rewrite as a join), `LISTAGG`
-  (aggregate strings in JavaScript — no string aggregate exists), `JSON_TABLE`
-  (`JSON_VALUE` and `JSON_QUERY`), `SIMILAR TO` (`LIKE`, or `MATCH` for text search), `COLLATE`,
-  `ARRAY[...]`, `TIME` literals (use `TIMESTAMP`), `CREATE SEQUENCE`, `GRANT`,
-  `SET TRANSACTION`, table declarations with multiple or composite unique keys, composite primary
-  or foreign keys, savepoints, correlated `NOT IN` (use `NOT EXISTS`), non-equality
-  correlation in scalar subqueries or `IN`, and correlated `EXISTS` nested below `OR`.
+- Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form, and
+  https://minnowdb.com/postgres-feature-profile.json before assuming PostgreSQL behavior. They
+  list the tracked supported and rejected forms plus deliberate differences and extensions.
+- Supported PostgreSQL forms include exact NUMERIC/DECIMAL, JSON/JSONB, UUID, arrays, TIME,
+  intervals, enums, sequences, multiple/composite keys, savepoints, filtered upserts, correlated
+  NOT IN, equality-correlated LATERAL, STRING_AGG, SIMILAR TO, COLLATE, and constant JSON_TABLE.
+- Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, configurable transaction isolation,
+  non-equality correlation in scalar subqueries or `IN`, correlated `EXISTS` below `OR`, correlated
+  LATERAL grouping/order/limit, correlated JSON_TABLE documents, enum evolution, and sequence
+  options. Check each supported entry's note before assuming every PostgreSQL variant.
 ```
 
 ## Why those rules
@@ -117,9 +125,9 @@ it needs to be.
 - **Workers.** Query execution on the main thread competes with rendering. Everyday application
   calls are the same on either side, so there is no reason to start on the main thread and move later.
   See [Workers & multi-tab](/docs/engine/workers).
-- **The SQL surface.** It is large but not complete, and the rejections are deliberate and
-  documented. An agent that checks the matrix writes a supported form the first time instead of
-  discovering the gap through an error.
+- **The SQL surface.** It is broad but not complete. The matrix lists every documented exclusion
+  and the limits on narrower supported forms. Checking it first avoids generating SQL the engine
+  will reject.
 - **The store choice.** Both durable stores use the same interface and file format, so this
   is a deployment decision, not an architecture one. The OPFS store's synchronous handles exist
   only in workers, and OPFS itself is absent in Safari private browsing — which is why the rule

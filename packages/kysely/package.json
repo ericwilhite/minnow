@@ -1,21 +1,21 @@
 {
-  "name": "@minnowdb/client",
-  "version": "0.2.0",
-  "description": "Typed query client for Minnow: a schema-aware builder over @minnowdb/core with inferred row types, constraints, views, and live queries.",
+  "name": "@minnowdb/kysely",
+  "version": "0.1.0",
+  "description": "Run Kysely queries against Minnow's browser-local SQL engine.",
   "license": "MIT",
   "author": "Eric Wilhite",
-  "homepage": "https://minnowdb.com/docs/client/",
+  "homepage": "https://minnowdb.com/docs/adapters/kysely/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ericwilhite/minnow.git",
-    "directory": "packages/client"
+    "directory": "packages/kysely"
   },
   "bugs": "https://github.com/ericwilhite/minnow/issues",
   "keywords": [
     "sql",
     "database",
     "browser",
-    "typescript",
+    "kysely",
     "query-builder",
     "minnow"
   ],
@@ -34,6 +34,12 @@
     "!dist/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@minnowdb/core": ">=0.2.1 <1.0.0"
+    "@minnowdb/core": ">=0.3.0 <1.0.0"
+  },
+  "peerDependencies": {
+    "kysely": ">=0.29.5 <0.30.0"
+  },
+  "devDependencies": {
+    "kysely": "^0.29.5"
   }
 }

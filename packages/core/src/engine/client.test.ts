@@ -220,7 +220,7 @@ describe("MinnowDatabaseClient", () => {
     // the generated values (including Dates) must survive the structured clone back.
     const notes = table("notes", {
       id: column.number().unique().autoIncrement(),
-      created: column.datetime().default("now"),
+      created: column.datetime().defaultSql("CURRENT_TIMESTAMP"),
       body: column.string(),
     });
     await client.migrate(schema([notes]));
@@ -234,7 +234,7 @@ describe("MinnowDatabaseClient", () => {
     // (the columnar pivot of empty rows would otherwise lose it).
     const stamps = table("stamps", {
       id: column.number().unique().autoIncrement(),
-      created: column.datetime().default("now"),
+      created: column.datetime().defaultSql("CURRENT_TIMESTAMP"),
     });
     await client.migrate(schema([stamps]));
     const empty = await client.insertBatch("stamps", [{}, {}]);
@@ -269,7 +269,10 @@ describe("MinnowDatabaseClient", () => {
       defaultValue: { kind: "literal", value: "future" },
       backfill: "existing",
     });
-    await client.insertBatch("wire_defaults", [{ id: 2, status: null }]);
+    await expect(client.insertBatch("wire_defaults", [{ id: 2, status: null }])).rejects.toThrow(
+      "status[0] cannot be null",
+    );
+    await client.insertBatch("wire_defaults", [{ id: 2 }]);
 
     expect(await client.query("SELECT id, status FROM wire_defaults ORDER BY id")).toMatchObject({
       rows: [

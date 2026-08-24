@@ -18,7 +18,7 @@ import {
   cachedListMembership,
   childExpressions,
   distinctFromComparison,
-  explicitNullOrder,
+  nullOrder,
   isScalarFunctionName,
   likeMatches,
   orderOutputName,
@@ -47,7 +47,20 @@ import {
   type QueryMemoryReservation,
   type QueryMemoryUsage,
 } from "./memory.js";
-import { compareSqlStrings, defineSqlResultProperty } from "./sql-semantics.js";
+import {
+  compareSqlStrings,
+  compileSimilarPattern,
+  defineSqlResultProperty,
+} from "./sql-semantics.js";
+import {
+  exactNumericBinary,
+  exactNumericCompare,
+  collatedDomainCompare,
+  enumDomainCompare,
+  externalSqlDomainValue,
+  isExactNumeric,
+  protectedSqlTextValue,
+} from "./sql-domains.js";
 import { buildSortKeyColumn, sortKeyIndexes } from "./sort-keys.js";
 
 const DEFAULT_BATCH_ROWS = 2_048;
@@ -369,6 +382,13 @@ interface BoundSelectItem {
 interface AggregateSpec {
   readonly name: AggregateName;
   readonly argument: BoundExpression;
+  /** Per-row separator for STRING_AGG. */
+  readonly delimiter?: BoundExpression;
+  readonly orderBy?: ReadonlyArray<{
+    expression: BoundExpression;
+    direction: "asc" | "desc";
+    nulls?: "first" | "last";
+  }>;
   /** `COUNT(DISTINCT x)`: the accumulator sees each distinct value once per group. */
   readonly distinct?: boolean;
   /** Set for MIN/MAX/COUNT over a bare datetime column: aggregate on raw epoch milliseconds. */
@@ -382,7 +402,7 @@ interface GroupState {
   readonly counts: Float64Array;
   readonly sums: Float64Array;
   readonly values: Array<QueryValue | undefined>;
-  /** Present only when this plan has JSON_ARRAYAGG; member arrays remain lazy per slot. */
+  /** Present only when this plan has a variable-width list aggregate; arrays stay lazy. */
   readonly lists?: Array<QueryValue[] | undefined>;
   readonly valueReservations: Array<QueryMemoryReservation | undefined>;
   readonly valueReservationBytes: Float64Array;
@@ -461,6 +481,7 @@ export function columnarTableFromRows(
   name: string,
   rows: readonly DatabaseRow[],
   projectedColumnNames?: readonly string[],
+  protectText = true,
 ): ColumnarTable {
   const columnNameSet = new Set(projectedColumnNames);
   if (projectedColumnNames === undefined) {
@@ -472,7 +493,10 @@ export function columnarTableFromRows(
   if (columnNames.length === 0) return { name, rowCount: rows.length, columns: new Map() };
   const columns = new Map<string, ColumnarColumnInput>();
   for (const columnName of columnNames) {
-    const values = rows.map((row) => row[columnName] ?? null);
+    const values = rows.map((row) => {
+      const value = row[columnName] ?? null;
+      return protectText && typeof value === "string" ? protectedSqlTextValue(value) : value;
+    });
     columns.set(columnName, { type: inferVectorType(values), values });
   }
   return createColumnarTable(name, columns);
@@ -1088,7 +1112,9 @@ function bindPlan(
     groupBy,
     groupIndexBySignature,
     aggregates: aggregateSpecs,
-    hasListAggregate: aggregateSpecs.some((aggregate) => aggregate.name === "JSON_ARRAYAGG"),
+    hasListAggregate: aggregateSpecs.some(
+      (aggregate) => aggregate.name === "JSON_ARRAYAGG" || aggregate.name === "STRING_AGG",
+    ),
     select,
     orderBy,
     grouped,
@@ -1195,7 +1221,11 @@ function bindExpression(
     };
   }
   if (expression.kind === "literal" || expression.kind === "wildcard") {
-    return { ...expression, signature };
+    return expression.kind === "literal" &&
+      typeof expression.value === "string" &&
+      expression.internalSqlValue !== true
+      ? { ...expression, value: protectedSqlTextValue(expression.value), signature }
+      : { ...expression, signature };
   }
   if (expression.kind === "column") {
     const parts = expression.reference.split(".");
@@ -1362,6 +1392,7 @@ function bindExpression(
         : undefined;
     const rawNumber =
       expression.name !== "JSON_ARRAYAGG" &&
+      expression.name !== "STRING_AGG" &&
       argument.kind === "column" &&
       argument.vector.kind === "number"
         ? { source: argument.source, vector: argument.vector }
@@ -1369,6 +1400,25 @@ function bindExpression(
     aggregateSpecs.push({
       name: expression.name,
       argument,
+      ...(expression.name === "STRING_AGG"
+        ? { delimiter: required(arguments_[1], "STRING_AGG delimiter is missing") }
+        : {}),
+      ...(expression.aggregateOrderBy === undefined
+        ? {}
+        : {
+            orderBy: expression.aggregateOrderBy.map((order) => ({
+              ...order,
+              expression: bindExpression(
+                order.expression,
+                sources,
+                aggregateSpecs,
+                aggregateIndexes,
+                memory,
+                ftsBySignature,
+                ftsStats,
+              ),
+            })),
+          }),
       // The signature this slot was keyed by is the JSON of the compiled call, which carries the
       // flag — so COUNT(x) and COUNT(DISTINCT x) in one select land in separate slots.
       ...(expression.distinct === true ? { distinct: true } : {}),
@@ -1442,7 +1492,8 @@ function ensureFtsDictionaryCache(
     const tokenCount = withScores ? new Uint32Array(vector.dictionary.length) : undefined;
     const termTf = withScores ? new Uint32Array(vector.dictionary.length * termCount) : undefined;
     for (let code = 0; code < vector.dictionary.length; code += 1) {
-      const tokens = tokenize(vector.dictionary[code] ?? "");
+      const rendered = externalSqlDomainValue(vector.dictionary[code] ?? "");
+      const tokens = tokenize(typeof rendered === "string" ? rendered : "");
       masks[code] = termsMask(tokens, expression.terms);
       if (tokenCount !== undefined) tokenCount[code] = tokens.length;
       if (termTf !== undefined) {
@@ -2028,8 +2079,21 @@ async function executeBoundPlanWithHashSpill(
                   spec.argument.kind === "wildcard"
                     ? 1
                     : evaluateBatchExpression(plan, spec.argument, batch, row);
-                spillRow[`a${String(index)}`] =
-                  raw === null || raw === undefined ? null : asQueryValue(raw);
+                if (spec.name === "STRING_AGG" && raw !== null && raw !== undefined) {
+                  const delimiter = required(spec.delimiter, "STRING_AGG delimiter is missing");
+                  spillRow[`a${String(index)}`] = JSON.stringify([
+                    raw,
+                    evaluateBatchExpression(plan, delimiter, batch, row),
+                    (spec.orderBy ?? []).map((order) =>
+                      encodeSpillValue(
+                        asQueryValue(evaluateBatchExpression(plan, order.expression, batch, row)),
+                      ),
+                    ),
+                  ]);
+                } else {
+                  spillRow[`a${String(index)}`] =
+                    raw === null || raw === undefined ? null : asQueryValue(raw);
+                }
               }
               batchMemory.tally(queryRowPayloadBytes(spillRow), "Hash spill value row");
               const partition = hashQueryValues(groupValues) & (partitionCount - 1);
@@ -2406,7 +2470,12 @@ function compareOrderedRows(
   orderBy: BoundPlan["orderBy"],
 ): number {
   for (const order of orderBy) {
-    const placed = explicitNullOrder(left[order.outputName], right[order.outputName], order.nulls);
+    const placed = nullOrder(
+      left[order.outputName],
+      right[order.outputName],
+      order.nulls,
+      order.direction,
+    );
     if (placed !== undefined && placed !== 0) return placed;
     const comparison = compareValues(left[order.outputName], right[order.outputName]);
     if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
@@ -3816,7 +3885,7 @@ class ResultSink {
     const orderBy = this.#plan.orderBy;
     for (let index = 0; index < orderBy.length; index += 1) {
       const order = required(orderBy[index], "Order term is missing");
-      const placed = explicitNullOrder(left[index], right[index], order.nulls);
+      const placed = nullOrder(left[index], right[index], order.nulls, order.direction);
       if (placed !== undefined && placed !== 0) return placed;
       const comparison = compareValues(left[index], right[index]);
       if (comparison !== 0) return order.direction === "desc" ? -comparison : comparison;
@@ -4453,7 +4522,14 @@ function updateAggregates(
       spec.argument.kind === "wildcard"
         ? 1
         : evaluateBatchExpression(plan, spec.argument, batch, row);
-    applyAggregateValue(spec, state, index, value, memory);
+    const delimiter =
+      spec.delimiter === undefined
+        ? undefined
+        : evaluateBatchExpression(plan, spec.delimiter, batch, row);
+    const orderValues = (spec.orderBy ?? []).map((order) =>
+      asQueryValue(evaluateBatchExpression(plan, order.expression, batch, row)),
+    );
+    applyAggregateValue(spec, state, index, value, memory, delimiter, orderValues);
   }
 }
 
@@ -4480,7 +4556,26 @@ function updateAggregatesFromValues(
 ): void {
   for (let index = 0; index < plan.aggregates.length; index += 1) {
     const spec = required(plan.aggregates[index], "Aggregate specification is missing");
-    applyAggregateValue(spec, state, index, values[index], memory);
+    const value = values[index];
+    if (spec.name === "STRING_AGG" && typeof value === "string") {
+      const decoded: unknown = JSON.parse(value);
+      if (!Array.isArray(decoded) || decoded.length !== 3) {
+        throw new Error("Spilled STRING_AGG input is invalid");
+      }
+      const encodedOrder: unknown = decoded[2];
+      if (!Array.isArray(encodedOrder)) throw new Error("Spilled STRING_AGG order is invalid");
+      applyAggregateValue(
+        spec,
+        state,
+        index,
+        decoded[0],
+        memory,
+        decoded[1],
+        encodedOrder.map(decodeSpillValue),
+      );
+    } else {
+      applyAggregateValue(spec, state, index, value, memory);
+    }
   }
 }
 
@@ -4490,6 +4585,8 @@ function applyAggregateValue(
   index: number,
   value: unknown,
   memory: QueryMemoryContext,
+  delimiter?: unknown,
+  orderValues: readonly QueryValue[] = [],
 ): void {
   if (spec.name === "JSON_ARRAYAGG") {
     const member = asQueryValue(value ?? null);
@@ -4508,13 +4605,45 @@ function applyAggregateValue(
     );
     return;
   }
+  if (spec.name === "STRING_AGG") {
+    if (value === null || value === undefined) return;
+    value = externalSqlDomainValue(value);
+    delimiter = externalSqlDomainValue(delimiter);
+    if (typeof value !== "string") throw new TypeError("STRING_AGG value must be a string");
+    if (delimiter !== null && delimiter !== undefined && typeof delimiter !== "string") {
+      throw new TypeError("STRING_AGG delimiter must be a string");
+    }
+    const distinctMember = JSON.stringify([value, delimiter ?? ""]);
+    if (spec.distinct === true && !firstOfItsKind(state, index, distinctMember, memory)) return;
+    const member = JSON.stringify([value, delimiter ?? "", orderValues.map(encodeSpillValue)]);
+    state.counts[index] = (state.counts[index] ?? 0) + 1;
+    const lists = required(state.lists, "STRING_AGG list state is missing");
+    let list = lists[index];
+    if (list === undefined) {
+      list = [];
+      lists[index] = list;
+    }
+    list.push(member);
+    memory.tally(
+      safeMemorySum(QUERY_REFERENCE_BYTES, queryValuePayloadBytes(member), "STRING_AGG member"),
+      "STRING_AGG member",
+    );
+    return;
+  }
   if (value === null || value === undefined) return;
   // One gate for every path that accumulates: the generic per-row path, the raw datetime path,
   // and the re-accumulation of spilled rows.
   if (spec.distinct === true && !firstOfItsKind(state, index, value, memory)) return;
   state.counts[index] = (state.counts[index] ?? 0) + 1;
   if (spec.name === "SUM" || spec.name === "AVG") {
-    state.sums[index] = (state.sums[index] ?? 0) + numeric(value);
+    if (isExactNumeric(value)) {
+      const current = state.values[index];
+      const sum = current === undefined ? value : exactNumericBinary("+", current, value);
+      if (sum === null || sum === undefined) throw new Error("Exact NUMERIC sum disappeared");
+      replaceAggregateValue(state, index, sum, `${spec.name} aggregate value`, memory);
+    } else {
+      state.sums[index] = (state.sums[index] ?? 0) + numeric(value);
+    }
   } else if (
     spec.name === "MIN" &&
     (state.values[index] === undefined || compareValues(value, state.values[index]) < 0)
@@ -4640,10 +4769,52 @@ function evaluateFinalExpression(
       ),
     );
   }
-  const sum = group.sums[aggregateIndex] ?? 0;
-  if (expression.name === "SUM") return sum;
-  if (expression.name === "AVG") return sum / count;
+  if (expression.name === "STRING_AGG") {
+    const members = required(group.lists, "STRING_AGG list state is missing")[aggregateIndex] ?? [];
+    const decoded = members.map((encoded) => {
+      if (typeof encoded !== "string") throw new Error("STRING_AGG member is invalid");
+      const pair: unknown = JSON.parse(encoded);
+      if (
+        !Array.isArray(pair) ||
+        typeof pair[0] !== "string" ||
+        typeof pair[1] !== "string" ||
+        !Array.isArray(pair[2])
+      ) {
+        throw new Error("STRING_AGG member is invalid");
+      }
+      return {
+        value: pair[0],
+        delimiter: pair[1],
+        order: pair[2].map(decodeSpillValue),
+      };
+    });
+    const orderBy = plan.aggregates[aggregateIndex]?.orderBy ?? [];
+    if (orderBy.length > 0) {
+      decoded.sort((left, right) => {
+        for (const [index, order] of orderBy.entries()) {
+          const a = left.order[index];
+          const b = right.order[index];
+          const placed = nullOrder(a, b, order.nulls, order.direction);
+          if (placed !== undefined && placed !== 0) return placed;
+          const compared = compareValues(a, b);
+          if (compared !== 0) return order.direction === "desc" ? -compared : compared;
+        }
+        return 0;
+      });
+    }
+    return protectedSqlTextValue(
+      decoded
+        .map((member, index) => (index === 0 ? member.value : member.delimiter + member.value))
+        .join(""),
+    );
+  }
   const value = group.values[aggregateIndex] ?? null;
+  if (expression.name === "SUM")
+    return isExactNumeric(value) ? value : (group.sums[aggregateIndex] ?? 0);
+  if (expression.name === "AVG") {
+    if (isExactNumeric(value)) return exactNumericBinary("/", value, count);
+    return (group.sums[aggregateIndex] ?? 0) / count;
+  }
   // Raw-millisecond datetime extremes re-box into a Date only here, once per surviving group.
   if (typeof value === "number" && plan.aggregates[aggregateIndex]?.rawDatetime !== undefined) {
     return new Date(value);
@@ -4880,19 +5051,23 @@ function dictionaryLikeMatches(
   caseInsensitive: boolean,
   escape: string | undefined,
 ): Uint8Array {
+  const externalPattern = externalSqlDomainValue(pattern);
+  if (typeof externalPattern !== "string") throw new TypeError("LIKE requires string operands");
   let patterns = dictionaryLikeCache.get(dictionary);
   if (patterns === undefined) {
     patterns = new Map();
     dictionaryLikeCache.set(dictionary, patterns);
   }
-  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""} ${pattern}`;
+  const key = `${caseInsensitive ? "i" : "s"}${escape ?? ""} ${externalPattern}`;
   let matches = patterns.get(key);
   if (matches === undefined) {
     matches = new Uint8Array(dictionary.length);
     for (let index = 0; index < dictionary.length; index += 1) {
-      matches[index] = likeMatches(pattern, dictionary[index] ?? "", caseInsensitive, escape)
-        ? 1
-        : 0;
+      const value = externalSqlDomainValue(dictionary[index] ?? "");
+      matches[index] =
+        typeof value === "string" && likeMatches(externalPattern, value, caseInsensitive, escape)
+          ? 1
+          : 0;
     }
     if (patterns.size >= 32) patterns.clear();
     patterns.set(key, matches);
@@ -4990,23 +5165,30 @@ function booleanTruth(
       operator === "LIKE" ||
       operator === "NOT LIKE" ||
       operator === "ILIKE" ||
-      operator === "NOT ILIKE"
+      operator === "NOT ILIKE" ||
+      operator === "SIMILAR TO" ||
+      operator === "NOT SIMILAR TO"
     ) {
-      const value = evaluateValue(expression.left);
-      const pattern = evaluateValue(expression.right);
+      const value = externalSqlDomainValue(evaluateValue(expression.left));
+      const pattern = externalSqlDomainValue(evaluateValue(expression.right));
       if (value === null || value === undefined || pattern === null || pattern === undefined) {
         return null;
       }
       if (typeof value !== "string" || typeof pattern !== "string") {
         throw new TypeError("LIKE requires string operands");
       }
-      const matched = likeMatches(
-        pattern,
-        value,
-        operator === "ILIKE" || operator === "NOT ILIKE",
-        expression.escape,
-      );
-      return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
+      const similar = operator === "SIMILAR TO" || operator === "NOT SIMILAR TO";
+      const matched = similar
+        ? compileSimilarPattern(pattern, expression.escape ?? "\\").test(value)
+        : likeMatches(
+            pattern,
+            value,
+            operator === "ILIKE" || operator === "NOT ILIKE",
+            expression.escape,
+          );
+      return operator === "LIKE" || operator === "ILIKE" || operator === "SIMILAR TO"
+        ? matched
+        : !matched;
     }
     if (operator === "IS DISTINCT FROM" || operator === "IS NOT DISTINCT FROM") {
       const distinct = distinctFromComparison(
@@ -5020,8 +5202,8 @@ function booleanTruth(
     if (left === null || left === undefined || right === null || right === undefined) return null;
     const a = comparable(left);
     const b = comparable(right);
-    if (operator === "=") return a === b;
-    if (operator === "!=" || operator === "<>") return a !== b;
+    if (operator === "=") return compareValues(a, b) === 0;
+    if (operator === "!=" || operator === "<>") return compareValues(a, b) !== 0;
     const comparison = compareValues(a, b);
     if (operator === ">") return comparison > 0;
     if (operator === ">=") return comparison >= 0;
@@ -5274,8 +5456,12 @@ function binaryValue(
     if (typeof left !== "string" || typeof right !== "string") {
       throw new TypeError("|| requires string operands");
     }
-    return left + right;
+    return protectedSqlTextValue(
+      String(externalSqlDomainValue(left)) + String(externalSqlDomainValue(right)),
+    );
   }
+  const exact = exactNumericBinary(operator, left, right);
+  if (exact !== undefined) return exact;
   const a = numeric(left);
   const b = numeric(right);
   if (operator === "+") return a + b;
@@ -5302,8 +5488,12 @@ function comparisonValue(
     operator === "LIKE" ||
     operator === "NOT LIKE" ||
     operator === "ILIKE" ||
-    operator === "NOT ILIKE"
+    operator === "NOT ILIKE" ||
+    operator === "SIMILAR TO" ||
+    operator === "NOT SIMILAR TO"
   ) {
+    leftValue = externalSqlDomainValue(leftValue);
+    rightValue = externalSqlDomainValue(rightValue);
     if (
       leftValue === null ||
       leftValue === undefined ||
@@ -5315,12 +5505,13 @@ function comparisonValue(
     if (typeof leftValue !== "string" || typeof rightValue !== "string") {
       throw new TypeError("LIKE requires string operands");
     }
-    const matched = likeMatches(
-      rightValue,
-      leftValue,
-      operator === "ILIKE" || operator === "NOT ILIKE",
-    );
-    return operator === "LIKE" || operator === "ILIKE" ? matched : !matched;
+    const similar = operator === "SIMILAR TO" || operator === "NOT SIMILAR TO";
+    const matched = similar
+      ? compileSimilarPattern(rightValue).test(leftValue)
+      : likeMatches(rightValue, leftValue, operator === "ILIKE" || operator === "NOT ILIKE");
+    return operator === "LIKE" || operator === "ILIKE" || operator === "SIMILAR TO"
+      ? matched
+      : !matched;
   }
   if (
     leftValue === null ||
@@ -5332,8 +5523,8 @@ function comparisonValue(
   }
   const left = comparable(leftValue);
   const right = comparable(rightValue);
-  if (operator === "=") return left === right;
-  if (operator === "!=" || operator === "<>") return left !== right;
+  if (operator === "=") return compareValues(left, right) === 0;
+  if (operator === "!=" || operator === "<>") return compareValues(left, right) !== 0;
   const comparison = compareValues(left, right);
   if (operator === ">") return comparison > 0;
   if (operator === ">=") return comparison >= 0;
@@ -5389,6 +5580,12 @@ function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
 }
 
 function compareValues(left: unknown, right: unknown): number {
+  const collated = collatedDomainCompare(left, right);
+  if (collated !== undefined) return collated;
+  const enumOrder = enumDomainCompare(left, right);
+  if (enumOrder !== undefined) return enumOrder;
+  const exact = exactNumericCompare(left, right);
+  if (exact !== undefined) return exact;
   const a = left instanceof Date ? left.getTime() : left;
   const b = right instanceof Date ? right.getTime() : right;
   if (a === b) return 0;

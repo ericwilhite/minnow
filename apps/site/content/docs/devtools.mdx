@@ -28,8 +28,7 @@ npm install @minnowdb/devtools
 
 ## Mount it
 
-The panel attaches to a `MinnowDatabase`, a `MinnowDatabaseClient`, or the typed `Minnow` client
-over either — it reaches the database behind that client through [`db.driver`](/docs/reference/api).
+The panel attaches directly to a `MinnowDatabase` or worker-hosted `MinnowDatabaseClient`.
 
 ```ts
 import { mountMinnowDevtools } from "@minnowdb/devtools";
@@ -80,13 +79,15 @@ The database is a property rather than an attribute, because it is an object.
 ## The schema rail
 
 Your tables sit down the left of both tabs, each expanding to its columns with their types,
-nullability, and which one is the unique key. Knowing what a column is called is as useful for
-writing a query as it is for browsing a table, so the rail never goes away.
+nullability, and which one is the unique key. SQL-declared indexes follow the columns with their
+ordered keys, descending directions, uniqueness, and build health. Knowing what a column or index
+is called is as useful for writing a statement as it is for browsing a table, so the rail never
+goes away.
 
 What clicking does follows the tab you are on:
 
-- On **Query**, a table or column name is inserted at the caret — `orders`, or `orders.total` —
-  spaced from whatever precedes it.
+- On **Query**, a table, column, or index name is inserted at the caret — `orders`,
+  `orders.total`, or `orders_by_total` — spaced from whatever precedes it.
 - On **Data**, a table opens in the grid.
 
 The chevron expands a table either way, so you can read its columns without loading it.
@@ -101,12 +102,12 @@ table's own order. The unique key is appended to every sort, so rows with equal 
 stable order instead of shuffling between pages.
 
 **Filtering.** `+ filter` builds a typed comparison: `=`, `≠`, `contains`, `starts with`, `<`, `≤`,
-`>`, `≥`, `like`, `in`, `between`, `is null`, `is not null`, offered per column type. Values are
+`>`, `≥`, `like`, `in`, `between`, `is null`, and `is not null`, offered per column type. Values are
 converted to the column's type before they reach SQL, so `score > 10` compares numbers. Filters
 combine with AND.
 
 For text, **`contains` is the one you usually want** — it adds the wildcards, so `crea` finds
-`created`. `like` takes a pattern exactly as written, which is standard SQL: `like crea` matches
+`created`. `like` takes a pattern exactly as written, following PostgreSQL: `like crea` matches
 only the string `crea`, and you need `%crea%` to search inside a value. The value box hints which
 one you are in.
 
@@ -125,7 +126,7 @@ when it is a datetime (the engine's date literals carry no time of day). Both gi
 one just gets slower the further in you go.
 
 **Counting.** `COUNT(*)` scans the whole table, so it runs alongside the first page rather than
-delaying it. Until it lands, the status bar says how many rows are loaded.
+delaying it. While it runs, the status bar says how many rows are loaded.
 
 ## Editing rows
 
@@ -143,8 +144,8 @@ needs the quotes).
 Writes go through the keyed batch API rather than generated SQL, so a datetime is written to the
 millisecond — the day-granular limit applies only to filters, which have to compile to SQL.
 
-After a write the row is re-read rather than patched in place, so the grid shows what actually
-landed.
+After a write the row is read again rather than patched in place, so the grid shows the committed
+value.
 
 **When editing is unavailable**, the panel says so in a banner instead of leaving a dead button:
 
@@ -217,11 +218,19 @@ Queries return rows; anything that changes data is described and confirmed first
 - An `UPDATE` or `DELETE` with no `WHERE` clause is called out as hitting every row.
 - With `permissions.write: false`, the statement is refused outright and never reaches the database.
 
+That confirmation step covers every statement that can change the database: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, schema
+DDL, index and trigger DDL, and transaction control. Destructive schema operations say what will
+be removed. Successful DDL refreshes the rail and completion automatically, so a new table,
+column, or index is available without pressing reload.
+
+`RETURNING` rows from an insert, update, or delete appear in the Rows tab and are cached with that
+history entry just like a SELECT result.
+
 What a statement does is read off the compiled plan, not its text, so a `SELECT` that merely
 mentions `DELETE` in a string literal is still a query.
 
 SQL that fails to compile is reported with the offending token selected in the editor — the
-position comes from [`SqlCompileError`](/docs/engine/index#errors).
+position comes from [`SqlCompileError`](/docs/engine#errors).
 
 ## Diagnostics
 
@@ -239,12 +248,18 @@ features share explains nothing rather than guessing between them.
 
 The **Plan** tab beside the results shows what the optimizer made of the statement — the join
 order, where filters run, and whether the scan can stream. It is asked for only
-when you look at it, and running a query returns you to the rows.
+when you look at it, and running a query returns you to the rows. Non-query statements say that a
+SELECT is required instead of passing DDL to the query planner.
+
+The Query/Data and Rows/Plan tab bars use the standard arrow, Home, and End keys. The editor
+divider is keyboard-resizable with Up and Down. In the data grid, arrow keys move between visible
+cells, Space selects a row, and Enter starts editing a cell when editing is available.
 
 ## History
 
-The last 50 runs are kept beside the console, newest first, each with its row count, timing, and
-age — or its error message, in red, if it failed. Click one to put it back in the editor.
+The last 50 runs are kept beside the console, newest first. Queries show their row count; other
+statements show their operation-specific result. Every entry carries its timing and age — or its
+error message, in red, if it failed. Click one to put it back in the editor.
 
 The query text and those timings persist, so history survives a reload. Result sets do not: fifty
 of them would exhaust the storage quota on the first wide query, so recent rows are cached in

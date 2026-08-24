@@ -117,7 +117,8 @@ export async function listDatasets(): Promise<DatasetRecord[]> {
     );
     await indexedDbTransactionDone(transaction);
     return records
-      .filter(isDatasetRecord)
+      .map(normalizeDatasetRecord)
+      .filter((record): record is DatasetRecord => record !== undefined)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   } finally {
     registry.close();
@@ -142,10 +143,15 @@ export async function removeDatasetRecord(id: string): Promise<void> {
   }
 }
 
-function isDatasetRecord(value: unknown): value is DatasetRecord {
-  if (typeof value !== "object" || value === null) return false;
+/**
+ * Records created by previous benchmark UIs did not record an index mode or split storage between
+ * table data and indexes. Keep their totals usable, but label both details unknown: development
+ * versions existed both before and after the shared foreign-key indexes were introduced.
+ */
+function normalizeDatasetRecord(value: unknown): DatasetRecord | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
   const record = value as Record<string, unknown>;
-  return (
+  if (!(
     typeof record.id === "string" &&
     typeof record.createdAt === "string" &&
     typeof record.scale === "number" &&
@@ -157,5 +163,36 @@ function isDatasetRecord(value: unknown): value is DatasetRecord {
     ["relaxed", "strict"].includes(String(record.durability)) &&
     typeof record.engines === "object" &&
     record.engines !== null
+  )) {
+    return undefined;
+  }
+  const secondaryIndexes =
+    record.secondaryIndexes === "foreign-keys" || record.secondaryIndexes === "none"
+      ? record.secondaryIndexes
+      : "unknown";
+  const engines = Object.fromEntries(
+    Object.entries(record.engines).map(([engine, value]) => {
+      if (typeof value !== "object" || value === null) return [engine, value];
+      const materialization = value as Record<string, unknown>;
+      return [
+        engine,
+        {
+          ...materialization,
+          dataStoredBytes:
+            typeof materialization.dataStoredBytes === "number"
+              ? materialization.dataStoredBytes
+              : null,
+          indexStoredBytes:
+            typeof materialization.indexStoredBytes === "number"
+              ? materialization.indexStoredBytes
+              : null,
+        },
+      ];
+    }),
   );
+  return {
+    ...(record as unknown as DatasetRecord),
+    secondaryIndexes,
+    engines,
+  };
 }

@@ -38,16 +38,20 @@ export default function BenchmarksPage() {
         <p className="mb-2">
           Every engine runs its shipped defaults — no pragmas, no tuning. Each database persists to
           the storage its own documentation recommends, named per engine above and reported exactly
-          as the engine installed it once a run has finished. Only the engine&rsquo;s own call is
-          timed; reshaping rows into the form each API wants is the harness&rsquo;s cost and is
-          excluded.
+          as the engine installed it once a run has finished. The workload declares the same primary
+          keys and foreign-key secondary indexes for all engines. Bulk inserts and post-load index
+          builds are reported separately, so an index cannot make a read faster by hiding its build
+          cost in the load number. Choose primary keys only to measure the same workload without
+          those secondary indexes. The storage table separates table data from index bytes. Only the
+          engine&rsquo;s own call is timed; reshaping rows into the form each API wants is the
+          harness&rsquo;s cost and is excluded.
         </p>
         <p className="mb-2">
-          The Minnow client columns and the live-query suite measure what an application pays above
-          the engine: every call goes through <code>MinnowDatabaseClient</code> over a message
-          channel, so the number includes the RPC frame, the result crossing the channel in its
-          columnar wire form, and the rows rebuilt on the receiving side. The live suite then
-          commits a row and stops the clock when the last affected subscription has been told.
+          All comparison engines already run in the benchmark&rsquo;s dedicated web worker. The read
+          table therefore compares their engine calls directly instead of adding a second, nested
+          worker channel to Minnow alone. The live-query suite still uses
+          <code>MinnowDatabaseClient</code>, because notification delivery across that channel is
+          the behavior it measures.
         </p>
         <p className="mb-2">
           Timings are taken by the batch. The browser&rsquo;s clock ticks every 5µs on this page and

@@ -76,9 +76,10 @@ another file-based store can be built from the same parts.
 
 One directory per database under `minnowdb/` in the origin's private file system: `wal` (the
 write-ahead log), `checkpoint-a` and `checkpoint-b` (alternating full-state snapshots),
-`extents/` (packed, append-only files holding block and full-text payloads), and `temp/` (query
-spill). Deleting the directory deletes the database — `deleteOpfsDatabase({ name })` does
-exactly that.
+`extents/` (packed, append-only files holding column blocks and index postings), and `temp/`
+(query spill). Posting row locators use a compact delta-varint encoding rather than JSON, so a
+secondary index does not spend most of its space spelling out bigint values. Deleting the
+directory deletes the database — `deleteOpfsDatabase({ name })` does exactly that.
 
 Collection deletes a sealed extent when it becomes empty and repacks one once dead payloads take
 more than half its file. Sealed extent bytes therefore stay below twice their live payload, plus

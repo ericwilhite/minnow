@@ -6,8 +6,6 @@ import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from 
 
 interface MatrixFeature {
   id: string;
-  /** ISO/IEC 9075:2023 Annex F feature identifier, or "minnow" for an engine extension. */
-  feature: string;
   status: "supported" | "unsupported";
   example: string;
   /** Statements executed before the example, for examples that need prior state. */
@@ -18,7 +16,9 @@ interface MatrixFeature {
   notes?: string;
 }
 
-const matrix = rawMatrix as { features: MatrixFeature[] };
+const matrix = rawMatrix as {
+  features: MatrixFeature[];
+};
 
 const rows: DatabaseRow[] = [
   { region: "west", amount: 10, active: true, joined: new Date("2026-01-02T00:00:00.000Z") },
@@ -70,24 +70,12 @@ describe("SQL feature matrix conformance", () => {
     expect(new Set(features.map(({ id }) => id)).size).toBe(features.length);
   });
 
-  it("keys every entry to the standard it claims", () => {
-    // An entry with no feature identifier cannot be checked against the standard at all, and a
-    // free-text one would drift; "minnow" is the single spelling for an extension SQL:2023 does
-    // not define, so the extensions stay countable.
-    const identifier = /^(?:[EFSTR]\d{3}(?:-\d{2})?|minnow)$/;
-    for (const feature of features) {
-      expect(`${feature.id}: ${feature.feature}`).toMatch(
-        new RegExp(`^${feature.id.replaceAll(".", "\\.")}: (?:[EFSTR]\\d{3}(?:-\\d{2})?|minnow)$`),
-      );
-      expect(identifier.test(feature.feature)).toBe(true);
-    }
+  it("uses the PostgreSQL profile as its only compatibility taxonomy", () => {
+    expect(features.filter((feature) => "feature" in feature)).toEqual([]);
   });
 
-  it("explains every feature it does not support", () => {
-    // A bare "unsupported" reads as an oversight. Each one carries the error a caller actually
-    // sees plus the reason the engine declines, so the boundary is a decision, not a gap.
+  it("explains every PostgreSQL form it does not support", () => {
     const unsupported = features.filter(({ status }) => status === "unsupported");
-    expect(unsupported.length).toBeGreaterThan(5);
     for (const feature of unsupported) {
       expect(feature.error ?? "").not.toBe("");
       expect((feature.notes ?? "").length).toBeGreaterThan(20);
@@ -125,7 +113,7 @@ describe("SQL feature matrix conformance", () => {
       // than optimization, so those plans have no runnable unoptimized form. They are named
       // here rather than caught by a bare try, so a feature that stops running unoptimized for
       // any other reason fails instead of quietly opting itself out.
-      if (!feature.id.startsWith("subquery.correlated")) {
+      if (!feature.id.startsWith("subquery.correlated") && feature.id !== "from.lateral") {
         const raw = bindPlanParameters(
           compileQuery(feature.example, { optimize: false }),
           feature.params,

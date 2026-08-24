@@ -22,23 +22,30 @@ export interface InsertFormDeps {
  */
 export function createInsertForm(deps: InsertFormDeps): InsertForm {
   const fields = el("div", { class: "insert-fields" });
-  const error = el("div", { class: "insert-error" });
+  const error = el("div", { class: "insert-error", attrs: { role: "alert" } });
   error.hidden = true;
   const save = button("btn primary", "Review insert");
   const cancel = button("btn", "Cancel");
-  const heading = el("h3", { class: "insert-title" });
+  const heading = el("h3", { class: "insert-title", attrs: { id: "mdt-insert-title" } });
 
-  const node = el("div", { class: "insert-sheet" }, [
-    el("div", { class: "insert-head" }, [heading]),
-    fields,
-    error,
-    el("div", { class: "insert-foot" }, [
-      el("span", { class: "insert-note", text: "Blank means NULL where the column allows it" }),
-      el("span", { class: "spacer" }),
-      cancel,
-      save,
-    ]),
-  ]);
+  const node = el(
+    "div",
+    {
+      class: "insert-sheet",
+      attrs: { role: "dialog", "aria-modal": "false", "aria-labelledby": "mdt-insert-title" },
+    },
+    [
+      el("div", { class: "insert-head" }, [heading]),
+      fields,
+      error,
+      el("div", { class: "insert-foot" }, [
+        el("span", { class: "insert-note", text: "Blank means NULL where the column allows it" }),
+        el("span", { class: "spacer" }),
+        cancel,
+        save,
+      ]),
+    ],
+  );
   node.hidden = true;
 
   let table: TableInfo | undefined;

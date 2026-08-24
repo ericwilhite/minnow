@@ -41,6 +41,18 @@
       "sqlite": 0.019,
       "pglite": 0.00647
     },
+    "kysely-point-lookup": {
+      "sqlite": 0.027,
+      "pglite": 0.0093
+    },
+    "exact-numeric-filter": {
+      "sqlite": 114,
+      "pglite": 13.3
+    },
+    "composite-key-lookup": {
+      "sqlite": 86,
+      "pglite": 0.55
+    },
     "range-scan": {
       "sqlite": 0.0831,
       "pglite": 0.0287
@@ -70,16 +82,16 @@
       "pglite": 0.18
     },
     "memo-hit-aggregate": {
-      "sqlite": 0.000102,
-      "pglite": 0.000151
+      "sqlite": 0.00016,
+      "pglite": 0.00023
     },
     "point-update": {
       "sqlite": 0.279,
       "pglite": 0.0971
     },
     "range-update": {
-      "sqlite": 0.286,
-      "pglite": 0.113
+      "sqlite": 0.38,
+      "pglite": 0.15
     },
     "filtered-update": {
       "sqlite": 0.485,

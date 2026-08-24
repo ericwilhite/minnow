@@ -136,5 +136,14 @@ describe("describeOutcome", () => {
     );
     expect(describeOutcome({ id: "a", sql: "x", at: 0, ms: 12, rowCount: 1 })).toBe("1 row · 12ms");
     expect(describeOutcome({ id: "a", sql: "x", at: 0, ms: 12, error: "boom" })).toBe("boom");
+    expect(
+      describeOutcome({
+        id: "a",
+        sql: "x",
+        at: 0,
+        ms: 12,
+        outcome: "created index by_name on people(name)",
+      }),
+    ).toBe("created index by_name on people(name) · 12ms");
   });
 });

@@ -25,12 +25,16 @@ describe("cornerRect", () => {
   });
 
   it("anchors to the origin on a viewport too small to hold the minimum", () => {
-    // Three columns cannot be squeezed into a phone. The panel keeps its usable width and starts
-    // at the origin, so the rail and the view are reachable, rather than shrinking to nothing.
+    // At exactly the desktop floor it still opens at that floor.
     const rect = cornerRect("bottom-right", { width: 500, height: 340 }, desktop);
     expect(rect.x).toBe(0);
     expect(rect.y).toBe(0);
     expect(rect.width).toBe(minimumSize.width);
+
+    // Below the floor, the viewport wins: close and window controls must never hang off-screen.
+    const phone = cornerRect("bottom-right", { width: 390, height: 700 }, desktop);
+    expect(phone.x).toBe(0);
+    expect(phone.width).toBe(390);
   });
 
   it("fits a panel that is merely larger than asked for", () => {
@@ -46,10 +50,10 @@ describe("cornerRect", () => {
 });
 
 describe("preferredSize", () => {
-  it("never opens smaller than the usable minimum", () => {
+  it("keeps the desktop minimum when it fits and the viewport margins when it does not", () => {
+    expect(preferredSize(desktop).width).toBeGreaterThanOrEqual(minimumSize.width);
     const size = preferredSize({ width: 320, height: 200 });
-    expect(size.width).toBe(minimumSize.width);
-    expect(size.height).toBe(minimumSize.height);
+    expect(size).toEqual({ width: 304, height: 184 });
   });
 });
 
@@ -69,6 +73,14 @@ describe("clampToViewport", () => {
     const clamped = clampToViewport(restored, desktop);
     expect(clamped.width).toBe(desktop.width);
     expect(clamped.height).toBe(desktop.height);
+  });
+
+  it("shrinks below the desktop floor on a phone so every control stays reachable", () => {
+    const clamped = clampToViewport(
+      { x: 200, y: 100, width: minimumSize.width, height: 500 },
+      { width: 390, height: 640 },
+    );
+    expect(clamped).toEqual({ x: 0, y: 100, width: 390, height: 500 });
   });
 });
 

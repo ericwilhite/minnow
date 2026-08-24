@@ -47,6 +47,7 @@ export function createConfirmLayer(): ConfirmLayer {
   heading.id = "mdt-confirm-title";
 
   let settle: ((confirmed: boolean) => void) | undefined;
+  let returnFocus: HTMLElement | undefined;
 
   function close(confirmed: boolean): void {
     if (settle === undefined) return;
@@ -54,6 +55,8 @@ export function createConfirmLayer(): ConfirmLayer {
     settle = undefined;
     node.hidden = true;
     resolve(confirmed);
+    if (returnFocus?.isConnected === true) returnFocus.focus();
+    returnFocus = undefined;
   }
 
   cancel.addEventListener("click", () => {
@@ -82,6 +85,11 @@ export function createConfirmLayer(): ConfirmLayer {
         // A second prompt while one is open would strand the first; decline it instead.
         close(false);
         settle = resolve;
+        const root = node.getRootNode();
+        returnFocus =
+          root instanceof ShadowRoot && root.activeElement instanceof HTMLElement
+            ? root.activeElement
+            : undefined;
         heading.textContent = request.title;
 
         facts.replaceChildren(

@@ -18,6 +18,8 @@ export const engineNames: Record<EngineId, string> = {
 };
 
 export type CompressionCodec = "raw" | "gzip";
+export type SecondaryIndexMode = "none" | "foreign-keys";
+export type RecordedSecondaryIndexMode = SecondaryIndexMode | "unknown";
 
 /** One engine's materialized copy of a dataset. */
 export interface EngineMaterialization {
@@ -34,9 +36,17 @@ export interface EngineMaterialization {
   vfs?: "opfs" | "sah-pool";
   version: string;
   persistence: string;
+  /** Storage occupied after tables and primary keys, before optional secondary indexes. */
+  dataStoredBytes: number | null;
+  /** Additional logical bytes attributed to the optional secondary indexes. */
+  indexStoredBytes: number | null;
   storedBytes: number | null;
+  /** End-to-end materialization, including schema, inserts, indexes, verification, and reopen. */
   buildMs: number;
+  /** Engine calls that insert the generated rows; harness-side row generation is excluded. */
   insertMs: number;
+  /** Engine DDL calls that build the workload's secondary indexes after the bulk insert. */
+  indexMs: number;
   error?: string;
 }
 
@@ -50,6 +60,7 @@ export interface DatasetRecord {
   compression: CompressionCodec;
   targetBlockBytes: number;
   durability: DurabilityMode;
+  secondaryIndexes: RecordedSecondaryIndexMode;
   engines: Partial<Record<EngineId, EngineMaterialization>>;
 }
 
@@ -58,6 +69,7 @@ export interface DatasetCreatePayload {
   compression: CompressionCodec;
   targetBlockBytes: number;
   durability: DurabilityMode;
+  secondaryIndexes: SecondaryIndexMode;
   engines: EngineId[];
 }
 
@@ -134,15 +146,6 @@ export interface ReferenceEngineMeasurement {
   cachedMedianMs?: number;
   cachedBatchSize?: number;
   /**
-   * Minnow engines only: median of the same statement issued through `MinnowDatabaseClient`
-   * over a message channel — the RPC frame, the result crossing the channel in its columnar
-   * wire form, and the rows rebuilt on the receiving side. This is what an application on the
-   * main thread pays; `medianMs` is what the engine alone costs. Absent for engines that have
-   * no such client layer.
-   */
-  clientMedianMs?: number;
-  clientBatchSize?: number;
-  /**
    * Peak modeled execution memory in bytes, self-reported by engines that measure their own
    * execution. The browser's cross-engine memory API is unavailable in this harness (Chromium
    * refuses it without full site isolation, which Playwright's build lacks, and it does not
@@ -173,6 +176,7 @@ export interface ReferenceQueryReport {
 export interface ReferenceSuiteResult {
   datasetId: string;
   scale: number;
+  secondaryIndexes: RecordedSecondaryIndexMode;
   sampleCount: number;
   engines: EngineId[];
   queries: ReferenceQueryReport[];

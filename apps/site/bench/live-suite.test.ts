@@ -20,6 +20,7 @@ const record: DatasetRecord = {
   compression: "raw",
   targetBlockBytes: 1_048_576,
   durability: "relaxed",
+  secondaryIndexes: "none",
   engines: {},
 };
 

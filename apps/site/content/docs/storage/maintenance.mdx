@@ -104,8 +104,8 @@ everything that version needs.
 The completed pass also removes expired reader leases, abandoned query-spill owners and pages,
 old manifest markers below the earliest readable checkpoint once every unused block they name
 is gone, and finished maintenance-job records beyond the small diagnostic tail. Keeping that
-marker until its last block disappears lets small passes resume a large backlog without
-losing its durable block list. These are record bounds, not just block-byte bounds: normal
+marker until its last block disappears lets small passes resume a large cleanup without losing
+its durable block list. These are record bounds, not just block-byte bounds: normal
 commits, cancelled folds, and crashed readers do not leave one permanent metadata record per
 event. Segment discovery reads bounded `listSegmentPage()` windows directly, so reclaiming old
 segment and transaction records does not depend on keeping an unbounded compaction-job history.

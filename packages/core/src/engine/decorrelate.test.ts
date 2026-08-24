@@ -19,6 +19,26 @@ const tables = new Map<string, DatabaseRow[]>([
       { region: "north", label: "North", rank: 3 },
     ],
   ],
+  [
+    "probes",
+    [
+      { g: "empty", v: null },
+      { g: "clean", v: 1 },
+      { g: "clean", v: 2 },
+      { g: "clean", v: null },
+      { g: "poisoned", v: 1 },
+      { g: "poisoned", v: 3 },
+    ],
+  ],
+  [
+    "members",
+    [
+      { g: "clean", v: 2 },
+      { g: "clean", v: 3 },
+      { g: "poisoned", v: null },
+      { g: "poisoned", v: 4 },
+    ],
+  ],
 ]);
 
 function run(sql: string): DatabaseRow[] {
@@ -88,6 +108,37 @@ describe("correlated subquery decorrelation", () => {
     ).toEqual([{ amount: 10 }, { amount: 6 }]);
   });
 
+  it("decorrelates equality LATERAL sources into a hash join", () => {
+    const plan = compileQuery(
+      "SELECT r.amount, x.label FROM rows r, " +
+        "LATERAL (SELECT d.label FROM dims d WHERE d.region = r.region) x",
+    );
+    expect(plan.joins.at(-1)?.kind).toBe("inner");
+    expect(plan.joins.at(-1)?.on).toBeUndefined();
+    expect(executeQuery(plan, tables).rows).toEqual([
+      { amount: 10, label: "West Coast" },
+      { amount: 6, label: "West Coast" },
+    ]);
+    expect(executeRowQuery(plan, tables).rows).toEqual([
+      { amount: 10, label: "West Coast" },
+      { amount: 6, label: "West Coast" },
+    ]);
+  });
+
+  it("preserves LEFT LATERAL rows and hides decorrelation keys from wildcards", () => {
+    expect(
+      run(
+        "SELECT r.amount, x.* FROM rows r LEFT JOIN LATERAL " +
+          "(SELECT d.label FROM dims d WHERE d.region = r.region) x ON TRUE ORDER BY r.amount",
+      ),
+    ).toEqual([
+      { amount: 3, "x.label": null },
+      { amount: 6, "x.label": "West Coast" },
+      { amount: 8, "x.label": null },
+      { amount: 10, "x.label": "West Coast" },
+    ]);
+  });
+
   it("supports multi-key correlation", () => {
     expect(
       run(
@@ -129,12 +180,25 @@ describe("correlated subquery decorrelation", () => {
     expect(executeRowQuery(plan, tables).rows).toEqual([{ amount: 3 }]);
   });
 
-  it("rejects correlated NOT IN with a pointer to NOT EXISTS", () => {
-    expect(() =>
-      compileQuery(
-        "SELECT r.region FROM rows r WHERE r.region NOT IN (SELECT d.region FROM dims d WHERE d.region = r.region)",
-      ),
-    ).toThrow("use NOT EXISTS");
+  it("answers correlated NOT IN with empty-set and NULL semantics", () => {
+    const plan = compileQuery(
+      "SELECT p.g, p.v FROM probes p WHERE p.v NOT IN " +
+        "(SELECT m.v FROM members m WHERE m.g = p.g)",
+    );
+    expect(plan.joins.slice(-2).map(({ kind, on }) => [kind, on])).toEqual([
+      ["anti", undefined],
+      ["left", undefined],
+    ]);
+    expect(executeQuery(plan, tables).rows).toEqual([
+      // NULL NOT IN an empty correlated set is true.
+      { g: "empty", v: null },
+      // 1 has no equal member and the set contains no NULL.
+      { g: "clean", v: 1 },
+    ]);
+    expect(executeRowQuery(plan, tables).rows).toEqual([
+      { g: "empty", v: null },
+      { g: "clean", v: 1 },
+    ]);
   });
 
   it("answers correlated scalar aggregates in the select list", () => {

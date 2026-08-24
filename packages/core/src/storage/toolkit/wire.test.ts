@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   decodeChunk,
+  decodePostingChunk,
   decodeRecordJson,
   decodeSyncCheckpoint,
   encodeChunk,
+  encodePostingChunk,
   encodeRecordJson,
   encodeSyncCheckpoint,
 } from "./wire.js";
@@ -55,6 +57,32 @@ describe("chunk envelope", () => {
   it("treats the wrong magic as not-written", () => {
     const checkpoint = encodeSyncCheckpoint({ anything: 1 });
     expect(decodeChunk(checkpoint)).toBeUndefined();
+  });
+});
+
+describe("compact posting chunks", () => {
+  it("round-trips sorted bigint locators and unicode terms", () => {
+    const postings = [
+      { term: "café", rowIds: [1n, 2n, 4_294_967_295n], tf: [1, 3, 2] },
+      { term: "paid", rowIds: [7n, 8n, 50n], tf: [1, 1, 1] },
+    ];
+    expect(decodePostingChunk(encodePostingChunk(postings))).toEqual(postings);
+  });
+
+  it("is materially smaller than the legacy JSON representation", () => {
+    const postings = Array.from({ length: 100 }, (_, term) => ({
+      term: `term-${String(term)}`,
+      rowIds: Array.from({ length: 20 }, (_, row) => BigInt(term * 100 + row + 1)),
+      tf: Array.from({ length: 20 }, () => 1),
+    }));
+    expect(encodePostingChunk(postings).byteLength).toBeLessThan(
+      encodeChunk(postings).byteLength / 3,
+    );
+  });
+
+  it("leaves legacy generic chunks to the compatibility decoder", () => {
+    const legacy = encodeChunk([{ term: "old", rowIds: [1n], tf: [1] }]);
+    expect(decodePostingChunk(legacy)).toBeUndefined();
   });
 });
 

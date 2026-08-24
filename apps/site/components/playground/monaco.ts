@@ -203,6 +203,50 @@ async function start(declarations: string): Promise<Monaco> {
     { content: declarations, filePath: "file:///playground.d.ts" },
   ]);
 
+  /*
+   * Keep the query builder's starting point on the first screen of an empty completion list.
+   *
+   * Kysely has enough root helpers that Monaco virtualizes `selectFrom` below the visible rows.
+   * That is technically complete but poor discovery for the reader this console is meant for.
+   * This one ranked item supplements the TypeScript worker rather than replacing it: the worker
+   * still supplies every member, the signature after acceptance, and all schema-aware results.
+   * Restricting it to the playground model and a root `db.` expression prevents it from leaking
+   * into table, column, or arbitrary TypeScript completions.
+   */
+  monaco.languages.registerCompletionItemProvider(
+    { language: "typescript", pattern: "**/snippet.ts" },
+    {
+      triggerCharacters: ["."],
+      provideCompletionItems(model, position) {
+        const beforeCursor = model
+          .getLineContent(position.lineNumber)
+          .slice(0, position.column - 1);
+        if (!/(?:^|[^\w$])db\.[\w$]*$/.test(beforeCursor)) return { suggestions: [] };
+
+        const word = model.getWordUntilPosition(position);
+        return {
+          suggestions: [
+            {
+              label: "selectFrom",
+              kind: monaco.languages.CompletionItemKind.Method,
+              detail: "Start a typed query",
+              documentation: "Select rows from a table in the playground schema.",
+              sortText: "0000-selectFrom",
+              preselect: true,
+              insertText: "selectFrom",
+              range: {
+                startLineNumber: position.lineNumber,
+                startColumn: word.startColumn,
+                endLineNumber: position.lineNumber,
+                endColumn: position.column,
+              },
+            },
+          ],
+        };
+      },
+    },
+  );
+
   return monaco;
 }
 

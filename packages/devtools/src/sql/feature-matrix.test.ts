@@ -61,10 +61,10 @@ describe("the shipped matrix", () => {
   it("explains the failures that a devtools user is most likely to hit", () => {
     const index = buildFailureIndex(matrix.features);
     for (const message of [
-      "Correlated NOT IN subqueries are not supported; use NOT EXISTS",
       "UPDATE requires a table with a unique key",
       // BEGIN is a statement now; the isolation level is what a user still cannot ask for.
       "Expected SELECT, found SET",
+      "Expected SELECT, found GRANT",
     ]) {
       expect(lookupFailure(index, message)?.notes).toBeDefined();
     }

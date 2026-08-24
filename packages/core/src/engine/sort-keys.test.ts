@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { explicitNullOrder } from "./query.js";
+import { nullOrder } from "./query.js";
 import { buildSortKeyColumn, sortKeyIndexes, type SortKeyTerm } from "./sort-keys.js";
 import { compareSqlValues } from "./sql-semantics.js";
 
@@ -15,7 +15,12 @@ function referenceOrder(terms: readonly TermSpec[]): number[] {
   const indexes = Array.from({ length: count }, (_, index) => index);
   indexes.sort((left, right) => {
     for (const term of terms) {
-      const placed = explicitNullOrder(term.values[left], term.values[right], term.nulls);
+      const placed = nullOrder(
+        term.values[left],
+        term.values[right],
+        term.nulls,
+        term.descending === true ? "desc" : "asc",
+      );
       if (placed !== undefined && placed !== 0) return placed;
       const comparison = compareSqlValues(term.values[left], term.values[right]);
       if (comparison !== 0) return term.descending === true ? -comparison : comparison;
@@ -103,7 +108,7 @@ describe("sort key columns", () => {
 
 describe("sortKeyIndexes", () => {
   it("is stable: equal keys keep their input order", () => {
-    expect(kernelOrder([{ values: [2, 1, 2, 1, null, 2, null] }])).toEqual([4, 6, 1, 3, 0, 2, 5]);
+    expect(kernelOrder([{ values: [2, 1, 2, 1, null, 2, null] }])).toEqual([1, 3, 0, 2, 5, 4, 6]);
     expect(kernelOrder([{ values: ["b", "a", "b", "a"], descending: true }])).toEqual([0, 2, 1, 3]);
   });
 
@@ -113,10 +118,10 @@ describe("sortKeyIndexes", () => {
     expect(kernelOrder([{ values, descending: true }])).toEqual([0, 4, 2, 1, 3, 6, 5]);
   });
 
-  it("places NULL first by default ascending, last descending, or where NULLS FIRST/LAST says", () => {
+  it("uses PostgreSQL NULL defaults or an explicit NULLS FIRST/LAST", () => {
     const values = [1, null, 0, null, 2];
-    expect(kernelOrder([{ values }])).toEqual([1, 3, 2, 0, 4]);
-    expect(kernelOrder([{ values, descending: true }])).toEqual([4, 0, 2, 1, 3]);
+    expect(kernelOrder([{ values }])).toEqual([2, 0, 4, 1, 3]);
+    expect(kernelOrder([{ values, descending: true }])).toEqual([1, 3, 4, 0, 2]);
     expect(kernelOrder([{ values, nulls: "last" }])).toEqual([2, 0, 4, 1, 3]);
     expect(kernelOrder([{ values, descending: true, nulls: "first" }])).toEqual([1, 3, 4, 0, 2]);
     // NULL and NaN are different keys: NaN is a number that sorts last among numbers.

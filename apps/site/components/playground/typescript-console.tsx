@@ -1,6 +1,6 @@
 "use client";
 /**
- * The typed client, over the database this page already built.
+ * Kysely, over the database this page already built.
  *
  * The SQL console beside it proves the engine answers queries. This one proves the other half of
  * the claim: that the query you write is checked against the schema before it runs. So the editor
@@ -70,16 +70,22 @@ export function TypeScriptConsole({
       }
       setStatus({ kind: "ready" });
 
-      const [{ createMinnow, sql }, core] = await Promise.all([
-        import("@minnowdb/client"),
+      const [{ createKysely }, kysely, core] = await Promise.all([
+        import("@minnowdb/kysely"),
+        import("kysely"),
         import("@minnowdb/core"),
       ]);
-      const db = createMinnow(database.current, {
+      const db = createKysely({
+        driver: database.current,
         schema: (await import("@/lib/dataset/retail")).retailDefinition,
       });
       setResult(
         await runSnippet(compiled.javascript, {
-          modules: { "@minnowdb/client": { createMinnow, sql }, "@minnowdb/core": core },
+          modules: {
+            "@minnowdb/kysely": { createKysely },
+            kysely: { sql: kysely.sql },
+            "@minnowdb/core": core,
+          },
           globals: { db, database: database.current },
         }),
       );

@@ -40,6 +40,9 @@ export function validateCreatePayload(value: unknown): DatasetCreatePayload {
   if (durability !== "relaxed" && durability !== "strict") {
     throw new Error("Invalid durability");
   }
+  if (payload.secondaryIndexes !== "none" && payload.secondaryIndexes !== "foreign-keys") {
+    throw new Error("Invalid secondary-index mode");
+  }
   if (
     !Array.isArray(payload.engines) ||
     payload.engines.length === 0 ||
@@ -52,6 +55,7 @@ export function validateCreatePayload(value: unknown): DatasetCreatePayload {
     compression,
     targetBlockBytes: payload.targetBlockBytes ?? 1_048_576,
     durability,
+    secondaryIndexes: payload.secondaryIndexes,
     engines: [...new Set(payload.engines)],
   };
 }
@@ -72,6 +76,7 @@ export async function datasetCreate(
     compression: payload.compression,
     targetBlockBytes: payload.targetBlockBytes,
     durability: payload.durability,
+    secondaryIndexes: payload.secondaryIndexes,
     engines: {},
   };
   const totalRows = record.totalRows * payload.engines.length;
@@ -114,9 +119,12 @@ export async function datasetCreate(
         storageName: "",
         version: "unavailable",
         persistence: "not materialized",
+        dataStoredBytes: null,
+        indexStoredBytes: null,
         storedBytes: null,
         buildMs: 0,
         insertMs: 0,
+        indexMs: 0,
         error: error instanceof Error ? error.message : String(error),
       };
     }
@@ -147,9 +155,12 @@ async function cleanupPartial(record: DatasetRecord, engine: EngineId): Promise<
             : `mdb-dataset-${record.id}`,
       version: "",
       persistence: "",
+      dataStoredBytes: null,
+      indexStoredBytes: null,
       storedBytes: null,
       buildMs: 0,
       insertMs: 0,
+      indexMs: 0,
     });
   } catch {
     // Best effort; orphaned partial storage is reclaimed on delete.

@@ -77,15 +77,49 @@ export interface PublishManifestInput {
 export const simpleDataTypes = ["boolean", "number", "string", "datetime"] as const;
 export type SimpleDataType = (typeof simpleDataTypes)[number];
 
+/** PostgreSQL logical domains layered over the four stable physical block encodings. */
+export type SqlDomain =
+  | { kind: "numeric"; precision?: number; scale?: number }
+  | { kind: "json" | "jsonb" | "uuid" | "time" | "interval" }
+  | { kind: "array"; element: string }
+  | { kind: "enum"; name: string; values: string[] };
+
+/** Validates the logical metadata shared by SQL DDL, the schema DSL, and restored catalogs. */
+export function validateSqlDomain(domain: SqlDomain, context: string): SqlDomain {
+  if (domain.kind === "numeric") {
+    const { precision, scale } = domain;
+    if (
+      (precision !== undefined &&
+        (!Number.isSafeInteger(precision) || precision < 1 || precision > 100_000)) ||
+      (scale !== undefined && (!Number.isSafeInteger(scale) || scale < 0 || scale > 100_000)) ||
+      (precision !== undefined && scale !== undefined && scale > precision)
+    ) {
+      throw new TypeError(`Invalid NUMERIC domain metadata: ${context}`);
+    }
+  }
+  if (
+    domain.kind === "array" &&
+    (domain.element.trim().length === 0 || domain.element.trim() !== domain.element)
+  ) {
+    throw new TypeError(`ARRAY element type must be a trimmed non-empty name: ${context}`);
+  }
+  if (domain.kind === "enum") {
+    if (domain.name.trim().length === 0 || domain.name.trim() !== domain.name) {
+      throw new TypeError(`Enum type name must be a trimmed non-empty name: ${context}`);
+    }
+    validateEnumValues(domain.values, domain.name);
+  }
+  return structuredClone(domain);
+}
+
 /**
- * Declarative write-time default. Plain structured-clone-safe data: the spec crosses the
- * worker postMessage boundary and persists in the catalog, so function defaults are
- * unrepresentable by design — the schema DSL carries those separately (`ColumnBuilder.defaultFn`)
- * and the typed facade fills them before a batch reaches the engine.
+ * Declarative SQL write-time default. The spec is structured-clone-safe because it crosses the
+ * worker boundary and persists in the catalog. Expressions are parsed and type-checked by the
+ * engine before the catalog is changed, then evaluated once for every omitted insert slot.
  */
 export type ColumnDefault =
-  | { kind: "now" }
-  | { kind: "literal"; value: boolean | number | string }
+  | { kind: "literal"; value: boolean | number | string | Date }
+  | { kind: "expression"; sql: string }
   | { kind: "autoincrement" };
 
 export interface TableColumnRecord {
@@ -99,8 +133,10 @@ export interface TableColumnRecord {
    * before it reaches storage while preserving the released Float64 block encoding.
    */
   integer?: true;
+  /** SQL-level semantics for a value physically encoded in this column's primitive type. */
+  sqlDomain?: SqlDomain;
   nullable: boolean;
-  /** Fills null-or-absent slots at insert time; never applied at read time. */
+  /** Fills omitted or SQL `DEFAULT` slots at insert time; explicit NULL is never replaced. */
   defaultValue?: ColumnDefault;
   /**
    * What rows written before this column existed read as, instead of NULL.
@@ -122,6 +158,8 @@ export interface TableColumnRecord {
    * dropping it) is catalog-only while narrowing it is rejected by migration planning.
    */
   enumValues?: string[];
+  /** Engine-generated row-addressing column; stored and indexed, never exposed as SQL schema. */
+  hidden?: true;
 }
 
 /**
@@ -158,6 +196,20 @@ export function validateTableColumns(columns: readonly TableColumnRecord[]): voi
     if (integer !== undefined && (integer !== true || column.type !== "number")) {
       throw new TypeError(`Integer domain requires a number column: ${column.name}`);
     }
+    if (column.sqlDomain !== undefined && column.type !== "string") {
+      throw new TypeError(`SQL domain columns must use string storage: ${column.name}`);
+    }
+    if (column.sqlDomain !== undefined) validateSqlDomain(column.sqlDomain, column.name);
+    if (column.integer === true && column.sqlDomain !== undefined) {
+      throw new TypeError(
+        `A column cannot have both integer and SQL-domain metadata: ${column.name}`,
+      );
+    }
+    if (column.enumValues !== undefined && column.sqlDomain !== undefined) {
+      throw new TypeError(
+        `A column cannot have both enum restrictions and a SQL domain: ${column.name}`,
+      );
+    }
   }
   const ids = new Set(columns.map(({ id }) => id));
   const names = new Set(columns.map(({ name }) => name));
@@ -169,29 +221,22 @@ export function validateTableColumns(columns: readonly TableColumnRecord[]): voi
 /**
  * The single authority on which default declarations are legal, shared by the schema DSL's
  * `table()` and the engine's `createTable` so the two entry points (and the wire path between
- * them) can never drift: defaults require non-nullable columns, "now" is datetime-only,
- * auto-increment is the number unique key, and the unique key never defaults to a constant.
+ * them) can never drift. Storage owns structural and literal validation; the engine additionally
+ * parses and type-checks SQL expressions before catalog mutation.
  */
 export function validateColumnDefault(
   column: {
     name: string;
     type: SimpleDataType;
     integer?: true;
+    sqlDomain?: SqlDomain;
     nullable: boolean;
     isUniqueKey: boolean;
     enumValues?: readonly string[];
   },
   defaultValue: ColumnDefault,
 ): void {
-  if (column.nullable) {
-    throw new TypeError(`Defaults require a non-nullable column: ${column.name}`);
-  }
   switch (defaultValue.kind) {
-    case "now":
-      if (column.type !== "datetime") {
-        throw new TypeError(`Default now requires a datetime column: ${column.name}`);
-      }
-      return;
     case "autoincrement":
       if (column.type !== "number") {
         throw new TypeError(`Auto-increment requires a number column: ${column.name}`);
@@ -200,12 +245,25 @@ export function validateColumnDefault(
         throw new TypeError(`Auto-increment requires the unique key column: ${column.name}`);
       }
       return;
+    case "expression":
+      if (
+        typeof defaultValue.sql !== "string" ||
+        defaultValue.sql.length === 0 ||
+        defaultValue.sql.trim() !== defaultValue.sql
+      ) {
+        throw new TypeError(`Default SQL must be a trimmed non-empty expression: ${column.name}`);
+      }
+      return;
     case "literal": {
       const value = defaultValue.value;
-      if (column.type === "datetime") {
-        throw new TypeError(`Datetime columns default with now, not a literal: ${column.name}`);
-      }
-      if (typeof value !== column.type) {
+      const numericDomain = column.sqlDomain?.kind === "numeric";
+      const correctType =
+        column.type === "datetime"
+          ? value instanceof Date && Number.isFinite(value.getTime())
+          : numericDomain
+            ? typeof value === "number" || typeof value === "string"
+            : typeof value === column.type;
+      if (!correctType) {
         throw new TypeError(`Default literal must be a ${column.type}: ${column.name}`);
       }
       if (typeof value === "number" && !Number.isFinite(value)) {
@@ -221,12 +279,16 @@ export function validateColumnDefault(
       ) {
         throw new TypeError(`Default must be one of the enum values: ${column.name}`);
       }
-      if (column.isUniqueKey) {
-        throw new TypeError(`Unique key cannot default to a constant: ${column.name}`);
+      if (
+        column.sqlDomain?.kind === "enum" &&
+        typeof value === "string" &&
+        !column.sqlDomain.values.includes(value)
+      ) {
+        throw new TypeError(`Default must be one of the enum values: ${column.name}`);
       }
       return;
     }
-    // The wire path can hand this untyped data (including specs from removed generator kinds).
+    // Storage restoration and untyped wire callers can still supply malformed catalog data.
     default:
       throw new TypeError(
         `Unknown default kind: ${String((defaultValue as { kind?: unknown }).kind)}`,
@@ -292,6 +354,8 @@ export interface TableRecord {
   name: string;
   columns: TableColumnRecord[];
   uniqueKeyColumnId?: string;
+  /** Declared PRIMARY KEY columns. More than one uses the hidden scalar row-addressing key. */
+  primaryKeyColumnIds?: string[];
   uniqueKeyLookupReady?: boolean;
   /** Full-text index state per column ID. Writers that see this emit commit deltas. */
   ftsColumns?: Record<string, FtsColumnIndexRecord>;
@@ -299,16 +363,14 @@ export interface TableRecord {
   secondaryIndexes?: Record<string, SecondaryIndexRecord>;
   /** AFTER triggers on this table, fired by the committing writer inside its transaction. */
   triggers?: TriggerRecord[];
-  /**
-   * Single-column FOREIGN KEY constraints (E141-04). The referenced column is the parent's
-   * unique key, which is what the engine can probe for existence and what its keyed write paths
-   * address rows by; a parent key never changes, so only ON DELETE has an action to take.
-   */
+  /** FOREIGN KEY constraints. Missing arrays are legacy single-column records. */
   foreignKeys?: Array<{
     name: string;
     column: string;
+    columns?: string[];
     parentTable: string;
     parentColumn: string;
+    parentColumns?: string[];
     onDelete: "restrict" | "cascade" | "set null";
   }>;
   /**
@@ -340,6 +402,10 @@ export interface TableRecord {
      */
     managed?: boolean;
   };
+  /** Internal catalog object backing CREATE TYPE ... AS ENUM; never exposed as a table. */
+  enumType?: { name: string; values: string[] };
+  /** Internal catalog object backing a durable PostgreSQL sequence. */
+  sequence?: { name: string; start: number; columnId: string };
   createdAt: string;
   /** Compare-and-swap revision for catalog evolution; records written before it read as 0. */
   revision?: number;

@@ -12,6 +12,8 @@
  * matter what order they accumulate in. Keep it that way: never feed it a running float.
  */
 
+import { externalSqlDomainValue } from "./sql-domains.js";
+
 export const FTS_TOKENIZER_VERSION = 1;
 
 /** BM25 constants — the standard defaults. */
@@ -323,6 +325,7 @@ export function ftsBm25Row(
 
 /** Renders one cell for the document, per column type. Booleans are excluded from documents. */
 export function renderDocumentValue(value: unknown): string | undefined {
+  value = externalSqlDomainValue(value);
   if (value === null || value === undefined || typeof value === "boolean") return undefined;
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "number") return String(value);
