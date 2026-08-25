@@ -45,7 +45,9 @@ nightly and on demand. The release workflow repeats both against the exact CI-te
 will not publish until they pass. `.github/workflows/performance.yml` runs the performance gate
 nightly. The performance gate is deliberately kept off the merge path — it measures a machine as
 much as it measures the code, and a merge gate that fails on a noisy runner is one people learn to
-re-run rather than read.
+re-run rather than read. When a completed run crosses a ratio threshold, the gate starts a fresh
+process and fails only if that same workload and comparison engine cross it again. Setup errors,
+missing profiles, and incomplete runs still fail immediately.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
